@@ -2,6 +2,10 @@
 
 从 GitHub **0.2.25** 升级：这次重点是让 Amoo 从一次问答变成可以继续修改、预览和交付的会话，同时补齐相册、日程、连接恢复与手机伴侣体验。
 
+## 实测性能
+
+Linux + PZ261A，同一 USB、每项每版 9 次测量：Amoo 连续会话读取中位耗时 **730 → 345 ms（减少约 53%）**；电话基础信息读取 **402 → 275 ms（减少约 31%）**。启动基本持平。以上为预热后的读取路径，不代表模型生成或整个应用提速。[完整方法与逐次数据](https://github.com/xydzf520/stepx/blob/main/docs/PERFORMANCE_0_2_50.md)。
+
 ## 核心更新
 
 - **Amoo 会话与连续创作**：回复支持流式接收；按需求识别聊天、文件、图片与应用任务，也可以改回普通聊天。成果卡片支持预览、继续修改、打开位置和发送手机。修复应用继续编辑时工作目录不存在导致的错误。
@@ -22,15 +26,17 @@
 ## 使用范围
 
 - 主要适配 **STEPX Neo / PZ261A**。高级权限与重启恢复限定已核对的 Android 16 / 172 固件；其他固件不会按“相同型号”盲目写入。
-- 普通 Android 可尝试授权 ADB 后的连接、文件、应用与投屏；不具备 STEPX 专有背屏、Amoo 或系统服务。手机伴侣需要 **Android 13+**。
+- 普通 Android 不在本版客户端支持范围：设备识别当前限定 STEPX / PZ261A / pandora。手机伴侣需要 **Android 13+**。
 - Windows x64 需要合适的 USB 驱动；macOS 未经 Apple 公证；Windows 未使用商业代码签名。Linux 发布包以 Ubuntu 24.04 为构建基线。
-- Windows/macOS 的原生 CI、打包与运行依赖检查不等于已完成所有实体电脑和手机的图形界面验收。详见 [兼容性与本轮验证](CROSS_PLATFORM_0_2_50.md)。
+- Windows/macOS 的原生 CI、打包与运行依赖检查不等于已完成所有实体电脑和手机的图形界面验收。详见 [兼容性与本轮验证](https://github.com/xydzf520/stepx/blob/main/docs/CROSS_PLATFORM_0_2_50.md)。
 - 普通对话默认沿用手机 Amoo 账号；自有模型与 GUI Agent 的模型服务分别配置、分别计费。公开伴侣包不包含许可未明确的 Neo 执行引擎。
 
-[0.2.25 → 0.2.50 变更对照](UPDATE_0_2_50.md) · [完整更新日志](../CHANGELOG.md) · [项目首页](https://github.com/xydzf520/stepx)
+[0.2.25 → 0.2.50 变更对照](https://github.com/xydzf520/stepx/blob/main/docs/UPDATE_0_2_50.md) · [完整更新日志](https://github.com/xydzf520/stepx/blob/main/CHANGELOG.md) · [项目首页](https://github.com/xydzf520/stepx)
 
 ## 发布前回归修复
 
 - 未发送的新对话，打开历史记录或切换会话前会保存草稿和附件。
 - 修复 macOS 工作文件预览的路径别名处理，保留工作目录范围与符号链接检查。
 - 9 种窗口尺寸覆盖长中文、混合附件、预览与会话切换。
+
+[观看 / 下载 4 分 03 秒女生配音更新视频](https://github.com/xydzf520/stepx/releases/download/v0.2.50/StepX-Companion-0.2.50-update-wechat.mp4) · [1080p 版本](https://github.com/xydzf520/stepx/releases/download/v0.2.50/StepX-Companion-0.2.50-update-1080p.mp4)

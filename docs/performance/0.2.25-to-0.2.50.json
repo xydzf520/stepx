@@ -1,0 +1,617 @@
+{
+  "baseline": "GitHub v0.2.25",
+  "current": "0216ce89518e9e9a8ee90ed9211963d699f2b103 / v0.2.50",
+  "platform": "Linux x86_64",
+  "phone": "PZ261A Android 16 / 172",
+  "transport": "same USB",
+  "method": "Release source probes; three alternating version blocks; one warm-up + three measured runs per metric/block; same session; no model generation or message sending. Existing phone bridge restored afterwards.",
+  "summary": [
+    {
+      "metric": "device_summary",
+      "samples_per_version": 9,
+      "old_median_ms": 151.05,
+      "new_median_ms": 134.14,
+      "elapsed_reduction_percent": 11.2,
+      "old_range_ms": [
+        75.89,
+        176.49
+      ],
+      "new_range_ms": [
+        78.28,
+        168.37
+      ]
+    },
+    {
+      "metric": "phone_capabilities",
+      "samples_per_version": 9,
+      "old_median_ms": 401.82,
+      "new_median_ms": 275.43,
+      "elapsed_reduction_percent": 31.45,
+      "old_range_ms": [
+        301.67,
+        427.36
+      ],
+      "new_range_ms": [
+        173.9,
+        296.72
+      ]
+    },
+    {
+      "metric": "amoo_snapshot",
+      "samples_per_version": 9,
+      "old_median_ms": 730.13,
+      "new_median_ms": 345.48,
+      "elapsed_reduction_percent": 52.68,
+      "old_range_ms": [
+        467.21,
+        1340.24
+      ],
+      "new_range_ms": [
+        238.28,
+        577.61
+      ]
+    }
+  ],
+  "samples": [
+    {
+      "count": 232,
+      "metric": "device_summary",
+      "ms": 75.89196,
+      "ok": true,
+      "version": "0.2.25",
+      "block": 0,
+      "sample": 0
+    },
+    {
+      "count": 1,
+      "metric": "phone_capabilities",
+      "ms": 377.801992,
+      "ok": true,
+      "version": "0.2.25",
+      "block": 0,
+      "sample": 0
+    },
+    {
+      "count": 68,
+      "metric": "amoo_snapshot",
+      "ms": 503.01793299999997,
+      "ok": true,
+      "version": "0.2.25",
+      "block": 0,
+      "sample": 0
+    },
+    {
+      "count": 232,
+      "metric": "device_summary",
+      "ms": 151.131406,
+      "ok": true,
+      "version": "0.2.25",
+      "block": 0,
+      "sample": 1
+    },
+    {
+      "count": 1,
+      "metric": "phone_capabilities",
+      "ms": 401.82000899999997,
+      "ok": true,
+      "version": "0.2.25",
+      "block": 0,
+      "sample": 1
+    },
+    {
+      "count": 68,
+      "metric": "amoo_snapshot",
+      "ms": 802.103489,
+      "ok": true,
+      "version": "0.2.25",
+      "block": 0,
+      "sample": 1
+    },
+    {
+      "count": 232,
+      "metric": "device_summary",
+      "ms": 151.05442599999998,
+      "ok": true,
+      "version": "0.2.25",
+      "block": 0,
+      "sample": 2
+    },
+    {
+      "count": 1,
+      "metric": "phone_capabilities",
+      "ms": 402.07038,
+      "ok": true,
+      "version": "0.2.25",
+      "block": 0,
+      "sample": 2
+    },
+    {
+      "count": 68,
+      "metric": "amoo_snapshot",
+      "ms": 1340.240087,
+      "ok": true,
+      "version": "0.2.25",
+      "block": 0,
+      "sample": 2
+    },
+    {
+      "count": 232,
+      "metric": "device_summary",
+      "ms": 164.014615,
+      "ok": true,
+      "version": "0.2.50",
+      "block": 0,
+      "sample": 0
+    },
+    {
+      "count": 1,
+      "metric": "phone_capabilities",
+      "ms": 296.721874,
+      "ok": true,
+      "version": "0.2.50",
+      "block": 0,
+      "sample": 0
+    },
+    {
+      "count": 68,
+      "metric": "amoo_snapshot",
+      "ms": 317.518794,
+      "ok": true,
+      "version": "0.2.50",
+      "block": 0,
+      "sample": 0
+    },
+    {
+      "count": 232,
+      "metric": "device_summary",
+      "ms": 168.368318,
+      "ok": true,
+      "version": "0.2.50",
+      "block": 0,
+      "sample": 1
+    },
+    {
+      "count": 1,
+      "metric": "phone_capabilities",
+      "ms": 263.237479,
+      "ok": true,
+      "version": "0.2.50",
+      "block": 0,
+      "sample": 1
+    },
+    {
+      "count": 68,
+      "metric": "amoo_snapshot",
+      "ms": 346.035185,
+      "ok": true,
+      "version": "0.2.50",
+      "block": 0,
+      "sample": 1
+    },
+    {
+      "count": 232,
+      "metric": "device_summary",
+      "ms": 159.368701,
+      "ok": true,
+      "version": "0.2.50",
+      "block": 0,
+      "sample": 2
+    },
+    {
+      "count": 1,
+      "metric": "phone_capabilities",
+      "ms": 296.11839200000003,
+      "ok": true,
+      "version": "0.2.50",
+      "block": 0,
+      "sample": 2
+    },
+    {
+      "count": 68,
+      "metric": "amoo_snapshot",
+      "ms": 358.839642,
+      "ok": true,
+      "version": "0.2.50",
+      "block": 0,
+      "sample": 2
+    },
+    {
+      "count": 232,
+      "metric": "device_summary",
+      "ms": 122.420345,
+      "ok": true,
+      "version": "0.2.50",
+      "block": 1,
+      "sample": 0
+    },
+    {
+      "count": 1,
+      "metric": "phone_capabilities",
+      "ms": 275.431082,
+      "ok": true,
+      "version": "0.2.50",
+      "block": 1,
+      "sample": 0
+    },
+    {
+      "count": 68,
+      "metric": "amoo_snapshot",
+      "ms": 498.945111,
+      "ok": true,
+      "version": "0.2.50",
+      "block": 1,
+      "sample": 0
+    },
+    {
+      "count": 232,
+      "metric": "device_summary",
+      "ms": 107.044665,
+      "ok": true,
+      "version": "0.2.50",
+      "block": 1,
+      "sample": 1
+    },
+    {
+      "count": 1,
+      "metric": "phone_capabilities",
+      "ms": 250.86781299999998,
+      "ok": true,
+      "version": "0.2.50",
+      "block": 1,
+      "sample": 1
+    },
+    {
+      "count": 68,
+      "metric": "amoo_snapshot",
+      "ms": 306.252255,
+      "ok": true,
+      "version": "0.2.50",
+      "block": 1,
+      "sample": 1
+    },
+    {
+      "count": 232,
+      "metric": "device_summary",
+      "ms": 121.887603,
+      "ok": true,
+      "version": "0.2.50",
+      "block": 1,
+      "sample": 2
+    },
+    {
+      "count": 1,
+      "metric": "phone_capabilities",
+      "ms": 270.80539799999997,
+      "ok": true,
+      "version": "0.2.50",
+      "block": 1,
+      "sample": 2
+    },
+    {
+      "count": 68,
+      "metric": "amoo_snapshot",
+      "ms": 345.480531,
+      "ok": true,
+      "version": "0.2.50",
+      "block": 1,
+      "sample": 2
+    },
+    {
+      "count": 232,
+      "metric": "device_summary",
+      "ms": 126.049295,
+      "ok": true,
+      "version": "0.2.25",
+      "block": 1,
+      "sample": 0
+    },
+    {
+      "count": 1,
+      "metric": "phone_capabilities",
+      "ms": 351.72146399999997,
+      "ok": true,
+      "version": "0.2.25",
+      "block": 1,
+      "sample": 0
+    },
+    {
+      "count": 68,
+      "metric": "amoo_snapshot",
+      "ms": 874.459581,
+      "ok": true,
+      "version": "0.2.25",
+      "block": 1,
+      "sample": 0
+    },
+    {
+      "count": 232,
+      "metric": "device_summary",
+      "ms": 151.13404699999998,
+      "ok": true,
+      "version": "0.2.25",
+      "block": 1,
+      "sample": 1
+    },
+    {
+      "count": 1,
+      "metric": "phone_capabilities",
+      "ms": 427.359654,
+      "ok": true,
+      "version": "0.2.25",
+      "block": 1,
+      "sample": 1
+    },
+    {
+      "count": 68,
+      "metric": "amoo_snapshot",
+      "ms": 1320.182531,
+      "ok": true,
+      "version": "0.2.25",
+      "block": 1,
+      "sample": 1
+    },
+    {
+      "count": 232,
+      "metric": "device_summary",
+      "ms": 176.31268,
+      "ok": true,
+      "version": "0.2.25",
+      "block": 1,
+      "sample": 2
+    },
+    {
+      "count": 1,
+      "metric": "phone_capabilities",
+      "ms": 401.914169,
+      "ok": true,
+      "version": "0.2.25",
+      "block": 1,
+      "sample": 2
+    },
+    {
+      "count": 68,
+      "metric": "amoo_snapshot",
+      "ms": 551.162257,
+      "ok": true,
+      "version": "0.2.25",
+      "block": 1,
+      "sample": 2
+    },
+    {
+      "count": 232,
+      "metric": "device_summary",
+      "ms": 176.49389,
+      "ok": true,
+      "version": "0.2.25",
+      "block": 2,
+      "sample": 0
+    },
+    {
+      "count": 1,
+      "metric": "phone_capabilities",
+      "ms": 376.738047,
+      "ok": true,
+      "version": "0.2.25",
+      "block": 2,
+      "sample": 0
+    },
+    {
+      "count": 68,
+      "metric": "amoo_snapshot",
+      "ms": 506.4093,
+      "ok": true,
+      "version": "0.2.25",
+      "block": 2,
+      "sample": 0
+    },
+    {
+      "count": 232,
+      "metric": "device_summary",
+      "ms": 151.017607,
+      "ok": true,
+      "version": "0.2.25",
+      "block": 2,
+      "sample": 1
+    },
+    {
+      "count": 1,
+      "metric": "phone_capabilities",
+      "ms": 401.90079899999995,
+      "ok": true,
+      "version": "0.2.25",
+      "block": 2,
+      "sample": 1
+    },
+    {
+      "count": 68,
+      "metric": "amoo_snapshot",
+      "ms": 467.207724,
+      "ok": true,
+      "version": "0.2.25",
+      "block": 2,
+      "sample": 1
+    },
+    {
+      "count": 232,
+      "metric": "device_summary",
+      "ms": 150.980696,
+      "ok": true,
+      "version": "0.2.25",
+      "block": 2,
+      "sample": 2
+    },
+    {
+      "count": 1,
+      "metric": "phone_capabilities",
+      "ms": 301.672751,
+      "ok": true,
+      "version": "0.2.25",
+      "block": 2,
+      "sample": 2
+    },
+    {
+      "count": 68,
+      "metric": "amoo_snapshot",
+      "ms": 730.1307,
+      "ok": true,
+      "version": "0.2.25",
+      "block": 2,
+      "sample": 2
+    },
+    {
+      "count": 232,
+      "metric": "device_summary",
+      "ms": 78.284233,
+      "ok": true,
+      "version": "0.2.50",
+      "block": 2,
+      "sample": 0
+    },
+    {
+      "count": 1,
+      "metric": "phone_capabilities",
+      "ms": 173.899577,
+      "ok": true,
+      "version": "0.2.50",
+      "block": 2,
+      "sample": 0
+    },
+    {
+      "count": 68,
+      "metric": "amoo_snapshot",
+      "ms": 238.278797,
+      "ok": true,
+      "version": "0.2.50",
+      "block": 2,
+      "sample": 0
+    },
+    {
+      "count": 232,
+      "metric": "device_summary",
+      "ms": 134.136327,
+      "ok": true,
+      "version": "0.2.50",
+      "block": 2,
+      "sample": 1
+    },
+    {
+      "count": 1,
+      "metric": "phone_capabilities",
+      "ms": 284.473569,
+      "ok": true,
+      "version": "0.2.50",
+      "block": 2,
+      "sample": 1
+    },
+    {
+      "count": 68,
+      "metric": "amoo_snapshot",
+      "ms": 577.612126,
+      "ok": true,
+      "version": "0.2.50",
+      "block": 2,
+      "sample": 1
+    },
+    {
+      "count": 232,
+      "metric": "device_summary",
+      "ms": 149.392168,
+      "ok": true,
+      "version": "0.2.50",
+      "block": 2,
+      "sample": 2
+    },
+    {
+      "count": 1,
+      "metric": "phone_capabilities",
+      "ms": 282.775081,
+      "ok": true,
+      "version": "0.2.50",
+      "block": 2,
+      "sample": 2
+    },
+    {
+      "count": 68,
+      "metric": "amoo_snapshot",
+      "ms": 262.431554,
+      "ok": true,
+      "version": "0.2.50",
+      "block": 2,
+      "sample": 2
+    }
+  ],
+  "startup": {
+    "method": "Official Linux release packages; demo/light mode, isolated persistent config per version, same X11 display; one warm-up then five alternating launches per version; process creation to first mapped top-level window; 15 ms polling. Does not measure phone data readiness or cold boot.",
+    "summary": [
+      {
+        "version": "0.2.25",
+        "median_ms": 118.66,
+        "min_ms": 117.78,
+        "max_ms": 121.08,
+        "samples": 5
+      },
+      {
+        "version": "0.2.50",
+        "median_ms": 122.01,
+        "min_ms": 117.99,
+        "max_ms": 142.93,
+        "samples": 5
+      }
+    ],
+    "samples": [
+      {
+        "version": "0.2.25",
+        "sample": 0,
+        "ms": 118.66
+      },
+      {
+        "version": "0.2.50",
+        "sample": 0,
+        "ms": 122.01
+      },
+      {
+        "version": "0.2.50",
+        "sample": 1,
+        "ms": 142.93
+      },
+      {
+        "version": "0.2.25",
+        "sample": 1,
+        "ms": 118.47
+      },
+      {
+        "version": "0.2.25",
+        "sample": 2,
+        "ms": 117.78
+      },
+      {
+        "version": "0.2.50",
+        "sample": 2,
+        "ms": 123.11
+      },
+      {
+        "version": "0.2.50",
+        "sample": 3,
+        "ms": 119.84
+      },
+      {
+        "version": "0.2.25",
+        "sample": 3,
+        "ms": 118.69
+      },
+      {
+        "version": "0.2.25",
+        "sample": 4,
+        "ms": 121.08
+      },
+      {
+        "version": "0.2.50",
+        "sample": 4,
+        "ms": 117.99
+      }
+    ]
+  },
+  "cpu": "AMD Ryzen 9 7950X",
+  "tested_at": "2026-10-27 Asia/Shanghai",
+  "baseline_commit": "0c94d2e0e208ae91bab7def228d718e28efaf1d5"
+}

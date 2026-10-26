@@ -15,9 +15,11 @@ Linux / macOS / Windows · Rust 原生客户端 · 当前主要适配 PZ261A
 
 </div>
 
-面向 **STEPX Neo / PZ261A** 用户的社区项目，与 STEPX、Amoo、Google 无官方隶属关系。普通 Android 可尝试部分连接和管理功能；专有能力需要对应手机、固件和账号。
+面向 **STEPX Neo / PZ261A** 用户的社区项目，与 STEPX、Amoo、Google 无官方隶属关系。客户端当前以 STEPX / PZ261A 设备识别为入口，普通 Android 不在本版支持范围；专有能力还需要对应固件和账号。
 
 ## 0.2.25 → 0.2.50：从对话到持续创作
+
+**同机真机实测：Amoo 连续会话读取耗时减少约 53%，电话基础信息读取减少约 31%。** 这是预热后的读取环节中位数，不代表模型生成或全应用提速。[测试方法与全部结果](docs/PERFORMANCE_0_2_50.md)。
 
 本次把重点放在日常使用：Amoo 流式回复、围绕成果继续修改，相册与电脑扩容文件联动，日历与闹钟集中查看，以及扫码和已配对设备自动重连。
 
@@ -25,7 +27,7 @@ Linux / macOS / Windows · Rust 原生客户端 · 当前主要适配 PZ261A
 
 [<img src="docs/images/update-0.2.50-cover.jpg" width="300" alt="0.2.25 到 0.2.50 竖版更新视频" />](https://github.com/xydzf520/stepx/releases/download/v0.2.50/StepX-Companion-0.2.50-update-wechat.mp4)
 
-[观看 / 下载竖版更新视频](https://github.com/xydzf520/stepx/releases/download/v0.2.50/StepX-Companion-0.2.50-update-wechat.mp4) · 适合微信聊天和群分享，配中文字幕与合成配音。界面截图使用演示数据，流程示意会单独标注。
+[观看 / 下载竖版更新视频](https://github.com/xydzf520/stepx/releases/download/v0.2.50/StepX-Companion-0.2.50-update-wechat.mp4) · 适合微信聊天和群分享，**4 分 03 秒**，配重点中文字幕与自然女生合成配音。界面截图使用演示数据，流程示意会单独标注。
 
 ## 特色功能
 
@@ -101,7 +103,7 @@ Studio 首次网页登录需要本人完成；之后可以复用已授权会话�
 
 发布包提供 **ADB、scrcpy、Python、Java 与 APK 校验工具**，无需预装 Android Studio。请完整解压，不要只复制可执行文件。每个包附 SHA-256；Windows/macOS 的原生构建与运行时验证不等于所有实体电脑均已联调。[完整验证边界 →](docs/CROSS_PLATFORM_0_2_50.md)
 
-主要设备为 PZ261A；高级权限/重启恢复适配 Android 16 / 172 固件，未知固件不跳过检查强装。普通 Android 可尝试部分基础能力；手机伴侣最低 Android 13。同局域网自动发现需要设备互访和 mDNS，防火墙或访客网络隔离可能阻止连接。
+主要设备为 PZ261A；高级权限/重启恢复适配 Android 16 / 172 固件，未知固件不跳过检查强装。普通 Android 目前会被客户端设备识别拦截，不列入支持范围；手机伴侣最低 Android 13。同局域网自动发现需要设备互访和 mDNS，防火墙或访客网络隔离可能阻止连接。
 
 ## 快速开始
 
