@@ -371,7 +371,12 @@ impl Companion {
             .collect::<Vec<_>>();
         self.workspace.last_draft = (draft.clone(), paths.clone());
         if self.workspace.active.is_none() {
-            return;
+            if draft.trim().is_empty() && paths.is_empty() {
+                return;
+            }
+            // A new conversation is lazy until it has actual input. Persist
+            // that input before history/window switches, even before sending.
+            self.workspace_ensure_task();
         }
         let intent = self.workspace.intent;
         if let Some(task) = self.workspace_task_mut() {
@@ -2080,6 +2085,8 @@ impl Companion {
         self.workspace_persist();
     }
     pub(super) fn workspace_toggle_history(&mut self) {
+        self.workspace_capture_draft();
+        self.workspace_persist();
         self.amoo_ui.screen_mode = false;
         let compact = self.push.shell_mode != ShellMode::Full;
         if !is_verification_harness() && !compact && self.workspace.viewport.x() >= 1000.0 {
@@ -5004,6 +5011,24 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(&nonexistent_ws);
         }
+    }
+
+    #[test]
+    fn unsent_new_conversation_preserves_draft_on_history_and_session_switch() {
+        let mut app = Companion::new_for_test();
+        app.demo_mode = true;
+        app.workspace_switch_new().unwrap();
+        assert!(app.workspace.active.is_none());
+        app.workspace_capture_draft();
+        assert!(app.workspace.active.is_none(), "empty welcome must not create history");
+        app.fields[F_AMOO].set("尚未发送的中文草稿\n第二行保持原样");
+        app.workspace_toggle_history();
+        let id = app.workspace.active.clone().expect("unsent input has a draft record");
+        app.workspace_switch_new().unwrap();
+        app.fields[F_AMOO].set("第二条草稿");
+        app.workspace_select_task(&id).unwrap();
+        assert_eq!(app.fields[F_AMOO].text, "尚未发送的中文草稿\n第二行保持原样");
+        assert!(app.workspace.journal.tasks.iter().any(|t| t.draft == "第二条草稿"));
     }
 
     #[test]

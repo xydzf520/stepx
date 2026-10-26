@@ -2489,14 +2489,14 @@ fn insert_work_preview_memory_cache(
 fn read_work_preview(root: &std::path::Path, path: &std::path::Path) -> Result<WorkLocalPreview> {
     validate_open_path(Some(root), path)?;
     let workspace = work::Workspace::open(root)?;
-    let relative = path
+    let canonical_path = path.canonicalize()?;
+    let relative = canonical_path
         .strip_prefix(workspace.root())
         .context("文件不在工作文件夹内")?;
     let metadata = std::fs::metadata(path)?;
     anyhow::ensure!(metadata.is_file(), "请选择普通文件预览");
     let file_len = metadata.len();
     let mtime = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
-    let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     if let Ok(mem) = work_preview_memory_cache().lock() {
         if let Some((cached_len, cached_mtime, cached_preview)) = mem.get(&canonical_path) {
             if *cached_len == file_len && *cached_mtime == mtime {
@@ -2754,15 +2754,15 @@ fn delimited_preview(source: &str, delimiter: char) -> String {
 }
 
 fn validate_open_path(root: Option<&std::path::Path>, path: &std::path::Path) -> Result<()> {
-    let root = root
-        .ok_or_else(|| anyhow::anyhow!("请先选择工作文件夹"))?
-        .canonicalize()?;
+    let selected_root = root.ok_or_else(|| anyhow::anyhow!("请先选择工作文件夹"))?;
+    let root = selected_root.canonicalize()?;
     anyhow::ensure!(
         path.canonicalize()?.starts_with(&root),
         "该文件已移出当前工作文件夹，请刷新"
     );
     let relative = path
-        .strip_prefix(&root)
+        .strip_prefix(selected_root)
+        .or_else(|_| path.strip_prefix(&root))
         .context("文件不在当前工作文件夹内")?;
     let mut candidate = root;
     for component in relative.components() {
@@ -2948,6 +2948,22 @@ mod preview_tests {
         let linked = root.path().join("linked.md");
         std::os::unix::fs::symlink(text, &linked).unwrap();
         assert!(read_work_preview(root.path(), &linked).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn workspace_aliases_allow_previews_but_child_symlinks_stay_blocked() {
+        let parent = tempfile::tempdir().unwrap();
+        let real = parent.path().join("实际工作目录");
+        std::fs::create_dir(&real).unwrap();
+        let alias = parent.path().join("工作目录别名");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        std::fs::write(real.join("说明.md"), "# 跨平台预览").unwrap();
+        let preview = read_work_preview(&alias, &alias.join("说明.md")).unwrap();
+        assert_eq!(preview.text.as_deref(), Some("# 跨平台预览"));
+        assert!(read_work_preview(&alias, &real.join("说明.md").canonicalize().unwrap()).is_ok());
+        std::os::unix::fs::symlink(real.join("说明.md"), real.join("内部链接.md")).unwrap();
+        assert!(read_work_preview(&alias, &alias.join("内部链接.md")).is_err());
     }
 
     #[test]
