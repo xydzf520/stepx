@@ -28,6 +28,28 @@ class Guards(unittest.TestCase):
                 adapter.inspect()
             guard.assert_not_called()
 
+    def test_other_user_selected_stepx_serial_is_accepted(self):
+        dump = '  Package [com.stepx.companion.app] (abcd):\n    appId=10234\n    com.stepos.permission.MANAGE_BACK_SCREEN: granted=true\n'
+        for transport, physical in [
+            ('ZYPZ261A01M692888AB', 'ZYPZ261A01M692888AB'),
+            ('192.168.1.88:5555', 'ZYPZ261A01M692888AB'),
+        ]:
+            with self.subTest(transport=transport), patch.dict(
+                adapter.os.environ,
+                {'STEPX_SERIAL': transport, 'STEPX_DEVICE_SERIAL': physical},
+            ):
+                fresh_spec = importlib.util.spec_from_file_location('companion_permissions_user', SCRIPT)
+                fresh = importlib.util.module_from_spec(fresh_spec)
+                fresh_spec.loader.exec_module(fresh)
+                self.assertEqual(fresh.AUTHORIZED_SERIAL, transport)
+                with patch.object(fresh, 'ADB', ['adb', '-s', transport]), \
+                     patch.object(fresh, 'guard') as guard, \
+                     patch.object(fresh, 'shell', return_value=dump):
+                    result = fresh.inspect()
+                    self.assertTrue(result['granted'])
+                    self.assertEqual(result['uid'], 10234)
+                    guard.assert_called_once_with()
+
     def test_preflight_requires_apk(self):
         with patch.object(adapter, 'inspect') as inspect:
             with self.assertRaisesRegex(RuntimeError, 'APK'):

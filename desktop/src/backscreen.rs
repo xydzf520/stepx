@@ -1,8 +1,9 @@
 //! The physical matrix is 17 columns by 23 rows. Twelve corner cells have no LED.
 //! Rendering is pure; device playback is bounded, cancellable, and restores settings.
+pub use crate::device::is_backscreen_corner;
 use crate::{
     adb::{shell_quote, Adb},
-    device::{is_backscreen_corner, Device},
+    device::Device,
 };
 use anyhow::{bail, Context, Result};
 use chrono::{Local, Timelike};
@@ -184,6 +185,8 @@ pub struct ImageOptions {
     pub dither: bool,
     pub threshold: Option<u8>,
     pub fit: ImageFit,
+    pub rotation_deg: u16,
+    pub flip_h: bool,
 }
 
 /// Alpha is composited over black and the aspect ratio is preserved before sampling.
@@ -193,11 +196,21 @@ pub fn image_frame(path: &Path, options: &ImageOptions) -> Result<Vec<u8>> {
     if w == 0 || h == 0 || u64::from(w) * u64::from(h) > 64_000_000 {
         bail!("图片尺寸为空或超过6400万像素")
     }
-    let rgba = image::ImageReader::open(path)?
+    let mut rgba = image::ImageReader::open(path)?
         .with_guessed_format()?
         .decode()
         .context("无法读取图片")?
         .to_rgba8();
+    match options.rotation_deg % 360 {
+        90 => rgba = imageops::rotate90(&rgba),
+        180 => rgba = imageops::rotate180(&rgba),
+        270 => rgba = imageops::rotate270(&rgba),
+        _ => {}
+    }
+    if options.flip_h {
+        rgba = imageops::flip_horizontal(&rgba);
+    }
+    let (w, h) = rgba.dimensions();
     let resized = match options.fit {
         ImageFit::Contain => imageops::resize(
             &rgba,
@@ -800,13 +813,21 @@ impl Drop for RestoreGuard {
     }
 }
 fn bs(adb: &Adb, device: &Device, args: &[&str]) -> Result<String> {
-    let mut a = vec!["dumpsys", "display_ext", "back_screen"];
-    a.extend_from_slice(args);
-    let command = a
+    bs_batch(adb, device, &[args])
+}
+fn bs_batch(adb: &Adb, device: &Device, commands: &[&[&str]]) -> Result<String> {
+    let command = commands
         .iter()
-        .map(|s| shell_quote(s))
+        .map(|args| {
+            let mut a = vec!["dumpsys", "display_ext", "back_screen"];
+            a.extend_from_slice(args);
+            a.iter()
+                .map(|s| shell_quote(s))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
         .collect::<Vec<_>>()
-        .join(" ");
+        .join(" && ");
     let out = adb.run_timeout(
         &["-s", &device.transport, "shell", &command],
         Duration::from_secs(3),
@@ -840,12 +861,11 @@ struct Saved {
 }
 impl Saved {
     fn read(adb: &Adb, device: &Device) -> Result<Self> {
-        let state = bs(adb, device, &["basic"])?;
-        let brightness = bs(adb, device, &["brightness"])?;
-        let mode = token(&state, "settingsDisplayMode=").context("固件未返回背屏模式")?;
-        let kind = token(&state, "settingsType=").context("固件未返回背屏内容类型")?;
-        let automatic = token(&brightness, "auto=").context("固件未返回自动亮度")?;
-        let manual = brightness
+        let combined = bs_batch(adb, device, &[&["basic"], &["brightness"]])?;
+        let mode = token(&combined, "settingsDisplayMode=").context("固件未返回背屏模式")?;
+        let kind = token(&combined, "settingsType=").context("固件未返回背屏内容类型")?;
+        let automatic = token(&combined, "auto=").context("固件未返回自动亮度")?;
+        let manual = combined
             .lines()
             .find_map(|l| l.split("manual=").nth(1))
             .and_then(|s| s.split_whitespace().next())
@@ -860,22 +880,21 @@ impl Saved {
     fn restore(&self, adb: &Adb, device: &Device) -> Result<()> {
         device.verify(adb)?;
         clear_frame(adb, device)?;
-        bs(adb, device, &["brightness", "manual", &self.manual])?;
-        bs(
+        let auto_arg = if self.automatic == "true" {
+            "on"
+        } else {
+            "off"
+        };
+        bs_batch(
             adb,
             device,
             &[
-                "brightness",
-                "auto",
-                if self.automatic == "true" {
-                    "on"
-                } else {
-                    "off"
-                },
+                &["brightness", "manual", &self.manual],
+                &["brightness", "auto", auto_arg],
+                &["basic", "type", &self.kind],
+                &["basic", "display_mode", &self.mode],
             ],
         )?;
-        bs(adb, device, &["basic", "type", &self.kind])?;
-        bs(adb, device, &["basic", "display_mode", &self.mode])?;
         let now = Self::read(adb, device)?;
         if now.mode != self.mode
             || now.kind != self.kind
@@ -1041,24 +1060,29 @@ pub fn start(adb: Adb, device: Device, source: Source, config: PlaybackConfig) -
             if worker_cancel.load(Ordering::Acquire) {
                 return Ok((true, 0));
             }
-            bs(&adb, &device, &["brightness", "auto", "off"])?;
-            if worker_cancel.load(Ordering::Acquire) {
-                return Ok((true, 0));
-            }
-            bs(&adb, &device, &["brightness", "manual", "255"])?;
-            if worker_cancel.load(Ordering::Acquire) {
-                return Ok((true, 0));
-            }
-            bs(&adb, &device, &["basic", "display_mode", "always"])?;
-            if worker_cancel.load(Ordering::Acquire) {
-                return Ok((true, 0));
-            }
-            bs(&adb, &device, &["wake"])?;
+            bs_batch(
+                &adb,
+                &device,
+                &[
+                    &["brightness", "auto", "off"],
+                    &["brightness", "manual", "255"],
+                    &["basic", "display_mode", "always"],
+                    &["wake"],
+                ],
+            )?;
             let started = Instant::now();
             let mut frames = 0;
-            let mut live = live_data(&adb, &device)?;
+            let needs_live = matches!(
+                source,
+                Source::Preset(Preset::Clock | Preset::Battery) | Source::App { .. }
+            );
+            let mut live = if needs_live {
+                live_data(&adb, &device)?
+            } else {
+                LiveData::default()
+            };
             let mut sampled = Instant::now();
-            let mut first_sample = true;
+            let mut first_sample = false;
             let mut active = true;
             let mut last = vec![];
             let mut next = Instant::now();
@@ -1101,9 +1125,11 @@ pub fn start(adb: Adb, device: Device, source: Source, config: PlaybackConfig) -
                 }
                 if sampled.elapsed() >= Duration::from_secs(1) || first_sample {
                     first_sample = false;
-                    live = live_data(&adb, &device)?;
-                    if worker_cancel.load(Ordering::Acquire) {
-                        return Ok((true, frames));
+                    if needs_live {
+                        live = live_data(&adb, &device)?;
+                        if worker_cancel.load(Ordering::Acquire) {
+                            return Ok((true, frames));
+                        }
                     }
                     if let Source::App { package, .. } = &source {
                         let now = foreground(&adb, &device)? == *package;
@@ -1117,10 +1143,16 @@ pub fn start(adb: Adb, device: Device, source: Source, config: PlaybackConfig) -
                                 message: "等待目标应用进入前台；已恢复手机原背屏模式与亮度".into(),
                             });
                         } else if !active && now {
-                            bs(&adb, &device, &["brightness", "auto", "off"])?;
-                            bs(&adb, &device, &["brightness", "manual", "255"])?;
-                            bs(&adb, &device, &["basic", "display_mode", "always"])?;
-                            bs(&adb, &device, &["wake"])?;
+                            bs_batch(
+                                &adb,
+                                &device,
+                                &[
+                                    &["brightness", "auto", "off"],
+                                    &["brightness", "manual", "255"],
+                                    &["basic", "display_mode", "always"],
+                                    &["wake"],
+                                ],
+                            )?;
                             checked_output = false;
                         }
                         active = now;
@@ -1438,9 +1470,15 @@ pub fn set_brightness(adb: &Adb, device: &Device, level: u8) -> Result<String> {
         bail!("亮度级别需1–8")
     };
     let value = ((level as u16 * 32).min(255)).to_string();
-    bs(adb, device, &["brightness", "auto", "off"])?;
-    bs(adb, device, &["brightness", "manual", &value])?;
-    let state = bs(adb, device, &["brightness"])?;
+    let state = bs_batch(
+        adb,
+        device,
+        &[
+            &["brightness", "auto", "off"],
+            &["brightness", "manual", &value],
+            &["brightness"],
+        ],
+    )?;
     if !state.contains(&format!("manual={value} ")) {
         bail!("手机亮度回读失败")
     };
@@ -1464,18 +1502,16 @@ pub fn marquee(
         bail!("手机原生字库支持最多64个英文字母、数字、空格和 ! ? -；中文请使用 Amoo 生成像素图")
     };
     clear_frame(adb, device)?;
-    bs(adb, device, &["basic", "text", text])?;
-    bs(
+    bs_batch(
         adb,
         device,
-        &["basic", "marquee", if scroll { "on" } else { "off" }],
+        &[
+            &["basic", "text", text],
+            &["basic", "marquee", if scroll { "on" } else { "off" }],
+            &["basic", "invert", if invert { "on" } else { "off" }],
+            &["basic", "type", "text"],
+        ],
     )?;
-    bs(
-        adb,
-        device,
-        &["basic", "invert", if invert { "on" } else { "off" }],
-    )?;
-    bs(adb, device, &["basic", "type", "text"])?;
     Ok(format!("已保存手机背屏文字：{text}"))
 }
 
@@ -1525,6 +1561,226 @@ pub fn stop_pomodoro_countdown(adb: &Adb, device: &Device) -> Result<String> {
     let _ = crate::companion_app::stop(adb, device);
     let _ = clear_frame(adb, device);
     Ok("已结束背屏专注番茄钟，恢复手机默认背屏显示".into())
+}
+
+/// Instant (<1ms) deterministic 17x23 pixel badge & text synthesizer for human prompts.
+pub fn synthesize_prompt_frame(prompt: &str) -> (String, Vec<u8>) {
+    let p = prompt.trim();
+    let lower = p.to_lowercase();
+    let cfg = PlaybackConfig {
+        brightness: 8,
+        ..Default::default()
+    };
+    if lower.contains("会议")
+        || lower.contains("勿扰")
+        || lower.contains("dnd")
+        || lower.contains("静音")
+    {
+        let mut f = vec![0u8; SLOTS];
+        // Draw DND / No-disturb circle with horizontal bar + "DND" 3x5 text
+        sprite(
+            &mut f,
+            &[
+                "  #####  ",
+                " ##   ## ",
+                "##     ##",
+                "## ### ##",
+                "## ### ##",
+                "##     ##",
+                " ##   ## ",
+                "  #####  ",
+            ],
+            4,
+            3,
+            255,
+        );
+        sprite(
+            &mut f,
+            &[
+                "##. #.# ##.",
+                "#.# ### #.#",
+                "#.# ### #.#",
+                "#.# #.# #.#",
+                "##. #.# ##.",
+            ],
+            3,
+            14,
+            230,
+        );
+        return ("会议中勿扰".into(), f);
+    }
+    if lower.contains("sos") || lower.contains("求助") || lower.contains("紧急") {
+        let mut f = vec![0u8; SLOTS];
+        sprite(
+            &mut f,
+            &[
+                " ###  ###  ### ",
+                "#    #   # #   ",
+                " ### #   #  ###",
+                "   # #   #    #",
+                "###   ###  ### ",
+            ],
+            1,
+            5,
+            255,
+        );
+        sprite(
+            &mut f,
+            &[
+                "  #    #    #  ",
+                "  #    #    #  ",
+                "  #    #    #  ",
+                "               ",
+                "  #    #    #  ",
+            ],
+            1,
+            13,
+            255,
+        );
+        return ("SOS 紧急灯牌".into(), f);
+    }
+    if lower.contains("爱心")
+        || lower.contains("心")
+        || lower.contains("heart")
+        || lower.contains("love")
+    {
+        let f = frame(
+            &Source::Preset(Preset::Heart),
+            &cfg,
+            Duration::from_millis(200),
+            &LiveData::default(),
+        );
+        return ("心动光斑".into(), f);
+    }
+    if lower.contains("猫") || lower.contains("宠物") || lower.contains("cat") {
+        let mut f = vec![0u8; SLOTS];
+        sprite(
+            &mut f,
+            &[
+                " #         # ",
+                " ##       ## ",
+                " ###     ### ",
+                " ########### ",
+                " #  ## ##  # ",
+                " ########### ",
+                " #   ###   # ",
+                "  #########  ",
+                "    #####    ",
+                "   #######   ",
+                "  ## ### ##  ",
+            ],
+            2,
+            6,
+            255,
+        );
+        return ("像素猫咪".into(), f);
+    }
+    if lower.contains("闪电")
+        || lower.contains("能量")
+        || lower.contains("充电")
+        || lower.contains("电池")
+    {
+        let f = frame(
+            &Source::Preset(Preset::Battery),
+            &cfg,
+            Duration::from_millis(200),
+            &LiveData::default(),
+        );
+        return ("赛博能量闪电".into(), f);
+    }
+    if lower.contains("时间") || lower.contains("时钟") || lower.contains("clock") {
+        let f = frame(
+            &Source::Preset(Preset::Clock),
+            &cfg,
+            Duration::from_millis(200),
+            &LiveData::default(),
+        );
+        return ("像素数字时钟".into(), f);
+    }
+    if lower.contains("笑")
+        || lower.contains("开心")
+        || lower.contains("休息")
+        || lower.contains("smile")
+    {
+        let mut f = vec![0u8; SLOTS];
+        sprite(
+            &mut f,
+            &[
+                "   #######   ",
+                " ##       ## ",
+                "#  ##   ##  #",
+                "#  ##   ##  #",
+                "#           #",
+                "#  #     #  #",
+                "#   #####   #",
+                " ##       ## ",
+                "   #######   ",
+            ],
+            2,
+            7,
+            255,
+        );
+        return ("微笑休息灯牌".into(), f);
+    }
+    // Extract digits/letters (e.g. pickup code like "5-2-108" or "4210" or custom short text)
+    let ascii: Vec<char> = p
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    if !ascii.is_empty() {
+        let mut f = vec![0u8; SLOTS];
+        // Render up to 3 rows of 4 chars (3x5 font)
+        for (idx, ch) in ascii.iter().take(12).enumerate() {
+            let row = (idx / 4) as i32;
+            let col = (idx % 4) as i32;
+            let glyph = tiny_glyph_3x5(*ch);
+            sprite(&mut f, &glyph, 1 + col * 4, 3 + row * 6, 255);
+        }
+        return (format!("点阵灯牌 · {}", p), f);
+    }
+    let f = frame(
+        &Source::Preset(Preset::Meteor),
+        &cfg,
+        Duration::from_millis(300),
+        &LiveData::default(),
+    );
+    (format!("点阵方案 · {}", p), f)
+}
+
+fn tiny_glyph_3x5(ch: char) -> [&'static str; 5] {
+    match ch {
+        '0' | 'O' => ["###", "# #", "# #", "# #", "###"],
+        '1' | 'I' => [" # ", "## ", " # ", " # ", "###"],
+        '2' | 'Z' => ["###", "  #", "###", "#  ", "###"],
+        '3' => ["###", "  #", "###", "  #", "###"],
+        '4' => ["# #", "# #", "###", "  #", "  #"],
+        '5' | 'S' => ["###", "#  ", "###", "  #", "###"],
+        '6' => ["###", "#  ", "###", "# #", "###"],
+        '7' => ["###", "  #", " # ", " # ", " # "],
+        '8' | 'B' => ["###", "# #", "###", "# #", "###"],
+        '9' => ["###", "# #", "###", "  #", "###"],
+        '-' => ["   ", "   ", "###", "   ", "   "],
+        'A' => [" # ", "# #", "###", "# #", "# #"],
+        'C' => ["###", "#  ", "#  ", "#  ", "###"],
+        'D' => ["## ", "# #", "# #", "# #", "## "],
+        'E' => ["###", "#  ", "###", "#  ", "###"],
+        'F' => ["###", "#  ", "###", "#  ", "#  "],
+        'G' => ["###", "#  ", "# #", "# #", "###"],
+        'H' => ["# #", "# #", "###", "# #", "# #"],
+        'K' => ["# #", "## ", "#  ", "## ", "# #"],
+        'L' => ["#  ", "#  ", "#  ", "#  ", "###"],
+        'M' => ["# #", "###", "###", "# #", "# #"],
+        'N' => ["###", "# #", "# #", "# #", "# #"],
+        'P' => ["###", "# #", "###", "#  ", "#  "],
+        'R' => ["###", "# #", "## ", "# #", "# #"],
+        'T' => ["###", " # ", " # ", " # ", " # "],
+        'U' | 'V' => ["# #", "# #", "# #", "# #", "###"],
+        'W' => ["# #", "# #", "###", "###", "# #"],
+        'X' => ["# #", "# #", " # ", "# #", "# #"],
+        'Y' => ["# #", "# #", " # ", " # ", " # "],
+        _ => ["###", "# #", " # ", "   ", " # "],
+    }
 }
 
 #[cfg(test)]

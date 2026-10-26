@@ -10,7 +10,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = json.loads((ROOT / 'target.json').read_text())
-SERIAL = os.environ.get('STEPX_SERIAL', CONFIG['serial'])
+SERIAL = os.environ.get('STEPX_SERIAL') or os.environ.get('STEPX_DEVICE_SERIAL') or CONFIG.get('serial', '')
 DEVICE_SERIAL = os.environ.get('STEPX_DEVICE_SERIAL', '')
 ADB = [os.environ.get('STEPX_ADB', shutil.which('adb') or 'adb'), '-s', SERIAL]
 

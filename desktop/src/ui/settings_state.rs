@@ -1,4 +1,5 @@
 use super::*;
+use facloud_ui::TypedActionView;
 use stepx_companion::settings::{self, Appearance, Settings};
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
@@ -26,6 +27,10 @@ pub(super) enum SettingsAction {
     CancelShortcut,
     ResetShortcut,
     CaptureShortcut(settings::CompactShortcut),
+    SetAppsFilter(u8),
+    ToggleAppsSort,
+    OpenConfigDir,
+    OpenStateDir,
 }
 pub(super) struct SettingsUi {
     pub value: Settings,
@@ -39,12 +44,16 @@ pub(super) struct SettingsUi {
     pub changelog: bool,
     pub sync_status: String,
     pub staging: Option<mpsc::Receiver<std::result::Result<String, String>>>,
+    pub apps_filter: u8,
+    pub apps_sort_by_name: bool,
 }
 impl Default for SettingsUi {
     fn default() -> Self {
+        let value = settings::load();
+        let draft = value.clone();
         Self {
-            value: settings::load(),
-            draft: settings::load(),
+            value,
+            draft,
             notify_draft: stepx_companion::desktop_notify::load_preferences(),
             tab: std::env::args()
                 .position(|a| a == "--settings-tab")
@@ -59,6 +68,8 @@ impl Default for SettingsUi {
             changelog: false,
             sync_status: String::new(),
             staging: None,
+            apps_filter: 0,
+            apps_sort_by_name: true,
         }
     }
 }
@@ -116,27 +127,43 @@ impl Companion {
             }
             SettingsAction::Apply => return self.apply_settings(ctx),
             SettingsAction::Tab(tab) => {
+                if self.settings.tab != *tab || self.page != Page::Settings {
+                    self.trigger_subtab_switch();
+                }
                 self.page = Page::Settings;
                 self.settings.tab = *tab;
                 self.settings.feedback.clear();
                 self.scroll = Default::default();
-                self.motion_started = Instant::now();
                 return Ok(());
             }
             SettingsAction::Changelog => {
                 self.settings.changelog = !self.settings.changelog;
                 self.scroll = Default::default();
+                self.trigger_subtab_switch();
                 return Ok(());
             }
             SettingsAction::Expansion => {
                 self.page = Page::Expansion;
                 self.handle_expansion_action(&expansion_state::ExpansionAction::Settings, ctx);
                 self.scroll = Default::default();
+                self.trigger_subtab_switch();
                 return Ok(());
             }
             SettingsAction::Models => {
-                self.page = Page::Amoo;
-                self.workspace.panel = 5;
+                if self.fields[F_LAB_ENDPOINT].text.is_empty()
+                    && !self.studio_lab.config.endpoint.is_empty()
+                {
+                    self.fields[F_LAB_ENDPOINT].set(&self.studio_lab.config.endpoint);
+                }
+                if self.fields[F_LAB_MODEL].text.is_empty()
+                    && !self.studio_lab.config.model.is_empty()
+                {
+                    self.fields[F_LAB_MODEL].set(&self.studio_lab.config.model);
+                }
+                self.page = Page::Settings;
+                self.settings.tab = 2;
+                self.scroll = Default::default();
+                self.trigger_subtab_switch();
                 return Ok(());
             }
             SettingsAction::RetrySync => {
@@ -199,6 +226,28 @@ impl Companion {
                     stepx_companion::companion_link::receive_directory()?
                 };
                 return work_state::open_work_path(&p);
+            }
+            SettingsAction::SetAppsFilter(filter) => {
+                self.settings.apps_filter = (*filter).min(3);
+                self.trigger_subtab_switch();
+                ctx.notify();
+                return Ok(());
+            }
+            SettingsAction::ToggleAppsSort => {
+                self.settings.apps_sort_by_name = !self.settings.apps_sort_by_name;
+                self.trigger_subtab_switch();
+                ctx.notify();
+                return Ok(());
+            }
+            SettingsAction::OpenConfigDir => {
+                let dir = stepx_companion::resources::user_config().join("stepx-companion");
+                let _ = std::fs::create_dir_all(&dir);
+                return work_state::open_work_path(&dir);
+            }
+            SettingsAction::OpenStateDir => {
+                let dir = stepx_companion::resources::user_state();
+                let _ = std::fs::create_dir_all(&dir);
+                return work_state::open_work_path(&dir);
             }
         }
         self.settings.feedback = "有未保存的更改，确认保存后才会生效".into();
@@ -416,24 +465,37 @@ impl Companion {
         }
         self.sync_tray();
         if self.page == Page::Settings {
-            if let Some(status) = stepx_companion::work_sync::summary() {
+            thread_local! {
+                static SUMMARY_CACHE: std::cell::RefCell<Option<(Instant, Option<String>)>> =
+                    const { std::cell::RefCell::new(None) };
+            }
+            let status = if self.settings.staging.is_some() {
+                let s = stepx_companion::work_sync::summary();
+                SUMMARY_CACHE.with(|c| *c.borrow_mut() = Some((Instant::now(), s.clone())));
+                s
+            } else {
+                SUMMARY_CACHE.with(|c| {
+                    let mut guard = c.borrow_mut();
+                    if let Some((at, cached)) = guard.as_ref() {
+                        if at.elapsed() < Duration::from_secs(2) {
+                            return cached.clone();
+                        }
+                    }
+                    let fresh = stepx_companion::work_sync::summary();
+                    *guard = Some((Instant::now(), fresh.clone()));
+                    fresh
+                })
+            };
+            if let Some(status) = status {
                 if self.settings.sync_status != status {
                     self.settings.sync_status = status;
                     ctx.notify();
                 }
             }
         }
-        let mut actions = Vec::new();
+        let mut menu_ids = Vec::new();
         while let Ok(event) = MenuEvent::receiver().try_recv() {
-            match event.id.as_ref() {
-                "stepx-show" => actions.push(None),
-                "stepx-settings" => actions.push(Some(Action::Page(Page::Settings))),
-                "stepx-compact" => actions.push(Some(Action::Push(PushAction::SetShellMode(
-                    ShellMode::MiniAi,
-                )))),
-                "stepx-quit" => actions.push(Some(Action::QuitApplication)),
-                _ => {}
-            }
+            menu_ids.push(event.id.as_ref().to_owned());
         }
         while let Ok(event) = TrayIconEvent::receiver().try_recv() {
             if matches!(
@@ -444,18 +506,34 @@ impl Companion {
                     ..
                 }
             ) {
-                actions.push(None);
+                menu_ids.push("stepx-show".to_owned());
             }
         }
-        for action in actions {
-            self.settings.hidden = false;
-            let id = ctx.window_id();
-            ctx.windows().show_window_and_focus_app(id);
-            if let Some(action) = action {
-                ctx.dispatch_typed_action(&action);
+        for id in menu_ids {
+            self.handle_tray_menu_id(&id, ctx);
+            if id == "stepx-quit" {
+                break;
             }
-            ctx.notify();
         }
+    }
+    pub(super) fn handle_tray_menu_id(&mut self, menu_id: &str, ctx: &mut ViewContext<Self>) {
+        let action = match menu_id {
+            "stepx-show" => None,
+            "stepx-settings" => Some(Action::Page(Page::Settings)),
+            "stepx-compact" => Some(Action::Push(PushAction::SetShellMode(ShellMode::MiniAi))),
+            "stepx-quit" => {
+                self.handle_action(&Action::QuitApplication, ctx);
+                return;
+            }
+            _ => return,
+        };
+        self.settings.hidden = false;
+        let id = ctx.window_id();
+        ctx.windows().show_window_and_focus_app(id);
+        if let Some(action) = action {
+            self.handle_action(&action, ctx);
+        }
+        ctx.notify();
     }
     pub(super) fn remember_work_directory(&mut self) -> Result<()> {
         self.settings.value.work_directory = self.work.workspace.clone();

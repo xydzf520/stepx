@@ -1,26 +1,52 @@
 //! File handoff over the selected, already-authorized ADB transport.
 use crate::{
-    adb::{run_process, shell_quote, Adb},
+    adb::{shell_quote, Adb},
     device::Device,
 };
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 use std::{
+    collections::{HashMap, HashSet},
     fs,
     io::Write,
     path::{Path, PathBuf},
-    process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Mutex,
+        mpsc, Arc, Mutex, OnceLock,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 const BASE: &str = "/sdcard/Android/data/com.stepx.companion.app/files";
 const LIMIT: u64 = 256 * 1024 * 1024;
+const CHECKED_BASE_TTL: Duration = Duration::from_secs(30);
 static RECEIVE_LOCK: Mutex<()> = Mutex::new(());
 static ID_LOCK: Mutex<()> = Mutex::new(());
+static CHECKED_BASE_CACHE: OnceLock<Mutex<HashMap<(String, String), (Instant, String)>>> =
+    OnceLock::new();
+static DESKTOP_ID_CACHE: OnceLock<Mutex<Option<(PathBuf, String)>>> = OnceLock::new();
+static RECEIVED_OUTBOX_CACHE: OnceLock<Mutex<HashSet<(PathBuf, String, String)>>> = OnceLock::new();
+
+fn checked_base_cache() -> &'static Mutex<HashMap<(String, String), (Instant, String)>> {
+    CHECKED_BASE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn desktop_id_cache() -> &'static Mutex<Option<(PathBuf, String)>> {
+    DESKTOP_ID_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn received_outbox_cache() -> &'static Mutex<HashSet<(PathBuf, String, String)>> {
+    RECEIVED_OUTBOX_CACHE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn remember_received_outbox(key: (PathBuf, String, String)) {
+    if let Ok(mut guard) = received_outbox_cache().lock() {
+        if guard.len() >= 2048 {
+            guard.clear();
+        }
+        guard.insert(key);
+    }
+}
 
 pub(crate) fn uuid() -> String {
     let h = format!("{:032x}", rand::random::<u128>());
@@ -81,8 +107,18 @@ pub fn desktop_id() -> Result<String> {
         .map(PathBuf::from)
         .unwrap_or(home()?.join(".config"))
         .join("stepx-companion");
-    private_dir(&base)?;
     let path = base.join("desktop-id");
+    if let Ok(guard) = desktop_id_cache().lock() {
+        if let Some((cached_base, cached_id)) = guard.as_ref() {
+            if cached_base == &base
+                && fs::symlink_metadata(&path)
+                    .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
+            {
+                return Ok(cached_id.clone());
+            }
+        }
+    }
+    private_dir(&base)?;
     match fs::symlink_metadata(&path) {
         Ok(metadata) => {
             ensure!(
@@ -90,8 +126,12 @@ pub fn desktop_id() -> Result<String> {
                 "电脑身份文件无效"
             );
             let id = fs::read_to_string(&path).context("无法读取电脑身份文件")?;
-            ensure!(valid_id(id.trim()), "电脑身份文件无效");
-            return Ok(id.trim().into());
+            let trimmed = id.trim().to_string();
+            ensure!(valid_id(&trimmed), "电脑身份文件无效");
+            if let Ok(mut guard) = desktop_id_cache().lock() {
+                *guard = Some((base, trimmed.clone()));
+            }
+            return Ok(trimmed);
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("无法检测电脑身份文件"),
@@ -108,13 +148,20 @@ pub fn desktop_id() -> Result<String> {
         Ok(mut file) => {
             file.write_all(id.as_bytes())?;
             file.sync_all()?;
+            if let Ok(mut guard) = desktop_id_cache().lock() {
+                *guard = Some((base, id.clone()));
+            }
             Ok(id)
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             ensure!(fs::symlink_metadata(&path)?.is_file(), "电脑身份文件无效");
             let id = fs::read_to_string(&path).context("无法读取并发创建的电脑身份文件")?;
-            ensure!(valid_id(id.trim()), "电脑身份文件无效");
-            Ok(id.trim().into())
+            let trimmed = id.trim().to_string();
+            ensure!(valid_id(&trimmed), "电脑身份文件无效");
+            if let Ok(mut guard) = desktop_id_cache().lock() {
+                *guard = Some((base, trimmed.clone()));
+            }
+            Ok(trimmed)
         }
         Err(e) => Err(e.into()),
     }
@@ -133,11 +180,7 @@ pub fn receive_directory() -> Result<PathBuf> {
     Ok(path)
 }
 pub(crate) fn digest(path: &Path) -> Result<String> {
-    let mut cmd = crate::resources::python_command();
-    cmd.arg("-c").arg("import hashlib,sys\nh=hashlib.sha256()\nwith open(sys.argv[1],'rb') as f:\n for b in iter(lambda:f.read(1048576),b''):h.update(b)\nprint(h.hexdigest())").arg(path);
-    let result = run_process(cmd, None, Duration::from_secs(120))?;
-    ensure!(result.status.success(), "无法校验文件");
-    let hash = String::from_utf8(result.stdout)?.trim().to_string();
+    let hash = crate::device::sha256_file(path).context("无法校验文件")?;
     ensure!(
         hash.len() == 64 && hash.bytes().all(|c| c.is_ascii_hexdigit()),
         "文件校验结果无效"
@@ -161,6 +204,15 @@ fn json_write(adb: &Adb, device: &Device, path: &str, value: &Value) -> Result<(
 }
 fn checked_base(adb: &Adb, device: &Device) -> Result<()> {
     device.verify(adb)?;
+    let cache_key = (device.transport.clone(), device.serial.clone());
+    let expected_base = format!("{}:{BASE}", adb.path.display());
+    if let Ok(guard) = checked_base_cache().lock() {
+        if let Some((at, cached_base)) = guard.get(&cache_key) {
+            if at.elapsed() < CHECKED_BASE_TTL && cached_base == &expected_base {
+                return Ok(());
+            }
+        }
+    }
     ensure!(
         adb.shell(
             &device.transport,
@@ -172,6 +224,9 @@ fn checked_base(adb: &Adb, device: &Device) -> Result<()> {
     let root = shell_quote(BASE);
     let out = adb.script(&device.transport, &format!("test ! -L {root} && test ! -L {root}/transfers && test ! -L {root}/transfers/inbox && test ! -L {root}/transfers/outbox && mkdir -p {root}/transfers/inbox {root}/transfers/outbox && echo ready"))?;
     ensure!(out.trim() == "ready", "手机传输目录无效");
+    if let Ok(mut guard) = checked_base_cache().lock() {
+        guard.insert(cache_key, (Instant::now(), expected_base));
+    }
     Ok(())
 }
 pub fn heartbeat(adb: &Adb, device: &Device) -> Result<()> {
@@ -211,7 +266,9 @@ pub fn send_files(adb: &Adb, device: &Device, paths: &[PathBuf]) -> Result<usize
     }
     let mut count = 0;
     for path in paths {
-        device.verify(adb)?;
+        if count > 0 {
+            device.verify(adb)?;
+        }
         let id = uuid();
         let name = path.file_name().unwrap().to_str().unwrap();
         let size = fs::metadata(path)?.len();
@@ -261,7 +318,6 @@ pub fn send_staged(
     size: u64,
 ) -> Result<()> {
     ensure!(valid_id(id), "无效传输标识");
-    device.verify(adb)?;
     checked_base(adb, device)?;
     let name = path
         .file_name()
@@ -335,6 +391,12 @@ pub fn receive_pending(adb: &Adb, device: &Device) -> Result<usize> {
     let _guard = RECEIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     checked_base(adb, device)?;
     let desktop = desktop_id()?;
+    let root_dir = crate::settings::downloads();
+    let use_received_cache = adb
+        .path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == "adb" || n.eq_ignore_ascii_case("adb.exe"));
     let mut count = 0;
     let mut errors = Vec::new();
     let listing = adb.shell(
@@ -344,6 +406,14 @@ pub fn receive_pending(adb: &Adb, device: &Device) -> Result<usize> {
     for id in listing.lines().filter(|s| valid_id(s)).take(300) {
         if count >= 10 {
             break;
+        }
+        let cache_key = (root_dir.clone(), device.serial.clone(), id.to_string());
+        if use_received_cache
+            && received_outbox_cache()
+                .lock()
+                .is_ok_and(|guard| guard.contains(&cache_key))
+        {
+            continue;
         }
         let dir = format!("{BASE}/transfers/outbox/{id}");
         let qdir = shell_quote(&dir);
@@ -381,6 +451,9 @@ pub fn receive_pending(adb: &Adb, device: &Device) -> Result<usize> {
             if receipt["id"] == id
                 && (receipt["status"] == "received" || receipt["status"] == "error")
             {
+                if use_received_cache && receipt["status"] == "received" {
+                    remember_received_outbox(cache_key);
+                }
                 continue;
             }
         }
@@ -425,6 +498,9 @@ pub fn receive_pending(adb: &Adb, device: &Device) -> Result<usize> {
         }
         json_write(adb, device, &format!("{dir}/receipt.json"), &receipt)?;
         if receipt["status"] == "received" {
+            if use_received_cache {
+                remember_received_outbox(cache_key);
+            }
             count += 1;
         }
     }
@@ -583,5 +659,17 @@ mod tests {
         for id in ["../x", "z2345678-1234-1234-1234-123456789012", "1234"] {
             assert!(!valid_id(id));
         }
+    }
+    #[test]
+    fn streaming_sha256_matches_in_memory_sha256_across_chunk_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sample.bin");
+        let payload: Vec<u8> = (0..150_000).map(|i| (i % 251) as u8).collect();
+        fs::write(&path, &payload).unwrap();
+        let expected: String = crate::device::sha256(&payload)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(digest(&path).unwrap(), expected);
     }
 }

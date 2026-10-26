@@ -487,3 +487,119 @@ fn adb_onboarding_is_only_automatic_for_new_users_and_remembers_skip() {
     connected.remember("example".into(), "StepX".into());
     assert!(!connected.should_show_adb_guide());
 }
+
+#[cfg(unix)]
+#[test]
+fn low_level_protocols_batch_updates_ota_companion_and_sms_prepare() {
+    use std::os::unix::fs::PermissionsExt;
+    use stepx_companion::{bridge, companion_app, device::Device, ota, updates};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("adb");
+    let log = dir.path().join("calls");
+    std::fs::write(
+        &path,
+        format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> {}
+case "$*" in
+*ro.serialno*)
+    printf 'phone-e2e\n'
+    ;;
+*resolve-activity*stepos.settings.SYSTEM_UPDATE_SETTINGS*)
+    printf 'Step AOS 1.2.0\n2026-10-01\npriority=0\ncom.stepos.update/.SystemUpgradeListActivity\n'
+    ;;
+*stepx-ota.jar*stat*)
+    printf 'READY\n'
+    ;;
+*OtaProbe*)
+    printf 'STEPX_OTA_RESULT:{{"protocol":1,"current_version":"Step AOS 1.2.0_20261001_120000","model":"PZ261A","environment":"prod","identity_complete":true,"identity_fields":{{"dsid":true}},"install_status":{{"internal_permission":true,"shop_demo":false,"system_update":{{"status":0,"channel":"stable","mask_id":"Step AOS 1.2.0"}}}},"channels":[{{"channel":"current","server_code":200,"http_status":200,"releases":[]}},{{"channel":"stable","server_code":200,"http_status":200,"releases":[]}},{{"channel":"beta","server_code":200,"http_status":200,"releases":[]}},{{"channel":"daily","server_code":200,"http_status":200,"releases":[]}}]}}\n'
+    ;;
+*"<<<STEPX_DUMP>>>"*)
+    printf 'package:/data/app/com.stepx.companion.app/base.apk\n'
+    printf '\n<<<STEPX_DUMP>>>\nversionName=0.1.32\nUser 0:\n  com.stepos.permission.MANAGE_BACK_SCREEN: granted=true\n  android.permission.CAMERA: granted=true\n  android.permission.POST_NOTIFICATIONS: granted=true\n  android.permission.READ_PHONE_STATE: granted=true\n  android.permission.MANAGE_DEBUGGING: granted=true\n  android.permission.WRITE_SECURE_SETTINGS: granted=true\n'
+    printf '\n<<<STEPX_PID>>>\n4321\n'
+    printf '\n<<<STEPX_STATUS>>>\n{{"running":true,"mode":"standby","lastGameScore":12,"bestScore":30,"uptimeMs":10000}}\n'
+    printf '\n<<<STEPX_PAIRING>>>\n{{"updatedAtMs":1700000000000,"pairingBridgeReady":true,"pairingSupported":true}}\n'
+    printf '\n<<<STEPX_TIME>>>\n1700000001\n'
+    printf '\n<<<STEPX_UPTIME>>>\n10.50 20.00\n'
+    printf '\n<<<STEPX_BG>>>\n{{"enabled":true,"active":false,"lastError":"","leaseExpiresElapsedMs":5000}}\n'
+    printf '\n<<<STEPX_AMOO_META>>>\nstep/pandora/pandora:16/BP2A.250605.031.A3/20260208:user/release-keys\n36\n03a799f776c8cb094b4da040eb51173b3588f8be79fd8e325d01b2753b7ffcf5  /system/priv-app/AgentBus/AgentBus.apk\n'
+    printf '\n<<<STEPX_WIFI>>>\n1\n'
+    printf '\n<<<STEPX_DOZE>>>\nuser,com.stepx.companion.app,10234\n'
+    printf '\n<<<STEPX_OEM>>>\ncloud freeze white apps:\nuser freeze white apps:\nfreeze white app: com.stepx.companion.app\nlocal freeze white apps:\n'
+    ;;
+*stepx-bridge.jar*stat*)
+    printf 'READY\n'
+    ;;
+*com.stepx.companion.Bridge*)
+    read -r req
+    case "$req" in
+    *sms_prepare*)
+        printf 'STEPX_RESULT:{{"ok":true,"request_id":"req-123","number":"10086","body":"hello","subscription":3,"subscription_label":"中国移动 SIM 1","parts":1}}\n'
+        ;;
+    *)
+        printf 'STEPX_RESULT:{{"ok":false,"error":"unexpected op"}}\n'
+        ;;
+    esac
+    ;;
+*)
+    exit 9
+    ;;
+esac
+"#,
+            shell_quote(log.to_str().unwrap())
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let adb = Adb { path };
+    let device = Device {
+        transport: "phone-e2e".into(),
+        serial: "phone-e2e".into(),
+        model: "PZ261A".into(),
+        android: "16".into(),
+        product: "pandora".into(),
+    };
+
+    // 1. updates::phone_version runs in 2 ADB calls (verify + 1 batched script)
+    let pv = updates::phone_version(&adb, &device).unwrap();
+    assert_eq!(pv.firmware, "Step AOS 1.2.0");
+    assert_eq!(pv.security_patch, "2026-10-01");
+    assert!(pv.has_update_page);
+    let calls_after_pv = std::fs::read_to_string(&log).unwrap().lines().count();
+    assert_eq!(calls_after_pv, 2);
+
+    // 2. ota::install_status caches stepx-ota.jar on first call (3 calls: verify + stat + OtaProbe)
+    // and reuses cache on second call (2 calls: verify + OtaProbe, zero push/stat)
+    let st1 = ota::install_status(&adb, &device).unwrap();
+    assert_eq!(st1.internal_permission, Some(true));
+    assert_eq!(st1.shop_demo, Some(false));
+    let calls_after_ota1 = std::fs::read_to_string(&log).unwrap().lines().count();
+    assert_eq!(calls_after_ota1 - calls_after_pv, 3);
+
+    let report = ota::check(&adb, &device).unwrap();
+    assert_eq!(report.current_version, "Step AOS 1.2.0_20261001_120000");
+    let calls_after_ota2 = std::fs::read_to_string(&log).unwrap().lines().count();
+    assert_eq!(calls_after_ota2 - calls_after_ota1, 2);
+
+    // 3. companion_app::inspect runs in 2 ADB calls (verify + 1 unified script) instead of 18
+    let comp = companion_app::inspect(&adb, &device).unwrap();
+    assert!(comp.installed);
+    assert_eq!(comp.version, "0.1.32");
+    assert!(comp.permission_granted);
+    assert!(comp.running);
+    assert!(comp.pairing_ready);
+    assert_eq!(comp.doze_exempt, Some(true));
+    assert_eq!(comp.oem_freezer_exempt, Some(true));
+    let calls_after_comp = std::fs::read_to_string(&log).unwrap().lines().count();
+    assert_eq!(calls_after_comp - calls_after_ota2, 2);
+
+    // 4. bridge::sms_prepare resolves subscription_label in a single JVM call (no separate capabilities call)
+    bridge::mark_bridge_jar_cached(&device.transport);
+    let plan = bridge::sms_prepare(&adb, &device, "10086", "hello", Some(3)).unwrap();
+    assert_eq!(plan.subscription, 3);
+    assert_eq!(plan.subscription_label, "中国移动 SIM 1");
+    let calls_after_sms = std::fs::read_to_string(&log).unwrap().lines().count();
+    assert_eq!(calls_after_sms - calls_after_comp, 2); // verify + 1 single app_process call
+}

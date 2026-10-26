@@ -76,7 +76,7 @@ impl Companion {
                             self.set_compact_mode(ShellMode::Full,ctx);
                             self.handle_action(&action(W::New),ctx);
                             self.fields[F_AMOO].set("这是 StepX Companion 对话验收。请只回复：对话连接正常，7 乘 8 等于 56。不要执行其他任务。");
-                            self.workspace.intent=Intent::Chat;
+                            assert_eq!(self.workspace.intent,Intent::Auto);
                             self.handle_action(&action(W::Prepare),ctx);
                             assert!(self.workspace.proposal.is_none());
                             assert!(self.workspace.running.is_some(),"{}",self.status);
@@ -112,11 +112,14 @@ impl Companion {
                         self.add_amoo_paths(&[file]).unwrap();
                         self.fields[F_AMOO].set("这是 StepX Companion 统一任务验收。分析附件销售表格：计算各项金额及合计，生成 result.csv 和 app-brief.md；再做一个手机销售看板，显示三项金额与总计，带一个显示/隐藏明细按钮。禁止使用外网，不读取其他个人文件。应用由下一阶段完成。请快速完成这个小任务。");
                         if !c.app {self.fields[F_AMOO].set("这是 StepX Companion 统一任务验收。分析附件销售表格，计算各项金额及合计，生成 result.csv 和简短的 analysis.md。禁止使用外网，不读取其他个人文件。请快速完成这个小任务。");}
-                        self.workspace.intent=Intent::Files;self.handle_action(&action(W::Prepare),ctx);
-                        assert_eq!(self.workspace.proposal.as_ref().unwrap().steps,vec![Executor::Files]);
+                        assert_eq!(self.workspace.intent,Intent::Auto);
+                        self.handle_action(&action(W::Prepare),ctx);
+                        assert!(self.workspace.proposal.is_none());
+                        assert_eq!(self.workspace_task().unwrap().route,Some(Intent::Files));
+                        assert!(self.workspace.running.is_some(),"{}",self.status);
                         c.task=self.workspace.active.clone().unwrap();
                     },
-                    1=>{capture(ctx,dir.join("live-plan.png"));self.handle_action(&action(W::Confirm),ctx);assert!(self.workspace.running.is_some(),"{}",self.status);},
+                    1=>{capture(ctx,dir.join("live-plan.png"));},
                     2=>{
                         if self.workspace_busy()||self.workspace.next{return;}
                         let t=self.workspace_task().unwrap();
@@ -144,11 +147,17 @@ impl Companion {
                     1=>capture(ctx,dir.join("01-start.png")),
                     2=>{
                         let file=dir.join("sales.csv");std::fs::write(&file,"item,total\nA,100\nB,200\n").unwrap();self.add_amoo_paths(&[file]).unwrap();
-                        self.fields[F_AMOO].set("分析销售表格，生成汇报 PPT，再做一个手机看板");self.workspace.intent=Intent::Files;
-                        self.handle_action(&action(W::Prepare),ctx);assert_eq!(self.workspace.proposal.as_ref().unwrap().steps,vec![Executor::Files]);assert!(!self.workspace_busy());c.task=self.workspace.active.clone().unwrap();c.attachments=self.amoo_attachments.clone();
+                        self.fields[F_AMOO].set("分析销售表格，生成汇报 PPT，再做一个手机看板");
+                        assert_eq!(self.workspace.intent,Intent::Auto);
+                        self.handle_action(&action(W::Prepare),ctx);
+                        assert!(self.workspace.proposal.is_none());
+                        assert_eq!(self.workspace_task().unwrap().route_note,"先整理文件再做应用");
+                        assert_eq!(self.workspace_task().unwrap().route,Some(Intent::App));
+                        assert!(!self.workspace_busy());
+                        c.task=self.workspace.active.clone().unwrap();c.attachments=self.amoo_attachments.clone();
                     },
                     3=>capture(ctx,dir.join("02-plan.png")),
-                    4=>{self.handle_action(&action(W::EditPlan),ctx);self.handle_action(&action(W::New),ctx);self.fields[F_AMOO].set("第二个任务的草稿");self.handle_action(&action(W::History),ctx);self.handle_action(&action(W::Select(c.task.clone())),ctx);assert_eq!(self.amoo_attachments,c.attachments);assert!(self.fields[F_AMOO].text.starts_with("分析销售表格"));self.set_compact_mode(ShellMode::MiniAi,ctx);},
+                    4=>{self.handle_action(&action(W::Reroute(Intent::Chat)),ctx);assert_eq!(self.workspace_task().unwrap().route,None);self.handle_action(&action(W::New),ctx);self.fields[F_AMOO].set("第二个任务的草稿");self.handle_action(&action(W::History),ctx);self.handle_action(&action(W::Select(c.task.clone())),ctx);assert_eq!(self.amoo_attachments,c.attachments);assert!(self.fields[F_AMOO].text.starts_with("分析销售表格"));self.set_compact_mode(ShellMode::MiniAi,ctx);},
                     5=>{assert_eq!(self.amoo_attachments,c.attachments);capture(ctx,dir.join("03-compact-draft.png"));},
                     6=>{self.handle_action(&action(W::Menu(2)),ctx);},
                     7=>{assert_eq!(self.push.shell_mode,ShellMode::MiniAi);capture(ctx,dir.join("04-compact-resources.png"));self.handle_action(&action(W::ClosePanel),ctx);self.set_compact_mode(ShellMode::Full,ctx);},

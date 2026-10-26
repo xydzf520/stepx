@@ -114,7 +114,10 @@ public final class PushStore {
         public String clientMsgId;
         public boolean recalled;
 
+        private transient JSONObject cachedJson;
+
         JSONObject toJson() throws JSONException {
+            if (cachedJson != null) return cachedJson;
             JSONObject msg = new JSONObject();
             msg.put("id", id);
             msg.put("sender", sender);
@@ -127,6 +130,7 @@ public final class PushStore {
             if (clientMsgId != null && !clientMsgId.isEmpty()) {
                 msg.put("clientMsgId", clientMsgId);
             }
+            cachedJson = msg;
             return msg;
         }
 
@@ -240,7 +244,10 @@ public final class PushStore {
         public String firstUrl;
         public String threadId;
 
+        transient JSONObject cachedJson;
+
         JSONObject toJson() throws JSONException {
+            if (cachedJson != null) return cachedJson;
             JSONObject entry = new JSONObject();
             entry.put("seqId", seqId);
             entry.put("key", key);
@@ -272,6 +279,7 @@ public final class PushStore {
             if (threadId != null && !threadId.isEmpty()) {
                 entry.put("threadId", threadId);
             }
+            cachedJson = entry;
             return entry;
         }
 
@@ -370,6 +378,12 @@ public final class PushStore {
     private RemoteReplyDispatcher replyDispatcher = DEFAULT_DISPATCHER;
     private long revision = 1L;
     private long nextSeqId = 1L;
+    private boolean threadsDirty = false;
+    private boolean feedDirty = false;
+    private int batchDepth = 0;
+    private long cachedSnapshotRevision = -1;
+    private String cachedSnapshotJson = null;
+    private JSONObject cachedSnapshotObj = null;
 
     private final Map<String, ThreadRecord> threadsById = new LinkedHashMap<String, ThreadRecord>();
     private final List<NotificationRecord> notifications = new ArrayList<NotificationRecord>();
@@ -423,6 +437,38 @@ public final class PushStore {
 
     public synchronized int getNotificationCount() {
         return notifications.size();
+    }
+
+    public synchronized void beginBatch() {
+        batchDepth++;
+    }
+
+    public synchronized void endBatch() {
+        if (batchDepth > 0) {
+            batchDepth--;
+            if (batchDepth == 0 && (threadsDirty || feedDirty)) {
+                saveToDisk();
+            }
+        }
+    }
+
+    public synchronized JSONObject statusSummary() throws Exception {
+        int unreadImCount = 0;
+        for (ThreadRecord t : threadsById.values()) {
+            unreadImCount += t.unreadCount;
+        }
+        int activePushCount = 0;
+        for (NotificationRecord n : notifications) {
+            if (n.active && !n.ongoing) {
+                activePushCount++;
+            }
+        }
+        return new JSONObject()
+            .put("revision", revision)
+            .put("threadCount", threadsById.size())
+            .put("unreadImCount", unreadImCount)
+            .put("activePushCount", activePushCount)
+            .put("totalPushCount", notifications.size());
     }
 
     public synchronized ThreadRecord getThreadRecord(String threadId) {
@@ -564,9 +610,8 @@ public final class PushStore {
         entry.packageName = safePkg;
         entry.appName = safeAppName;
         entry.category = category;
-        entry.title = ImAppCatalog.cleanConversationTitle(safePkg, effectiveRawTitle).isEmpty()
-            ? effectiveRawTitle
-            : ImAppCatalog.cleanConversationTitle(safePkg, effectiveRawTitle);
+        String cleanedTitle = ImAppCatalog.cleanConversationTitle(safePkg, effectiveRawTitle);
+        entry.title = cleanedTitle.isEmpty() ? effectiveRawTitle : cleanedTitle;
         entry.sender = detectedSender;
         entry.text = safeText;
         entry.subText = safeSubText;
@@ -584,6 +629,7 @@ public final class PushStore {
         entry.threadId = threadId;
 
         upsertNotificationRecord(entry, safeKey, ongoing);
+        feedDirty = true;
         saveToDisk();
         return entry;
     }
@@ -635,6 +681,7 @@ public final class PushStore {
                         break;
                     } else {
                         existing.active = false;
+                        existing.cachedJson = null;
                     }
                 }
             }
@@ -725,6 +772,7 @@ public final class PushStore {
 
         threadsById.put(threadId, thread);
         trimThreadsCapacity();
+        threadsDirty = true;
     }
 
     private static boolean hasDistinctSenders(List<StyleMessage> list, String cleanTitle) {
@@ -815,7 +863,9 @@ public final class PushStore {
                         n.read = true;
                         n.dismissed = true;
                     }
+                    n.cachedJson = null;
                     changed = true;
+                    feedDirty = true;
                 }
                 if (n.threadId != null && !n.threadId.isEmpty()) {
                     affectedThreadId = n.threadId;
@@ -830,6 +880,7 @@ public final class PushStore {
                     if (thread.unreadCount > 0) {
                         thread.unreadCount = 0;
                         changed = true;
+                        threadsDirty = true;
                     }
                     // Crucial: keep canReply=true because handle is soft-retained in memory!
                     thread.canReply = handlesByThread.containsKey(thread.threadId);
@@ -913,6 +964,7 @@ public final class PushStore {
             ThreadRecord thread = threadsById.get(resolvedThreadId);
             if (thread != null) {
                 thread.canReply = false;
+                threadsDirty = true;
             }
             revision++;
             saveToDisk();
@@ -1034,6 +1086,7 @@ public final class PushStore {
 
         threadsById.put(threadId, thread);
         trimThreadsCapacity();
+        threadsDirty = true;
         revision++;
         saveToDisk();
         return thread;
@@ -1098,6 +1151,7 @@ public final class PushStore {
 
         threadsById.put(threadId, thread);
         trimThreadsCapacity();
+        threadsDirty = true;
         revision++;
         saveToDisk();
 
@@ -1142,8 +1196,11 @@ public final class PushStore {
                     resolvedPkg = n.packageName;
                 }
                 n.read = true;
+                n.cachedJson = null;
+                feedDirty = true;
                 if (n.threadId != null && threadsById.containsKey(n.threadId)) {
                     threadsById.get(n.threadId).unreadCount = 0;
+                    threadsDirty = true;
                 }
                 break;
             }
@@ -1182,11 +1239,56 @@ public final class PushStore {
             .put("revision", revision);
     }
 
+    public synchronized boolean isUnchangedSnapshot(long sinceRevision) {
+        return sinceRevision > 0 && sinceRevision == revision;
+    }
+
     public synchronized JSONObject snapshot(long sinceRevision) throws JSONException {
+        boolean unchanged = isUnchangedSnapshot(sinceRevision);
+        if (unchanged) {
+            int unreadImCount = 0;
+            int activePushCount = 0;
+            if (cachedSnapshotRevision == revision && cachedSnapshotObj != null) {
+                unreadImCount = cachedSnapshotObj.optInt("unreadImCount", 0);
+                activePushCount = cachedSnapshotObj.optInt("activePushCount", 0);
+            } else {
+                for (ThreadRecord t : threadsById.values()) {
+                    unreadImCount += t.unreadCount;
+                }
+                for (NotificationRecord n : notifications) {
+                    if (n.active && !n.ongoing) {
+                        activePushCount++;
+                    }
+                }
+            }
+            return new JSONObject()
+                .put("ok", true)
+                .put("revision", revision)
+                .put("unchanged", true)
+                .put("threads", new JSONArray())
+                .put("notifications", new JSONArray())
+                .put("otpBanners", new JSONArray())
+                .put("unreadImCount", unreadImCount)
+                .put("activePushCount", activePushCount)
+                .put("totalPushCount", notifications.size());
+        }
+        if (cachedSnapshotRevision == revision && cachedSnapshotObj != null) {
+            JSONObject copy = new JSONObject();
+            copy.put("ok", true);
+            copy.put("revision", revision);
+            copy.put("unchanged", unchanged);
+            copy.put("threads", cachedSnapshotObj.optJSONArray("threads"));
+            copy.put("notifications", cachedSnapshotObj.optJSONArray("notifications"));
+            copy.put("otpBanners", cachedSnapshotObj.optJSONArray("otpBanners"));
+            copy.put("unreadImCount", cachedSnapshotObj.optInt("unreadImCount", 0));
+            copy.put("activePushCount", cachedSnapshotObj.optInt("activePushCount", 0));
+            copy.put("totalPushCount", cachedSnapshotObj.optInt("totalPushCount", 0));
+            return copy;
+        }
+
         JSONObject out = new JSONObject();
         out.put("ok", true);
         out.put("revision", revision);
-        boolean unchanged = sinceRevision > 0 && sinceRevision == revision;
         out.put("unchanged", unchanged);
 
         List<ThreadRecord> sortedThreads = getSortedThreadsList();
@@ -1205,8 +1307,12 @@ public final class PushStore {
             if (n.active && !n.ongoing) {
                 activePushCount++;
             }
-            n.canReply = (n.threadId != null && handlesByThread.containsKey(n.threadId))
+            boolean nextCanReply = (n.threadId != null && handlesByThread.containsKey(n.threadId))
                 || (n.key != null && !n.key.isEmpty() && handlesByKey.containsKey(n.key));
+            if (n.canReply != nextCanReply) {
+                n.canReply = nextCanReply;
+                n.cachedJson = null;
+            }
             feedArr.put(n.toJson());
 
             if (n.otpCode != null && !n.otpCode.isEmpty() && !n.dismissed && otpBannersArr.length() < 10) {
@@ -1227,7 +1333,21 @@ public final class PushStore {
         out.put("unreadImCount", unreadImCount);
         out.put("activePushCount", activePushCount);
         out.put("totalPushCount", notifications.size());
-        return out;
+        cachedSnapshotRevision = revision;
+        cachedSnapshotObj = out;
+        cachedSnapshotJson = out.toString();
+
+        JSONObject copy = new JSONObject();
+        copy.put("ok", true);
+        copy.put("revision", revision);
+        copy.put("unchanged", unchanged);
+        copy.put("threads", threadsArr);
+        copy.put("notifications", feedArr);
+        copy.put("otpBanners", otpBannersArr);
+        copy.put("unreadImCount", unreadImCount);
+        copy.put("activePushCount", activePushCount);
+        copy.put("totalPushCount", notifications.size());
+        return copy;
     }
 
     public synchronized JSONObject threadDetail(String threadId) throws JSONException {
@@ -1301,28 +1421,40 @@ public final class PushStore {
     }
 
     private void saveToDisk() {
-        if (storageDir == null) return;
+        if (batchDepth > 0) return;
+        if (storageDir == null) {
+            threadsDirty = false;
+            feedDirty = false;
+            return;
+        }
+        if (!threadsDirty && !feedDirty) return;
         try {
             storageDir.mkdirs();
 
-            JSONObject threadsRoot = new JSONObject();
-            threadsRoot.put("revision", revision);
-            JSONArray threadsArr = new JSONArray();
-            for (ThreadRecord t : getSortedThreadsList()) {
-                threadsArr.put(t.toJson());
+            if (threadsDirty) {
+                JSONObject threadsRoot = new JSONObject();
+                threadsRoot.put("revision", revision);
+                JSONArray threadsArr = new JSONArray();
+                for (ThreadRecord t : getSortedThreadsList()) {
+                    threadsArr.put(t.toJson());
+                }
+                threadsRoot.put("threads", threadsArr);
+                writeAtomic(new File(storageDir, "im_threads.json"), threadsRoot.toString());
+                threadsDirty = false;
             }
-            threadsRoot.put("threads", threadsArr);
-            writeAtomic(new File(storageDir, "im_threads.json"), threadsRoot.toString());
 
-            JSONObject feedRoot = new JSONObject();
-            feedRoot.put("revision", revision);
-            feedRoot.put("nextSeqId", nextSeqId);
-            JSONArray feedArr = new JSONArray();
-            for (NotificationRecord n : notifications) {
-                feedArr.put(n.toJson());
+            if (feedDirty) {
+                JSONObject feedRoot = new JSONObject();
+                feedRoot.put("revision", revision);
+                feedRoot.put("nextSeqId", nextSeqId);
+                JSONArray feedArr = new JSONArray();
+                for (NotificationRecord n : notifications) {
+                    feedArr.put(n.toJson());
+                }
+                feedRoot.put("notifications", feedArr);
+                writeAtomic(new File(storageDir, "push_feed.json"), feedRoot.toString());
+                feedDirty = false;
             }
-            feedRoot.put("notifications", feedArr);
-            writeAtomic(new File(storageDir, "push_feed.json"), feedRoot.toString());
         } catch (Throwable ignored) {
         }
     }

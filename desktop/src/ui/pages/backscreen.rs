@@ -1,15 +1,64 @@
 //! A compact LED studio: edit locally, inspect the result, then play on the phone.
 use super::super::{
-    backscreen_state::BackScreenAction as BsAction, icons::UiIcon, theme::*, widgets::*, Action,
-    Companion, Page, F_BACK_MARQUEE, F_BACK_PROMPT,
+    backscreen_state::BackScreenAction as BsAction, icons::UiIcon, studio_state::StudioAction,
+    theme::*, widgets::*, Action, Companion, Page, F_BACK_MARQUEE, F_BACK_PROMPT,
 };
 use facloud_ui::{elements::*, fonts::Weight, platform::Cursor};
 use std::time::Duration;
 use stepx_companion::backscreen as bs;
 
+static GALLERY_MTIME_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, (std::time::Instant, String)>>,
+> = std::sync::OnceLock::new();
+
+fn cached_gallery_mtime_label(path: &std::path::Path) -> String {
+    const TTL: Duration = Duration::from_secs(2);
+    let cache =
+        GALLERY_MTIME_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Ok(map) = cache.lock() {
+        if let Some((at, label)) = map.get(path) {
+            if at.elapsed() < TTL {
+                return label.clone();
+            }
+        }
+    }
+    let date = std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .map(|time| {
+            chrono::DateTime::<chrono::Local>::from(time)
+                .format("%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_default();
+    if let Ok(mut map) = cache.lock() {
+        if map.len() >= 256 {
+            map.retain(|_, (at, _)| at.elapsed() < TTL);
+            if map.len() >= 256 {
+                map.clear();
+            }
+        }
+        map.insert(
+            path.to_path_buf(),
+            (std::time::Instant::now(), date.clone()),
+        );
+    }
+    date
+}
+
 impl Companion {
     fn bs_button(&self, id: &str, label: &str, action: BsAction, style: Btn) -> El {
         self.button(format!("bs-{id}"), label, Action::BackScreen(action), style)
+    }
+    fn bs_button_icon(
+        &self,
+        id: &str,
+        label: impl Into<String>,
+        icon: UiIcon,
+        a: BsAction,
+        kind: Btn,
+    ) -> El {
+        self.button_icon(format!("bs-{id}"), label, icon, Action::BackScreen(a), kind)
     }
     fn bs_title(&self, icon: UiIcon, title: &str) -> El {
         self.hstack(
@@ -18,24 +67,46 @@ impl Companion {
         )
     }
     pub(in super::super) fn backscreen_actions(&self) -> Vec<El> {
-        vec![
-            self.bs_button(
-                "inspect-top",
-                "刷新手机状态",
-                BsAction::CompanionInspect,
-                Btn::Secondary,
-            ),
-            self.bs_button(
-                "advanced-top",
-                if self.back_screen.advanced {
-                    "收起设置"
+        let custom_active = self.back_screen.playing
+            || (self.back_screen.applied_to_phone && self.back_screen.companion_mode != "native")
+            || self.back_screen.pomodoro_active;
+        let restore_action = if self.back_screen.playing {
+            BsAction::Stop
+        } else if self.back_screen.pomodoro_active {
+            BsAction::StopPomodoro
+        } else {
+            BsAction::CompanionStop
+        };
+        let mut actions = Vec::new();
+        if custom_active || self.selected.is_some() {
+            actions.push(self.bs_button(
+                "restore-default-top",
+                "恢复手机默认背屏",
+                restore_action,
+                if custom_active {
+                    Btn::Primary
                 } else {
-                    "背屏设置"
+                    Btn::Secondary
                 },
-                BsAction::Advanced,
-                Btn::Secondary,
-            ),
-        ]
+            ));
+        }
+        actions.push(self.bs_button(
+            "inspect-top",
+            "刷新手机状态",
+            BsAction::CompanionInspect,
+            Btn::Secondary,
+        ));
+        actions.push(self.bs_button(
+            "advanced-top",
+            if self.back_screen.advanced {
+                "收起设置"
+            } else {
+                "背屏设置"
+            },
+            BsAction::Advanced,
+            Btn::Secondary,
+        ));
+        actions
     }
     fn bs_preview(&self) -> El {
         let p = self.p();
@@ -76,13 +147,18 @@ impl Companion {
                             self.vstack(
                                 S2,
                                 vec![
-                                    self.line("点阵放大", MICRO, p.text3),
-                                    Container::new(self.matrix_grid(
-                                        preview_frame,
-                                        3.6,
-                                        0.95,
-                                        false,
-                                    ))
+                                    self.line("点阵放大 (可点击手绘)", MICRO, p.text3),
+                                    Container::new(
+                                        super::super::led_grid::LedGrid::new(
+                                            preview_frame,
+                                            3.6,
+                                            0.95,
+                                        )
+                                        .on_pixel_click(|x, y| {
+                                            Action::BackScreen(BsAction::TogglePixel(x, y))
+                                        })
+                                        .finish(),
+                                    )
                                     .with_uniform_padding(S2)
                                     .with_background_color(rgb(24, 24, 30))
                                     .with_corner_radius(CornerRadius::with_all(Radius::Pixels(
@@ -98,6 +174,57 @@ impl Companion {
             ))
             .finish(),
             self.mono("17 × 23 · 379 灯珠", MICRO, p.text2),
+            self.hstack(
+                6.,
+                vec![
+                    self.ui_icon(UiIcon::Lightbulb, 13., p.text3),
+                    self.line("点击上方灯阵格可直接手绘/擦除像素", MICRO, p.text3),
+                ],
+            ),
+            self.wrap(vec![
+                self.bs_button_icon(
+                    "diy-invert",
+                    "反相",
+                    UiIcon::Contrast,
+                    BsAction::InvertFrame,
+                    Btn::Secondary,
+                ),
+                self.bs_button_icon(
+                    "diy-left",
+                    "左移",
+                    UiIcon::ArrowLeft,
+                    BsAction::ShiftFrame(-1, 0),
+                    Btn::Secondary,
+                ),
+                self.bs_button_icon(
+                    "diy-up",
+                    "上移",
+                    UiIcon::ArrowUp,
+                    BsAction::ShiftFrame(0, -1),
+                    Btn::Secondary,
+                ),
+                self.bs_button_icon(
+                    "diy-down",
+                    "下移",
+                    UiIcon::ArrowDown,
+                    BsAction::ShiftFrame(0, 1),
+                    Btn::Secondary,
+                ),
+                self.bs_button_icon(
+                    "diy-right",
+                    "右移",
+                    UiIcon::ArrowRight,
+                    BsAction::ShiftFrame(1, 0),
+                    Btn::Secondary,
+                ),
+                self.bs_button_icon(
+                    "diy-clear",
+                    "清空画布",
+                    UiIcon::Trash,
+                    BsAction::ClearDiyFrame,
+                    Btn::Ghost,
+                ),
+            ]),
             self.bs_button(
                 "preview-toggle",
                 if state.preview_running {
@@ -149,16 +276,20 @@ impl Companion {
             self.disabled_button("正在同步手机…")
         } else if state.generating {
             self.disabled_button("等待 Amoo 生成")
+        } else if needs_companion && state.companion_installed == Some(false) {
+            self.bs_button(
+                "install-companion",
+                "一键安装并启用背屏伴侣",
+                BsAction::CompanionInstall,
+                Btn::Primary,
+            )
         } else if needs_companion
-            && (state.companion_installed != Some(true) || !state.companion_permission)
+            && state.companion_installed == Some(true)
+            && !state.companion_permission
         {
             self.bs_button(
                 "install-companion",
-                if state.companion_installed == Some(true) {
-                    "修复 StepX伴侣"
-                } else {
-                    "安装 StepX伴侣"
-                },
+                "修复 StepX伴侣权限",
                 BsAction::CompanionInstall,
                 Btn::Primary,
             )
@@ -170,27 +301,31 @@ impl Companion {
                 if state.temporary_app() {
                     "应用临时联动"
                 } else {
-                    "应用到背屏"
+                    "应用到手机背屏"
                 },
                 BsAction::Play,
                 Btn::Primary,
             )
         };
-        let mut footer = vec![primary];
-        if needs_companion {
-            footer.push(self.text(&state.companion_status, MICRO, p.text2));
-        }
+        parts.push(self.divider());
+        parts.push(primary);
         if state.playing {
-            footer.push(self.bs_button("stop", "停止并恢复", BsAction::Stop, Btn::Secondary));
+            parts.push(self.bs_button("stop", "停止并恢复", BsAction::Stop, Btn::Secondary));
         } else if state.applied_to_phone && state.companion_mode != "native" {
-            footer.push(self.bs_button(
+            parts.push(self.bs_button(
                 "stop-companion",
                 "停止并恢复",
                 BsAction::CompanionStop,
                 Btn::Secondary,
             ));
         }
-        footer.push(self.text(
+        if needs_companion
+            && !state.companion_status.is_empty()
+            && (self.selected.is_none() || state.companion_status != "连接手机后检测 StepX伴侣")
+        {
+            parts.push(self.text(&state.companion_status, MICRO, p.text2));
+        }
+        parts.push(self.text(
             if game {
                 "背屏朝向自己，轻敲三下开始；翻到正面结束并恢复原显示。"
             } else if state.native_feature.is_some() {
@@ -206,20 +341,12 @@ impl Companion {
             p.text3,
         ));
         let preview = Container::new(self.vstack(S3, parts))
-            .with_uniform_padding(S3)
+            .with_uniform_padding(S4)
             .with_background_color(p.bg)
             .with_border(Border::all(1.).with_border_color(p.border))
             .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_PANEL)))
             .finish();
-        Flex::column()
-            .with_main_axis_size(MainAxisSize::Max)
-            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-            .with_spacing(S3)
-            .with_child(
-                Expanded::new(1., self.pane_scroll(self.scroll_aux.clone(), preview)).finish(),
-            )
-            .with_child(self.panel(footer))
-            .finish()
+        self.pane_scroll(self.scroll_aux.clone(), preview)
     }
     fn bs_preset_card(&self, preset: bs::Preset) -> El {
         let p = self.p();
@@ -278,20 +405,45 @@ impl Companion {
         Hoverable::new(
             self.mouse_state(format!("bs-preset-{}", preset.key())),
             move |mouse| {
+                let hovered = mouse.is_mouse_over_element();
+                let t = if self.settings.value.reduced_motion {
+                    if hovered {
+                        1.
+                    } else {
+                        0.
+                    }
+                } else {
+                    mouse.hover_progress().clamp(0., 1.)
+                };
+                let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t) as u8;
+                let bg = if mouse.is_clicked() {
+                    p.accent_soft
+                } else if selected {
+                    p.selected
+                } else {
+                    facloud_ui::color::ColorU::new(
+                        mix(p.bg.r, p.hover.r),
+                        mix(p.bg.g, p.hover.g),
+                        mix(p.bg.b, p.hover.b),
+                        mix(p.bg.a, p.hover.a),
+                    )
+                };
+                let border_color = if mouse.is_clicked() {
+                    p.accent
+                } else if selected {
+                    p.border_strong
+                } else {
+                    facloud_ui::color::ColorU::new(
+                        mix(p.border.r, p.border_strong.r),
+                        mix(p.border.g, p.border_strong.g),
+                        mix(p.border.b, p.border_strong.b),
+                        mix(p.border.a, p.border_strong.a),
+                    )
+                };
                 Container::new(contents)
                     .with_uniform_padding(S3)
-                    .with_background_color(if selected {
-                        p.selected
-                    } else if mouse.is_mouse_over_element() {
-                        p.hover
-                    } else {
-                        p.bg
-                    })
-                    .with_border(Border::all(1.).with_border_color(if selected {
-                        p.border_strong
-                    } else {
-                        p.border
-                    }))
+                    .with_background_color(bg)
+                    .with_border(Border::all(1.).with_border_color(border_color))
                     .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_PANEL)))
                     .finish()
             },
@@ -300,15 +452,50 @@ impl Companion {
         .on_click(move |ctx, _, _| {
             ctx.dispatch_typed_action(Action::BackScreen(BsAction::SelectPreset(preset)))
         })
+        .on_double_click(move |ctx, _, _| {
+            ctx.dispatch_typed_action(Action::BackScreen(BsAction::ApplyPreset(preset)))
+        })
+        .on_right_click(move |ctx, _, at| {
+            ctx.dispatch_typed_action(Action::ContextOpen(
+                crate::ui::context_menu::Target::BackScreenPreset(preset),
+                at,
+            ))
+        })
         .finish()
     }
     fn bs_gallery(&self) -> El {
         let p = self.p();
+        let active_filter = self.back_screen.preset_filter;
+        let is_utility = |preset: bs::Preset| {
+            matches!(
+                preset,
+                bs::Preset::Clock | bs::Preset::Countdown | bs::Preset::Battery
+            )
+        };
+        let filtered_presets: Vec<bs::Preset> = bs::Preset::ALL
+            .into_iter()
+            .filter(|&preset| match active_filter {
+                1 => !is_utility(preset),
+                2 => is_utility(preset),
+                _ => true,
+            })
+            .collect();
+        let total_count = bs::Preset::ALL.len();
+        let util_count = bs::Preset::ALL
+            .into_iter()
+            .filter(|&p| is_utility(p))
+            .count();
+        let anim_count = total_count.saturating_sub(util_count);
+
         let mut parts = vec![
             self.between(
                 self.bs_title(UiIcon::Smile, "有趣，也实用"),
                 self.line(
-                    format!("{} 种效果", bs::Preset::ALL.len()),
+                    format!(
+                        "当前显示 {} / {} 种效果",
+                        filtered_presets.len(),
+                        total_count
+                    ),
                     CAPTION,
                     p.text3,
                 ),
@@ -318,8 +505,40 @@ impl Companion {
                 CAPTION,
                 p.text2,
             ),
+            self.wrap(vec![
+                self.bs_button(
+                    "preset-filter-0",
+                    &format!("全部预设 ({total_count})"),
+                    BsAction::PresetFilter(0),
+                    if active_filter == 0 {
+                        Btn::Primary
+                    } else {
+                        Btn::Secondary
+                    },
+                ),
+                self.bs_button(
+                    "preset-filter-1",
+                    &format!("动态像素动画 ({anim_count})"),
+                    BsAction::PresetFilter(1),
+                    if active_filter == 1 {
+                        Btn::Primary
+                    } else {
+                        Btn::Secondary
+                    },
+                ),
+                self.bs_button(
+                    "preset-filter-2",
+                    &format!("实用时钟与状态 ({util_count})"),
+                    BsAction::PresetFilter(2),
+                    if active_filter == 2 {
+                        Btn::Primary
+                    } else {
+                        Btn::Secondary
+                    },
+                ),
+            ]),
         ];
-        for row in bs::Preset::ALL.chunks(2) {
+        for row in filtered_presets.chunks(2) {
             let mut cards: Vec<El> = row
                 .iter()
                 .map(|preset| Expanded::new(1., self.bs_preset_card(*preset)).finish())
@@ -329,7 +548,6 @@ impl Companion {
             }
             parts.push(self.hstack(S2, cards));
         }
-        parts.push(self.bs_recent_gallery(3));
         self.vstack(S2, parts)
     }
     fn bs_recent_gallery(&self, limit: usize) -> El {
@@ -370,33 +588,47 @@ impl Companion {
                         .contain()
                         .finish(),
                     )
+                    .with_max_width(180.)
                     .with_height(92.)
                     .finish();
-                    let date = std::fs::metadata(path)
-                        .and_then(|meta| meta.modified())
-                        .ok()
-                        .map(|time| {
-                            chrono::DateTime::<chrono::Local>::from(time)
-                                .format("%m-%d %H:%M")
-                                .to_string()
-                        })
-                        .unwrap_or_default();
-                    cards.push(
-                        Expanded::new(
-                            1.,
-                            self.panel(vec![
-                                image,
-                                self.line(date, MICRO, p.text3),
-                                self.bs_button(
-                                    &format!("recent-{index}"),
-                                    "转为像素",
-                                    BsAction::RecentImage(index),
-                                    Btn::Secondary,
-                                ),
-                            ]),
-                        )
-                        .finish(),
-                    );
+                    let date = cached_gallery_mtime_label(path);
+                    let card_body = self.panel(vec![
+                        image,
+                        self.line(date, MICRO, p.text3),
+                        self.bs_button(
+                            &format!("recent-{index}"),
+                            "转为像素",
+                            BsAction::RecentImage(index),
+                            Btn::Secondary,
+                        ),
+                    ]);
+                    let open_path = path.clone();
+                    let menu_path = path.display().to_string();
+                    let card = Hoverable::new(
+                        self.mouse_state(format!("bs-recent-card-{index}")),
+                        move |_| card_body,
+                    )
+                    .with_defer_events_to_children()
+                    .with_cursor(Cursor::PointingHand)
+                    .on_click(move |ctx, _, _| {
+                        ctx.dispatch_typed_action(Action::BackScreen(BsAction::RecentImage(index)))
+                    })
+                    .on_double_click(move |ctx, _, _| {
+                        ctx.dispatch_typed_action(Action::Studio(StudioAction::OpenPath(
+                            open_path.clone(),
+                        )))
+                    })
+                    .on_right_click(move |ctx, _, at| {
+                        ctx.dispatch_typed_action(Action::ContextOpen(
+                            crate::ui::context_menu::Target::BackScreenRecentImage {
+                                index,
+                                path: menu_path.clone(),
+                            },
+                            at,
+                        ))
+                    })
+                    .finish();
+                    cards.push(Expanded::new(1., card).finish());
                 }
                 while cards.len() < 3 {
                     cards.push(Expanded::new(1., Empty::new().finish()).finish());
@@ -414,32 +646,55 @@ impl Companion {
         let mut caret = 0;
         if focused {
             let cursor = field.cursor.min(value.len());
-            caret = cursor + field.preedit.len();
-            value.insert_str(cursor, &format!("{}│", field.preedit));
+            caret = value[..cursor].chars().count() + field.preedit.chars().count();
+            value.insert_str(cursor, &field.preedit);
         }
         let empty = field.text.is_empty() && field.preedit.is_empty();
         if value.is_empty() {
-            value = "例如：一只眨眼的猫咪，柔和亮度，播放 20 秒。也可以做番茄钟，或生成新的图片。"
-                .into();
+            value = "输入你想生成的背屏内容，例如：像素小狗眨眼、赛博霓虹雨夜".into();
         }
         Hoverable::new(self.mouse_state("bs-amoo-prompt"), move |mouse| {
-            ConstrainedBox::new(
-                Container::new(
-                    Text::new(value, self.font, BODY)
-                        .with_saved_char_position(caret, format!("input-caret:{F_BACK_PROMPT}"))
-                        .with_color(if empty && !focused { p.text3 } else { p.text })
-                        .with_line_height_ratio(1.5)
-                        .finish(),
-                )
-                .with_uniform_padding(S3)
-                .with_background_color(p.surface)
-                .with_border(Border::all(1.).with_border_color(if focused {
-                    p.accent
-                } else if mouse.is_mouse_over_element() {
-                    p.border_strong
+            let hovered = mouse.is_mouse_over_element();
+            let t = if self.settings.value.reduced_motion {
+                if hovered {
+                    1.
                 } else {
-                    p.border
-                }))
+                    0.
+                }
+            } else {
+                mouse.hover_progress().clamp(0., 1.)
+            };
+            let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t) as u8;
+            let bg = if mouse.is_clicked() {
+                p.accent_soft
+            } else {
+                facloud_ui::color::ColorU::new(
+                    mix(p.surface.r, p.hover.r),
+                    mix(p.surface.g, p.hover.g),
+                    mix(p.surface.b, p.hover.b),
+                    mix(p.surface.a, p.hover.a),
+                )
+            };
+            let border_color = if focused || mouse.is_clicked() {
+                p.accent
+            } else {
+                facloud_ui::color::ColorU::new(
+                    mix(p.border.r, p.border_strong.r),
+                    mix(p.border.g, p.border_strong.g),
+                    mix(p.border.b, p.border_strong.b),
+                    mix(p.border.a, p.border_strong.a),
+                )
+            };
+            ConstrainedBox::new(
+                Container::new(self.multiline_field_text(
+                    &value,
+                    caret,
+                    F_BACK_PROMPT,
+                    if empty { p.text3 } else { p.text },
+                ))
+                .with_uniform_padding(S3)
+                .with_background_color(bg)
+                .with_border(Border::all(1.).with_border_color(border_color))
                 .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
                 .finish(),
             )
@@ -447,7 +702,14 @@ impl Companion {
             .finish()
         })
         .with_cursor(Cursor::IBeam)
+        .with_defer_events_to_children()
         .on_mouse_down(|ctx, _, _| ctx.dispatch_typed_action(Action::Focus(F_BACK_PROMPT)))
+        .on_right_click(|ctx, _, at| {
+            ctx.dispatch_typed_action(Action::ContextOpen(
+                crate::ui::context_menu::Target::Input(F_BACK_PROMPT),
+                at,
+            ))
+        })
         .finish()
     }
     fn bs_amoo(&self) -> El {
@@ -480,34 +742,122 @@ impl Companion {
                 self.bs_button("prompt-breath", "极简呼吸灯", BsAction::Prompt("极简中心光晕缓慢呼吸明暗交替，低亮度适合桌面静置陪伴".into()), Btn::Secondary),
                 self.bs_button("prompt-shiba", "像素萌宠柴犬", BsAction::Prompt("生成一张高对比度单色像素柴犬笑脸，纯黑背景，白色清晰轮廓，适合背屏灯珠显示".into()), Btn::Secondary),
             ]),
-            if state.generating {self.bs_button("cancel-generation", "取消生成", BsAction::CancelGenerate, Btn::Secondary)} else {self.bs_button("amoo-generate", "生成背屏方案", BsAction::Generate, Btn::Secondary)},
-            Container::new(
-                self.between(
-                    self.hstack(
-                        S2,
-                        vec![
-                            self.pill_badge("跨页直达", p.accent, p.accent_soft),
-                            self.line(
-                                "可在「文件与扩容」中任选手机照片、GIF 或视频一键推送到背屏创作工坊",
-                                MICRO,
-                                p.text2,
-                            ),
-                        ],
-                    ),
-                    self.button(
-                        "bs-amoo-goto-files",
-                        "去文件与扩容挑选素材",
-                        Action::Page(Page::Files),
-                        Btn::Ghost,
-                    ),
+            self.hstack(
+                6.,
+                vec![
+                    self.ui_icon(UiIcon::Bolt, 14., p.accent),
+                    self.line("常用状态灯牌一键生成 (免手机直出 23×17 点阵)", CAPTION, p.text2),
+                ],
+            ),
+            self.wrap(vec![
+                self.chip(
+                    "bs-badge-dnd",
+                    "勿扰",
+                    Some(UiIcon::Ban),
+                    vec![
+                        Action::BackScreen(BsAction::Prompt("勿扰 DND".into())),
+                        Action::BackScreen(BsAction::LocalSynthesize),
+                    ],
+                    false,
+                    false,
                 ),
-            )
-            .with_horizontal_padding(S3)
-            .with_vertical_padding(S2)
-            .with_background_color(p.surface)
-            .with_border(Border::all(1.).with_border_color(p.border))
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
-            .finish(),
+                self.chip(
+                    "bs-badge-meeting",
+                    "会议中",
+                    Some(UiIcon::Briefcase),
+                    vec![
+                        Action::BackScreen(BsAction::Prompt("会议中 MEET".into())),
+                        Action::BackScreen(BsAction::LocalSynthesize),
+                    ],
+                    false,
+                    false,
+                ),
+                self.chip(
+                    "bs-badge-coffee",
+                    "休息中",
+                    Some(UiIcon::Coffee),
+                    vec![
+                        Action::BackScreen(BsAction::Prompt("休息中 COFFEE".into())),
+                        Action::BackScreen(BsAction::LocalSynthesize),
+                    ],
+                    false,
+                    false,
+                ),
+                self.chip(
+                    "bs-badge-pickup",
+                    "取件码",
+                    Some(UiIcon::Package),
+                    vec![
+                        Action::BackScreen(BsAction::Prompt("取件码 8-2-104".into())),
+                        Action::BackScreen(BsAction::LocalSynthesize),
+                    ],
+                    false,
+                    false,
+                ),
+                self.chip(
+                    "bs-badge-heart",
+                    "心动",
+                    Some(UiIcon::Heart),
+                    vec![
+                        Action::BackScreen(BsAction::Prompt("爱心 LOVE".into())),
+                        Action::BackScreen(BsAction::LocalSynthesize),
+                    ],
+                    false,
+                    false,
+                ),
+                self.chip(
+                    "bs-badge-cat",
+                    "像素猫",
+                    Some(UiIcon::Cat),
+                    vec![
+                        Action::BackScreen(BsAction::Prompt("像素猫咪 CAT".into())),
+                        Action::BackScreen(BsAction::LocalSynthesize),
+                    ],
+                    false,
+                    false,
+                ),
+                self.chip(
+                    "bs-badge-bolt",
+                    "充能中",
+                    Some(UiIcon::Bolt),
+                    vec![
+                        Action::BackScreen(BsAction::Prompt("闪电充能 POWER".into())),
+                        Action::BackScreen(BsAction::LocalSynthesize),
+                    ],
+                    false,
+                    false,
+                ),
+                self.chip(
+                    "bs-badge-sos",
+                    "SOS",
+                    Some(UiIcon::AlertTriangle),
+                    vec![
+                        Action::BackScreen(BsAction::Prompt("SOS".into())),
+                        Action::BackScreen(BsAction::LocalSynthesize),
+                    ],
+                    false,
+                    false,
+                ),
+            ]),
+            if state.generating {
+                self.bs_button(
+                    "cancel-generation",
+                    "取消生成",
+                    BsAction::CancelGenerate,
+                    Btn::Secondary,
+                )
+            } else {
+                self.wrap(vec![
+                    self.bs_button("amoo-generate", "生成背屏方案", BsAction::Generate, Btn::Primary),
+                    self.bs_button_icon(
+                        "amoo-local-synth",
+                        "本地极速生成点阵",
+                        UiIcon::Bolt,
+                        BsAction::LocalSynthesize,
+                        Btn::Secondary,
+                    ),
+                ])
+            },
         ];
         if !state.generator_status.is_empty() {
             parts.push(self.panel(vec![
@@ -540,6 +890,7 @@ impl Companion {
         if state.image_path.is_some() {
             parts.push(self.bs_source_image());
         }
+        parts.push(self.bs_recent_gallery(6));
         self.vstack(S3, parts)
     }
     fn bs_source_image(&self) -> El {
@@ -557,16 +908,26 @@ impl Companion {
             .contain()
             .finish(),
         )
+        .with_max_width(240.)
         .with_height(148.)
         .finish();
-        self.panel(vec![
-            self.between(
-                self.bs_title(UiIcon::Image, "原图"),
-                self.line(&self.back_screen.origin, MICRO, p.text3),
+        self.hover_panel_interactive(
+            "bs-source-image",
+            self.vstack(
+                S3,
+                vec![
+                    self.between(
+                        self.bs_title(UiIcon::Image, "原图"),
+                        self.line(&self.back_screen.origin, MICRO, p.text3),
+                    ),
+                    image,
+                    self.text("左侧为实际灯珠布局下的灰度转换结果。", MICRO, p.text3),
+                ],
             ),
-            image,
-            self.text("左侧为实际灯珠布局下的灰度转换结果。", MICRO, p.text3),
-        ])
+            None,
+            Some(Action::Studio(StudioAction::OpenPath(path.clone()))),
+            Some(crate::ui::context_menu::Target::LocalFile(path.clone())),
+        )
     }
     fn bs_images(&self) -> El {
         let p = self.p();
@@ -581,13 +942,19 @@ impl Companion {
             self.wrap(vec![
                 self.bs_button(
                     "choose-image",
-                    "选择图片…",
+                    "选择电脑图片…",
                     BsAction::PickImage,
+                    Btn::Primary,
+                ),
+                self.button(
+                    "bs-image-goto-gallery",
+                    "浏览手机图库",
+                    Action::Page(Page::Gallery),
                     Btn::Secondary,
                 ),
                 self.button(
                     "bs-image-goto-files",
-                    "从文件与扩容推送手机照片/GIF/视频",
+                    "从手机文件推送照片/GIF/视频",
                     Action::Page(Page::Files),
                     Btn::Ghost,
                 ),
@@ -595,55 +962,121 @@ impl Companion {
         ];
         if state.image_path.is_some() {
             parts.push(self.bs_source_image());
-            parts.push(self.wrap(vec![
-                self.bs_button(
-                    "image-fit",
-                    match state.image_options.fit {
-                        bs::ImageFit::Contain => "完整显示",
-                        bs::ImageFit::Cover => "居中裁切",
-                    },
-                    BsAction::Fit,
-                    Btn::Secondary,
-                ),
-                self.bs_button(
-                    "image-dither",
-                    if state.image_options.dither {
-                        "抖动：开"
-                    } else {
-                        "抖动：关"
-                    },
-                    BsAction::Dither,
-                    Btn::Secondary,
-                ),
-                self.bs_button(
-                    "image-threshold",
-                    if state.image_options.threshold.is_some() {
-                        "黑白模式"
-                    } else {
-                        "灰度模式"
-                    },
-                    BsAction::Threshold,
-                    Btn::Secondary,
-                ),
-                self.bs_button(
-                    "image-invert",
-                    if state.config.invert {
-                        "反色：开"
-                    } else {
-                        "反色：关"
-                    },
-                    BsAction::Invert,
-                    Btn::Secondary,
-                ),
-            ]));
-            parts.push(self.text(
-                "抖动保留明暗层次；黑白模式强化轮廓。反色适合白底图片。",
-                CAPTION,
-                p.text3,
-            ));
         } else {
             parts.push(self.panel(vec![self.bs_title(UiIcon::Lightbulb, "试试这些画面"), self.text("简笔头像、宠物轮廓、像素角色、单色标志。可以先让 Amoo 生成图片，再在这里调整转换效果。", BODY, p.text2), self.bs_button("image-to-amoo", "用 Amoo 创作", BsAction::Tab(1), Btn::Secondary)]));
         }
+        parts.push(self.wrap(vec![
+            self.bs_button(
+                "image-fit",
+                match state.image_options.fit {
+                    bs::ImageFit::Contain => "完整显示",
+                    bs::ImageFit::Cover => "居中裁切",
+                },
+                BsAction::Fit,
+                Btn::Secondary,
+            ),
+            self.bs_button(
+                "image-dither",
+                if state.image_options.dither {
+                    "抖动：开"
+                } else {
+                    "抖动：关"
+                },
+                BsAction::Dither,
+                Btn::Secondary,
+            ),
+            self.bs_button(
+                "image-threshold",
+                if state.image_options.threshold.is_some() {
+                    "黑白模式"
+                } else {
+                    "灰度模式"
+                },
+                BsAction::Threshold,
+                Btn::Secondary,
+            ),
+            self.bs_button(
+                "image-invert",
+                if state.config.invert {
+                    "反色：开"
+                } else {
+                    "反色：关"
+                },
+                BsAction::Invert,
+                Btn::Secondary,
+            ),
+            self.bs_button_icon(
+                "image-rot90",
+                "旋转 90°",
+                UiIcon::Refresh,
+                BsAction::RotateImage90,
+                Btn::Secondary,
+            ),
+            self.bs_button_icon(
+                "image-fliph",
+                "水平翻转",
+                UiIcon::Flip,
+                BsAction::FlipImageH,
+                Btn::Secondary,
+            ),
+        ]));
+        parts.push(self.wrap(vec![
+            self.bs_button(
+                "thresh-auto",
+                "自动阈值",
+                BsAction::SetThresholdValue(None),
+                if state.image_options.threshold.is_none() {
+                    Btn::Primary
+                } else {
+                    Btn::Secondary
+                },
+            ),
+            self.bs_button(
+                "thresh-96",
+                "柔和 96",
+                BsAction::SetThresholdValue(Some(96)),
+                if state.image_options.threshold == Some(96) {
+                    Btn::Primary
+                } else {
+                    Btn::Secondary
+                },
+            ),
+            self.bs_button(
+                "thresh-128",
+                "标准 128",
+                BsAction::SetThresholdValue(Some(128)),
+                if state.image_options.threshold == Some(128) {
+                    Btn::Primary
+                } else {
+                    Btn::Secondary
+                },
+            ),
+            self.bs_button(
+                "thresh-160",
+                "高对比 160",
+                BsAction::SetThresholdValue(Some(160)),
+                if state.image_options.threshold == Some(160) {
+                    Btn::Primary
+                } else {
+                    Btn::Secondary
+                },
+            ),
+            self.bs_button(
+                "thresh-192",
+                "极简 192",
+                BsAction::SetThresholdValue(Some(192)),
+                if state.image_options.threshold == Some(192) {
+                    Btn::Primary
+                } else {
+                    Btn::Secondary
+                },
+            ),
+        ]));
+        parts.push(self.text(
+            "抖动保留明暗层次；多档二值化阈值可强化不同明暗轮廓，支持 90° 旋转与水平翻转。",
+            CAPTION,
+            p.text3,
+        ));
         parts.push(self.bs_recent_gallery(24));
         self.vstack(S3, parts)
     }
@@ -731,23 +1164,29 @@ impl Companion {
                 } else {
                     self.ui_icon(UiIcon::Package, 28., p.text3)
                 };
-                parts.push(self.panel(vec![self.between(
+                let pkg_click = app.package.clone();
+                let lbl_click = app.label.clone();
+                let pkg_dbl = app.package.clone();
+                let lbl_dbl = app.label.clone();
+                let pkg_menu = app.package.clone();
+                let lbl_menu = app.label.clone();
+                let row_panel = self.panel(vec![self.between(
                     self.hstack(
                         S2,
                         vec![
-                                icon,
-                                Expanded::new(
-                                    1.,
-                                    self.vstack(
-                                        S1,
-                                        vec![
-                                            self.line_w(&app.label, BODY, p.text, Weight::Medium),
-                                            self.line(&app.package, MICRO, p.text3),
-                                        ],
-                                    ),
-                                )
-                                .finish(),
-                            ],
+                            icon,
+                            Expanded::new(
+                                1.,
+                                self.vstack(
+                                    S1,
+                                    vec![
+                                        self.line_w(&app.label, BODY, p.text, Weight::Medium),
+                                        self.line(&app.package, MICRO, p.text3),
+                                    ],
+                                ),
+                            )
+                            .finish(),
+                        ],
                     ),
                     self.bs_button(
                         &format!("app-{}", app.package),
@@ -755,7 +1194,37 @@ impl Companion {
                         BsAction::SelectApp(app.package.clone(), app.label.clone()),
                         Btn::Secondary,
                     ),
-                )]));
+                )]);
+                parts.push(
+                    Hoverable::new(
+                        self.mouse_state(format!("bs-app-row-{}", app.package)),
+                        move |_| row_panel,
+                    )
+                    .with_defer_events_to_children()
+                    .with_cursor(Cursor::PointingHand)
+                    .on_click(move |ctx, _, _| {
+                        ctx.dispatch_typed_action(Action::BackScreen(BsAction::SelectApp(
+                            pkg_click.clone(),
+                            lbl_click.clone(),
+                        )))
+                    })
+                    .on_double_click(move |ctx, _, _| {
+                        ctx.dispatch_typed_action(Action::BackScreen(BsAction::SelectApp(
+                            pkg_dbl.clone(),
+                            lbl_dbl.clone(),
+                        )))
+                    })
+                    .on_right_click(move |ctx, _, at| {
+                        ctx.dispatch_typed_action(Action::ContextOpen(
+                            crate::ui::context_menu::Target::BackScreenApp {
+                                label: lbl_menu.clone(),
+                                package: pkg_menu.clone(),
+                            },
+                            at,
+                        ))
+                    })
+                    .finish(),
+                );
             }
         }
         self.vstack(S3, parts)
@@ -885,20 +1354,12 @@ impl Companion {
             && state.companion_permission
             && !state.companion_busy
         {
-            game.push(self.wrap(vec![
-                self.bs_button(
-                    "game-now",
-                    "立即开始一局",
-                    BsAction::GameStart,
-                    Btn::Secondary,
-                ),
-                self.bs_button(
-                    "game-inspect",
-                    "刷新积分与状态",
-                    BsAction::CompanionInspect,
-                    Btn::Ghost,
-                ),
-            ]));
+            game.push(self.wrap(vec![self.bs_button(
+                "game-now",
+                "立即开始一局",
+                BsAction::GameStart,
+                Btn::Primary,
+            )]));
         }
         let mut companion = vec![
             self.between(
@@ -961,7 +1422,10 @@ impl Companion {
     fn bs_advanced(&self) -> El {
         let p = self.p();
         let mut settings = vec![
-            self.bs_title(UiIcon::Settings, "手机默认设置"),
+            self.between(
+                self.bs_title(UiIcon::Settings, "手机默认设置"),
+                self.bs_button("advanced-close", "收起设置", BsAction::Advanced, Btn::Ghost),
+            ),
             self.text(
                 "以下按钮直接保存到手机，即刻生效。要修改图案，请返回预览后点击「应用到背屏」。",
                 CAPTION,
@@ -995,22 +1459,22 @@ impl Companion {
             ]),
             self.input(F_BACK_MARQUEE, "输入英文或数字个性文字", None),
             self.wrap(vec![
-                self.button(
+                self.bs_button(
                     "bs-marquee-preset-stepx",
                     "预设: STEPX AI",
-                    Action::CopyText("背屏跑马灯预设".into(), "STEPX AI".into()),
+                    BsAction::SetMarqueePreset("STEPX AI".into()),
                     Btn::Ghost,
                 ),
-                self.button(
+                self.bs_button(
                     "bs-marquee-preset-focus",
                     "预设: FOCUS ON",
-                    Action::CopyText("背屏跑马灯预设".into(), "FOCUS ON".into()),
+                    BsAction::SetMarqueePreset("FOCUS ON".into()),
                     Btn::Ghost,
                 ),
-                self.button(
+                self.bs_button(
                     "bs-marquee-preset-coffee",
                     "预设: COFFEE TIME",
-                    Action::CopyText("背屏跑马灯预设".into(), "COFFEE TIME".into()),
+                    BsAction::SetMarqueePreset("COFFEE TIME".into()),
                     Btn::Ghost,
                 ),
             ]),
@@ -1308,10 +1772,10 @@ impl Companion {
         if state.advanced {
             creative.push(self.bs_advanced());
         }
-        if state.tab == 0 || state.tab == 3 {
+        if state.tab == 3 {
             creative.push(self.bs_smart_linkage_and_pomodoro_panel());
         }
-        creative.push(content);
+        creative.push(self.sub_enter(content));
         let right = Flex::column()
             .with_main_axis_size(MainAxisSize::Max)
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
@@ -1323,7 +1787,8 @@ impl Companion {
                     self.pane_scroll(
                         state.scroll.clone(),
                         Container::new(self.vstack(S4, creative))
-                            .with_padding_right(S1)
+                            .with_padding_right(S2)
+                            .with_padding_bottom(S4)
                             .finish(),
                     ),
                 )

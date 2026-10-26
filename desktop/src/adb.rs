@@ -4,6 +4,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
+    sync::{Mutex, OnceLock},
     thread,
     time::{Duration, Instant},
 };
@@ -13,26 +14,46 @@ pub struct Adb {
     pub path: PathBuf,
 }
 
+static DISCOVER_CACHE: OnceLock<Mutex<Option<(Option<OsString>, PathBuf)>>> = OnceLock::new();
+
 impl Adb {
     pub fn discover() -> Result<Self> {
-        if let Some(path) = std::env::var_os("STEPX_ADB") {
-            return Ok(Self { path: path.into() });
-        }
-        if let Some(local) = bundled_tool("adb") {
-            return Ok(Self { path: local });
-        }
-        for key in ["ANDROID_HOME", "ANDROID_SDK_ROOT"] {
-            if let Some(dir) = std::env::var_os(key) {
-                let path = PathBuf::from(dir).join("platform-tools").join(exe("adb"));
-                if path.is_file() {
-                    return Ok(Self { path });
+        let stepx_adb = std::env::var_os("STEPX_ADB");
+        let cache = DISCOVER_CACHE.get_or_init(|| Mutex::new(None));
+        if let Ok(guard) = cache.lock() {
+            if let Some((cached_env, cached_path)) = guard.as_ref() {
+                if *cached_env == stepx_adb && cached_path.is_file() {
+                    return Ok(Self {
+                        path: cached_path.clone(),
+                    });
                 }
             }
         }
-        find_executable("adb")
-            .or_else(|| platform_tool_candidate("adb"))
-            .map(|path| Self { path })
-            .context(adb_missing_help())
+        let discovered = if let Some(path) = stepx_adb.clone() {
+            Self { path: path.into() }
+        } else if let Some(local) = bundled_tool("adb") {
+            Self { path: local }
+        } else {
+            let mut sdk_path = None;
+            for key in ["ANDROID_HOME", "ANDROID_SDK_ROOT"] {
+                if let Some(dir) = std::env::var_os(key) {
+                    let path = PathBuf::from(dir).join("platform-tools").join(exe("adb"));
+                    if path.is_file() {
+                        sdk_path = Some(path);
+                        break;
+                    }
+                }
+            }
+            let path = sdk_path
+                .or_else(|| find_executable("adb"))
+                .or_else(|| platform_tool_candidate("adb"))
+                .context(adb_missing_help())?;
+            Self { path }
+        };
+        if let Ok(mut guard) = cache.lock() {
+            *guard = Some((stepx_adb, discovered.path.clone()));
+        }
+        Ok(discovered)
     }
 
     fn command(&self, args: &[OsString]) -> Command {
@@ -161,30 +182,47 @@ pub fn run_process(
         command.creation_flags(CREATE_NO_WINDOW);
     }
     let program = command.get_program().to_owned();
-    let mut child = command
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "无法启动 {}：{}。请完整解压安装包，并检查安全软件是否隔离了组件。",
-                Path::new(&program)
-                    .file_name()
-                    .unwrap_or(&program)
-                    .to_string_lossy(),
-                e
-            )
-        })?;
+        .stderr(Stdio::piped());
+    let mut attempts = 0u8;
+    let mut child = loop {
+        match command.spawn() {
+            Ok(child) => break child,
+            #[cfg(unix)]
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && attempts < 20 => {
+                attempts += 1;
+                thread::sleep(Duration::from_millis(2));
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "无法启动 {}：{}。请完整解压安装包，并检查安全软件是否隔离了组件。",
+                    Path::new(&program)
+                        .file_name()
+                        .unwrap_or(&program)
+                        .to_string_lossy(),
+                    e
+                ));
+            }
+        }
+    };
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
-    let out = thread::spawn(move || read_bounded(&mut stdout));
+    let waiting_thread = thread::current();
+    let out = thread::spawn(move || {
+        let res = read_bounded(&mut stdout);
+        waiting_thread.unpark();
+        res
+    });
     let err = thread::spawn(move || read_bounded(&mut stderr));
     let stdin = child.stdin.take();
     if let (Some(mut stdin), Some(input)) = (stdin, input) {
         let _ = stdin.write_all(&input);
     }
     let start = Instant::now();
+    const BACKOFF_MS: [u64; 6] = [1, 2, 4, 8, 15, 25];
+    let mut poll_step = 0usize;
     let status = loop {
         match child.try_wait()? {
             Some(status) => break Some(status),
@@ -197,7 +235,11 @@ pub fn run_process(
                 let _ = child.wait();
                 break None;
             }
-            None => thread::sleep(Duration::from_millis(25)),
+            None => {
+                let wait_ms = BACKOFF_MS[poll_step.min(BACKOFF_MS.len() - 1)];
+                poll_step = poll_step.saturating_add(1);
+                thread::park_timeout(Duration::from_millis(wait_ms));
+            }
         }
     };
     let stdout = out

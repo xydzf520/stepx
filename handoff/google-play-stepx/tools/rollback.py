@@ -3,14 +3,14 @@ import sys
 """恢复原厂 StepClaw 启动器并移除本次 GMS 安装；会删除本次 Google 本地数据。"""
 import pathlib, subprocess, json, time, sys
 
-from common import ROOT, STATE as HERE, ADB, guard, shell
+from common import ROOT, STATE as HERE, ADB, CONFIG, guard, shell
 import argparse
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--keep-apps', action='store_true')
 args = parser.parse_args()
 guard()
 BASELINE = json.loads((HERE / 'baseline.json').read_text())
-assert BASELINE.get('serial', 'ZYPZ261A01M692000LP') == ADB[-1], 'Wrong device baseline'
+assert BASELINE.get('serial', CONFIG.get('serial', '')) == ADB[-1], 'Wrong device baseline'
 INSTALL = json.loads((HERE / 'boot-install.json').read_text())
 assert subprocess.check_output(ADB + ['shell', 'getprop', 'ro.build.fingerprint'], text=True).strip() == BASELINE['fingerprint'], '设备固件已变化，停止自动回退'
 code = '''import os,json,hashlib,shutil,fcntl,stat

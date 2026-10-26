@@ -32,7 +32,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA = "stepx-play-protect-certification-v1"
 FORMAT = 1
-DEFAULT_SERIAL = "ZYPZ261A01M692000LP"
+DEFAULT_SERIAL = ""
 MAX_CATALOG_BYTES = 8 * 1024 * 1024
 SUPPORTED_DEVICES_URL = "https://storage.googleapis.com/play_public/supported_devices.html"
 ATTESTATION_ROOTS_URL = "https://android.googleapis.com/attestation/root"

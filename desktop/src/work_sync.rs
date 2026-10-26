@@ -52,6 +52,7 @@ pub fn enqueue(workspace: &Path, paths: &[PathBuf], serial: &str) -> Result<usiz
 }
 fn enqueue_in(root: &Path, workspace: &Path, paths: &[PathBuf], serial: &str) -> Result<usize> {
     ensure!(!serial.is_empty(), "未指定接收手机");
+    let _ = fs::create_dir_all(workspace);
     let workspace = workspace.canonicalize()?;
     let output = workspace.join("Amoo Work Outputs");
     ensure!(
@@ -142,31 +143,55 @@ pub fn process(adb: &Adb, device: &Device) -> Result<usize> {
     };
     let root = root();
     let mut entries = read(&root)?;
-    let Some(index) = entries
+    let now_ts = now();
+    let indices: Vec<usize> = entries
         .iter()
-        .position(|e| !e.done && e.serial == device.serial && now().saturating_sub(e.attempt) > 60)
-    else {
+        .enumerate()
+        .filter(|(_, e)| {
+            !e.done && e.serial == device.serial && now_ts.saturating_sub(e.attempt) > 60
+        })
+        .map(|(idx, _)| idx)
+        .take(8)
+        .collect();
+    if indices.is_empty() {
         return Ok(0);
-    };
-    let item = &mut entries[index];
-    let path = root.join(&item.id).join(&item.name);
-    item.attempt = now();
-    let result =
-        crate::companion_link::send_staged(adb, device, &path, &item.id, &item.sha256, item.size);
-    match result {
-        Ok(()) => {
-            item.done = true;
-            item.error.clear();
-            save(&root, &entries)?;
-            let _ = fs::remove_dir_all(path.parent().unwrap());
-            Ok(1)
-        }
-        Err(e) => {
-            item.error = format!("{e:#}");
-            save(&root, &entries)?;
-            Err(e)
+    }
+    let mut delivered = 0usize;
+    let mut last_err = None;
+    for index in indices {
+        let item = &mut entries[index];
+        let path = root.join(&item.id).join(&item.name);
+        item.attempt = now();
+        let result = crate::companion_link::send_staged(
+            adb,
+            device,
+            &path,
+            &item.id,
+            &item.sha256,
+            item.size,
+        );
+        match result {
+            Ok(()) => {
+                item.done = true;
+                item.error.clear();
+                save(&root, &entries)?;
+                let _ = fs::remove_dir_all(path.parent().unwrap());
+                delivered += 1;
+            }
+            Err(e) => {
+                item.error = format!("{e:#}");
+                save(&root, &entries)?;
+                last_err = Some(e);
+                break;
+            }
         }
     }
+    if delivered == 0 {
+        if let Some(e) = last_err {
+            return Err(e);
+        }
+    }
+    Ok(delivered)
 }
 pub fn retry() -> Result<()> {
     let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());

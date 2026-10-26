@@ -120,17 +120,77 @@ pub fn run(
     app: &str,
     goal: &str,
     control: &Control,
-    emit: impl FnMut(ScreenEvent),
+    mut emit: impl FnMut(ScreenEvent),
 ) -> Result<GuiRunResult> {
-    crate::amoo_gui::validate_request(app, goal)?;
-    crate::independent_gui::run(
+    let (normalized_app, normalized_goal) = crate::amoo_screen::infer_app_and_task(app, goal);
+    crate::amoo_gui::validate_request(&normalized_app, &normalized_goal)?;
+    if let Some(instant) = crate::amoo_screen::try_instant_screen_command(
         adb,
         device,
-        &format!("应用：{app}。用户目标：{goal}"),
+        &normalized_app,
+        &normalized_goal,
+        &mut emit,
+    )? {
+        return Ok(instant);
+    }
+    let started = Instant::now();
+    match crate::independent_gui::run(
+        adb,
+        device,
+        &format!("应用：{normalized_app}。用户目标：{normalized_goal}"),
         None,
         control,
-        emit,
-    )
+        &mut emit,
+    ) {
+        Ok(res)
+            if matches!(
+                res.state,
+                GuiRunState::Completed | GuiRunState::WaitingCancelled | GuiRunState::Disconnected
+            ) =>
+        {
+            Ok(res)
+        }
+        Ok(res) if control.stop.load(Ordering::Relaxed) => Ok(res),
+        Err(_) if control.stop.load(Ordering::Relaxed) => Ok(GuiRunResult {
+            state: GuiRunState::WaitingCancelled,
+            message: "已停止手机操作。".into(),
+            invocation_id: String::new(),
+            raw_result: None,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        }),
+        _ => {
+            emit(ScreenEvent::Status(
+                "手机独立执行通道未就绪，已自动切换为桌面视觉导航模式继续执行…".into(),
+            ));
+            match crate::amoo_screen::run_with_pause(
+                adb,
+                device,
+                &normalized_app,
+                &normalized_goal,
+                &control.stop,
+                &control.pause,
+                &mut emit,
+            ) {
+                Ok(fallback) => Ok(fallback),
+                Err(_) if control.stop.load(Ordering::Relaxed) => Ok(GuiRunResult {
+                    state: GuiRunState::WaitingCancelled,
+                    message: "已停止手机操作。".into(),
+                    invocation_id: String::new(),
+                    raw_result: None,
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                }),
+                Err(err) => Ok(GuiRunResult {
+                    state: GuiRunState::Failed,
+                    message: format!(
+                        "未能完成复杂多步视觉导航（{err}）。提示：点亮屏幕、截图、提取屏幕文字、打开应用、点击按钮、开关设置等基础操作可直接零配置秒级执行；多步复杂自动化可在「设置 -> 模型配置」中检查手机视觉模型连接。"
+                    ),
+                    invocation_id: String::new(),
+                    raw_result: None,
+                    elapsed_ms: 0,
+                }),
+            }
+        }
+    }
 }
 
 /// Explicit legacy route. Independent-agent failures never fall back to this account.
@@ -192,7 +252,7 @@ pub fn run_with_amoo(
                 if op == "stop" {
                     break;
                 }
-                for _ in 0..5 {
+                for _ in 0..15 {
                     if finished.load(Ordering::Relaxed) {
                         break;
                     }

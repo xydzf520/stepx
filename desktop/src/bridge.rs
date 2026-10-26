@@ -60,6 +60,17 @@ pub struct SimSubscription {
     pub label: String,
 }
 
+pub fn friendly_carrier_name(raw: &str) -> String {
+    let trimmed = raw.trim();
+    match trimmed.to_ascii_uppercase().as_str() {
+        "CT" | "CHN-CT" | "CHINA TELECOM" | "CHN-TELECOM" => "中国电信".to_string(),
+        "CMCC" | "CM" | "CHINA MOBILE" | "CHN-CMCC" => "中国移动".to_string(),
+        "CUCC" | "CU" | "CHN-UNICOM" | "CHINA UNICOM" | "CHN-CU" => "中国联通".to_string(),
+        "CBN" | "CHINA BROADNET" | "CHN-CBN" => "中国广电".to_string(),
+        _ => trimmed.to_string(),
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capabilities {
     pub send_sms: bool,
@@ -157,7 +168,6 @@ pub fn ensure_bridge_jar(adb: &Adb, device: &Device) -> Result<()> {
     if is_bridge_jar_cached(&device.transport) {
         return Ok(());
     }
-    device.verify(adb)?;
     let expected_len = BRIDGE_JAR.len();
     let check_cmd = format!(
         "mkdir -p {dir} && chmod 700 {dir} && [ -f {jar} ] && [ \"$(stat -c %s {jar} 2>/dev/null)\" = \"{expected_len}\" ] && printf READY",
@@ -228,6 +238,7 @@ pub fn call_bridge(
     request: &Value,
     timeout: Duration,
 ) -> Result<Value> {
+    device.verify(adb)?;
     let was_cached = is_bridge_jar_cached(&device.transport);
     ensure_bridge_jar(adb, device)?;
     match run_bridge_once(adb, device, request, timeout) {
@@ -290,12 +301,9 @@ pub fn parse_capabilities(val: &Value) -> Result<Capabilities> {
     if let Some(arr) = val.get("subscriptions").and_then(Value::as_array) {
         for item in arr {
             let id = item.get("id").and_then(Value::as_i64).unwrap_or(-1) as i32;
-            let slot = item.get("slot").and_then(Value::as_i64).unwrap_or(1) as i32;
-            let label = item
-                .get("label")
-                .and_then(Value::as_str)
-                .unwrap_or("SIM")
-                .to_string();
+            let slot = (item.get("slot").and_then(Value::as_i64).unwrap_or(1) as i32).max(1);
+            let label =
+                friendly_carrier_name(item.get("label").and_then(Value::as_str).unwrap_or("SIM"));
             if id >= 0 {
                 subscriptions.push(SimSubscription { id, slot, label });
             }
@@ -434,7 +442,7 @@ pub fn parse_amoo_snapshot(val: &Value) -> AmooSnapshot {
                 if has_tti_image && !texts.iter().any(|t| t.contains("[AI 生成图片卡片]")) {
                     texts.insert(
                         texts.len().min(1),
-                        "🖼 [AI 生成图片卡片 · 手机端已渲染高清写真]".to_string(),
+                        "[AI 生成图片卡片 · 手机端已渲染高清写真]".to_string(),
                     );
                 }
                 if !texts.is_empty() {
@@ -531,7 +539,6 @@ pub fn amoo_send(adb: &Adb, device: &Device, text: &str) -> Result<AmooSnapshot>
     if text.is_empty() || text.chars().count() > 8000 {
         bail!("问题不能为空，且最多 8000 字");
     }
-    let _ = adb.shell(&device.transport, &["input", "keyevent", "224"]);
     let _ = device.open_amoo(adb);
     std::thread::sleep(Duration::from_millis(350));
     if call_bridge(
@@ -605,7 +612,6 @@ pub fn sms_prepare(
     if body.trim().is_empty() || body.chars().count() > 2000 {
         bail!("短信正文不能为空，最多 2000 字");
     }
-    let caps = capabilities(adb, device)?;
     let req = json!({
         "op": "sms_prepare",
         "number": number,
@@ -621,12 +627,12 @@ pub fn sms_prepare(
         .get("parts")
         .and_then(Value::as_u64)
         .context("手机未返回短信分段数")? as usize;
-    let sub_label = caps
-        .subscriptions
-        .iter()
-        .find(|s| s.id == sub_id)
-        .map(|s| format!("卡槽 {} · {}", s.slot, s.label))
-        .unwrap_or_else(|| format!("SIM #{sub_id}"));
+    let sub_label = val
+        .get("subscription_label")
+        .and_then(Value::as_str)
+        .map(friendly_carrier_name)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("SIM {sub_id}"));
     let request_id = format!(
         "{:016x}{:016x}",
         rand::random::<u64>(),
@@ -750,6 +756,11 @@ mod tests {
         assert!(!caps.locked);
         assert_eq!(caps.default_subscription, 2);
         assert_eq!(caps.subscriptions.len(), 1);
-        assert_eq!(caps.subscriptions[0].label, "CMCC");
+        assert_eq!(caps.subscriptions[0].slot, 1);
+        assert_eq!(caps.subscriptions[0].label, "中国移动");
+        assert_eq!(friendly_carrier_name("CT"), "中国电信");
+        assert_eq!(friendly_carrier_name("CHN-CT"), "中国电信");
+        assert_eq!(friendly_carrier_name("CUCC"), "中国联通");
+        assert_eq!(friendly_carrier_name("CBN"), "中国广电");
     }
 }

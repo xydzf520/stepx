@@ -13,8 +13,8 @@ impl Companion {
             None
         } else {
             Some(Device {
-                transport: "ZYPZ261A01M692000LP".into(),
-                serial: "ZYPZ261A01M692000LP".into(),
+                transport: "STEPX_DEMO_DEVICE".into(),
+                serial: "STEPX_DEMO_DEVICE".into(),
                 model: "StepX PZ261A".into(),
                 android: "16".into(),
                 product: "pandora".into(),
@@ -24,7 +24,7 @@ impl Companion {
             self.seed_demo_usage();
         }
         self.devices = vec![Transport {
-            id: "ZYPZ261A01M692000LP".into(),
+            id: "STEPX_DEMO_DEVICE".into(),
             state: "device".into(),
             model: "StepX_PZ261A".into(),
         }];
@@ -48,6 +48,85 @@ impl Companion {
             protocol: 1,
         });
         self.selected_sim = Some(1);
+        self.selected_call_sim = Some(1);
+        self.active_call_number = None;
+        self.pending_call = None;
+        self.sms_loaded = true;
+        self.sms_error = None;
+        self.phone_loaded = true;
+        self.call_logs_error = None;
+        self.contacts_error = None;
+        self.contacts = vec![
+            stepx_companion::device::ContactEntry {
+                name: "张晓峰".into(),
+                number: "138 0013 8000".into(),
+            },
+            stepx_companion::device::ContactEntry {
+                name: "林婉清".into(),
+                number: "139 1024 6688".into(),
+            },
+            stepx_companion::device::ContactEntry {
+                name: "王磊".into(),
+                number: "186 2100 9527".into(),
+            },
+            stepx_companion::device::ContactEntry {
+                name: "陈思远".into(),
+                number: "137 6408 3310".into(),
+            },
+            stepx_companion::device::ContactEntry {
+                name: "周明轩".into(),
+                number: "150 0192 7741".into(),
+            },
+            stepx_companion::device::ContactEntry {
+                name: "顺丰速运客服".into(),
+                number: "95338".into(),
+            },
+        ];
+        self.selected_contact = 0;
+        self.call_logs = vec![
+            stepx_companion::device::CallRecord {
+                number: "138 0013 8000".into(),
+                name: "张晓峰".into(),
+                call_type: 1,
+                date_ms: now - 18 * min,
+                duration_sec: 265,
+            },
+            stepx_companion::device::CallRecord {
+                number: "139 1024 6688".into(),
+                name: "林婉清".into(),
+                call_type: 3,
+                date_ms: now - 46 * min,
+                duration_sec: 0,
+            },
+            stepx_companion::device::CallRecord {
+                number: "186 2100 9527".into(),
+                name: "王磊".into(),
+                call_type: 2,
+                date_ms: now - 135 * min,
+                duration_sec: 142,
+            },
+            stepx_companion::device::CallRecord {
+                number: "137 6408 3310".into(),
+                name: "陈思远".into(),
+                call_type: 1,
+                date_ms: now - 310 * min,
+                duration_sec: 88,
+            },
+            stepx_companion::device::CallRecord {
+                number: "021-68881024".into(),
+                name: String::new(),
+                call_type: 3,
+                date_ms: now - 720 * min,
+                duration_sec: 0,
+            },
+            stepx_companion::device::CallRecord {
+                number: "150 0192 7741".into(),
+                name: "周明轩".into(),
+                call_type: 2,
+                date_ms: now - 1480 * min,
+                duration_sec: 410,
+            },
+        ];
         self.amoo_snapshot = Some(AmooSnapshot {
             turns: vec![
                 AmooTurn {
@@ -156,8 +235,138 @@ impl Companion {
             model: "StepX PZ261A".into(),
         }];
         self.preferences.selected_serial = Some("PZ261A0001".into());
+        self.prefs = self.preferences.clone();
         self.status = "已连接 StepX PZ261A".into();
         self.error = false;
+        self.companion_status.checked = true;
+        self.companion_status.installed = true;
+        self.companion_status.permission_granted = true;
+        self.companion_status.running = true;
+        self.back_screen.companion_installed = Some(true);
+        self.back_screen.companion_permission = true;
+        self.back_screen.companion_status = "StepX伴侣已就绪 · 背屏权限已开启".into();
+        self.back_screen.stepos_suite.checked = true;
+        self.back_screen.stepos_suite.wellbeing.screen_time_minutes = 164;
+        self.back_screen.stepos_suite.wellbeing.unlock_count = 38;
+        self.back_screen.stepos_suite.wellbeing.alphame_running = true;
+        self.back_screen.stepos_suite.wellbeing.top_apps = vec![
+            ("Amoo 助手".into(), "com.stepos.ailauncher".into(), 68),
+            ("微信".into(), "com.tencent.mm".into(), 46),
+            ("Chrome 浏览器".into(), "com.android.chrome".into(), 32),
+            ("相册".into(), "com.stepos.media.gallery".into(), 18),
+        ];
+        self.back_screen.stepos_suite.calendar_events = vec![
+            stepx_companion::toolbox::PhoneCalendarEvent {
+                id: 101,
+                title: "第四季度产品与桌面协同评审会".into(),
+                dtstart: now + 60 * min,
+                dtend: now + 120 * min,
+                all_day: false,
+                location: "3 楼大会议室".into(),
+                description: "讨论手机日历、闹钟与背屏双向联动体验".into(),
+                source: "双端已同步".into(),
+            },
+            stepx_companion::toolbox::PhoneCalendarEvent {
+                id: 102,
+                title: "晚间重点待办复盘与周报归档".into(),
+                dtstart: now + 240 * min,
+                dtend: now + 300 * min,
+                all_day: false,
+                location: String::new(),
+                description: "由 StepX 桌面端直接同步创建".into(),
+                source: "双端已同步".into(),
+            },
+            stepx_companion::toolbox::PhoneCalendarEvent {
+                id: 900_001,
+                title: "StepX 跨端日历与相册架构同步".into(),
+                dtstart: now + 1440 * min,
+                dtend: now + 1500 * min,
+                all_day: false,
+                location: "线上协同会议室".into(),
+                description: "电脑系统日历双向自动同步".into(),
+                source: "电脑日历".into(),
+            },
+        ];
+        self.back_screen.stepos_suite.alarms = vec![
+            stepx_companion::toolbox::PhoneAlarmItem {
+                id: 1,
+                hour: 8,
+                minutes: 0,
+                enabled: true,
+                days_of_week: 31,
+                vibrate: true,
+                message: "晨间重点事项与通勤提醒".into(),
+            },
+            stepx_companion::toolbox::PhoneAlarmItem {
+                id: 2,
+                hour: 13,
+                minutes: 45,
+                enabled: true,
+                days_of_week: 0,
+                vibrate: true,
+                message: "下午评审会提前 15 分钟提醒".into(),
+            },
+            stepx_companion::toolbox::PhoneAlarmItem {
+                id: 3,
+                hour: 22,
+                minutes: 30,
+                enabled: false,
+                days_of_week: 127,
+                vibrate: true,
+                message: "晚间休息与次日日程预览".into(),
+            },
+        ];
+        let demo_thumb =
+            stepx_companion::resources::root().join("desktop/assets/amoo_tti_portrait.png");
+        let thumb_opt = demo_thumb
+            .is_file()
+            .then(|| demo_thumb.to_string_lossy().to_string());
+        self.back_screen.gallery_checked = true;
+        self.back_screen.gallery_items = vec![
+            stepx_companion::toolbox::PhoneGalleryItem {
+                remote_path: "/sdcard/DCIM/Camera/IMG_20261025_142018.jpg".into(),
+                name: "IMG_20261025_142018.jpg".into(),
+                category: "camera".into(),
+                size_bytes: 3_842_190,
+                modified_ms: now - 35 * min,
+                local_thumb_path: thumb_opt.clone(),
+            },
+            stepx_companion::toolbox::PhoneGalleryItem {
+                remote_path: "/sdcard/Pictures/Screenshots/StepX_20261025_135502.png".into(),
+                name: "StepX_20261025_135502.png".into(),
+                category: "screenshot".into(),
+                size_bytes: 1_248_640,
+                modified_ms: now - 90 * min,
+                local_thumb_path: thumb_opt.clone(),
+            },
+            stepx_companion::toolbox::PhoneGalleryItem {
+                remote_path: "/sdcard/DCIM/Camera/IMG_20261024_183205.jpg".into(),
+                name: "IMG_20261024_183205.jpg".into(),
+                category: "camera".into(),
+                size_bytes: 4_215_000,
+                modified_ms: now - 1180 * min,
+                local_thumb_path: thumb_opt.clone(),
+            },
+            stepx_companion::toolbox::PhoneGalleryItem {
+                remote_path: "/sdcard/Pictures/StepX_RearMatrix_Preview.png".into(),
+                name: "StepX_RearMatrix_Preview.png".into(),
+                category: "pictures".into(),
+                size_bytes: 612_400,
+                modified_ms: now - 2400 * min,
+                local_thumb_path: thumb_opt,
+            },
+        ];
+        self.back_screen.stepos_suite.controls = stepx_companion::toolbox::PhoneSystemControls {
+            dnd_on: false,
+            wifi_on: true,
+            bluetooth_on: true,
+            brightness_percent: 65,
+        };
+        self.back_screen.stepos_suite.phone_clipboard =
+            "【顺丰速运】取件码 5-2-1103 · 3 楼大会议室 14:00 评审".into();
+        self.back_screen.stepos_suite.thermal_summary =
+            "多温区实时温控：机身 31.4°C · 电池 29.5°C · NPU 43.2°C".into();
+        self.back_screen.stepos_suite.last_action_note = "已同步手机日程与闹钟状态".into();
         self.init_demo_push();
         // Alternate state set: confirmations, transient panels.
         if std::env::var_os("STEPX_DEMO_ALT").is_some() {

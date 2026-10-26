@@ -1,7 +1,10 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.stepx.companion.app" android:versionCode="29" android:versionName="0.1.28">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.stepx.companion.app" android:versionCode="33" android:versionName="0.1.32">
   <uses-sdk android:minSdkVersion="33" android:targetSdkVersion="35" />
   <uses-permission android:name="com.stepos.permission.MANAGE_BACK_SCREEN" />
   <uses-permission android:name="com.stepos.cloud.push.permission.MESSAGE" />
+  <uses-permission android:name="com.stepos.agentsafetycenter.permission.READ_AGENT_LEDGER" />
+  <uses-permission android:name="com.stepos.agentsafetycenter.permission.READ_AGENT_PERMISSIONS" />
+  <uses-permission android:name="com.stepos.agentsafetycenter.permission.READ_SCREEN_PERCEPTION_SETTINGS" />
   <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
   <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
   <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -17,10 +20,17 @@
   <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
   <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
   <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+  <uses-permission android:name="android.permission.ACCESS_MEDIA_LOCATION" />
+  <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+  <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
   <uses-feature android:name="android.hardware.camera" android:required="false" />
   <queries>
     <package android:name="com.stepx.companion.neo" />
     <package android:name="com.stepos.agentbus" />
+    <package android:name="com.stepos.ailauncher" />
+    <package android:name="com.stepos.aiengine" />
+    <package android:name="com.stepos.agentsafetycenter" />
+    <package android:name="com.stepos.alphame" />
     <package android:name="com.tencent.mm" />
     <package android:name="com.tencent.wework" />
     <package android:name="com.alibaba.android.rimet" />
@@ -59,7 +69,7 @@
     <provider android:name=".StudioProvider" android:authorities="com.stepx.companion.app.studio" android:exported="true" android:permission="android.permission.DUMP" />
     <activity android:name=".NeoSettingsActivity" android:exported="true" />
     <activity android:name=".StudioActivity" android:exported="true" />
-    <activity android:name=".StudioLocalActivity" android:exported="true" android:permission="android.permission.DUMP" />
+    <activity android:name=".StudioLocalActivity" android:launchMode="singleTop" android:exported="true" android:permission="android.permission.DUMP" />
     <activity android:name=".StudioWebActivity" android:exported="true" android:permission="android.permission.DUMP" />
     <activity android:name=".StudioAccountActivity" android:exported="true" android:permission="android.permission.DUMP" />
     <service android:name=".GuiAccessibilityService" android:label="StepX伴侣 · 看屏操作" android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE" android:exported="true">

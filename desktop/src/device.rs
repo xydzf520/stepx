@@ -96,7 +96,15 @@ pub fn canonical_serial_from_transport(id: &str) -> Option<String> {
 impl Transport {
     pub fn backup_transports(&self) -> Vec<String> {
         let canonical = canonical_serial_from_transport(&self.id).unwrap_or_default();
-        backup_transports_for(&[&self.id, &canonical])
+        let model_key = if !self.model.is_empty() {
+            format!("model:{}", self.model)
+        } else {
+            String::new()
+        };
+        backup_transports_for(&[&self.id, &canonical, &model_key])
+            .into_iter()
+            .filter(|b| b != &self.id)
+            .collect()
     }
 }
 
@@ -127,10 +135,13 @@ pub fn parse_devices(output: &str) -> Vec<Transport> {
             ))
         })
         .collect();
-    deduplicate_parsed_transports(raw)
+    deduplicate_parsed_transports(raw, false)
 }
 
-fn deduplicate_parsed_transports(raw: Vec<(Transport, String)>) -> Vec<Transport> {
+fn deduplicate_parsed_transports(
+    raw: Vec<(Transport, String)>,
+    preserve_existing_backups: bool,
+) -> Vec<Transport> {
     struct TransportGroup {
         serial: Option<String>,
         model: String,
@@ -193,19 +204,44 @@ fn deduplicate_parsed_transports(raw: Vec<(Transport, String)>) -> Vec<Transport
             if primary.model.is_empty() && !group.model.is_empty() {
                 primary.model = group.model.clone();
             }
-            let mut backups = Vec::new();
+            let mut backups = if preserve_existing_backups {
+                primary.backup_transports()
+            } else {
+                Vec::new()
+            };
             for m in iter {
                 if m.id != primary.id && !backups.contains(&m.id) {
-                    backups.push(m.id);
+                    backups.push(m.id.clone());
+                }
+                if preserve_existing_backups {
+                    for b in m.backup_transports() {
+                        if b != primary.id && !backups.contains(&b) {
+                            backups.push(b);
+                        }
+                    }
                 }
             }
+            backups.sort_by(|a, b| {
+                transport_priority(a)
+                    .cmp(&transport_priority(b))
+                    .then_with(|| a.cmp(b))
+            });
             let serial_key = group.serial.unwrap_or_default();
             let model_key = if !primary.model.is_empty() {
                 format!("model:{}", primary.model)
             } else {
                 String::new()
             };
-            set_backup_transports_for(&[&primary.id, &serial_key, &model_key], backups);
+            set_backup_transports_for(&[&primary.id, &serial_key, &model_key], backups.clone());
+            if !serial_key.is_empty() && serial_key != primary.id {
+                let mut serial_backups = vec![primary.id.clone()];
+                for b in &backups {
+                    if !serial_backups.contains(b) {
+                        serial_backups.push(b.clone());
+                    }
+                }
+                set_backup_transports_for(&[&serial_key], serial_backups);
+            }
             result.push(primary);
         }
     }
@@ -214,7 +250,7 @@ fn deduplicate_parsed_transports(raw: Vec<(Transport, String)>) -> Vec<Transport
 
 pub fn deduplicate_transports(transports: Vec<Transport>) -> Vec<Transport> {
     let raw = transports.into_iter().map(|t| (t, String::new())).collect();
-    deduplicate_parsed_transports(raw)
+    deduplicate_parsed_transports(raw, true)
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -410,10 +446,12 @@ impl Device {
             android: parts[2].into(),
             product: parts[3].into(),
         };
-        if let Ok(raw_devices) =
-            adb.run_timeout(&["devices", "-l"], std::time::Duration::from_secs(2))
-        {
-            let _ = parse_devices(&raw_devices);
+        if device.backup_transports().is_empty() {
+            if let Ok(raw_devices) =
+                adb.run_timeout(&["devices", "-l"], std::time::Duration::from_secs(2))
+            {
+                let _ = parse_devices(&raw_devices);
+            }
         }
         let existing_backups = device.backup_transports();
         if !existing_backups.is_empty() {
@@ -438,7 +476,12 @@ impl Device {
     }
 
     pub fn key(&self, adb: &Adb, code: u32) -> Result<()> {
-        if ![3, 4, 5, 6, 24, 25, 26, 82, 164, 187, 219, 224].contains(&code) {
+        if ![
+            3, 4, 5, 6, 24, 25, 26, 27, 66, 67, 82, 85, 87, 88, 120, 164, 187, 219, 220, 221, 223,
+            224, 231,
+        ]
+        .contains(&code)
+        {
             bail!("不支持的按键");
         }
         self.verify(adb)?;
@@ -446,42 +489,155 @@ impl Device {
         Ok(())
     }
 
-    pub fn open_amoo(&self, adb: &Adb) -> Result<String> {
+    pub fn screen_resolution(&self, adb: &Adb) -> (u32, u32) {
+        adb.shell(&self.transport, &["wm", "size"])
+            .map(|raw| parse_wm_size(&raw))
+            .unwrap_or((1080, 2400))
+    }
+
+    pub fn tap_normalized(&self, adb: &Adb, norm_x: u16, norm_y: u16) -> Result<(u32, u32)> {
         self.verify(adb)?;
-        let installed = adb.shell(&self.transport, &["pm", "path", "com.stepos.ailauncher"])?;
-        if !installed.contains("package:") {
-            bail!("没有检测到系统 Amoo 包 com.stepos.ailauncher");
-        }
-        let _ = adb.shell(&self.transport, &["input", "keyevent", "224"]);
-        let _ = adb.shell(&self.transport, &["input", "keyevent", "82"]);
-        if adb
-            .shell(
-                &self.transport,
-                &[
-                    "am",
-                    "start",
-                    "-n",
-                    "com.stepos.ailauncher/.chat.activity.ChatMainActivity",
-                    "--activity-single-top",
-                ],
-            )
-            .is_err()
-        {
-            if adb
-                .shell(
+        let (w, h) = self.screen_resolution(adb);
+        let px = ((norm_x.min(1000) as u32) * w / 1000).clamp(1, w.saturating_sub(1));
+        let py = ((norm_y.min(1000) as u32) * h / 1000).clamp(1, h.saturating_sub(1));
+        adb.shell(
+            &self.transport,
+            &["input", "tap", &px.to_string(), &py.to_string()],
+        )?;
+        Ok((px, py))
+    }
+
+    pub fn screen_gesture(&self, adb: &Adb, gesture: u8) -> Result<String> {
+        self.verify(adb)?;
+        let (w, h) = self.screen_resolution(adb);
+        let cx = w / 2;
+        let cy = h / 2;
+        let y_bot = h * 78 / 100;
+        let y_top = h * 22 / 100;
+        let x_right = w * 84 / 100;
+        let x_left = w * 16 / 100;
+        match gesture {
+            0 => {
+                adb.shell(
                     &self.transport,
                     &[
-                        "am",
-                        "start",
-                        "-a",
-                        "com.stepos.ailauncher.action.OPEN_CHAT",
-                        "-p",
-                        "com.stepos.ailauncher",
+                        "input",
+                        "swipe",
+                        &cx.to_string(),
+                        &y_bot.to_string(),
+                        &cx.to_string(),
+                        &y_top.to_string(),
+                        "240",
                     ],
-                )
-                .is_err()
-            {
-                self.key(adb, 219)?;
+                )?;
+                Ok("已向手机发送上滑手势".into())
+            }
+            1 => {
+                adb.shell(
+                    &self.transport,
+                    &[
+                        "input",
+                        "swipe",
+                        &cx.to_string(),
+                        &y_top.to_string(),
+                        &cx.to_string(),
+                        &y_bot.to_string(),
+                        "240",
+                    ],
+                )?;
+                Ok("已向手机发送下滑手势".into())
+            }
+            2 => {
+                adb.shell(
+                    &self.transport,
+                    &[
+                        "input",
+                        "swipe",
+                        &x_right.to_string(),
+                        &cy.to_string(),
+                        &x_left.to_string(),
+                        &cy.to_string(),
+                        "220",
+                    ],
+                )?;
+                Ok("已向手机发送左滑手势".into())
+            }
+            3 => {
+                adb.shell(
+                    &self.transport,
+                    &[
+                        "input",
+                        "swipe",
+                        &x_left.to_string(),
+                        &cy.to_string(),
+                        &x_right.to_string(),
+                        &cy.to_string(),
+                        "220",
+                    ],
+                )?;
+                Ok("已向手机发送右滑返回手势".into())
+            }
+            4 => {
+                let _ = adb.shell(
+                    &self.transport,
+                    &["cmd", "statusbar", "expand-notifications"],
+                );
+                Ok("已展开手机通知栏".into())
+            }
+            5 => {
+                let _ = adb.shell(&self.transport, &["cmd", "statusbar", "expand-settings"]);
+                Ok("已展开手机快捷设置面板".into())
+            }
+            6 => {
+                let _ = adb.shell(&self.transport, &["cmd", "statusbar", "collapse"]);
+                Ok("已收起手机状态栏".into())
+            }
+            _ => {
+                let _ = adb.script(
+                    &self.transport,
+                    &format!(
+                        "input keyevent 224; wm dismiss-keyguard >/dev/null 2>&1 || true; input swipe {cx} {y_bot} {cx} {y_top} 220"
+                    ),
+                );
+                Ok("已点亮屏幕并发送上滑解锁".into())
+            }
+        }
+    }
+
+    pub fn open_amoo(&self, adb: &Adb) -> Result<String> {
+        self.verify(adb)?;
+        let script = concat!(
+            "if ! pm path com.stepos.ailauncher 2>/dev/null | grep -q 'package:'; then ",
+            "echo STEPX_NO_AMOO; ",
+            "else ",
+            "input keyevent 224 >/dev/null 2>&1 || true; ",
+            "input keyevent 82 >/dev/null 2>&1 || true; ",
+            "am start -n com.stepos.ailauncher/.chat.activity.ChatMainActivity --activity-single-top; ",
+            "fi"
+        );
+        match adb.script(&self.transport, script) {
+            Ok(out) => {
+                if out.contains("STEPX_NO_AMOO") {
+                    bail!("没有检测到系统 Amoo 包 com.stepos.ailauncher");
+                }
+            }
+            Err(_) => {
+                if adb
+                    .shell(
+                        &self.transport,
+                        &[
+                            "am",
+                            "start",
+                            "-a",
+                            "com.stepos.ailauncher.action.OPEN_CHAT",
+                            "-p",
+                            "com.stepos.ailauncher",
+                        ],
+                    )
+                    .is_err()
+                {
+                    self.key(adb, 219)?;
+                }
             }
         }
         Ok("已在手机上打开 Amoo 对话中心".into())
@@ -504,7 +660,7 @@ impl Device {
     }
 
     pub fn open_amoo_tasks(&self, adb: &Adb) -> Result<String> {
-        self.verify(adb)?;
+        let _ = self.open_amoo(adb)?;
         let _ = adb.shell(
             &self.transport,
             &[
@@ -516,7 +672,6 @@ impl Device {
                 "com.stepos.ailauncher",
             ],
         );
-        let _ = self.open_amoo(adb);
         Ok("已在手机上打开 Amoo 会话与并行任务中心".into())
     }
 
@@ -600,8 +755,7 @@ impl Device {
     }
 
     pub fn amoo_voice_wake(&self, adb: &Adb) -> Result<String> {
-        self.verify(adb)?;
-        let _ = self.open_amoo(adb);
+        let _ = self.open_amoo(adb)?;
         adb.shell(
             &self.transport,
             &[
@@ -843,12 +997,12 @@ impl Device {
             "/data/local/tmp/stepx-ui-{:016x}.xml",
             rand::random::<u64>()
         );
-        let result = (|| {
-            adb.shell(&self.transport, &["uiautomator", "dump", &remote])?;
-            visible_text(&adb.shell(&self.transport, &["cat", &remote])?)
-        })();
-        let _ = adb.shell(&self.transport, &["rm", "-f", &remote]);
-        result
+        let q = crate::adb::shell_quote(&remote);
+        let xml = adb.script(
+            &self.transport,
+            &format!("uiautomator dump {q} >/dev/null && cat {q}; rm -f {q}"),
+        )?;
+        visible_text(&xml)
     }
 
     pub fn messages(&self, adb: &Adb) -> Result<Vec<crate::sms::Message>> {
@@ -992,8 +1146,16 @@ impl Device {
     }
 
     pub fn mirror(&self, adb: &Adb) -> Result<MirrorSession> {
+        self.mirror_with_options(adb, crate::mirror::MirrorOptions::default())
+    }
+
+    pub fn mirror_with_options(
+        &self,
+        adb: &Adb,
+        options: crate::mirror::MirrorOptions,
+    ) -> Result<MirrorSession> {
         self.verify(adb)?;
-        MirrorSession::start(adb, &self.transport)
+        crate::mirror::start_with_options(adb, &self.transport, options)
     }
 
     pub fn force_stop_app(&self, adb: &Adb, package: &str) -> Result<String> {
@@ -1025,6 +1187,7 @@ impl Device {
             .arg(&script)
             .arg(subcmd)
             .env("STEPX_SERIAL", &self.transport)
+            .env("STEPX_DEVICE_SERIAL", &self.serial)
             .output()
             .context("无法调用 Google Play 特权管理脚本")?;
         if !out.status.success() {
@@ -1046,6 +1209,7 @@ impl Device {
             .arg("-c")
             .arg(py_code)
             .env("STEPX_SERIAL", &self.transport)
+            .env("STEPX_DEVICE_SERIAL", &self.serial)
             .output()
             .context("无法调用 root_bridge.py")?;
         let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -1086,13 +1250,16 @@ impl Device {
 
     pub fn inspect_system_services(&self, adb: &Adb) -> Result<Vec<SystemServiceInfo>> {
         self.verify(adb)?;
-        let disabled_raw = adb.shell(&self.transport, &["pm", "list", "packages", "-d"])?;
-        let all_raw = adb.shell(&self.transport, &["pm", "list", "packages", "-u"])?;
-        let installed_raw = adb.shell(&self.transport, &["pm", "list", "packages"])?;
-        let ime_raw = adb.shell(
+        let combined = adb.script(
             &self.transport,
-            &["settings", "get", "secure", "default_input_method"],
+            "pm list packages -d; echo '<<<STEPX_U>>>'; pm list packages -u; echo '<<<STEPX_ALL>>>'; pm list packages; echo '<<<STEPX_IME>>>'; settings get secure default_input_method",
         )?;
+        let (disabled_raw, rest) = combined
+            .split_once("<<<STEPX_U>>>")
+            .unwrap_or((&combined, ""));
+        let (all_raw, rest) = rest.split_once("<<<STEPX_ALL>>>").unwrap_or((rest, ""));
+        let (installed_raw, ime_raw) = rest.split_once("<<<STEPX_IME>>>").unwrap_or((rest, ""));
+        let ime_raw = ime_raw.trim();
 
         let mut list = default_system_services();
         for item in &mut list {
@@ -1128,33 +1295,43 @@ impl Device {
         Ok(list)
     }
 
-    pub fn toggle_system_service(&self, adb: &Adb, package: &str, enable: bool) -> Result<String> {
-        self.verify(adb)?;
+    fn toggle_system_service_no_inspect(
+        &self,
+        adb: &Adb,
+        package: &str,
+        enable: bool,
+    ) -> Result<()> {
         let known = default_system_services()
             .into_iter()
             .any(|s| s.package == package && s.safe_to_remove);
         if !known {
             bail!("此服务不在可管理范围内");
         }
-        let ime = adb.shell(
-            &self.transport,
-            &["settings", "get", "secure", "default_input_method"],
-        )?;
-        if !enable && ime.starts_with(&format!("{package}/")) {
-            bail!("不能停用当前输入法，请先在手机设置中切换输入法");
-        }
         if enable {
-            adb.shell(
+            let q = crate::adb::shell_quote(package);
+            adb.script(
                 &self.transport,
-                &["cmd", "package", "install-existing", "--user", "0", package],
+                &format!("cmd package install-existing --user 0 {q} >/dev/null 2>&1 || true; pm enable --user 0 {q}"),
             )?;
-            adb.shell(&self.transport, &["pm", "enable", "--user", "0", package])?;
         } else {
+            let ime = adb.shell(
+                &self.transport,
+                &["settings", "get", "secure", "default_input_method"],
+            )?;
+            if ime.trim().starts_with(&format!("{package}/")) {
+                bail!("不能停用当前输入法，请先在手机设置中切换输入法");
+            }
             adb.shell(
                 &self.transport,
                 &["pm", "disable-user", "--user", "0", package],
             )?;
         }
+        Ok(())
+    }
+
+    pub fn toggle_system_service(&self, adb: &Adb, package: &str, enable: bool) -> Result<String> {
+        self.verify(adb)?;
+        self.toggle_system_service_no_inspect(adb, package, enable)?;
         let status = self.inspect_system_services(adb)?;
         if !status
             .iter()
@@ -1178,12 +1355,24 @@ impl Device {
             "com.android.bips",
             "com.android.dreams.basic",
         ];
-        let mut count = 0usize;
+        let mut toggled = Vec::new();
         for pkg in targets {
-            if self.toggle_system_service(adb, pkg, false).is_ok() {
-                count += 1;
+            if self
+                .toggle_system_service_no_inspect(adb, pkg, false)
+                .is_ok()
+            {
+                toggled.push(pkg);
             }
         }
+        let status = self.inspect_system_services(adb).unwrap_or_default();
+        let count = toggled
+            .into_iter()
+            .filter(|pkg| {
+                status
+                    .iter()
+                    .any(|s| s.package == *pkg && s.status_note != "未安装" && !s.enabled)
+            })
+            .count();
         Ok(format!(
             "已完成系统自带服务一键精简：共停用 {count} 项冗余后台服务（搜狗定制输入法 / QDMA 诊断 / 系统追踪 / 打印后台等）"
         ))
@@ -1200,8 +1389,9 @@ impl Device {
             "com.android.dreams.basic",
         ];
         for pkg in targets {
-            let _ = self.toggle_system_service(adb, pkg, true);
+            let _ = self.toggle_system_service_no_inspect(adb, pkg, true);
         }
+        let _ = self.inspect_system_services(adb);
         Ok("已恢复全部 StepOS 原厂预装系统服务".into())
     }
 
@@ -1218,65 +1408,29 @@ impl Device {
     /// Grants deep Amoo & OpenClaw permissions + background keep-alive (`oom_score_adj = -800`).
     pub fn grant_deep_amoo_permissions(&self, adb: &Adb) -> Result<String> {
         self.verify(adb)?;
+        let mut cmds = Vec::with_capacity(18);
         for pkg in ["com.stepos.ailauncher", "com.stepos.stepclaw"] {
-            let _ = adb.shell(
-                &self.transport,
-                &["dumpsys", "deviceidle", "whitelist", &format!("+{pkg}")],
-            );
-            let _ = adb.shell(
-                &self.transport,
-                &["cmd", "appops", "set", pkg, "RUN_IN_BACKGROUND", "allow"],
-            );
-            let _ = adb.shell(
-                &self.transport,
-                &[
-                    "cmd",
-                    "appops",
-                    "set",
-                    pkg,
-                    "RUN_ANY_IN_BACKGROUND",
-                    "allow",
-                ],
-            );
-            let _ = adb.shell(
-                &self.transport,
-                &[
-                    "cmd",
-                    "appops",
-                    "set",
-                    pkg,
-                    "SYSTEM_EXEMPT_FROM_POWER_RESTRICTIONS",
-                    "allow",
-                ],
-            );
-            let _ = adb.shell(
-                &self.transport,
-                &["cmd", "appops", "set", pkg, "SYSTEM_ALERT_WINDOW", "allow"],
-            );
-            let _ = adb.shell(
-                &self.transport,
-                &["cmd", "appops", "set", pkg, "GET_USAGE_STATS", "allow"],
-            );
-            let _ = adb.shell(
-                &self.transport,
-                &[
-                    "cmd",
-                    "appops",
-                    "set",
-                    pkg,
-                    "MANAGE_EXTERNAL_STORAGE",
-                    "allow",
-                ],
-            );
-            let _ = adb.shell(
-                &self.transport,
-                &["cmd", "appops", "set", pkg, "WRITE_SETTINGS", "allow"],
-            );
-            let _ = adb.shell(
-                &self.transport,
-                &["am", "set-standby-bucket", pkg, "active"],
-            );
+            cmds.push(format!(
+                "dumpsys deviceidle whitelist +{pkg} >/dev/null 2>&1 || true"
+            ));
+            for op in [
+                "RUN_IN_BACKGROUND",
+                "RUN_ANY_IN_BACKGROUND",
+                "SYSTEM_EXEMPT_FROM_POWER_RESTRICTIONS",
+                "SYSTEM_ALERT_WINDOW",
+                "GET_USAGE_STATS",
+                "MANAGE_EXTERNAL_STORAGE",
+                "WRITE_SETTINGS",
+            ] {
+                cmds.push(format!(
+                    "cmd appops set {pkg} {op} allow >/dev/null 2>&1 || true"
+                ));
+            }
+            cmds.push(format!(
+                "am set-standby-bucket {pkg} active >/dev/null 2>&1 || true"
+            ));
         }
+        let _ = adb.script(&self.transport, &cmds.join("; "));
         // Also use root_bridge to lock oom_score_adj = -800 on openclaw gateway & ailauncher processes
         let py = r#"
 import glob, os
@@ -2144,13 +2298,30 @@ pub(crate) fn provider_number(row: &serde_json::Value, key: &str) -> Result<i64>
         .with_context(|| format!("手机记录字段 {key} 无效"))
 }
 
+fn clean_nullable_field(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("null") {
+        String::new()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 pub fn parse_call_records(value: &serde_json::Value) -> Result<Vec<CallRecord>> {
     let rows = value["rows"].as_array().context("手机未返回通话记录列表")?;
     rows.iter()
         .map(|row| {
+            let number = clean_nullable_field(row["number"].as_str().unwrap_or(""));
+            let name = clean_nullable_field(
+                row["name"]
+                    .as_str()
+                    .or_else(|| row["cached_name"].as_str())
+                    .or_else(|| row["CACHED_NAME"].as_str())
+                    .unwrap_or(""),
+            );
             Ok(CallRecord {
-                number: row["number"].as_str().unwrap_or("").into(),
-                name: row["name"].as_str().unwrap_or("").into(),
+                number,
+                name,
                 call_type: provider_number(row, "type")? as u8,
                 date_ms: provider_number(row, "date")?,
                 duration_sec: provider_number(row, "duration")?.max(0) as u64,
@@ -2162,13 +2333,18 @@ pub fn parse_call_records(value: &serde_json::Value) -> Result<Vec<CallRecord>> 
 pub fn parse_contact_records(value: &serde_json::Value) -> Result<Vec<ContactEntry>> {
     let rows = value["rows"].as_array().context("手机未返回通讯录列表")?;
     let mut contacts = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for row in rows {
-        let entry = ContactEntry {
-            name: row["display_name"].as_str().unwrap_or("").into(),
-            number: row["data1"].as_str().unwrap_or("").into(),
-        };
-        if !contacts.contains(&entry) {
-            contacts.push(entry);
+        let mut name = clean_nullable_field(row["display_name"].as_str().unwrap_or(""));
+        let number = clean_nullable_field(row["data1"].as_str().unwrap_or(""));
+        if number.is_empty() {
+            continue;
+        }
+        if name.is_empty() {
+            name = number.clone();
+        }
+        if seen.insert((name.clone(), number.clone())) {
+            contacts.push(ContactEntry { name, number });
         }
     }
     Ok(contacts)
@@ -2186,13 +2362,13 @@ pub fn parse_call_logs(raw: &str) -> Vec<CallRecord> {
         let mut rec = CallRecord::default();
         for part in row.split(", ") {
             if let Some(v) = part.strip_prefix("number=") {
-                if v != "NULL" {
-                    rec.number = v.trim().to_string();
-                }
-            } else if let Some(v) = part.strip_prefix("name=") {
-                if v != "NULL" {
-                    rec.name = v.trim().to_string();
-                }
+                rec.number = clean_nullable_field(v);
+            } else if let Some(v) = part
+                .strip_prefix("name=")
+                .or_else(|| part.strip_prefix("CACHED_NAME="))
+                .or_else(|| part.strip_prefix("cached_name="))
+            {
+                rec.name = clean_nullable_field(v);
             } else if let Some(v) = part.strip_prefix("type=") {
                 rec.call_type = v.trim().parse().unwrap_or(1);
             } else if let Some(v) = part.strip_prefix("date=") {
@@ -2222,13 +2398,9 @@ pub fn parse_contacts(raw: &str) -> Vec<ContactEntry> {
         let mut number = String::new();
         for part in rest.split(", ") {
             if let Some(v) = part.strip_prefix("display_name=") {
-                if v != "NULL" {
-                    name = v.trim().to_string();
-                }
+                name = clean_nullable_field(v);
             } else if let Some(v) = part.strip_prefix("data1=") {
-                if v != "NULL" {
-                    number = v.trim().to_string();
-                }
+                number = clean_nullable_field(v);
             }
         }
         if !number.is_empty() {
@@ -2561,23 +2733,74 @@ pub fn derive_openclaw_token(android_id: &str) -> String {
     hex
 }
 
-pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
-    const K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
-        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
-        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
-        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
-        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
-        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-        0xc67178f2,
-    ];
-    let mut h: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-        0x5be0cd19,
-    ];
+const SHA256_K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+const SHA256_INIT: [u32; 8] = [
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+];
+
+fn sha256_compress(h: &mut [u32; 8], chunk: &[u8; 64]) {
+    let mut w = [0u32; 64];
+    for (i, word) in chunk.chunks_exact(4).enumerate() {
+        w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+    }
+    for i in 16..64 {
+        let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+        let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16]
+            .wrapping_add(s0)
+            .wrapping_add(w[i - 7])
+            .wrapping_add(s1);
+    }
+    let mut a = h[0];
+    let mut b = h[1];
+    let mut c = h[2];
+    let mut d = h[3];
+    let mut e = h[4];
+    let mut f = h[5];
+    let mut g = h[6];
+    let mut hh = h[7];
+    for i in 0..64 {
+        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+        let ch = (e & f) ^ ((!e) & g);
+        let temp1 = hh
+            .wrapping_add(s1)
+            .wrapping_add(ch)
+            .wrapping_add(SHA256_K[i])
+            .wrapping_add(w[i]);
+        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+        let maj = (a & b) ^ (a & c) ^ (b & c);
+        let temp2 = s0.wrapping_add(maj);
+        hh = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(temp1);
+        d = c;
+        c = b;
+        b = a;
+        a = temp1.wrapping_add(temp2);
+    }
+    h[0] = h[0].wrapping_add(a);
+    h[1] = h[1].wrapping_add(b);
+    h[2] = h[2].wrapping_add(c);
+    h[3] = h[3].wrapping_add(d);
+    h[4] = h[4].wrapping_add(e);
+    h[5] = h[5].wrapping_add(f);
+    h[6] = h[6].wrapping_add(g);
+    h[7] = h[7].wrapping_add(hh);
+}
+
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    let mut h = SHA256_INIT;
     let bit_len = (data.len() as u64) * 8;
     let mut padded = data.to_vec();
     padded.push(0x80);
@@ -2586,60 +2809,73 @@ pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
     }
     padded.extend_from_slice(&bit_len.to_be_bytes());
     for chunk in padded.chunks_exact(64) {
-        let mut w = [0u32; 64];
-        for (i, word) in chunk.chunks_exact(4).enumerate() {
-            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[i - 7])
-                .wrapping_add(s1);
-        }
-        let mut a = h[0];
-        let mut b = h[1];
-        let mut c = h[2];
-        let mut d = h[3];
-        let mut e = h[4];
-        let mut f = h[5];
-        let mut g = h[6];
-        let mut hh = h[7];
-        for i in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ ((!e) & g);
-            let temp1 = hh
-                .wrapping_add(s1)
-                .wrapping_add(ch)
-                .wrapping_add(K[i])
-                .wrapping_add(w[i]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let temp2 = s0.wrapping_add(maj);
-            hh = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
-        }
-        h[0] = h[0].wrapping_add(a);
-        h[1] = h[1].wrapping_add(b);
-        h[2] = h[2].wrapping_add(c);
-        h[3] = h[3].wrapping_add(d);
-        h[4] = h[4].wrapping_add(e);
-        h[5] = h[5].wrapping_add(f);
-        h[6] = h[6].wrapping_add(g);
-        h[7] = h[7].wrapping_add(hh);
+        let block: &[u8; 64] = chunk.try_into().unwrap();
+        sha256_compress(&mut h, block);
     }
     let mut out = [0u8; 32];
     for (i, word) in h.iter().enumerate() {
         out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
     }
     out
+}
+
+pub fn sha256_reader(mut reader: impl std::io::Read) -> std::io::Result<String> {
+    let mut h = SHA256_INIT;
+    let mut total_bytes: u64 = 0;
+    let mut pending = [0u8; 64];
+    let mut pending_len = 0usize;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        total_bytes = total_bytes.wrapping_add(n as u64);
+        let mut slice = &buf[..n];
+        if pending_len > 0 {
+            let take = (64 - pending_len).min(slice.len());
+            pending[pending_len..pending_len + take].copy_from_slice(&slice[..take]);
+            pending_len += take;
+            slice = &slice[take..];
+            if pending_len == 64 {
+                sha256_compress(&mut h, &pending);
+                pending_len = 0;
+            }
+        }
+        let mut chunks = slice.chunks_exact(64);
+        for chunk in &mut chunks {
+            let block: &[u8; 64] = chunk.try_into().unwrap();
+            sha256_compress(&mut h, block);
+        }
+        let rem = chunks.remainder();
+        if !rem.is_empty() {
+            pending[..rem.len()].copy_from_slice(rem);
+            pending_len = rem.len();
+        }
+    }
+    let bit_len = total_bytes.wrapping_mul(8);
+    pending[pending_len] = 0x80;
+    pending_len += 1;
+    if pending_len > 56 {
+        pending[pending_len..64].fill(0);
+        sha256_compress(&mut h, &pending);
+        pending_len = 0;
+    }
+    pending[pending_len..56].fill(0);
+    pending[56..64].copy_from_slice(&bit_len.to_be_bytes());
+    sha256_compress(&mut h, &pending);
+
+    let mut hex = String::with_capacity(64);
+    for word in h {
+        use std::fmt::Write;
+        let _ = write!(&mut hex, "{word:08x}");
+    }
+    Ok(hex)
+}
+
+pub fn sha256_file(path: &std::path::Path) -> std::io::Result<String> {
+    let file = std::fs::File::open(path)?;
+    sha256_reader(file)
 }
 
 fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
@@ -2664,6 +2900,31 @@ fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     outer.extend_from_slice(&opad);
     outer.extend_from_slice(&inner_hash);
     sha256(&outer)
+}
+
+pub fn parse_wm_size(output: &str) -> (u32, u32) {
+    let mut physical = None;
+    for line in output.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("Override size:") {
+            if let Some((w, h)) = rest.trim().split_once('x') {
+                if let (Ok(w), Ok(h)) = (w.trim().parse::<u32>(), h.trim().parse::<u32>()) {
+                    if w > 0 && h > 0 {
+                        return (w, h);
+                    }
+                }
+            }
+        } else if let Some(rest) = line.strip_prefix("Physical size:") {
+            if let Some((w, h)) = rest.trim().split_once('x') {
+                if let (Ok(w), Ok(h)) = (w.trim().parse::<u32>(), h.trim().parse::<u32>()) {
+                    if w > 0 && h > 0 {
+                        physical = Some((w, h));
+                    }
+                }
+            }
+        }
+    }
+    physical.unwrap_or((1080, 2400))
 }
 
 #[cfg(test)]
@@ -2705,8 +2966,8 @@ mod generic_apk_install_tests {
     #[test]
     fn deduplicates_four_line_adb_devices_and_preserves_wireless_backups() {
         use super::{
-            canonical_serial_from_transport, deduplicate_multi_transport_devices, parse_devices,
-            transport_priority, Device,
+            canonical_serial_from_transport, deduplicate_multi_transport_devices,
+            deduplicate_transports, parse_devices, transport_priority, Device,
         };
 
         let sample = "\
@@ -2726,6 +2987,16 @@ adb-ZYPZ261A01M692000LP-jYyV3X._adb-tls-connect._tcp device product:pandora mode
         assert_eq!(transports[1].model, "PZ261A");
         assert_eq!(
             transports[1].backup_transports(),
+            vec![
+                "10.0.1.177:34883".to_string(),
+                "adb-ZYPZ261A01M692000LP-jYyV3X._adb-tls-connect._tcp".to_string(),
+            ]
+        );
+
+        let rededuped = deduplicate_transports(transports);
+        assert_eq!(rededuped.len(), 2);
+        assert_eq!(
+            rededuped[1].backup_transports(),
             vec![
                 "10.0.1.177:34883".to_string(),
                 "adb-ZYPZ261A01M692000LP-jYyV3X._adb-tls-connect._tcp".to_string(),
@@ -2775,5 +3046,16 @@ adb-ZYPZ261A01M692000LP-jYyV3X._adb-tls-connect._tcp device product:pandora mode
                 "adb-ZYPZ261A01M692000LP-jYyV3X._adb-tls-connect._tcp".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn parses_wm_size_physical_and_override() {
+        use super::parse_wm_size;
+        assert_eq!(parse_wm_size("Physical size: 1260x2800\n"), (1260, 2800));
+        assert_eq!(
+            parse_wm_size("Physical size: 1260x2800\nOverride size: 1080x2400\n"),
+            (1080, 2400)
+        );
+        assert_eq!(parse_wm_size(""), (1080, 2400));
     }
 }

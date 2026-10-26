@@ -13,12 +13,24 @@ const MAX_PIXELS: u64 = 64 * 1024 * 1024;
 const MAX_CACHE: u64 = 512 * 1024 * 1024;
 const MAX_OBJECTS: usize = 2048;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
 struct Reference {
     version: u8,
     content: String,
     bytes: u64,
 }
+
+type FileCacheKey = (PathBuf, u64, Option<std::time::SystemTime>);
+
+static VALID_IMAGE_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<FileCacheKey, bool>>,
+> = std::sync::OnceLock::new();
+
+static FILE_DIGEST_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<FileCacheKey, String>>,
+> = std::sync::OnceLock::new();
+
+static SAVE_PRUNE_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub(super) fn root() -> Option<PathBuf> {
     if cfg!(windows) {
@@ -51,29 +63,69 @@ fn reference_keys(url: &str, identity: Option<&str>) -> Vec<String> {
     keys
 }
 fn valid_image(path: &Path) -> bool {
+    use image::GenericImageView;
     let Ok(meta) = std::fs::symlink_metadata(path) else {
         return false;
     };
     if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_IMAGE {
         return false;
     }
-    let Ok(reader) = image::ImageReader::open(path) else {
-        return false;
-    };
-    let Ok(reader) = reader.with_guessed_format() else {
-        return false;
-    };
-    let Ok((width, height)) = reader.into_dimensions() else {
-        return false;
-    };
-    if width == 0 || height == 0 || u64::from(width) * u64::from(height) > MAX_PIXELS {
-        return false;
+    let cache_key = (path.to_path_buf(), meta.len(), meta.modified().ok());
+    let cache =
+        VALID_IMAGE_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Ok(map) = cache.lock() {
+        if let Some(&valid) = map.get(&cache_key) {
+            return valid;
+        }
     }
-    image::ImageReader::open(path)
-        .ok()
-        .and_then(|r| r.with_guessed_format().ok())
-        .and_then(|r| r.decode().ok())
-        .is_some()
+    let valid = (|| {
+        let reader = image::ImageReader::open(path)
+            .ok()?
+            .with_guessed_format()
+            .ok()?;
+        let image = reader.decode().ok()?;
+        let (w, h) = image.dimensions();
+        Some(w > 0 && h > 0 && u64::from(w) * u64::from(h) <= MAX_PIXELS)
+    })()
+    .unwrap_or(false);
+    if let Ok(mut map) = cache.lock() {
+        if map.len() > 512 {
+            map.clear();
+        }
+        map.insert(cache_key, valid);
+    }
+    valid
+}
+fn file_digest(path: &Path, expected_bytes: Option<u64>) -> Option<String> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_IMAGE {
+        return None;
+    }
+    if let Some(expected) = expected_bytes {
+        if meta.len() != expected {
+            return None;
+        }
+    }
+    let cache_key = (path.to_path_buf(), meta.len(), meta.modified().ok());
+    let cache =
+        FILE_DIGEST_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Ok(map) = cache.lock() {
+        if let Some(digest) = map.get(&cache_key) {
+            return Some(digest.clone());
+        }
+    }
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.len() as u64 != meta.len() {
+        return None;
+    }
+    let digest = hash(&bytes);
+    if let Ok(mut map) = cache.lock() {
+        if map.len() > 512 {
+            map.clear();
+        }
+        map.insert(cache_key, digest.clone());
+    }
+    Some(digest)
 }
 fn private_directory(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path)?;
@@ -90,10 +142,21 @@ fn private_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 fn write_reference(directory: &Path, key: &str, reference: &Reference) -> Result<()> {
+    let target = directory.join(format!("{key}.json"));
+    if let Some(existing) = std::fs::symlink_metadata(&target)
+        .ok()
+        .filter(|m| m.is_file() && m.len() <= 1024)
+        .and_then(|_| std::fs::read(&target).ok())
+        .and_then(|bytes| serde_json::from_slice::<Reference>(&bytes).ok())
+    {
+        if existing == *reference {
+            return Ok(());
+        }
+    }
     let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
     serde_json::to_writer(&mut temporary, reference)?;
     temporary.flush()?;
-    temporary.persist(directory.join(format!("{key}.json")))?;
+    temporary.persist(target)?;
     Ok(())
 }
 fn touch(path: &Path) {
@@ -101,6 +164,17 @@ fn touch(path: &Path) {
         let _ =
             file.set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()));
     }
+}
+fn touch_throttled(path: &Path) {
+    if std::fs::symlink_metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < std::time::Duration::from_secs(2))
+    {
+        return;
+    }
+    touch(path);
 }
 
 pub(super) fn load(root: &Path, scope: &str, url: &str) -> Option<PathBuf> {
@@ -139,10 +213,8 @@ pub(super) fn load_with_identity(
         if !valid_image(&path) {
             continue;
         }
-        let Some(bytes) = std::fs::read(&path).ok() else {
-            continue;
-        };
-        if bytes.len() as u64 != reference.bytes || hash(&bytes) != reference.content {
+        if file_digest(&path, Some(reference.bytes)).as_deref() != Some(reference.content.as_str())
+        {
             continue;
         }
         // Teach an exact newly signed URL about an already verified source
@@ -150,7 +222,7 @@ pub(super) fn load_with_identity(
         for alias in &keys {
             let _ = write_reference(&refs, alias, &reference);
         }
-        touch(&path);
+        touch_throttled(&path);
         return Some(path);
     }
     // Migrate only an exact known reference from the old cache. Never scan by
@@ -209,9 +281,7 @@ pub(super) fn save_with_identity(
     let content = hash(&bytes);
     let path = objects.join(format!("{content}.image"));
     if !valid_image(&path)
-        || std::fs::read(&path)
-            .ok()
-            .is_none_or(|stored| hash(&stored) != content)
+        || file_digest(&path, Some(bytes.len() as u64)).as_deref() != Some(content.as_str())
     {
         let mut temporary = tempfile::NamedTempFile::new_in(&objects)?;
         temporary.write_all(&bytes)?;
@@ -227,7 +297,9 @@ pub(super) fn save_with_identity(
         write_reference(&refs, &key, &reference)?;
     }
     touch(&path);
-    prune(&directory, &path, MAX_CACHE, MAX_OBJECTS)?;
+    if SAVE_PRUNE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 16 == 0 {
+        prune(&directory, &path, MAX_CACHE, MAX_OBJECTS)?;
+    }
     Ok(path)
 }
 

@@ -36,6 +36,8 @@ ALLOWLIST_DIRS: Tuple[str, ...] = (
     "desktop/companion-app/libs",
     "desktop/companion-permissions",
     "desktop/neo-agent-adapter",
+    "handoff/google-play-stepx/tools",
+    "handoff/google-play-stepx/module",
 )
 
 ALLOWLIST_FILES: Tuple[str, ...] = (

@@ -141,6 +141,18 @@ def verify_payload(root,release):
         if info.get('CFBundleShortVersionString')!=release['version']:raise ValueError('安装包版本不匹配')
     return payload,exe
 
+def tree_fingerprint(dest):
+    entries=[]
+    for cur,dirs,files in os.walk(dest,followlinks=False):
+        dirs.sort();files.sort()
+        base=Path(cur)
+        for name in dirs+files:
+            p=base/name;rel=p.relative_to(dest).as_posix();st=p.lstat()
+            if stat.S_ISLNK(st.st_mode):entries.append([rel,'L',os.readlink(p)])
+            elif stat.S_ISDIR(st.st_mode):entries.append([rel,'D',st.st_mode&0o777])
+            else:entries.append([rel,'F',st.st_size,st.st_mtime_ns,st.st_ino])
+    return entries
+
 def download(release,job):
     job=Path(job); job.mkdir(parents=True,exist_ok=True)
     cancelled(job)
@@ -173,11 +185,13 @@ def download(release,job):
         root=dest/release['name'].removesuffix('.tar.gz').removesuffix('.zip')
         payload,exe=verify_payload(root,release)
         # Verified bytes are retained to re-check before preparing installation.
+        atomic_json(job/'unpacked.json',dict(sha256=expected,files=tree_fingerprint(dest)))
         atomic_json(job/'ready.json',dict(release=release,sha256=expected,payload=str(payload),exe=str(exe)))
         cancelled(job)
         emit('ready',job=str(job))
     except BaseException:
         archive.unlink(missing_ok=True)
+        (job/'unpacked.json').unlink(missing_ok=True)
         shutil.rmtree(job/'unpacked',ignore_errors=True)
         raise
 
@@ -198,11 +212,23 @@ def installation_target(executable,platform):
 def prepare(job,executable,pid):
     job=Path(job); ready=json.loads((job/'ready.json').read_text(encoding='utf-8'));r=ready['release']
     if digest_file(job/'package.part')!=ready['sha256']:raise ValueError('暂存包已变化，请重新下载')
-    # Discard extracted files and re-extract from verified archive (no staging TOCTOU).
-    shutil.rmtree(job/'unpacked'); (job/'unpacked').mkdir()
-    extract(job/'package.part',job/'unpacked',job)
-    root=job/'unpacked'/r['name'].removesuffix('.tar.gz').removesuffix('.zip')
-    payload,newexe=verify_payload(root,r)
+    dest=job/'unpacked'
+    root=dest/r['name'].removesuffix('.tar.gz').removesuffix('.zip')
+    payload=newexe=None
+    marker=job/'unpacked.json'
+    if dest.is_dir() and marker.is_file():
+        try:
+            info=json.loads(marker.read_text(encoding='utf-8'))
+            if info.get('sha256')==ready['sha256'] and info.get('files')==tree_fingerprint(dest):
+                payload,newexe=verify_payload(root,r)
+        except Exception:
+            payload=newexe=None
+    if payload is None or newexe is None:
+        # Discard extracted files and re-extract from verified archive (no staging TOCTOU).
+        shutil.rmtree(dest,ignore_errors=True); dest.mkdir()
+        extract(job/'package.part',dest,job)
+        payload,newexe=verify_payload(root,r)
+        atomic_json(marker,dict(sha256=ready['sha256'],files=tree_fingerprint(dest)))
     target=installation_target(executable,r['platform'])
     mac=r['platform'].startswith('macos')
     stem=target.stem if mac else target.name; suffix='.app' if mac else ''

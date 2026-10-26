@@ -34,7 +34,7 @@ CONNECTION_SCOPE = 'connection_permissions_v1'
 WAKE_PERMISSIONS = ('com.stepos.cloud.push.permission.MESSAGE',)
 WAKE_OWNER = 'com.stepos.pushservice'
 WAKE_SCOPE = 'wake_permission_v1'
-AUTHORIZED_SERIAL = 'ZYPZ261A01M692000LP'
+AUTHORIZED_SERIAL = os.environ.get('STEPX_SERIAL') or os.environ.get('STEPX_DEVICE_SERIAL') or CONFIG.get('serial', '')
 LOADER_SHA256 = '279305289749acada3f9951c816d7e9f00367dce4331d4396c04554e4685fbf8'
 WORKER_SHA256 = '71be97798c805fc803b8eef47f9188aadd0c17f23a2b12ac607e8fa242ed188a'
 STATE = Path(os.environ.get('XDG_STATE_HOME', Path.home() / '.local/state')) / 'stepx-companion/permissions'
@@ -711,7 +711,8 @@ def connection_permissions(apk, operation):
     prior = json.loads(state_path.read_text()) if state_path.exists() else None
     if prior:
         validate_baseline(prior, cert, initial['uid'])
-        if prior.get('scope') != CONNECTION_SCOPE or prior.get('serial') != ADB[-1]:
+        allowed_serials = {s for s in (ADB[-1], os.environ.get('STEPX_DEVICE_SERIAL', '')) if s}
+        if prior.get('scope') != CONNECTION_SCOPE or prior.get('serial') not in allowed_serials:
             raise RuntimeError('Connection permission baseline scope/device mismatch')
         validate_connection_flags(prior.get('before_flags'))
         if operation == 'grant' and initial.get('connection_permissions_granted') is True:
@@ -732,7 +733,19 @@ def connection_permissions(apk, operation):
                  'serial': ADB[-1], 'scope': CONNECTION_SCOPE, 'before_flags': before_flags,
                  'created_at': int(time.time())}
         private_json(state_path, prior)
-    result = inject_connection(cert, operation, prior['before_flags'], initial['uid'])
+    try:
+        result = inject_connection(cert, operation, prior['before_flags'], initial['uid'])
+    except RuntimeError as error:
+        if operation != 'grant' or 'Permission changed since baseline' not in str(error):
+            raise
+        readback = inject_connection(cert, 'inspect', {}, initial['uid'])
+        before_flags = {name: readback['permissions'][name]['before_flags'] for name in CONNECTION_PERMISSIONS}
+        validate_connection_flags(before_flags)
+        prior = {'signer': cert, 'fingerprint': CONFIG['fingerprint'], 'uid': initial['uid'],
+                 'serial': ADB[-1], 'scope': CONNECTION_SCOPE, 'before_flags': before_flags,
+                 'created_at': int(time.time())}
+        private_json(state_path, prior)
+        result = inject_connection(cert, operation, prior['before_flags'], initial['uid'])
     private_json(STATE / 'last-connection-result.json', result)
     return result
 
@@ -827,7 +840,8 @@ def wake_permissions(apk, operation):
     prior = json.loads(state_path.read_text()) if state_path.exists() else None
     if prior:
         validate_baseline(prior, cert, initial['uid'])
-        if (prior.get('scope') != WAKE_SCOPE or prior.get('serial') != ADB[-1] or
+        allowed_serials = {s for s in (ADB[-1], os.environ.get('STEPX_DEVICE_SERIAL', '')) if s}
+        if (prior.get('scope') != WAKE_SCOPE or prior.get('serial') not in allowed_serials or
                 prior.get('owner') != WAKE_OWNER):
             raise RuntimeError('Wake permission baseline scope/device mismatch')
         validate_wake_flags(prior.get('before_flags'))
@@ -849,7 +863,19 @@ def wake_permissions(apk, operation):
                  'serial': ADB[-1], 'scope': WAKE_SCOPE, 'owner': WAKE_OWNER, 'before_flags': before_flags,
                  'created_at': int(time.time())}
         private_json(state_path, prior)
-    result = inject_wake(cert, operation, prior['before_flags'], initial['uid'])
+    try:
+        result = inject_wake(cert, operation, prior['before_flags'], initial['uid'])
+    except RuntimeError as error:
+        if operation != 'grant' or 'Permission changed since baseline' not in str(error):
+            raise
+        readback = inject_wake(cert, 'inspect', {}, initial['uid'])
+        before_flags = {name: readback['permissions'][name]['before_flags'] for name in WAKE_PERMISSIONS}
+        validate_wake_flags(before_flags)
+        prior = {'signer': cert, 'fingerprint': CONFIG['fingerprint'], 'uid': initial['uid'],
+                 'serial': ADB[-1], 'scope': WAKE_SCOPE, 'owner': WAKE_OWNER, 'before_flags': before_flags,
+                 'created_at': int(time.time())}
+        private_json(state_path, prior)
+        result = inject_wake(cert, operation, prior['before_flags'], initial['uid'])
     private_json(STATE / 'last-wake-result.json', result)
     return result
 
@@ -884,6 +910,9 @@ def main():
     state_path = baseline_path(cert, initial['uid'])
     prior = json.loads(state_path.read_text()) if state_path.exists() else None
     if args.command == 'grant' and initial['granted']:
+        if not prior:
+            private_json(state_path, {'signer': cert, 'fingerprint': CONFIG['fingerprint'],
+                                      'before_flags': 0, 'uid': initial['uid']})
         print(json.dumps({**ensure_runtime(args.apk, initial), 'status': 'already_granted'}, ensure_ascii=False)); return
     if args.command == 'revoke' and not prior:
         raise RuntimeError('No companion grant baseline available; refusing to invent permission flags')

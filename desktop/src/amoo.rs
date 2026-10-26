@@ -233,11 +233,10 @@ pub fn parse_stream_event(frame: &Value) -> Option<StreamDelta> {
     } else {
         raw_session_key
     };
-    let session_key = if raw_session_key.is_empty() {
-        "agent:main:main".to_string()
-    } else {
-        raw_session_key.to_string()
-    };
+    if raw_session_key.is_empty() {
+        return None;
+    }
+    let session_key = raw_session_key.to_string();
 
     let run_id = {
         let r = string(payload, &["runId", "run_id", "id"]);
@@ -356,13 +355,19 @@ pub fn parse_stream_event(frame: &Value) -> Option<StreamDelta> {
             tool_name = tools
                 .iter()
                 .filter_map(|t| t["name"].as_str().filter(|s| !s.is_empty()))
+                .map(friendly_tool_label)
                 .collect::<Vec<_>>()
                 .join(" · ");
         }
     }
 
     let tool_status = if !tool_name.is_empty() {
-        Some(format!("正在调用工具：{tool_name}"))
+        let friendly_name = tool_name
+            .split(" · ")
+            .map(friendly_tool_label)
+            .collect::<Vec<_>>()
+            .join(" · ");
+        Some(format!("正在调用工具：{friendly_name}"))
     } else if is_tool_event && !finished {
         let status_label = string(payload, &["status", "phase"]);
         if !status_label.is_empty()
@@ -371,7 +376,10 @@ pub fn parse_stream_event(frame: &Value) -> Option<StreamDelta> {
                 "tool_use" | "tool" | "running" | "started"
             )
         {
-            Some(format!("正在调用工具：{status_label}"))
+            Some(format!(
+                "正在调用工具：{}",
+                friendly_tool_label(status_label)
+            ))
         } else {
             Some("正在调用工具…".to_string())
         }
@@ -746,9 +754,9 @@ impl AgentBus {
         selected: Option<&str>,
         pending: &[String],
     ) -> Result<RealAmooData> {
-        let scope_before = crate::amoo_usage::account_scope(&self._forward.adb, &self.device)
-            .ok()
-            .flatten();
+        let snapshot_started = Instant::now();
+        let scope_before_res = crate::amoo_usage::account_scope(&self._forward.adb, &self.device);
+        let scope_before = scope_before_res.as_ref().ok().cloned().flatten();
         let payload = self.call("sessions.list", json!({"limit":100}))?;
         let rows = payload["sessions"]
             .as_array()
@@ -799,6 +807,10 @@ impl AgentBus {
                 Instant::now() + Duration::from_secs(12),
             );
             session.messages.sort_by_key(|message| message.timestamp_ms);
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let (status, status_kind) = status_from_session_and_history(session, now_ms);
+            session.status = status;
+            session.status_kind = status_kind;
             // Report the last real parent-session inference, not a catalog default
             // or the model used by an unrelated child task.
             session.model = recent_session_model(session)
@@ -812,9 +824,14 @@ impl AgentBus {
             );
             session.history_loaded = true;
         }
-        let scope_after = crate::amoo_usage::account_scope(&self._forward.adb, &self.device)
-            .ok()
-            .flatten();
+        let scope_after =
+            if scope_before_res.is_ok() && snapshot_started.elapsed() < Duration::from_secs(5) {
+                data.account_scope.clone()
+            } else {
+                crate::amoo_usage::account_scope(&self._forward.adb, &self.device)
+                    .ok()
+                    .flatten()
+            };
         if data.account_scope != scope_after {
             bail!("同步期间手机 Amoo 账号已改变，请重新同步；未合并不同账号的记录");
         }
@@ -987,6 +1004,18 @@ impl AgentBus {
             },
         })
     }
+
+    pub fn abort(&mut self, session_key: &str, run_id: Option<&str>) -> Result<()> {
+        let mut params = json!({
+            "sessionKey": session_key,
+            "sessionId": session_key,
+        });
+        if let Some(id) = run_id.filter(|s| !s.is_empty()) {
+            params["runId"] = json!(id);
+        }
+        let _ = self.call_with_timeout("chat.abort", params, Duration::from_secs(3));
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1006,22 +1035,40 @@ pub struct PendingReply {
 
 impl PendingReply {
     pub fn finished(&self, session: &RealSessionInfo) -> bool {
-        if session.key == self.key
-            && session
-                .messages
-                .iter()
-                .any(|m| m.run_id == self.run_id && m.stop_reason == "tracking_limit")
+        if session.key != self.key {
+            return false;
+        }
+        if session
+            .messages
+            .iter()
+            .any(|m| m.run_id == self.run_id && m.stop_reason == "tracking_limit")
         {
             return true;
         }
-        session.key == self.key
-            && !session
-                .messages
-                .iter()
-                .any(|m| m.run_id == self.run_id && m.stop_reason == "child_running")
-            && session.messages.iter().any(|m| {
-                m.role == "assistant" && m.run_id == self.run_id && is_terminal(&m.stop_reason)
-            })
+        if session
+            .messages
+            .iter()
+            .any(|m| m.run_id == self.run_id && m.stop_reason == "child_running")
+        {
+            return false;
+        }
+        if session.messages.iter().any(|m| {
+            m.role == "assistant" && m.run_id == self.run_id && is_terminal(&m.stop_reason)
+        }) {
+            return true;
+        }
+        // Fallback when the service omits runId on the final assistant message:
+        // check assistant messages strictly after our user turn.
+        let user_pos = session
+            .messages
+            .iter()
+            .rposition(|m| m.role == "user" && m.run_id == self.run_id);
+        if let Some(idx) = user_pos {
+            return session.messages[idx + 1..].iter().any(|m| {
+                m.role == "assistant" && m.run_id.is_empty() && is_terminal(&m.stop_reason)
+            });
+        }
+        false
     }
 }
 
@@ -1071,7 +1118,7 @@ pub(crate) fn poll_stream_events_from_stream(
     Ok(out)
 }
 
-fn is_terminal(reason: &str) -> bool {
+pub fn is_terminal(reason: &str) -> bool {
     matches!(
         reason.to_ascii_lowercase().as_str(),
         "stop"
@@ -1082,7 +1129,38 @@ fn is_terminal(reason: &str) -> bool {
             | "length"
             | "tracking_limit"
             | "task_delivered"
+            | "completed"
+            | "done"
+            | "finished"
+            | "stop_sequence"
     )
+}
+
+pub(crate) fn status_from_session_and_history(
+    session: &RealSessionInfo,
+    now_ms: i64,
+) -> (String, u8) {
+    if let Some(last) = session.messages.last() {
+        if last.role == "user" || (!last.stop_reason.is_empty() && !is_terminal(&last.stop_reason))
+        {
+            return ("进行中".into(), 1);
+        }
+        if last.role != "user" {
+            if is_terminal(&last.stop_reason) {
+                return ("已完成".into(), 2);
+            }
+            if last.stop_reason.is_empty()
+                && !last.text.trim().is_empty()
+                && (last.timestamp_ms <= 0 || now_ms.saturating_sub(last.timestamp_ms) > 15_000)
+            {
+                return ("已完成".into(), 2);
+            }
+        }
+        if session.status_kind != 1 {
+            return ("已完成".into(), 2);
+        }
+    }
+    (session.status.clone(), session.status_kind)
 }
 
 struct ChildTask {
@@ -1213,6 +1291,24 @@ pub fn fetch(adb: &Adb, device: &Device, selected: Option<&str>) -> Result<RealA
     AgentBus::connect(adb, device)?.snapshot(selected)
 }
 
+pub fn friendly_tool_label(raw: &str) -> &str {
+    match raw.trim() {
+        "batch_file_upload_return_all" => "批量上传文件",
+        "task_result_submit" => "提交任务成果",
+        "sessions_spawn" => "启动协同子智能体",
+        "task_create" => "创建拆解任务",
+        "text_to_image" => "AI 图像生成",
+        "web_search" => "联网搜索",
+        "web_fetch" | "fetch_page" => "读取网页",
+        "bash" | "exec" | "run_command" => "执行终端命令",
+        "read" | "read_file" => "读取文件",
+        "write" | "write_file" => "写入文件",
+        "edit" | "edit_file" => "编辑文件",
+        "browser" => "浏览器操作",
+        other => other,
+    }
+}
+
 fn string<'a>(value: &'a Value, names: &[&str]) -> &'a str {
     names
         .iter()
@@ -1230,7 +1326,14 @@ fn parse_sessions(rows: &[Value]) -> Result<RealAmooData> {
         if key.is_empty() {
             bail!("Amoo 会话缺少真实标识，已停止同步");
         }
-        let title = string(row, &["title", "displayName", "name"]);
+        let raw_title = string(row, &["title", "displayName", "name"]).trim();
+        let title = if raw_title.is_empty() {
+            "未命名会话"
+        } else if raw_title == "main" || raw_title == "default" || raw_title.starts_with("agent:") {
+            "主对话"
+        } else {
+            raw_title
+        };
         let status = string(row, &["status"]);
         let (label, kind) = match status {
             "done" => ("已完成", 2),
@@ -1243,11 +1346,7 @@ fn parse_sessions(rows: &[Value]) -> Result<RealAmooData> {
         data.sessions.push(RealSessionInfo {
             key: key.into(),
             session_id: string(row, &["id"]).into(),
-            title: if title.is_empty() {
-                "未命名会话".into()
-            } else {
-                title.into()
-            },
+            title: title.into(),
             agent: "Amoo 助手".into(),
             status: label.into(),
             status_kind: kind,
@@ -1949,9 +2048,24 @@ mod tests {
         assert_eq!(tool_delta.session_key, "agent:main:s1");
         assert_eq!(
             tool_delta.tool_status.as_deref(),
-            Some("正在调用工具：web_search")
+            Some("正在调用工具：联网搜索")
         );
         assert!(!tool_delta.finished);
+
+        let upload_frame = json!({
+            "type": "event",
+            "event": "agent.tool.call",
+            "payload": {
+                "sessionKey": "agent:main:s1",
+                "runId": "run-42",
+                "toolName": "batch_file_upload_return_all"
+            }
+        });
+        let upload_delta = parse_stream_event(&upload_frame).unwrap();
+        assert_eq!(
+            upload_delta.tool_status.as_deref(),
+            Some("正在调用工具：批量上传文件")
+        );
 
         let done_frame = json!({
             "type": "event",
@@ -2039,5 +2153,108 @@ mod tests {
         assert!(expired.is_none());
         // Entry was evicted upon expiration check
         assert!(get_cached_amoo_context_at(&key, now + Duration::from_secs(10)).is_none());
+    }
+
+    #[test]
+    fn pending_reply_finishes_on_terminal_assistant_message_without_run_id_after_user_turn() {
+        let pending = PendingReply {
+            key: "session".into(),
+            text: "测试无 runId 终态回复".into(),
+            run_id: "run-target".into(),
+        };
+        let mut session = RealSessionInfo {
+            key: "session".into(),
+            messages: parse_messages(&[
+                json!({"role":"user","text":"上一轮","runId":"run-prev"}),
+                json!({"role":"assistant","text":"上一轮无 runId 回复","stopReason":"completed"}),
+                json!({"role":"user","text":"测试无 runId 终态回复","runId":"run-target"}),
+                json!({"role":"assistant","text":"流式中间态","stopReason":"streaming"}),
+            ])
+            .unwrap(),
+            ..Default::default()
+        };
+        // Earlier assistant message without run_id and non-terminal assistant message after user turn do not finish
+        assert!(!pending.finished(&session));
+
+        // Terminal assistant message with stop_reason "completed" and empty run_id immediately after user turn
+        session.messages.pop();
+        session.messages.extend(
+            parse_messages(&[
+                json!({"role":"assistant","text":"已完成回复","stopReason":"completed"}),
+            ])
+            .unwrap(),
+        );
+        assert!(session.messages.last().unwrap().run_id.is_empty());
+        assert!(pending.finished(&session));
+
+        // Also verify with stop_reason "stop" and empty run_id immediately following the user's message
+        session.messages.pop();
+        session.messages.extend(
+            parse_messages(&[json!({"role":"assistant","text":"已停止回复","stopReason":"stop"})])
+                .unwrap(),
+        );
+        assert!(session.messages.last().unwrap().run_id.is_empty());
+        assert!(pending.finished(&session));
+    }
+
+    #[test]
+    fn parse_stream_event_rejects_missing_session_key_to_prevent_cross_session_hijack() {
+        let missing_session = json!({
+            "type": "event",
+            "event": "agent",
+            "payload": {
+                "stream": "assistant",
+                "runId": "run-123",
+                "data": { "text": "没有 sessionKey 的碎片" }
+            }
+        });
+        assert!(parse_stream_event(&missing_session).is_none());
+
+        let with_session = json!({
+            "type": "event",
+            "event": "agent",
+            "payload": {
+                "sessionKey": "agent:main:subagent:abc",
+                "stream": "assistant",
+                "runId": "run-123",
+                "data": { "text": "带 sessionKey 的碎片" }
+            }
+        });
+        let delta = parse_stream_event(&with_session).expect("delta with sessionKey");
+        assert_eq!(delta.session_key, "agent:main:subagent:abc");
+        assert_eq!(delta.delta_text.as_str(), "带 sessionKey 的碎片");
+    }
+
+    #[test]
+    fn status_from_session_and_history_clears_stale_running_status_when_reply_is_done() {
+        let mut session = RealSessionInfo {
+            key: "agent:main:main".into(),
+            status: "进行中".into(),
+            status_kind: 1,
+            messages: parse_messages(&[
+                json!({"role":"user","text":"写一篇长文","timestamp": 1_000}),
+                json!({"role":"assistant","text":"这是完整的长文内容。","stopReason":"end_turn","timestamp": 2_000}),
+            ])
+            .unwrap(),
+            ..Default::default()
+        };
+        let (status, kind) = status_from_session_and_history(&session, 3_000);
+        assert_eq!(status, "已完成");
+        assert_eq!(kind, 2);
+
+        // Assistant message without explicit stopReason that is older than 15s also clears stale running status
+        session.messages = parse_messages(&[
+            json!({"role":"user","text":"写一篇长文","timestamp": 1_000}),
+            json!({"role":"assistant","text":"已输出完毕但未带 stopReason","timestamp": 2_000}),
+        ])
+        .unwrap();
+        let (status_aged, kind_aged) = status_from_session_and_history(&session, 20_000);
+        assert_eq!(status_aged, "已完成");
+        assert_eq!(kind_aged, 2);
+
+        // Fresh streaming assistant message (<15s) without stopReason keeps running status if gateway says running
+        let (status_fresh, kind_fresh) = status_from_session_and_history(&session, 5_000);
+        assert_eq!(status_fresh, "进行中");
+        assert_eq!(kind_fresh, 1);
     }
 }

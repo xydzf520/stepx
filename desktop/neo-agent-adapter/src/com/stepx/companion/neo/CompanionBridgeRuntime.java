@@ -57,9 +57,22 @@ final class CompanionBridgeRuntime {
                 persist();
             }
         } catch (Exception ignored) { record = new JSONObject(); }
-        monitor.scheduleWithFixedDelay(() -> {
-            synchronized (this) { try { refresh(); } catch (Exception ignored) {} }
-        }, 1, 1, TimeUnit.SECONDS);
+        scheduleMonitor();
+    }
+    private void scheduleMonitor() {
+        long delayMs;
+        synchronized (this) {
+            String st = record.optString("state");
+            boolean activeTask = !st.isEmpty() && !BridgePolicy.terminal(st);
+            delayMs = activeTask ? 1000L : 10000L;
+        }
+        monitor.schedule(this::monitorTick, delayMs, TimeUnit.MILLISECONDS);
+    }
+    private void monitorTick() {
+        synchronized (this) {
+            try { refresh(); } catch (Exception ignored) {}
+        }
+        scheduleMonitor();
     }
     private interface MainCall<T> { T run() throws Exception; }
     private <T> T onMain(MainCall<T> action) throws Exception {

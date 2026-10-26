@@ -14,7 +14,9 @@ import java.util.concurrent.*;
 /** Settings and library stay inside the existing companion application. */
 public final class ExpansionActivity extends Activity {
  private CompanionUi ui;private LinearLayout body;private final Handler handler=new Handler(Looper.getMainLooper());private final ExecutorService worker=Executors.newSingleThreadExecutor();private JSONObject status=new JSONObject();private JSONArray items=new JSONArray();private String kind="all",sort="date",filter="all";private boolean descending=true,settings=false,busy=false;private int limit=40,offset=0;private ScrollView pageScroll;private android.database.ContentObserver observer;private String notice="";private boolean shortcutOpened=false;private CheckBox photos,videos,documents;private Spinner retention;private long generation=0;
- private JSONObject draft;private LinearLayout root;private boolean firstRender=true;private ProgressBar loadingLine;private Runnable loadingReveal;
+ private JSONObject draft;private LinearLayout root;private boolean firstRender=true;private ProgressBar loadingLine;private Runnable loadingReveal;private String searchQuery="";private LinearLayout libraryList;
+ private final android.util.LruCache<String,android.graphics.Bitmap> thumbCache=new android.util.LruCache<>(64);
+ private volatile int listGeneration=0;
  private void stopLoading(){if(loadingReveal!=null)handler.removeCallbacks(loadingReveal);if(loadingLine!=null)loadingLine.setVisibility(View.INVISIBLE);}
  private static final String[] KINDS={"all","photos","videos","documents"},LABELS={"全部","照片","视频","文档"},SORTS={"date","name","size"};
  public void onCreate(Bundle saved){super.onCreate(saved);ui=new CompanionUi(this);if(saved!=null&&saved.containsKey("draft")){try{draft=new JSONObject(saved.getString("draft","{}"));}catch(Exception ignored){}}android.content.SharedPreferences p=getSharedPreferences("expansion-ui",0);kind=p.getString("kind","all");sort=p.getString("sort","date");descending=p.getBoolean("descending",true);settings=getIntent().getBooleanExtra("settings",false);observer=new android.database.ContentObserver(handler){public void onChange(boolean self){if(!settings&&!busy){handler.removeCallbacks(refresh);handler.postDelayed(refresh,400);}}};getContentResolver().registerContentObserver(DocumentsContract.buildChildDocumentsUri(ExpansionStore.DOCS,"root"),true,observer);render();}
@@ -62,24 +64,145 @@ public final class ExpansionActivity extends Activity {
   HorizontalScrollView sc=new HorizontalScrollView(this);LinearLayout chips=new LinearLayout(this);for(int i=0;i<KINDS.length;i++){final String k=KINDS[i];Button b=new Button(this);b.setText(LABELS[i]);ui.styleButton(b,kind.equals(k));chips.addView(b,new LinearLayout.LayoutParams(ui.dp(80),ui.dp(46)));b.setOnClickListener(v->{kind=k;offset=0;pageScroll=null;saveSort();});}sc.addView(chips);LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(-1,-2);lp.topMargin=ui.dp(16);body.addView(sc,lp);
   LinearLayout order=new LinearLayout(this);Spinner sorts=new Spinner(this);sorts.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,new String[]{"按日期","按名称","按大小"}));sorts.setSelection(Arrays.asList(SORTS).indexOf(sort)<0?0:Arrays.asList(SORTS).indexOf(sort));order.addView(sorts,new LinearLayout.LayoutParams(0,ui.dp(48),1));sorts.setOnItemSelectedListener(new android.widget.AdapterView.OnItemSelectedListener(){public void onNothingSelected(android.widget.AdapterView<?> p){}public void onItemSelected(android.widget.AdapterView<?> p,View v,int pos,long id){if(!sort.equals(SORTS[pos])){sort=SORTS[pos];saveSort();}}});Button dir=new Button(this);dir.setText(descending?"降序 ↓":"升序 ↑");ui.styleButton(dir,false);order.addView(dir);dir.setOnClickListener(v->{descending=!descending;saveSort();});body.addView(order);
   Spinner states=new Spinner(this);String[] ids={"all","archived","restored","prepared","failed"};states.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,new String[]{"全部状态","已迁移到电脑","已恢复到手机","待完成迁移","迁移失败"}));states.setSelection(Math.max(0,Arrays.asList(ids).indexOf(filter)));body.addView(states,new LinearLayout.LayoutParams(-1,ui.dp(48)));states.setOnItemSelectedListener(new android.widget.AdapterView.OnItemSelectedListener(){public void onNothingSelected(android.widget.AdapterView<?> p){}public void onItemSelected(android.widget.AdapterView<?> p,View v,int pos,long id){if(!filter.equals(ids[pos])){filter=ids[pos];offset=0;pageScroll=null;load();}}});
-  if(items.length()==0){LinearLayout empty=ui.card(body,12);ui.title(empty,"这里保留你的文件入口",17,0);ui.text(empty,"选择自动迁移类型并连接电脑后，文件会出现在这里。点击文件可查看原件或恢复到手机。",13,CompanionUi.MUTED,10);ui.button(empty,"设置自动迁移",false,()->{settings=true;render();});}
-  for(int i=0;i<items.length();i++){JSONObject j=items.optJSONObject(i);if(j==null)continue;LinearLayout card=ui.card(body,10);String date=new SimpleDateFormat("yyyy-MM-dd HH:mm",Locale.CHINA).format(new Date(j.optLong("modified")));thumbnail(card,j);ui.row(card,j.optString("kind").equals("photos")?UiGlyph.IMAGE:j.optString("kind").equals("videos")?UiGlyph.VIDEO:UiGlyph.FILE,j.optString("name"),date+" · "+bytes(j.optLong("size"))+"\n"+stateLabel(j.optString("state")),()->details(j));}
+  EditText search=new EditText(this);search.setHint("搜索文件名或路径…");search.setSingleLine(true);search.setTextSize(14);search.setTextColor(CompanionUi.INK);search.setHintTextColor(CompanionUi.MUTED);search.setPadding(ui.dp(12),ui.dp(10),ui.dp(12),ui.dp(10));search.setBackground(ui.shape(android.graphics.Color.WHITE,CompanionUi.LINE,8));search.setText(searchQuery);LinearLayout.LayoutParams sp=new LinearLayout.LayoutParams(-1,ui.dp(46));sp.topMargin=ui.dp(8);body.addView(search,sp);
+  libraryList=ui.column();body.addView(libraryList,new LinearLayout.LayoutParams(-1,-2));renderLibraryItems();
+  search.addTextChangedListener(new android.text.TextWatcher(){public void beforeTextChanged(CharSequence s,int a,int b,int c){}public void onTextChanged(CharSequence s,int a,int b,int c){}public void afterTextChanged(android.text.Editable e){searchQuery=e==null?"":e.toString().trim();renderLibraryItems();}});
   if(offset>0)ui.button(body,"上一页",false,()->{offset=Math.max(0,offset-limit);pageScroll=null;load();});if(items.length()>=limit)ui.button(body,"下一页",false,()->{offset+=limit;pageScroll=null;load();});ui.button(body,"刷新文件库",false,this::load);
+ }
+ private void renderLibraryItems(){
+  if(libraryList==null)return;libraryList.removeAllViews();
+  int listGen=++listGeneration;
+  if(items.length()==0){LinearLayout empty=ui.card(libraryList,12);ui.title(empty,"这里保留你的文件入口",17,0);ui.text(empty,"选择自动迁移类型并连接电脑后，文件会出现在这里。点击文件可放大预览、查看原件或恢复到手机。",13,CompanionUi.MUTED,10);ui.button(empty,"设置自动迁移",false,()->{settings=true;render();});return;}
+  String q=searchQuery.toLowerCase(Locale.ROOT);int shown=0;
+  SimpleDateFormat fmt=new SimpleDateFormat("yyyy-MM-dd HH:mm",Locale.CHINA);
+  for(int i=0;i<items.length();i++){JSONObject j=items.optJSONObject(i);if(j==null)continue;String name=j.optString("name"),path=j.optString("path");if(!q.isEmpty()&&!name.toLowerCase(Locale.ROOT).contains(q)&&!path.toLowerCase(Locale.ROOT).contains(q))continue;shown++;LinearLayout card=ui.card(libraryList,10);String date=fmt.format(new Date(j.optLong("modified")));thumbnail(card,j,listGen);ui.row(card,j.optString("kind").equals("photos")?UiGlyph.IMAGE:j.optString("kind").equals("videos")?UiGlyph.VIDEO:UiGlyph.FILE,name,date+" · "+bytes(j.optLong("size"))+"\n"+stateLabel(j.optString("state"))+(j.optString("kind").equals("photos")?" · 点击放大预览":""),()->details(j));}
+  if(shown==0){LinearLayout empty=ui.card(libraryList,12);ui.title(empty,"没有匹配“"+searchQuery+"”的文件",16,0);ui.text(empty,"请尝试其他关键词，或切换上方分类与状态筛选。",13,CompanionUi.MUTED,8);}
+ }
+ static boolean isImageName(String name){if(name==null)return false;String n=name.toLowerCase(Locale.ROOT);return n.endsWith(".jpg")||n.endsWith(".jpeg")||n.endsWith(".png")||n.endsWith(".webp")||n.endsWith(".gif")||n.endsWith(".bmp");}
+ static final class DecodedImage {
+  final android.graphics.Bitmap bitmap;final int width,height;
+  DecodedImage(android.graphics.Bitmap b,int w,int h){bitmap=b;width=w;height=h;}
+ }
+ static DecodedImage decodeSampled(java.io.File f){
+  if(f==null||!f.isFile())return null;
+  android.graphics.BitmapFactory.Options bounds=new android.graphics.BitmapFactory.Options();bounds.inJustDecodeBounds=true;android.graphics.BitmapFactory.decodeFile(f.getPath(),bounds);
+  if(bounds.outWidth<=0||bounds.outHeight<=0)return null;
+  android.graphics.BitmapFactory.Options opts=new android.graphics.BitmapFactory.Options();opts.inSampleSize=1;
+  while(Math.max(bounds.outWidth,bounds.outHeight)/opts.inSampleSize>2048)opts.inSampleSize*=2;
+  android.graphics.Bitmap b=android.graphics.BitmapFactory.decodeFile(f.getPath(),opts);
+  return b==null?null:new DecodedImage(b,bounds.outWidth,bounds.outHeight);
+ }
+ static final class ZoomableImageView extends View {
+  private android.graphics.Bitmap bitmap;private int origW,origH;private float scale=1f,panX=0f,panY=0f,lastX,lastY;private int rotation=0;private boolean dragging=false;private Runnable onChange;
+  private final android.graphics.Paint paint=new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG|android.graphics.Paint.FILTER_BITMAP_FLAG);
+  private final ScaleGestureDetector scaleDetector;private final GestureDetector gestureDetector;
+  ZoomableImageView(Context c){
+   super(c);setContentDescription("可缩放图片预览");setBackgroundColor(0xff18181b);
+   scaleDetector=new ScaleGestureDetector(c,new ScaleGestureDetector.SimpleOnScaleGestureListener(){@Override public boolean onScale(ScaleGestureDetector d){setZoom(scale*d.getScaleFactor());return true;}});
+   gestureDetector=new GestureDetector(c,new GestureDetector.SimpleOnGestureListener(){@Override public boolean onDown(MotionEvent e){return true;}@Override public boolean onDoubleTap(MotionEvent e){setZoom(scale>1.2f?1f:2.5f);return true;}});
+  }
+  void setOnChange(Runnable r){onChange=r;}
+  void setImage(DecodedImage d){if(d==null)return;bitmap=d.bitmap;origW=d.width;origH=d.height;scale=1f;panX=0f;panY=0f;rotation=0;fire();invalidate();}
+  void setZoom(float next){scale=Math.max(1f,Math.min(5f,next));if(scale<=1.01f){panX=0f;panY=0f;}fire();invalidate();}
+  void zoomBy(float factor){setZoom(scale*factor);}
+  void resetZoom(){scale=1f;panX=0f;panY=0f;rotation=0;fire();invalidate();}
+  void rotate90(){rotation=(rotation+90)%360;panX=0f;panY=0f;fire();invalidate();}
+  int zoomPercent(){return Math.round(scale*100f);}
+  int origWidth(){return origW;}
+  int origHeight(){return origH;}
+  boolean hasImage(){return bitmap!=null&&!bitmap.isRecycled();}
+  private void fire(){if(onChange!=null)onChange.run();}
+  @Override protected void onDraw(android.graphics.Canvas canvas){
+   super.onDraw(canvas);canvas.drawColor(0xff18181b);
+   if(bitmap==null||bitmap.isRecycled()||getWidth()<=0||getHeight()<=0)return;
+   boolean swapped=(rotation%180)!=0;
+   float iw=swapped?bitmap.getHeight():bitmap.getWidth(),ih=swapped?bitmap.getWidth():bitmap.getHeight();
+   if(iw<=0||ih<=0)return;
+   float base=Math.min(getWidth()/iw,getHeight()/ih),fw=iw*base*scale,fh=ih*base*scale;
+   float maxX=Math.max(0f,(fw-getWidth())/2f),maxY=Math.max(0f,(fh-getHeight())/2f);
+   panX=Math.max(-maxX,Math.min(maxX,panX));panY=Math.max(-maxY,Math.min(maxY,panY));
+   canvas.save();canvas.translate(getWidth()/2f+panX,getHeight()/2f+panY);canvas.rotate(rotation);
+   float total=base*scale;canvas.scale(total,total);
+   canvas.drawBitmap(bitmap,-bitmap.getWidth()/2f,-bitmap.getHeight()/2f,paint);canvas.restore();
+  }
+  @Override public boolean onTouchEvent(MotionEvent e){
+   if(getParent()!=null)getParent().requestDisallowInterceptTouchEvent(scale>1.01f||e.getPointerCount()>1);
+   scaleDetector.onTouchEvent(e);gestureDetector.onTouchEvent(e);
+   switch(e.getActionMasked()){
+    case MotionEvent.ACTION_DOWN:lastX=e.getX();lastY=e.getY();dragging=true;break;
+    case MotionEvent.ACTION_MOVE:
+     if(dragging&&!scaleDetector.isInProgress()&&e.getPointerCount()==1&&scale>1.01f){panX+=e.getX()-lastX;panY+=e.getY()-lastY;invalidate();}
+     lastX=e.getX();lastY=e.getY();break;
+    case MotionEvent.ACTION_UP:case MotionEvent.ACTION_CANCEL:case MotionEvent.ACTION_POINTER_UP:dragging=false;break;
+   }
+   return true;
+  }
+ }
+ static ZoomableImageView addZoomBox(Context ctx,CompanionUi ui,LinearLayout parent,int heightDp,TextView metaLabel,String sourceHint){
+  ZoomableImageView zv=new ZoomableImageView(ctx);LinearLayout.LayoutParams zp=new LinearLayout.LayoutParams(-1,ui.dp(heightDp));zp.topMargin=ui.dp(12);parent.addView(zv,zp);
+  LinearLayout bar=new LinearLayout(ctx);LinearLayout.LayoutParams bp=new LinearLayout.LayoutParams(-1,-2);bp.topMargin=ui.dp(8);parent.addView(bar,bp);
+  Button out=new Button(ctx),reset=new Button(ctx),in=new Button(ctx),rot=new Button(ctx);
+  out.setText("缩小 -");reset.setText("100%");in.setText("放大 +");rot.setText("旋转 90°");
+  for(Button b:new Button[]{out,reset,in,rot}){ui.styleButton(b,false);b.setTextSize(12);b.setMinHeight(ui.dp(40));b.setPadding(ui.dp(6),ui.dp(6),ui.dp(6),ui.dp(6));LinearLayout.LayoutParams cp=new LinearLayout.LayoutParams(0,ui.dp(40),1);if(bar.getChildCount()>0)cp.leftMargin=ui.dp(6);bar.addView(b,cp);}
+  out.setOnClickListener(v->zv.zoomBy(0.8f));reset.setOnClickListener(v->zv.resetZoom());in.setOnClickListener(v->zv.zoomBy(1.25f));rot.setOnClickListener(v->zv.rotate90());
+  zv.setOnChange(()->{reset.setText(zv.zoomPercent()+"%");if(metaLabel!=null&&zv.origWidth()>0)metaLabel.setText(zv.origWidth()+" × "+zv.origHeight()+" px · 缩放 "+zv.zoomPercent()+"% · 双指缩放 / 双击 2.5x / 拖动"+(sourceHint==null||sourceHint.isEmpty()?"":" · "+sourceHint));});
+  return zv;
  }
  private static final class ThumbnailView extends View {
   private android.graphics.Bitmap bitmap;private final android.graphics.Paint paint=new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG|android.graphics.Paint.FILTER_BITMAP_FLAG);
-  ThumbnailView(Context c){super(c);setContentDescription("文件缩略图");}
+  ThumbnailView(Context c){super(c);setContentDescription("文件缩略图，点击放大预览");}
   void setBitmap(android.graphics.Bitmap b){bitmap=b;invalidate();}
   protected void onDraw(android.graphics.Canvas canvas){super.onDraw(canvas);if(bitmap==null||bitmap.isRecycled())return;float scale=Math.max(getWidth()/(float)bitmap.getWidth(),getHeight()/(float)bitmap.getHeight());float w=bitmap.getWidth()*scale,h=bitmap.getHeight()*scale;canvas.drawBitmap(bitmap,null,new android.graphics.RectF((getWidth()-w)/2,(getHeight()-h)/2,(getWidth()+w)/2,(getHeight()+h)/2),paint);}
  }
- private void thumbnail(LinearLayout card,JSONObject j){if(!j.optString("kind").equals("photos")&&!j.optString("kind").equals("videos"))return;ThumbnailView view=new ThumbnailView(this);view.setVisibility(View.GONE);card.addView(view,new LinearLayout.LayoutParams(-1,ui.dp(150)));long g=generation;worker.execute(()->{try{android.graphics.Bitmap b=android.graphics.BitmapFactory.decodeFile(new ExpansionStore(this).thumbnail(j.getString("id")).getPath());if(b!=null)handler.post(()->{if(!isDestroyed()&&g==generation){view.setBitmap(b);view.setVisibility(View.VISIBLE);}});}catch(Exception ignored){}});}
+ private void thumbnail(LinearLayout card,JSONObject j,int listGen){
+  if(!j.optString("kind").equals("photos")&&!j.optString("kind").equals("videos"))return;
+  ThumbnailView view=new ThumbnailView(this);view.setOnClickListener(v->details(j));
+  String id=j.optString("id");
+  android.graphics.Bitmap cached=id.isEmpty()?null:thumbCache.get(id);
+  if(cached!=null&&!cached.isRecycled()){
+   view.setBitmap(cached);view.setVisibility(View.VISIBLE);
+   card.addView(view,new LinearLayout.LayoutParams(-1,ui.dp(150)));
+   return;
+  }
+  view.setVisibility(View.GONE);card.addView(view,new LinearLayout.LayoutParams(-1,ui.dp(150)));
+  long g=generation;
+  worker.execute(()->{
+   if(listGen!=listGeneration||g!=generation)return;
+   try{
+    android.graphics.Bitmap b=android.graphics.BitmapFactory.decodeFile(new ExpansionStore(this).thumbnail(id).getPath());
+    if(b!=null){
+     if(!id.isEmpty())thumbCache.put(id,b);
+     handler.post(()->{if(!isDestroyed()&&g==generation&&listGen==listGeneration){view.setBitmap(b);view.setVisibility(View.VISIBLE);}});
+    }
+   }catch(Exception ignored){}
+  });
+ }
 
  static String stateLabel(String s){switch(s){case "archived":return "原件在电脑";case "restored":return "已恢复到手机";case "failed":return "迁移未完成";case "releasing":return "正在完成迁移";default:return "待完成迁移";}}
  private void details(JSONObject j){
-  Dialog dialog=new Dialog(this);LinearLayout card=ui.column();card.setPadding(ui.dp(20),ui.dp(20),ui.dp(20),ui.dp(20));card.setBackground(ui.shape(android.graphics.Color.WHITE,CompanionUi.LINE,12));ui.title(card,j.optString("name"),18,0);ui.text(card,stateLabel(j.optString("state"))+" · "+bytes(j.optLong("size")),13,CompanionUi.MUTED,8);ui.text(card,j.optString("path"),12,CompanionUi.MUTED,10);if(!j.optString("error").isEmpty())ui.text(card,j.optString("error"),13,CompanionUi.AMBER,12);
-  if(j.optString("state").equals("archived")||j.optString("state").equals("restored")){ui.button(card,"打开文件",true,()->{dialog.dismiss();retrieve(j,"view");});if(j.optString("state").equals("archived"))ui.button(card,"恢复到手机",false,()->new AlertDialog.Builder(this).setTitle("恢复原件到这台手机？").setMessage(j.optString("name")+"\n需要手机空间："+bytes(j.optLong("size"))+"\n电脑副本保留。请保持与原电脑连接。").setNegativeButton("取消",null).setPositiveButton("恢复到手机",(x,w)->{dialog.dismiss();retrieve(j,"restore");}).show());else ui.button(card,"移除记录",false,()->{dialog.dismiss();task(()->{new ExpansionStore(this).forget(j.getString("id"));return "已移除记录，手机原件和电脑副本保留";});});}
+  Dialog dialog=new Dialog(this);ScrollView scroll=new ScrollView(this);LinearLayout card=ui.column();card.setPadding(ui.dp(20),ui.dp(20),ui.dp(20),ui.dp(20));card.setBackground(ui.shape(android.graphics.Color.WHITE,CompanionUi.LINE,12));scroll.addView(card);ui.title(card,j.optString("name"),18,0);ui.text(card,stateLabel(j.optString("state"))+" · "+bytes(j.optLong("size")),13,CompanionUi.MUTED,8);ui.text(card,j.optString("path"),12,CompanionUi.MUTED,6);if(!j.optString("error").isEmpty())ui.text(card,j.optString("error"),13,CompanionUi.AMBER,10);
+  boolean visual=j.optString("kind").equals("photos")||j.optString("kind").equals("videos")||isImageName(j.optString("name"));
+  if(visual){
+   TextView meta=ui.text(card,"正在加载预览（支持双指缩放、双击放大、拖动查看）…",12,CompanionUi.MUTED,8);
+   ZoomableImageView zv=addZoomBox(this,ui,card,260,meta,"");
+   Button hdBtn=new Button(this);ui.styleButton(hdBtn,false);hdBtn.setText("从电脑加载高清原图到此处预览");hdBtn.setVisibility(View.GONE);
+   LinearLayout.LayoutParams hp=new LinearLayout.LayoutParams(-1,-2);hp.topMargin=ui.dp(8);card.addView(hdBtn,hp);
+   worker.execute(()->{try{
+    ExpansionStore s=new ExpansionStore(this);java.io.File full=j.optString("kind").equals("videos")?null:s.available(j);
+    DecodedImage dec=decodeSampled(full!=null?full:s.thumbnail(j.getString("id")));
+    boolean isFull=full!=null&&dec!=null;
+    if(dec!=null)handler.post(()->{if(!isDestroyed()&&dialog.isShowing()){zv.setOnChange(()->{meta.setText(zv.origWidth()+" × "+zv.origHeight()+" px · 缩放 "+zv.zoomPercent()+"% · "+(isFull?"高清原图":"本地预览缩略图")+" · 双指/双击缩放");});zv.setImage(dec);if(!isFull&&j.optString("kind").equals("photos")&&status.optBoolean("online")&&(j.optString("state").equals("archived")||j.optString("state").equals("restored")))hdBtn.setVisibility(View.VISIBLE);}});
+   }catch(Exception ignored){}});
+   hdBtn.setOnClickListener(v->{hdBtn.setEnabled(false);hdBtn.setText("正在从电脑取回高清原图…");worker.execute(()->{try{
+    ExpansionStore s=new ExpansionStore(this);JSONObject r=s.request(j.getString("id"),"view");long end=SystemClock.elapsedRealtime()+120000;
+    while(!r.optString("state").equals("ready")){if(Thread.currentThread().isInterrupted())return;if(r.optString("state").equals("error"))throw new java.io.IOException(r.optString("error"));if(!s.online(s.host()))throw new java.io.IOException("电脑已断开");if(SystemClock.elapsedRealtime()>end)throw new java.io.IOException("取回超时");Thread.sleep(400);r=s.requestState(j.getString("id"));}
+    DecodedImage hd=decodeSampled(s.available(j));
+    handler.post(()->{if(!isDestroyed()&&dialog.isShowing()&&hd!=null){hdBtn.setVisibility(View.GONE);zv.setOnChange(()->{meta.setText(zv.origWidth()+" × "+zv.origHeight()+" px · 缩放 "+zv.zoomPercent()+"% · 高清原图已缓存");});zv.setImage(hd);}});
+   }catch(Exception e){handler.post(()->{if(!isDestroyed()&&dialog.isShowing()){hdBtn.setEnabled(true);hdBtn.setText("重试加载高清原图（"+e.getMessage()+"）");}});}});});
+  }
+  if(j.optString("state").equals("archived")||j.optString("state").equals("restored")){ui.button(card,"外部应用打开",true,()->{dialog.dismiss();retrieve(j,"view");});if(j.optString("state").equals("archived"))ui.button(card,"恢复到手机",false,()->new AlertDialog.Builder(this).setTitle("恢复原件到这台手机？").setMessage(j.optString("name")+"\n需要手机空间："+bytes(j.optLong("size"))+"\n电脑副本保留。请保持与原电脑连接。").setNegativeButton("取消",null).setPositiveButton("恢复到手机",(x,w)->{dialog.dismiss();retrieve(j,"restore");}).show());else ui.button(card,"移除记录",false,()->{dialog.dismiss();task(()->{new ExpansionStore(this).forget(j.getString("id"));return "已移除记录，手机原件和电脑副本保留";});});}
   if(j.optString("state").equals("prepared")||j.optString("state").equals("failed"))ui.button(card,"取消此文件的迁移",false,()->{dialog.dismiss();task(()->{new ExpansionStore(this).forget(j.getString("id"));return "已取消，手机原件保留且不再自动迁移";});});
-  ui.button(card,"关闭",false,dialog::dismiss);dialog.setContentView(card);dialog.getWindow().setBackgroundDrawableResource(android.R.color.transparent);dialog.show();dialog.getWindow().setLayout(getResources().getDisplayMetrics().widthPixels-ui.dp(40),-2);
+  ui.button(card,"关闭",false,dialog::dismiss);dialog.setContentView(scroll);dialog.getWindow().setBackgroundDrawableResource(android.R.color.transparent);dialog.show();dialog.getWindow().setLayout(getResources().getDisplayMetrics().widthPixels-ui.dp(32),-2);
  }
  private interface Job{String run()throws Exception;}
  private void task(Job job){if(busy)return;busy=true;notice="正在处理…";render();worker.execute(()->{String n;try{n=job.run();}catch(Exception e){n=e.getMessage();}String next=n;handler.post(()->{if(isDestroyed())return;busy=false;notice=next;load();});});}

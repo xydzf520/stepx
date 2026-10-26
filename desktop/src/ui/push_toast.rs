@@ -6,7 +6,7 @@
 //! - Quick 1-click reply phrases & AI smart draft
 //! - 1-click OTP / verification code copy & URL open
 //! - Quick jump to `ShellMode::MiniNotify` or `ShellMode::Full`
-//! - Privacy mask (`🔒 防窥脱敏`) and alert scope toggles
+//! - Privacy mask (`防窥脱敏`) and alert scope toggles
 
 use super::{theme::*, widgets::*, Action, Companion, PushAction, ShellMode, F_TOAST_REPLY};
 use facloud_ui::{elements::*, fonts::Weight};

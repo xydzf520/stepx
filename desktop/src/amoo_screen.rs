@@ -178,7 +178,12 @@ impl Session {
         let folder = tempfile::tempdir()?;
         let path = folder.path().join("current-screen.png");
         fs::write(&path, png)?;
-        let uploaded = amoo_media::upload_attachments(&self.adb, &self.device, &[path])?;
+        let uploaded = amoo_media::upload_attachments_with_bus(
+            &self.adb,
+            &self.device,
+            &[path],
+            Some(&mut self.bus),
+        )?;
         self.uploads.push(uploaded.directory.clone());
         check(&self.adb, &self.device, cancel, deadline)?;
         let pending = self.bus.send_with_attachments(
@@ -481,68 +486,755 @@ fn hierarchy(adb: &Adb, device: &Device) -> Result<Vec<UiNode>> {
         rand::random::<u128>()
     );
     device.verify(adb)?;
-    let result = (|| {
-        adb.shell(
-            &device.transport,
-            &["uiautomator", "dump", "--compressed", &remote],
-        )?;
-        nodes(&adb.shell(&device.transport, &["cat", &remote])?)
-    })();
-    let _ = adb.shell(&device.transport, &["rm", "-f", "--", &remote]);
-    result
+    let q = crate::adb::shell_quote(&remote);
+    let xml = adb.script(
+        &device.transport,
+        &format!("uiautomator dump --compressed {q} >/dev/null && cat {q}; rm -f {q}"),
+    )?;
+    ensure!(xml.contains("<hierarchy"), "无法读取手机当前界面结构");
+    nodes(&xml)
 }
 
-pub(crate) fn launch(adb: &Adb, device: &Device, app_name: &str) -> Result<()> {
-    let info = crate::bridge::call_bridge(
+pub fn capture_png(adb: &Adb, device: &Device) -> Result<Vec<u8>> {
+    let (png, _, _) = screenshot(adb, device)?;
+    Ok(png)
+}
+
+pub fn is_current_screen_target(app_name: &str) -> bool {
+    matches!(
+        app_name.trim(),
+        "" | "当前屏幕" | "手机屏幕" | "手机桌面" | "桌面" | "系统" | "当前画面" | "手机"
+    )
+}
+
+pub fn resolve_app_alias(app_name: &str) -> &'static [&'static str] {
+    match app_name.trim().to_lowercase().as_str() {
+        "微信" | "wechat" => &["com.tencent.mm"],
+        "设置" | "系统设置" | "settings" => &["com.android.settings"],
+        "相机" | "拍照" | "camera" => &[
+            "com.android.camera",
+            "com.android.camera2",
+            "com.sec.android.app.camera",
+            "com.huawei.camera",
+            "com.oplus.camera",
+        ],
+        "相册" | "图库" | "照片" | "gallery" | "photos" => &[
+            "com.android.gallery3d",
+            "com.miui.gallery",
+            "com.coloros.gallery3d",
+            "com.google.android.apps.photos",
+        ],
+        "浏览器" | "browser" | "chrome" => &[
+            "com.android.browser",
+            "com.android.chrome",
+            "com.heytap.browser",
+        ],
+        "短信" | "信息" | "messages" => {
+            &["com.android.mms", "com.google.android.apps.messaging"]
+        }
+        "电话" | "拨号" | "联系人" | "通讯录" => &[
+            "com.android.dialer",
+            "com.android.contacts",
+            "com.google.android.dialer",
+        ],
+        "日历" | "calendar" => &["com.android.calendar", "com.google.android.calendar"],
+        "时钟" | "闹钟" | "clock" => &["com.android.deskclock", "com.google.android.deskclock"],
+        "计算器" | "calculator" => &["com.android.calculator2", "com.google.android.calculator"],
+        "文件" | "文件管理" | "files" => {
+            &["com.android.documentsui", "com.android.fileexplorer"]
+        }
+        "淘宝" | "taobao" => &["com.taobao.taobao"],
+        "支付宝" | "alipay" => &["com.eg.android.AlipayGphone"],
+        "抖音" | "douyin" | "tiktok" => &["com.ss.android.ugc.aweme"],
+        "美团" | "meituan" => &["com.sankuai.meituan"],
+        "小红书" | "rednote" => &["com.xingin.xhs"],
+        "哔哩哔哩" | "b站" | "bilibili" => &["tv.danmaku.bili"],
+        "高德" | "高德地图" | "地图" | "百度地图" => {
+            &["com.autonavi.minimap", "com.baidu.BaiduMap"]
+        }
+        "网易云音乐" | "网易云" | "音乐" | "qq音乐" => {
+            &["com.netease.cloudmusic", "com.tencent.qqmusic"]
+        }
+        "qq" => &["com.tencent.mobileqq"],
+        "京东" | "jd" => &["com.jingdong.app.mall"],
+        "拼多多" | "pdd" => &["com.xunmeng.pinduoduo"],
+        "飞书" | "feishu" | "lark" => &["com.ss.android.lark"],
+        "钉钉" | "dingtalk" => &["com.alibaba.android.rimet"],
+        "企业微信" | "企微" | "wecom" => &["com.tencent.wework"],
+        _ => &[],
+    }
+}
+
+pub fn infer_app_and_task(raw_app: &str, raw_task: &str) -> (String, String) {
+    let app_trimmed = raw_app.trim();
+    let task_trimmed = raw_task.trim();
+    if !app_trimmed.is_empty() && task_trimmed.is_empty() {
+        return (app_trimmed.to_string(), format!("打开 {app_trimmed}"));
+    }
+    if !app_trimmed.is_empty() {
+        return (app_trimmed.to_string(), task_trimmed.to_string());
+    }
+    if let Some(target) = parse_pure_launch_target("", task_trimmed) {
+        return (target, task_trimmed.to_string());
+    }
+    for candidate in [
+        "企业微信",
+        "网易云音乐",
+        "哔哩哔哩",
+        "高德地图",
+        "百度地图",
+        "系统设置",
+        "文件管理",
+        "小红书",
+        "支付宝",
+        "拼多多",
+        "计算器",
+        "浏览器",
+        "通讯录",
+        "联系人",
+        "微信",
+        "设置",
+        "相机",
+        "相册",
+        "图库",
+        "短信",
+        "信息",
+        "电话",
+        "拨号",
+        "日历",
+        "闹钟",
+        "时钟",
+        "淘宝",
+        "抖音",
+        "美团",
+        "B站",
+        "b站",
+        "高德",
+        "地图",
+        "音乐",
+        "QQ",
+        "京东",
+        "飞书",
+        "钉钉",
+    ] {
+        if task_trimmed.contains(candidate) {
+            return (candidate.to_string(), task_trimmed.to_string());
+        }
+    }
+    ("当前屏幕".to_string(), task_trimmed.to_string())
+}
+
+pub fn parse_pure_launch_target(app_name: &str, task: &str) -> Option<String> {
+    let t = task.trim();
+    let rest = ["打开", "启动", "进入", "切换到"]
+        .into_iter()
+        .find_map(|prefix| t.strip_prefix(prefix))
+        .map(str::trim)?;
+    if rest.is_empty() {
+        return None;
+    }
+    let cleaned = rest
+        .trim_end_matches("应用")
+        .trim_end_matches("App")
+        .trim_end_matches("APP")
+        .trim_end_matches("app")
+        .trim();
+    if cleaned.is_empty() {
+        return None;
+    }
+    // Reject if it contains multi-step instructions or is a system setting shortcut handled separately
+    if cleaned.chars().count() > 14
+        || [
+            "并",
+            "然后",
+            "再",
+            "查看",
+            "搜索",
+            "查找",
+            "发送",
+            "发消息",
+            "发条",
+            "点击",
+            "截屏",
+            "截图",
+            "设置",
+            "Wi-Fi",
+            "WiFi",
+            "蓝牙",
+            "无线网",
+            "开发者",
+            "声音",
+            "亮度",
+            "，",
+            ",",
+            "。",
+            ";",
+            "；",
+        ]
+        .iter()
+        .any(|kw| cleaned.contains(kw))
+    {
+        return None;
+    }
+    if !app_name.trim().is_empty() && !is_current_screen_target(app_name) {
+        return Some(app_name.trim().to_string());
+    }
+    Some(cleaned.to_string())
+}
+
+pub fn parse_direct_click_target(task: &str) -> Option<String> {
+    let t = task.trim();
+    let rest = ["点击屏幕上的", "点击按钮", "点一下", "点击", "轻触"]
+        .into_iter()
+        .find_map(|prefix| t.strip_prefix(prefix))
+        .map(str::trim)?;
+    let cleaned = rest
+        .trim_matches(|c: char| matches!(c, '"' | '\'' | '“' | '”' | '「' | '」' | ' '))
+        .trim_end_matches("按钮")
+        .trim_end_matches("选项")
+        .trim();
+    if cleaned.is_empty()
+        || cleaned.chars().count() > 18
+        || ["并", "然后", "再", "输入", "发送", "，", ",", "。"]
+            .iter()
+            .any(|kw| cleaned.contains(kw))
+    {
+        return None;
+    }
+    Some(cleaned.to_string())
+}
+
+pub fn launch(adb: &Adb, device: &Device, app_name: &str) -> Result<crate::apps::AppInfo> {
+    let trimmed = app_name.trim();
+    if is_current_screen_target(trimmed) {
+        return Ok(crate::apps::AppInfo {
+            package: String::new(),
+            label: "当前屏幕".into(),
+            system: true,
+            enabled: true,
+            launchable: true,
+            ..Default::default()
+        });
+    }
+    let aliases = resolve_app_alias(trimmed);
+    let target_lower = trimmed.to_lowercase();
+    let mut chosen_pkg: Option<String> = None;
+    let mut chosen_label = trimmed.to_string();
+
+    if let Ok(info) = crate::bridge::call_bridge(
         adb,
         device,
         &json!({"op":"apps_list","icons":false}),
         Duration::from_secs(20),
+    ) {
+        if let Some(apps) = info["apps"].as_array() {
+            let launchable: Vec<_> = apps
+                .iter()
+                .filter(|a| a["enabled"] == true && a["launchable"] == true)
+                .collect();
+
+            // 1. Exact label or package match (case-insensitive)
+            let exact: Vec<_> = launchable
+                .iter()
+                .copied()
+                .filter(|a| {
+                    a["label"]
+                        .as_str()
+                        .is_some_and(|l| l.trim().eq_ignore_ascii_case(trimmed))
+                        || a["package"]
+                            .as_str()
+                            .is_some_and(|p| p.trim().eq_ignore_ascii_case(trimmed))
+                })
+                .collect();
+
+            let matched = if exact.len() == 1 {
+                Some(exact[0])
+            } else if let Some(found) = aliases.iter().find_map(|alias_pkg| {
+                launchable
+                    .iter()
+                    .copied()
+                    .find(|a| a["package"].as_str() == Some(*alias_pkg))
+            }) {
+                // 2. Built-in common Chinese/English alias match
+                Some(found)
+            } else {
+                // 3. Fuzzy substring label match when unique
+                let fuzzy: Vec<_> = launchable
+                    .iter()
+                    .copied()
+                    .filter(|a| {
+                        a["label"].as_str().is_some_and(|l| {
+                            let ll = l.trim().to_lowercase();
+                            !ll.is_empty()
+                                && (ll.contains(&target_lower) || target_lower.contains(&ll))
+                        })
+                    })
+                    .collect();
+                if fuzzy.len() == 1 {
+                    Some(fuzzy[0])
+                } else {
+                    None
+                }
+            };
+
+            if let Some(app) = matched {
+                if let Some(pkg) = app["package"].as_str() {
+                    chosen_pkg = Some(pkg.to_string());
+                }
+                if let Some(lbl) = app["label"].as_str() {
+                    chosen_label = lbl.to_string();
+                }
+            }
+        }
+    }
+
+    if chosen_pkg.is_none() {
+        if let Some(first_alias) = aliases.first() {
+            chosen_pkg = Some((*first_alias).to_string());
+        } else if trimmed.contains('.') && crate::apps::validate_package(trimmed).is_ok() {
+            chosen_pkg = Some(trimmed.to_string());
+        }
+    }
+
+    let package = chosen_pkg.context(
+        "无法唯一确定目标应用，请输入应用名称（如：微信、设置、相机、支付宝）或完整包名",
     )?;
-    let apps = info["apps"].as_array().context("未读到手机应用目录")?;
-    let matching: Vec<_> = apps
-        .iter()
-        .filter(|a| {
-            a["enabled"] == true
-                && a["launchable"] == true
-                && (a["label"].as_str() == Some(app_name.trim())
-                    || a["package"].as_str() == Some(app_name.trim()))
-        })
-        .collect();
-    ensure!(
-        matching.len() == 1,
-        "无法唯一确定目标应用，请使用手机应用列表中的准确名称或包名"
-    );
-    let package = matching[0]["package"].as_str().context("应用包名缺失")?;
-    crate::apps::validate_package(package)?;
+    crate::apps::validate_package(&package)?;
     device.verify(adb)?;
-    let resolved = adb.shell(
-        &device.transport,
-        &[
-            "cmd",
-            "package",
-            "resolve-activity",
-            "--brief",
-            "-a",
-            "android.intent.action.MAIN",
-            "-c",
-            "android.intent.category.LAUNCHER",
-            "-p",
-            package,
-        ],
-    )?;
-    let component = resolved
+    let resolved = adb
+        .shell(
+            &device.transport,
+            &[
+                "cmd",
+                "package",
+                "resolve-activity",
+                "--brief",
+                "-a",
+                "android.intent.action.MAIN",
+                "-c",
+                "android.intent.category.LAUNCHER",
+                "-p",
+                &package,
+            ],
+        )
+        .unwrap_or_default();
+    if let Some(component) = resolved
         .lines()
+        .map(str::trim)
         .find(|s| s.starts_with(&format!("{package}/")))
-        .context("目标应用没有可打开的界面")?;
-    ensure!(
-        component
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "._/$".contains(c)),
-        "目标应用启动组件无效"
-    );
-    adb.shell(&device.transport, &["am", "start", "-n", component])?;
-    Ok(())
+    {
+        ensure!(
+            component
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "._/$".contains(c)),
+            "目标应用启动组件无效"
+        );
+        adb.shell(&device.transport, &["am", "start", "-n", component])?;
+    } else {
+        adb.shell(
+            &device.transport,
+            &[
+                "monkey",
+                "-p",
+                &package,
+                "-c",
+                "android.intent.category.LAUNCHER",
+                "1",
+            ],
+        )?;
+    }
+    Ok(crate::apps::AppInfo {
+        package,
+        label: chosen_label,
+        enabled: true,
+        launchable: true,
+        ..Default::default()
+    })
+}
+
+pub fn try_instant_screen_command(
+    adb: &Adb,
+    device: &Device,
+    app_name: &str,
+    task: &str,
+    mut on_event: impl FnMut(ScreenEvent),
+) -> Result<Option<GuiRunResult>> {
+    let started = Instant::now();
+    let t = task.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    let finish = |step_desc: String,
+                  message: String,
+                  png: Option<Vec<u8>>,
+                  action_tag: &str,
+                  extra: serde_json::Value,
+                  on_event: &mut dyn FnMut(ScreenEvent)|
+     -> Result<Option<GuiRunResult>> {
+        on_event(ScreenEvent::Step {
+            number: 1,
+            description: step_desc.clone(),
+        });
+        if let Some(bytes) = png {
+            on_event(ScreenEvent::Screenshot {
+                number: 1,
+                png: bytes,
+            });
+        }
+        on_event(ScreenEvent::Status(message.clone()));
+        Ok(Some(GuiRunResult {
+            state: GuiRunState::Completed,
+            message,
+            invocation_id: format!("instant:{action_tag}"),
+            raw_result: Some(json!({
+                "mode": "instant_screen_command",
+                "action": action_tag,
+                "step": step_desc,
+                "extra": extra,
+            })),
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        }))
+    };
+
+    // 1. Wake & Swipe Unlock
+    if matches!(
+        t,
+        "点亮屏幕"
+            | "点亮手机"
+            | "点亮手机屏幕"
+            | "帮我点亮手机屏幕"
+            | "帮我点亮屏幕"
+            | "唤醒屏幕"
+            | "唤醒手机"
+            | "亮屏"
+            | "解锁"
+            | "解锁手机"
+            | "滑动解锁"
+            | "上滑解锁"
+            | "点亮并解锁"
+            | "点亮解锁"
+    ) {
+        device.verify(adb)?;
+        on_event(ScreenEvent::Status(
+            "正在点亮手机屏幕并执行上滑解锁…".into(),
+        ));
+        adb.shell(&device.transport, &["input", "keyevent", "224"])?;
+        adb.shell(
+            &device.transport,
+            &["input", "swipe", "540", "1850", "540", "650", "300"],
+        )?;
+        thread::sleep(Duration::from_millis(450));
+        let png = capture_png(adb, device).ok();
+        return finish(
+            "点亮手机屏幕并上滑解锁".into(),
+            "已点亮手机屏幕并执行上滑解锁，最新实时画面已同步到桌面。".into(),
+            png,
+            "wake_unlock",
+            json!({}),
+            &mut on_event,
+        );
+    }
+
+    // 2. Lock Screen / Sleep
+    if matches!(t, "锁屏" | "息屏" | "关闭屏幕" | "锁定屏幕" | "把手机锁屏") {
+        device.verify(adb)?;
+        adb.shell(&device.transport, &["input", "keyevent", "223"])?;
+        return finish(
+            "关闭并锁定手机屏幕".into(),
+            "已发送手机锁屏指令，屏幕已关闭。".into(),
+            None,
+            "lock_screen",
+            json!({}),
+            &mut on_event,
+        );
+    }
+
+    // 3. Screenshot / Inspect Live Screen
+    if matches!(
+        t,
+        "截屏"
+            | "截图"
+            | "截取画面"
+            | "截取手机画面"
+            | "帮我截取手机画面"
+            | "刷新画面"
+            | "刷新手机画面"
+            | "看看手机屏幕"
+            | "查看手机画面"
+            | "手机现在显示什么"
+    ) {
+        device.verify(adb)?;
+        on_event(ScreenEvent::Status("正在截取手机当前实时画面…".into()));
+        let png = capture_png(adb, device)?;
+        let summary = hierarchy(adb, device)
+            .ok()
+            .map(|nodes| {
+                let mut labels = Vec::new();
+                for n in nodes {
+                    for s in [n.text.trim(), n.description.trim()] {
+                        if !s.is_empty() && !labels.iter().any(|x: &String| x == s) {
+                            labels.push(s.to_string());
+                        }
+                    }
+                    if labels.len() >= 8 {
+                        break;
+                    }
+                }
+                labels
+            })
+            .unwrap_or_default();
+        let msg = if summary.is_empty() {
+            "已截取当前手机实时画面，可在下方预览原图。".into()
+        } else {
+            format!(
+                "已截取当前手机实时画面（界面可见内容：{}）。",
+                summary.join(" / ")
+            )
+        };
+        return finish(
+            "截取当前手机实时画面".into(),
+            msg,
+            Some(png),
+            "screenshot",
+            json!({ "visible_summary": summary }),
+            &mut on_event,
+        );
+    }
+
+    // 4. Extract Screen Text
+    if matches!(
+        t,
+        "提取屏幕文字"
+            | "提取手机屏幕文字"
+            | "读取屏幕文字"
+            | "识别屏幕文字"
+            | "复制屏幕文字"
+            | "提取画面文字"
+            | "屏幕上的文字"
+    ) {
+        device.verify(adb)?;
+        on_event(ScreenEvent::Status(
+            "正在读取并提取手机当前屏幕文字…".into(),
+        ));
+        let png = capture_png(adb, device).ok();
+        let mut lines = Vec::new();
+        if let Ok(list) = hierarchy(adb, device) {
+            for n in list {
+                for raw in [n.text.trim(), n.description.trim()] {
+                    if !raw.is_empty() && !lines.iter().any(|existing: &String| existing == raw) {
+                        lines.push(raw.to_string());
+                    }
+                }
+            }
+        }
+        if lines.is_empty() {
+            if let Ok(vis) = device.visible_text(adb) {
+                for line in vis.lines().map(str::trim).filter(|s| !s.is_empty()) {
+                    if !lines.iter().any(|existing: &String| existing == line) {
+                        lines.push(line.to_string());
+                    }
+                }
+            }
+        }
+        let msg = if lines.is_empty() {
+            "已扫描当前手机画面，暂未检测到可读取的控件文字（可能处于锁屏或纯图片/视频画面）。"
+                .into()
+        } else {
+            let preview: Vec<String> = lines.iter().take(24).map(|s| format!("• {s}")).collect();
+            format!(
+                "已从当前手机屏幕提取 {} 条文字内容：\n{}",
+                lines.len(),
+                preview.join("\n")
+            )
+        };
+        return finish(
+            "提取当前手机屏幕文字".into(),
+            msg,
+            png,
+            "extract_text",
+            json!({ "extracted_lines": lines }),
+            &mut on_event,
+        );
+    }
+
+    // 5. Volume & Mute
+    if let Some((keycode, step_desc, msg)) = match t {
+        "静音" | "手机静音" | "把手机静音" | "切换静音" => Some((
+            "164",
+            "切换手机静音状态",
+            "已发送手机静音切换指令，最新画面已刷新。",
+        )),
+        "音量调大" | "调大音量" | "音量+" | "增加音量" => {
+            Some(("24", "调大手机媒体音量", "已调大手机音量，最新画面已刷新。"))
+        }
+        "音量调小" | "调小音量" | "音量-" | "减小音量" => {
+            Some(("25", "调小手机媒体音量", "已调小手机音量，最新画面已刷新。"))
+        }
+        _ => None,
+    } {
+        device.verify(adb)?;
+        adb.shell(&device.transport, &["input", "keyevent", keycode])?;
+        thread::sleep(Duration::from_millis(350));
+        let png = capture_png(adb, device).ok();
+        return finish(
+            step_desc.into(),
+            msg.into(),
+            png,
+            "volume_key",
+            json!({ "keycode": keycode }),
+            &mut on_event,
+        );
+    }
+
+    // 6. System Settings Panels
+    if let Some((intent_action, label)) = match t {
+        "Wi-Fi 设置"
+        | "WiFi设置"
+        | "Wi-Fi设置"
+        | "打开 Wi-Fi 设置"
+        | "打开WiFi设置"
+        | "打开手机Wi-Fi设置"
+        | "打开手机WiFi设置"
+        | "无线网设置"
+        | "打开无线网设置"
+        | "打开 Wi-Fi"
+        | "打开WiFi" => Some(("android.settings.WIFI_SETTINGS", "Wi-Fi 设置")),
+        "蓝牙设置" | "打开蓝牙设置" | "打开手机蓝牙设置" | "打开蓝牙" | "连接蓝牙" => {
+            Some(("android.settings.BLUETOOTH_SETTINGS", "蓝牙设置"))
+        }
+        "系统设置" | "打开设置" | "打开系统设置" | "打开手机设置" => {
+            Some(("android.settings.SETTINGS", "系统设置"))
+        }
+        "声音设置" | "音量设置" | "打开声音设置" => {
+            Some(("android.settings.SOUND_SETTINGS", "声音与振动设置"))
+        }
+        "显示设置" | "亮度设置" | "打开显示设置" | "打开亮度设置" => {
+            Some(("android.settings.DISPLAY_SETTINGS", "显示与亮度设置"))
+        }
+        "开发者选项" | "打开开发者选项" => Some((
+            "android.settings.APPLICATION_DEVELOPMENT_SETTINGS",
+            "开发者选项",
+        )),
+        _ => None,
+    } {
+        device.verify(adb)?;
+        on_event(ScreenEvent::Status(format!("正在打开手机「{label}」界面…")));
+        adb.shell(&device.transport, &["am", "start", "-a", intent_action])?;
+        thread::sleep(Duration::from_millis(750));
+        let png = capture_png(adb, device).ok();
+        return finish(
+            format!("打开手机{label}"),
+            format!("已在手机上打开「{label}」界面，最新画面已同步到下方预览。"),
+            png,
+            "settings_panel",
+            json!({ "intent": intent_action }),
+            &mut on_event,
+        );
+    }
+
+    // 7. Navigation Keys
+    if let Some((keycode, step_desc, msg)) = match t {
+        "返回桌面" | "回到桌面" | "回到手机桌面" | "按 Home 键" => Some((
+            3u32,
+            "返回手机主屏幕桌面",
+            "已返回手机桌面，最新画面已同步。",
+        )),
+        "返回上一页" | "后退" | "按返回键" => Some((
+            4u32,
+            "返回手机上一级页面",
+            "已执行手机返回上一页操作，最新画面已同步。",
+        )),
+        "最近任务" | "多任务" | "任务管理" => Some((
+            187u32,
+            "打开手机最近任务列表",
+            "已打开手机最近任务切换视图，最新画面已同步。",
+        )),
+        _ => None,
+    } {
+        device.verify(adb)?;
+        device.key(adb, keycode)?;
+        thread::sleep(Duration::from_millis(550));
+        let png = capture_png(adb, device).ok();
+        return finish(
+            step_desc.into(),
+            msg.into(),
+            png,
+            "nav_key",
+            json!({ "keycode": keycode }),
+            &mut on_event,
+        );
+    }
+
+    // 8. Pure App Launch ("打开微信", "启动支付宝", etc.)
+    if let Some(target_app) = parse_pure_launch_target(app_name, t) {
+        on_event(ScreenEvent::Status(format!(
+            "正在手机上启动「{target_app}」…"
+        )));
+        let info = launch(adb, device, &target_app)?;
+        thread::sleep(Duration::from_millis(850));
+        let png = capture_png(adb, device).ok();
+        return finish(
+            format!("打开应用：{}", info.label),
+            format!(
+                "已在手机上打开「{}」，最新画面已同步到下方预览。",
+                info.label
+            ),
+            png,
+            "launch_app",
+            json!({ "package": info.package, "label": info.label }),
+            &mut on_event,
+        );
+    }
+
+    // 9. Direct UI Text Click ("点击 搜索", "点一下 确定", etc.)
+    if let Some(target_label) = parse_direct_click_target(t) {
+        device.verify(adb)?;
+        if !is_current_screen_target(app_name) {
+            let _ = launch(adb, device, app_name);
+            thread::sleep(Duration::from_millis(700));
+        }
+        on_event(ScreenEvent::Status(format!(
+            "正在手机屏幕上查找并点击「{target_label}」…"
+        )));
+        let list = hierarchy(adb, device)?;
+        let target_lower = target_label.to_lowercase();
+        let matched = list
+            .iter()
+            .find(|n| {
+                n.enabled
+                    && (n.text.trim().eq_ignore_ascii_case(&target_label)
+                        || n.description.trim().eq_ignore_ascii_case(&target_label))
+            })
+            .or_else(|| {
+                list.iter().find(|n| {
+                    n.enabled
+                        && (n.text.to_lowercase().contains(&target_lower)
+                            || n.description.to_lowercase().contains(&target_lower))
+                })
+            });
+        if let Some(node) = matched {
+            let x = (node.bounds[0] + node.bounds[2]) / 2;
+            let y = (node.bounds[1] + node.bounds[3]) / 2;
+            adb.shell(
+                &device.transport,
+                &["input", "tap", &x.to_string(), &y.to_string()],
+            )?;
+            thread::sleep(Duration::from_millis(700));
+            let png = capture_png(adb, device).ok();
+            return finish(
+                format!("点击界面元素：{target_label}"),
+                format!(
+                    "已在手机屏幕上定位并点击「{target_label}」（坐标 {x}, {y}），最新画面已同步。"
+                ),
+                png,
+                "direct_click",
+                json!({ "target": target_label, "x": x, "y": y }),
+                &mut on_event,
+            );
+        }
+    }
+
+    Ok(None)
 }
 
 fn perform(
@@ -624,47 +1316,98 @@ pub fn run(
     cancel: &AtomicBool,
     mut on_event: impl FnMut(ScreenEvent),
 ) -> Result<GuiRunResult> {
-    amoo_gui::validate_request(app_name, task)?;
+    let pause = AtomicBool::new(false);
+    run_with_pause(adb, device, app_name, task, cancel, &pause, &mut on_event)
+}
+
+fn wait_if_paused(
+    adb: &Adb,
+    device: &Device,
+    cancel: &AtomicBool,
+    pause: &AtomicBool,
+    deadline: Instant,
+    emit: &mut dyn FnMut(ScreenEvent),
+) -> Result<()> {
+    let mut notified = false;
+    while pause.load(Ordering::Relaxed) {
+        if cancel.load(Ordering::Relaxed) {
+            bail!("已停止后续屏幕操作");
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "桌面看屏协作已达到 10 分钟上限，已停止后续屏幕操作"
+        );
+        if !notified {
+            emit(ScreenEvent::Status(
+                "已暂停手机操作，你可以随时接手手机；点击「继续」恢复执行。".into(),
+            ));
+            notified = true;
+        }
+        thread::sleep(Duration::from_millis(120));
+    }
+    check(adb, device, cancel, deadline)
+}
+
+pub fn run_with_pause(
+    adb: &Adb,
+    device: &Device,
+    app_name: &str,
+    goal: &str,
+    cancel: &AtomicBool,
+    pause: &AtomicBool,
+    emit: &mut dyn FnMut(ScreenEvent),
+) -> Result<GuiRunResult> {
+    let (normalized_app, normalized_task) = infer_app_and_task(app_name, goal);
+    amoo_gui::validate_request(&normalized_app, &normalized_task)?;
+    if let Some(instant) =
+        try_instant_screen_command(adb, device, &normalized_app, &normalized_task, &mut *emit)?
+    {
+        return Ok(instant);
+    }
     let started = Instant::now();
     let deadline = started + TOTAL_TIME;
-    check(adb, device, cancel, deadline)?;
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(GuiRunResult {
+            state: GuiRunState::WaitingCancelled,
+            message: "已停止后续屏幕操作。".into(),
+            invocation_id: String::new(),
+            raw_result: None,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        });
+    }
+    wait_if_paused(adb, device, cancel, pause, deadline, emit)?;
     let mut session = Session::open(adb, device)?;
     let mut records = vec![];
     let execution = (|| -> Result<String> {
-        on_event(ScreenEvent::Status(
+        emit(ScreenEvent::Status(
             "正在打开目标应用；仅进行只读导航，截图将交给手机 Amoo 模型理解".into(),
         ));
-        check(adb, device, cancel, deadline)?;
-        launch(adb, device, app_name)?;
+        wait_if_paused(adb, device, cancel, pause, deadline, emit)?;
+        launch(adb, device, &normalized_app)?;
         thread::sleep(Duration::from_millis(700));
         let mut previous = "目标应用已打开，等待读取真实画面".to_string();
         let mut unchanged = 0;
         for number in 1..=MAX_STEPS {
-            check(adb, device, cancel, deadline)?;
+            wait_if_paused(adb, device, cancel, pause, deadline, emit)?;
             let (png, width, height) = screenshot(adb, device)?;
-            on_event(ScreenEvent::Screenshot {
+            emit(ScreenEvent::Screenshot {
                 number,
                 png: png.clone(),
             });
-            on_event(ScreenEvent::Status(format!(
+            emit(ScreenEvent::Status(format!(
                 "第 {number} / {MAX_STEPS} 步：Amoo 正在看当前手机画面"
             )));
             let text = session.reply(
                 &png,
-                &prompt(task, &previous, number, false),
+                &prompt(&normalized_task, &previous, number, false),
                 cancel,
                 deadline,
             )?;
             let decision = parse_decision(&text)?;
-            check(adb, device, cancel, deadline)?;
-            let (fresh, w, h) = screenshot(adb, device)?;
-            ensure!(
-                w == width && h == height,
-                "分析期间手机方向改变，已停止后续动作"
-            );
+            wait_if_paused(adb, device, cancel, pause, deadline, emit)?;
             // Status bar clocks/animations may change; guard_click additionally
             // verifies the actual visible label and point against a fresh tree.
-            let before_hash = amoo_media::artifact_content_key(&fresh);
+            let before_hash = amoo_media::artifact_content_key(&png);
             if matches!(&decision.action, Action::Done { .. }) {
                 let visible = device.visible_text(adb)?;
                 let answer = completed_answer(&decision.action, &visible)?;
@@ -683,7 +1426,7 @@ pub fn run(
                 cancel,
                 deadline,
             )?;
-            on_event(ScreenEvent::Step {
+            emit(ScreenEvent::Step {
                 number,
                 description: description.clone(),
             });
@@ -693,11 +1436,11 @@ pub fn run(
                 }
                 thread::sleep(Duration::from_millis(100));
             }
-            check(adb, device, cancel, deadline)?;
+            wait_if_paused(adb, device, cancel, pause, deadline, emit)?;
             let (after, _, _) = screenshot(adb, device)?;
             let changed = before_hash != amoo_media::artifact_content_key(&after);
             *records.last_mut().expect("proposal was recorded") = json!({"step":number,"decision":decision,"action":description,"screen_changed":changed,"executed":true});
-            on_event(ScreenEvent::Screenshot { number, png: after });
+            emit(ScreenEvent::Screenshot { number, png: after });
             unchanged = if changed { 0 } else { unchanged + 1 };
             ensure!(
                 unchanged < 3,
@@ -714,7 +1457,7 @@ pub fn run(
         }
         bail!("已达到 12 步上限，尚未确认目标完成，已停止后续屏幕操作")
     })();
-    on_event(ScreenEvent::Status(
+    emit(ScreenEvent::Status(
         "正在清理本次临时视觉会话和手机截图副本…".into(),
     ));
     let deleted = session.clean();
@@ -787,5 +1530,38 @@ mod tests {
         )
         .is_err());
         assert!(completed_answer(&done("无法完成", "设置", false), "设置").is_err());
+    }
+
+    #[test]
+    fn common_chinese_app_aliases_and_task_inference_work() {
+        assert_eq!(resolve_app_alias("微信"), &["com.tencent.mm"]);
+        assert_eq!(resolve_app_alias("设置"), &["com.android.settings"]);
+        assert_eq!(
+            resolve_app_alias("支付宝"),
+            &["com.eg.android.AlipayGphone"]
+        );
+        assert!(is_current_screen_target(""));
+        assert!(is_current_screen_target("当前屏幕"));
+        assert_eq!(
+            infer_app_and_task("", "打开微信给王总发消息"),
+            ("微信".to_string(), "打开微信给王总发消息".to_string())
+        );
+        assert_eq!(
+            infer_app_and_task("微信", ""),
+            ("微信".to_string(), "打开 微信".to_string())
+        );
+        assert_eq!(
+            infer_app_and_task("", "点亮屏幕"),
+            ("当前屏幕".to_string(), "点亮屏幕".to_string())
+        );
+        assert_eq!(
+            parse_pure_launch_target("", "打开微信"),
+            Some("微信".to_string())
+        );
+        assert_eq!(parse_pure_launch_target("", "打开微信然后发消息"), None);
+        assert_eq!(
+            parse_direct_click_target("点击 确定"),
+            Some("确定".to_string())
+        );
     }
 }

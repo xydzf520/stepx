@@ -17,15 +17,22 @@ pub(super) enum StudioLabAction {
     Select(usize),
     HistoryPage(usize),
     Iterate,
+    ReusePrompt(usize),
     Preview,
+    PreviewAt(usize),
     OpenFolder,
     Refresh,
     ToggleReport,
     CloudModels,
     CloudModel(String),
     DeliverPhone,
+    DeliverPhoneAt(usize),
+    OpenInWorkbench(usize),
+    ImportFromWork,
     SyncCloud,
     OpenCloud,
+    DeleteArtifactAt(usize),
+    ApplyProviderPreset(u8),
 }
 impl StudioLabAction {
     fn available(&self, busy: bool, running: bool) -> bool {
@@ -33,7 +40,18 @@ impl StudioLabAction {
         if running
             && matches!(
                 self,
-                Start | Fresh | Template(_) | Iterate | Save | Test | Models | ClearKey
+                Start
+                    | Fresh
+                    | Template(_)
+                    | Iterate
+                    | ReusePrompt(_)
+                    | OpenInWorkbench(_)
+                    | ImportFromWork
+                    | Save
+                    | Test
+                    | Models
+                    | ClearKey
+                    | ApplyProviderPreset(_)
             )
         {
             return false;
@@ -47,6 +65,8 @@ impl StudioLabAction {
                     | Protocol(_)
                     | Model(_)
                     | CloudModel(_)
+                    | DeleteArtifactAt(_)
+                    | ApplyProviderPreset(_)
             )
     }
 }
@@ -86,7 +106,6 @@ pub(super) struct CloudFeedback {
     pub recovery_url: Option<String>,
     pub error: Option<String>,
 }
-#[derive(Default)]
 pub(super) struct StudioLabUiState {
     pub loaded: bool,
     pub config: studio_lab::PublicConfig,
@@ -113,11 +132,82 @@ pub(super) struct StudioLabUiState {
     pub cloud_scope: Option<String>,
     pub phone_feedback: std::collections::HashMap<(String, String), Result<String, String>>,
     pub cloud_feedback: std::collections::HashMap<(String, String, String), CloudFeedback>,
+    pub last_prompt: String,
+    pub artifact_prompts: std::collections::HashMap<String, String>,
 }
-pub(super) const LAB_TEMPLATES: [(&str,&str);3] = [
-    ("做个小游戏","制作一款适合手机竖屏的贪吃蛇小游戏。清晰的开始、暂停、重开和触控方向按钮；实时积分，碰撞结束；键盘方向键也可操作。离线可用，不依赖网络。请真实测试开始、暂停、方向控制与重新开始，验证分数和游戏状态会变化。"),
-    ("随手记账","制作适合手机竖屏的离线记账应用。金额、分类和备注输入，新增、修改、删除，实时总计，重开后保留本地数据。首次没有伪造账单。请真实测试新增两笔、统计总额和删除后的总额变化。"),
-    ("专注计时","制作手机和电脑都能用的离线专注计时器。可选时长，开始、暂停、继续、重置，清楚显示剩余时间；支持短时测试模式。请验证倒计时实际变化、暂停时保持、重置恢复，以及触屏布局。"),
+impl Default for StudioLabUiState {
+    fn default() -> Self {
+        let config = studio_lab::load_config().unwrap_or_default();
+        let protocol = u8::from(config.protocol == "anthropic");
+        let artifacts = studio_lab::list_artifacts().unwrap_or_default();
+        let selected = (!artifacts.is_empty()).then_some(0);
+        let report = artifacts
+            .first()
+            .and_then(|a| studio_lab::read_report(a).ok().map(|r| (a.id.clone(), r)));
+        Self {
+            loaded: !artifacts.is_empty(),
+            config,
+            protocol,
+            models: Vec::new(),
+            model_note: None,
+            pending_config: None,
+            artifacts,
+            history_page: 0,
+            selected,
+            handle: None,
+            events: Vec::new(),
+            status: String::new(),
+            error: None,
+            source: None,
+            source_name: None,
+            prompt_scroll: ClippedScrollStateHandle::default(),
+            report,
+            report_loading: None,
+            report_error: None,
+            report_open: false,
+            cloud_models: Vec::new(),
+            cloud_model: None,
+            cloud_scope: None,
+            phone_feedback: std::collections::HashMap::new(),
+            cloud_feedback: std::collections::HashMap::new(),
+            last_prompt: String::new(),
+            artifact_prompts: std::collections::HashMap::new(),
+        }
+    }
+}
+pub(super) const LAB_TEMPLATES: [(&str, &str); 8] = [
+    (
+        "贪吃蛇大作战",
+        "制作一款适合手机竖屏(390×844)与桌面自适应的深色霓虹贪吃蛇 HTML5 Canvas 游戏。包含实时积分、最高纪录(localStorage)、氮气加速双倍积分开关、暂停/继续与重开按钮；同时提供键盘方向键/WASD控制与屏幕底部触控方向盘(上/下/左/右)，确保手机和电脑都能100%流畅试玩。",
+    ),
+    (
+        "2048 益智方块",
+        "制作一款赛博深色风格的 4×4 2048 益智方块游戏。实现完整的四向滑动合并算法、当前积分与最高分(localStorage)、悔棋一步(Undo)和新开一局按钮；同时支持键盘方向键、触摸屏手势滑动以及屏幕四向按钮操作。",
+    ),
+    (
+        "霓虹打砖块",
+        "制作一款复古街机风的霓虹打砖块 HTML5 Canvas 游戏。包含多排彩色能量砖块、挡板反弹物理角度计算、连击倍率积分、生命值显示、开始/暂停/重开按钮，支持鼠标/触摸拖拽挡板以及左右方向键与屏幕左右触控按钮。",
+    ),
+    (
+        "太空弹幕射击",
+        "制作一款竖屏太空战机弹幕射击小游戏。包含星空粒子背景、自动连发激光、敌机波次生成、护盾能量条、得分与最高分统计、暂停与重开按钮；支持触屏拖拽战机、键盘方向键以及屏幕左/右/护盾技能按钮。",
+    ),
+    (
+        "番茄专注时钟",
+        "制作一款适合手机和电脑的离线番茄专注时钟 App。顶部包含 SVG 环形倒计时进度圈、25min深度专注与5min休息模式切换、开始/暂停/重置按钮及已完成番茄计数器；底部包含可新增、勾选完成、删除并保存在 localStorage 的今日专注待办清单。",
+    ),
+    (
+        "随手记账看板",
+        "制作一款适合手机竖屏的随手记账与月度预算看板 App。顶部展示本月已支出总额、月度预算进度条与四大分类(餐饮/交通/数码/娱乐)汇总卡片；中部提供快速记账表单(金额、分类、备注)；底部支持按分类筛选与删除账单，并持久化到 localStorage。",
+    ),
+    (
+        "每日习惯打卡",
+        "制作一款深色极简风的每日习惯打卡与连续天数追踪 App。支持新增习惯(如早起饮水、阅读30分钟、有氧运动)、点击今日打卡自动累加连续打卡天数(Streak)、展示今日完成率进度条与近7天打卡热力矩阵，并持久化到 localStorage。",
+    ),
+    (
+        "背屏点阵控制器",
+        "制作一款 StepX 23×17 背屏光显点阵图案编辑器与控制器 App。提供 23×17 可点击/涂抹绘制的 LED 像素网格、亮度滑块、跑马灯滚动预览、4款内置预设图案(赛博闪电/猫咪眨眼/专注时钟/能量爱心)一键切换与导出 JSON 点阵数据。",
+    ),
 ];
 
 impl Companion {
@@ -156,6 +246,30 @@ impl Companion {
         self.studio_lab
             .selected
             .and_then(|i| self.studio_lab.artifacts.get(i))
+    }
+    pub(super) fn studio_lab_prompt_for(&self, a: &studio_lab::LabArtifact) -> String {
+        if let Some(p) = self
+            .studio_lab
+            .artifact_prompts
+            .get(&a.id)
+            .filter(|s| !s.trim().is_empty())
+        {
+            return p.clone();
+        }
+        match a.id.as_str() {
+            "starter-neon-snake" => return LAB_TEMPLATES[0].1.into(),
+            "starter-cyber-2048" => return LAB_TEMPLATES[1].1.into(),
+            "starter-pomodoro-app" => return LAB_TEMPLATES[4].1.into(),
+            "starter-expense-app" => return LAB_TEMPLATES[5].1.into(),
+            _ => {}
+        }
+        if !self.studio_lab.last_prompt.trim().is_empty() {
+            return self.studio_lab.last_prompt.clone();
+        }
+        format!(
+            "请继续改进离线应用「{}」（第 {} 轮 · {}），保留已有核心功能并优化交互体验。",
+            a.name, a.round, a.summary
+        )
     }
     pub(super) fn tick_studio_lab(&mut self) -> bool {
         let mut changed = false;
@@ -247,12 +361,44 @@ impl Companion {
             );
             changed = true;
         }
-        if !matches!(self.page, Page::Studio | Page::Amoo) || self.busy || self.demo_mode {
+        if !matches!(self.page, Page::Studio | Page::Amoo | Page::Settings) || self.busy {
             return changed;
+        }
+        if self.fields[F_LAB_ENDPOINT].text.is_empty()
+            && !self.studio_lab.config.endpoint.is_empty()
+            && self.focus != Some(F_LAB_ENDPOINT)
+        {
+            self.fields[F_LAB_ENDPOINT].set(&self.studio_lab.config.endpoint);
+        }
+        if self.fields[F_LAB_MODEL].text.is_empty()
+            && !self.studio_lab.config.model.is_empty()
+            && self.focus != Some(F_LAB_MODEL)
+        {
+            self.fields[F_LAB_MODEL].set(&self.studio_lab.config.model);
         }
         if !self.studio_lab.loaded {
             self.studio_lab.loaded = true;
-            self.submit("正在读取 Studio 工作台…", |_| {
+            if self.demo_mode || self.page == Page::Amoo {
+                if !self.demo_mode {
+                    if let Ok(config) = studio_lab::load_config() {
+                        self.fields[F_LAB_ENDPOINT].set(&config.endpoint);
+                        self.fields[F_LAB_MODEL].set(&config.model);
+                        self.studio_lab.protocol = u8::from(config.protocol == "anthropic");
+                        self.studio_lab.config = config;
+                    }
+                }
+                if let Ok(artifacts) = studio_lab::list_artifacts() {
+                    self.studio_lab.artifacts = artifacts;
+                    self.studio_lab.selected = (!self.studio_lab.artifacts.is_empty()).then_some(0);
+                    if let Some(a) = self.studio_lab_selected().cloned() {
+                        if let Ok(report) = studio_lab::read_report(&a) {
+                            self.studio_lab.report = Some((a.id, report));
+                        }
+                    }
+                }
+                return true;
+            }
+            self.submit("正在读取作品…", |_| {
                 Ok(Outcome::StudioLab(StudioLabOutcome::Loaded(
                     (|| Ok((studio_lab::load_config()?, studio_lab::list_artifacts()?)))()
                         .map_err(|e: anyhow::Error| e.to_string()),
@@ -268,6 +414,13 @@ impl Companion {
                 .is_none_or(|(id, _)| id != &artifact.id)
                 && self.studio_lab.report_loading.as_ref() != Some(&artifact.id)
             {
+                if self.demo_mode || self.page == Page::Amoo {
+                    if let Ok(report) = studio_lab::read_report(&artifact) {
+                        self.studio_lab.report = Some((artifact.id, report));
+                        return true;
+                    }
+                    return changed;
+                }
                 self.studio_lab.report_loading = Some(artifact.id.clone());
                 self.submit("正在读取作品验证结果…", move |_| {
                     Ok(Outcome::StudioLab(StudioLabOutcome::Report(
@@ -281,6 +434,11 @@ impl Companion {
         changed
     }
     fn studio_lab_receive_artifact(&mut self, artifact: studio_lab::LabArtifact) {
+        if !self.studio_lab.last_prompt.trim().is_empty() {
+            self.studio_lab
+                .artifact_prompts
+                .insert(artifact.id.clone(), self.studio_lab.last_prompt.clone());
+        }
         self.workspace_output(stepx_companion::amoo_workspace::Output {
             path: artifact.html_path.clone(),
             name: artifact.name.clone(),
@@ -303,7 +461,16 @@ impl Companion {
     fn studio_lab_store_action(&mut self, kind: u8) {
         let endpoint = self.fields[F_LAB_ENDPOINT].text.clone();
         let model = self.fields[F_LAB_MODEL].text.clone();
-        let key = self.fields[F_LAB_KEY].text.clone();
+        let mut key = self.fields[F_LAB_KEY].text.clone();
+        if kind != 3
+            && key.trim().is_empty()
+            && !self.studio_lab.config.has_key
+            && (endpoint.contains("127.0.0.1")
+                || endpoint.contains("localhost")
+                || endpoint.contains("11434"))
+        {
+            key = "ollama".into();
+        }
         let protocol = if self.studio_lab.protocol == 1 {
             "anthropic"
         } else {
@@ -337,6 +504,47 @@ impl Companion {
             },
         );
     }
+    pub(super) fn studio_lab_start(&mut self) -> bool {
+        self.studio_lab.error = None;
+        if self.studio_lab.handle.is_some() {
+            return true;
+        }
+        let use_phone = !self.studio_lab.config.has_key;
+        if !use_phone && (self.studio_lab.config.model.is_empty() || self.studio_lab_config_dirty())
+        {
+            self.studio_lab.error = Some("需要先填写模型服务".into());
+            return true;
+        }
+        let prompt = self.fields[F_LAB_PROMPT].text.trim().to_string();
+        if prompt.is_empty() {
+            return false;
+        }
+        self.studio_lab.last_prompt = prompt.clone();
+        self.studio_lab.events.clear();
+        self.studio_lab.status = "正在连接模型，开始创作…".into();
+        let phone = if use_phone {
+            match self.selected.clone().zip(Adb::discover().ok()) {
+                Some((device, adb)) => Some((adb, device)),
+                None if self.demo_mode => {
+                    return true;
+                }
+                None => {
+                    self.studio_lab.error = Some("请先连接手机".into());
+                    return true;
+                }
+            }
+        } else {
+            None
+        };
+        self.studio_lab.handle = Some(studio_lab::start_with_phone(
+            studio_lab::LabRequest {
+                prompt,
+                source: self.studio_lab.source.clone(),
+            },
+            phone,
+        ));
+        true
+    }
     pub(super) fn handle_studio_lab_action(
         &mut self,
         action: &StudioLabAction,
@@ -349,51 +557,77 @@ impl Companion {
         self.studio_lab.error = None;
         self.error = false;
         match action {
-            A::Protocol(v) => self.studio_lab.protocol = (*v).min(1),
+            A::Protocol(v) => {
+                self.studio_lab.protocol = (*v).min(1);
+                self.trigger_subtab_switch();
+            }
+            A::ApplyProviderPreset(idx) => {
+                let (endpoint, model, proto, note) = match idx {
+                    0 => (
+                        "https://api.stepfun.com/v1",
+                        "step-2-16k",
+                        0,
+                        "已填入阶跃星辰 StepFun 接口预设，请粘贴 API Key 后点击「保存设置」",
+                    ),
+                    1 => (
+                        "https://api.deepseek.com/v1",
+                        "deepseek-chat",
+                        0,
+                        "已填入 DeepSeek 接口预设，请粘贴 API Key 后点击「保存设置」",
+                    ),
+                    2 => (
+                        "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                        "qwen-plus",
+                        0,
+                        "已填入通义千问 DashScope 兼容接口预设，请粘贴 API Key 后点击「保存设置」",
+                    ),
+                    3 => (
+                        "https://api.moonshot.cn/v1",
+                        "moonshot-v1-32k",
+                        0,
+                        "已填入 Kimi (Moonshot) 接口预设，请粘贴 API Key 后点击「保存设置」",
+                    ),
+                    4 => (
+                        "https://open.bigmodel.cn/api/paas/v4",
+                        "glm-4-plus",
+                        0,
+                        "已填入智谱 GLM 接口预设，请粘贴 API Key 后点击「保存设置」",
+                    ),
+                    5 => (
+                        "https://api.openai.com/v1",
+                        "gpt-4o",
+                        0,
+                        "已填入 OpenAI 官方接口预设，请粘贴 API Key 后点击「保存设置」",
+                    ),
+                    6 => (
+                        "https://api.anthropic.com",
+                        "claude-3-5-sonnet-latest",
+                        1,
+                        "已填入 Anthropic Claude 接口预设，请粘贴 API Key 后点击「保存设置」",
+                    ),
+                    _ => (
+                        "http://127.0.0.1:11434/v1",
+                        "qwen2.5:7b",
+                        0,
+                        "已填入本机 Ollama (127.0.0.1:11434) 免密钥预设，可直接点击「保存设置」或「读取模型」",
+                    ),
+                };
+                self.fields[F_LAB_ENDPOINT].set(endpoint);
+                self.fields[F_LAB_MODEL].set(model);
+                self.studio_lab.protocol = proto;
+                self.studio_lab.model_note = Some(note.into());
+                self.status = note.into();
+                self.trigger_subtab_switch();
+            }
             A::Save => self.studio_lab_store_action(0),
             A::Test => self.studio_lab_store_action(1),
             A::Models => self.studio_lab_store_action(2),
             A::ClearKey => self.studio_lab_store_action(3),
             A::Model(name) => self.fields[F_LAB_MODEL].set(name),
             A::Start => {
-                if self.studio_lab.handle.is_some() {
-                    return;
-                }
-                let use_phone = !self.studio_lab.config.has_key;
-                if !use_phone
-                    && (self.studio_lab.config.model.is_empty() || self.studio_lab_config_dirty())
-                {
-                    self.studio_lab.error =
-                        Some("请先在连接设置中保存自己的模型 API 与模型名称".into());
-                    self.studio.tab = 3;
-                    return;
-                }
-                let prompt = self.fields[F_LAB_PROMPT].text.trim().to_string();
-                if prompt.is_empty() {
+                if !self.studio_lab_start() {
                     self.focus_field(F_LAB_PROMPT, ctx);
-                    return;
                 }
-                self.studio_lab.events.clear();
-                self.studio_lab.status = "正在连接模型，开始创作…".into();
-                let phone = if use_phone {
-                    match self.selected.clone().zip(Adb::discover().ok()) {
-                        Some((device, adb)) => Some((adb, device)),
-                        None => {
-                            self.studio_lab.error =
-                                Some("请连接手机使用 Amoo，或在模型设置保存自己的 API".into());
-                            return;
-                        }
-                    }
-                } else {
-                    None
-                };
-                self.studio_lab.handle = Some(studio_lab::start_with_phone(
-                    studio_lab::LabRequest {
-                        prompt,
-                        source: self.studio_lab.source.clone(),
-                    },
-                    phone,
-                ));
             }
             A::Stop => {
                 if let Some(handle) = &self.studio_lab.handle {
@@ -404,6 +638,7 @@ impl Companion {
             A::HistoryPage(page) => {
                 self.studio_lab.history_page =
                     (*page).min(self.studio_lab.artifacts.len().saturating_sub(1) / 6);
+                self.trigger_subtab_switch();
             }
             A::Fresh => {
                 self.studio.tab = 2;
@@ -412,6 +647,7 @@ impl Companion {
                 self.studio_lab.report = None;
                 self.studio_lab.report_loading = None;
                 self.studio_lab.report_error = None;
+                self.trigger_subtab_switch();
                 if self.studio_lab.handle.is_some() {
                     return;
                 }
@@ -426,9 +662,11 @@ impl Companion {
                     return;
                 }
                 if let Some((_, prompt)) = LAB_TEMPLATES.get(*i) {
+                    self.studio.tab = 2;
                     self.studio_lab.source = None;
                     self.studio_lab.source_name = None;
                     self.fields[F_LAB_PROMPT].set(prompt);
+                    self.trigger_subtab_switch();
                     self.focus_field(F_LAB_PROMPT, ctx);
                 }
             }
@@ -438,6 +676,7 @@ impl Companion {
                     self.studio_lab.report = None;
                     self.studio_lab.report_loading = None;
                     self.studio_lab.report_error = None;
+                    self.trigger_subtab_switch();
                 }
             }
             A::Iterate => {
@@ -448,18 +687,101 @@ impl Companion {
                     self.focus_field(F_LAB_PROMPT, ctx);
                 }
             }
+            A::ReusePrompt(i) | A::OpenInWorkbench(i) => {
+                if let Some(a) = self.studio_lab.artifacts.get(*i).cloned() {
+                    self.studio.tab = 2;
+                    self.studio_lab.selected = Some(*i);
+                    self.studio_lab.report = None;
+                    self.studio_lab.report_loading = None;
+                    self.studio_lab.report_error = None;
+                    let prompt = self.studio_lab_prompt_for(&a);
+                    self.studio_lab.source = Some(a.html_path);
+                    self.studio_lab.source_name = Some(a.name.clone());
+                    self.fields[F_LAB_PROMPT].set(&prompt);
+                    self.trigger_subtab_switch();
+                    self.focus_field(F_LAB_PROMPT, ctx);
+                    self.status = format!("已在工作台载入「{}」，可立即预览或继续改进", a.name);
+                }
+            }
+            A::ImportFromWork => {
+                if self.studio_lab.handle.is_some() {
+                    return;
+                }
+                self.studio.tab = 2;
+                self.studio_lab.source = None;
+                self.studio_lab.source_name = None;
+                let latest = self
+                    .work
+                    .artifacts
+                    .first()
+                    .map(|a| (a.name.clone(), a.path.clone()))
+                    .or_else(|| {
+                        self.work
+                            .files
+                            .iter()
+                            .find(|f| !f.is_dir)
+                            .map(|f| (f.name.clone(), f.path.clone()))
+                    });
+                let prompt = if let Some((name, path)) = latest {
+                    let snippet = std::fs::read_to_string(&path)
+                        .ok()
+                        .map(|s| s.chars().take(2000).collect::<String>())
+                        .filter(|s| !s.trim().is_empty());
+                    if let Some(text) = snippet {
+                        format!(
+                            "请基于以下专业交付文档/数据（{}），制作一个可交互的移动端数据看板与实用应用：\n\n{}",
+                            name,
+                            text.trim()
+                        )
+                    } else {
+                        format!(
+                            "请基于以下专业交付文档/数据（文件：{}），制作一个可交互的移动端数据看板与实用应用：\n包含关键指标卡片、分类筛选、交互式图表和本地数据持久化。",
+                            name
+                        )
+                    }
+                } else {
+                    "请基于以下专业交付文档/数据，制作一个可交互的移动端数据看板与实用应用：\n1. 顶部展示核心 KPI 指标卡片与达成率进度条；\n2. 支持按分类/周期筛选明细数据并实时重算汇总；\n3. 支持新增记录、状态标记与本地 localStorage 持久化；\n4. 适配 390×844 手机竖屏与桌面深色主题。".into()
+                };
+                self.fields[F_LAB_PROMPT].set(&prompt);
+                self.focus_field(F_LAB_PROMPT, ctx);
+                self.status = "已导入专业交付数据看板需求，可点击开始创作生成交互应用".into();
+            }
             A::ToggleReport => self.studio_lab.report_open = !self.studio_lab.report_open,
+            A::DeleteArtifactAt(i) => {
+                if *i < self.studio_lab.artifacts.len() {
+                    let removed = self.studio_lab.artifacts.remove(*i);
+                    remove_artifact_root_dir(&removed.root);
+                    if self.studio_lab.selected == Some(*i) {
+                        self.studio_lab.selected =
+                            (!self.studio_lab.artifacts.is_empty()).then_some(0);
+                    } else if let Some(sel) = self.studio_lab.selected {
+                        if sel > *i {
+                            self.studio_lab.selected = Some(sel - 1);
+                        }
+                    }
+                    self.status = format!("已删除本机作品「{}」", removed.name);
+                }
+            }
             A::Refresh => self.submit("正在读取本机作品…", |_| {
                 Ok(Outcome::StudioLab(StudioLabOutcome::Artifacts(
                     studio_lab::list_artifacts().map_err(|e| e.to_string()),
                 )))
             }),
+            A::PreviewAt(i) => {
+                if *i < self.studio_lab.artifacts.len() {
+                    self.studio_lab.selected = Some(*i);
+                    self.studio_lab.report = None;
+                    self.studio_lab.report_loading = None;
+                    self.studio_lab.report_error = None;
+                    self.handle_studio_lab_action(&A::Preview, ctx);
+                }
+            }
             A::Preview => {
                 if let Some(a) = self.studio_lab_selected().cloned() {
-                    self.submit("正在打开隔离预览…", move |_| {
+                    self.submit("正在打开交互预览…", move |_| {
                         Ok(Outcome::StudioLab(StudioLabOutcome::Note(
-                            studio_lab::open_preview(&a)
-                                .map(|_| "已打开独立离线预览，可实际操作检查".into())
+                            studio_lab::open_preview_window(&a)
+                                .map(|_| "已打开独立离线预览窗口，可实际操作试玩".into())
                                 .map_err(|e| e.to_string()),
                         )))
                     });
@@ -509,20 +831,33 @@ impl Companion {
                     self.studio_lab.cloud_model = Some(model.clone());
                 }
             }
+            A::DeliverPhoneAt(i) => {
+                if *i < self.studio_lab.artifacts.len() {
+                    self.studio_lab.selected = Some(*i);
+                    self.studio_lab.report = None;
+                    self.studio_lab.report_loading = None;
+                    self.studio_lab.report_error = None;
+                    self.handle_studio_lab_action(&A::DeliverPhone, ctx);
+                }
+            }
             A::DeliverPhone => {
-                let Some(a) = self.studio_lab_selected().filter(|a| a.passed).cloned() else {
-                    self.studio_lab.error = Some("请先选择自动检查通过的作品".into());
+                let Some(a) = self
+                    .studio_lab_selected()
+                    .filter(|a| a.html_path.is_file())
+                    .cloned()
+                else {
+                    self.studio_lab.error = Some("请先选择有效的本机作品文件".into());
                     return;
                 };
                 self.with_device(
-                    "正在发送并验证手机离线作品…",
+                    "正在发送并打开手机离线作品…",
                     move |adb, d| {
                         let result = (|| {
                             let html = studio_lab::verified_html(&a)?;
                             let r = studio_delivery::install_local(adb, &d, &a.name, &html)?;
                             studio_delivery::open_local(adb, &d, &r.id)?;
                             Ok(format!(
-                                "{} 已发送到手机并完成页面载入；可在伴侣作品库离线打开",
+                                "「{}」已发送到手机并打开；可在伴侣作品库随时离线试玩",
                                 a.name
                             ))
                         })();
@@ -598,7 +933,7 @@ impl Companion {
     fn studio_lab_apply_saved_config(&mut self, config: studio_lab::PublicConfig) {
         self.fields[F_LAB_KEY].clear();
         self.record_notice(
-            "Studio 模型设置已保存",
+            "模型服务已保存",
             "后续任务将使用已确认的模型服务；密钥仅保存在本机。",
         );
         if self
@@ -812,6 +1147,20 @@ impl Companion {
     }
 }
 
+fn remove_artifact_root_dir(root: &std::path::Path) {
+    if root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .is_some_and(|name| name.starts_with("round-"))
+    {
+        if let Some(parent) = root.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+            return;
+        }
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
 // Only a validated official editor route may become a recovery action. Never
 // offer retry-as-new after creation succeeded but source upload failed.
 fn created_editor_url(error: &str) -> Option<String> {
@@ -824,7 +1173,7 @@ fn created_editor_url(error: &str) -> Option<String> {
 }
 #[cfg(test)]
 mod tests {
-    use super::created_editor_url;
+    use super::{created_editor_url, remove_artifact_root_dir};
     #[test]
     fn recovery_link_is_only_an_official_project_route() {
         let url = "https://studio.stepx.com/builder/app/p_1234567890abcdef";
@@ -837,6 +1186,17 @@ mod tests {
         )
         .is_none());
         assert!(created_editor_url("HTTP 403").is_none());
+    }
+
+    #[test]
+    fn deleting_round_artifact_removes_entire_parent_run_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let run_dir = temp.path().join("runs").join("starter-analytics-cockpit");
+        let round_dir = run_dir.join("round-1");
+        std::fs::create_dir_all(&round_dir).unwrap();
+        std::fs::write(round_dir.join("index.html"), "<html></html>").unwrap();
+        remove_artifact_root_dir(&round_dir);
+        assert!(!run_dir.exists());
     }
 }
 

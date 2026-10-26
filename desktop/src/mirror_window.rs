@@ -52,7 +52,7 @@ impl Watcher {
                     if let Ok(mut value) = state.lock() {
                         *value = frame;
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    std::thread::sleep(std::time::Duration::from_millis(33));
                 }
             });
         Self { latest, stopped }

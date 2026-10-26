@@ -16,27 +16,31 @@ enum RichBlock {
 // window resizing, with a strict bound so long conversations cannot grow it forever.
 #[derive(Default)]
 struct RichTextCache {
-    entries: std::collections::VecDeque<(String, Vec<RichBlock>)>,
+    entries: std::collections::VecDeque<(String, std::sync::Arc<[RichBlock]>)>,
     bytes: usize,
 }
 impl RichTextCache {
-    fn get(&mut self, source: &str) -> Vec<RichBlock> {
+    fn get(&mut self, source: &str) -> std::sync::Arc<[RichBlock]> {
         if let Some(index) = self.entries.iter().position(|(text, _)| text == source) {
+            if index == 0 {
+                return std::sync::Arc::clone(&self.entries[0].1);
+            }
             let entry = self.entries.remove(index).unwrap();
-            let result = entry.1.clone();
-            self.entries.push_back(entry);
+            let result = std::sync::Arc::clone(&entry.1);
+            self.entries.push_front(entry);
             return result;
         }
-        let result = parse_blocks(source);
+        let result: std::sync::Arc<[RichBlock]> = parse_blocks(source).into();
         if source.len() <= 256 * 1024 {
             while self.entries.len() >= 64 || self.bytes + source.len() > 2 * 1024 * 1024 {
-                let Some((text, _)) = self.entries.pop_front() else {
+                let Some((text, _)) = self.entries.pop_back() else {
                     break;
                 };
                 self.bytes -= text.len();
             }
             self.bytes += source.len();
-            self.entries.push_back((source.to_owned(), result.clone()));
+            self.entries
+                .push_front((source.to_owned(), std::sync::Arc::clone(&result)));
         }
         result
     }
@@ -67,11 +71,14 @@ fn parse_blocks(source: &str) -> Vec<RichBlock> {
             pending.clear();
             return;
         }
-        let value = parse_markdown_with_gfm_tables(pending).unwrap_or_else(|_| {
+        let mut value = parse_markdown_with_gfm_tables(pending).unwrap_or_else(|_| {
             FormattedText::new([FormattedTextLine::Line(vec![
                 markdown_parser::FormattedTextFragment::plain_text(pending.clone()),
             ])])
         });
+        for line in &mut value.lines {
+            sanitize_links(line);
+        }
         blocks.push(if quote {
             RichBlock::Quote(value)
         } else {
@@ -115,11 +122,11 @@ pub(in super::super) fn markdown_images(
     source: &str,
 ) -> Vec<stepx_companion::openclaw::RealAttachment> {
     let mut seen = std::collections::HashSet::new();
-    RICH_TEXT_CACHE
-        .with(|cache| cache.borrow_mut().get(source))
-        .into_iter()
+    let blocks = RICH_TEXT_CACHE.with(|cache| cache.borrow_mut().get(source));
+    blocks
+        .iter()
         .flat_map(|block| match block {
-            RichBlock::Markdown(text) | RichBlock::Quote(text) => text.lines,
+            RichBlock::Markdown(text) | RichBlock::Quote(text) => text.lines.iter(),
         })
         .filter_map(|line| match line {
             FormattedTextLine::Image(image)
@@ -129,10 +136,10 @@ pub(in super::super) fn markdown_images(
                     name: if image.alt_text.is_empty() {
                         "图片".into()
                     } else {
-                        image.alt_text
+                        image.alt_text.clone()
                     },
                     kind: "image".into(),
-                    url: image.source,
+                    url: image.source.clone(),
                     ..Default::default()
                 })
             }
@@ -141,44 +148,52 @@ pub(in super::super) fn markdown_images(
         .collect()
 }
 
+fn sanitize_fragments(fragments: &mut [markdown_parser::FormattedTextFragment]) {
+    for fragment in fragments {
+        if fragment
+            .styles
+            .hyperlink
+            .as_ref()
+            .is_some_and(|link| match link {
+                Hyperlink::Url(url) => !safe_link(url),
+                Hyperlink::Action(_) => true,
+            })
+        {
+            fragment.styles.hyperlink = None;
+        } else if fragment.styles.hyperlink.is_some() {
+            fragment.styles.underline = true;
+        }
+    }
+}
+
 fn sanitize_links(line: &mut FormattedTextLine) {
-    let fragments = match line {
-        FormattedTextLine::Line(text) => Some(text),
-        FormattedTextLine::Heading(header) => Some(&mut header.text),
-        FormattedTextLine::OrderedList(list) => Some(&mut list.indented_text.text),
-        FormattedTextLine::UnorderedList(list) => Some(&mut list.text),
-        FormattedTextLine::TaskList(list) => Some(&mut list.text),
-        _ => None,
-    };
-    if let Some(fragments) = fragments {
-        for fragment in fragments {
-            if fragment
-                .styles
-                .hyperlink
-                .as_ref()
-                .is_some_and(|link| match link {
-                    Hyperlink::Url(url) => !safe_link(url),
-                    Hyperlink::Action(_) => true,
-                })
-            {
-                fragment.styles.hyperlink = None;
-            } else if fragment.styles.hyperlink.is_some() {
-                fragment.styles.underline = true;
+    match line {
+        FormattedTextLine::Line(text) => sanitize_fragments(text),
+        FormattedTextLine::Heading(header) => sanitize_fragments(&mut header.text),
+        FormattedTextLine::OrderedList(list) => sanitize_fragments(&mut list.indented_text.text),
+        FormattedTextLine::UnorderedList(list) => sanitize_fragments(&mut list.text),
+        FormattedTextLine::TaskList(list) => sanitize_fragments(&mut list.text),
+        FormattedTextLine::Table(table) => {
+            for cell in &mut table.headers {
+                sanitize_fragments(cell);
+            }
+            for row in &mut table.rows {
+                for cell in row {
+                    sanitize_fragments(cell);
+                }
             }
         }
+        _ => {}
     }
 }
 
 impl Companion {
     fn work_formatted(
         &self,
-        mut text: FormattedText,
+        text: FormattedText,
         weight: Option<Weight>,
         alignment: TextAlignment,
     ) -> El {
-        for line in &mut text.lines {
-            sanitize_links(line);
-        }
         let p = self.p();
         let mut element = FormattedTextElement::new(
             text,
@@ -216,7 +231,7 @@ impl Companion {
         element.finish()
     }
 
-    fn work_markdown_table(&self, table: FormattedTable, id: &str) -> El {
+    fn work_markdown_table(&self, table: &FormattedTable, id: &str) -> El {
         let p = self.p();
         let columns = table.headers.len().max(1);
         let key = format!("work-table-full-{id}");
@@ -283,7 +298,7 @@ impl Companion {
             .finish()
     }
 
-    fn work_markdown_lines(&self, text: FormattedText, id: &str) -> El {
+    fn work_markdown_lines(&self, text: &FormattedText, id: &str) -> El {
         let p = self.p();
         let mut elements = Vec::new();
         let mut lines = Vec::new();
@@ -296,7 +311,7 @@ impl Companion {
                 ));
             }
         };
-        for (index, line) in text.lines.into_iter().enumerate() {
+        for (index, line) in text.lines.iter().enumerate() {
             match line {
                 FormattedTextLine::Table(table) => {
                     flush(&mut elements, &mut lines);
@@ -370,7 +385,7 @@ impl Companion {
                         None,
                     ));
                 }
-                other => lines.push(other),
+                other => lines.push(other.clone()),
             }
         }
         flush(&mut elements, &mut lines);
@@ -379,11 +394,11 @@ impl Companion {
 
     pub(in super::super) fn work_rich_text(&self, body: &str, id: &str) -> El {
         let p = self.p();
+        let blocks = RICH_TEXT_CACHE.with(|cache| cache.borrow_mut().get(body));
         self.vstack(
             S3,
-            RICH_TEXT_CACHE
-                .with(|cache| cache.borrow_mut().get(body))
-                .into_iter()
+            blocks
+                .iter()
                 .enumerate()
                 .map(|(index, block)| match block {
                     RichBlock::Markdown(text) => {

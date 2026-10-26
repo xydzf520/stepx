@@ -10,17 +10,130 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
     fs,
+    io::{BufRead, BufReader, Write},
+    net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Mutex,
+        mpsc, Arc, Mutex, OnceLock,
     },
     thread,
     time::{Duration, Instant},
 };
 static TRANSFER_LOCK: Mutex<()> = Mutex::new(());
 const RESERVE: u64 = 128 * 1024 * 1024;
+const EXPANSION_SOCKET_NAME: &str = "localabstract:stepx_push_v1";
+const SOCKET_MISS_TTL: Duration = Duration::from_secs(15);
+const VERIFY_CACHE_TTL: Duration = Duration::from_secs(5);
+
+struct ExpansionForwardEntry {
+    port: Option<u16>,
+    stream: Option<BufReader<TcpStream>>,
+    updated_at: Instant,
+}
+
+fn expansion_forward_cache() -> &'static Mutex<HashMap<String, ExpansionForwardEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, ExpansionForwardEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn device_verify_cache() -> &'static Mutex<HashMap<(PathBuf, String, String), Instant>> {
+    static CACHE: OnceLock<Mutex<HashMap<(PathBuf, String, String), Instant>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn verify_device_cached(adb: &Adb, d: &Device) -> Result<()> {
+    let key = (adb.path.clone(), d.transport.clone(), d.serial.clone());
+    if let Ok(guard) = device_verify_cache().lock() {
+        if let Some(ts) = guard.get(&key) {
+            if ts.elapsed() < VERIFY_CACHE_TTL {
+                return Ok(());
+            }
+        }
+    }
+    d.verify(adb)?;
+    if let Ok(mut guard) = device_verify_cache().lock() {
+        guard.insert(key, Instant::now());
+    }
+    Ok(())
+}
+
+fn obtain_expansion_port(adb: &Adb, serial: &str, force_refresh: bool) -> Result<(u16, bool)> {
+    if !force_refresh {
+        if let Ok(guard) = expansion_forward_cache().lock() {
+            if let Some(entry) = guard.get(serial) {
+                if let Some(port) = entry.port {
+                    if entry.updated_at.elapsed() <= Duration::from_secs(300) {
+                        return Ok((port, true));
+                    }
+                } else if entry.updated_at.elapsed() < SOCKET_MISS_TTL {
+                    anyhow::bail!("本地推送流连接不可用（冷却期内直接回退）");
+                }
+            }
+        }
+    }
+    let out = adb.run_timeout(
+        &["-s", serial, "forward", "tcp:0", EXPANSION_SOCKET_NAME],
+        Duration::from_millis(2500),
+    )?;
+    let port: u16 = out
+        .lines()
+        .find_map(|line| line.trim().parse::<u16>().ok())
+        .context("无法解析 adb forward 分配的本地端口")?;
+    if let Ok(mut guard) = expansion_forward_cache().lock() {
+        guard.insert(
+            serial.to_string(),
+            ExpansionForwardEntry {
+                port: Some(port),
+                stream: None,
+                updated_at: Instant::now(),
+            },
+        );
+    }
+    Ok((port, false))
+}
+
+fn mark_expansion_socket_unavailable(serial: &str) {
+    if let Ok(mut guard) = expansion_forward_cache().lock() {
+        guard.insert(
+            serial.to_string(),
+            ExpansionForwardEntry {
+                port: None,
+                stream: None,
+                updated_at: Instant::now(),
+            },
+        );
+    }
+}
+
+fn invalidate_expansion_port(serial: &str) {
+    if let Ok(mut guard) = expansion_forward_cache().lock() {
+        guard.remove(serial);
+    }
+}
+
+fn take_cached_expansion_stream(serial: &str, expected_port: u16) -> Option<BufReader<TcpStream>> {
+    if let Ok(mut guard) = expansion_forward_cache().lock() {
+        if let Some(entry) = guard.get_mut(serial) {
+            if entry.port == Some(expected_port) {
+                return entry.stream.take();
+            }
+        }
+    }
+    None
+}
+
+fn return_cached_expansion_stream(serial: &str, port: u16, reader: BufReader<TcpStream>) {
+    if let Ok(mut guard) = expansion_forward_cache().lock() {
+        if let Some(entry) = guard.get_mut(serial) {
+            entry.port = Some(port);
+            entry.stream = Some(reader);
+            entry.updated_at = Instant::now();
+        }
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -163,11 +276,7 @@ pub fn local_file(c: &Config, j: &Value) -> Result<PathBuf> {
     Ok(p)
 }
 pub fn digest(p: &Path) -> Result<String> {
-    let mut cmd = resources::python_command();
-    cmd.arg("-c").arg("import hashlib,sys\nh=hashlib.sha256()\nwith open(sys.argv[1],'rb') as f:\n for b in iter(lambda:f.read(1048576),b''):h.update(b)\nprint(h.hexdigest())").arg(p);
-    let out = run_process(cmd, None, Duration::from_secs(600))?;
-    ensure!(out.status.success(), "无法校验文件，请检查运行依赖");
-    let h = String::from_utf8(out.stdout)?.trim().to_owned();
+    let h = crate::device::sha256_file(p).context("无法校验文件，请检查运行依赖")?;
     ensure!(h.len() == 64, "文件校验回执无效");
     Ok(h)
 }
@@ -180,25 +289,143 @@ fn verify(p: &Path, j: &Value) -> Result<()> {
     Ok(())
 }
 fn free_space(p: &Path) -> Result<u64> {
-    let mut cmd = resources::python_command();
-    cmd.arg("-c")
-        .arg("import shutil,sys;print(shutil.disk_usage(sys.argv[1]).free)")
-        .arg(p);
-    let out = run_process(cmd, None, Duration::from_secs(10))?;
-    ensure!(out.status.success(), "无法读取电脑可用空间");
-    Ok(String::from_utf8(out.stdout)?.trim().parse()?)
+    #[cfg(unix)]
+    {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+        if let Ok(c_path) = CString::new(p.as_os_str().as_bytes()) {
+            unsafe {
+                let mut stat: libc::statvfs = std::mem::zeroed();
+                if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
+                    let block_size = if stat.f_frsize > 0 {
+                        stat.f_frsize as u64
+                    } else {
+                        stat.f_bsize as u64
+                    };
+                    return Ok((stat.f_bavail as u64).saturating_mul(block_size));
+                }
+            }
+        }
+        let mut cmd = std::process::Command::new("df");
+        cmd.arg("-Pk").arg(p);
+        let out = run_process(cmd, None, Duration::from_secs(10))?;
+        ensure!(out.status.success(), "无法读取电脑可用空间");
+        let text = String::from_utf8(out.stdout)?;
+        let avail_kb: u64 = text
+            .lines()
+            .nth(1)
+            .and_then(|line| line.split_whitespace().nth(3))
+            .context("无法读取电脑可用空间")?
+            .parse()?;
+        return Ok(avail_kb.saturating_mul(1024));
+    }
+    #[cfg(not(unix))]
+    {
+        let mut cmd = resources::python_command();
+        cmd.arg("-c")
+            .arg("import shutil,sys;print(shutil.disk_usage(sys.argv[1]).free)")
+            .arg(p);
+        let out = run_process(cmd, None, Duration::from_secs(10))?;
+        ensure!(out.status.success(), "无法读取电脑可用空间");
+        Ok(String::from_utf8(out.stdout)?.trim().parse()?)
+    }
 }
-pub fn phone_call(adb: &Adb, d: &Device, q: Value) -> Result<Value> {
-    d.verify(adb)?;
-    let timeout = if matches!(
-        q["op"].as_str(),
-        Some("status" | "offer" | "configure" | "requests" | "request")
-    ) {
-        Duration::from_secs(25)
+fn try_call_expansion_socket(
+    adb: &Adb,
+    serial: &str,
+    method: &str,
+    arg_json: &str,
+    read_timeout: Duration,
+) -> Result<Value> {
+    let mut payload = serde_json::to_vec(&json!({
+        "op": "expansion_call",
+        "method": method,
+        "arg": arg_json,
+    }))?;
+    ensure!(payload.len() <= 32768, "扩容请求过长");
+    payload.push(b'\n');
+
+    for attempt in 0..2 {
+        let force_refresh = attempt > 0;
+        let (port, from_cache) = match obtain_expansion_port(adb, serial, force_refresh) {
+            Ok(res) => res,
+            Err(e) => {
+                mark_expansion_socket_unavailable(serial);
+                return Err(e);
+            }
+        };
+
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let io_result = (|| -> Result<Value> {
+            let mut reader = match take_cached_expansion_stream(serial, port) {
+                Some(r) => r,
+                None => {
+                    let s = TcpStream::connect_timeout(&addr, Duration::from_millis(1500))
+                        .context("连接本地扩容套接字超时")?;
+                    let _ = s.set_nodelay(true);
+                    BufReader::new(s)
+                }
+            };
+            reader
+                .get_mut()
+                .set_write_timeout(Some(Duration::from_millis(1500)))?;
+            reader.get_mut().set_read_timeout(Some(read_timeout))?;
+            reader.get_mut().write_all(&payload)?;
+            reader.get_mut().flush()?;
+
+            let mut line = String::new();
+            let n = reader.read_line(&mut line)?;
+            ensure!(n > 0, "本地扩容套接字已断开 (EOF)");
+            let value: Value =
+                serde_json::from_str(line.trim()).context("解析扩容套接字 JSON 失败")?;
+            return_cached_expansion_stream(serial, port, reader);
+            Ok(value)
+        })();
+
+        match io_result {
+            Ok(val) => {
+                return Ok(val);
+            }
+            Err(err) => {
+                if !from_cache || attempt == 1 {
+                    mark_expansion_socket_unavailable(serial);
+                    return Err(err);
+                }
+                invalidate_expansion_port(serial);
+            }
+        }
+    }
+    anyhow::bail!("本地扩容套接字连接不可用")
+}
+
+pub fn call_provider(
+    adb: &Adb,
+    serial: &str,
+    method: &str,
+    arg_json: &str,
+    timeout: Duration,
+) -> Result<Value> {
+    let socket_read_timeout = timeout
+        .min(Duration::from_secs(600))
+        .max(Duration::from_millis(1500));
+    if let Ok(r) = try_call_expansion_socket(adb, serial, method, arg_json, socket_read_timeout) {
+        if r.get("error")
+            .and_then(Value::as_str)
+            .is_none_or(|e| !e.contains("未知推送操作"))
+        {
+            ensure!(
+                r["ok"] == true,
+                "{}",
+                r["error"].as_str().unwrap_or("手机操作未完成")
+            );
+            return Ok(r);
+        }
+    }
+
+    let encoded = if arg_json.trim_start().starts_with('{') {
+        STANDARD.encode(arg_json.as_bytes())
     } else {
-        Duration::from_secs(600)
+        arg_json.to_string()
     };
-    let encoded = STANDARD.encode(serde_json::to_vec(&q)?);
     ensure!(encoded.len() <= 32768, "扩容请求过长");
     let args = [
         "content",
@@ -208,7 +435,7 @@ pub fn phone_call(adb: &Adb, d: &Device, q: Value) -> Result<Value> {
         "--uri",
         "content://com.stepx.companion.app.expansion",
         "--method",
-        "request",
+        method,
         "--arg",
         &encoded,
     ];
@@ -217,7 +444,7 @@ pub fn phone_call(adb: &Adb, d: &Device, q: Value) -> Result<Value> {
         .map(|s| shell_quote(s))
         .collect::<Vec<_>>()
         .join(" ");
-    let out = adb.run_timeout(&["-s", &d.transport, "shell", &command], timeout)?;
+    let out = adb.run_timeout(&["-s", serial, "shell", &command], timeout)?;
     let raw = out
         .split("result=")
         .nth(1)
@@ -232,6 +459,22 @@ pub fn phone_call(adb: &Adb, d: &Device, q: Value) -> Result<Value> {
         r["error"].as_str().unwrap_or("手机操作未完成")
     );
     Ok(r)
+}
+
+pub fn phone_call(adb: &Adb, d: &Device, q: Value) -> Result<Value> {
+    verify_device_cached(adb, d)?;
+    let timeout = if matches!(
+        q["op"].as_str(),
+        Some(
+            "status" | "offer" | "configure" | "requests" | "request" | "inspect" | "scan" | "list"
+        )
+    ) {
+        Duration::from_millis(2500)
+    } else {
+        Duration::from_secs(600)
+    };
+    let arg_json = serde_json::to_string(&q)?;
+    call_provider(adb, &d.transport, "request", &arg_json, timeout)
 }
 pub fn offer(adb: &Adb, d: &Device, c: &Config) -> Result<Value> {
     let ready = c.folder.as_ref().is_some_and(|f| f.is_dir());
@@ -261,7 +504,11 @@ pub fn records(c: &Config) -> Result<Vec<Value>> {
             if let Ok(b) = fs::read(p) {
                 if let Ok(j) = serde_json::from_slice::<Value>(&b) {
                     if check_record(&j).is_ok() {
-                        rows.push(j);
+                        if local_file(c, &j).is_err() && j["state"] != "archived" {
+                            let _ = fs::remove_dir_all(e.path());
+                        } else {
+                            rows.push(j);
+                        }
                     }
                 }
             }
@@ -304,7 +551,6 @@ fn migrate_cancellable(
     ensure!(j["desktop"] == desktop, "文件属于另一台电脑");
     ensure!(!stop.load(Ordering::Acquire), "设备已切换，手机原件保留");
     let dir = file_dir(c, strval(&j, "id"))?;
-    atomic_json(&dir.join("receipt.json"), &j)?;
     let target = dir.join(data_name(&j));
     if target.exists() {
         ensure!(
@@ -564,9 +810,13 @@ impl Worker {
         let lease_stop = stop.clone();
         let lease_adb = adb.clone();
         let lease_device = d.clone();
+        let migrating_active = Arc::new(AtomicBool::new(false));
+        let lease_migrating = migrating_active.clone();
         thread::spawn(move || {
             while !lease_stop.load(Ordering::Acquire) {
-                let _ = offer(&lease_adb, &lease_device, &config());
+                if lease_migrating.load(Ordering::Relaxed) {
+                    let _ = offer(&lease_adb, &lease_device, &config());
+                }
                 for _ in 0..16 {
                     if lease_stop.load(Ordering::Acquire) {
                         return;
@@ -576,6 +826,15 @@ impl Worker {
             }
         });
         thread::spawn(move || {
+            let _ = adb.run_timeout(
+                &[
+                    "-s",
+                    &d.transport,
+                    "shell",
+                    "pm grant com.stepx.companion.app android.permission.ACCESS_MEDIA_LOCATION >/dev/null 2>&1; pm grant com.stepx.companion.app android.permission.READ_MEDIA_IMAGES >/dev/null 2>&1; pm grant com.stepx.companion.app android.permission.READ_MEDIA_VIDEO >/dev/null 2>&1; pm grant com.stepx.companion.app android.permission.WRITE_SECURE_SETTINGS >/dev/null 2>&1; appops set com.stepx.companion.app ACCESS_MEDIA_LOCATION allow >/dev/null 2>&1; settings put secure com.stepx.companion.app_op_100 4 >/dev/null 2>&1; cmd notification allow_listener com.stepx.companion.app/com.stepx.companion.app.PushNotificationService >/dev/null 2>&1 || true; true",
+                ],
+                Duration::from_secs(5),
+            );
             let mut snap = Snapshot::default();
             let mut configuration_blocked = false;
             let mut cooldown = std::collections::HashMap::<String, Instant>::new();
@@ -654,6 +913,8 @@ impl Worker {
                             }
                         }
                     }
+                    let mut did_work = false;
+                    let desktop = crate::companion_link::desktop_id()?;
                     snap.status = offer(&adb, &d, &cfg)?;
                     snap.online = true;
                     snap.error = false;
@@ -661,11 +922,10 @@ impl Worker {
                     snap.files = records(&cfg)?
                         .into_iter()
                         .filter(|j| {
-                            j["desktop"] == crate::companion_link::desktop_id().unwrap_or_default()
+                            j["desktop"] == desktop
                                 && j["phoneSerial"].as_str().is_none_or(|s| s == d.serial)
                         })
                         .collect();
-                    let desktop = crate::companion_link::desktop_id()?;
                     if snap.status["permission"] == true
                         && (inspected.elapsed() >= Duration::from_secs(30)
                             || inspected_epoch != snap.status["policy"]["epoch"])
@@ -699,6 +959,8 @@ impl Worker {
                             if stopped.load(Ordering::Acquire) {
                                 return Ok(());
                             }
+                            did_work = true;
+                            migrating_active.store(true, Ordering::Relaxed);
                             snap.phase = "正在取回手机文件".into();
                             snap.active = Some(j.clone());
                             let _ = out.send(snap.clone());
@@ -711,6 +973,7 @@ impl Worker {
                                 return Err(e);
                             }
                         }
+                        migrating_active.store(false, Ordering::Relaxed);
                     }
                     if snap.status["policy"]["enabled"] == true
                         && cfg.folder.is_some()
@@ -724,6 +987,8 @@ impl Worker {
                                     .is_none_or(|t| t.elapsed() > Duration::from_secs(300))
                             })
                         }) {
+                            did_work = true;
+                            migrating_active.store(true, Ordering::Relaxed);
                             if let Err(e) = migrate_cancellable(
                                 &adb,
                                 &d,
@@ -736,6 +1001,7 @@ impl Worker {
                                 },
                                 &stopped,
                             ) {
+                                migrating_active.store(false, Ordering::Relaxed);
                                 cooldown.insert(strval(j, "path").into(), Instant::now());
                                 if let Some(file) =
                                     snap.active.as_ref().filter(|f| valid_id(strval(f, "id")))
@@ -746,37 +1012,47 @@ impl Worker {
                                         json!({"op":"fail","id":file["id"],"error":format!("{e:#}")}),
                                     );
                                     if let Ok(dir) = file_dir(&cfg, strval(file, "id")) {
-                                        let mut failed = file.clone();
-                                        failed["state"] = json!("failed");
-                                        failed["error"] = json!(format!("{e:#}"));
-                                        let _ = atomic_json(&dir.join("receipt.json"), &failed);
+                                        if local_file(&cfg, file).is_ok() {
+                                            let mut failed = file.clone();
+                                            failed["state"] = json!("failed");
+                                            failed["error"] = json!(format!("{e:#}"));
+                                            let _ = atomic_json(&dir.join("receipt.json"), &failed);
+                                        } else {
+                                            let _ = fs::remove_dir_all(dir);
+                                        }
                                     }
                                 }
                                 return Err(e);
                             }
+                            migrating_active.store(false, Ordering::Relaxed);
                             inspected = Instant::now() - Duration::from_secs(60);
                         } else if !cooldown.is_empty() {
                             snap.phase =
                                 "部分文件迁移失败，5 分钟后重试；也可点击“检查迁移”立即重试".into();
                         }
                     }
-                    snap.status = offer(&adb, &d, &cfg)?;
-                    snap.files = records(&cfg)?
-                        .into_iter()
-                        .filter(|j| {
-                            j["desktop"] == desktop
-                                && j["phoneSerial"].as_str().is_none_or(|s| s == d.serial)
-                        })
-                        .collect();
+                    if did_work {
+                        snap.status = offer(&adb, &d, &cfg)?;
+                        snap.files = records(&cfg)?
+                            .into_iter()
+                            .filter(|j| {
+                                j["desktop"] == desktop
+                                    && j["phoneSerial"].as_str().is_none_or(|s| s == d.serial)
+                            })
+                            .collect();
+                    }
                     snap.active = None;
                     Ok(())
                 })();
+                migrating_active.store(false, Ordering::Relaxed);
                 if let Err(e) = result {
+                    let current_desktop_id =
+                        crate::companion_link::desktop_id().unwrap_or_default();
                     snap.files = records(&cfg)
                         .unwrap_or_else(|_| snap.files.clone())
                         .into_iter()
                         .filter(|j| {
-                            j["desktop"] == crate::companion_link::desktop_id().unwrap_or_default()
+                            j["desktop"] == current_desktop_id
                                 && j["phoneSerial"].as_str().is_none_or(|s| s == d.serial)
                         })
                         .collect();
@@ -890,5 +1166,54 @@ mod tests {
         let mut j = record();
         j["name"] = json!("CON:bad/name?.pdf");
         assert_eq!(data_name(&j), "original.pdf");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn phone_call_prefers_local_socket_and_falls_back_to_content_call() {
+        use std::net::TcpListener;
+        use std::os::unix::fs::PermissionsExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&mut stream).read_line(&mut line).unwrap();
+            let req: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(req["op"], "expansion_call");
+            assert_eq!(req["method"], "request");
+            let inner: Value = serde_json::from_str(req["arg"].as_str().unwrap()).unwrap();
+            assert_eq!(inner["op"], "status");
+            stream
+                .write_all(b"{\"ok\":true,\"online\":true,\"via\":\"socket\"}\n")
+                .unwrap();
+        });
+
+        let d = tempfile::tempdir().unwrap();
+        let adb_path = d.path().join("adb");
+        let log_path = d.path().join("adb.log");
+        fs::write(
+            &adb_path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\ncase \"$*\" in\n*ro.serialno*) printf 'sock-phone\\n';;\n*forward*) printf '{port}\\n';;\n*content\\ call*) exit 99;;\nesac\n",
+                shell_quote(log_path.to_str().unwrap())
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&adb_path, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let adb = Adb { path: adb_path };
+        let dev = Device {
+            transport: "sock-phone".into(),
+            serial: "sock-phone".into(),
+            model: "PZ261A".into(),
+            android: "16".into(),
+            product: "pandora".into(),
+        };
+        let res = phone_call(&adb, &dev, json!({"op": "status"})).unwrap();
+        assert_eq!(res["via"], "socket");
+        server.join().unwrap();
+        let log = fs::read_to_string(&log_path).unwrap();
+        assert!(!log.contains("content call"));
     }
 }

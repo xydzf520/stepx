@@ -16,6 +16,36 @@ pub struct Entry {
 }
 
 impl Entry {
+    pub fn sort_time_key(&self) -> u64 {
+        let digits: String = self.name.chars().filter(|c| c.is_ascii_digit()).collect();
+        if digits.len() >= 8 {
+            digits
+                .chars()
+                .take(14)
+                .collect::<String>()
+                .parse::<u64>()
+                .unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
+    pub fn date_label(&self) -> Option<String> {
+        let digits: Vec<char> = self.name.chars().filter(|c| c.is_ascii_digit()).collect();
+        if digits.len() >= 8 {
+            let y: String = digits[0..4].iter().collect();
+            let m: String = digits[4..6].iter().collect();
+            let d: String = digits[6..8].iter().collect();
+            if let (Ok(yv), Ok(mv), Ok(dv)) = (y.parse::<u32>(), m.parse::<u32>(), d.parse::<u32>())
+            {
+                if (2015..=2035).contains(&yv) && (1..=12).contains(&mv) && (1..=31).contains(&dv) {
+                    return Some(format!("{yv:04}-{mv:02}-{dv:02}"));
+                }
+            }
+        }
+        None
+    }
+
     pub fn kind_badge(&self) -> &'static str {
         if self.symlink {
             "链接"
@@ -56,10 +86,22 @@ impl Entry {
             } else if lower.ends_with(".pdf")
                 || lower.ends_with(".doc")
                 || lower.ends_with(".docx")
+                || lower.ends_with(".xlsx")
+                || lower.ends_with(".xls")
+                || lower.ends_with(".pptx")
+                || lower.ends_with(".ppt")
                 || lower.ends_with(".txt")
                 || lower.ends_with(".md")
                 || lower.ends_with(".json")
                 || lower.ends_with(".csv")
+                || lower.ends_with(".html")
+                || lower.ends_with(".htm")
+                || lower.ends_with(".xml")
+                || lower.ends_with(".log")
+                || lower.ends_with(".yaml")
+                || lower.ends_with(".yml")
+                || lower.ends_with(".toml")
+                || lower.ends_with(".rtf")
             {
                 "文档"
             } else {
@@ -105,6 +147,11 @@ pub fn validate_path(path: &str) -> Result<()> {
 fn verified_path(adb: &Adb, device: &Device, path: &str) -> Result<String> {
     validate_path(path)?;
     device.verify(adb)?;
+    resolve_storage_path(adb, device, path)
+}
+
+fn resolve_storage_path(adb: &Adb, device: &Device, path: &str) -> Result<String> {
+    validate_path(path)?;
     let canonical = adb.shell(&device.transport, &["readlink", "-f", path])?;
     let canonical = canonical.trim().to_string();
     if canonical != "/storage/emulated/0" && !canonical.starts_with("/storage/emulated/0/") {
@@ -115,7 +162,7 @@ fn verified_path(adb: &Adb, device: &Device, path: &str) -> Result<String> {
 
 pub fn list(adb: &Adb, device: &Device, path: &str) -> Result<Vec<Entry>> {
     let canonical = verified_path(adb, device, path)?;
-    let script = format!("find {} -mindepth 1 -maxdepth 1 -exec sh -c 'for f do stat -c \"%f\" \"$f\" && stat -c \"%s\" \"$f\" && printf \"%s\\0\" \"$f\"; done' sh {{}} +", shell_quote(&canonical));
+    let script = format!("find {} -mindepth 1 -maxdepth 1 -exec sh -c 'for f do stat -c \"%f\n%s\" \"$f\" && printf \"%s\\0\" \"$f\"; done' sh {{}} +", shell_quote(&canonical));
     let text = adb.script(&device.transport, &script)?;
     parse_entries(&text, &canonical, path)
 }
@@ -196,24 +243,32 @@ pub fn trash(adb: &Adb, device: &Device, remote: &str) -> Result<Trashed> {
         bail!("不能移动共享存储根目录");
     }
     let trash_root = "/sdcard/.stepx-trash";
-    adb.shell(&device.transport, &["test", "!", "-L", remote])
-        .context("不移动符号链接，请选择实际文件")?;
-    adb.shell(&device.transport, &["test", "!", "-L", trash_root])
-        .context("回收站不能是符号链接")?;
-    adb.shell(&device.transport, &["mkdir", "-p", trash_root])?;
-    let root = verified_path(adb, device, trash_root)?;
+    let q_remote = shell_quote(remote);
+    let q_trash = shell_quote(trash_root);
+    let root = adb
+        .script(
+            &device.transport,
+            &format!(
+                "test ! -L {q_remote} && test ! -L {q_trash} && mkdir -p {q_trash} && readlink -f {q_trash}"
+            ),
+        )
+        .context("不移动符号链接，请选择实际文件")?
+        .trim()
+        .to_string();
+    if root != "/storage/emulated/0" && !root.starts_with("/storage/emulated/0/") {
+        bail!("该路径不属于手机共享存储（符号链接或存储用户不受支持）");
+    }
     let name = Path::new(remote)
         .file_name()
         .and_then(|s| s.to_str())
         .context("文件名无效")?;
     let target = format!("{root}/{:016x}-{name}", rand::random::<u64>());
-    adb.shell(&device.transport, &["mv", "-n", &canonical, &target])?;
+    let q_canonical = shell_quote(&canonical);
+    let q_target = shell_quote(&target);
     adb.script(
         &device.transport,
         &format!(
-            "test ! -e {} && test -e {}",
-            shell_quote(&canonical),
-            shell_quote(&target)
+            "mv -n -- {q_canonical} {q_target} && test ! -e {q_canonical} && test -e {q_target}"
         ),
     )?;
     Ok(Trashed {
@@ -233,7 +288,7 @@ pub fn restore(adb: &Adb, device: &Device, record: &Trashed) -> Result<()> {
         .context("原目录无效")?
         .to_string_lossy()
         .to_string();
-    let parent = verified_path(adb, device, &parent)?;
+    let parent = resolve_storage_path(adb, device, &parent)?;
     let name = Path::new(&record.original)
         .file_name()
         .context("原文件名无效")?
@@ -301,7 +356,7 @@ pub fn rename(adb: &Adb, device: &Device, remote: &str, new_name: &str) -> Resul
         .context("原文件父目录无效")?
         .to_string_lossy()
         .to_string();
-    let parent_canonical = verified_path(adb, device, &parent_logical)?;
+    let parent_canonical = resolve_storage_path(adb, device, &parent_logical)?;
     let target_canonical = format!("{parent_canonical}/{new_name}");
     if target_canonical == canonical {
         return Ok(remote.to_string());
@@ -330,8 +385,14 @@ pub fn delete(adb: &Adb, device: &Device, remote: &str) -> Result<()> {
     if canonical == "/storage/emulated/0" {
         bail!("不能删除共享存储根目录");
     }
-    adb.shell(&device.transport, &["test", "!", "-L", remote])
-        .context("不删除符号链接，请选择实际文件")?;
-    adb.shell(&device.transport, &["rm", "-rf", "--", &canonical])?;
+    adb.script(
+        &device.transport,
+        &format!(
+            "test ! -L {} && rm -rf -- {}",
+            shell_quote(remote),
+            shell_quote(&canonical)
+        ),
+    )
+    .context("不删除符号链接，请选择实际文件")?;
     Ok(())
 }

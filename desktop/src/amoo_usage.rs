@@ -252,12 +252,12 @@ pub fn account_scope(
             .is_some_and(|s| s.eq_ignore_ascii_case("adb"));
     if can_cache {
         if let Ok(guard) = SCOPE_CACHE.lock() {
-            if let Some((transport, serial, at, Some(cached))) = guard.as_ref() {
+            if let Some((transport, serial, at, cached)) = guard.as_ref() {
                 if transport == &device.transport
                     && serial == &device.serial
-                    && at.elapsed() < Duration::from_millis(2500)
+                    && at.elapsed() < Duration::from_secs(15)
                 {
-                    return Ok(Some(cached.clone()));
+                    return Ok(cached.clone());
                 }
             }
         }
@@ -274,7 +274,12 @@ pub fn account_scope(
     let Some(account) = account_name(&dump, user) else {
         if can_cache {
             if let Ok(mut guard) = SCOPE_CACHE.lock() {
-                *guard = None;
+                *guard = Some((
+                    device.transport.clone(),
+                    device.serial.clone(),
+                    Instant::now(),
+                    None,
+                ));
             }
         }
         return Ok(None);

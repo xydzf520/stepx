@@ -92,7 +92,7 @@ def verify(req, path):
     info = metadata(path)
     if req.get('version') and info['post-aios-version'] != req['version']: raise ValueError('固件目标版本与官方候选不匹配')
     emit('progress', phase='verify', done=size, total=size)
-    return dict(path=str(path), sha256=actual['sha256'], metadata=info, size=size)
+    return dict(path=str(path), sha256=actual['sha256'], metadata=info, size=size, verified_stat=[end.st_size, end.st_mtime_ns, end.st_ino])
 
 def download(req, test_origin=None):
     size, hashes = contract(req)
@@ -112,6 +112,7 @@ def download(req, test_origin=None):
     if part.is_symlink(): raise ValueError('固件临时文件不能为符号链接')
     offset = part.stat().st_size if part.exists() else 0
     if offset > size: part.unlink(); offset = 0
+    stream_digests = None
     if offset < size:
         check_cancel(req)
         # Reserve enough space for the complete remaining bytes; keep a small OS margin.
@@ -129,6 +130,8 @@ def download(req, test_origin=None):
             length = response.headers.get('Content-Length')
             if length and int(length) != size - offset: raise ValueError('服务器固件长度与官方记录不匹配')
             done, last = offset, 0
+            if offset == 0:
+                stream_digests = {k: hashlib.new(k) for k in set(hashes) | {'sha256'}}
             with part.open('ab' if offset else 'wb') as stream:
                 os.chmod(part, 0o600)
                 while True:
@@ -137,22 +140,63 @@ def download(req, test_origin=None):
                     if not data: break
                     if done + len(data) > size: raise ValueError('下载超过官方固件大小')
                     stream.write(data); done += len(data)
+                    if stream_digests is not None:
+                        for d in stream_digests.values(): d.update(data)
                     if time.monotonic() - last > .2:
                         emit('progress', phase='download', done=done, total=size); last = time.monotonic()
                 stream.flush(); os.fsync(stream.fileno())
             if done != size: raise ValueError('固件下载中断，可继续下载')
     try:
-        result = verify(req, part)
+        if stream_digests is not None:
+            check_cancel(req)
+            part_file = secure_file(part)
+            if part_file.stat().st_size != size: raise ValueError('固件大小与官方记录不匹配')
+            actual = {k: d.hexdigest() for k, d in stream_digests.items()}
+            for k, v in hashes.items():
+                if actual[k] != v: raise ValueError('固件 %s 校验失败，请重新下载' % k.upper())
+            info = metadata(part_file)
+            if req.get('version') and info['post-aios-version'] != req['version']: raise ValueError('固件目标版本与官方候选不匹配')
+            emit('progress', phase='verify', done=size, total=size)
+            result = dict(path=str(part_file), sha256=actual['sha256'], metadata=info, size=size)
+        else:
+            result = verify(req, part)
     except Cancelled: raise
     except Exception:
         part.unlink(missing_ok=True)
         raise
     os.replace(part, dest)
+    st = os.stat(dest)
     result['path'] = str(dest)
+    result['verified_stat'] = [st.st_size, st.st_mtime_ns, st.st_ino]
     return result
 
 def stage(req):
-    verified = verify(req, req['path'])
+    size, expected = contract(req)
+    path = secure_file(req['path'])
+    st = path.stat()
+    vstat = req.get('verified_stat')
+    sha = expected.get('sha256')
+    if (
+        isinstance(vstat, (list, tuple))
+        and len(vstat) == 3
+        and [st.st_size, st.st_mtime_ns, st.st_ino] == list(vstat)
+        and st.st_size == size
+        and sha
+    ):
+        check_cancel(req)
+        info = metadata(path)
+        if req.get('version') and info['post-aios-version'] != req['version']:
+            raise ValueError('固件目标版本与官方候选不匹配')
+        emit('progress', phase='verify', done=size, total=size)
+        verified = dict(
+            path=str(path),
+            sha256=sha,
+            metadata=info,
+            size=size,
+            verified_stat=[st.st_size, st.st_mtime_ns, st.st_ino],
+        )
+    else:
+        verified = verify(req, req['path'])
     adb = [req['adb'], '-s', req['transport']]
     remote = req['remote']
     if not re.fullmatch(r'/sdcard/Download/StepX-OTA/[0-9a-f]{32}/update\.zip', remote): raise ValueError('手机固件目标路径无效')

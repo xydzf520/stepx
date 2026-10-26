@@ -25,6 +25,22 @@ pub(super) enum ExpansionAction {
     Restore(String),
     AnalyzeWithAmoo(String),
     SetGalleryGrid(bool),
+    SelectMedia(Option<String>),
+    MediaZoomIn,
+    MediaZoomOut,
+    MediaZoomSet(u16),
+    MediaRotateRight(String),
+    MediaPrev,
+    MediaNext,
+    SetGridCols(u8),
+    FilesSort(String),
+    FilesToggleDesc,
+    FilesFilter(String),
+    FilesZoomSet(u16),
+    FilesClosePreview,
+    FilesPreview(String),
+    RevealInFolder(String),
+    ManualImportLocalFiles,
     Refresh,
 }
 pub(super) struct ExpansionUi {
@@ -37,6 +53,15 @@ pub(super) struct ExpansionUi {
     pub settings: bool,
     pub confirm: bool,
     pub gallery_grid_mode: bool,
+    pub selected_media_id: Option<String>,
+    pub media_zoom_pct: u16,
+    pub media_rotations: std::collections::HashMap<String, u16>,
+    pub grid_cols: u8,
+    pub files_sort: String,
+    pub files_desc: bool,
+    pub files_filter: String,
+    pub files_preview_path: Option<String>,
+    pub files_preview_zoom: u16,
     pub limit: usize,
     pub feedback: String,
     pub pending: Option<mpsc::Receiver<std::result::Result<Value, String>>>,
@@ -45,6 +70,31 @@ pub(super) struct ExpansionUi {
     pub preview_error: String,
     pub preview_pending: Option<mpsc::Receiver<std::result::Result<Value, String>>>,
 }
+pub(super) const MAX_MEDIA_ROTATIONS: usize = 256;
+
+impl ExpansionUi {
+    /// Bound `media_rotations` at `MAX_MEDIA_ROTATIONS` (256) entries so rotating
+    /// many media files across long sessions never leaks memory.
+    pub(super) fn insert_media_rotation(&mut self, id: String, deg: u16) {
+        if !self.media_rotations.contains_key(&id) {
+            while self.media_rotations.len() >= MAX_MEDIA_ROTATIONS {
+                let selected = self.selected_media_id.as_deref();
+                let victim = self
+                    .media_rotations
+                    .keys()
+                    .find(|k| Some(k.as_str()) != selected)
+                    .or_else(|| self.media_rotations.keys().next())
+                    .cloned();
+                let Some(victim) = victim else {
+                    break;
+                };
+                self.media_rotations.remove(&victim);
+            }
+        }
+        self.media_rotations.insert(id, deg);
+    }
+}
+
 impl Default for ExpansionUi {
     fn default() -> Self {
         let config = expansion::config();
@@ -58,9 +108,11 @@ impl Default for ExpansionUi {
         }
         let (tx, local) = mpsc::channel();
         let disk = config.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send(expansion::records(&disk).unwrap_or_default());
-        });
+        if !demo {
+            std::thread::spawn(move || {
+                let _ = tx.send(expansion::records(&disk).unwrap_or_default());
+            });
+        }
         Self {
             worker: None,
             local,
@@ -71,6 +123,15 @@ impl Default for ExpansionUi {
             settings: false,
             confirm: false,
             gallery_grid_mode: true,
+            selected_media_id: None,
+            media_zoom_pct: 100,
+            media_rotations: std::collections::HashMap::new(),
+            grid_cols: 3,
+            files_sort: "name".into(),
+            files_desc: false,
+            files_filter: "all".into(),
+            files_preview_path: None,
+            files_preview_zoom: 100,
             limit: 40,
             feedback: String::new(),
             pending: None,
@@ -83,7 +144,9 @@ impl Default for ExpansionUi {
 }
 impl Companion {
     fn save_expansion_view(&mut self) -> Result<()> {
-        self.expansion.config.folder = expansion::config().folder;
+        if self.expansion.config.folder.is_none() {
+            self.expansion.config.folder = expansion::config().folder;
+        }
         expansion::save_config(&self.expansion.config)
     }
     pub(super) fn tick_expansion(&mut self) -> bool {
@@ -137,7 +200,7 @@ impl Companion {
             changed = true;
         }
         if let Ok(files) = self.expansion.local.try_recv() {
-            if !files.is_empty() || !self.demo_mode {
+            if !self.demo_mode {
                 self.expansion.snapshot.files = files;
                 changed = true;
             }
@@ -155,7 +218,9 @@ impl Companion {
                 self.expansion.draft = Some(s.status["policy"].clone());
             }
             self.expansion.snapshot = s;
-            self.expansion.config = expansion::config();
+            if self.expansion.config.folder.is_none() {
+                self.expansion.config = expansion::config();
+            }
             if self.expansion.feedback == "正在处理…" && self.expansion.snapshot.active.is_none()
             {
                 self.expansion.feedback.clear();
@@ -179,7 +244,11 @@ impl Companion {
                 Ok(s) => {
                     let on = s["policy"]["enabled"] == true;
                     self.expansion.snapshot.status = s;
-                    self.expansion.config = expansion::config();
+                    if let Some(folder) = self.expansion.draft_folder.clone() {
+                        self.expansion.config.folder = Some(folder);
+                    } else if self.expansion.config.folder.is_none() {
+                        self.expansion.config = expansion::config();
+                    }
                     self.expansion.discard();
                     self.expansion.settings = false;
                     if on {
@@ -308,12 +377,114 @@ impl Companion {
                     }
                 }
                 ExpansionAction::OpenFolder => {
-                    if let Some(p) = if self.expansion.settings {
-                        &self.expansion.draft_folder
+                    let base = if self.expansion.settings {
+                        if self.expansion.draft_folder.is_none() {
+                            self.expansion.draft_folder =
+                                Some(stepx_companion::settings::downloads());
+                        }
+                        self.expansion.draft_folder.clone()
                     } else {
-                        &self.expansion.config.folder
-                    } {
-                        super::work_state::open_work_path(p)?;
+                        if self.expansion.config.folder.is_none() {
+                            let dl = stepx_companion::settings::downloads();
+                            self.expansion.config.folder = Some(dl);
+                            let _ = expansion::save_config(&self.expansion.config);
+                        }
+                        self.expansion.config.folder.clone()
+                    };
+                    if let Some(p) = base {
+                        let vault = p.join("StepX Storage");
+                        let _ = std::fs::create_dir_all(&vault);
+                        super::work_state::open_work_path(&vault)?;
+                    }
+                }
+                ExpansionAction::ManualImportLocalFiles => {
+                    if self.expansion.config.folder.is_none() {
+                        let dl = stepx_companion::settings::downloads();
+                        self.expansion.config.folder = Some(dl);
+                        let _ = expansion::save_config(&self.expansion.config);
+                    }
+                    let base = self
+                        .expansion
+                        .config
+                        .folder
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("未设置电脑扩容目录"))?;
+                    let picked = native_dialog::FileDialog::new()
+                        .set_title("选择要归档到电脑扩容库的文件")
+                        .show_open_multiple_file()?;
+                    if !picked.is_empty() {
+                        let vault = base.join("StepX Storage");
+                        let mut imported = 0usize;
+                        let now_ms = chrono::Utc::now().timestamp_millis();
+                        let today_label =
+                            format!("{} · 今天", chrono::Local::now().format("%Y-%m-%d"));
+                        for src in picked {
+                            if !src.is_file() {
+                                continue;
+                            }
+                            let Some(name) = src
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                                .map(|s| s.to_string())
+                            else {
+                                continue;
+                            };
+                            let ext = src
+                                .extension()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("")
+                                .to_ascii_lowercase();
+                            let (kind, sub_folder, rel_prefix) = if matches!(
+                                ext.as_str(),
+                                "jpg" | "jpeg" | "png" | "webp" | "gif" | "heic" | "bmp" | "dng"
+                            ) {
+                                ("photos", "照片与视频", "Pictures")
+                            } else if matches!(
+                                ext.as_str(),
+                                "mp4" | "mov" | "mkv" | "avi" | "webm" | "3gp" | "flv"
+                            ) {
+                                ("videos", "照片与视频", "Movies")
+                            } else if matches!(
+                                ext.as_str(),
+                                "mp3" | "wav" | "flac" | "m4a" | "aac" | "ogg" | "opus" | "amr"
+                            ) {
+                                ("audio", "录音与音频", "Music")
+                            } else {
+                                ("documents", "社交与文档", "Documents")
+                            };
+                            let dest_dir = vault.join(sub_folder);
+                            let _ = std::fs::create_dir_all(&dest_dir);
+                            let dest_file = dest_dir.join(&name);
+                            if src != dest_file {
+                                let _ = std::fs::copy(&src, &dest_file);
+                            }
+                            let size = std::fs::metadata(&dest_file)
+                                .or_else(|_| std::fs::metadata(&src))
+                                .map(|m| m.len())
+                                .unwrap_or(0);
+                            let id = format!("local-{}-{imported}", now_ms as u64);
+                            let entry = json!({
+                                "id": id,
+                                "name": name,
+                                "path": format!("{rel_prefix}/{name}"),
+                                "kind": kind,
+                                "state": "archived",
+                                "size": size,
+                                "modified": now_ms,
+                                "mtimeMs": now_ms,
+                                "archivedAt": now_ms,
+                                "archivedAtMs": now_ms,
+                                "dateGroup": today_label,
+                                "localPath": dest_file.to_string_lossy().to_string(),
+                            });
+                            self.expansion.snapshot.files.insert(0, entry);
+                            imported += 1;
+                        }
+                        if imported > 0 {
+                            self.expansion.feedback =
+                                format!("已手动归档 {imported} 个文件到电脑扩容库");
+                            self.record_notice("存储扩容", self.expansion.feedback.clone());
+                        }
                     }
                 }
                 ExpansionAction::Type(k) => {
@@ -370,6 +541,7 @@ impl Companion {
                 ExpansionAction::Filter(k) => {
                     self.expansion.config.kind = k.clone();
                     self.expansion.limit = 40;
+                    self.trigger_subtab_switch();
                     self.save_expansion_view()?;
                 }
                 ExpansionAction::Sort(s) => {
@@ -383,11 +555,108 @@ impl Companion {
                 ExpansionAction::State(s) => {
                     self.expansion.config.filter = s.clone();
                     self.expansion.limit = 40;
+                    self.trigger_subtab_switch();
                     self.save_expansion_view()?;
                 }
                 ExpansionAction::More => self.expansion.limit += 40,
                 ExpansionAction::SetGalleryGrid(grid) => {
                     self.expansion.gallery_grid_mode = *grid;
+                    self.trigger_subtab_switch();
+                }
+                ExpansionAction::SelectMedia(id) => {
+                    self.expansion.selected_media_id = id.clone();
+                    if id.is_some() {
+                        self.expansion.media_zoom_pct = 100;
+                    }
+                }
+                ExpansionAction::MediaZoomIn => {
+                    let steps = [50u16, 100, 150, 200, 300, 400];
+                    let next = steps
+                        .iter()
+                        .copied()
+                        .find(|&s| s > self.expansion.media_zoom_pct)
+                        .unwrap_or(400);
+                    self.expansion.media_zoom_pct = next;
+                }
+                ExpansionAction::MediaZoomOut => {
+                    let steps = [50u16, 100, 150, 200, 300, 400];
+                    let prev = steps
+                        .iter()
+                        .rev()
+                        .copied()
+                        .find(|&s| s < self.expansion.media_zoom_pct)
+                        .unwrap_or(50);
+                    self.expansion.media_zoom_pct = prev;
+                }
+                ExpansionAction::MediaZoomSet(pct) => {
+                    self.expansion.media_zoom_pct = (*pct).clamp(50, 400);
+                }
+                ExpansionAction::MediaRotateRight(id) => {
+                    let current = self.expansion.media_rotations.get(id).copied().unwrap_or(0);
+                    let next_deg = (current + 90) % 360;
+                    self.expansion.insert_media_rotation(id.clone(), next_deg);
+                    self.ensure_rotated_media_preview(id, next_deg);
+                    self.expansion.feedback = format!("已将图片顺时针旋转至 {next_deg}°");
+                }
+                ExpansionAction::MediaPrev => {
+                    let filtered = self.expansion_filtered_files();
+                    if !filtered.is_empty() {
+                        let cur = self.expansion.selected_media_id.as_deref().unwrap_or("");
+                        let pos = filtered
+                            .iter()
+                            .position(|j| j["id"].as_str() == Some(cur))
+                            .unwrap_or(0);
+                        let prev_idx = (pos + filtered.len() - 1) % filtered.len();
+                        if let Some(id) = filtered[prev_idx]["id"].as_str() {
+                            self.expansion.selected_media_id = Some(id.to_string());
+                        }
+                    }
+                }
+                ExpansionAction::MediaNext => {
+                    let filtered = self.expansion_filtered_files();
+                    if !filtered.is_empty() {
+                        let cur = self.expansion.selected_media_id.as_deref().unwrap_or("");
+                        let pos = filtered
+                            .iter()
+                            .position(|j| j["id"].as_str() == Some(cur))
+                            .unwrap_or(0);
+                        let next_idx = (pos + 1) % filtered.len();
+                        if let Some(id) = filtered[next_idx]["id"].as_str() {
+                            self.expansion.selected_media_id = Some(id.to_string());
+                        }
+                    }
+                }
+                ExpansionAction::SetGridCols(cols) => {
+                    self.expansion.grid_cols = (*cols).clamp(2, 4);
+                    self.expansion.gallery_grid_mode = true;
+                }
+                ExpansionAction::FilesSort(s) => {
+                    self.expansion.files_sort = s.clone();
+                    self.file_sort = match s.as_str() {
+                        "time" => FileSort::Time,
+                        "size" => FileSort::Size,
+                        "kind" => FileSort::Kind,
+                        _ => FileSort::Name,
+                    };
+                    self.file_page = 0;
+                }
+                ExpansionAction::FilesToggleDesc => {
+                    self.expansion.files_desc = !self.expansion.files_desc;
+                    self.file_page = 0;
+                }
+                ExpansionAction::FilesFilter(f) => {
+                    self.expansion.files_filter = f.clone();
+                    self.file_page = 0;
+                }
+                ExpansionAction::FilesZoomSet(z) => {
+                    self.expansion.files_preview_zoom = (*z).clamp(50, 400);
+                }
+                ExpansionAction::FilesClosePreview => {
+                    self.expansion.files_preview_path = None;
+                }
+                ExpansionAction::FilesPreview(path) => {
+                    self.expansion.files_preview_path = Some(path.clone());
+                    self.expansion.files_preview_zoom = 100;
                 }
                 ExpansionAction::Open(id) => {
                     let j = self
@@ -399,13 +668,8 @@ impl Companion {
                         .cloned()
                         .or_else(|| demo_files().into_iter().find(|j| j["id"] == *id))
                         .ok_or_else(|| anyhow::anyhow!("文件记录已变化"))?;
-                    if let Ok(p) = expansion::local_file(&self.expansion.config, &j) {
+                    if let Some(p) = resolve_media_local_path(&self.expansion.config, &j) {
                         super::work_state::open_work_path(&p)?;
-                    } else if let Some(local) = j["localPath"]
-                        .as_str()
-                        .filter(|s| !s.is_empty() && std::path::Path::new(s).is_file())
-                    {
-                        super::work_state::open_work_path(std::path::Path::new(local))?;
                     } else if self.demo_mode || j["demo"] == true {
                         self.expansion.feedback = format!(
                             "已定位电脑归档原件：{}",
@@ -418,7 +682,7 @@ impl Companion {
                         )?)?;
                     }
                 }
-                ExpansionAction::AnalyzeWithAmoo(id) => {
+                ExpansionAction::RevealInFolder(id) => {
                     let j = self
                         .expansion
                         .snapshot
@@ -428,47 +692,91 @@ impl Companion {
                         .cloned()
                         .or_else(|| demo_files().into_iter().find(|j| j["id"] == *id))
                         .ok_or_else(|| anyhow::anyhow!("文件记录已变化"))?;
-                    let name = j["name"].as_str().unwrap_or("归档文件").to_string();
-                    let size_bytes = j["size"].as_u64().unwrap_or(0);
-                    let kind = j["kind"].as_str().unwrap_or("");
-                    let local_path = expansion::local_file(&self.expansion.config, &j)
-                        .ok()
-                        .or_else(|| {
-                            j["localPath"]
-                                .as_str()
-                                .filter(|s| !s.is_empty())
-                                .map(PathBuf::from)
-                                .filter(|p| p.is_file())
-                        });
-                    if let Some(path) = &local_path {
-                        let is_img = kind == "photos"
-                            || path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
-                                matches!(
-                                    e.to_ascii_lowercase().as_str(),
-                                    "png" | "jpg" | "jpeg" | "webp" | "gif"
-                                )
-                            });
-                        if !self
-                            .amoo_attachments
-                            .iter()
-                            .any(|a| a.local_path.as_ref() == Some(path))
-                        {
-                            self.amoo_attachments.push(AmooAttachment {
-                                name: name.clone(),
-                                size_label: storage::format_bytes(size_bytes),
-                                is_image: is_img,
-                                local_path: Some(path.clone()),
-                            });
+                    if let Some(p) = resolve_media_local_path(&self.expansion.config, &j) {
+                        super::work_state::reveal_in_folder(&p)?;
+                    } else if let Some(folder) = &self.expansion.config.folder {
+                        super::work_state::reveal_in_folder(folder)?;
+                    } else {
+                        let target = expansion::local_file(&self.expansion.config, &j)?;
+                        super::work_state::reveal_in_folder(&target)?;
+                    }
+                }
+                ExpansionAction::AnalyzeWithAmoo(id) => {
+                    if let Some(j) = self
+                        .expansion
+                        .snapshot
+                        .files
+                        .iter()
+                        .find(|j| j["id"] == *id)
+                        .cloned()
+                        .or_else(|| demo_files().into_iter().find(|j| j["id"] == *id))
+                    {
+                        let name = j["name"].as_str().unwrap_or("归档文件").to_string();
+                        let size_bytes = j["size"].as_u64().unwrap_or(0);
+                        let kind = j["kind"].as_str().unwrap_or("");
+                        let local_path = resolve_media_local_path(&self.expansion.config, &j);
+                        if let Some(path) = &local_path {
+                            let is_img = kind == "photos"
+                                || path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+                                    matches!(
+                                        e.to_ascii_lowercase().as_str(),
+                                        "png" | "jpg" | "jpeg" | "webp" | "gif"
+                                    )
+                                });
+                            let staged_path = if path
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                                .is_some_and(|n| n == name)
+                            {
+                                path.clone()
+                            } else {
+                                let cache_dir = std::env::temp_dir().join("stepx-gallery-cache");
+                                let _ = std::fs::create_dir_all(&cache_dir);
+                                let dest = cache_dir.join(&name);
+                                if std::fs::copy(path, &dest).is_ok() {
+                                    dest
+                                } else {
+                                    path.clone()
+                                }
+                            };
+                            if is_img {
+                                self.work.insert_image_preview(
+                                    staged_path.to_string_lossy().into_owned(),
+                                    staged_path.clone(),
+                                );
+                            }
+                            if !self.amoo_attachments.iter().any(|a| {
+                                a.local_path.as_ref() == Some(&staged_path)
+                                    || a.local_path.as_ref() == Some(path)
+                            }) {
+                                self.amoo_attachments.push(AmooAttachment {
+                                    name: name.clone(),
+                                    size_label: storage::format_bytes(size_bytes),
+                                    is_image: is_img,
+                                    local_path: Some(staged_path),
+                                });
+                            }
                         }
+                        if self.fields[F_AMOO].text.trim().is_empty() {
+                            self.fields[F_AMOO].set(&format!("请帮我分析这份扩容归档文件：{name}"));
+                        }
+                        self.status = format!("已载入扩容原件「{name}」至 Amoo 对话框");
+                    } else {
+                        let name = PathBuf::from(id)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or(id.as_str())
+                            .to_string();
+                        self.fields[F_AMOO]
+                            .set(&format!("请帮我分析手机中的文件「{name}」（路径：{id}）"));
+                        self.status = format!("已将手机文件「{name}」带入 Amoo 对话框");
                     }
-                    if self.fields[F_AMOO].text.trim().is_empty() {
-                        self.fields[F_AMOO].set(&format!("请帮我分析这份扩容归档文件：{name}"));
-                    }
+                    self.workspace.sub_view = 0;
+                    self.workspace.panel = 0;
                     self.page = Page::Amoo;
                     self.scroll = Default::default();
                     self.reveal_latest_chat();
                     self.focus_field(F_AMOO, ctx);
-                    self.status = format!("已载入扩容原件「{name}」至 Amoo 对话框");
                 }
                 ExpansionAction::Restore(id) => {
                     self.expansion_command(Command::Restore(id.clone()))
@@ -482,6 +790,196 @@ impl Companion {
         }
         ctx.notify();
     }
+
+    pub(super) fn expansion_filtered_files(&self) -> Vec<Value> {
+        let e = &self.expansion;
+        let fallback_demo = if e.snapshot.files.is_empty()
+            && self.demo_mode
+            && std::env::var_os("STEPX_EMPTY").is_none()
+        {
+            demo_files()
+        } else {
+            Vec::new()
+        };
+        let all_files = if !e.snapshot.files.is_empty() {
+            &e.snapshot.files
+        } else {
+            &fallback_demo
+        };
+        let query = self.fields[F_GALLERY_SEARCH].text.trim().to_lowercase();
+        let mut files: Vec<Value> = all_files
+            .iter()
+            .filter(|j| {
+                let item_kind = expansion_item_kind(j);
+                let kind_ok = e.config.kind == "all"
+                    || j["kind"] == e.config.kind
+                    || item_kind == e.config.kind.as_str();
+                let state_ok = e.config.filter == "all" || j["state"] == e.config.filter;
+                let query_ok = query.is_empty()
+                    || j["name"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_lowercase()
+                        .contains(&query)
+                    || j["path"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_lowercase()
+                        .contains(&query)
+                    || j["dateGroup"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_lowercase()
+                        .contains(&query);
+                kind_ok && state_ok && query_ok
+            })
+            .cloned()
+            .collect();
+        files.sort_by(|a, b| {
+            let order = match e.config.sort.as_str() {
+                "name" => a["name"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_lowercase()
+                    .cmp(&b["name"].as_str().unwrap_or("").to_lowercase()),
+                "size" => a["size"].as_u64().cmp(&b["size"].as_u64()),
+                _ => a["modified"].as_u64().cmp(&b["modified"].as_u64()),
+            };
+            if e.config.descending {
+                order.reverse()
+            } else {
+                order
+            }
+        });
+        files
+    }
+
+    fn ensure_rotated_media_preview(&self, id: &str, deg: u16) {
+        if deg % 360 == 0 {
+            return;
+        }
+        let Some(j) = self
+            .expansion
+            .snapshot
+            .files
+            .iter()
+            .find(|j| j["id"].as_str() == Some(id))
+            .cloned()
+            .or_else(|| {
+                demo_files()
+                    .into_iter()
+                    .find(|j| j["id"].as_str() == Some(id))
+            })
+        else {
+            return;
+        };
+        let img_opt = resolve_media_local_path(&self.expansion.config, &j)
+            .and_then(|p| image::open(p).ok())
+            .or_else(|| {
+                let asset = match j["previewAsset"].as_str() {
+                    Some("neo_front_frame.png") => "neo_front_frame.png",
+                    Some("neo_rear_housing.png") => "neo_rear_housing.png",
+                    _ => "stepx_home_screen.png",
+                };
+                use facloud_ui::assets::AssetProvider;
+                DesktopAssets
+                    .get(asset)
+                    .ok()
+                    .and_then(|bytes| image::load_from_memory(&bytes).ok())
+            });
+        let Some(img) = img_opt else {
+            return;
+        };
+        let rotated = match deg % 360 {
+            90 => img.rotate90(),
+            180 => img.rotate180(),
+            270 => img.rotate270(),
+            _ => img,
+        };
+        let cache_dir = std::env::temp_dir().join("stepx-expansion-rot");
+        let _ = std::fs::create_dir_all(&cache_dir);
+        let safe_id: String = id
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .collect();
+        let target = cache_dir.join(format!("{safe_id}_{deg}.png"));
+        let _ = rotated.save(&target);
+        widgets::invalidate_cached_file(&target);
+    }
+}
+
+pub(super) fn expansion_item_kind(j: &Value) -> &'static str {
+    match j["kind"].as_str().unwrap_or("") {
+        "photos" | "photo" | "image" => "photos",
+        "videos" | "video" => "videos",
+        "audio" | "audiobooks" | "music" => "audio",
+        "documents" | "document" | "docs" => "documents",
+        _ => {
+            let lower = j["name"].as_str().unwrap_or("").to_ascii_lowercase();
+            if lower.ends_with(".jpg")
+                || lower.ends_with(".jpeg")
+                || lower.ends_with(".png")
+                || lower.ends_with(".webp")
+                || lower.ends_with(".heic")
+                || lower.ends_with(".gif")
+            {
+                "photos"
+            } else if lower.ends_with(".mp4")
+                || lower.ends_with(".mov")
+                || lower.ends_with(".mkv")
+                || lower.ends_with(".webm")
+            {
+                "videos"
+            } else if lower.ends_with(".mp3")
+                || lower.ends_with(".wav")
+                || lower.ends_with(".flac")
+                || lower.ends_with(".m4a")
+                || lower.ends_with(".aac")
+                || lower.ends_with(".ogg")
+                || lower.ends_with(".opus")
+                || lower.ends_with(".amr")
+            {
+                "audio"
+            } else {
+                "documents"
+            }
+        }
+    }
+}
+
+pub(super) fn resolve_media_local_path(config: &Config, j: &Value) -> Option<PathBuf> {
+    if let Ok(p) = expansion::local_file(config, j) {
+        if widgets::cached_is_file(&p) {
+            return Some(p);
+        }
+    }
+    if let Some(raw) = j["localPath"].as_str().filter(|s| !s.is_empty()) {
+        let direct = PathBuf::from(raw);
+        if widgets::cached_is_file(&direct) {
+            return Some(direct);
+        }
+        if let Some(stripped) = raw.strip_prefix("desktop/") {
+            let alt = PathBuf::from(stripped);
+            if widgets::cached_is_file(&alt) {
+                return Some(alt);
+            }
+        }
+    }
+    None
+}
+
+pub(super) fn rotated_media_cache_path(id: &str, deg: u16) -> Option<PathBuf> {
+    if deg % 360 == 0 {
+        return None;
+    }
+    let safe_id: String = id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    let target = std::env::temp_dir()
+        .join("stepx-expansion-rot")
+        .join(format!("{safe_id}_{deg}.png"));
+    widgets::cached_is_file(&target).then_some(target)
 }
 
 fn default_policy() -> Value {

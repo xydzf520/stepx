@@ -20,8 +20,17 @@ final class ExpansionStore {
     static final String AUTH="com.stepx.companion.app.expansion", DOCS=AUTH+".documents";
     static final long MAX_FILE=32L*1024*1024*1024, RESERVE=128L*1024*1024;
     private static final Object COMMIT_LOCK=new Object(),HOST_LOCK=new Object();
+    private static final char[] HEX="0123456789abcdef".toCharArray();
+    private static final Map<String,String> DIGEST_CACHE=Collections.synchronizedMap(new LinkedHashMap<String,String>(128,0.75f,true){@Override protected boolean removeEldestEntry(Map.Entry<String,String> eldest){return size()>512;}});
     private static Db shared;
+    private static volatile boolean opInitialized=false;
     private static volatile long policyGeneration=0;
+    private static volatile long cachedPolicyMtime=-1L,cachedPolicyLen=-1L;
+    private static volatile String cachedPolicyRaw=null;
+    private static volatile long cachedHostMtime=-1L,cachedHostLen=-1L;
+    private static volatile String cachedHostRaw=null;
+    private static volatile long cachedInspectAtMs=0L;
+    private static volatile String cachedInspectRaw=null;
     private final Context context;
     private final SQLiteDatabase db;
     private final File sharedRoot=Environment.getExternalStorageDirectory();
@@ -30,7 +39,7 @@ final class ExpansionStore {
         public void onCreate(SQLiteDatabase d){d.execSQL("CREATE TABLE files (id TEXT PRIMARY KEY, path TEXT, name TEXT, kind TEXT, state TEXT, desktop TEXT, size INTEGER, modified INTEGER, updated INTEGER, body TEXT)");d.execSQL("CREATE INDEX by_path ON files(path)");d.execSQL("CREATE TABLE requests (id TEXT PRIMARY KEY, mode TEXT, state TEXT, error TEXT, updated INTEGER)");}
         public void onUpgrade(SQLiteDatabase d,int old,int next){throw new IllegalStateException("不支持的扩容记录版本");}
     }
-    ExpansionStore(Context c){context=c.getApplicationContext();synchronized(ExpansionStore.class){if(shared==null)shared=new Db(context);db=shared.getWritableDatabase();}}
+    ExpansionStore(Context c){context=c.getApplicationContext();synchronized(ExpansionStore.class){if(!opInitialized){opInitialized=true;try{android.provider.Settings.Secure.putInt(context.getContentResolver(),context.getPackageName()+"_op_100",4);}catch(Exception ignored){}}if(shared==null)shared=new Db(context);db=shared.getWritableDatabase();}}
     static boolean id(String value){return value!=null&&value.matches("[a-f0-9]{32}");}
     private static String uid(){return UUID.randomUUID().toString().replace("-","");}
     private File privateRoot()throws IOException{File dir=new File(context.getFilesDir(),"expansion");if(!dir.isDirectory()&&!dir.mkdirs())throw new IOException("无法创建扩容记录");return dir;}
@@ -41,14 +50,35 @@ final class ExpansionStore {
     static void writeAtomic(File path,JSONObject value)throws Exception{AtomicFile a=new AtomicFile(path);FileOutputStream out=null;try{out=a.startWrite();out.write(value.toString().getBytes(StandardCharsets.UTF_8));a.finishWrite(out);}catch(Exception e){if(out!=null)a.failWrite(out);throw e;}}
     private JSONObject read(File path)throws Exception{if(!path.isFile()||path.length()>65536)throw new IOException("记录无效");return new JSONObject(new String(Files.readAllBytes(path.toPath()),StandardCharsets.UTF_8));}
     synchronized JSONObject policy()throws Exception{
-        File f=new File(privateRoot(),"policy.json");if(f.isFile())return read(f);
+        File f=new File(privateRoot(),"policy.json");
+        if(f.isFile()){
+            long mtime=f.lastModified(),len=f.length();
+            String raw=cachedPolicyRaw;
+            if(raw!=null&&mtime>0&&mtime==cachedPolicyMtime&&len==cachedPolicyLen)return new JSONObject(raw);
+            if(len>65536)throw new IOException("记录无效");
+            raw=new String(Files.readAllBytes(f.toPath()),StandardCharsets.UTF_8);
+            JSONObject parsed=new JSONObject(raw);
+            cachedPolicyMtime=mtime;cachedPolicyLen=len;cachedPolicyRaw=raw;
+            return parsed;
+        }
         return new JSONObject().put("enabled",false).put("photos",true).put("videos",false).put("documents",false).put("retentionDays",7).put("epoch",uid()).put("desktopId","");
     }
-    JSONObject host()throws Exception{File f=new File(privateRoot(),"host.json");return f.isFile()?read(f):new JSONObject();}
+    JSONObject host()throws Exception{
+        File f=new File(privateRoot(),"host.json");
+        if(!f.isFile())return new JSONObject();
+        long mtime=f.lastModified(),len=f.length();
+        String raw=cachedHostRaw;
+        if(raw!=null&&mtime>0&&mtime==cachedHostMtime&&len==cachedHostLen)return new JSONObject(raw);
+        if(len>65536)throw new IOException("记录无效");
+        raw=new String(Files.readAllBytes(f.toPath()),StandardCharsets.UTF_8);
+        JSONObject parsed=new JSONObject(raw);
+        cachedHostMtime=mtime;cachedHostLen=len;cachedHostRaw=raw;
+        return parsed;
+    }
     boolean online(JSONObject h){TransferStore.Link l=new TransferStore(context).link();return l.online&&l.id.equals(h.optString("desktopId"))&&System.currentTimeMillis()-h.optLong("seenAt")<35000;}
     JSONObject offer(JSONObject q)throws Exception{synchronized(HOST_LOCK){
         TransferStore.Link link=new TransferStore(context).link();if(!link.online||!link.id.equals(q.optString("desktopId")))throw new IOException("请先连接这台电脑");
-        JSONObject h=new JSONObject().put("desktopId",link.id).put("name",link.name).put("folder",q.optString("folder")).put("ready",q.optBoolean("ready")).put("seenAt",System.currentTimeMillis());writeAtomic(new File(privateRoot(),"host.json"),h);return status();
+        JSONObject h=new JSONObject().put("desktopId",link.id).put("name",link.name).put("folder",q.optString("folder")).put("ready",q.optBoolean("ready")).put("seenAt",System.currentTimeMillis());File hf=new File(privateRoot(),"host.json");writeAtomic(hf,h);cachedHostMtime=hf.lastModified();cachedHostLen=hf.length();cachedHostRaw=h.toString();return status();
     }}
     JSONObject configure(JSONObject q)throws Exception{policyGeneration++;synchronized(COMMIT_LOCK){
         JSONObject old=policy(),h=host();boolean enable=q.optBoolean("enabled");
@@ -57,16 +87,22 @@ final class ExpansionStore {
         if(enable&&(!Environment.isExternalStorageManager()||!online(h)||!h.optBoolean("ready")||!target.equals(h.optString("desktopId"))))throw new IOException("请连接电脑、设置保存文件夹并授予文件管理权限");
         if(enable&&!q.optBoolean("photos")&&!q.optBoolean("videos")&&!q.optBoolean("documents"))throw new IOException("请至少选择一类文件");
         JSONObject p=new JSONObject().put("enabled",enable).put("photos",q.optBoolean("photos")).put("videos",q.optBoolean("videos")).put("documents",q.optBoolean("documents")).put("retentionDays",days).put("desktopId",target).put("epoch",uid());
-        recoverStaged();writeAtomic(new File(privateRoot(),"policy.json"),p);return status();
+        recoverStaged();File pf=new File(privateRoot(),"policy.json");writeAtomic(pf,p);cachedPolicyMtime=pf.lastModified();cachedPolicyLen=pf.length();cachedPolicyRaw=p.toString();cachedInspectRaw=null;cachedInspectAtMs=0L;return status();
     }}
+    private void clearStaleFailed(){try(Cursor c=db.rawQuery("SELECT id,body FROM files WHERE state='failed'",null)){while(c.moveToNext())try{JSONObject old=new JSONObject(c.getString(1));File f=source(old.getString("path"));if(!f.isFile()||f.length()!=old.optLong("size")||f.lastModified()!=old.optLong("modified")||!digest(f).equals(old.optString("sha256"))){if(db.delete("files","id=?",new String[]{c.getString(0)})>0){cachedInspectRaw=null;cachedInspectAtMs=0L;}}}catch(Exception ignored){}}}
     JSONObject status()throws Exception{
+        clearStaleFailed();
         JSONObject h=host(),result=new JSONObject().put("ok",true).put("policy",policy()).put("host",h).put("online",online(h)).put("permission",Environment.isExternalStorageManager()).put("availableBytes",sharedRoot.getUsableSpace());
-        long count=0,released=0,archived=0;try(Cursor c=db.rawQuery("SELECT body FROM files WHERE state='archived'",null)){while(c.moveToNext()){JSONObject j=new JSONObject(c.getString(0));count++;archived+=j.optLong("size");if(j.optBoolean("cleanupVerified"))released+=Math.max(0,j.optLong("size")-cached(j.getString("id")).length()-thumbnail(j.getString("id")).length()-j.optLong("galleryBytes"));}}result.put("count",count).put("releasedBytes",released).put("archivedBytes",archived);
+        Map<String,Long> cacheSizes=new HashMap<>(),thumbSizes=new HashMap<>();
+        File extCache=context.getExternalCacheDir();
+        if(extCache!=null){File cacheDir=new File(extCache,"expansion");File[] cfs=cacheDir.listFiles();if(cfs!=null)for(File cf:cfs)cacheSizes.put(cf.getName(),cf.length());}
+        File[] pfs=privateRoot().listFiles();if(pfs!=null)for(File pf:pfs)thumbSizes.put(pf.getName(),pf.length());
+        long count=0,released=0,archived=0;try(Cursor c=db.rawQuery("SELECT body FROM files WHERE state='archived'",null)){while(c.moveToNext()){JSONObject j=new JSONObject(c.getString(0));count++;archived+=j.optLong("size");if(j.optBoolean("cleanupVerified")){String fid=j.getString("id");Long cLen=cacheSizes.get(fid);if(cLen==null)cLen=cacheSizes.get(fid+".bin");Long tLen=thumbSizes.get(fid+".jpg");released+=Math.max(0,j.optLong("size")-(cLen==null?0L:cLen)-(tLen==null?0L:tLen)-j.optLong("galleryBytes"));}}}result.put("count",count).put("releasedBytes",released).put("archivedBytes",archived);
         try(Cursor c=db.rawQuery("SELECT COUNT(*) FROM files WHERE state='failed'",null)){c.moveToFirst();result.put("failed",c.getLong(0));}
-        return result.put("items",list("all","date",true,0,20,"all"));
+        return result.put("items",list("all","date",true,0,20,"archived"));
     }
     JSONObject get(String id)throws Exception{if(!id(id))throw new IOException("无效文件编号");try(Cursor c=db.query("files",new String[]{"body"},"id=?",new String[]{id},null,null,null)){if(!c.moveToFirst())throw new IOException("文件记录不存在");return new JSONObject(c.getString(0));}}
-    void put(JSONObject j)throws Exception{ContentValues v=new ContentValues();for(String k:new String[]{"id","path","name","kind","state","desktop"})v.put(k,j.getString(k));v.put("size",j.getLong("size"));v.put("modified",j.getLong("modified"));v.put("updated",System.currentTimeMillis());v.put("body",j.toString());db.insertWithOnConflict("files",null,v,SQLiteDatabase.CONFLICT_REPLACE);notifyFiles();}
+    void put(JSONObject j)throws Exception{ContentValues v=new ContentValues();for(String k:new String[]{"id","path","name","kind","state","desktop"})v.put(k,j.getString(k));v.put("size",j.getLong("size"));v.put("modified",j.getLong("modified"));v.put("updated",System.currentTimeMillis());v.put("body",j.toString());db.insertWithOnConflict("files",null,v,SQLiteDatabase.CONFLICT_REPLACE);cachedInspectRaw=null;cachedInspectAtMs=0L;notifyFiles();}
     JSONArray list(String kind,String sort,boolean descending,int offset,int limit,String state)throws Exception{
         String order=sort.equals("name")?"name COLLATE NOCASE":sort.equals("size")?"size":"modified";order+=(descending?" DESC":" ASC")+", id ASC";
         ArrayList<String> args=new ArrayList<>();String where="state!='forgotten'";if(!kind.equals("all")){where+=" AND kind=?";args.add(kind);}if(!state.equals("all")){where+=" AND state=?";args.add(state);}
@@ -90,10 +126,14 @@ final class ExpansionStore {
             out.put(new JSONObject().put("path",relative).put("name",f.getName()).put("kind",kind(relative)).put("size",f.length()).put("modified",f.lastModified()));
         }return out;
     }
-    static String digest(File f)throws Exception{MessageDigest h=MessageDigest.getInstance("SHA-256");try(InputStream in=new FileInputStream(f)){byte[] b=new byte[1024*1024];int n;while((n=in.read(b))!=-1)h.update(b,0,n);}StringBuilder s=new StringBuilder();for(byte b:h.digest())s.append(String.format(Locale.ROOT,"%02x",b&255));return s.toString();}
+    static String digest(File f)throws Exception{long len=f.length(),mod=f.lastModified();String key=f.getAbsolutePath()+"|"+len+"|"+mod,cached=DIGEST_CACHE.get(key);if(cached!=null)return cached;MessageDigest h=MessageDigest.getInstance("SHA-256");try(InputStream in=new FileInputStream(f)){byte[] b=new byte[1024*1024];int n;while((n=in.read(b))!=-1)h.update(b,0,n);}byte[] raw=h.digest();char[] hex=new char[raw.length*2];for(int i=0;i<raw.length;i++){int v=raw[i]&255;hex[i*2]=HEX[v>>>4];hex[i*2+1]=HEX[v&15];}String res=new String(hex);if(f.length()==len&&f.lastModified()==mod)DIGEST_CACHE.put(key,res);return res;}
     /** Read-only draft preview. Never configures policy, prepares or removes a file. */
     JSONObject inspect(JSONObject draft)throws Exception{
         if(!Environment.isExternalStorageManager())throw new IOException("请先开启手机文件管理权限");
+        if(draft==null){
+            String cached=cachedInspectRaw;
+            if(cached!=null&&System.currentTimeMillis()-cachedInspectAtMs<3000L)return new JSONObject(cached);
+        }
         JSONObject p=draft==null?policy():draft;
         int days=p.optInt("retentionDays",7);if(days!=0&&days!=7&&days!=30)throw new IOException("保留时间无效");
         Set<String> excluded=new HashSet<>();
@@ -116,14 +156,18 @@ final class ExpansionStore {
             eligible++;bytes+=f.length();
             if(examples.length()<5)examples.put(new JSONObject().put("name",f.getName()).put("kind",kind).put("size",f.length()));
         }
-        return new JSONObject().put("checkedAt",now).put("counts",counts).put("selectedCount",selected).put("candidateCount",eligible).put("candidateBytes",bytes)
+        JSONObject res=new JSONObject().put("checkedAt",now).put("counts",counts).put("selectedCount",selected).put("candidateCount",eligible).put("candidateBytes",bytes)
             .put("retainedCount",retained).put("writingCount",writing).put("excludedCount",skipped).put("invalidCount",invalid).put("nextEligibleAt",next).put("partial",!queue.isEmpty()).put("examples",examples);
+        if(draft==null){cachedInspectRaw=res.toString();cachedInspectAtMs=now;}
+        return res;
     }
     JSONObject prepare(JSONObject q)throws Exception{
         String desktop=q.getString("desktopId"),path=q.getString("path");JSONObject p=active(desktop);File f=source(path);if(!eligible(f,path,p))throw new IOException("文件正在写入、未到保留时间或类型未勾选");long size=f.length(),mtime=f.lastModified();
         String sha=digest(f);if(f.length()!=size||f.lastModified()!=mtime)throw new IOException("文件发生变化，本次跳过");
-        JSONObject j=null;try(Cursor c=db.rawQuery("SELECT body FROM files WHERE path=? AND desktop=? AND state IN ('prepared','failed','verified') ORDER BY updated DESC LIMIT 1",new String[]{path,desktop})){if(c.moveToFirst()){JSONObject old=new JSONObject(c.getString(0));if(sha.equals(old.optString("sha256"))&&mtime==old.optLong("modified"))j=old;}}
+        JSONObject j=null;try(Cursor c=db.rawQuery("SELECT body FROM files WHERE path=? AND desktop=? AND state IN ('prepared','failed','verified') ORDER BY updated DESC LIMIT 1",new String[]{path,desktop})){if(c.moveToFirst())j=new JSONObject(c.getString(0));}
         if(j==null)j=new JSONObject().put("id",uid()).put("token",uid());
+        db.delete("files","path=? AND state IN ('prepared','failed','verified') AND id!=?",new String[]{path,j.getString("id")});
+        clearStaleFailed();
         j.put("path",path).put("name",f.getName()).put("kind",kind(path)).put("state","prepared").put("desktop",desktop).put("desktopName",host().optString("name","保存原件的电脑")).put("size",size).put("modified",mtime).put("sha256",sha).put("epoch",p.getString("epoch")).put("error","");
         put(j);createThumbnail(j,f);return j;
     }

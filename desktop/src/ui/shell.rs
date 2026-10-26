@@ -17,7 +17,11 @@ impl Companion {
         self.ease_scroll(
             ClippedScrollable::vertical(
                 state.clone(),
-                Container::new(content).with_uniform_padding(S5).finish(),
+                Container::new(content)
+                    .with_horizontal_padding(S5)
+                    .with_padding_top(S5)
+                    .with_padding_bottom(S6)
+                    .finish(),
                 ScrollbarWidth::Auto,
                 thumb.into(),
                 thumb_active.into(),
@@ -241,7 +245,7 @@ impl Companion {
         self.nav_item_icon(id, icon, label, badge, is_active, Action::Page(target))
     }
 
-    fn nav_item_icon(
+    pub(super) fn nav_item_icon(
         &self,
         id: &str,
         icon: UiIcon,
@@ -255,26 +259,38 @@ impl Companion {
         let font = self.font;
         let mono_font = self.mono_font;
         Hoverable::new(state, move |mouse| {
-            let hovered = mouse.is_mouse_over_element();
+            let t = self.hover_t(&mouse);
+            let clicked = mouse.is_clicked();
             let bg = if active {
-                p.selected
-            } else if hovered {
-                p.hover
+                if clicked {
+                    lerp_color(p.selected, p.hover, 0.5)
+                } else {
+                    p.selected
+                }
+            } else if clicked {
+                p.press_color(p.hover)
             } else {
-                ColorU::transparent_black()
+                lerp_color(ColorU::transparent_black(), p.hover, t)
             };
             let border = if active && !p.dark {
                 Border::all(1.).with_border_color(rgb(0xE4, 0xE4, 0xE7))
             } else {
                 Border::all(1.).with_border_color(ColorU::transparent_black())
             };
-            let icon_fg = if active { p.text } else { p.text2 };
-            let text_fg = if active {
+            let icon_fg = if active || clicked {
                 p.text
-            } else if p.dark {
+            } else {
+                lerp_color(p.text2, p.text, t * 0.65)
+            };
+            let resting_text = if p.dark {
                 p.text2
             } else {
                 rgb(0x52, 0x52, 0x5B)
+            };
+            let text_fg = if active || clicked {
+                p.text
+            } else {
+                lerp_color(resting_text, p.text, t)
             };
             let left = Flex::row()
                 .with_spacing(10.)
@@ -347,6 +363,24 @@ impl Companion {
         .finish()
     }
 
+    pub(super) fn cached_device_metrics(&self) -> stepx_companion::device::DeviceMetrics {
+        thread_local! {
+            static CACHE: std::cell::RefCell<Option<(String, stepx_companion::device::DeviceMetrics)>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        CACHE.with(|cache| {
+            let mut borrow = cache.borrow_mut();
+            if let Some((cached_summary, metrics)) = borrow.as_ref() {
+                if cached_summary == &self.summary {
+                    return metrics.clone();
+                }
+            }
+            let metrics = stepx_companion::device::DeviceMetrics::from_summary(&self.summary);
+            *borrow = Some((self.summary.clone(), metrics.clone()));
+            metrics
+        })
+    }
+
     fn device_block(&self) -> El {
         let p = self.p();
         let state = self.mouse_state("device-block");
@@ -370,15 +404,18 @@ impl Companion {
 
         let content = match &self.selected {
             Some(d) => {
-                let metrics = stepx_companion::device::DeviceMetrics::from_summary(&self.summary);
-                let transport = if is_wireless(&d.transport) {
-                    "局域网无线直连"
+                let metrics = self.cached_device_metrics();
+                let has_backup = !d.backup_transports().is_empty();
+                let transport = if has_backup {
+                    "双通道连接"
+                } else if is_wireless(&d.transport) {
+                    "无线直连"
                 } else {
-                    "USB 有线连接"
+                    "USB 连接"
                 };
                 let detail = match metrics.battery_level {
                     Some(b) => format!("{transport} · {b}%"),
-                    None => format!("{transport} · 电量未读取"),
+                    None => format!("{transport} · 已就绪"),
                 };
                 let title = if d.model.contains("StepX") {
                     d.model.clone()
@@ -413,19 +450,25 @@ impl Companion {
                     .with_child(self.line(detail, CAPTION, p.text2))
                     .finish();
 
-                self.between(
-                    self.hstack(10., vec![icon_box, text_col]),
-                    self.ui_icon(UiIcon::Connect, 14., p.text3),
-                )
+                self.hstack(10., vec![icon_box, text_col])
             }
             None => {
+                let reconnecting = self.connection_watch.detached_serial.is_some()
+                    && self
+                        .connection_watch
+                        .disconnected_at
+                        .is_some_and(|t| t.elapsed() < Duration::from_secs(30));
                 let icon_box = ConstrainedBox::new(
                     Container::new(
                         Flex::row()
                             .with_main_axis_size(MainAxisSize::Max)
                             .with_main_axis_alignment(MainAxisAlignment::Center)
                             .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                            .with_child(self.ui_icon(UiIcon::Smartphone, 15., p.text3))
+                            .with_child(self.ui_icon(
+                                UiIcon::Smartphone,
+                                15.,
+                                if reconnecting { p.warning } else { p.text3 },
+                            ))
                             .finish(),
                     )
                     .with_background_color(icon_bg)
@@ -439,8 +482,24 @@ impl Companion {
                 let text_col = Flex::column()
                     .with_spacing(2.)
                     .with_cross_axis_alignment(CrossAxisAlignment::Start)
-                    .with_child(self.line_w("未连接设备", CAPTION, p.text, Weight::Semibold))
-                    .with_child(self.line("点击前往配对", CAPTION, p.text2))
+                    .with_child(if reconnecting {
+                        self.lead(
+                            6.,
+                            self.dot(p.warning),
+                            self.line_w("正在自动重连…", CAPTION, p.text, Weight::Semibold),
+                        )
+                    } else {
+                        self.line_w("未连接设备", CAPTION, p.text, Weight::Semibold)
+                    })
+                    .with_child(self.line(
+                        if reconnecting {
+                            "无线/USB 通道恢复中"
+                        } else {
+                            "点击前往配对"
+                        },
+                        CAPTION,
+                        p.text2,
+                    ))
                     .finish();
 
                 self.between(
@@ -451,14 +510,21 @@ impl Companion {
         };
 
         Hoverable::new(state, move |mouse| {
+            let t = self.hover_t(&mouse);
+            let bg = if mouse.is_clicked() {
+                p.press_color(p.hover)
+            } else {
+                lerp_color(card_bg, p.hover, t)
+            };
+            let border_col = if self.page == Page::Connect {
+                p.accent
+            } else {
+                lerp_color(card_border, p.border_strong, t)
+            };
             Container::new(content)
                 .with_uniform_padding(10.)
-                .with_background_color(if mouse.is_mouse_over_element() {
-                    p.hover
-                } else {
-                    card_bg
-                })
-                .with_border(Border::all(1.).with_border_color(card_border))
+                .with_background_color(bg)
+                .with_border(Border::all(1.).with_border_color(border_col))
                 .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_PANEL)))
                 .finish()
         })
@@ -493,6 +559,25 @@ impl Companion {
         };
         let total_unread = im_unread + sms_unread + push_unread;
         let msg_badge = (total_unread > 0).then(|| total_unread.to_string());
+        let cal_badge = (!self.back_screen.stepos_suite.calendar_events.is_empty()).then(|| {
+            self.back_screen
+                .stepos_suite
+                .calendar_events
+                .len()
+                .to_string()
+        });
+        let alarm_badge = {
+            let c = self
+                .back_screen
+                .stepos_suite
+                .alarms
+                .iter()
+                .filter(|a| a.enabled)
+                .count();
+            (c > 0).then(|| c.to_string())
+        };
+        let gallery_badge = (!self.back_screen.gallery_items.is_empty())
+            .then(|| self.back_screen.gallery_items.len().to_string());
         let app_badge = (self.apps_loaded && self.apps_error.is_none()).then(|| {
             self.apps
                 .iter()
@@ -500,6 +585,7 @@ impl Companion {
                 .count()
                 .to_string()
         });
+        let amoo_badge = self.workspace_busy().then(|| "运行中".to_string());
 
         let logo_box = ConstrainedBox::new(
             Image::new(
@@ -546,7 +632,7 @@ impl Companion {
                     .with_spacing(2.)
                     .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
                     .with_children(vec![
-                        self.nav_group_title("工作台", true),
+                        self.nav_group_title("AI 与工作台", true),
                         self.nav_item_with_match(
                             "overview",
                             UiIcon::Home,
@@ -554,6 +640,59 @@ impl Companion {
                             Page::Overview,
                             matches!(self.page, Page::Overview | Page::Account),
                             None,
+                        ),
+                        // 唯一的 AI 入口：聊天、生成文件、做应用都在这里，由系统自动判断。
+                        // Page::Work 不再单独出现在侧边栏（只从「我的作品」/成果卡进入），
+                        // 打开时仍高亮 Amoo。「我的作品」是作品与文件库。
+                        self.nav_item_with_match(
+                            "amoo",
+                            UiIcon::Chat,
+                            "Amoo 对话",
+                            Page::Amoo,
+                            matches!(self.page, Page::Amoo | Page::Work),
+                            amoo_badge,
+                        ),
+                        self.nav_item_with_match(
+                            "studio",
+                            UiIcon::Package,
+                            "我的作品",
+                            Page::Studio,
+                            self.page == Page::Studio,
+                            None,
+                        ),
+                        self.nav_group_title("日历、闹钟与通信", false),
+                        self.nav_item_with_match(
+                            "calendar",
+                            UiIcon::Calendar,
+                            "日历",
+                            Page::Calendar,
+                            matches!(self.page, Page::Calendar | Page::Schedule),
+                            cal_badge,
+                        ),
+                        self.nav_item_with_match(
+                            "alarms",
+                            UiIcon::Clock,
+                            "闹钟",
+                            Page::Alarms,
+                            self.page == Page::Alarms,
+                            alarm_badge,
+                        ),
+                        self.nav_item_with_match(
+                            "sms",
+                            UiIcon::Sms,
+                            "消息与通知",
+                            Page::Sms,
+                            matches!(self.page, Page::Sms | Page::Notifications | Page::Phone),
+                            msg_badge,
+                        ),
+                        self.nav_group_title("媒体与设备", false),
+                        self.nav_item_with_match(
+                            "gallery",
+                            UiIcon::Image,
+                            "图库",
+                            Page::Gallery,
+                            self.page == Page::Gallery,
+                            gallery_badge,
                         ),
                         self.nav_item_with_match(
                             "backscreen",
@@ -564,23 +703,13 @@ impl Companion {
                             Some("点阵".into()),
                         ),
                         self.nav_item_with_match(
-                            "amoo",
-                            UiIcon::Chat,
-                            "Amoo",
-                            Page::Amoo,
-                            matches!(self.page, Page::Amoo | Page::Work | Page::Studio),
-                            None,
+                            "apps",
+                            UiIcon::Apps,
+                            "应用",
+                            Page::Apps,
+                            self.page == Page::Apps,
+                            app_badge,
                         ),
-                        self.nav_group_title("通信与通知", false),
-                        self.nav_item_with_match(
-                            "sms",
-                            UiIcon::Sms,
-                            "消息与通知",
-                            Page::Sms,
-                            matches!(self.page, Page::Sms | Page::Notifications | Page::Phone),
-                            msg_badge,
-                        ),
-                        self.nav_group_title("设备与工具", false),
                         self.nav_item_with_match(
                             "files",
                             UiIcon::Folder,
@@ -588,14 +717,6 @@ impl Companion {
                             Page::Files,
                             matches!(self.page, Page::Files | Page::Expansion),
                             None,
-                        ),
-                        self.nav_item_with_match(
-                            "apps",
-                            UiIcon::Apps,
-                            "应用",
-                            Page::Apps,
-                            self.page == Page::Apps,
-                            app_badge,
                         ),
                         self.nav_item_with_match(
                             "tools",
@@ -646,22 +767,23 @@ impl Companion {
         let p = self.p();
         let state = self.mouse_state(format!("win:{id}"));
         Hoverable::new(state, move |mouse| {
-            let hovered = mouse.is_mouse_over_element();
-            let bg = if hovered {
+            let t = self.hover_t(&mouse);
+            let clicked = mouse.is_clicked();
+            let target_bg = if danger { p.danger } else { p.hover };
+            let bg = if clicked {
                 if danger {
-                    p.danger
+                    lerp_color(p.danger, ColorU::black(), 0.18)
                 } else {
-                    p.hover
+                    p.press_color(p.hover)
                 }
             } else {
-                ColorU::transparent_black()
+                lerp_color(ColorU::transparent_black(), target_bg, t)
             };
-            let fg = if hovered && danger {
-                ColorU::white()
-            } else if hovered {
-                p.text
+            let target_fg = if danger { ColorU::white() } else { p.text };
+            let fg = if clicked {
+                target_fg
             } else {
-                p.text2
+                lerp_color(p.text2, target_fg, t)
             };
             ConstrainedBox::new(
                 Container::new(
@@ -714,11 +836,37 @@ impl Companion {
             }
             Page::BackScreen => "17 列 × 23 行 · 379 颗单色灯珠 · 创作与手机联动".into(),
             Page::Amoo => "".into(),
+            Page::Calendar | Page::Schedule => format!(
+                "电脑与手机双向日历 · {} 项日程 · {}",
+                self.back_screen.stepos_suite.calendar_events.len(),
+                if self.preferences.auto_sync_calendar {
+                    "自动同步开启"
+                } else {
+                    "手动管理"
+                }
+            ),
+            Page::Alarms => {
+                let enabled = self
+                    .back_screen
+                    .stepos_suite
+                    .alarms
+                    .iter()
+                    .filter(|a| a.enabled)
+                    .count();
+                format!(
+                    "{enabled}/{} 个手机闹钟开启 · 专注番茄钟与自动化提醒",
+                    self.back_screen.stepos_suite.alarms.len()
+                )
+            }
+            Page::Gallery => format!(
+                "手机真实相册与截图 · {} 张照片 · 电脑预览与双向传输",
+                self.back_screen.gallery_items.len()
+            ),
             Page::Account => "手机账号 · 真实消息 Token 用量".into(),
             Page::About | Page::Settings => "更顺手的使用习惯".into(),
             Page::Expansion => "电脑保存原件 · 手机保留入口".into(),
-            Page::Work => "手机任务同步 · 本地文件协作".into(),
-            Page::Studio => "电脑创作 · 手机体验 · 作品分享".into(),
+            Page::Work => "用文件夹里的文件干活 · 结果同步回 Amoo 对话".into(),
+            Page::Studio => "做过的文档、应用和小游戏都在这里".into(),
             Page::Sms => {
                 let im_threads = self.push.snapshot.threads.len();
                 let im_unread: usize = self
@@ -766,7 +914,7 @@ impl Companion {
             }
             Page::Phone => "通话记录、手机通讯录与桌面直接拨号".into(),
             Page::Files => {
-                let m = stepx_companion::device::DeviceMetrics::from_summary(&self.summary);
+                let m = self.cached_device_metrics();
                 if m.storage_total.is_empty() {
                     "内部存储 · 容量暂不可用".into()
                 } else {

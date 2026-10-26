@@ -23,7 +23,11 @@ impl TypedActionView for Companion {
             }
             if !matches!(
                 action,
-                Action::MinimizeWindow | Action::MaximizeWindow | Action::StudioOpenUrl(_)
+                Action::MinimizeWindow
+                    | Action::MaximizeWindow
+                    | Action::CloseWindow
+                    | Action::QuitApplication
+                    | Action::StudioOpenUrl(_)
             ) {
                 return;
             }
@@ -36,11 +40,21 @@ impl TypedActionView for Companion {
         if self.shortcuts.recording
             && matches!(
                 action,
-                Action::Page(_) | Action::CloseWindow | Action::CompactChat
+                Action::Page(_)
+                    | Action::CloseWindow
+                    | Action::QuitApplication
+                    | Action::CompactChat
             )
         {
             let _ = self.shortcuts.resume();
             self.shortcuts.recording = false;
+        }
+        if matches!(action, Action::QuitApplication) {
+            self.context_menu = None;
+            self.work.image_viewer = None;
+            self.adb_guide_step = None;
+            self.handle_ui_action(action, ctx);
+            return;
         }
         if self.work.image_viewer.is_some() {
             if matches!(action, Action::Escape) {
@@ -50,7 +64,9 @@ impl TypedActionView for Companion {
             }
             if !matches!(
                 action,
-                Action::Work(WorkAction::CloseImagePreview)
+                Action::Work(_)
+                    | Action::CopyText(..)
+                    | Action::StudioOpenUrl(_)
                     | Action::MinimizeWindow
                     | Action::MaximizeWindow
                     | Action::CloseWindow
@@ -137,6 +153,9 @@ impl TypedActionView for Companion {
                 self.record_notice("设置未保存", self.settings.feedback.clone());
                 self.error = true;
             } else {
+                if let SettingsAction::SetAppsFilter(filter) = action {
+                    self.settings.apps_filter = (*filter).min(3);
+                }
                 self.error = false;
             }
             self.sync_ime(ctx);
@@ -144,6 +163,16 @@ impl TypedActionView for Companion {
             return;
         }
         if let Action::Expansion(action) = action {
+            if matches!(
+                action,
+                expansion_state::ExpansionAction::Settings
+                    | expansion_state::ExpansionAction::Back
+                    | expansion_state::ExpansionAction::Filter(_)
+                    | expansion_state::ExpansionAction::State(_)
+                    | expansion_state::ExpansionAction::SetGalleryGrid(_)
+            ) {
+                self.motion_started = Instant::now();
+            }
             self.handle_expansion_action(action, ctx);
             return;
         }
@@ -157,7 +186,29 @@ impl TypedActionView for Companion {
             ctx.notify();
             return;
         }
+        if self.page == Page::Amoo
+            || matches!(
+                action,
+                Action::Page(Page::Amoo)
+                    | Action::Workspace(_)
+                    | Action::AmooUi(_)
+                    | Action::AmooSend
+                    | Action::AmooSelectSession(_)
+                    | Action::AmooNewChat
+                    | Action::AmooRetryMessage { .. }
+                    | Action::AmooRetryReply
+                    | Action::SubmitFocused
+                    | Action::QuickGuiScenario { .. }
+            )
+        {
+            self.demote_busy_if_background();
+        }
         if let Action::AmooUi(action) = action {
+            if matches!(action, AmooUiAction::GuiMode(true))
+                && self.push.shell_mode != ShellMode::Full
+            {
+                self.set_compact_mode(ShellMode::Full, ctx);
+            }
             self.handle_amoo_ui_action(action);
             self.sync_ime(ctx);
             ctx.notify();
@@ -171,6 +222,9 @@ impl TypedActionView for Companion {
             return;
         }
         if let Action::Workspace(action) = action {
+            if matches!(action, WorkspaceAction::SendScheduleToAmoo(_)) {
+                self.page = Page::Amoo;
+            }
             self.handle_workspace(action, ctx);
             self.sync_ime(ctx);
             return;
@@ -187,12 +241,34 @@ impl TypedActionView for Companion {
             return;
         }
         if let Action::Studio(action) = action {
+            if matches!(
+                action,
+                StudioAction::Tab(_)
+                    | StudioAction::Source(_)
+                    | StudioAction::Category(_)
+                    | StudioAction::Select(_)
+                    | StudioAction::WebSelect(_)
+                    | StudioAction::CloudCategory(_)
+                    | StudioAction::CloudSelect(_)
+            ) {
+                self.motion_started = Instant::now();
+            }
             self.handle_studio_action(action, ctx);
             self.sync_ime(ctx);
             ctx.notify();
             return;
         }
         if let Action::Work(action) = action {
+            if matches!(
+                action,
+                WorkAction::Tab(_)
+                    | WorkAction::Panel(_)
+                    | WorkAction::Mode(_)
+                    | WorkAction::NewChat
+                    | WorkAction::Session(_)
+            ) {
+                self.motion_started = Instant::now();
+            }
             if !action.keeps_current_shell()
                 && !matches!(self.page, Page::Amoo | Page::Work | Page::Studio)
             {
@@ -204,6 +280,16 @@ impl TypedActionView for Companion {
             return;
         }
         if let Action::Push(action) = action {
+            if matches!(
+                action,
+                PushAction::SelectImThread(_)
+                    | PushAction::SelectImChannel(_)
+                    | PushAction::SelectCategory(_)
+                    | PushAction::SelectAppFilter(_)
+                    | PushAction::SelectNotification(_)
+            ) {
+                self.motion_started = Instant::now();
+            }
             self.handle_push_action(action, ctx);
             self.sync_ime(ctx);
             ctx.notify();
@@ -259,55 +345,31 @@ impl Companion {
         if self.handle_text_action(action, ctx) {
             return true;
         }
-        if !self.demo_mode
-            && (matches!(
-                action,
-                Action::AmooToggleMemory
-                    | Action::AmooAddMemory
-                    | Action::AmooCycleStyle
-                    | Action::AmooCycleCommute
-                    | Action::AmooToggleSkillManage
-                    | Action::AmooToggleExpressCard
-                    | Action::AmooQueryExpress
-            ) || matches!(action, Action::AmooSelectAgent(index) if *index != 0))
-        {
-            self.status = "此功能的后台接口尚未接入，未修改手机配置；当前支持 Amoo 文字对话".into();
-            self.error = true;
-            return true;
-        }
-        if !self.demo_mode
-            && matches!(
-                action,
-                Action::AmooToggleRecording | Action::AmooToggleTts | Action::AmooSelectModel(_)
-            )
-        {
-            self.status = match action {
-                Action::AmooToggleRecording => "语音输入尚未接入，暂时无法将语音转为文字",
-                Action::AmooToggleTts => "语音播报尚未接入",
-                _ => "模型切换尚未接入",
-            }
-            .into();
-            self.error = true;
-            return true;
-        }
         match action {
             Action::Page(page) => {
                 self.clear_text_interaction();
-                self.motion_started = Instant::now();
+                if self.page != *page {
+                    if self.page == Page::Work {
+                        self.work.trim_idle_previews();
+                    }
+                    if self.page == Page::Gallery && !self.back_screen.gallery_lightbox {
+                        self.back_screen.gallery_zoom_pct = 100;
+                        self.work.trim_idle_previews();
+                    }
+                }
+                if self.page != *page || (*page == Page::Tools && self.tool_page.is_some()) {
+                    self.trigger_subtab_switch();
+                }
                 self.set_compact_mode(ShellMode::Full, ctx);
                 if let Some(i) = self.focus {
                     self.fields[i].preedit.clear();
                 }
-                self.page = if matches!(page, Page::Work | Page::Studio) {
-                    Page::Amoo
-                } else {
-                    *page
-                };
-                if *page == Page::Work {
-                    self.workspace.intent = stepx_companion::amoo_workspace::Intent::Files;
+                self.page = *page;
+                if *page == Page::Amoo {
+                    self.demote_busy_if_background();
                 }
-                if *page == Page::Studio {
-                    self.workspace.panel = 4;
+                if *page == Page::Studio && !self.studio.loaded && !self.busy {
+                    self.refresh_studio();
                 }
                 self.back_screen
                     .set_preview_visible(*page == Page::BackScreen);
@@ -328,8 +390,39 @@ impl Companion {
                 }
                 self.load_work_previews();
                 self.auto_load_for_page();
+                if !self.demo_mode
+                    && matches!(
+                        self.page,
+                        Page::Tools
+                            | Page::Overview
+                            | Page::Calendar
+                            | Page::Schedule
+                            | Page::Alarms
+                    )
+                    && !self.back_screen.stepos_suite.checked
+                    && !self.back_screen.stepos_suite_loading
+                    && self.selected.is_some()
+                {
+                    self.handle_backscreen_action(&BackScreenAction::InspectStepOsSuite, ctx);
+                }
+                if !self.demo_mode
+                    && self.page == Page::Gallery
+                    && !self.back_screen.gallery_checked
+                    && !self.back_screen.gallery_loading
+                    && self.selected.is_some()
+                {
+                    self.handle_backscreen_action(&BackScreenAction::GalleryRefresh, ctx);
+                }
             }
             Action::OpenTool(tool) => {
+                if self.page == Page::Work {
+                    self.work.trim_idle_previews();
+                }
+                if self.page == Page::Gallery && !self.back_screen.gallery_lightbox {
+                    self.back_screen.gallery_zoom_pct = 100;
+                    self.work.trim_idle_previews();
+                }
+                self.trigger_subtab_switch();
                 self.set_compact_mode(ShellMode::Full, ctx);
                 self.page = Page::Tools;
                 self.tool_page = *tool;
@@ -343,6 +436,7 @@ impl Companion {
                 self.neo_enable_ime = *enabled;
             }
             Action::ToolCategory(category) => {
+                self.trigger_subtab_switch();
                 self.tool_category = *category;
             }
             Action::PrepareUtility(action) => {
@@ -360,11 +454,13 @@ impl Companion {
                 }
             }
             Action::ToolTab(tab) => {
+                self.trigger_subtab_switch();
                 self.tools_tab = *tab;
                 self.tools_result_page = 0;
                 self.tools_pending = None;
             }
             Action::ToolResultPage(page) => {
+                self.trigger_subtab_switch();
                 self.tools_result_page = *page;
                 self.tools_pending = None;
             }
@@ -380,6 +476,7 @@ impl Companion {
                     return true;
                 }
                 if let Some((parent, name)) = path.rsplit_once('/') {
+                    self.motion_started = Instant::now();
                     self.page = Page::Files;
                     self.fields[F_FILE_SEARCH].set(name);
                     self.tools_pending = None;
@@ -418,6 +515,7 @@ impl Companion {
                 }
             }
             Action::ConnectGuide(step) => {
+                self.trigger_subtab_switch();
                 self.connect_guide_step = step.map(|step| step.min(5));
                 self.page = Page::Connect;
                 self.focus = None;
@@ -427,7 +525,10 @@ impl Companion {
                 self.auto_load_for_page();
             }
             Action::PairTab(tab) => {
-                self.pair_tab = *tab;
+                if self.pair_tab != *tab {
+                    self.pair_tab = *tab;
+                    self.trigger_subtab_switch();
+                }
                 match tab {
                     PairTab::Qr => self.focus = None,
                     PairTab::Code => self.focus_field(F_PAIR_CODE, ctx),
@@ -444,6 +545,9 @@ impl Companion {
                 self.handle_ui_action(&Action::Trash, ctx);
             }
             Action::SmsFilter(filter) => {
+                if self.sms_filter != *filter {
+                    self.trigger_subtab_switch();
+                }
                 self.sms_filter = *filter;
                 self.selected_thread = None;
                 self.fields[F_SMS_TO].clear();
@@ -462,6 +566,7 @@ impl Companion {
                 self.pending_call = None;
             }
             Action::ToggleSystemApps(include) => {
+                self.motion_started = Instant::now();
                 self.include_system_apps = *include;
                 self.scroll = Default::default();
             }
@@ -480,6 +585,9 @@ impl Companion {
                 self.pending_sms_plan = None;
             }
             Action::SelectSmsThread(thread) => {
+                self.motion_started = Instant::now();
+                self.push.im_channel = stepx_companion::push::ImChannel::Sms;
+                self.push.selected_im_thread = Some(String::new());
                 self.selected_thread = thread.clone();
                 self.pending_sms_plan = None;
                 self.scroll_aux = Default::default();
@@ -490,12 +598,15 @@ impl Companion {
                 }
             }
             Action::NewSms => {
+                self.motion_started = Instant::now();
+                self.push.im_channel = stepx_companion::push::ImChannel::Sms;
+                self.push.selected_im_thread = Some(String::new());
                 self.selected_thread = Some("__new__".into());
                 self.pending_sms_plan = None;
                 self.fields[F_SMS_TO].clear();
                 self.fields[F_SMS_BODY].clear();
                 self.focus_field(F_SMS_TO, ctx);
-                self.status = "新建短信：请在下方输入收件人号码与短信正文".into();
+                self.status = "新建短信：请在下方选择联系人或输入收件人号码".into();
             }
             Action::CancelDirectSms => {
                 self.pending_sms_plan = None;
@@ -514,6 +625,7 @@ impl Companion {
                 self.save_preferences("已移除");
             }
             Action::FileSort(sort) => {
+                self.motion_started = Instant::now();
                 self.file_sort = *sort;
                 self.file_page = 0;
             }
@@ -526,14 +638,27 @@ impl Companion {
                 self.fields[F_FILE_NAME].clear();
                 self.focus_field(F_FILE_NAME, ctx);
             }
+            Action::OpenNewTextFile => {
+                if self.page != Page::Files || self.selected.is_none() {
+                    return true;
+                }
+                self.file_modal = Some(FileModal::NewTextFile);
+                self.trash_confirm = false;
+                self.fields[F_FILE_NAME].set("未命名笔记.txt");
+                self.focus_field(F_FILE_NAME, ctx);
+                self.fields[F_FILE_NAME].all = true;
+            }
             Action::OpenRename => {
                 if self.page != Page::Files {
                     return true;
                 }
-                if let Some((idx, name)) = self
+                let sel = self
                     .selected_file
-                    .and_then(|i| self.files.get(i).map(|e| (i, e.name.clone())))
+                    .or_else(|| self.visible_real_files().first().map(|(i, _)| *i));
+                if let Some((idx, name)) =
+                    sel.and_then(|i| self.files.get(i).map(|e| (i, e.name.clone())))
                 {
+                    self.selected_file = Some(idx);
                     self.file_modal = Some(FileModal::Rename(idx));
                     self.trash_confirm = false;
                     self.fields[F_FILE_NAME].set(&name);
@@ -549,11 +674,27 @@ impl Companion {
                 }
             }
             Action::MoveFileSelection(delta) => {
+                if self.page == Page::Gallery {
+                    let cols = self.back_screen.gallery_grid_cols.clamp(2, 4) as isize;
+                    if delta.is_negative() {
+                        for _ in 0..cols.abs() {
+                            self.handle_backscreen_action(&BackScreenAction::GalleryPrevPhoto, ctx);
+                        }
+                    } else {
+                        for _ in 0..cols.abs() {
+                            self.handle_backscreen_action(&BackScreenAction::GalleryNextPhoto, ctx);
+                        }
+                    }
+                    return true;
+                }
                 if self.page != Page::Files {
                     return true;
                 }
-                let filtered: Vec<usize> =
-                    self.filtered_files().into_iter().map(|(i, _)| i).collect();
+                let filtered: Vec<usize> = self
+                    .visible_real_files()
+                    .into_iter()
+                    .map(|(i, _)| i)
+                    .collect();
                 if filtered.is_empty() {
                     return true;
                 }
@@ -570,21 +711,57 @@ impl Companion {
                 self.file_page = next / FILES_PER_PAGE;
                 self.trash_confirm = false;
             }
+            Action::MoveHorizontalSelection(delta) => {
+                if self.page == Page::Gallery {
+                    let act = if *delta < 0 {
+                        BackScreenAction::GalleryPrevPhoto
+                    } else {
+                        BackScreenAction::GalleryNextPhoto
+                    };
+                    self.handle_backscreen_action(&act, ctx);
+                } else if self.page == Page::Expansion {
+                    let act = if *delta < 0 {
+                        expansion_state::ExpansionAction::MediaPrev
+                    } else {
+                        expansion_state::ExpansionAction::MediaNext
+                    };
+                    self.handle_expansion_action(&act, ctx);
+                }
+            }
             Action::SelectFile(i) => {
                 self.selected_file = Some(*i);
                 self.trash_confirm = false;
             }
             Action::FilePage(page) => {
+                self.motion_started = Instant::now();
                 self.file_page = *page;
                 self.selected_file = None;
                 self.trash_confirm = false;
                 self.scroll = Default::default();
             }
             Action::Trash | Action::DeleteFile => {
+                if self.page == Page::Gallery && self.focus.is_none() {
+                    if let Some(item) = self
+                        .back_screen
+                        .gallery_items
+                        .get(self.back_screen.gallery_selected)
+                        .cloned()
+                    {
+                        self.handle_backscreen_action(
+                            &BackScreenAction::GalleryDelete(item.remote_path),
+                            ctx,
+                        );
+                    }
+                    return true;
+                }
                 if self.page != Page::Files {
                     return true;
                 }
-                if self.selected_file.is_some() {
+                let sel = self
+                    .selected_file
+                    .or_else(|| self.visible_real_files().first().map(|(i, _)| *i));
+                if let Some(i) = sel {
+                    self.selected_file = Some(i);
                     self.trash_confirm = true;
                     self.permanent_delete = matches!(action, Action::DeleteFile);
                     self.file_modal = None;
@@ -624,6 +801,9 @@ impl Companion {
                         F_STUDIO_SEARCH
                     }),
                     Page::Overview => Some(F_OV_TEXT),
+                    Page::Gallery => Some(F_GALLERY_SEARCH),
+                    Page::Calendar | Page::Schedule => Some(F_PHONE_SCHEDULE_TITLE),
+                    Page::Alarms => Some(F_ALARM_TIME),
                     Page::Connect
                     | Page::Tools
                     | Page::Account
@@ -662,6 +842,9 @@ impl Companion {
                     Page::Files if self.file_modal.is_some() => &[F_FILE_NAME, F_FILE_SEARCH],
                     Page::Files => &[F_FILE_SEARCH],
                     Page::Apps => &[F_APP_SEARCH],
+                    Page::Calendar | Page::Schedule => &[F_PHONE_SCHEDULE_TITLE, F_CALENDAR_TIME],
+                    Page::Alarms => &[F_ALARM_TIME, F_PHONE_SCHEDULE_TITLE],
+                    Page::Gallery => &[F_GALLERY_SEARCH],
                     Page::Tools
                     | Page::Account
                     | Page::About
@@ -710,9 +893,8 @@ impl Companion {
                 ctx.toggle_maximized_window();
             }
             Action::CloseWindow | Action::QuitApplication => {
-                if matches!(action, Action::CloseWindow)
-                    && self.settings.value.close_to_tray
-                    && self.settings.tray.is_some()
+                let force_quit = matches!(action, Action::QuitApplication);
+                if !force_quit && self.settings.value.close_to_tray && self.settings.tray.is_some()
                 {
                     self.remember_window(ctx, true);
                     self.settings.hidden = true;
@@ -720,7 +902,7 @@ impl Companion {
                     ctx.windows().hide_window(id);
                     return true;
                 }
-                if self.back_screen.companion_busy {
+                if !force_quit && self.back_screen.companion_busy {
                     self.status = "正在同步 StepX伴侣，请完成后关闭窗口".into();
                     ctx.notify();
                     return true;
@@ -730,8 +912,14 @@ impl Companion {
                 }
                 self.cancel_backscreen();
                 self.stop_mirror();
+                self.close_mirror_controls(ctx);
+                self.workspace_flush();
                 self.remember_window(ctx, true);
+                self.settings.tray = None;
                 ctx.close_window();
+                if force_quit {
+                    ctx.terminate_app(platform::TerminationMode::ForceTerminate, None);
+                }
             }
             Action::OverviewBackPreview(back) => {
                 self.overview_back_preview = *back;
@@ -745,6 +933,7 @@ impl Companion {
                 };
             }
             Action::AmooSelectAgent(idx) => {
+                self.motion_started = Instant::now();
                 self.amoo_agent_idx = *idx;
                 let name = match *idx {
                     0 => "Amoo 助手",
@@ -761,13 +950,26 @@ impl Companion {
                 }) {
                     self.amoo_session_idx = pos;
                 }
+                self.error = false;
                 self.status = format!("已切换协同智能体：{name}");
             }
             Action::AmooSelectSession(idx) => {
+                self.motion_started = Instant::now();
                 self.amoo_ui.screen_mode = false;
                 self.amoo_show_schedules = false;
                 if let Some(session) = self.amoo_sessions.get(*idx) {
                     let key = session.session_key.clone();
+                    if let Some(task_id) = self
+                        .workspace
+                        .journal
+                        .tasks
+                        .iter()
+                        .find(|t| t.session.as_deref() == Some(key.as_str()))
+                        .map(|t| t.id.clone())
+                    {
+                        self.workspace.active = Some(task_id);
+                        self.workspace_restore();
+                    }
                     self.clear_text_interaction();
                     self.compact.history = false;
                     self.amoo_session_idx = *idx;
@@ -777,23 +979,12 @@ impl Companion {
                     self.reveal_latest_chat();
                     self.focus_field(F_AMOO, ctx);
                     if !self.demo_mode {
-                        if !self.busy {
-                            self.with_device("正在从后台读取会话…", move |adb, d| {
-                                Ok(Outcome::AmooRealData(
-                                    amoo::fetch(adb, &d, Some(&key))?,
-                                    "已从后台同步会话".into(),
-                                ))
-                            });
-                        } else {
-                            self.amoo_poll_remaining = 3;
-                            self.last_amoo_poll = Instant::now()
-                                .checked_sub(Duration::from_secs(60))
-                                .unwrap_or_else(Instant::now);
-                        }
+                        self.request_amoo_session_sync(Some(key));
                     }
                 }
             }
             Action::AmooNewChat => {
+                self.motion_started = Instant::now();
                 self.amoo_ui.screen_mode = false;
                 if self.busy {
                     return true;
@@ -829,6 +1020,11 @@ impl Companion {
             }
             Action::AmooToggleTts => {
                 self.amoo_tts_on = !self.amoo_tts_on;
+                if !self.amoo_tts_on {
+                    self.speech.playback = None;
+                    self.speech.key = None;
+                }
+                self.error = false;
                 self.status = format!(
                     "Amoo 语音朗读已{}",
                     if self.amoo_tts_on { "开启" } else { "关闭" }
@@ -885,6 +1081,7 @@ impl Companion {
             }
             Action::AmooToggleMemory => {
                 self.amoo_memory_enabled = !self.amoo_memory_enabled;
+                self.trigger_subtab_switch();
                 self.status = format!(
                     "Amoo 跨会话记忆已{}",
                     if self.amoo_memory_enabled {
@@ -901,6 +1098,7 @@ impl Companion {
                     1 => "温和详细 · 分步拆解",
                     _ => "极客专业 · 附带命令",
                 };
+                self.error = false;
                 self.status = format!("已切换交流风格偏好：{label}");
             }
             Action::AmooCycleCommute => {
@@ -910,27 +1108,39 @@ impl Companion {
                     1 => "09:00 播报日程",
                     _ => "18:30 晚高峰提醒",
                 };
+                self.error = false;
                 self.status = format!("已切换通勤偏好：{label}");
             }
             Action::AmooAddMemory => {
-                let text = self.fields[F_AMOO].text.trim().to_string();
-                let new_title = if text.is_empty() {
+                let mem_input = self.fields[F_AMOO_MEMORY_INPUT].text.trim().to_string();
+                let chat_input = self.fields[F_AMOO].text.trim().to_string();
+                let new_title = if !mem_input.is_empty() {
+                    self.fields[F_AMOO_MEMORY_INPUT].clear();
+                    mem_input
+                } else if !chat_input.is_empty() {
+                    self.fields[F_AMOO].clear();
+                    chat_input
+                } else {
                     format!(
                         "背屏常显偏好：{} ({}级亮度)",
                         self.back_screen.title, self.back_screen.config.brightness
                     )
-                } else {
-                    self.fields[F_AMOO].clear();
-                    text
+                };
+                let cat_label = match self.workspace.memory_category {
+                    1 => "关于我 · 个人画像",
+                    2 => "交流偏好 · 称呼与语气",
+                    3 => "备忘事项 · 重要记录",
+                    _ => "关于我 · 个人记忆",
                 };
                 self.amoo_memories.insert(
                     0,
                     AmooMemoryEntry {
                         title: new_title.clone(),
-                        sub: "桌面新增 · 实时同步".into(),
+                        sub: format!("{cat_label} · 桌面新增"),
                     },
                 );
-                self.status = format!("已写入 Amoo 记忆：{new_title}");
+                self.amoo_bm25_entries = self.amoo_bm25_entries.max(self.amoo_memories.len());
+                self.status = format!("已添加个人记忆：「{new_title}」");
             }
             Action::AmooUseMemory(mem) => {
                 self.fields[F_AMOO].set(&format!("结合我的偏好「{mem}」，帮我安排："));
@@ -939,6 +1149,7 @@ impl Companion {
             }
             Action::AmooToggleSkillManage => {
                 self.amoo_skill_manage = !self.amoo_skill_manage;
+                self.trigger_subtab_switch();
                 self.status = if self.amoo_skill_manage {
                     "已进入技能管理模式：点击下方技能胶囊可启用或停用".into()
                 } else {
@@ -1043,8 +1254,10 @@ impl Companion {
             }
             Action::AmooToggleDetails => {
                 self.amoo_show_details = !self.amoo_show_details;
+                self.trigger_subtab_switch();
             }
             Action::AmooToggleSchedules => {
+                self.trigger_subtab_switch();
                 self.amoo_show_schedules = !self.amoo_show_schedules;
                 self.amoo_ui.album_path = None;
                 self.scroll = Default::default();
@@ -1111,9 +1324,11 @@ impl Companion {
                 }
             }
             Action::PhoneFilterMissed(missed) => {
+                self.motion_started = Instant::now();
                 self.call_filter_missed = *missed;
             }
             Action::PhoneSelectContact(idx) => {
+                self.motion_started = Instant::now();
                 self.pending_call = None;
                 self.selected_contact = *idx;
                 if let Some(c) = self.filtered_contacts().get(*idx) {
@@ -1136,12 +1351,89 @@ impl Companion {
                 self.pending_call = None;
                 self.fields[F_PHONE_DIAL].clear();
             }
+            Action::PhoneDialNumber(number) => {
+                self.motion_started = Instant::now();
+                self.pending_call = None;
+                self.fields[F_PHONE_DIAL].set(number);
+                self.page = Page::Phone;
+                self.focus_field(F_PHONE_DIAL, ctx);
+                self.status = format!("已填入号码 {number}，可直接呼叫");
+            }
             Action::PhoneSmsTo(number) => {
+                self.motion_started = Instant::now();
+                self.push.im_channel = stepx_companion::push::ImChannel::Sms;
+                self.push.selected_im_thread = Some(String::new());
+                self.pending_sms_plan = None;
                 self.fields[F_SMS_TO].set(number);
                 self.selected_thread = Some(number.clone());
                 self.page = Page::Sms;
                 self.focus_field(F_SMS_BODY, ctx);
                 self.status = format!("正在向 {number} 编写短信");
+            }
+            Action::FillDetectedPhoneIp(ip) => {
+                let endpoint = if ip.contains(':') {
+                    ip.clone()
+                } else {
+                    format!("{ip}:5555")
+                };
+                self.fields[F_PAIR_ADDR].set(&endpoint);
+                self.fields[F_CONNECT].set(&endpoint);
+                self.status = format!("已填入检测到的手机局域网地址：{endpoint}");
+                self.error = false;
+            }
+            Action::QuickGuiScenario { app, goal } => {
+                self.motion_started = Instant::now();
+                self.page = Page::Amoo;
+                self.handle_amoo_ui_action(&AmooUiAction::GuiMode(true));
+                self.fields[F_AMOO_GUI_APP].set(app);
+                self.fields[F_AMOO].set(goal);
+                if self.selected.is_some() && !self.amoo_ui.gui_running && !goal.trim().is_empty() {
+                    self.send_amoo_draft();
+                } else {
+                    self.focus_field(F_AMOO, ctx);
+                    self.status = format!("已填入手机操控指令「{goal}」，点击执行即可开始");
+                }
+            }
+            Action::ScreenshotToBackScreen => {
+                if let Some((_, path)) = &self.screenshot {
+                    let path = path.clone();
+                    if let Err(err) = self.back_screen.apply_image(path, "手机屏幕截图") {
+                        self.error = true;
+                        self.status = format!("截图转背屏点阵失败：{err:#}");
+                    } else {
+                        self.back_screen.tab = 2;
+                        self.page = Page::BackScreen;
+                        self.error = false;
+                        self.status = "已将手机截图载入背屏点阵工坊".into();
+                    }
+                }
+            }
+            Action::RevealLocalPath(path) => match work_state::reveal_in_folder(path) {
+                Ok(()) => {
+                    self.error = false;
+                    self.status = format!("已在文件夹中显示：{}", path.display());
+                }
+                Err(err) => {
+                    self.error = true;
+                    self.status = format!("无法打开所在文件夹：{err}");
+                }
+            },
+            Action::SendToAmoo(prompt) => {
+                self.set_compact_mode(ShellMode::Full, ctx);
+                self.page = Page::Amoo;
+                self.workspace.sub_view = 0;
+                self.workspace.panel = 0;
+                self.workspace.proposal = None;
+                self.fields[F_AMOO].set(prompt);
+                self.focus_field(F_AMOO, ctx);
+                self.status = "已将内容带入 Amoo 对话，按 Enter 即可发送".into();
+                self.error = false;
+            }
+            Action::EditUserMessage(text) => {
+                self.fields[F_AMOO].set(text);
+                self.focus_field(F_AMOO, ctx);
+                self.status = "已将消息填入输入框，可修改后重新发送".into();
+                self.error = false;
             }
             Action::Insert(_)
             | Action::Preedit(_)
@@ -1197,6 +1489,74 @@ impl Companion {
                 self.error = false;
                 self.tools_feedback = Some((Some(ToolPage::Screen), self.status.clone(), false));
             }
+            Action::ToggleLiveScreenStream => {
+                self.live_screen_stream = !self.live_screen_stream;
+                self.last_live_screen_poll = Instant::now() - Duration::from_secs(10);
+                self.status = if self.live_screen_stream {
+                    "已开启内嵌屏幕实时连拍同步（可在桌面直接点按屏幕操控手机）".into()
+                } else {
+                    "已暂停内嵌屏幕实时连拍同步".into()
+                };
+                self.error = false;
+            }
+            Action::SetMirrorQuality(q) => {
+                self.mirror_options.quality = (*q).min(2);
+                let label = match self.mirror_options.quality {
+                    0 => "720P 流畅 (30帧 · 4Mbps)",
+                    1 => "1080P 高清 (60帧 · 8Mbps)",
+                    _ => "原画超清 (120帧 · 16Mbps)",
+                };
+                self.status = format!("已切换独立投屏画质档位：{label}");
+                self.error = false;
+            }
+            Action::ToggleMirrorAlwaysOnTop => {
+                self.mirror_options.always_on_top = !self.mirror_options.always_on_top;
+                self.status = format!(
+                    "投屏窗口始终置顶：{}",
+                    if self.mirror_options.always_on_top {
+                        "已开启"
+                    } else {
+                        "已关闭"
+                    }
+                );
+                self.error = false;
+            }
+            Action::ToggleMirrorTurnScreenOff => {
+                self.mirror_options.turn_screen_off = !self.mirror_options.turn_screen_off;
+                self.status = format!(
+                    "投屏时手机息屏省电：{}",
+                    if self.mirror_options.turn_screen_off {
+                        "已开启"
+                    } else {
+                        "已关闭"
+                    }
+                );
+                self.error = false;
+            }
+            Action::ToggleMirrorStayAwake => {
+                self.mirror_options.stay_awake = !self.mirror_options.stay_awake;
+                self.status = format!(
+                    "投屏期间保持手机常亮：{}",
+                    if self.mirror_options.stay_awake {
+                        "已开启"
+                    } else {
+                        "已关闭"
+                    }
+                );
+                self.error = false;
+            }
+            Action::ToggleMirrorShowTouches => {
+                self.mirror_options.show_touches = !self.mirror_options.show_touches;
+                self.status = format!(
+                    "投屏显示触控点轨迹：{}",
+                    if self.mirror_options.show_touches {
+                        "已开启"
+                    } else {
+                        "已关闭"
+                    }
+                );
+                self.error = false;
+            }
             Action::SaveScreenshot => self.save_screenshot(),
             Action::AmooSelectModel(idx) => {
                 self.amoo_model_idx = *idx;
@@ -1231,6 +1591,7 @@ impl Companion {
             }
             Action::AmooToggleExpressCard => {
                 self.amoo_express_open = !self.amoo_express_open;
+                self.error = false;
                 self.status = if self.amoo_express_open {
                     "已展开 PC 端快递速查与取件码卡片".into()
                 } else {
@@ -1239,6 +1600,7 @@ impl Companion {
             }
             Action::AmooQueryExpress => {
                 self.amoo_express_open = true;
+                self.error = false;
                 if let Some(pos) = self
                     .amoo_sessions
                     .iter()
@@ -1246,9 +1608,30 @@ impl Companion {
                 {
                     self.amoo_session_idx = pos;
                 }
-                self.status =
-                    "已从手机 Amoo「快递物流查询」与短信提取 2 件待取包裹（取件码 4-2-1086 / 顺丰 SF14298019283）"
-                        .into();
+                if self.demo_mode {
+                    self.status =
+                        "已从手机 Amoo「快递物流查询」与短信提取 2 件待取包裹（取件码 4-2-1086 / 顺丰 SF14298019283）"
+                            .into();
+                } else {
+                    let codes: Vec<String> = self
+                        .sms
+                        .iter()
+                        .filter_map(|m| pages::sms::extract_pickup_code(&m.body))
+                        .take(3)
+                        .collect();
+                    if !codes.is_empty() {
+                        self.status = format!(
+                            "已从手机短信提取 {} 件待取包裹（取件码 {}）",
+                            codes.len(),
+                            codes.join(" / ")
+                        );
+                    } else {
+                        self.fields[F_AMOO].set("请帮我汇总最近的快递物流与驿站取件码");
+                        self.focus_field(F_AMOO, ctx);
+                        self.status =
+                            "已填入快递查询指令，按 Enter 即可向 Amoo 发起物流与取件码汇总".into();
+                    }
+                }
             }
             Action::AmooTogglePcControl => {
                 self.amoo_pc_control_enabled = !self.amoo_pc_control_enabled;
@@ -1327,6 +1710,26 @@ impl Companion {
                 }
                 Some(F_STUDIO_NAME) | Some(F_STUDIO_URL) => Action::Studio(StudioAction::Save),
                 Some(F_PHONE_DIAL) => Action::PhoneCall(self.fields[F_PHONE_DIAL].text.clone()),
+                Some(F_CALENDAR_TIME) => {
+                    self.handle_backscreen_action(
+                        &BackScreenAction::CalendarCreateOnSelectedDate(None),
+                        ctx,
+                    );
+                    return None;
+                }
+                Some(F_ALARM_TIME) => {
+                    self.handle_backscreen_action(&BackScreenAction::AlarmCreateCustom, ctx);
+                    return None;
+                }
+                Some(F_PHONE_SCHEDULE_TITLE) => {
+                    let act = if self.page == Page::Alarms {
+                        BackScreenAction::AlarmCreateCustom
+                    } else {
+                        BackScreenAction::CalendarCreateOnSelectedDate(None)
+                    };
+                    self.handle_backscreen_action(&act, ctx);
+                    return None;
+                }
                 Some(F_IM_REPLY) => {
                     self.handle_push_action(&PushAction::SendImReply, ctx);
                     return None;
@@ -1419,6 +1822,14 @@ impl Companion {
                 }
                 Page::Account => Action::AmooUi(AmooUiAction::RefreshUsage),
                 Page::Amoo => Action::AmooSnapshot,
+                Page::Calendar | Page::Schedule | Page::Alarms => {
+                    self.handle_backscreen_action(&BackScreenAction::InspectStepOsSuite, ctx);
+                    return None;
+                }
+                Page::Gallery => {
+                    self.handle_backscreen_action(&BackScreenAction::GalleryRefresh, ctx);
+                    return None;
+                }
                 Page::Work => {
                     self.refresh_work();
                     return None;
@@ -1442,15 +1853,36 @@ impl Companion {
                     Some(ToolPage::Companion) => Action::CompanionInspect,
                     Some(ToolPage::Neo) => Action::NeoInspect,
                     Some(ToolPage::Services) => Action::InspectServices,
+                    Some(ToolPage::Screen) => Action::Screenshot,
                     Some(ToolPage::Device) => Action::Summary,
                     _ => return None,
                 },
             },
             Action::ActivateSelectedFile => {
-                if self.page != Page::Files || self.focus.is_some() {
+                if self.focus.is_some() {
                     return None;
                 }
-                return self.selected_file.and_then(|i| self.activate_file(i));
+                if self.page == Page::Gallery {
+                    if let Some(item) = self
+                        .back_screen
+                        .gallery_items
+                        .get(self.back_screen.gallery_selected)
+                        .cloned()
+                    {
+                        self.handle_backscreen_action(
+                            &BackScreenAction::GalleryOpenOnDesktop(item.remote_path),
+                            ctx,
+                        );
+                    }
+                    return None;
+                }
+                if self.page != Page::Files {
+                    return None;
+                }
+                let sel = self
+                    .selected_file
+                    .or_else(|| self.visible_real_files().first().map(|(i, _)| *i));
+                return sel.and_then(|i| self.activate_file(i));
             }
             Action::ActivateFile(i) => return self.activate_file(*i),
             Action::DownloadFile(i) => {

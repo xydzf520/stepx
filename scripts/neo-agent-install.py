@@ -177,13 +177,24 @@ class Installer:
         if self.receipt.is_file():
             try: recovery = json.loads(self.receipt.read_text()).get('phase') != 'restored'
             except (ValueError, OSError): recovery = True
-        runtime_available = self.has_embedded_runtime() if path else False
+        runtime_available = False
+        signature_verified = False
+        if path:
+            with tempfile.TemporaryDirectory(prefix='stepx-embedded-inspect-') as temp:
+                local = Path(temp) / 'base.apk'
+                run(self.adb + ['pull', path, local])
+                runtime_available = embedded_runtime(apk_manifest(local))
+                if verify:
+                    actual, cert = apk_identity(local)
+                    if actual != PACKAGE:
+                        raise RuntimeError('手机 APK 包名不匹配')
+                    signature_verified = cert is not None
         out = {'checked': True, 'companion_installed': bool(path), 'installed': runtime_available, 'version': version.group(1).strip() if version else '',
                'accessibility_enabled': contains(self.setting('enabled_accessibility_services'), ACCESS),
                'ime_enabled': contains(self.setting('enabled_input_methods'), IME), 'doze_exempt': self.doze(),
                'oem_freezer_exempt': self.freezer(), 'recovery_available': recovery}
         if verify and path:
-            out['signature_verified'] = self.installed_cert(PACKAGE) is not None
+            out['signature_verified'] = signature_verified
         return out
 
     def save(self, value):

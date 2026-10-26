@@ -61,6 +61,12 @@ impl Companion {
         action: &Action,
         ctx: &mut ViewContext<Self>,
     ) -> bool {
+        if matches!(action, Action::QuitApplication) {
+            self.cancel_review_state();
+            self.interaction.review = None;
+            self.interaction.history_open = false;
+            return false;
+        }
         if self.interaction.approved {
             self.interaction.approved = false;
             return false;
@@ -129,7 +135,6 @@ impl Companion {
                     | Action::Forget
                     | Action::SetPreferredDevice(_)
                     | Action::CloseWindow
-                    | Action::QuitApplication
             )
         {
             self.status = "正在确认手机迁移设置，请稍后再切换或退出".into();
@@ -151,7 +156,6 @@ impl Companion {
                 | Action::OpenTool(_)
                 | Action::Studio(StudioAction::Tab(_))
                 | Action::CloseWindow
-                | Action::QuitApplication
                 | Action::Push(
                     PushAction::SetShellMode(_)
                         | PushAction::OpenMiniAiWindow

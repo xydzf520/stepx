@@ -1,13 +1,32 @@
-//! Amoo Work: task execution with a persistent deliverables and preview pane.
+//! 文件处理页（Page::Work）：用工作文件夹里的文件干活，带结果预览。
+//! 只作为次要入口，从「我的作品」或成果卡进入；主入口是 Amoo 对话。
 use super::super::{
     amoo_display::session_title, icons::UiIcon, theme::*, widgets::*, Action, AmooChatItem,
     Companion, Page, WorkAction, F_WORK_AGENT_NAME, F_WORK_CAP_SEARCH, F_WORK_PROMPT,
     F_WORK_SEARCH,
 };
-use facloud_ui::{elements::*, fonts::Weight, platform::Cursor};
+use facloud_ui::{color::ColorU, elements::*, fonts::Weight, platform::Cursor};
 use pathfinder_geometry::vector::vec2f;
 use std::collections::HashSet;
 use stepx_companion::storage::format_bytes;
+
+fn mix_color(a: ColorU, b: ColorU, t: f32) -> ColorU {
+    let t = t.clamp(0.0, 1.0);
+    if t <= 0.0 {
+        return a;
+    }
+    if t >= 1.0 {
+        return b;
+    }
+    let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    if a.a == 0 {
+        return ColorU::new(b.r, b.g, b.b, mix(0, b.a));
+    }
+    if b.a == 0 {
+        return ColorU::new(a.r, a.g, a.b, mix(a.a, 0));
+    }
+    ColorU::new(mix(a.r, b.r), mix(a.g, b.g), mix(a.b, b.b), mix(a.a, b.a))
+}
 
 // Shared with the desktop harness, including mixed protocol + Markdown replies.
 fn work_message_text(text: &str, user: bool) -> Option<String> {
@@ -32,26 +51,36 @@ fn compact_work_text(text: &str, max: usize) -> String {
     }
 }
 
-fn work_step_name(name: &str) -> &str {
+pub(crate) fn work_step_name(name: &str) -> &str {
     match name {
         "exec" | "system.run" | "stepclaw.exec" => "执行任务步骤",
         "ability" | "ability.call" => "调用手机能力",
-        "list_files" => "查看工作资料",
-        "read_file" => "阅读资料",
+        "list_files" => "浏览目录结构",
+        "read_file" => "读取文件内容",
         "csv_summary" => "分析表格数据",
-        "write_file" => "保存工作成果",
+        "write_file" => "写入文件内容",
+        "search_files" => "检索工作区文件",
+        "web_search" => "联网搜索资料",
+        "fetch_page" => "抓取网页正文",
         "task_create" | "sessions_spawn" => "创建子任务",
         "text_to_image" => "生成图片",
+        "write_document" => "撰写 Word 文档",
         "create_document" => "生成文档",
         "edit_document" => "修订文档",
         "edit_text" => "修改文件",
+        "write_spreadsheet" => "生成 Excel 表格",
         "create_spreadsheet" => "生成表格",
-        "create_presentation" | "write_presentation" => "制作演示文稿",
+        "write_presentation" => "制作 PPT 演示稿",
+        "create_presentation" => "制作演示文稿",
         _ => name,
     }
 }
 
 impl Companion {
+    pub(in super::super) fn work_step_name(name: &str) -> &str {
+        work_step_name(name)
+    }
+
     fn work_button(&self, id: &str, label: &str, action: WorkAction, kind: Btn) -> El {
         self.button(format!("work-{id}"), label, Action::Work(action), kind)
     }
@@ -67,9 +96,28 @@ impl Companion {
         let label = label.into();
         Hoverable::new(self.mouse_state(id.into()), move |mouse| {
             let hovered = mouse.is_mouse_over_element();
+            let t = if self.settings.value.reduced_motion {
+                if hovered {
+                    1.0
+                } else {
+                    0.0
+                }
+            } else {
+                mouse.hover_progress().clamp(0.0, 1.0)
+            };
+            let bg = if mouse.is_clicked() {
+                p.accent_soft
+            } else {
+                mix_color(p.bg, p.hover, t)
+            };
+            let fg = if mouse.is_clicked() || hovered {
+                p.text
+            } else {
+                mix_color(p.text2, p.text, t)
+            };
             let button = ConstrainedBox::new(
-                Container::new(Align::new(self.ui_icon(icon, 16., p.text2)).finish())
-                    .with_background_color(if hovered { p.hover } else { p.bg })
+                Container::new(Align::new(self.ui_icon(icon, 16., fg)).finish())
+                    .with_background_color(bg)
                     .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
                     .finish(),
             )
@@ -111,9 +159,15 @@ impl Companion {
                 self.work_button("refresh", "同步手机", WorkAction::Refresh, Btn::Secondary)
             },
             if self.busy || self.work.running {
-                self.disabled_button("+ 新建工作")
+                self.disabled_button("新建工作")
             } else {
-                self.work_button("new", "+ 新建工作", WorkAction::NewChat, Btn::Primary)
+                self.button_icon(
+                    "work-new",
+                    "新建工作",
+                    UiIcon::Plus,
+                    Action::Work(WorkAction::NewChat),
+                    Btn::Primary,
+                )
             },
         ]
     }
@@ -142,7 +196,7 @@ impl Companion {
             {
                 continue;
             }
-            let active = self.amoo_session_idx == index;
+            let active = self.work_session_index() == Some(index);
             let pending = self.amoo_pending_reply.contains_key(&session.session_key);
             let title = session_title(&session.title);
             let subtitle = if pending {
@@ -161,20 +215,32 @@ impl Companion {
                 Hoverable::new(
                     self.mouse_state(format!("work-session-{index}")),
                     move |mouse| {
+                        let hovered = mouse.is_mouse_over_element();
+                        let t = if self.settings.value.reduced_motion {
+                            if hovered {
+                                1.0
+                            } else {
+                                0.0
+                            }
+                        } else {
+                            mouse.hover_progress().clamp(0.0, 1.0)
+                        };
+                        let bg = if mouse.is_clicked() {
+                            p.accent_soft
+                        } else if active {
+                            mix_color(p.selected, p.hover, t * 0.5)
+                        } else {
+                            mix_color(p.bg, p.hover, t)
+                        };
+                        let border = if active || mouse.is_clicked() {
+                            p.border_strong
+                        } else {
+                            mix_color(p.border, p.border_strong, t)
+                        };
                         Container::new(row)
                             .with_uniform_padding(S3)
-                            .with_background_color(if active {
-                                p.selected
-                            } else if mouse.is_mouse_over_element() {
-                                p.hover
-                            } else {
-                                p.bg
-                            })
-                            .with_border(Border::all(1.).with_border_color(if active {
-                                p.border_strong
-                            } else {
-                                p.border
-                            }))
+                            .with_background_color(bg)
+                            .with_border(Border::all(1.).with_border_color(border))
                             .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
                             .finish()
                     },
@@ -202,19 +268,24 @@ impl Companion {
                 .with_main_axis_size(MainAxisSize::Max)
                 .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
                 .with_spacing(S3)
-                .with_child(self.work_title(UiIcon::Tools, "工作记录"))
+                .with_child(self.work_title(UiIcon::Tools, "处理记录"))
                 .with_child(self.input(F_WORK_SEARCH, "搜索工作与会话…", None))
                 .with_child(
                     Expanded::new(
                         1.,
-                        self.pane_scroll(self.scroll_aux.clone(), self.vstack(S2, rows)),
+                        self.pane_scroll(
+                            self.scroll_aux.clone(),
+                            Container::new(self.vstack(S2, rows))
+                                .with_padding_bottom(S3)
+                                .finish(),
+                        ),
                     )
                     .finish(),
                 )
                 .with_child(self.text("后台连接手机 Amoo，无需唤起手机界面。", MICRO, p.text3))
                 .finish(),
         )
-        .with_uniform_padding(S3)
+        .with_uniform_padding(S4)
         .with_background_color(p.sidebar)
         .with_border(Border::right(1.).with_border_color(p.border))
         .finish()
@@ -225,49 +296,67 @@ impl Companion {
         if let AmooChatItem::Attachment {
             name,
             kind,
+            url,
+            path,
             size_bytes,
             ..
         } = item
         {
-            return self.panel(vec![self.between(
-                self.hstack(
-                    S2,
-                    vec![
-                        self.ui_icon(
-                            if kind == "image" {
-                                UiIcon::Image
-                            } else {
-                                UiIcon::File
-                            },
-                            18.,
-                            p.text2,
-                        ),
-                        Expanded::new(
-                            1.,
-                            self.vstack(
-                                S1,
-                                vec![
-                                    self.line_w(name, BODY, p.text, Weight::Medium),
-                                    self.line(
-                                        size_bytes
-                                            .map(format_bytes)
-                                            .unwrap_or_else(|| "手机任务附件".into()),
-                                        MICRO,
-                                        p.text3,
-                                    ),
-                                ],
+            return self.hover_panel_interactive(
+                format!("work-chat-att-{index}"),
+                self.between(
+                    self.hstack(
+                        S2,
+                        vec![
+                            self.ui_icon(
+                                if kind == "image" {
+                                    UiIcon::Image
+                                } else {
+                                    UiIcon::File
+                                },
+                                18.,
+                                p.text2,
                             ),
-                        )
-                        .finish(),
-                    ],
+                            Expanded::new(
+                                1.,
+                                self.vstack(
+                                    S1,
+                                    vec![
+                                        self.line_w(name, BODY, p.text, Weight::Medium),
+                                        self.line(
+                                            size_bytes
+                                                .map(format_bytes)
+                                                .unwrap_or_else(|| "手机任务附件".into()),
+                                            MICRO,
+                                            p.text3,
+                                        ),
+                                    ],
+                                ),
+                            )
+                            .finish(),
+                        ],
+                    ),
+                    self.work_button(
+                        &format!("preview-result-{index}"),
+                        "预览",
+                        WorkAction::PreviewRemote(index),
+                        Btn::Secondary,
+                    ),
                 ),
-                self.work_button(
-                    &format!("preview-result-{index}"),
-                    "预览",
-                    WorkAction::PreviewRemote(index),
-                    Btn::Secondary,
-                ),
-            )]);
+                Some(Action::Work(WorkAction::PreviewRemote(index))),
+                Some(if !path.is_empty() {
+                    Action::Work(WorkAction::OpenPreview(path.clone()))
+                } else if !url.is_empty() {
+                    Action::StudioOpenUrl(url.clone())
+                } else {
+                    Action::Work(WorkAction::PreviewRemote(index))
+                }),
+                Some(crate::ui::context_menu::Target::ChatAttachment {
+                    path: path.clone(),
+                    url: url.clone(),
+                    remove_idx: None,
+                }),
+            );
         }
         if let AmooChatItem::ToolRecords { key, records } = item {
             let expanded = self.amoo_expanded_tool_records.contains(key);
@@ -279,13 +368,14 @@ impl Companion {
                 }
             }
             let mut children = vec![self.between(
-                self.button(
+                self.button_icon(
                     format!("work-records-{key}"),
-                    format!(
-                        "{} 执行过程 · {} 步",
-                        if expanded { "▾" } else { "›" },
-                        records.len()
-                    ),
+                    format!("执行过程 · {} 步", records.len()),
+                    if expanded {
+                        UiIcon::ChevronDown
+                    } else {
+                        UiIcon::ChevronRight
+                    },
                     Action::AmooToggleToolRecords(key.clone()),
                     Btn::Ghost,
                 ),
@@ -380,7 +470,10 @@ impl Companion {
         }
         if !user && !body.is_empty() {
             meta.push(self.speech_icon(
-                format!("work-speech:{}:{index}", self.amoo_session_idx),
+                format!(
+                    "work-speech:{}:{index}",
+                    self.work_session_index().unwrap_or(usize::MAX)
+                ),
                 body.clone(),
             ));
         }
@@ -443,12 +536,13 @@ impl Companion {
         }
         let is_empty = field.text.is_empty() && field.preedit.is_empty();
         if value.is_empty() {
-            value = if self.work.mode == 2 {
-                "描述要生成的图片，可添加参考图、指定风格与尺寸…"
+            value = if let Some(hint) = &self.work.revise_hint {
+                hint.clone()
+            } else if self.work.mode == 2 {
+                "描述要生成的图片，可添加参考图、指定风格与尺寸…".into()
             } else {
-                "描述要完成的工作，可附上文件、目标和交付要求…"
-            }
-            .into();
+                "描述要处理的事情，可以附上文件…".into()
+            };
         }
         Hoverable::new(self.mouse_state("work-prompt"), move |_| {
             ConstrainedBox::new(
@@ -482,10 +576,68 @@ impl Companion {
         .finish()
     }
 
+    fn work_office_quick_bar(&self) -> El {
+        let p = self.p();
+        let starters = [
+            (0u8, "Word 方案.docx"),
+            (1u8, "Excel 财务表.xlsx"),
+            (2u8, "PPT 汇报.pptx"),
+            (3u8, "调研报告.md"),
+            (4u8, "做小游戏"),
+        ];
+        self.panel(vec![
+            self.between(
+                self.hstack(
+                    S2,
+                    vec![
+                        self.ui_icon(UiIcon::Bolt, 15., p.accent),
+                        self.line_w("生成示例文件", CAPTION, p.text, Weight::Semibold),
+                    ],
+                ),
+                self.line("保存在工作文件夹里，可以修改或发到手机", MICRO, p.text3),
+            ),
+            self.wrap(
+                starters
+                    .iter()
+                    .map(|(idx, label)| {
+                        self.work_button(
+                            &format!("quick-starter-{idx}"),
+                            label,
+                            WorkAction::QuickStarter(*idx),
+                            Btn::Secondary,
+                        )
+                    })
+                    .collect(),
+            ),
+            self.hstack(
+                S2,
+                vec![
+                    self.ui_icon(UiIcon::Star, 14., p.text2),
+                    self.line("或者让 Amoo 按你的资料来做：", MICRO, p.text2),
+                ],
+            ),
+            self.wrap(
+                WORK_SCENARIOS
+                    .iter()
+                    .enumerate()
+                    .map(|(index, name)| {
+                        self.work_button(
+                            &format!("template-{index}"),
+                            name,
+                            WorkAction::Template(index as u8),
+                            Btn::Ghost,
+                        )
+                    })
+                    .collect(),
+            ),
+        ])
+    }
+
     fn work_conversation_pane(&self) -> El {
         let p = self.p();
-        let session = self.amoo_sessions.get(self.amoo_session_idx);
-        let mut stream = Vec::new();
+        // 文件处理页使用自己的会话，不显示 Amoo 当前对话。
+        let session = self.work_session();
+        let mut stream = vec![self.work_office_quick_bar()];
         if let Some(session) = session.filter(|s| !s.items.is_empty()) {
             stream.extend(
                 session
@@ -496,38 +648,25 @@ impl Companion {
             );
         } else {
             stream.push(self.panel(vec![
-                    self.work_title(UiIcon::Tools, "今天想完成什么工作？"),
-                    self.text(
-                        "添加资料，说明目标和交付格式。Amoo 会逐步处理，并把成果文件放在右侧。",
-                        BODY,
-                        p.text2,
-                    ),
-                    self.wrap(
-                        WORK_SCENARIOS
-                            .iter()
-                            .enumerate()
-                            .map(|(index, name)| {
-                                self.work_button(
-                                    &format!("template-{index}"),
-                                    name,
-                                    WorkAction::Template(index as u8),
-                                    Btn::Secondary,
-                                )
-                            })
-                            .collect(),
-                    ),
-                ]));
+                self.work_title(UiIcon::Tools, "要处理哪些文件？"),
+                self.text(
+                    "这里用工作文件夹里的文件干活。平时直接在 Amoo 对话里说需求就行，做好的文件也会出现在对话里。",
+                    BODY,
+                    p.text2,
+                ),
+            ]));
         }
         if !self.work.events.is_empty() {
             let key = "amoo-work-desktop-events";
             let expanded = self.amoo_expanded_tool_records.contains(key);
-            let mut events = vec![self.button(
+            let mut events = vec![self.button_icon(
                 "work-desktop-events",
-                format!(
-                    "{} 工作过程 · {} 条记录",
-                    if expanded { "▾" } else { "›" },
-                    self.work.events.len()
-                ),
+                format!("工作过程 · {} 条记录", self.work.events.len()),
+                if expanded {
+                    UiIcon::ChevronDown
+                } else {
+                    UiIcon::ChevronRight
+                },
                 Action::AmooToggleToolRecords(key.into()),
                 Btn::Ghost,
             )];
@@ -617,13 +756,13 @@ impl Companion {
                 self.wrap(vec![
                     self.work_button(
                         "attach-image",
-                        "🖼 上传本地图片",
+                        "上传图片",
                         WorkAction::AttachImages,
                         Btn::Ghost,
                     ),
                     self.work_button(
                         "attach-document",
-                        "📎 添加文档与附件",
+                        "添加文件",
                         WorkAction::Attach,
                         Btn::Ghost,
                     ),
@@ -691,37 +830,58 @@ impl Companion {
         let needs_workspace = self.work.mode == 1 && self.work.workspace.is_none();
         let phone_pending =
             session.is_some_and(|s| self.amoo_pending_reply.contains_key(&s.session_key));
+        let local_model_ready = self.studio_lab.config.has_key
+            && !self.studio_lab.config.endpoint.trim().is_empty()
+            && !self.studio_lab.config.model.trim().is_empty();
+        let backend_ready = self.selected.is_some() || (self.work.mode == 1 && local_model_ready);
         let can_send = !self.work.running
             && !phone_pending
             && !self.busy
-            && self.selected.is_some()
-            && !needs_workspace
+            && backend_ready
             && !self.fields[F_WORK_PROMPT].text.trim().is_empty();
-        let mut composer_actions = vec![self.work_button(
-            "attach",
+        let mut composer_actions = vec![self.button_icon(
+            "work-attach",
             if self.work.attach_menu_open {
-                "× 收起附件"
+                "收起附件"
             } else {
-                "+ 添加文件"
+                "添加文件"
             },
-            WorkAction::ToggleAttachMenu,
+            if self.work.attach_menu_open {
+                UiIcon::Close
+            } else {
+                UiIcon::Plus
+            },
+            Action::Work(WorkAction::ToggleAttachMenu),
             Btn::Ghost,
         )];
-        if needs_workspace {
+        if needs_workspace && self.work.panel != 2 {
             composer_actions.push(self.work_button(
                 "composer-workspace",
-                "选择工作文件夹",
+                "选择文件夹",
                 WorkAction::ChooseWorkspace,
-                Btn::Secondary,
+                Btn::Ghost,
             ));
         }
         composer_actions.push(
             Expanded::new(
                 1.,
-                self.line("Enter 发送 · Shift+Enter 换行", MICRO, p.text3),
+                self.line(
+                    if needs_workspace {
+                        "没选文件夹时用默认工作文件夹，也可以改用「用手机处理」 · Enter 发送"
+                    } else {
+                        "Enter 发送 · Shift+Enter 换行"
+                    },
+                    MICRO,
+                    p.text3,
+                ),
             )
             .finish(),
         );
+        let primary_label = if self.work.mode == 2 {
+            "生成图片"
+        } else {
+            "开始处理"
+        };
         composer_actions.push(if self.work.running {
             self.work_button("cancel", "停止任务", WorkAction::Cancel, Btn::Secondary)
         } else if phone_pending {
@@ -732,25 +892,14 @@ impl Companion {
                 Btn::Secondary,
             )
         } else if can_send {
-            self.work_button(
-                "send",
-                if self.work.mode == 2 {
-                    "生成图片"
-                } else {
-                    "开始工作"
-                },
-                WorkAction::Send,
-                Btn::Primary,
-            )
+            self.work_button("send", primary_label, WorkAction::Send, Btn::Primary)
         } else {
-            self.disabled_button(if self.selected.is_none() {
+            self.disabled_button(if !backend_ready {
                 "请连接手机"
-            } else if needs_workspace {
-                "请选择文件夹"
-            } else if self.fields[F_WORK_PROMPT].text.trim().is_empty() {
-                "开始工作"
-            } else {
+            } else if self.busy {
                 "正在同步"
+            } else {
+                primary_label
             })
         });
         composer.push(self.hstack(S2, composer_actions));
@@ -770,7 +919,7 @@ impl Companion {
                         if self.work.running || phone_pending {
                             "进行中"
                         } else {
-                            "工作台"
+                            "文件处理"
                         },
                         if self.work.running || phone_pending {
                             p.success
@@ -783,17 +932,17 @@ impl Companion {
                     "work-mode",
                     vec![
                         (
-                            "手机处理".into(),
+                            "用手机处理".into(),
                             self.work.mode == 0,
                             Action::Work(WorkAction::Mode(0)),
                         ),
                         (
-                            "桌面协作".into(),
+                            "用电脑处理".into(),
                             self.work.mode == 1,
                             Action::Work(WorkAction::Mode(1)),
                         ),
                         (
-                            "图片创作".into(),
+                            "生成图片".into(),
                             self.work.mode == 2,
                             Action::Work(WorkAction::Mode(2)),
                         ),
@@ -805,7 +954,11 @@ impl Companion {
             header,
             Expanded::new(
                 1.,
-                self.chat_scroll(self.selectable_messages(self.vstack(S3, stream))),
+                self.chat_scroll(
+                    Container::new(self.selectable_messages(self.vstack(S3, stream)))
+                        .with_padding_bottom(S3)
+                        .finish(),
+                ),
             )
             .finish(),
             Container::new(self.vstack(S2, composer))
@@ -830,8 +983,9 @@ impl Companion {
                 .with_children(children)
                 .finish(),
         )
-        .with_horizontal_padding(S4)
-        .with_vertical_padding(S4)
+        .with_horizontal_padding(S5)
+        .with_padding_top(S4)
+        .with_padding_bottom(S5)
         .finish()
     }
 
@@ -839,8 +993,7 @@ impl Companion {
         let p = self.p();
         let mut seen = HashSet::new();
         let remote_files: Vec<_> = self
-            .amoo_sessions
-            .get(self.amoo_session_idx)
+            .work_session()
             .into_iter()
             .flat_map(|session| session.items.iter().enumerate())
             .filter(|(_, item)| match item {
@@ -853,13 +1006,47 @@ impl Companion {
             .collect();
         let mut items = vec![self.between(
             self.work_title(UiIcon::File, "成果预览"),
-            self.work_action_icon(
-                "work-preview-hide",
-                "收起预览",
-                UiIcon::Close,
-                Action::Work(WorkAction::Panel(2)),
-            ),
+            if self.work.local_preview.is_some() {
+                self.work_button(
+                    "preview-close",
+                    "关闭文件",
+                    WorkAction::ClosePreview,
+                    Btn::Ghost,
+                )
+            } else {
+                Empty::new().finish()
+            },
         )];
+        if !self.work.artifacts.is_empty() || !self.work.files.is_empty() {
+            let pills: Vec<El> = self
+                .work
+                .artifacts
+                .iter()
+                .enumerate()
+                .take(6)
+                .map(|(i, artifact)| {
+                    let active = self
+                        .work
+                        .local_preview
+                        .as_ref()
+                        .is_some_and(|preview| preview.path == artifact.path);
+                    let label = artifact
+                        .path
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| artifact.name.clone());
+                    self.work_button(
+                        &format!("switcher-artifact-{i}"),
+                        &label,
+                        WorkAction::PreviewArtifact(i),
+                        if active { Btn::Primary } else { Btn::Secondary },
+                    )
+                })
+                .collect();
+            if !pills.is_empty() {
+                items.push(self.wrap(pills));
+            }
+        }
         if let Some(path) = &self.work.local_preview_loading {
             items.push(self.panel(vec![
                 self.line("正在读取文件…", CAPTION, p.text2),
@@ -870,14 +1057,94 @@ impl Companion {
                 ),
             ]));
         } else if let Some(preview) = &self.work.local_preview {
+            let mut preview_actions = Vec::new();
+            if preview.image {
+                preview_actions.push(self.work_button(
+                    "preview-zoom-open",
+                    "放大查看",
+                    WorkAction::OpenPreview(preview.path.to_string_lossy().into_owned()),
+                    Btn::Primary,
+                ));
+            } else {
+                preview_actions.push(
+                    self.work_button(
+                        "preview-open",
+                        if preview
+                            .path
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .is_some_and(|e| {
+                                e.eq_ignore_ascii_case("html") || e.eq_ignore_ascii_case("htm")
+                            })
+                        {
+                            "在浏览器打开"
+                        } else {
+                            "打开文件"
+                        },
+                        WorkAction::OpenLocalPreview,
+                        Btn::Secondary,
+                    ),
+                );
+                preview_actions.push(self.work_button(
+                    "preview-revise",
+                    "让 Amoo 修改",
+                    WorkAction::ReviseFile(preview.path.clone()),
+                    Btn::Primary,
+                ));
+            }
+            preview_actions.push(self.work_button(
+                "preview-deliver-phone",
+                "发到手机",
+                WorkAction::DeliverFileToPhone(preview.path.clone()),
+                Btn::Secondary,
+            ));
+            if !preview.image {
+                preview_actions.push(self.work_button(
+                    "preview-turn-into-app",
+                    "做成应用",
+                    WorkAction::TurnIntoApp(preview.path.clone()),
+                    Btn::Secondary,
+                ));
+            } else {
+                preview_actions.push(self.work_button(
+                    "preview-open",
+                    "打开文件",
+                    WorkAction::OpenLocalPreview,
+                    Btn::Secondary,
+                ));
+            }
+            preview_actions.push(self.work_button(
+                "preview-export",
+                "另存为",
+                WorkAction::ExportLocalPreview,
+                Btn::Secondary,
+            ));
+            if let Some(text) = &preview.text {
+                preview_actions.push(self.button(
+                    "work-preview-copy-text",
+                    "复制内容",
+                    Action::CopyText(text.clone(), "已复制文件内容".into()),
+                    Btn::Ghost,
+                ));
+            }
+            preview_actions.push(self.button(
+                "work-preview-copy-path",
+                "复制路径",
+                Action::CopyText(preview.path.display().to_string(), "已复制文件路径".into()),
+                Btn::Ghost,
+            ));
             let mut content = vec![
                 self.between(
                     self.line_w(&preview.name, BODY, p.text, Weight::Semibold),
-                    self.work_button("preview-close", "×", WorkAction::ClosePreview, Btn::Ghost),
+                    self.line(format_bytes(preview.bytes), MICRO, p.text3),
                 ),
-                self.line(format_bytes(preview.bytes), MICRO, p.text3),
+                self.wrap(preview_actions),
+                self.divider(),
             ];
             if preview.image {
+                if let Some((w, h)) = cached_image_dimensions(&preview.path) {
+                    content.push(self.pill_badge(format!("{w} × {h} px"), p.text2, p.tag_bg));
+                }
                 content.push(
                     ConstrainedBox::new(
                         Image::new(
@@ -896,17 +1163,21 @@ impl Companion {
             if let Some(text) = &preview.text {
                 let key = "work-local-preview-full";
                 let expanded = self.amoo_expanded_tool_records.contains(key);
-                let long = text.chars().count() > 1400;
-                let visible = if long && !expanded {
-                    format!("{}\n\n…", text.chars().take(1400).collect::<String>())
+                let cutoff = text.char_indices().nth(4500).map(|(idx, _)| idx);
+                let long = cutoff.is_some();
+                if preview.markdown {
+                    let body = match cutoff {
+                        Some(idx) if !expanded => &text[..idx],
+                        _ => text.as_str(),
+                    };
+                    content.push(self.work_rich_text(body, "workspace-preview"));
                 } else {
-                    text.clone()
-                };
-                content.push(if preview.markdown {
-                    self.work_rich_text(&visible, "workspace-preview")
-                } else {
-                    self.text(visible, MICRO, p.text)
-                });
+                    let visible = match cutoff {
+                        Some(idx) if !expanded => format!("{}\n\n…", &text[..idx]),
+                        _ => text.clone(),
+                    };
+                    content.push(self.text(visible, MICRO, p.text));
+                }
                 if long {
                     content.push(self.link_muted(
                         "work-preview-show-full",
@@ -920,31 +1191,6 @@ impl Companion {
                 }
             }
             content.push(self.text(&preview.note, MICRO, p.text3));
-            content.push(self.wrap(vec![
-                    self.work_button(
-                        "preview-open",
-                        if preview
-                            .path
-                            .extension()
-                            .and_then(|e| e.to_str())
-                            .is_some_and(|e| {
-                                e.eq_ignore_ascii_case("html") || e.eq_ignore_ascii_case("htm")
-                            })
-                        {
-                            "↗ 在浏览器运行"
-                        } else {
-                            "↗ 打开原文件"
-                        },
-                        WorkAction::OpenLocalPreview,
-                        Btn::Secondary,
-                    ),
-                    self.work_button(
-                        "preview-export",
-                        "↓ 导出",
-                        WorkAction::ExportLocalPreview,
-                        Btn::Secondary,
-                    ),
-                ]));
             items.push(self.panel(content));
         } else if let Some(error) = &self.work.local_preview_error {
             items.push(self.panel(vec![
@@ -958,8 +1204,7 @@ impl Companion {
             ]));
         } else {
             let remote = self
-                .amoo_sessions
-                .get(self.amoo_session_idx)
+                .work_session()
                 .into_iter()
                 .flat_map(|session| session.items.iter().rev())
                 .find(|item| match item {
@@ -979,14 +1224,37 @@ impl Companion {
                 path,
             }) = remote
             {
-                items.push(self.amoo_phone_attachment_card(
-                    name,
-                    kind,
-                    mime,
-                    url,
-                    path,
-                    *size_bytes,
-                ));
+                let card =
+                    self.amoo_phone_attachment_card(name, kind, mime, url, path, *size_bytes);
+                let dbl_path = path.clone();
+                let dbl_url = url.clone();
+                let menu_path = path.clone();
+                let menu_url = url.clone();
+                items.push(
+                    Hoverable::new(self.mouse_state("work-remote-att-card"), move |_| card)
+                        .with_defer_events_to_children()
+                        .with_cursor(Cursor::PointingHand)
+                        .on_double_click(move |ctx, _, _| {
+                            if !dbl_path.is_empty() {
+                                ctx.dispatch_typed_action(Action::Work(WorkAction::OpenPreview(
+                                    dbl_path.clone(),
+                                )));
+                            } else if !dbl_url.is_empty() {
+                                ctx.dispatch_typed_action(Action::StudioOpenUrl(dbl_url.clone()));
+                            }
+                        })
+                        .on_right_click(move |ctx, _, at| {
+                            ctx.dispatch_typed_action(Action::ContextOpen(
+                                crate::ui::context_menu::Target::ChatAttachment {
+                                    path: menu_path.clone(),
+                                    url: menu_url.clone(),
+                                    remove_idx: None,
+                                },
+                                at,
+                            ));
+                        })
+                        .finish(),
+                );
             } else {
                 items.push(self.panel(vec![
                     self.ui_icon(UiIcon::Image, 30., p.text3),
@@ -1007,7 +1275,12 @@ impl Companion {
                     self.work.artifacts.len() + remote_files.len()
                 ),
             ),
-            self.work_button("files-refresh", "↻", WorkAction::RefreshFiles, Btn::Ghost),
+            self.work_button(
+                "files-refresh",
+                "刷新",
+                WorkAction::RefreshFiles,
+                Btn::Ghost,
+            ),
         ));
         if self.work.artifacts.is_empty() && remote_files.is_empty() {
             items.push(self.text("任务产生的图片、文档和表格会归集到这里。", MICRO, p.text3));
@@ -1030,7 +1303,7 @@ impl Companion {
                         .as_ref()
                         .is_some_and(|value| value == identity);
                 let cached = self.work.image_previews.contains_key(identity);
-                items.push(self.list_row(
+                items.push(self.list_row_with_menu(
                     format!("work-remote-file-{index}"),
                     self.hstack(
                         S2,
@@ -1077,7 +1350,18 @@ impl Companion {
                     ),
                     selected,
                     Some(Action::Work(WorkAction::PreviewRemote(index))),
-                    None,
+                    Some(if !path.is_empty() {
+                        Action::Work(WorkAction::OpenPreview(path.clone()))
+                    } else if !url.is_empty() {
+                        Action::StudioOpenUrl(url.clone())
+                    } else {
+                        Action::Work(WorkAction::PreviewRemote(index))
+                    }),
+                    Some(crate::ui::context_menu::Target::ChatAttachment {
+                        path: path.clone(),
+                        url: url.clone(),
+                        remove_idx: None,
+                    }),
                 ));
             }
         }
@@ -1087,7 +1371,7 @@ impl Companion {
                 .local_preview
                 .as_ref()
                 .is_some_and(|preview| preview.path == artifact.path);
-            items.push(self.list_row(
+            items.push(self.list_row_with_menu(
                 format!("work-artifact-{index}"),
                 self.hstack(
                     S2,
@@ -1123,6 +1407,11 @@ impl Companion {
                 selected,
                 Some(Action::Work(WorkAction::PreviewArtifact(index))),
                 Some(Action::Work(WorkAction::OpenArtifact(index))),
+                Some(crate::ui::context_menu::Target::ChatAttachment {
+                    path: artifact.path.display().to_string(),
+                    url: String::new(),
+                    remove_idx: None,
+                }),
             ));
         }
         items.push(self.divider());
@@ -1145,13 +1434,14 @@ impl Companion {
             ]));
             let files_key = "work-workspace-files-expanded";
             let expanded = self.amoo_expanded_tool_records.contains(files_key);
-            items.push(self.button(
+            items.push(self.button_icon(
                 "work-workspace-files-toggle",
-                format!(
-                    "{} 浏览资料 · {} 项",
-                    if expanded { "▾" } else { "›" },
-                    self.work.files.len()
-                ),
+                format!("浏览资料 · {} 项", self.work.files.len()),
+                if expanded {
+                    UiIcon::ChevronDown
+                } else {
+                    UiIcon::ChevronRight
+                },
                 Action::AmooToggleToolRecords(files_key.into()),
                 Btn::Ghost,
             ));
@@ -1197,22 +1487,29 @@ impl Companion {
             }
         } else {
             items.push(self.text(
-                "选择文件夹，供桌面协作读取资料并保存成果。",
+                "选一个文件夹，用电脑处理时会从这里读取资料，结果也保存在这里。",
                 CAPTION,
                 p.text3,
             ));
             items.push(self.work_button(
                 "workspace-choose",
-                "📁 选择工作文件夹",
+                "选择工作文件夹",
                 WorkAction::ChooseWorkspace,
                 Btn::Secondary,
             ));
         }
-        Container::new(self.pane_scroll(self.work.files_scroll.clone(), self.vstack(S3, items)))
-            .with_uniform_padding(S3)
-            .with_background_color(p.sidebar)
-            .with_border(Border::left(1.).with_border_color(p.border))
-            .finish()
+        Container::new(
+            self.pane_scroll(
+                self.work.files_scroll.clone(),
+                Container::new(self.vstack(S3, items))
+                    .with_padding_bottom(S5)
+                    .finish(),
+            ),
+        )
+        .with_uniform_padding(S4)
+        .with_background_color(p.sidebar)
+        .with_border(Border::left(1.).with_border_color(p.border))
+        .finish()
     }
 
     fn work_desktop_workflows(&self) -> El {
@@ -1284,14 +1581,20 @@ impl Companion {
                 )),
             );
             return if self.work.tab == 2 {
-                Container::new(self.pane_scroll(
+                self.pane_scroll(
                     self.scroll.clone(),
-                    self.vstack(S4, vec![self.work_desktop_workflows(), unavailable]),
-                ))
-                .with_uniform_padding(S4)
-                .finish()
+                    Container::new(
+                        self.vstack(S4, vec![self.work_desktop_workflows(), unavailable]),
+                    )
+                    .with_horizontal_padding(S5)
+                    .with_padding_top(S5)
+                    .with_padding_bottom(S6)
+                    .finish(),
+                )
             } else {
-                unavailable
+                Container::new(unavailable)
+                    .with_uniform_padding(S5)
+                    .finish()
             };
         };
         let query = self.fields[F_WORK_CAP_SEARCH].text.trim().to_lowercase();
@@ -1369,7 +1672,11 @@ impl Companion {
                         vec![
                             self.heading("跟随手机默认"),
                             self.text(
-                                "由手机 Amoo 自动选择；下方显示实际调用记录，当前不支持手动指定。",
+                                if catalog.can_select_model {
+                                    "由手机 Amoo 自动按任务选择模型，也可在下方手动指定已验证模型。"
+                                } else {
+                                    "由手机 Amoo 自动选择；下方显示实际调用记录，当前不支持手动指定。"
+                                },
                                 CAPTION,
                                 p.text2,
                             ),
@@ -1492,7 +1799,7 @@ impl Companion {
             }
             2 => {
                 rows.push(self.work_desktop_workflows());
-                for (market, skills) in [(true, &self.work.market_skills), (false, &catalog.skills)]
+                for (market, skills) in [(false, &catalog.skills), (true, &self.work.market_skills)]
                 {
                     if market {
                         rows.push(self.work_title(UiIcon::Search, "手机技能市场"));
@@ -1641,13 +1948,14 @@ impl Companion {
                     .filter(|tool| matches(&format!("{} {} {}", tool.id, tool.name, tool.group)))
                     .collect();
                 let mut tool_rows = vec![
-                    self.button(
+                    self.button_icon(
                         "work-phone-tools",
-                        format!(
-                            "{} 手机工具目录 · {} 项",
-                            if expanded { "▾" } else { "›" },
-                            tools.len()
-                        ),
+                        format!("手机工具目录 · {} 项", tools.len()),
+                        if expanded {
+                            UiIcon::ChevronDown
+                        } else {
+                            UiIcon::ChevronRight
+                        },
                         Action::AmooToggleToolRecords(key.into()),
                         Btn::Ghost,
                     ),
@@ -1729,7 +2037,7 @@ impl Companion {
                 rows.push(self.panel(vec![
                     self.work_title(UiIcon::Apps, "安装与部署"),
                     self.text(
-                        "安装本地 APK 到手机，或在 Studio 管理并部署 AI 应用。",
+                        "安装本地 APK 到手机，或在「我的作品」里管理做过的应用。",
                         BODY,
                         p.text2,
                     ),
@@ -1748,7 +2056,7 @@ impl Companion {
                         ),
                         self.button(
                             "work-app-studio",
-                            "打开 Studio",
+                            "打开我的作品",
                             Action::Page(Page::Studio),
                             Btn::Secondary,
                         ),
@@ -1788,106 +2096,152 @@ impl Companion {
                 p.text3,
             ));
         }
-        Container::new(self.pane_scroll(self.scroll.clone(), self.vstack(S3, rows)))
-            .with_uniform_padding(S4)
-            .finish()
+        self.pane_scroll(
+            self.scroll.clone(),
+            Container::new(self.vstack(S3, rows))
+                .with_horizontal_padding(S5)
+                .with_padding_top(S5)
+                .with_padding_bottom(S6)
+                .finish(),
+        )
     }
 
     pub(in super::super) fn work_page(&self) -> El {
         let p = self.p();
         let capabilities = self.work.capabilities_open;
-        let header = Container::new(self.between(
-            if capabilities {
-                self.hstack(
-                    S2,
-                    vec![
-                        self.work_button(
-                            "back-work",
-                            "← 返回工作",
-                            WorkAction::Capabilities,
-                            Btn::Secondary,
-                        ),
-                        self.segmented(
-                            "work-capability-tabs",
-                            ["模型", "技能", "智能体", "AI 应用"]
-                                .iter()
-                                .enumerate()
-                                .map(|(index, label)| {
-                                    (
-                                        (*label).to_string(),
-                                        self.work.tab == index as u8 + 1,
-                                        Action::Work(WorkAction::Tab(index as u8 + 1)),
-                                    )
-                                })
-                                .collect(),
-                        ),
-                    ],
-                )
-            } else {
-                self.hstack(
-                    S2,
-                    vec![
-                        self.work_button(
-                            "toggle-sessions",
-                            if self.work.panel == 1 {
-                                "☰ 收起记录"
-                            } else {
-                                "☰ 工作记录"
-                            },
-                            WorkAction::Panel(1),
-                            if self.work.panel == 1 {
-                                Btn::Secondary
-                            } else {
-                                Btn::Ghost
-                            },
-                        ),
-                        self.work_button(
-                            "toggle-files",
-                            if self.work.panel == 2 {
-                                "📄 收起预览"
-                            } else {
-                                "📄 成果与预览"
-                            },
-                            WorkAction::Panel(2),
-                            if self.work.panel == 2 {
-                                Btn::Secondary
-                            } else {
-                                Btn::Ghost
-                            },
-                        ),
-                        self.work_button(
-                            "capabilities",
-                            "⊟ 能力中心",
-                            WorkAction::Capabilities,
-                            Btn::Ghost,
-                        ),
-                    ],
-                )
-            },
-            self.hstack(
-                S2,
-                vec![
-                    self.dot(if self.amoo_gateway_online {
-                        p.success
-                    } else {
-                        p.text3
-                    }),
-                    self.line(
-                        if self.amoo_gateway_online {
-                            "手机已连接"
-                        } else if self.work.catalog_loading {
-                            "正在同步"
+        // 文件处理页只是次要入口：不再重复「对话 / 交付 / 工坊」三选一切换栏，
+        // 只留一个返回唯一 AI 入口的按钮。
+        let workbench_bar = self.hstack(
+            S2,
+            vec![
+                self.button_icon(
+                    "work-back-amoo",
+                    "返回 Amoo",
+                    UiIcon::ArrowLeft,
+                    Action::Page(Page::Amoo),
+                    Btn::Ghost,
+                ),
+                self.line_w("文件处理", BODY, p.text, Weight::Semibold),
+            ],
+        );
+        let header = Container::new(self.vstack(
+            S2,
+            vec![
+                self.between(workbench_bar, {
+                    let phone_connected = self.selected.is_some() || self.amoo_gateway_online;
+                    let local_ready = self.studio_lab.config.has_key
+                        && !self.studio_lab.config.endpoint.trim().is_empty()
+                        && !self.studio_lab.config.model.trim().is_empty();
+                    let status_label = if let Some(d) = &self.selected {
+                        let model = if d.model.contains("StepX") {
+                            d.model.clone()
+                        } else if d.model.is_empty() {
+                            "手机".to_string()
                         } else {
-                            "等待连接"
-                        },
-                        CAPTION,
-                        p.text2,
-                    ),
-                ],
-            ),
+                            format!("StepX {}", d.model)
+                        };
+                        format!("已连接 {model}")
+                    } else if self.amoo_gateway_online {
+                        "手机已连接".to_string()
+                    } else if self.work.catalog_loading {
+                        "正在同步".to_string()
+                    } else if local_ready {
+                        "自己的模型服务已就绪".to_string()
+                    } else {
+                        "手机未连接".to_string()
+                    };
+                    self.hstack(
+                        S2,
+                        vec![
+                            self.dot(if phone_connected || local_ready {
+                                p.success
+                            } else {
+                                p.text3
+                            }),
+                            self.line(
+                                status_label,
+                                CAPTION,
+                                if phone_connected || local_ready {
+                                    p.success
+                                } else {
+                                    p.text2
+                                },
+                            ),
+                        ],
+                    )
+                }),
+                if capabilities {
+                    self.hstack(
+                        S2,
+                        vec![
+                            self.button_icon(
+                                "work-back-work",
+                                "返回文件处理",
+                                UiIcon::ArrowLeft,
+                                Action::Work(WorkAction::Capabilities),
+                                Btn::Secondary,
+                            ),
+                            self.segmented(
+                                "work-capability-tabs",
+                                ["模型", "技能", "智能体", "AI 应用"]
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(index, label)| {
+                                        (
+                                            (*label).to_string(),
+                                            self.work.tab == index as u8 + 1,
+                                            Action::Work(WorkAction::Tab(index as u8 + 1)),
+                                        )
+                                    })
+                                    .collect(),
+                            ),
+                        ],
+                    )
+                } else {
+                    self.hstack(
+                        S2,
+                        vec![
+                            self.work_button(
+                                "toggle-sessions",
+                                if self.work.panel == 1 {
+                                    "收起记录"
+                                } else {
+                                    "处理记录"
+                                },
+                                WorkAction::Panel(1),
+                                if self.work.panel == 1 {
+                                    Btn::Secondary
+                                } else {
+                                    Btn::Ghost
+                                },
+                            ),
+                            self.work_button(
+                                "toggle-files",
+                                if self.work.panel == 2 {
+                                    "收起预览"
+                                } else {
+                                    "结果与预览"
+                                },
+                                WorkAction::Panel(2),
+                                if self.work.panel == 2 {
+                                    Btn::Secondary
+                                } else {
+                                    Btn::Ghost
+                                },
+                            ),
+                            self.work_button(
+                                "capabilities",
+                                "技能与模型",
+                                WorkAction::Capabilities,
+                                Btn::Ghost,
+                            ),
+                        ],
+                    )
+                },
+            ],
         ))
-        .with_horizontal_padding(S4)
-        .with_vertical_padding(S2)
+        .with_horizontal_padding(S5)
+        .with_vertical_padding(S3)
         .with_border(Border::bottom(1.).with_border_color(p.border))
         .finish();
         let body = if capabilities {
@@ -1895,11 +2249,11 @@ impl Companion {
         } else {
             let mut panes = Vec::new();
             if self.work.panel == 1 {
-                panes.push(self.fixed_w(220., self.work_session_pane()));
+                panes.push(self.fixed_w(236., self.work_session_pane()));
             }
             panes.push(Expanded::new(1., self.work_conversation_pane()).finish());
             if self.work.panel == 2 {
-                panes.push(self.fixed_w(308., self.work_workspace_pane()));
+                panes.push(self.fixed_w(356., self.work_workspace_pane()));
             }
             Flex::row()
                 .with_main_axis_size(MainAxisSize::Max)
@@ -1911,7 +2265,7 @@ impl Companion {
             .with_main_axis_size(MainAxisSize::Max)
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
             .with_child(header)
-            .with_child(Expanded::new(1., body).finish())
+            .with_child(Expanded::new(1., self.sub_enter(body)).finish())
             .finish()
     }
 }

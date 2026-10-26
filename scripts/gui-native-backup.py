@@ -17,7 +17,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
-SERIAL = 'ZYPZ261A01M692000LP'
+SERIAL = os.environ.get('STEPX_DEVICE_SERIAL') or os.environ.get('STEPX_SERIAL') or ''
 FINGERPRINT = 'StepX/pandora/pandora:16/BQ2A.260122.002-BP2A.250705.008/172:user/release-keys'
 PACKAGE = 'com.stepos.ability'
 APK = '/system/priv-app/ability/ability.apk'

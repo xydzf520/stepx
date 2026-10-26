@@ -6,11 +6,11 @@ use crate::{
     amoo::AgentBus,
     device::Device,
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Component, Path, PathBuf},
@@ -18,10 +18,10 @@ use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
-        Arc,
+        Arc, Mutex, OnceLock,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 const MAX_FILE: u64 = 32 * 1024 * 1024;
@@ -53,6 +53,7 @@ pub struct WorkArtifact {
     pub bytes: u64,
     pub kind: String,
 }
+pub type Artifact = WorkArtifact;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkLog {
     pub step: usize,
@@ -95,12 +96,63 @@ impl Drop for WorkHandle {
     }
 }
 
+pub fn is_ignored_workspace_entry(name: &str) -> bool {
+    name.is_empty()
+        || name.starts_with('.')
+        || name.starts_with("~$")
+        || name.ends_with(".tmp")
+        || name.ends_with(".temp")
+        || name.ends_with(".swp")
+        || name.ends_with(".crdownload")
+        || name.ends_with(".part")
+        || name.ends_with(".stepxlink")
+        || matches!(
+            name,
+            "StepX Companion" | "__pycache__" | "node_modules" | "target"
+        )
+        || (name.starts_with("SC_")
+            && name.len() >= 36
+            && name.as_bytes()[3..35].iter().all(|b| b.is_ascii_hexdigit()))
+}
+
+pub fn work_step_name(name: &str) -> &str {
+    match name {
+        "exec" | "system.run" | "stepclaw.exec" => "执行任务步骤",
+        "ability" | "ability.call" => "调用手机能力",
+        "list_files" => "浏览目录结构",
+        "read_file" => "读取文件内容",
+        "csv_summary" => "分析表格数据",
+        "write_file" => "写入文件内容",
+        "search_files" => "检索工作区文件",
+        "web_search" => "联网搜索资料",
+        "fetch_page" => "抓取网页正文",
+        "task_create" | "sessions_spawn" => "创建子任务",
+        "text_to_image" => "生成图片",
+        "write_document" => "撰写 Word 文档",
+        "create_document" => "生成文档",
+        "edit_document" => "修订文档",
+        "edit_text" => "修改文件",
+        "write_spreadsheet" => "生成 Excel 表格",
+        "create_spreadsheet" => "生成表格",
+        "write_presentation" => "制作 PPT 演示稿",
+        "create_presentation" => "制作演示文稿",
+        _ => name,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Workspace {
     root: PathBuf,
 }
 impl Workspace {
+    pub fn new(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            fs::create_dir_all(path).context("无法创建工作目录")?;
+        }
+        Self::open(path)
+    }
     pub fn open(path: &Path) -> Result<Self> {
+        let _ = fs::create_dir_all(path);
         let root = path.canonicalize().context("工作目录不存在或不可读取")?;
         if !root.is_dir() {
             bail!("请选择一个工作目录");
@@ -145,7 +197,7 @@ impl Workspace {
         }
         Ok(path)
     }
-    fn relative(&self, path: &Path) -> Result<String> {
+    pub fn relative(&self, path: &Path) -> Result<String> {
         let canonical = path.canonicalize().context("附件不存在")?;
         let relative = canonical
             .strip_prefix(&self.root)
@@ -176,6 +228,9 @@ impl Workspace {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
+            if is_ignored_workspace_entry(&name) {
+                continue;
+            }
             let path = entry.path();
             files.push(WorkFile {
                 relative_path: path
@@ -198,6 +253,37 @@ impl Workspace {
                 .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
         Ok(files)
+    }
+    pub fn search_files(&self, relative: &str, query: &str) -> Result<Vec<Value>> {
+        let query = Some(query)
+            .filter(|q| !q.is_empty() && q.len() < 500)
+            .context("请输入 1–500 字节的检索内容")?;
+        let mut matches = vec![];
+        for file in self
+            .list_files(relative)?
+            .into_iter()
+            .filter(|f| !f.directory && !is_ignored_workspace_entry(&f.name))
+            .take(100)
+        {
+            if let Ok(text) = self.read_text(&file.relative_path) {
+                for (index, line) in text
+                    .lines()
+                    .enumerate()
+                    .filter(|(_, line)| line.contains(query))
+                    .take(5)
+                {
+                    matches.push(json!({
+                        "path": file.relative_path,
+                        "line": index + 1,
+                        "text": line.chars().take(500).collect::<String>()
+                    }));
+                }
+            }
+            if matches.len() >= 50 {
+                break;
+            }
+        }
+        Ok(matches)
     }
     /// Bounded presentation data, separate from full text used by the model.
     pub fn spreadsheet_preview(&self, relative: &str) -> Result<Value> {
@@ -291,10 +377,286 @@ impl Workspace {
             bytes: content.len() as u64,
         })
     }
+    fn write_starter_bytes(&self, relative: &str, content: &[u8]) -> Result<WorkArtifact> {
+        if content.len() > MAX_OUTPUT {
+            bail!("单个生成文件不能超过 4 MB");
+        }
+        let path = self.path(relative, false)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut opts = OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = opts.open(&path).context("无法写入工作区样板文件")?;
+        file.write_all(content).and_then(|_| file.sync_all())?;
+        if let Ok((out_path, _)) = self.output_path("starter", relative) {
+            let mut out_opts = OpenOptions::new();
+            out_opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                out_opts.custom_flags(libc::O_NOFOLLOW);
+            }
+            if let Ok(mut out_file) = out_opts.open(&out_path) {
+                let _ = out_file
+                    .write_all(content)
+                    .and_then(|_| out_file.sync_all());
+            }
+        }
+        Ok(WorkArtifact {
+            kind: file_kind(&path),
+            path,
+            relative_path: relative.to_string(),
+            bytes: content.len() as u64,
+        })
+    }
+    pub fn write_spreadsheet(&self, relative: &str, payload: &Value) -> Result<WorkArtifact> {
+        if extension(Path::new(relative)) != "xlsx" {
+            bail!("输出应为 .xlsx 文件");
+        }
+        let bytes = generate_office("write_spreadsheet", payload)?;
+        self.write_starter_bytes(relative, &bytes)
+    }
+    pub fn write_presentation(&self, relative: &str, payload: &Value) -> Result<WorkArtifact> {
+        if extension(Path::new(relative)) != "pptx" {
+            bail!("输出应为 .pptx 文件");
+        }
+        let bytes = generate_office("write_presentation", payload)?;
+        self.write_starter_bytes(relative, &bytes)
+    }
+    pub fn write_document(&self, relative: &str, payload: &Value) -> Result<WorkArtifact> {
+        if extension(Path::new(relative)) != "docx" {
+            bail!("输出应为 .docx 文件");
+        }
+        let bytes = generate_office("write_document", payload)?;
+        self.write_starter_bytes(relative, &bytes)
+    }
+    pub fn write_file(&self, relative: &str, content: &str) -> Result<WorkArtifact> {
+        if !is_text_output(Path::new(relative)) {
+            bail!("此输出类型不受支持；请生成文档、数据表或 SVG");
+        }
+        self.write_starter_bytes(relative, content.as_bytes())
+    }
+}
+
+fn starter_xlsx_payload() -> Value {
+    json!({
+        "sheets": [
+            {
+                "sheet_name": "各产品线营收明细",
+                "column_widths": [26, 18, 18, 18, 14, 14],
+                "rows": [
+                    ["产品线", "季度目标(元)", "实际营收(元)", "毛利额(元)", "目标达成率", "同比增长率"],
+                    ["StepX AI 旗舰手机", {"value": 12500000, "format": "currency"}, {"value": 14280000, "format": "currency"}, {"value": 5426400, "format": "currency"}, {"formula": "ROUND(C2/B2,4)", "format": "percent"}, {"value": 0.325, "format": "percent"}],
+                    ["StepX Companion 桌面协同套件", {"value": 4800000, "format": "currency"}, {"value": 5360000, "format": "currency"}, {"value": 3644800, "format": "currency"}, {"formula": "ROUND(C3/B3,4)", "format": "percent"}, {"value": 0.412, "format": "percent"}],
+                    ["Amoo 云端智能体订阅", {"value": 6200000, "format": "currency"}, {"value": 6890000, "format": "currency"}, {"value": 5167500, "format": "currency"}, {"formula": "ROUND(C4/B4,4)", "format": "percent"}, {"value": 0.584, "format": "percent"}],
+                    ["背屏光显矩阵配件生态", {"value": 2400000, "format": "currency"}, {"value": 2580000, "format": "currency"}, {"value": 1186800, "format": "currency"}, {"formula": "ROUND(C5/B5,4)", "format": "percent"}, {"value": 0.218, "format": "percent"}],
+                    ["企业级私有化办公部署", {"value": 5500000, "format": "currency"}, {"value": 5920000, "format": "currency"}, {"value": 3788800, "format": "currency"}, {"formula": "ROUND(C6/B6,4)", "format": "percent"}, {"value": 0.296, "format": "percent"}],
+                    ["创作工坊与行业模板市场", {"value": 1800000, "format": "currency"}, {"value": 2150000, "format": "currency"}, {"value": 1548000, "format": "currency"}, {"formula": "ROUND(C7/B7,4)", "format": "percent"}, {"value": 0.64, "format": "percent"}],
+                    ["合计", {"formula": "SUM(B2:B7)", "format": "currency"}, {"formula": "SUM(C2:C7)", "format": "currency"}, {"formula": "SUM(D2:D7)", "format": "currency"}, {"formula": "ROUND(C8/B8,4)", "format": "percent"}, {"formula": "AVERAGE(F2:F7)", "format": "percent"}],
+                    ["均值", {"formula": "AVERAGE(B2:B7)", "format": "currency"}, {"formula": "AVERAGE(C2:C7)", "format": "currency"}, {"formula": "AVERAGE(D2:D7)", "format": "currency"}, {"formula": "AVERAGE(E2:E7)", "format": "percent"}, {"formula": "AVERAGE(F2:F7)", "format": "percent"}]
+                ]
+            },
+            {
+                "sheet_name": "区域利润汇总",
+                "column_widths": [20, 18, 18, 18, 14],
+                "rows": [
+                    ["区域", "目标利润(元)", "实际利润(元)", "超额贡献(元)", "目标达成率"],
+                    ["华东大区", {"value": 6800000, "format": "currency"}, {"value": 7920000, "format": "currency"}, {"formula": "C2-B2", "format": "currency"}, {"formula": "ROUND(C2/B2,4)", "format": "percent"}],
+                    ["华南大区", {"value": 5200000, "format": "currency"}, {"value": 5840000, "format": "currency"}, {"formula": "C3-B3", "format": "currency"}, {"formula": "ROUND(C3/B3,4)", "format": "percent"}],
+                    ["华北大区", {"value": 4500000, "format": "currency"}, {"value": 4890000, "format": "currency"}, {"formula": "C4-B4", "format": "currency"}, {"formula": "ROUND(C4/B4,4)", "format": "percent"}],
+                    ["中西部及海外", {"value": 2100000, "format": "currency"}, {"value": 2112300, "format": "currency"}, {"formula": "C5-B5", "format": "currency"}, {"formula": "ROUND(C5/B5,4)", "format": "percent"}],
+                    ["区域合计", {"formula": "SUM(B2:B5)", "format": "currency"}, {"formula": "SUM(C2:C5)", "format": "currency"}, {"formula": "SUM(D2:D5)", "format": "currency"}, {"formula": "ROUND(C6/B6,4)", "format": "percent"}],
+                    ["区域均值", {"formula": "AVERAGE(B2:B5)", "format": "currency"}, {"formula": "AVERAGE(C2:C5)", "format": "currency"}, {"formula": "AVERAGE(D2:D5)", "format": "currency"}, {"formula": "AVERAGE(E2:E5)", "format": "percent"}]
+                ]
+            }
+        ]
+    })
+}
+
+fn starter_pptx_payload() -> Value {
+    json!({
+        "slides": [
+            {
+                "title": "StepX 智能终端年度产品汇报",
+                "subtitle": "跨端 AI 协同 · 专业办公交付 · 创作工坊全链路复盘",
+                "layout": "cover"
+            },
+            {
+                "title": "年度核心脉络：从跨端连接到桌面 AI 工作台",
+                "subtitle": "打通手机端 Amoo 智能体与电脑端高价值文档及应用生产",
+                "layout": "section"
+            },
+            {
+                "title": "核心亮点",
+                "subtitle": "四大核心业务指标全面超额完成",
+                "layout": "content",
+                "bullets": [
+                    "双端协同日活提升 142%，手机与电脑文件流转实现零门槛接力",
+                    "专业交付引擎原生输出可编辑 Word、Excel、PPT 办公文档",
+                    "创作工坊支持一句话生成离线可玩的 HTML5 游戏与数据看板",
+                    "全流程沙箱边界保护，不覆写原始资料，所有交付成果可追溯"
+                ]
+            },
+            {
+                "title": "跨端协同架构",
+                "subtitle": "Amoo 智能体总线与桌面工作区双向直连",
+                "layout": "content",
+                "bullets": [
+                    "USB 与局域网高速通道自动发现，截图、通知与文件毫秒级同步",
+                    "手机端视觉识屏与电脑端深度排版、多表公式计算优势互补",
+                    "支持手机端 Amoo 云路由与本地自定义模型 API 无缝切换",
+                    "成果文件支持一键推送至手机 Download/StepX-Work 目录"
+                ]
+            },
+            {
+                "title": "办公与创作闭环",
+                "subtitle": "从静态报告到交互式数据应用的一键转化",
+                "layout": "content",
+                "bullets": [
+                    "内置财务看板 .xlsx、产品汇报 .pptx、立项书 .docx 样板交付",
+                    "支持在右侧预览窗格直接渲染多表数据、文档章节与幻灯片大纲",
+                    "一键唤起 Amoo 基于现有工作区文档进行增量修订与润色",
+                    "一键提取办公文档核心数据转入创作工坊，生成移动端交互看板"
+                ]
+            },
+            {
+                "title": "下阶段路线图",
+                "subtitle": "持续深化行业工作流与多端交互体验",
+                "layout": "content",
+                "bullets": [
+                    "Q3：发布财务核算、项目复盘、市场调研等 20+ 专业技能模板",
+                    "Q3：深化 23×17 背屏光显矩阵与桌面任务进度的实时联动",
+                    "Q4：升级多文档交叉核对与长篇报告图表自动化混排能力",
+                    "Q4：构建个人与团队跨设备知识库，赋能全场景移动生产力"
+                ]
+            }
+        ]
+    })
+}
+
+fn starter_docx_payload() -> Value {
+    json!({
+        "title": "StepX 跨端智能办公与创作立项书",
+        "paragraphs": [
+            {"style": "quote", "text": "立项愿景：让每一台 StepX 手机与桌面电脑组成无缝协同的 AI 生产力工作站，实现文档、表格、演示文稿与交互式应用的秒级交付。"},
+            {"style": "heading1", "text": "一、项目背景与核心价值"},
+            {"style": "body", "text": "在日常办公场景中，用户经常需要在手机端收集会议录音、白板照片、发票单据与即时消息，并在电脑端整理为正式的 Word 报告、Excel 财务报表或 PowerPoint 汇报材料。StepX 专业交付工作台通过端云协同协议，将移动端的感知能力与桌面端的工程化文档生成能力深度融合。"},
+            {"style": "heading2", "text": "1.1 四大核心交付能力"},
+            {"style": "bullet", "text": "结构化文档撰写（.docx）：支持多级标题、要点列表、引用标注与精确段落替换修订。"},
+            {"style": "bullet", "text": "多维财务与经营表格（.xlsx）：支持多工作表、SUM/AVERAGE/ROUND 公式预计算、人民币货币与百分比格式。"},
+            {"style": "bullet", "text": "宽屏商务演示文稿（.pptx）：原生生成 16:9 封面页、章节页与要点内容页，布局清晰可直接演示。"},
+            {"style": "bullet", "text": "跨工作台应用转化（HTML5）：一键将办公文档中的数据与结论转入创作工坊，生成可在手机与桌面端交互的看板或小游戏。"},
+            {"style": "heading1", "text": "二、架构设计与里程碑规划"},
+            {"style": "body", "text": "系统默认绑定专属安全工作目录，所有模型输出均作为受控数据解析，绝不执行任意外部脚本或覆盖用户原文件。同时提供一键同步到手机与一键交由 Amoo 修订的高频闭环操作。"},
+            {"style": "heading2", "text": "2.1 验收标准与交付质量"},
+            {"style": "bullet", "text": "零配置开箱即用：打开「专业交付」即可直接预览、修订或生成标准 Office 成果。"},
+            {"style": "bullet", "text": "端到端流转：支持「文档生成 → 内嵌预览 → Amoo 修订 → 同步手机 / 转做交互应用」完整闭环。"},
+            {"style": "quote", "text": "评审结论：立项方案目标明确、技术路径可靠，立即纳入核心交付基线。"}
+        ]
+    })
+}
+
+fn starter_md_content() -> &'static str {
+    concat!(
+        "# AI 终端与移动生产力深度调研报告\n\n",
+        "> **核心摘要**：2026 年智能终端正从「单一对话助手」向「跨端专业交付与创作闭环」演进。用户不仅需要 AI 回答问题，更需要直接获得可编辑的 `.docx`、`.xlsx`、`.pptx` 正式文档与可交互的 HTML5 移动应用。\n\n",
+        "## 一、主流终端 AI 生产力形态对比\n\n",
+        "| 评估维度 | StepX 跨端专业交付 | 传统云端文档插件 | 纯聊天式 AI 助手 |\n",
+        "| :--- | :--- | :--- | :--- |\n",
+        "| **Office 原生交付** | 原生生成 `.docx` / `.xlsx` / `.pptx` | 仅限单一宿主软件内辅助 | 仅输出纯文本，需手动复制排版 |\n",
+        "| **表格公式与多表** | 支持多工作表、`SUM`/`AVERAGE` 真实公式缓存 | 依赖手工配置函数 | 容易出现算术幻觉，无公式结构 |\n",
+        "| **手机与桌面协同** | ADB/局域网双向同步，支持直推手机 `Download` | 需多端登录并手动上传下载 | 缺少本地工作区文件读写能力 |\n",
+        "| **转做交互应用/游戏** | 一键提取文档数据转入创作工坊生成 HTML5 应用 | 不支持应用与游戏构建 | 代码块无法直接在手机视口验证 |\n",
+        "| **隐私与文件安全** | 本地受控工作区，保留原文件不覆盖 | 文档需全量上传第三方云端 | 无本地版本隔离机制 |\n\n",
+        "## 二、关键调研发现\n\n",
+        "1. **办公交付的「最后一公里」在于文件格式与二次编辑**：83% 的受访用户在获得 AI 回复后仍需花费 20 分钟以上将其整理进 Word、Excel 或 PPT。内置一键样板与原生 OpenXML 引擎可将交付耗时缩短 90%。\n",
+        "2. **静态报告向交互式看板转化需求激增**：管理层与业务团队越来越倾向于在手机竖屏上查看可筛选、可点击的动态数据看板。打通「专业交付」与「创作工坊」能实现从静态表格到动态看板的秒级跨越。\n",
+        "3. **增量修订优先于全量重写**：在实际工作中，基于已有方案进行定向修订（`让 Amoo 修订`）的频率是新建文档的 3.4 倍。\n\n",
+        "## 三、行动建议与落地清单\n\n",
+        "- **默认开启桌面协作模式**：预置高频办公样板，消除首次使用时的空目录阻塞。\n",
+        "- **强化右侧实时预览体验**：支持多工作表 Markdown 表格预览、Word 标题/列表/表格结构化渲染与 PPT 逐页大纲浏览。\n",
+        "- **固化三大高频流转动作**：在预览卡片常驻「让 Amoo 修订」、「同步到手机」与「转做成交互应用/看板」一键操作。\n"
+    )
+}
+
+pub fn generate_office_starter(workspace_root: &Path, kind: &str) -> Result<Artifact> {
+    let ws = Workspace::new(workspace_root)?;
+    match kind {
+        "xlsx" => ws.write_spreadsheet("季度经营分析与财务看板.xlsx", &starter_xlsx_payload()),
+        "pptx" => ws.write_presentation("StepX智能终端年度产品汇报.pptx", &starter_pptx_payload()),
+        "docx" => ws.write_document(
+            "StepX跨端智能办公与创作立项书.docx",
+            &starter_docx_payload(),
+        ),
+        "md" => ws.write_file("AI终端与移动生产力深度调研报告.md", starter_md_content()),
+        _ => bail!("不支持的办公样板类型：{kind}"),
+    }
+}
+
+pub fn ensure_office_starters(workspace_root: &Path) -> Result<Vec<Artifact>> {
+    let specs = [
+        ("xlsx", "季度经营分析与财务看板.xlsx"),
+        ("pptx", "StepX智能终端年度产品汇报.pptx"),
+        ("docx", "StepX跨端智能办公与创作立项书.docx"),
+        ("md", "AI终端与移动生产力深度调研报告.md"),
+    ];
+    let mut fast_out = Vec::with_capacity(specs.len());
+    for (_, filename) in specs {
+        let candidate = workspace_root.join(filename);
+        if let Ok(meta) = fs::symlink_metadata(&candidate) {
+            if meta.is_file() && !meta.file_type().is_symlink() && meta.len() > 0 {
+                fast_out.push(WorkArtifact {
+                    kind: file_kind(&candidate),
+                    path: candidate,
+                    relative_path: filename.to_string(),
+                    bytes: meta.len(),
+                });
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    if fast_out.len() == specs.len() {
+        return Ok(fast_out);
+    }
+    let ws = Workspace::new(workspace_root)?;
+    let mut out = Vec::with_capacity(specs.len());
+    for (kind, filename) in specs {
+        let existing = ws.path(filename, false)?;
+        if let Ok(meta) = fs::metadata(&existing) {
+            if meta.is_file() && meta.len() > 0 {
+                out.push(WorkArtifact {
+                    kind: file_kind(&existing),
+                    path: existing,
+                    relative_path: filename.to_string(),
+                    bytes: meta.len(),
+                });
+                continue;
+            }
+        }
+        out.push(generate_office_starter(workspace_root, kind)?);
+    }
+    Ok(out)
 }
 
 pub fn list_workspace(path: &Path) -> Result<Vec<WorkFile>> {
     Workspace::open(path)?.list_files("")
+}
+
+pub fn cache_key_digest(input: &[u8]) -> String {
+    crate::device::sha256(input)
+        .iter()
+        .take(16)
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Import phone-exported workflow documents without trusting remote paths.
@@ -649,6 +1011,81 @@ pub fn start(adb: Adb, device: Device, request: WorkRequest) -> WorkHandle {
     WorkHandle { events, cancel }
 }
 
+pub fn start_local(mut request: WorkRequest) -> WorkHandle {
+    let (tx, events) = mpsc::channel();
+    let (work_tx, work_events) = mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let token = cancel.clone();
+    let journal_workspace = request.workspace.clone();
+    thread::spawn(move || {
+        let mut journal = Journal::open(&journal_workspace).ok();
+        for event in work_events {
+            if let Some(writer) = journal.as_mut() {
+                if writer.record(&event).is_err() {
+                    journal = None;
+                }
+            }
+            if tx.send(event).is_err() {
+                break;
+            }
+        }
+    });
+    thread::spawn(move || {
+        let result = (|| -> Result<()> {
+            if request.prompt.trim().is_empty() {
+                bail!("请描述需要完成的工作");
+            }
+            let _ = fs::create_dir_all(&request.workspace);
+            let workspace = Workspace::open(&request.workspace)?;
+            let root = request.workspace.canonicalize()?;
+            let mut staged = Vec::new();
+            for path in &request.attachments {
+                if token.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                let path = path.canonicalize()?;
+                let path = if path.starts_with(&root) {
+                    path
+                } else {
+                    root.join(import_file(&root, &path)?.relative_path)
+                };
+                staged.push(path);
+            }
+            request.attachments = staged;
+            let attachments = request
+                .attachments
+                .iter()
+                .map(|path| workspace.relative(path))
+                .collect::<Result<Vec<_>>>()?;
+            let _ = work_tx.send(WorkEvent::Status(
+                "正在通过本地配置的模型生成办公交付物…".into(),
+            ));
+            let key = request
+                .session_key
+                .as_deref()
+                .filter(|key| !key.is_empty())
+                .unwrap_or("local-work-session")
+                .to_string();
+            let _ = work_tx.send(WorkEvent::SessionReady(key));
+            let mut backend = LocalApiBackend::new(work_tx.clone());
+            run_loop(
+                &workspace,
+                &request.prompt,
+                &attachments,
+                &mut backend,
+                &work_tx,
+                &token,
+            )
+        })();
+        if token.load(Ordering::SeqCst) {
+            let _ = work_tx.send(WorkEvent::Cancelled);
+        } else if let Err(error) = result {
+            let _ = work_tx.send(WorkEvent::Failed(format!("{error:#}")));
+        }
+    });
+    WorkHandle { events, cancel }
+}
+
 struct Journal {
     file: File,
 }
@@ -707,6 +1144,21 @@ pub fn load_session_artifacts(root: &Path, session_key: &str) -> Result<Vec<Work
     load_artifacts_for_session(root, Some(session_key))
 }
 
+type SessionLogCacheEntry = (
+    Option<SystemTime>,
+    u64,
+    Option<String>,
+    Vec<WorkArtifact>,
+    Vec<WorkArtifact>,
+);
+
+static SESSION_ARTIFACTS_LOG_CACHE: OnceLock<Mutex<HashMap<PathBuf, SessionLogCacheEntry>>> =
+    OnceLock::new();
+
+fn session_artifacts_log_cache() -> &'static Mutex<HashMap<PathBuf, SessionLogCacheEntry>> {
+    SESSION_ARTIFACTS_LOG_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn load_artifacts_for_session(root: &Path, session_key: Option<&str>) -> Result<Vec<WorkArtifact>> {
     let ws = Workspace::open(root)?;
     let records = ws.path(".amoo-work", false)?;
@@ -722,51 +1174,109 @@ fn load_artifacts_for_session(root: &Path, session_key: Option<&str>) -> Result<
             continue;
         }
         let log = entry.path().join("events.jsonl");
-        if !log.is_file() {
-            continue;
-        }
-        let Ok(bytes) = read_bounded(&log, 16 * 1024 * 1024 + 1) else {
+        let Ok(log_meta) = fs::metadata(&log) else {
             continue;
         };
-        if bytes.len() > 16 * 1024 * 1024 {
+        if !log_meta.is_file() || log_meta.len() > 16 * 1024 * 1024 {
             continue;
         }
-        let events: Vec<WorkEvent> = bytes
-            .split(|b| *b == b'\n')
-            .filter_map(|line| serde_json::from_slice(line).ok())
-            .collect();
-        if let Some(key) = session_key {
-            let bindings: HashSet<&str> = events
+        let modified = log_meta.modified().ok();
+        let len = log_meta.len();
+        let cached = session_artifacts_log_cache().lock().ok().and_then(|guard| {
+            guard
+                .get(&log)
+                .and_then(|(c_mod, c_len, single, bound, all)| {
+                    if *c_mod == modified && *c_len == len {
+                        Some((single.clone(), bound.clone(), all.clone()))
+                    } else {
+                        None
+                    }
+                })
+        });
+        let (single_session, bound_artifacts, all_artifacts) = if let Some(hit) = cached {
+            hit
+        } else {
+            let Ok(bytes) = read_bounded(&log, 16 * 1024 * 1024 + 1) else {
+                continue;
+            };
+            if bytes.len() > 16 * 1024 * 1024 {
+                continue;
+            }
+            let events: Vec<WorkEvent> = bytes
+                .split(|b| *b == b'\n')
+                .filter_map(|line| serde_json::from_slice(line).ok())
+                .collect();
+            let bindings: HashSet<String> = events
                 .iter()
                 .filter_map(|event| match event {
-                    WorkEvent::SessionReady(value) => Some(value.as_str()),
+                    WorkEvent::SessionReady(value) => Some(value.clone()),
                     _ => None,
                 })
                 .collect();
-            if bindings.len() != 1 || !bindings.contains(key) {
-                continue;
-            }
-        }
-        let mut bound = session_key.is_none();
-        for event in events {
-            if let WorkEvent::SessionReady(key) = &event {
-                bound = session_key.is_none_or(|expected| key == expected);
-            }
-            if !bound {
-                continue;
-            }
-            if let WorkEvent::Artifact(mut artifact) = event {
-                if !artifact.relative_path.starts_with("Amoo Work Outputs/") {
-                    continue;
+            let single_session = if bindings.len() == 1 {
+                bindings.into_iter().next()
+            } else {
+                None
+            };
+            let mut bound_artifacts = Vec::new();
+            let mut all_artifacts = Vec::new();
+            let mut bound = false;
+            for event in events {
+                if let WorkEvent::SessionReady(key) = &event {
+                    bound = single_session.as_deref() == Some(key.as_str());
                 }
-                if let Ok(path) = ws.path(&artifact.relative_path, true) {
-                    if let Ok(meta) = fs::metadata(&path) {
-                        if meta.is_file() && seen.insert(artifact.relative_path.clone()) {
-                            artifact.kind = file_kind(&path);
-                            artifact.path = path;
-                            artifact.bytes = meta.len();
-                            found.push(artifact);
-                        }
+                if let WorkEvent::Artifact(artifact) = event {
+                    if !artifact.relative_path.starts_with("Amoo Work Outputs/") {
+                        continue;
+                    }
+                    if bound {
+                        bound_artifacts.push(artifact.clone());
+                    }
+                    all_artifacts.push(artifact);
+                }
+            }
+            if let Ok(mut guard) = session_artifacts_log_cache().lock() {
+                if guard.len() >= 1024 {
+                    guard.clear();
+                }
+                guard.insert(
+                    log,
+                    (
+                        modified,
+                        len,
+                        single_session.clone(),
+                        bound_artifacts.clone(),
+                        all_artifacts.clone(),
+                    ),
+                );
+            }
+            (single_session, bound_artifacts, all_artifacts)
+        };
+        let candidates = if let Some(key) = session_key {
+            if single_session.as_deref() != Some(key) {
+                continue;
+            }
+            bound_artifacts
+        } else {
+            all_artifacts
+        };
+        for mut artifact in candidates {
+            if Path::new(&artifact.relative_path)
+                .components()
+                .any(|c| match c {
+                    Component::Normal(s) => is_ignored_workspace_entry(&s.to_string_lossy()),
+                    _ => false,
+                })
+            {
+                continue;
+            }
+            if let Ok(path) = ws.path(&artifact.relative_path, true) {
+                if let Ok(meta) = fs::metadata(&path) {
+                    if meta.is_file() && seen.insert(artifact.relative_path.clone()) {
+                        artifact.kind = file_kind(&path);
+                        artifact.path = path;
+                        artifact.bytes = meta.len();
+                        found.push(artifact);
                     }
                 }
             }
@@ -786,6 +1296,7 @@ fn run_phone(
     if request.prompt.trim().is_empty() {
         bail!("请描述需要完成的工作");
     }
+    let _ = fs::create_dir_all(&request.workspace);
     let workspace = Workspace::open(&request.workspace)?;
     let root = request.workspace.canonicalize()?;
     let mut staged = Vec::new();
@@ -814,39 +1325,166 @@ fn run_phone(
         return Ok(());
     }
     let _ = tx.send(WorkEvent::Status("正在连接手机 Amoo…".into()));
-    let mut bus = AgentBus::connect(adb, device)?;
-    let key = match request.session_key.as_deref().filter(|key| !key.is_empty()) {
-        Some(key) => key.to_string(),
-        None => bus.create_session()?,
+    let connected = if device.serial.trim().is_empty() {
+        Err(anyhow!("未选择手机设备"))
+    } else {
+        AgentBus::connect(adb, device)
     };
-    let _ = tx.send(WorkEvent::SessionReady(key.clone()));
-    if let Some(model) = request.model.as_deref().filter(|m| !m.is_empty()) {
-        // Implemented by the actual capability discovery module; no guessed model IDs.
-        bus.set_session_model(&key, model)?;
+    match connected {
+        Ok(mut bus) => {
+            let key = match request.session_key.as_deref().filter(|key| !key.is_empty()) {
+                Some(key) => key.to_string(),
+                None => bus.create_session()?,
+            };
+            let _ = tx.send(WorkEvent::SessionReady(key.clone()));
+            if let Some(model) = request.model.as_deref().filter(|m| !m.is_empty()) {
+                // Implemented by the actual capability discovery module; no guessed model IDs.
+                bus.set_session_model(&key, model)?;
+            }
+            let mut backend = PhoneBackend {
+                bus,
+                key,
+                events: tx.clone(),
+                adb: adb.clone(),
+                device: device.clone(),
+                // Images must enter Amoo's native attachment channel. A filesystem path
+                // or base64 inside a text tool result is not visual model input.
+                image_attachments: request
+                    .attachments
+                    .iter()
+                    .filter(|path| crate::amoo_media::mime_type(path).starts_with("image/"))
+                    .cloned()
+                    .collect(),
+            };
+            run_loop(
+                &workspace,
+                &request.prompt,
+                &attachments,
+                &mut backend,
+                tx,
+                cancel,
+            )
+        }
+        Err(phone_err) => {
+            if has_local_model_backend() {
+                let _ = tx.send(WorkEvent::Status(
+                    "正在通过本地配置的模型生成办公交付物…".into(),
+                ));
+                let key = request
+                    .session_key
+                    .as_deref()
+                    .filter(|key| !key.is_empty())
+                    .unwrap_or("local-work-session")
+                    .to_string();
+                let _ = tx.send(WorkEvent::SessionReady(key));
+                let mut backend = LocalApiBackend::new(tx.clone());
+                run_loop(
+                    &workspace,
+                    &request.prompt,
+                    &attachments,
+                    &mut backend,
+                    tx,
+                    cancel,
+                )
+            } else {
+                Err(phone_err)
+            }
+        }
     }
-    let mut backend = PhoneBackend {
-        bus,
-        key,
-        events: tx.clone(),
-        adb: adb.clone(),
-        device: device.clone(),
-        // Images must enter Amoo's native attachment channel. A filesystem path
-        // or base64 inside a text tool result is not visual model input.
-        image_attachments: request
-            .attachments
-            .iter()
-            .filter(|path| crate::amoo_media::mime_type(path).starts_with("image/"))
-            .cloned()
-            .collect(),
-    };
-    run_loop(
-        &workspace,
-        &request.prompt,
-        &attachments,
-        &mut backend,
-        tx,
-        cancel,
-    )
+}
+
+pub fn has_local_model_backend() -> bool {
+    crate::studio_lab::load_config().is_ok_and(|cfg| {
+        cfg.has_key && !cfg.endpoint.trim().is_empty() && !cfg.model.trim().is_empty()
+    })
+}
+
+struct LocalApiBackend {
+    config_path: PathBuf,
+    messages: Vec<Value>,
+    events: Sender<WorkEvent>,
+}
+
+impl LocalApiBackend {
+    fn new(events: Sender<WorkEvent>) -> Self {
+        let primary = crate::resources::user_config().join("stepx-companion/studio-lab/model.json");
+        let fallback = crate::resources::user_state().join("studio-lab/model.json");
+        let config_path = if primary.is_file() { primary } else { fallback };
+        Self {
+            config_path,
+            messages: vec![json!({
+                "role": "system",
+                "content": "你是 StepX 专业办公交付引擎 Amoo Work。当用户需要创建或修改 Word(.docx)、Excel(.xlsx)、PPT(.pptx)、Markdown(.md) 或其他工作文件时，严格使用 <amoo_work_protocol> JSON 协议返回工具计划。"
+            })],
+            events,
+        }
+    }
+}
+
+impl Backend for LocalApiBackend {
+    fn reply(&mut self, message: &str, cancel: &AtomicBool) -> Result<String> {
+        if cancel.load(Ordering::SeqCst) {
+            bail!("桌面任务已停止");
+        }
+        let _ = self
+            .events
+            .send(WorkEvent::Status("本地模型正在生成办公方案与文件…".into()));
+        self.messages
+            .push(json!({"role": "user", "content": message}));
+        let payload = serde_json::to_vec(&self.messages)?;
+        let script = r#"import json, sys, urllib.request, urllib.error
+cfg_path = sys.argv[1]
+with open(cfg_path, "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+endpoint = (cfg.get("endpoint") or "").strip().rstrip("/")
+model = (cfg.get("model") or "").strip()
+api_key = (cfg.get("key") or cfg.get("api_key") or "").strip()
+if not endpoint or not model or not api_key:
+    raise RuntimeError("本地模型 API 配置不完整")
+if not endpoint.endswith("/chat/completions"):
+    endpoint = endpoint + "/chat/completions"
+messages = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+body = json.dumps({"model": model, "messages": messages, "temperature": 0.2}).encode("utf-8")
+req = urllib.request.Request(
+    endpoint,
+    data=body,
+    headers={
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+        "User-Agent": "StepX-AmooWork/1.0",
+    },
+    method="POST",
+)
+with urllib.request.urlopen(req, timeout=90) as resp:
+    data = json.loads(resp.read().decode("utf-8"))
+content = (((data.get("choices") or [{}])[0]).get("message") or {}).get("content") or ""
+if isinstance(content, list):
+    content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+if not str(content).strip():
+    raise RuntimeError("本地模型返回内容为空")
+sys.stdout.buffer.write(str(content).encode("utf-8"))
+"#;
+        let mut command = crate::resources::python_command();
+        command
+            .arg("-I")
+            .arg("-c")
+            .arg(script)
+            .arg(&self.config_path);
+        let output = adb::run_process(command, Some(payload), Duration::from_secs(95))?;
+        if !output.status.success() {
+            bail!(
+                "本地模型调用失败：{}",
+                String::from_utf8_lossy(&output.stderr)
+                    .chars()
+                    .take(300)
+                    .collect::<String>()
+            );
+        }
+        let text = String::from_utf8(output.stdout).context("本地模型回复编码无效")?;
+        self.messages
+            .push(json!({"role": "assistant", "content": &text}));
+        Ok(text)
+    }
 }
 
 trait Backend {
@@ -890,10 +1528,11 @@ impl Backend for PhoneBackend {
             let _ = self.events.send(WorkEvent::Status(
                 "正在上传图片，让 Amoo 看图后处理工作文件…".into(),
             ));
-            let uploaded = crate::amoo_media::upload_attachments(
+            let uploaded = crate::amoo_media::upload_attachments_with_bus(
                 &self.adb,
                 &self.device,
                 &self.image_attachments,
+                Some(&mut self.bus),
             )?;
             if cancel.load(Ordering::SeqCst) {
                 let _ = self.adb.shell(
@@ -1090,6 +1729,7 @@ fn run_loop(
     let mut successful = 0;
     let mut artifacts = 0;
     let mut format_repairs = 0;
+    let mut nudge_sent = false;
     let mut completed_writes = std::collections::HashMap::<String, Value>::new();
     for round in 0..MAX_ROUNDS {
         if cancel.load(Ordering::SeqCst) {
@@ -1114,11 +1754,38 @@ fn run_loop(
         let plan = match parsed {
             Some(p) => p,
             None => {
-                let _ = tx.send(WorkEvent::Assistant(response));
-                let _ = tx.send(WorkEvent::Complete(completion_summary(
-                    count, successful, artifacts,
-                )));
-                return Ok(());
+                if round == 0
+                    && count == 0
+                    && completed_writes.is_empty()
+                    && !nudge_sent
+                    && prompt_expects_file_action(prompt)
+                {
+                    nudge_sent = true;
+                    let nudge = "<amoo_work_protocol>\n系统提示：你刚才仅回复了普通文字，未输出 <amoo_work_protocol> JSON 工具计划，电脑端尚未生成任何实际文件。请立即使用 <amoo_work_protocol>{\"amoo_work\":1,\"summary\":\"正在生成文件\",\"done\":false,\"tools\":[...]}</amoo_work_protocol> 调用 write_document、write_spreadsheet、write_presentation 或 write_file 实际写入文件。\n</amoo_work_protocol>";
+                    if let Ok(retry_response) = backend.reply(nudge, cancel) {
+                        if let Ok(Some(retry_plan)) = parse_plan(&retry_response) {
+                            retry_plan
+                        } else {
+                            let _ = tx.send(WorkEvent::Assistant(retry_response));
+                            let _ = tx.send(WorkEvent::Complete(completion_summary(
+                                count, successful, artifacts,
+                            )));
+                            return Ok(());
+                        }
+                    } else {
+                        let _ = tx.send(WorkEvent::Assistant(response));
+                        let _ = tx.send(WorkEvent::Complete(completion_summary(
+                            count, successful, artifacts,
+                        )));
+                        return Ok(());
+                    }
+                } else {
+                    let _ = tx.send(WorkEvent::Assistant(response));
+                    let _ = tx.send(WorkEvent::Complete(completion_summary(
+                        count, successful, artifacts,
+                    )));
+                    return Ok(());
+                }
             }
         };
         if !plan.summary.trim().is_empty() {
@@ -1202,6 +1869,46 @@ fn run_loop(
     }
     bail!("已达到 12 轮桌面协作上限，已有产物已保留；可检查后继续任务")
 }
+fn prompt_expects_file_action(prompt: &str) -> bool {
+    let lower = prompt.to_ascii_lowercase();
+    for kw in [
+        "生成",
+        "创建",
+        "制作",
+        "撰写",
+        "整理",
+        "写一",
+        "导出",
+        "保存",
+        "修订",
+        "修改",
+        "文件",
+        "文档",
+        "表格",
+        "报告",
+        "汇报",
+        "方案",
+        "看板",
+        "游戏",
+        "幻灯片",
+        "演示",
+        "docx",
+        "xlsx",
+        "pptx",
+        "word",
+        "excel",
+        "ppt",
+        "markdown",
+        ".md",
+        ".html",
+        ".csv",
+    ] {
+        if lower.contains(kw) {
+            return true;
+        }
+    }
+    false
+}
 fn completion_summary(attempted: usize, successful: usize, artifacts: usize) -> String {
     if attempted == 0 {
         "手机已回复；未执行桌面操作，未生成本地文件。".into()
@@ -1250,27 +1957,7 @@ fn execute_tool(ws: &Workspace, run: &str, call: &Value, tx: &Sender<WorkEvent>)
                 .as_str()
                 .filter(|q| !q.is_empty() && q.len() < 500)
                 .context("请输入 1–500 字节的检索内容")?;
-            let mut matches = vec![];
-            for file in ws
-                .list_files(path)?
-                .into_iter()
-                .filter(|f| !f.directory)
-                .take(100)
-            {
-                if let Ok(text) = ws.read_text(&file.relative_path) {
-                    for (index, line) in text
-                        .lines()
-                        .enumerate()
-                        .filter(|(_, line)| line.contains(query))
-                        .take(5)
-                    {
-                        matches.push(json!({"path":file.relative_path,"line":index+1,"text":line.chars().take(500).collect::<String>()}));
-                    }
-                }
-                if matches.len() >= 50 {
-                    break;
-                }
-            }
+            let matches = ws.search_files(path, query)?;
             Ok(json!({"matches":matches,"scope":"当前目录，最多检索 100 个文件"}))
         }
         "csv_summary" => csv_summary(&ws.read_text(path)?),
@@ -1493,11 +2180,43 @@ fn extract_pdf(path: &Path) -> Result<String> {
 fn python(code: &str, args: &[&Path], stdin: Option<Vec<u8>>) -> Result<Vec<u8>> {
     // Use the packaged interpreter. A script file also avoids Windows' 32K
     // command-line limit for Office generation and long installation paths.
-    let mut script = tempfile::Builder::new().suffix(".py").tempfile()?;
-    script.write_all(code.as_bytes())?;
-    script.flush()?;
+    let dir = crate::resources::user_state().join("runtime-scripts");
+    let _ = fs::create_dir_all(&dir);
+    let hash: String = crate::device::sha256(code.as_bytes())
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let cached_path = dir.join(format!("work-{hash}.py"));
+    let ready = fs::symlink_metadata(&cached_path).ok().is_some_and(|m| {
+        m.is_file() && !m.file_type().is_symlink() && m.len() == code.len() as u64
+    });
+    let temp_fallback = if ready {
+        None
+    } else if let Ok(mut tmp) = tempfile::NamedTempFile::new_in(&dir) {
+        if tmp.write_all(code.as_bytes()).is_ok()
+            && tmp.flush().is_ok()
+            && tmp.persist(&cached_path).is_ok()
+        {
+            None
+        } else {
+            let mut script = tempfile::Builder::new().suffix(".py").tempfile()?;
+            script.write_all(code.as_bytes())?;
+            script.flush()?;
+            Some(script)
+        }
+    } else {
+        let mut script = tempfile::Builder::new().suffix(".py").tempfile()?;
+        script.write_all(code.as_bytes())?;
+        script.flush()?;
+        Some(script)
+    };
+    let script_path = temp_fallback
+        .as_ref()
+        .map(|s| s.path())
+        .unwrap_or(cached_path.as_path());
     let mut command = crate::resources::python_command();
-    command.arg("-I").arg(script.path());
+    command.arg("-I").arg(script_path);
     for arg in args {
         command.arg(arg);
     }
@@ -1528,7 +2247,74 @@ fn generate_office_with_source(name: &str, call: &Value, source: Option<&Path>) 
         bail!("Office 文档内容超过 4 MB 上限");
     }
     let args: Vec<&Path> = source.into_iter().collect();
-    let bytes = python(include_str!("work_generate.py"), &args, Some(payload))?;
+    let base_script = include_str!("work_generate.py");
+    let script: std::borrow::Cow<'_, str> = if name == "write_spreadsheet"
+        && call
+            .get("sheets")
+            .and_then(Value::as_array)
+            .is_some_and(|s| !s.is_empty())
+    {
+        let multi_py = r#"def multi_spreadsheet(z, payload):
+    sheets = payload.get('sheets')
+    if not isinstance(sheets, list) or not sheets:
+        return spreadsheet(z, payload)
+    sheet_xmls = []
+    sheet_names = []
+    styles_xml = None
+    for idx, s in enumerate(sheets, 1):
+        if not isinstance(s, dict):
+            continue
+        sub_out = io.BytesIO()
+        sname = bounded_string(s.get('sheet_name') or s.get('name') or f'Sheet{idx}', 'sheet_name', 31)
+        sub_payload = {
+            'sheet_name': sname,
+            'rows': s.get('rows') or [],
+            'column_widths': s.get('column_widths') or payload.get('column_widths') or [],
+        }
+        with zipfile.ZipFile(sub_out, 'w', compression=zipfile.ZIP_DEFLATED) as sub_z:
+            spreadsheet(sub_z, sub_payload)
+        with zipfile.ZipFile(io.BytesIO(sub_out.getvalue()), 'r') as sub_r:
+            sheet_xmls.append(sub_r.read('xl/worksheets/sheet1.xml'))
+            if styles_xml is None:
+                styles_xml = sub_r.read('xl/styles.xml')
+        sheet_names.append(sname)
+    if not sheet_xmls:
+        return spreadsheet(z, payload)
+    for i, xml_bytes in enumerate(sheet_xmls, 1):
+        z.writestr(f'xl/worksheets/sheet{i}.xml', xml_bytes)
+    wb_sheets = ''.join(
+        f'<sheet name={quoteattr(name)} sheetId="{i}" r:id="rId{i}"/>'
+        for i, name in enumerate(sheet_names, 1)
+    )
+    z.writestr(
+        'xl/workbook.xml',
+        XML + f'<workbook xmlns="{S}" xmlns:r="{NS_DOCREL}"><sheets>{wb_sheets}</sheets><calcPr calcId="191029" fullCalcOnLoad="1"/></workbook>',
+    )
+    z.writestr('xl/styles.xml', styles_xml)
+    wb_rels = [(i, 'worksheet', f'worksheets/sheet{i}.xml') for i in range(1, len(sheet_xmls) + 1)]
+    wb_rels.append((len(sheet_xmls) + 1, 'styles', 'styles.xml'))
+    z.writestr('xl/_rels/workbook.xml.rels', rels(wb_rels))
+    z.writestr('_rels/.rels', rels([(1, 'officeDocument', 'xl/workbook.xml')]))
+    ct_entries = [('/xl/workbook.xml', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml')]
+    for i in range(1, len(sheet_xmls) + 1):
+        ct_entries.append((f'/xl/worksheets/sheet{i}.xml', 'application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml'))
+    ct_entries.append(('/xl/styles.xml', 'application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml'))
+    z.writestr('[Content_Types].xml', types(ct_entries))
+
+
+def main():"#;
+        std::borrow::Cow::Owned(
+            base_script
+                .replace(
+                    "elif tool == 'write_spreadsheet': spreadsheet(z, payload)",
+                    "elif tool == 'write_spreadsheet': multi_spreadsheet(z, payload)",
+                )
+                .replace("def main():", multi_py),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(base_script)
+    };
+    let bytes = python(&script, &args, Some(payload))?;
     if !bytes.starts_with(b"PK\x03\x04") || bytes.len() > MAX_OUTPUT {
         bail!("生成的 Office 文件无效或过大");
     }
@@ -2183,5 +2969,103 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e,WorkEvent::Complete(s) if s.contains("生成 1 个"))));
+    }
+
+    #[test]
+    fn office_starters_generate_valid_multi_sheet_xlsx_pptx_docx_and_markdown() {
+        if adb::find_executable("python3").is_none() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let artifacts = ensure_office_starters(temp.path()).unwrap();
+        assert_eq!(artifacts.len(), 4);
+        let ws = Workspace::open(temp.path()).unwrap();
+        let sheet_preview = ws
+            .spreadsheet_preview("季度经营分析与财务看板.xlsx")
+            .unwrap();
+        let sheets = sheet_preview["sheets"].as_array().unwrap();
+        assert_eq!(sheets.len(), 2);
+        assert_eq!(sheets[0]["name"], "各产品线营收明细");
+        assert_eq!(sheets[1]["name"], "区域利润汇总");
+        let ppt_text = ws.read_text("StepX智能终端年度产品汇报.pptx").unwrap();
+        assert!(ppt_text.contains("幻灯片: 6"));
+        let docx_text = ws.read_text("StepX跨端智能办公与创作立项书.docx").unwrap();
+        assert!(docx_text.contains("# StepX 跨端智能办公与创作立项书"));
+        assert!(docx_text.contains("## 1.1 四大核心交付能力"));
+        assert!(docx_text.contains("- 结构化文档撰写"));
+        assert!(docx_text.contains("> 立项愿景"));
+        let md_text = ws.read_text("AI终端与移动生产力深度调研报告.md").unwrap();
+        assert!(md_text.contains("| 评估维度 |"));
+    }
+
+    #[test]
+    fn round_zero_prose_response_gets_nudged_to_emit_protocol_and_write_file() {
+        let root = tempfile::tempdir().unwrap();
+        let ws = Workspace::open(root.path()).unwrap();
+        let mut model = FakeBackend {
+            requests: vec![],
+            replies: [
+                "好的，我现在为您生成报告文档。".into(),
+                json!({"amoo_work":1,"done":false,"tools":[{"id":"1","tool":"write_file","path":"nudged.md","content":"# 报告\n内容"}]})
+                    .to_string(),
+                json!({"amoo_work":1,"done":true,"summary":"已生成报告","tools":[]}).to_string(),
+            ]
+            .into(),
+        };
+        let (tx, rx) = mpsc::channel();
+        run_loop(
+            &ws,
+            "帮我生成一份调研报告文档",
+            &[],
+            &mut model,
+            &tx,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(model.requests.len(), 3);
+        let events: Vec<_> = rx.try_iter().collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, WorkEvent::Artifact(_)))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn workspace_hygiene_filters_hidden_lock_temp_and_system_entries() {
+        assert!(is_ignored_workspace_entry(".DS_Store"));
+        assert!(is_ignored_workspace_entry(".git"));
+        assert!(is_ignored_workspace_entry(".stepx"));
+        assert!(is_ignored_workspace_entry("~$季度经营分析.xlsx"));
+        assert!(is_ignored_workspace_entry("draft.tmp"));
+        assert!(is_ignored_workspace_entry("draft.temp"));
+        assert!(is_ignored_workspace_entry("notes.md.swp"));
+        assert!(is_ignored_workspace_entry("download.crdownload"));
+        assert!(is_ignored_workspace_entry("archive.part"));
+        assert!(is_ignored_workspace_entry("StepX Companion"));
+        assert!(is_ignored_workspace_entry("StepX Companion.stepxlink"));
+        assert!(is_ignored_workspace_entry(
+            "SC_0123456789abcdef0123456789abcdef_cache"
+        ));
+        assert!(!is_ignored_workspace_entry("季度经营分析与财务看板.xlsx"));
+        assert!(!is_ignored_workspace_entry("报告.md"));
+
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join(".DS_Store"), "junk").unwrap();
+        fs::write(temp.path().join("~$report.docx"), "lock").unwrap();
+        fs::write(temp.path().join("temp.tmp"), "secret keyword").unwrap();
+        fs::write(temp.path().join("StepX Companion"), "shortcut").unwrap();
+        fs::write(temp.path().join("real.md"), "visible secret keyword").unwrap();
+
+        let ws = Workspace::open(temp.path()).unwrap();
+        let listed = ws.list_files("").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "real.md");
+
+        let hits = ws.search_files("", "secret keyword").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["path"], "real.md");
     }
 }

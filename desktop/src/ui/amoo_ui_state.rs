@@ -13,6 +13,8 @@ pub(super) enum AmooUiAction {
     GuiMode(bool),
     GuiDesktopMode(bool),
     GuiRefresh,
+    GuiWakeAndSwipeUnlock,
+    GuiRefreshScreen,
     GuiStopWaiting,
     GuiPauseResume,
     GuiEnableTools,
@@ -260,6 +262,9 @@ impl Companion {
     pub(super) fn handle_amoo_ui_action(&mut self, action: &AmooUiAction) {
         match action {
             AmooUiAction::GuiMode(enabled) => {
+                if *enabled && self.page != Page::Amoo {
+                    self.page = Page::Amoo;
+                }
                 self.amoo_ui.screen_mode = *enabled;
                 if *enabled && !self.amoo_ui.gui_running {
                     self.amoo_ui.gui_desktop = true;
@@ -271,18 +276,94 @@ impl Companion {
                     if !self.amoo_ui.gui_running && !self.amoo_ui.gui_unconfirmed {
                         self.refresh_amoo_gui();
                     }
+                } else if !self.amoo_ui.gui_running && !self.amoo_ui.gui_paused {
+                    self.amoo_ui.gui_checking = false;
+                    self.amoo_ui.gui_rx = None;
+                    self.amoo_ui.gui_screenshot = None;
+                    self.amoo_ui.gui_screenshot_cache = None;
                 }
+                self.trigger_subtab_switch();
             }
             AmooUiAction::GuiRefresh => self.refresh_amoo_gui(),
+            AmooUiAction::GuiWakeAndSwipeUnlock => {
+                if self.amoo_ui.gui_running || self.amoo_ui.gui_checking {
+                    return;
+                }
+                let Some(device) = self.selected.clone().filter(|_| !self.demo_mode) else {
+                    self.amoo_ui.gui_message =
+                        "已发送点亮与上滑解锁指令（连接真实手机后将实时刷新屏幕画面）".into();
+                    return;
+                };
+                let (sender, receiver) = mpsc::channel();
+                self.amoo_ui.gui_rx = Some(receiver);
+                self.amoo_ui.gui_checking = true;
+                self.amoo_ui.gui_message = "正在点亮手机屏幕并执行上滑解锁…".into();
+                std::thread::spawn(move || {
+                    let result = Adb::discover()
+                        .and_then(|adb| {
+                            device.verify(&adb)?;
+                            let _ = adb.shell(&device.transport, &["input", "keyevent", "224"]);
+                            let _ = adb.shell(
+                                &device.transport,
+                                &["input", "swipe", "540", "1850", "540", "650", "300"],
+                            );
+                            std::thread::sleep(Duration::from_millis(450));
+                            if let Ok(png) = amoo_screen::capture_png(&adb, &device) {
+                                let _ = sender.send(GuiEvent::Progress(
+                                    amoo_screen::ScreenEvent::Screenshot { number: 0, png },
+                                ));
+                            }
+                            let mut st = amoo_gui::inspect(&adb, &device)?;
+                            st.message = if st.locked == Some(false) && st.interactive == Some(true)
+                            {
+                                "已点亮并解锁手机屏幕，当前画面已刷新，可直接发送操控指令".into()
+                            } else {
+                                "已点亮屏幕并上滑；若手机设置了锁屏密码，请点击「打开实时投屏」用鼠标解锁".into()
+                            };
+                            Ok(st)
+                        })
+                        .map_err(|error| format!("{error:#}"));
+                    let _ = sender.send(GuiEvent::Inspected(result));
+                });
+            }
+            AmooUiAction::GuiRefreshScreen => {
+                if self.amoo_ui.gui_running || self.amoo_ui.gui_checking {
+                    return;
+                }
+                let Some(device) = self.selected.clone().filter(|_| !self.demo_mode) else {
+                    self.amoo_ui.gui_message = "请先连接真实手机以获取实时屏幕画面".into();
+                    return;
+                };
+                let (sender, receiver) = mpsc::channel();
+                self.amoo_ui.gui_rx = Some(receiver);
+                self.amoo_ui.gui_checking = true;
+                self.amoo_ui.gui_message = "正在截取并刷新手机当前画面…".into();
+                std::thread::spawn(move || {
+                    let result = Adb::discover()
+                        .and_then(|adb| {
+                            if let Ok(png) = amoo_screen::capture_png(&adb, &device) {
+                                let _ = sender.send(GuiEvent::Progress(
+                                    amoo_screen::ScreenEvent::Screenshot { number: 0, png },
+                                ));
+                            }
+                            let mut st = amoo_gui::inspect(&adb, &device)?;
+                            st.message = format!("已刷新当前手机画面 · {}", st.message);
+                            Ok(st)
+                        })
+                        .map_err(|error| format!("{error:#}"));
+                    let _ = sender.send(GuiEvent::Inspected(result));
+                });
+            }
             AmooUiAction::GuiDesktopMode(desktop) => {
                 if !self.amoo_ui.gui_running && !self.amoo_ui.gui_unconfirmed {
                     self.amoo_ui.gui_desktop = *desktop;
                     self.amoo_ui.gui_message = if *desktop {
-                        "手机伴侣直接使用 Step Plan 模型看屏、规划并操作。desktop 仅发起目标和查看进度，关闭电脑不影响手机任务。"
+                        "智能操控模式：基础指令（点亮、截图、提字、打开应用、点击按钮）秒级直达；复杂多步操作自动调用视觉模型规划执行。"
                     } else {
-                        "手机原生执行由系统提供；发现接口不代表当前系统已经开放。"
+                        "手机原生执行模式：直接调用手机系统内置接口执行。"
                     }.into();
                 }
+                self.trigger_subtab_switch();
             }
             AmooUiAction::GuiPhoneControl(operation) => {
                 let operation = operation.clone();
@@ -330,20 +411,124 @@ impl Companion {
                 });
             }
             AmooUiAction::GuiPauseResume => {
+                if !self.amoo_ui.gui_running && !self.amoo_ui.gui_paused {
+                    self.amoo_ui.gui_screenshot = None;
+                    self.amoo_ui.gui_screenshot_cache = None;
+                    self.status = "当前没有正在执行的手机操控任务".into();
+                    return;
+                }
+                self.amoo_ui.gui_paused = !self.amoo_ui.gui_paused;
                 if let Some(pause) = &self.amoo_ui.gui_pause {
-                    self.amoo_ui.gui_paused = !self.amoo_ui.gui_paused;
                     pause.store(self.amoo_ui.gui_paused, Ordering::Relaxed);
+                }
+                if self.amoo_ui.gui_paused {
+                    self.amoo_ui.gui_message =
+                        "已暂停手机操作，你可以随时接手手机；点击「继续」恢复执行。".into();
+                    self.status = "已暂停手机操作".into();
+                } else {
+                    self.amoo_ui.gui_message = "已继续执行手机操作…".into();
+                    self.status = "已恢复手机操作".into();
+                }
+                let paused = self.amoo_ui.gui_paused;
+                if let Some(device) = self.selected.clone().filter(|_| !self.demo_mode) {
+                    std::thread::spawn(move || {
+                        if let Ok(adb) = Adb::discover() {
+                            let agent_op = if paused { "pause" } else { "resume" };
+                            let _ = stepx_companion::companion_gui::call(
+                                &adb,
+                                &device,
+                                serde_json::json!({"op":"agent","agentOp":agent_op}),
+                            );
+                            if let Ok(state) = stepx_companion::companion_gui::call(
+                                &adb,
+                                &device,
+                                serde_json::json!({"op":"status"}),
+                            ) {
+                                if !state["task"].is_null() {
+                                    let user_op = if paused { "user_pause" } else { "user_resume" };
+                                    let _ = stepx_companion::companion_gui::call(
+                                        &adb,
+                                        &device,
+                                        serde_json::json!({"op":user_op,"task":state["task"]}),
+                                    );
+                                }
+                            }
+                        }
+                    });
                 }
             }
             AmooUiAction::GuiStopWaiting => {
                 if let Some(cancel) = &self.amoo_ui.gui_cancel {
                     cancel.0.store(true, Ordering::Relaxed);
-                    self.amoo_ui.gui_message = if self.amoo_ui.gui_desktop {
-                        "正在停止后续步骤，等待当前步骤收尾；不会再执行下一步操作。"
-                    } else {
-                        "正在停止桌面等待；这不会停止手机上的操作"
+                }
+                if let Some(pause) = &self.amoo_ui.gui_pause {
+                    pause.store(false, Ordering::Relaxed);
+                }
+                let was_running = self.amoo_ui.gui_running || self.amoo_ui.gui_paused;
+                let elapsed_ms = self
+                    .amoo_ui
+                    .gui_started
+                    .map(|t| t.elapsed().as_millis() as u64)
+                    .unwrap_or(0);
+                self.amoo_ui.gui_running = false;
+                self.amoo_ui.gui_paused = false;
+                self.amoo_ui.gui_checking = false;
+                self.amoo_ui.gui_pause = None;
+                self.amoo_ui.gui_cancel = None;
+                self.amoo_ui.gui_rx = None;
+                self.amoo_ui.gui_discard_result = true;
+                if let Some((app_name, task)) = self.amoo_ui.gui_current.take() {
+                    self.amoo_ui.gui_records.push(GuiRecord {
+                        app_name,
+                        task,
+                        result: GuiRunResult {
+                            state: GuiRunState::WaitingCancelled,
+                            message: "已手动停止手机操作。".into(),
+                            invocation_id: String::new(),
+                            raw_result: None,
+                            elapsed_ms,
+                        },
+                        desktop: self.amoo_ui.gui_desktop,
+                        steps: std::mem::take(&mut self.amoo_ui.gui_steps),
+                        screenshot: self.amoo_ui.gui_screenshot.take(),
+                        _screenshot_cache: self.amoo_ui.gui_screenshot_cache.take(),
+                    });
+                    if self.amoo_ui.gui_records.len() > 20 {
+                        self.amoo_ui.gui_records.remove(0);
                     }
-                    .into();
+                }
+                self.amoo_ui.gui_steps.clear();
+                self.amoo_ui.gui_screenshot = None;
+                self.amoo_ui.gui_screenshot_cache = None;
+                self.amoo_ui.gui_started = None;
+                self.amoo_ui.gui_message = "已停止手机操作。".into();
+                self.status = "已停止手机操作".into();
+                self.error = false;
+                if was_running {
+                    if let Some(device) = self.selected.clone().filter(|_| !self.demo_mode) {
+                        std::thread::spawn(move || {
+                            if let Ok(adb) = Adb::discover() {
+                                let _ = stepx_companion::companion_gui::call(
+                                    &adb,
+                                    &device,
+                                    serde_json::json!({"op":"agent","agentOp":"stop"}),
+                                );
+                                if let Ok(state) = stepx_companion::companion_gui::call(
+                                    &adb,
+                                    &device,
+                                    serde_json::json!({"op":"status"}),
+                                ) {
+                                    if !state["task"].is_null() {
+                                        let _ = stepx_companion::companion_gui::call(
+                                            &adb,
+                                            &device,
+                                            serde_json::json!({"op":"user_stop","task":state["task"]}),
+                                        );
+                                    }
+                                }
+                            }
+                        });
+                    }
                 }
             }
             AmooUiAction::GuiAcknowledgeFinished => {
@@ -357,11 +542,13 @@ impl Companion {
             }
             AmooUiAction::AlbumClose => {
                 self.amoo_ui.album_path = None;
+                self.trigger_subtab_switch();
             }
             AmooUiAction::AlbumBrowse(path) => {
                 if self.busy {
                     return;
                 }
+                self.trigger_subtab_switch();
                 let path = path.clone();
                 if !["/sdcard/DCIM", "/sdcard/Pictures"]
                     .iter()
@@ -374,6 +561,11 @@ impl Companion {
                         .into_iter()
                         .filter(|e| {
                             !e.symlink
+                                && !e.name.starts_with('.')
+                                && !e.name.ends_with(".stepxlink")
+                                && e.name != "StepX Companion"
+                                && !stepx_companion::toolbox::is_expansion_stub_filename(&e.name)
+                                && !(e.name.starts_with("SC_") && e.name.len() >= 36)
                                 && (e.directory
                                     || matches!(
                                         std::path::Path::new(&e.name)
@@ -462,11 +654,19 @@ impl Companion {
         let (sender, receiver) = mpsc::channel();
         self.amoo_ui.gui_rx = Some(receiver);
         self.amoo_ui.gui_checking = true;
-        self.amoo_ui.gui_message = "正在检查手机锁屏状态与原生操作接口…".into();
+        self.amoo_ui.gui_message = "正在检查手机屏幕状态并同步实时画面…".into();
         std::thread::spawn(move || {
-            let result = Adb::discover()
-                .and_then(|adb| amoo_gui::inspect(&adb, &device))
-                .map_err(|error| format!("{error:#}"));
+            let result =
+                Adb::discover()
+                    .and_then(|adb| {
+                        if let Ok(png) = amoo_screen::capture_png(&adb, &device) {
+                            let _ = sender.send(GuiEvent::Progress(
+                                amoo_screen::ScreenEvent::Screenshot { number: 0, png },
+                            ));
+                        }
+                        amoo_gui::inspect(&adb, &device)
+                    })
+                    .map_err(|error| format!("{error:#}"));
             let _ = sender.send(GuiEvent::Inspected(result));
         });
     }
@@ -494,17 +694,15 @@ impl Companion {
                 "图片与文档附件请在“后台对话”发送。当前附件已保留，未发送手机操作。".into();
             return;
         }
-        let app_name = self.fields[F_AMOO_GUI_APP].text.trim().to_owned();
-        let task = self.fields[F_AMOO].text.trim().to_owned();
-        if app_name.is_empty() || task.is_empty() {
-            self.amoo_ui.gui_message = "请填写手机应用名称和要完成的操作".into();
-            self.focus = Some(if app_name.is_empty() {
-                F_AMOO_GUI_APP
-            } else {
-                F_AMOO
-            });
+        let raw_app = self.fields[F_AMOO_GUI_APP].text.trim().to_owned();
+        let raw_task = self.fields[F_AMOO].text.trim().to_owned();
+        if raw_app.is_empty() && raw_task.is_empty() {
+            self.amoo_ui.gui_message =
+                "请输入要让手机执行的操作（如：点亮屏幕、截取画面、提取屏幕文字、打开微信）".into();
+            self.focus = Some(F_AMOO);
             return;
         }
+        let (app_name, task) = amoo_screen::infer_app_and_task(&raw_app, &raw_task);
         if app_name.chars().count() > 120
             || app_name.chars().any(char::is_control)
             || task.chars().count() > 12000
@@ -537,9 +735,9 @@ impl Companion {
         self.amoo_ui.gui_screenshot_cache = None;
         let desktop = self.amoo_ui.gui_desktop;
         self.amoo_ui.gui_message = if desktop {
-            "正在委派给手机独立 GUI Agent；手机直接调用 Step Plan 模型执行任务。"
+            "正在连接手机屏幕并执行操作…"
         } else {
-            "正在复查锁屏状态并请求手机原生执行器；以手机返回结果为准。"
+            "正在检查锁屏状态并请求手机原生接口执行…"
         }
         .into();
         std::thread::spawn(move || {
@@ -609,7 +807,8 @@ impl Companion {
                         self.amoo_ui.gui_steps.push((number, description));
                     }
                     amoo_screen::ScreenEvent::Screenshot { number, png } => {
-                        if png.len() <= 16 * 1024 * 1024
+                        if (self.amoo_ui.screen_mode || self.amoo_ui.gui_running)
+                            && png.len() <= 16 * 1024 * 1024
                             && image::guess_format(&png).ok() == Some(image::ImageFormat::Png)
                         {
                             if self.amoo_ui.gui_screenshot_cache.is_none() {
@@ -1245,9 +1444,9 @@ impl Companion {
                 Btn::Secondary,
             ),
             self.button(
-                "account-to-work",
-                "Amoo Work",
-                Action::Page(Page::Work),
+                "account-to-studio",
+                "我的作品",
+                Action::Page(Page::Studio),
                 Btn::Secondary,
             ),
         ]));
@@ -1260,7 +1459,12 @@ impl AmooUiState {
         if let Some(cancel) = &self.gui_cancel {
             cancel.0.store(true, Ordering::Relaxed);
         }
+        if let Some(pause) = &self.gui_pause {
+            pause.store(false, Ordering::Relaxed);
+        }
         self.screen_mode = false;
+        self.gui_paused = false;
+        self.gui_pause = None;
         self.gui_current = None;
         self.gui_records.clear();
         self.gui_steps.clear();
@@ -1524,6 +1728,50 @@ mod tests {
         state.set_account_scope(Some("second-test-scope".into()));
         assert!(state.messages.is_empty());
         assert!(state.session_started.is_empty());
+    }
+
+    #[test]
+    fn gui_pause_resume_and_stop_waiting_immediately_update_state() {
+        let mut app = Companion::new_for_test();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let pause = Arc::new(AtomicBool::new(false));
+        let cache = tempfile::tempdir().unwrap();
+        let screenshot_path = cache.path().join("live.png");
+        std::fs::write(&screenshot_path, b"live frame").unwrap();
+
+        app.amoo_ui.gui_running = true;
+        app.amoo_ui.gui_desktop = true;
+        app.amoo_ui.gui_cancel = Some(GuiCancellation(cancel.clone()));
+        app.amoo_ui.gui_pause = Some(pause.clone());
+        app.amoo_ui.gui_current = Some(("设置".into(), "查看关于手机".into()));
+        app.amoo_ui.gui_screenshot = Some(screenshot_path);
+        app.amoo_ui.gui_screenshot_cache = Some(cache);
+
+        app.handle_amoo_ui_action(&AmooUiAction::GuiPauseResume);
+        assert!(app.amoo_ui.gui_paused);
+        assert!(pause.load(Ordering::Relaxed));
+        assert!(app.amoo_ui.gui_message.contains("已暂停"));
+
+        app.handle_amoo_ui_action(&AmooUiAction::GuiPauseResume);
+        assert!(!app.amoo_ui.gui_paused);
+        assert!(!pause.load(Ordering::Relaxed));
+        assert!(app.amoo_ui.gui_message.contains("已继续"));
+
+        app.handle_amoo_ui_action(&AmooUiAction::GuiPauseResume);
+        assert!(app.amoo_ui.gui_paused);
+
+        app.handle_amoo_ui_action(&AmooUiAction::GuiStopWaiting);
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(!pause.load(Ordering::Relaxed));
+        assert!(!app.amoo_ui.gui_running);
+        assert!(!app.amoo_ui.gui_paused);
+        assert!(app.amoo_ui.gui_screenshot.is_none());
+        assert!(app.amoo_ui.gui_current.is_none());
+        assert_eq!(app.amoo_ui.gui_records.len(), 1);
+        assert_eq!(
+            app.amoo_ui.gui_records[0].result.state,
+            GuiRunState::WaitingCancelled
+        );
     }
 }
 

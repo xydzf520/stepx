@@ -17,7 +17,7 @@ impl Companion {
         .with_width(48.)
         .with_height(48.)
         .finish();
-        let card = self.panel(vec![
+        self.panel(vec![
             self.hstack(S3, vec![logo, self.vstack(S1, vec![
                 self.line_w("StepX Companion", 26., p.text, Weight::Bold),
                 self.mono(format!("v{} · {}", stepx_companion::build_info::VERSION, stepx_companion::build_info::compiled_id()), CAPTION, p.text3),
@@ -37,9 +37,6 @@ impl Companion {
                 self.link_action("about-changelog", "更新日志", Action::Settings(super::super::SettingsAction::Changelog)),
                 self.link_action("about-license", "开源许可", Action::StudioOpenUrl("https://github.com/xydzf520/stepx/blob/main/THIRD_PARTY_NOTICES.md".into())),
             ]),
-        ]);
-        Align::new(ConstrainedBox::new(card).with_max_width(800.).finish())
-            .top_left()
-            .finish()
+        ])
     }
 }

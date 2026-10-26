@@ -11,7 +11,7 @@ use std::{
     collections::BTreeMap,
     io::{BufRead, BufReader, Write},
     path::PathBuf,
-    process::{Command, Stdio},
+    process::Stdio,
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver},
@@ -27,6 +27,7 @@ pub struct VerifiedPackage {
     pub version: String,
     pub size_bytes: u64,
     pub metadata: BTreeMap<String, String>,
+    pub(crate) verified_stat: Option<[u64; 3]>,
     sha256: String,
     firmware: Firmware,
 }
@@ -109,6 +110,7 @@ pub fn start_stage(adb: Adb, device: Device, package: VerifiedPackage) -> Result
     // The worker rechecks the serial before any phone operation; keep UI startup nonblocking.
     let mut req = request(&package.firmware)?;
     req["sha256"] = json!(package.sha256);
+    req["verified_stat"] = json!(package.verified_stat);
     req["op"] = json!("stage");
     req["path"] = json!(package.path);
     req["adb"] = json!(adb.path);
@@ -217,6 +219,10 @@ fn spawn(mut req: Value, firmware: Firmware, serial: Option<String>) -> Result<J
                                     version: firmware.version.clone(),
                                     size_bytes: firmware.size_bytes,
                                     metadata: serde_json::from_value(value["metadata"].clone())?,
+                                    verified_stat: serde_json::from_value(
+                                        value["verified_stat"].clone(),
+                                    )
+                                    .ok(),
                                     sha256: value["sha256"]
                                         .as_str()
                                         .context("缺少固件校验摘要")?
@@ -346,13 +352,16 @@ pub fn submit_install(
         (0..=600).contains(&age.num_seconds()),
         "官方报告已过期，请重新检查更新"
     );
-    let current=adb.script(&device.transport,"v=$(getprop ro.build.mask.id); if [ -z \"$v\" ]; then getprop ro.build.aios_version; else printf '%s\\n' \"$v\"; fi")?;
+    let raw_props = adb.script(
+        &device.transport,
+        "v=$(getprop ro.build.mask.id); if [ -z \"$v\" ]; then v=$(getprop ro.build.aios_version); fi; printf '%s\\n' \"$v\"; getprop ro.product.device; getprop ro.build.version.incremental; getprop ro.build.fingerprint; getprop ro.build.date.utc; getprop ro.boot.shopdemo; getprop ro.sys.shopdemo; getprop ro.demo_mode",
+    )?;
+    let (current, props) = raw_props.split_once('\n').unwrap_or((&raw_props, ""));
     ensure!(
         current.trim() == report.current_version,
         "手机系统已变化，请重新检查更新"
     );
-    let props=adb.script(&device.transport,"getprop ro.product.device; getprop ro.build.version.incremental; getprop ro.build.fingerprint; getprop ro.build.date.utc; getprop ro.boot.shopdemo; getprop ro.sys.shopdemo; getprop ro.demo_mode")?;
-    validate_device(&staged.package.metadata, &props)?;
+    validate_device(&staged.package.metadata, props)?;
     let actual = adb.run_timeout(
         &[
             "-s",
@@ -508,29 +517,53 @@ pub struct StagingUsage {
 fn staged_directories(adb: &Adb, device: &Device) -> Result<Vec<(String, u64)>> {
     device.verify(adb)?;
     let root = "/sdcard/Download/StepX-OTA";
-    let names = adb.script(
+    let output = adb.script(
         &device.transport,
-        "if [ -d /sdcard/Download/StepX-OTA ]; then ls -1 /sdcard/Download/StepX-OTA; fi",
+        "if [ -d /sdcard/Download/StepX-OTA ] && [ ! -L /sdcard/Download/StepX-OTA ]; then \
+           for d in /sdcard/Download/StepX-OTA/*; do \
+             if [ -d \"$d\" ] && [ ! -L \"$d\" ]; then \
+               name=${d##*/}; \
+               for f in \"$d/update.zip\" \"$d/update.zip.part\"; do \
+                 if [ -f \"$f\" ] && [ ! -L \"$f\" ]; then \
+                   s=$(stat -c %s \"$f\" 2>/dev/null); \
+                   if [ -n \"$s\" ]; then printf '%s\\t%s\\n' \"$name\" \"$s\"; fi; \
+                 fi; \
+               done; \
+             fi; \
+           done; \
+         fi",
     )?;
-    let mut result = Vec::new();
-    for name in names
-        .lines()
-        .map(str::trim)
-        .filter(|s| s.len() == 32 && s.bytes().all(|c| c.is_ascii_hexdigit()))
-        .take(512)
-    {
-        let directory = format!("{root}/{name}");
-        let q = crate::adb::shell_quote(&directory);
-        let output=adb.script(&device.transport,&format!("if [ -d {q} ] && [ ! -L {q} ]; then for f in {q}/update.zip {q}/update.zip.part; do if [ -f \"$f\" ] && [ ! -L \"$f\" ]; then stat -c %s \"$f\"; fi; done; fi"))?;
-        let bytes = output
-            .lines()
-            .filter_map(|s| s.trim().parse::<u64>().ok())
-            .sum();
-        if bytes > 0 {
-            result.push((directory, bytes));
+    let mut totals: BTreeMap<String, u64> = BTreeMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for line in output.lines() {
+        let mut parts = line.trim().split('\t');
+        let (Some(name), Some(size_str)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if name.len() != 32 || !name.bytes().all(|c| c.is_ascii_hexdigit()) {
+            continue;
+        }
+        let Ok(bytes) = size_str.trim().parse::<u64>() else {
+            continue;
+        };
+        if !totals.contains_key(name) {
+            if order.len() >= 512 {
+                continue;
+            }
+            order.push(name.to_owned());
+            totals.insert(name.to_owned(), 0);
+        }
+        if let Some(total) = totals.get_mut(name) {
+            *total = total.saturating_add(bytes);
         }
     }
-    Ok(result)
+    Ok(order
+        .into_iter()
+        .filter_map(|name| {
+            let bytes = totals.remove(&name).unwrap_or(0);
+            (bytes > 0).then(|| (format!("{root}/{name}"), bytes))
+        })
+        .collect())
 }
 /// Only recognizes application-owned 32-hex directories; never scans unrelated downloads.
 pub fn inspect_staged(adb: &Adb, device: &Device) -> Result<StagingUsage> {
@@ -543,22 +576,23 @@ pub fn inspect_staged(adb: &Adb, device: &Device) -> Result<StagingUsage> {
 /// User-triggered cleanup. Do not call while a transfer or system installation is active.
 pub fn cleanup_staged(adb: &Adb, device: &Device) -> Result<StagingUsage> {
     let dirs = staged_directories(adb, device)?;
+    if dirs.is_empty() {
+        return Ok(StagingUsage::default());
+    }
+    device.verify(adb)?;
+    let mut script = String::new();
     let mut removed = StagingUsage::default();
     for (dir, bytes) in dirs {
-        device.verify(adb)?;
-        adb.shell(
-            &device.transport,
-            &[
-                "rm",
-                "-f",
-                &format!("{dir}/update.zip"),
-                &format!("{dir}/update.zip.part"),
-            ],
-        )?;
+        let zip = crate::adb::shell_quote(&format!("{dir}/update.zip"));
+        let part = crate::adb::shell_quote(&format!("{dir}/update.zip.part"));
+        let dir_q = crate::adb::shell_quote(&dir);
         // Preserve any unexpected files instead of recursively removing the folder.
-        let _ = adb.shell(&device.transport, &["rmdir", &dir]);
+        script.push_str(&format!(
+            "rm -f {zip} {part}; rmdir {dir_q} 2>/dev/null || true; "
+        ));
         removed.count += 1;
         removed.bytes += bytes;
     }
+    adb.script(&device.transport, &script)?;
     Ok(removed)
 }

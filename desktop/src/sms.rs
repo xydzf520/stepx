@@ -68,11 +68,48 @@ pub fn decode_field(encoded: &str, name: &str) -> Result<String> {
     Ok(value.strip_suffix('\n').unwrap_or(value).to_owned())
 }
 
-/// Normalize formatting only; do not merge different international numbers.
+/// Normalize formatting and mainland China (+86 / 0086 / 86) mobile prefixes so threads,
+/// contacts, and call logs merge cleanly.
 pub fn normalize_address(address: &str) -> String {
-    address
+    let cleaned: String = address
         .chars()
-        .filter(|c| !c.is_whitespace() && !"-()".contains(*c))
+        .filter(|c| !c.is_whitespace() && !"-().\u{00a0}\u{200b}\u{202a}\u{202c}".contains(*c))
         .flat_map(char::to_lowercase)
-        .collect()
+        .collect();
+    let stripped = cleaned
+        .strip_prefix("+86")
+        .or_else(|| cleaned.strip_prefix("0086"))
+        .or_else(|| {
+            if cleaned.len() == 13 && cleaned.starts_with("861") {
+                cleaned.strip_prefix("86")
+            } else {
+                None
+            }
+        });
+    if let Some(rest) = stripped {
+        let bytes = rest.as_bytes();
+        if bytes.len() == 11
+            && bytes[0] == b'1'
+            && (b'3'..=b'9').contains(&bytes[1])
+            && bytes.iter().all(|b| b.is_ascii_digit())
+        {
+            return rest.to_string();
+        }
+    }
+    cleaned
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_mainland_mobile_prefixes_to_same_key() {
+        assert_eq!(normalize_address("+8613322988887"), "13322988887");
+        assert_eq!(normalize_address("+86 133-2298-8887"), "13322988887");
+        assert_eq!(normalize_address("008613322988887"), "13322988887");
+        assert_eq!(normalize_address("8613322988887"), "13322988887");
+        assert_eq!(normalize_address("13322988887"), "13322988887");
+        assert_eq!(normalize_address("1069800095555"), "1069800095555");
+    }
 }

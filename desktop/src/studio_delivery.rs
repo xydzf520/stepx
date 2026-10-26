@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub const MAX_HTML_BYTES: usize = 2 * 1024 * 1024;
-const CHUNK_BYTES: usize = 12 * 1024;
+const CHUNK_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LocalReceipt {
@@ -77,8 +77,9 @@ pub fn validate_html(name: &str, bytes: &[u8]) -> Result<()> {
 }
 pub fn install_local(adb: &Adb, device: &Device, name: &str, html: &[u8]) -> Result<LocalReceipt> {
     validate_html(name, html)?;
+    device.verify(adb)?;
     let digest = hash(html);
-    let begin = studio::phone_call(
+    let begin = studio::phone_call_unverified(
         adb,
         device,
         json!({"op":"local-begin","name":name.trim(),"size":html.len(),"sha256":digest}),
@@ -91,7 +92,7 @@ pub fn install_local(adb: &Adb, device: &Device, name: &str, html: &[u8]) -> Res
     let result = (|| {
         let mut offset = 0;
         for chunk in html.chunks(CHUNK_BYTES) {
-            let r = studio::phone_call(
+            let r = studio::phone_call_unverified(
                 adb,
                 device,
                 json!({"op":"local-chunk","upload":upload,"offset":offset,"data":STANDARD.encode(chunk)}),
@@ -102,7 +103,11 @@ pub fn install_local(adb: &Adb, device: &Device, name: &str, html: &[u8]) -> Res
                 "手机分片确认不一致"
             );
         }
-        let raw = studio::phone_call(adb, device, json!({"op":"local-commit","upload":upload}))?;
+        let raw = studio::phone_call_unverified(
+            adb,
+            device,
+            json!({"op":"local-commit","upload":upload}),
+        )?;
         let receipt: LocalReceipt = serde_json::from_value(raw).context("手机作品保存回执无效")?;
         ensure!(
             receipt.id == upload
@@ -114,7 +119,8 @@ pub fn install_local(adb: &Adb, device: &Device, name: &str, html: &[u8]) -> Res
         Ok(receipt)
     })();
     if result.is_err() {
-        let _ = studio::phone_call(adb, device, json!({"op":"local-abort","upload":upload}));
+        let _ =
+            studio::phone_call_unverified(adb, device, json!({"op":"local-abort","upload":upload}));
     }
     result
 }
@@ -161,8 +167,9 @@ pub fn open_local(adb: &Adb, device: &Device, id: &str) -> Result<Value> {
     );
     // A loaded document is not a functional-test verdict; the UI keeps the
     // distinction between delivery, page readiness and actual interaction QA.
-    for _ in 0..12 {
-        let status = local_status(adb, device)?;
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    for _ in 0..40 {
+        let status = studio::phone_call_unverified(adb, device, json!({"op":"local-status"}))?;
         if status["lastOpen"] == id
             && status["openToken"] == token
             && status["readyAt"].as_u64().unwrap_or(0) > 0
@@ -173,7 +180,7 @@ pub fn open_local(adb: &Adb, device: &Device, id: &str) -> Result<Value> {
             );
             return Ok(status);
         }
-        std::thread::sleep(std::time::Duration::from_millis(250));
+        std::thread::sleep(std::time::Duration::from_millis(60));
     }
     bail!("手机已打开窗口，但作品页面尚未确认载入；请在手机检查")
 }

@@ -116,6 +116,12 @@ impl Companion {
         if self.amoo_ui.snapshot_job.is_some() && !self.amoo_gateway_online {
             return "正在连接手机 Amoo…".into();
         }
+        if matches!(self.page, Page::Amoo) {
+            if let Some(run) = &self.workspace.running {
+                let secs = run.started_at.elapsed().as_secs();
+                return format!("正在执行任务（{}s）", secs);
+            }
+        }
         if matches!(self.status.as_str(), "就绪" | "") {
             return if self.selected.is_some() {
                 "设备已连接"

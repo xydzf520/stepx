@@ -18,7 +18,7 @@ struct SyncRequest {
 pub(super) struct SyncWorker {
     transport: String,
     sender: mpsc::Sender<SyncRequest>,
-    reset_baseline: Arc<std::sync::atomic::AtomicBool>,
+    pub(super) reset_baseline: Arc<std::sync::atomic::AtomicBool>,
     has_pending: Arc<std::sync::atomic::AtomicBool>,
     delta_rx: mpsc::Receiver<Vec<amoo::StreamDelta>>,
 }
@@ -68,7 +68,7 @@ impl SyncWorker {
                 }
                 let mut request = match next_req {
                     Some(request) => request,
-                    None => match receiver.recv_timeout(Duration::from_secs(12)) {
+                    None => match receiver.recv_timeout(Duration::from_secs(25)) {
                         Ok(request) => request,
                         Err(mpsc::RecvTimeoutError::Timeout) => {
                             bus = None;
@@ -85,23 +85,29 @@ impl SyncWorker {
                 if worker_reset.swap(false, std::sync::atomic::Ordering::SeqCst) {
                     previous = None;
                 }
-                // Escalation/de-escalation releases the previous task lease on this worker,
-                // never on the UI thread. An idle observer must not keep the phone awake.
-                if bus.as_ref().is_some_and(|(task, _)| *task != request.task) {
+                // Escalation releases the previous passive observer on this worker,
+                // never on the UI thread. A warm task bus already supports observe reads
+                // and is released automatically when the worker idles out.
+                if bus.as_ref().is_some_and(|(task, _)| !*task && request.task) {
                     bus = None;
                 }
                 let started = Instant::now();
                 let reused = bus.is_some();
-                let result = (|| -> Result<RealAmooData> {
+                let mut try_snapshot = |use_task_connect: bool,
+                                        reset_bus: bool|
+                 -> Result<RealAmooData> {
+                    if reset_bus {
+                        bus = None;
+                    }
                     if bus.is_none() {
-                        bus = Some((
-                            request.task,
-                            if request.task {
-                                amoo::AgentBus::connect(&adb, &device)?
-                            } else {
-                                amoo::AgentBus::observe(&adb, &device)?
-                            },
-                        ));
+                        bus = Some(if use_task_connect {
+                            (true, amoo::AgentBus::connect(&adb, &device)?)
+                        } else {
+                            match amoo::AgentBus::observe(&adb, &device) {
+                                Ok(observed) => (false, observed),
+                                Err(_) => (true, amoo::AgentBus::connect(&adb, &device)?),
+                            }
+                        });
                     }
                     let active_bus = &mut bus.as_mut().unwrap().1;
                     let data = active_bus
@@ -112,7 +118,12 @@ impl SyncWorker {
                         }
                     }
                     Ok(data)
-                })()
+                };
+                let result = match try_snapshot(request.task, false) {
+                    Ok(data) => Ok(data),
+                    Err(_) if !request.task => try_snapshot(true, true),
+                    Err(err) => Err(err),
+                }
                 .map_err(|e| format!("{e:#}"));
                 if result.is_err() {
                     bus = None;
@@ -168,12 +179,51 @@ fn matches_request(
         && key == job.key.as_deref()
 }
 impl Companion {
+    pub(super) fn current_amoo_sync_key(&self) -> Option<String> {
+        let work_key = (self.page == Page::Work && self.workspace.running.is_none())
+            .then(|| self.work_session().map(|s| s.session_key.clone()))
+            .flatten();
+        work_key
+            .or_else(|| self.workspace_task().and_then(|t| t.session.clone()))
+            .or_else(|| {
+                self.amoo_sessions
+                    .get(self.amoo_session_idx)
+                    .map(|s| s.session_key.clone())
+            })
+    }
+
+    pub(super) fn request_amoo_session_sync(&mut self, key: Option<String>) {
+        if self.demo_mode || self.selected.is_none() {
+            return;
+        }
+        let key = key.or_else(|| self.current_amoo_sync_key());
+        self.amoo_ui.snapshot_generation = self.amoo_ui.snapshot_generation.wrapping_add(1);
+        if let Some(worker) = self.amoo_ui.snapshot_worker.as_ref() {
+            worker
+                .reset_baseline
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.amoo_ui.snapshot_job = None;
+        self.amoo_poll_remaining = self.amoo_poll_remaining.max(4);
+        self.last_amoo_poll = Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .unwrap_or_else(Instant::now);
+        let pending = self.workspace_sync_pending_keys();
+        self.begin_amoo_sync(key, pending, true);
+    }
+
+    pub(super) fn refresh_amoo_background(&mut self) {
+        let key = self.current_amoo_sync_key();
+        self.request_amoo_session_sync(key);
+    }
+
     pub(super) fn begin_amoo_sync(
         &mut self,
         key: Option<String>,
         pending: Vec<String>,
         initial: bool,
     ) {
+        let key = key.or_else(|| self.current_amoo_sync_key());
         if let Some(worker) = self.amoo_ui.snapshot_worker.as_ref() {
             worker
                 .has_pending
@@ -229,11 +279,12 @@ impl Companion {
     }
 
     fn apply_stream_delta(&mut self, delta: amoo::StreamDelta) -> bool {
-        self.workspace.stream_delta_count = self.workspace.stream_delta_count.saturating_add(1);
-        if let Some(tool) = &delta.tool_status {
-            self.workspace.stream_tool_status = Some(tool.clone());
-        } else if delta.finished {
-            self.workspace.stream_tool_status = None;
+        if !delta.session_key.is_empty()
+            && (self.workspace.stopped_sessions.contains(&delta.session_key)
+                || self.workspace.deleted_sessions.contains(&delta.session_key))
+            && !self.amoo_pending_reply.contains_key(&delta.session_key)
+        {
+            return false;
         }
 
         let session_idx = if !delta.session_key.is_empty() {
@@ -248,13 +299,46 @@ impl Companion {
                 .position(|s| self.amoo_pending_reply.contains_key(&s.session_key))
         };
 
-        let mut updated_text: Option<String> = None;
         let mut resolved_session_key = delta.session_key.clone();
+        if resolved_session_key.is_empty() {
+            if let Some(idx) = session_idx {
+                resolved_session_key = self.amoo_sessions[idx].session_key.clone();
+            }
+        }
+        if !resolved_session_key.is_empty()
+            && (self
+                .workspace
+                .stopped_sessions
+                .contains(&resolved_session_key)
+                || self
+                    .workspace
+                    .deleted_sessions
+                    .contains(&resolved_session_key))
+            && !self.amoo_pending_reply.contains_key(&resolved_session_key)
+        {
+            return false;
+        }
+
+        let active_task_session = self.workspace_task().and_then(|t| t.session.as_deref());
+        let is_active = !resolved_session_key.is_empty()
+            && (active_task_session == Some(resolved_session_key.as_str())
+                || (active_task_session.is_none()
+                    && self
+                        .amoo_sessions
+                        .get(self.amoo_session_idx)
+                        .is_some_and(|s| s.session_key == resolved_session_key)));
+        if is_active {
+            self.workspace.stream_delta_count = self.workspace.stream_delta_count.saturating_add(1);
+            if let Some(tool) = &delta.tool_status {
+                self.workspace.stream_tool_status = Some(tool.clone());
+            } else if delta.finished {
+                self.workspace.stream_tool_status = None;
+            }
+        }
+
+        let mut updated_text: Option<String> = None;
         if let Some(idx) = session_idx {
             let session = &mut self.amoo_sessions[idx];
-            if resolved_session_key.is_empty() {
-                resolved_session_key = session.session_key.clone();
-            }
             let needs_new_item = !matches!(
                 session.items.last(),
                 Some(AmooChatItem::AssistantRich { .. })
@@ -316,9 +400,11 @@ impl Companion {
                 .filter(|r| r.executor == stepx_companion::amoo_workspace::Executor::Phone)
                 .map(|r| r.task.clone());
             if let Some(task) = self.workspace.journal.tasks.iter_mut().find(|t| {
-                (!resolved_session_key.is_empty()
-                    && t.session.as_deref() == Some(resolved_session_key.as_str()))
-                    || running_task_id.as_deref() == Some(t.id.as_str())
+                if !resolved_session_key.is_empty() {
+                    t.session.as_deref() == Some(resolved_session_key.as_str())
+                } else {
+                    running_task_id.as_deref() == Some(t.id.as_str())
+                }
             }) {
                 if task.turns.last().is_some_and(|t| !t.user) {
                     if let Some(last) = task.turns.last_mut() {
@@ -337,7 +423,9 @@ impl Companion {
             }
         }
 
-        self.reveal_latest_chat();
+        if is_active {
+            self.reveal_latest_chat();
+        }
         true
     }
 
@@ -366,16 +454,18 @@ impl Companion {
             Err(mpsc::TryRecvError::Disconnected) => Err("后台同步已结束，下次自动重试".into()),
         };
         let job = self.amoo_ui.snapshot_job.take().unwrap();
-        let key = self
-            .amoo_sessions
-            .get(self.amoo_session_idx)
-            .map(|s| s.session_key.as_str());
+        let current_key = self.current_amoo_sync_key();
+        let expected_key = if job.key.is_none() {
+            None
+        } else {
+            current_key.as_deref()
+        };
         if !matches_request(
             &job,
             self.amoo_ui.snapshot_generation,
             self.selected.as_ref().map(|d| d.serial.as_str()),
-            key,
-            self.busy || self.work.running || self.amoo_ui.gui_running,
+            expected_key,
+            false,
         ) {
             // A newer foreground operation or session switch owns the state.
             // A discarded result must not become the deduplication baseline:
@@ -408,7 +498,12 @@ impl Companion {
                         })
                     })
                     .collect();
-                self.apply(Outcome::AmooRealData(data, "已刷新后台对话".into()));
+                let msg = if self.busy {
+                    String::new()
+                } else {
+                    "已刷新后台对话".into()
+                };
+                self.apply(Outcome::AmooRealData(data, msg));
                 for (session_key, live_item) in live_items {
                     if self.amoo_pending_reply.contains_key(&session_key) {
                         if let Some(session) = self
@@ -479,5 +574,50 @@ mod tests {
             Some("chat-a"),
             true
         ));
+    }
+
+    #[test]
+    fn passive_real_amoo_sync_preserves_welcome_screen_sentinel_index() {
+        let mut app = Companion::new_for_test();
+        app.page = Page::Amoo;
+        app.workspace.active = None;
+        app.amoo_session_idx = usize::MAX;
+        let real = RealAmooData {
+            gateway_version: "1.0".into(),
+            gateway_online: true,
+            selected_session: Some("agent:main:existing".into()),
+            sessions: vec![openclaw::RealSessionInfo {
+                key: "agent:main:existing".into(),
+                title: "已有会话".into(),
+                agent: "Amoo".into(),
+                status: "就绪".into(),
+                history_loaded: true,
+                ..Default::default()
+            }],
+            memory_initialized: true,
+            ..Default::default()
+        };
+        app.apply_real_amoo_data_recorded(real);
+        assert_eq!(app.amoo_session_idx, usize::MAX);
+        assert_eq!(app.amoo_sessions.len(), 1);
+    }
+
+    #[test]
+    fn background_non_amoo_busy_demotes_on_amoo_and_does_not_drop_sync_snapshot() {
+        let mut app = Companion::new_for_test();
+        app.initializing = false;
+        app.selected = Some(Device {
+            serial: "phone-a".into(),
+            transport: "phone-a".into(),
+            model: "STEPX".into(),
+            android: "15".into(),
+            product: "stepx".into(),
+        });
+        app.busy = true;
+        app.job_page = Page::Overview;
+        app.page = Page::Amoo;
+        app.demote_busy_if_background();
+        assert!(!app.busy);
+        assert_eq!(app.bg_receivers.len(), 1);
     }
 }

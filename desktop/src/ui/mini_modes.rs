@@ -86,6 +86,24 @@ fn memory_mode(mode: ShellMode) -> stepx_companion::window_preferences::Mode {
     }
 }
 
+fn mix_color(a: ColorU, b: ColorU, t: f32) -> ColorU {
+    let t = t.clamp(0.0, 1.0);
+    if t <= 0.0 {
+        return a;
+    }
+    if t >= 1.0 {
+        return b;
+    }
+    let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    if a.a == 0 {
+        return ColorU::new(b.r, b.g, b.b, mix(0, b.a));
+    }
+    if b.a == 0 {
+        return ColorU::new(a.r, a.g, a.b, mix(a.a, 0));
+    }
+    ColorU::new(mix(a.r, b.r), mix(a.g, b.g), mix(a.b, b.b), mix(a.a, b.a))
+}
+
 /// Clamp to the current display, including displays with negative origins.
 fn fitted_bounds(current: RectF, display: RectF, size: Vector2F) -> RectF {
     let size = vec2f(
@@ -177,6 +195,29 @@ impl Companion {
                 Page::Amoo
             };
             self.compact.history = false;
+            if mode == ShellMode::MiniAi && self.push.clipboard_preview.trim().is_empty() {
+                let raw_clip = ctx.clipboard().read().plain_text.trim().to_string();
+                let effective = if !raw_clip.is_empty() {
+                    raw_clip
+                } else if !self
+                    .back_screen
+                    .stepos_suite
+                    .phone_clipboard
+                    .trim()
+                    .is_empty()
+                {
+                    self.back_screen
+                        .stepos_suite
+                        .phone_clipboard
+                        .trim()
+                        .to_string()
+                } else {
+                    String::new()
+                };
+                if !effective.is_empty() {
+                    self.push.clipboard_preview = Self::truncate_chars(&effective, 240);
+                }
+            }
             if self.push.pin_window {
                 self.set_compact_pin(true, ctx);
             }
@@ -258,15 +299,30 @@ impl Companion {
         let font = self.font;
         let control = Hoverable::new(state, move |mouse| {
             let hovered = mouse.is_mouse_over_element();
+            let t = if self.settings.value.reduced_motion {
+                if hovered {
+                    1.0
+                } else {
+                    0.0
+                }
+            } else {
+                mouse.hover_progress().clamp(0.0, 1.0)
+            };
             let bg = if mouse.is_clicked() {
                 p.accent_soft
-            } else if hovered {
-                p.hover
             } else {
-                p.surface
+                mix_color(p.surface, p.hover, t)
             };
-            let border = if hovered { p.accent } else { p.border };
-            let fg = if hovered { p.accent } else { p.text2 };
+            let border = if mouse.is_clicked() {
+                p.accent
+            } else {
+                mix_color(p.border, p.accent, t)
+            };
+            let fg = if mouse.is_clicked() || hovered {
+                p.accent
+            } else {
+                mix_color(p.text2, p.accent, t)
+            };
             Container::new(
                 ConstrainedBox::new(
                     Align::new(
@@ -310,27 +366,33 @@ impl Companion {
         let capture_state = self.mouse_state("clip-pill:compact-clip-capture");
         let capture_badge = Hoverable::new(capture_state, move |mouse| {
             let hovered = mouse.is_mouse_over_element();
+            let t = if self.settings.value.reduced_motion {
+                if hovered {
+                    1.0
+                } else {
+                    0.0
+                }
+            } else {
+                mouse.hover_progress().clamp(0.0, 1.0)
+            };
+            let bg = if mouse.is_clicked() {
+                p.accent_soft
+            } else {
+                mix_color(ColorU::transparent_black(), p.hover, t)
+            };
+            let fg = if mouse.is_clicked() || hovered {
+                p.accent
+            } else {
+                mix_color(p.text3, p.accent, t)
+            };
             Container::new(self.lead(
                 4.,
-                self.ui_icon(
-                    UiIcon::Clipboard,
-                    13.,
-                    if hovered { p.accent } else { p.text3 },
-                ),
-                self.line_w(
-                    snippet.clone(),
-                    MICRO,
-                    if hovered { p.accent } else { p.text3 },
-                    Weight::Medium,
-                ),
+                self.ui_icon(UiIcon::Clipboard, 13., fg),
+                self.line_w(snippet.clone(), MICRO, fg, Weight::Medium),
             ))
             .with_horizontal_padding(6.)
             .with_vertical_padding(3.)
-            .with_background_color(if hovered {
-                p.hover
-            } else {
-                ColorU::transparent_black()
-            })
+            .with_background_color(bg)
             .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_TAG)))
             .finish()
         })
@@ -726,11 +788,11 @@ impl Companion {
             let content = self.between(
                 self.lead(
                     S3,
-                    self.icon_box(
+                    self.ui_icon_box(
                         if thread.channel() == ImChannel::Sms {
-                            "✉"
+                            UiIcon::Sms
                         } else {
-                            "💬"
+                            UiIcon::Chat
                         },
                         36.,
                         p.surface,
@@ -757,14 +819,30 @@ impl Companion {
             let action = Action::Push(PushAction::SelectImThread(thread.thread_id.clone()));
             cards.push(
                 Hoverable::new(state, move |mouse| {
+                    let hovered = mouse.is_mouse_over_element();
+                    let t = if self.settings.value.reduced_motion {
+                        if hovered {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    } else {
+                        mouse.hover_progress().clamp(0.0, 1.0)
+                    };
+                    let bg = if mouse.is_clicked() {
+                        p.accent_soft
+                    } else {
+                        mix_color(p.bg, p.hover, t)
+                    };
+                    let border = if mouse.is_clicked() {
+                        p.border_strong
+                    } else {
+                        mix_color(p.border, p.border_strong, t)
+                    };
                     Container::new(content)
                         .with_uniform_padding(S3)
-                        .with_background_color(if mouse.is_mouse_over_element() {
-                            p.hover
-                        } else {
-                            p.bg
-                        })
-                        .with_border(Border::all(1.).with_border_color(p.border))
+                        .with_background_color(bg)
+                        .with_border(Border::all(1.).with_border_color(border))
                         .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
                         .finish()
                 })

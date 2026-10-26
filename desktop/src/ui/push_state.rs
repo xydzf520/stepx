@@ -87,6 +87,11 @@ pub(super) enum PushAction {
     OpenMiniNotifyWindow,
     TriggerTestToast,
     LoadDemoPush,
+    SetCallFilter(u8),
+    SetNotifCategory(u8),
+    FillSmsTemplate(String),
+    SelectCalendarQuickTime(String),
+    OpenNewAmooChat,
 }
 
 pub(super) enum PushOutcome {
@@ -98,6 +103,9 @@ pub(super) enum PushOutcome {
     PermissionEnsured(String, Result<bool, String>),
 }
 
+#[allow(dead_code)]
+pub(super) type PushUi = PushUiState;
+
 pub(super) struct PushUiState {
     pub snapshot: PushSnapshot,
     pub loaded: bool,
@@ -105,6 +113,8 @@ pub(super) struct PushUiState {
     pub sync_started: Instant,
     pub error: Option<String>,
     pub category: PushCategory,
+    pub notif_category: u8,
+    pub call_filter: u8,
     pub app_filter: Option<String>,
     pub collapse_ongoing: bool,
     pub selected_key: Option<String>,
@@ -127,6 +137,87 @@ pub(super) struct PushUiState {
     pub outcome_rx: mpsc::Receiver<PushOutcome>,
 }
 
+pub(super) const MAX_SEEN_TOAST_KEYS: usize = 2048;
+const MAX_IM_DRAFTS: usize = 128;
+
+impl PushUiState {
+    fn snapshot_active_toast_keys(next: &PushSnapshot) -> HashSet<String> {
+        let mut active_keys = HashSet::with_capacity(
+            next.notifications.len() * 2 + next.threads.len() * 2 + next.otp_banners.len(),
+        );
+        for n in &next.notifications {
+            if !n.key.is_empty() {
+                active_keys.insert(n.key.clone());
+            }
+            active_keys.insert(format!("seq:{}", n.seq_id));
+        }
+        for t in &next.threads {
+            if !t.thread_id.is_empty() {
+                active_keys.insert(t.thread_id.clone());
+            }
+            if !t.notification_key.is_empty() {
+                active_keys.insert(t.notification_key.clone());
+            }
+        }
+        for b in &next.otp_banners {
+            if !b.code.is_empty() {
+                active_keys.insert(b.code.clone());
+            }
+        }
+        active_keys
+    }
+
+    /// Bound `seen_toast_keys` at `MAX_SEEN_TOAST_KEYS` (2048) entries by retaining
+    /// keys still present in the current `PushSnapshot` and evicting stale keys when full.
+    pub(super) fn cap_seen_toast_keys(&mut self, next: &PushSnapshot) {
+        if self.seen_toast_keys.len() < MAX_SEEN_TOAST_KEYS {
+            return;
+        }
+        let active_keys = Self::snapshot_active_toast_keys(next);
+        if !active_keys.is_empty() {
+            self.seen_toast_keys.retain(|k| active_keys.contains(k));
+        }
+        while self.seen_toast_keys.len() > MAX_SEEN_TOAST_KEYS {
+            let victim = self
+                .seen_toast_keys
+                .iter()
+                .find(|k| !active_keys.contains(*k))
+                .or_else(|| self.seen_toast_keys.iter().next())
+                .cloned();
+            let Some(victim) = victim else {
+                break;
+            };
+            self.seen_toast_keys.remove(&victim);
+        }
+    }
+
+    pub(super) fn enforce_seen_toast_keys_bound(&mut self, next: &PushSnapshot) {
+        if self.seen_toast_keys.len() > MAX_SEEN_TOAST_KEYS {
+            self.cap_seen_toast_keys(next);
+        }
+    }
+
+    pub(super) fn insert_seen_toast_key(&mut self, key: String, next: &PushSnapshot) {
+        if !self.seen_toast_keys.contains(&key) && self.seen_toast_keys.len() >= MAX_SEEN_TOAST_KEYS
+        {
+            let active_keys = Self::snapshot_active_toast_keys(next);
+            while self.seen_toast_keys.len() >= MAX_SEEN_TOAST_KEYS {
+                let victim = self
+                    .seen_toast_keys
+                    .iter()
+                    .find(|k| !active_keys.contains(*k))
+                    .or_else(|| self.seen_toast_keys.iter().next())
+                    .cloned();
+                let Some(victim) = victim else {
+                    break;
+                };
+                self.seen_toast_keys.remove(&victim);
+            }
+        }
+        self.seen_toast_keys.insert(key);
+    }
+}
+
 impl Default for PushUiState {
     fn default() -> Self {
         let (outcome_tx, outcome_rx) = mpsc::channel();
@@ -137,6 +228,8 @@ impl Default for PushUiState {
             sync_started: Instant::now(),
             error: None,
             category: PushCategory::All,
+            notif_category: 0,
+            call_filter: 0,
             app_filter: None,
             collapse_ongoing: true,
             selected_key: None,
@@ -170,7 +263,7 @@ impl Companion {
         }
         let snap = push::demo_push_snapshot();
         for n in &snap.notifications {
-            self.push.seen_toast_keys.insert(n.key.clone());
+            self.push.insert_seen_toast_key(n.key.clone(), &snap);
         }
         self.push.selected_im_thread = snap.threads.first().map(|t| t.thread_id.clone());
         self.push.selected_key = snap.notifications.first().map(|n| n.key.clone());
@@ -301,7 +394,10 @@ impl Companion {
                 }
             }
             PushAction::SelectCategory(cat) => {
-                self.push.category = *cat;
+                if self.push.category != *cat {
+                    self.push.category = *cat;
+                    self.trigger_subtab_switch();
+                }
                 if let Some(first) = self
                     .push
                     .snapshot
@@ -313,7 +409,10 @@ impl Companion {
                 }
             }
             PushAction::SelectAppFilter(app) => {
-                self.push.app_filter = app.clone();
+                if self.push.app_filter != *app {
+                    self.push.app_filter = app.clone();
+                    self.trigger_subtab_switch();
+                }
             }
             PushAction::ToggleCollapseOngoing => {
                 self.push.collapse_ongoing = !self.push.collapse_ongoing;
@@ -438,12 +537,18 @@ impl Companion {
                 ctx.clipboard()
                     .write(ClipboardContent::plain_text(url.clone()));
                 if url.starts_with("https://") || url.starts_with("http://") {
-                    #[cfg(target_os = "linux")]
-                    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
-                    #[cfg(target_os = "macos")]
-                    let _ = std::process::Command::new("open").arg(url).spawn();
-                    #[cfg(target_os = "windows")]
-                    let _ = std::process::Command::new("explorer.exe").arg(url).spawn();
+                    let url = url.clone();
+                    std::thread::spawn(move || {
+                        #[cfg(target_os = "linux")]
+                        let child = std::process::Command::new("xdg-open").arg(&url).spawn();
+                        #[cfg(target_os = "macos")]
+                        let child = std::process::Command::new("open").arg(&url).spawn();
+                        #[cfg(target_os = "windows")]
+                        let child = std::process::Command::new("explorer.exe").arg(&url).spawn();
+                        if let Ok(mut c) = child {
+                            let _ = c.wait();
+                        }
+                    });
                 }
                 self.status = format!("已在浏览器打开并复制链接：{url}");
             }
@@ -505,7 +610,10 @@ impl Companion {
                 self.status = format!("已为「{title}」准备常用回复建议，请检查后发送");
             }
             PushAction::SelectImChannel(ch) => {
-                self.push.im_channel = *ch;
+                if self.push.im_channel != *ch {
+                    self.push.im_channel = *ch;
+                    self.trigger_subtab_switch();
+                }
                 if *ch != ImChannel::Sms {
                     let current_matches = self
                         .push
@@ -536,9 +644,19 @@ impl Companion {
                 }
                 if self.push.selected_im_thread.as_ref() != Some(thread_id) {
                     if let Some(previous) = &self.push.selected_im_thread {
-                        self.push
-                            .im_drafts
-                            .insert(previous.clone(), self.fields[F_IM_REPLY].text.clone());
+                        let draft = self.fields[F_IM_REPLY].text.clone();
+                        if draft.trim().is_empty() {
+                            self.push.im_drafts.remove(previous);
+                        } else {
+                            if !self.push.im_drafts.contains_key(previous)
+                                && self.push.im_drafts.len() >= MAX_IM_DRAFTS
+                            {
+                                if let Some(victim) = self.push.im_drafts.keys().next().cloned() {
+                                    self.push.im_drafts.remove(&victim);
+                                }
+                            }
+                            self.push.im_drafts.insert(previous.clone(), draft);
+                        }
                     }
                     self.fields[F_IM_REPLY].set(
                         self.push
@@ -656,9 +774,9 @@ impl Companion {
                 self.push.prefs.privacy_mask = !self.push.prefs.privacy_mask;
                 let _ = desktop_notify::save_preferences(&self.push.prefs);
                 self.status = if self.push.prefs.privacy_mask {
-                    "🔒 已开启防窥脱敏模式：通知正文将自动隐藏".into()
+                    "已开启防窥脱敏模式：通知正文将自动隐藏".into()
                 } else {
-                    "🔓 已关闭防窥脱敏模式：直接显示通知完整正文".into()
+                    "已关闭防窥脱敏模式：直接显示通知完整正文".into()
                 };
             }
             PushAction::ToggleAutoCopyOtp => {
@@ -782,7 +900,24 @@ impl Companion {
             }
             PushAction::CaptureClipboardPreview => {
                 let text = ctx.clipboard().read().plain_text.trim().to_string();
-                self.push.clipboard_preview = Self::truncate_chars(&text, 240);
+                let effective = if !text.is_empty() {
+                    text
+                } else if !self
+                    .back_screen
+                    .stepos_suite
+                    .phone_clipboard
+                    .trim()
+                    .is_empty()
+                {
+                    self.back_screen
+                        .stepos_suite
+                        .phone_clipboard
+                        .trim()
+                        .to_string()
+                } else {
+                    String::new()
+                };
+                self.push.clipboard_preview = Self::truncate_chars(&effective, 240);
                 self.status = if self.push.clipboard_preview.is_empty() {
                     "剪贴板暂无文本内容".into()
                 } else {
@@ -796,6 +931,18 @@ impl Companion {
                     raw_clip
                 } else if !self.push.clipboard_preview.trim().is_empty() {
                     self.push.clipboard_preview.trim().to_string()
+                } else if !self
+                    .back_screen
+                    .stepos_suite
+                    .phone_clipboard
+                    .trim()
+                    .is_empty()
+                {
+                    self.back_screen
+                        .stepos_suite
+                        .phone_clipboard
+                        .trim()
+                        .to_string()
                 } else if self.demo_mode {
                     "StepX Companion Desktop AI Workspace & Mobile Bridge".to_string()
                 } else {
@@ -816,6 +963,7 @@ impl Companion {
                     self.set_compact_mode(ShellMode::MiniAi, ctx);
                 }
                 self.compact.history = false;
+                self.workspace.sub_view = 0;
                 self.workspace.history = false;
                 self.workspace.panel = 0;
                 self.fields[F_AMOO].set(&prompt);
@@ -896,6 +1044,52 @@ impl Companion {
                 }
                 self.init_demo_push();
                 self.status = "已载入微信/飞书/钉钉/企微演示会话与全量手机推送数据".into();
+            }
+            PushAction::SetCallFilter(flt) => {
+                self.push.call_filter = *flt;
+                self.call_filter_missed = *flt == 1;
+                self.trigger_subtab_switch();
+                let label = match *flt {
+                    1 => "未接来电",
+                    2 => "呼入通话",
+                    3 => "呼出通话",
+                    _ => "全部通话记录",
+                };
+                self.status = format!("已筛选通话记录：{label}");
+                self.error = false;
+            }
+            PushAction::SetNotifCategory(cat) => {
+                self.push.notif_category = *cat;
+                self.trigger_subtab_switch();
+                let label = match *cat {
+                    1 => "验证码/取件码",
+                    2 => "社交通讯",
+                    3 => "系统与服务",
+                    _ => "全部通知",
+                };
+                self.status = format!("已切换通知快捷分组：{label}");
+                self.error = false;
+            }
+            PushAction::FillSmsTemplate(tpl) => {
+                self.fields[F_SMS_BODY].set(tpl);
+                self.pending_sms_plan = None;
+                self.focus_field(F_SMS_BODY, ctx);
+                self.status = format!("已填入短信快捷模板：「{tpl}」");
+                self.error = false;
+            }
+            PushAction::SelectCalendarQuickTime(time_str) => {
+                self.fields[F_CALENDAR_TIME].set(time_str);
+                self.focus_field(F_PHONE_SCHEDULE_TITLE, ctx);
+                self.status = format!("已选择日程时间：{time_str}");
+                self.error = false;
+            }
+            PushAction::OpenNewAmooChat => {
+                self.set_compact_mode(ShellMode::Full, ctx);
+                self.page = Page::Amoo;
+                self.handle_workspace(&WorkspaceAction::New, ctx);
+                self.focus_field(F_AMOO, ctx);
+                self.status = "已为您新建 Amoo 对话，请直接输入问题或指令".into();
+                self.error = false;
             }
         }
     }
@@ -978,7 +1172,7 @@ impl Companion {
 
         if immediate_sent {
             self.push.sending_thread = None;
-            let status_msg = format!("✓ 已通过同 Wi-Fi RemoteInput 秒回「{title}」：{text}");
+            let status_msg = format!("已通过同 Wi-Fi RemoteInput 秒回「{title}」：{text}");
             self.push.last_reply_status = Some(status_msg.clone());
             self.status = status_msg;
             return;
@@ -986,7 +1180,7 @@ impl Companion {
 
         if let Some(device) = self.selected.clone() {
             self.push.sending_thread = Some(thread_id.to_string());
-            let waiting = format!("⏳ 正在向「{title}」发送回复…");
+            let waiting = format!("正在向「{title}」发送回复…");
             self.push.last_reply_status = Some(waiting.clone());
             self.status = waiting;
             let tx = self.push.outcome_tx.clone();
@@ -1031,6 +1225,7 @@ impl Companion {
                 match res {
                     Ok(mut next) => {
                         push::merge_local_replies(&mut next, &self.push.snapshot);
+                        self.push.cap_seen_toast_keys(&next);
                         let active_thread_id =
                             if self.push.shell_mode == ShellMode::Full && self.page == Page::Sms {
                                 self.push.selected_im_thread.as_deref()
@@ -1044,12 +1239,13 @@ impl Companion {
                             &self.push.prefs,
                             active_thread_id,
                         );
+                        self.push.enforce_seen_toast_keys_bound(&next);
                         for toast in new_toasts {
                             if self.push.prefs.auto_copy_otp {
                                 if let Some(code) = &toast.otp_code {
                                     ctx.clipboard()
                                         .write(ClipboardContent::plain_text(code.clone()));
-                                    self.status = format!("🔑 已自动复制验证码 {code} 到剪贴板");
+                                    self.status = format!("已自动复制验证码 {code} 到剪贴板");
                                 }
                             }
                             if matches!(
@@ -1141,7 +1337,7 @@ impl Companion {
                             }
                         }
                         let msg = if receipt.message.is_empty() {
-                            "✓ 消息已通过同 Wi-Fi 通道直接发出".to_string()
+                            "消息已通过同 Wi-Fi 通道直接发出".to_string()
                         } else {
                             receipt.message
                         };
@@ -1289,9 +1485,14 @@ impl Companion {
                 let tx = self.push.outcome_tx.clone();
                 let serial = device.serial.clone();
                 let transport = device.transport.clone();
+                let since_revision = if self.push.loaded {
+                    self.push.snapshot.revision
+                } else {
+                    0
+                };
                 std::thread::spawn(move || {
                     let res = Adb::discover()
-                        .and_then(|adb| push::fetch_snapshot(&adb, &transport, 0))
+                        .and_then(|adb| push::fetch_snapshot(&adb, &transport, since_revision))
                         .map_err(|e| format!("{e:#}"));
                     let _ = tx.send(PushOutcome::Snapshot(serial, res));
                 });

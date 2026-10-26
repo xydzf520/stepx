@@ -1,9 +1,14 @@
 //! A decorative matrix is one layout/hit region, not 391 interactive widgets.
-use facloud_ui::{color::ColorU, elements::*, event::DispatchedEvent};
+use facloud_ui::{
+    color::ColorU,
+    elements::*,
+    event::{DispatchedEvent, Event},
+};
 use pathfinder_geometry::{
     rect::RectF,
     vector::{vec2f, Vector2F},
 };
+use std::sync::Arc;
 
 pub(super) struct LedGrid {
     frame: Vec<u8>,
@@ -11,6 +16,7 @@ pub(super) struct LedGrid {
     gap: f32,
     size: Option<Vector2F>,
     origin: Option<Point>,
+    on_pixel: Option<Arc<dyn Fn(usize, usize) -> super::Action + Send + Sync>>,
 }
 
 impl LedGrid {
@@ -21,7 +27,16 @@ impl LedGrid {
             gap,
             size: None,
             origin: None,
+            on_pixel: None,
         }
+    }
+
+    pub fn on_pixel_click(
+        mut self,
+        f: impl Fn(usize, usize) -> super::Action + Send + Sync + 'static,
+    ) -> Self {
+        self.on_pixel = Some(Arc::new(f));
+        self
     }
 
     fn natural_size(&self) -> Vector2F {
@@ -79,11 +94,55 @@ impl Element for LedGrid {
 
     fn dispatch_event(
         &mut self,
-        _: &DispatchedEvent,
-        _: &mut EventContext,
+        event: &DispatchedEvent,
+        ctx: &mut EventContext,
         _: &AppContext,
     ) -> bool {
-        false
+        let Some(cb) = &self.on_pixel else {
+            return false;
+        };
+        let (Some(origin), Some(size)) = (self.origin, self.size) else {
+            return false;
+        };
+        match event.raw_event() {
+            Event::RightMouseDown { position, .. } => {
+                if position.x() < origin.x()
+                    || position.y() < origin.y()
+                    || position.x() > origin.x() + size.x()
+                    || position.y() > origin.y() + size.y()
+                    || ctx.is_covered(Point::from_vec2f(*position, origin.z_index()))
+                {
+                    return false;
+                }
+                ctx.dispatch_typed_action(super::Action::ContextOpen(
+                    super::context_menu::Target::BackScreenCanvas,
+                    *position,
+                ));
+                return true;
+            }
+            Event::LeftMouseDown { position, .. } => {
+                if position.x() < origin.x()
+                    || position.y() < origin.y()
+                    || position.x() > origin.x() + size.x()
+                    || position.y() > origin.y() + size.y()
+                    || ctx.is_covered(Point::from_vec2f(*position, origin.z_index()))
+                {
+                    return false;
+                }
+                let pitch = (self.dot + self.gap).max(1.0);
+                let col = ((position.x() - origin.x()) / pitch).floor() as isize;
+                let row = ((position.y() - origin.y()) / pitch).floor() as isize;
+                if (0..17).contains(&col) && (0..23).contains(&row) {
+                    let (x, y) = (col as usize, row as usize);
+                    if !stepx_companion::device::is_backscreen_corner(x, y) {
+                        ctx.dispatch_typed_action(cb(x, y));
+                        return true;
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
     }
     fn size(&self) -> Option<Vector2F> {
         self.size

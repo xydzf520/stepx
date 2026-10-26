@@ -100,6 +100,8 @@ fn spawn(op: &str, data: serde_json::Value, directory: PathBuf) -> Result<Job> {
     drop(input);
     let stdout = child.stdout.take().unwrap();
     let (tx, receiver) = mpsc::channel();
+    let is_check = op == "check";
+    let dir_for_cleanup = directory.clone();
     std::thread::spawn(move || {
         let mut terminal = false;
         for line in BufReader::new(stdout).lines() {
@@ -119,6 +121,9 @@ fn spawn(op: &str, data: serde_json::Value, directory: PathBuf) -> Result<Job> {
             let _ = tx.send(Event::Error {
                 message: "更新工具意外退出，请重试".into(),
             });
+        }
+        if is_check {
+            let _ = std::fs::remove_dir_all(&dir_for_cleanup);
         }
     });
     Ok(Job {

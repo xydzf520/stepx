@@ -57,20 +57,20 @@ pub fn prepare_attachments(paths: &[PathBuf]) -> Result<Vec<Value>> {
         let mime = mime_type(path);
         let mut dimensions = None;
         if mime.starts_with("image/") {
-            let actual = match image::guess_format(&data) {
-                Ok(image::ImageFormat::Png) => "image/png",
-                Ok(image::ImageFormat::Jpeg) => "image/jpeg",
-                Ok(image::ImageFormat::WebP) => "image/webp",
-                Ok(image::ImageFormat::Gif) => "image/gif",
+            let (format, actual) = match image::guess_format(&data) {
+                Ok(fmt @ image::ImageFormat::Png) => (fmt, "image/png"),
+                Ok(fmt @ image::ImageFormat::Jpeg) => (fmt, "image/jpeg"),
+                Ok(fmt @ image::ImageFormat::WebP) => (fmt, "image/webp"),
+                Ok(fmt @ image::ImageFormat::Gif) => (fmt, "image/gif"),
                 _ => bail!("图片格式无效，请选择 PNG、JPEG、WebP 或 GIF 图片"),
             };
             if actual != mime {
                 bail!("图片扩展名与实际内容不一致，请重新保存为正确格式后上传")
             }
-            let (width, height) = image::ImageReader::new(std::io::Cursor::new(&data))
-                .with_guessed_format()?
-                .into_dimensions()
-                .context("无法读取图片尺寸，图片可能已损坏")?;
+            let (width, height) =
+                image::ImageReader::with_format(std::io::Cursor::new(&data), format)
+                    .into_dimensions()
+                    .context("无法读取图片尺寸，图片可能已损坏")?;
             if width == 0 || height == 0 || u64::from(width) * u64::from(height) > 64 * 1024 * 1024
             {
                 bail!("图片尺寸过大或无效，请缩小至 6400 万像素以内")
@@ -130,6 +130,165 @@ fn download_failure(info: Option<&Value>) -> &'static str {
     }
 }
 
+fn download_http_loopback(url: &str, dest: &std::path::Path) -> Result<()> {
+    use std::io::Write;
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::Duration;
+    const MAX_BYTES: usize = 8 * 1024 * 1024;
+    let parsed = url::Url::parse(url).map_err(|_| anyhow::anyhow!("invalid_url"))?;
+    if parsed.scheme() != "http" || parsed.host_str() != Some("127.0.0.1") {
+        bail!("invalid_url");
+    }
+    let port = parsed
+        .port()
+        .ok_or_else(|| anyhow::anyhow!("invalid_url"))?;
+    let mut path_and_query = parsed.path().to_string();
+    if path_and_query.is_empty() {
+        path_and_query.push('/');
+    }
+    if let Some(q) = parsed.query() {
+        path_and_query.push('?');
+        path_and_query.push_str(q);
+    }
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(10))
+        .map_err(|_| anyhow::anyhow!("network"))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(25)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(25)));
+    let req = format!(
+        "GET {path_and_query} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUser-Agent: StepX Desktop\r\nConnection: close\r\n\r\n"
+    );
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|_| anyhow::anyhow!("network"))?;
+    stream.flush().map_err(|_| anyhow::anyhow!("network"))?;
+
+    let mut buf = Vec::with_capacity(4096);
+    let mut tmp = [0u8; 4096];
+    let header_end = loop {
+        let n = stream
+            .read(&mut tmp)
+            .map_err(|_| anyhow::anyhow!("network"))?;
+        if n == 0 {
+            bail!("http");
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+        if buf.len() > 16384 {
+            bail!("http");
+        }
+    };
+    let header_str = String::from_utf8_lossy(&buf[..header_end - 4]);
+    let mut lines = header_str.split("\r\n");
+    let status_line = lines.next().unwrap_or("");
+    let status_code: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| anyhow::anyhow!("http"))?;
+    if status_code == 404 || status_code == 410 {
+        bail!("expired");
+    }
+    if status_code != 200 {
+        bail!("http");
+    }
+    let mut chunked = false;
+    let mut content_length: Option<usize> = None;
+    for line in lines {
+        if let Some((k, v)) = line.split_once(':') {
+            let k = k.trim().to_ascii_lowercase();
+            let v = v.trim().to_ascii_lowercase();
+            if k == "transfer-encoding" && v.contains("chunked") {
+                chunked = true;
+            } else if k == "content-length" {
+                content_length = v.parse::<usize>().ok();
+            }
+        }
+    }
+    if let Some(cl) = content_length {
+        if cl > MAX_BYTES {
+            bail!("too_large");
+        }
+    }
+    let body = if chunked {
+        let mut raw_body: Vec<u8> = buf.drain(header_end..).collect();
+        loop {
+            if raw_body.len() > MAX_BYTES + 65536 {
+                bail!("too_large");
+            }
+            let n = stream
+                .read(&mut tmp)
+                .map_err(|_| anyhow::anyhow!("network"))?;
+            if n == 0 {
+                break;
+            }
+            raw_body.extend_from_slice(&tmp[..n]);
+        }
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+        loop {
+            let Some(rel_crlf) = raw_body[pos..].windows(2).position(|w| w == b"\r\n") else {
+                bail!("http");
+            };
+            let size_line = std::str::from_utf8(&raw_body[pos..pos + rel_crlf])
+                .map_err(|_| anyhow::anyhow!("http"))?;
+            let size_hex = size_line.split(';').next().unwrap_or("").trim();
+            let chunk_size =
+                usize::from_str_radix(size_hex, 16).map_err(|_| anyhow::anyhow!("http"))?;
+            pos += rel_crlf + 2;
+            if chunk_size == 0 {
+                break;
+            }
+            if out.len() + chunk_size > MAX_BYTES {
+                bail!("too_large");
+            }
+            if pos + chunk_size + 2 > raw_body.len() {
+                bail!("http");
+            }
+            out.extend_from_slice(&raw_body[pos..pos + chunk_size]);
+            pos += chunk_size;
+            if &raw_body[pos..pos + 2] != b"\r\n" {
+                bail!("http");
+            }
+            pos += 2;
+        }
+        out
+    } else {
+        let mut out: Vec<u8> = buf.drain(header_end..).collect();
+        if out.len() > MAX_BYTES {
+            bail!("too_large");
+        }
+        while content_length.is_none_or(|cl| out.len() < cl) {
+            let n = stream
+                .read(&mut tmp)
+                .map_err(|_| anyhow::anyhow!("network"))?;
+            if n == 0 {
+                break;
+            }
+            if out.len() + n > MAX_BYTES {
+                bail!("too_large");
+            }
+            out.extend_from_slice(&tmp[..n]);
+        }
+        if let Some(cl) = content_length {
+            if out.len() < cl {
+                bail!("http");
+            }
+            out.truncate(cl);
+        }
+        out
+    };
+    if body.is_empty() {
+        bail!("empty");
+    }
+    let mut file = fs::File::create(dest)?;
+    file.write_all(&body)?;
+    file.flush()?;
+    Ok(())
+}
+
 /// Save a returned artifact through the phone's local blob server or its real HTTPS URL.
 /// Opaque blob identifiers and cloud filesystem paths are never guessed into URLs.
 pub fn download_artifact(
@@ -138,7 +297,7 @@ pub fn download_artifact(
     attachment: &crate::openclaw::RealAttachment,
     output: &std::path::Path,
 ) -> Result<DownloadedArtifact> {
-    use std::{process::Command, time::Duration};
+    use std::time::Duration;
     device.verify(adb)?;
     if output.exists() {
         bail!("目标文件已存在，请另选保存名称")
@@ -182,23 +341,44 @@ pub fn download_artifact(
     }
     let download = (|| -> Result<DownloadedArtifact> {
         let temp = tempfile::NamedTempFile::new_in(parent)?;
-        let payload = json!({"url":url,"output":temp.path(),"image":attachment.kind=="image"||attachment.mime.starts_with("image/")});
-        let mut command = crate::resources::python_command();
-        command.args(["-c", include_str!("amoo_download.py")]);
-        let result = crate::adb::run_process(
-            command,
-            Some(serde_json::to_vec(&payload)?),
-            Duration::from_secs(70),
-        )?;
-        let info = serde_json::from_slice::<Value>(&result.stdout).ok();
-        if !result.status.success() || info.as_ref().is_some_and(|info| info["ok"] == false) {
-            bail!(download_failure(info.as_ref()))
-        }
-        let info = info.context("附件下载返回无效")?;
-        let bytes = info["bytes"].as_u64().context("附件内容为空")?;
-        if bytes == 0 {
-            bail!("附件内容为空")
-        }
+        let (bytes, mime) = if url.starts_with("http://127.0.0.1:") {
+            if let Err(err) = download_http_loopback(&url, temp.path()) {
+                let code = err.to_string();
+                bail!(download_failure(Some(&json!({"error": code}))))
+            }
+            let bytes = fs::metadata(temp.path())?.len();
+            if bytes == 0 {
+                bail!("附件内容为空")
+            }
+            let mime = if !attachment.mime.is_empty() {
+                attachment.mime.clone()
+            } else {
+                mime_type(output).to_string()
+            };
+            (bytes, mime)
+        } else {
+            let payload = json!({"url":url,"output":temp.path(),"image":attachment.kind=="image"||attachment.mime.starts_with("image/")});
+            let mut command = crate::resources::python_command();
+            command.args(["-c", include_str!("amoo_download.py")]);
+            let result = crate::adb::run_process(
+                command,
+                Some(serde_json::to_vec(&payload)?),
+                Duration::from_secs(70),
+            )?;
+            let info = serde_json::from_slice::<Value>(&result.stdout).ok();
+            if !result.status.success() || info.as_ref().is_some_and(|info| info["ok"] == false) {
+                bail!(download_failure(info.as_ref()))
+            }
+            let info = info.context("附件下载返回无效")?;
+            let bytes = info["bytes"].as_u64().context("附件内容为空")?;
+            if bytes == 0 {
+                bail!("附件内容为空")
+            }
+            (
+                bytes,
+                info["mime"].as_str().unwrap_or(&attachment.mime).into(),
+            )
+        };
         if attachment.kind == "image" || attachment.mime.starts_with("image/") {
             verify_downloaded_image(temp.path())?;
         }
@@ -207,7 +387,7 @@ pub fn download_artifact(
         Ok(DownloadedArtifact {
             path: output.to_path_buf(),
             bytes,
-            mime: info["mime"].as_str().unwrap_or(&attachment.mime).into(),
+            mime,
         })
     })();
     if let Some(port) = forwarded {
@@ -217,18 +397,16 @@ pub fn download_artifact(
 }
 
 fn verify_downloaded_image(path: &std::path::Path) -> Result<()> {
-    let reader = image::ImageReader::open(path)?.with_guessed_format()?;
-    let (width, height) = reader
-        .into_dimensions()
+    use image::GenericImageView as _;
+    let decoded = image::ImageReader::open(path)?
+        .with_guessed_format()?
+        .decode()
         .context("下载的图片不完整或已损坏，请重试")?;
+    let (width, height) = decoded.dimensions();
     anyhow::ensure!(
         width > 0 && height > 0 && u64::from(width) * u64::from(height) <= 64 * 1024 * 1024,
         "下载的图片尺寸过大或无效"
     );
-    image::ImageReader::open(path)?
-        .with_guessed_format()?
-        .decode()
-        .context("下载的图片不完整或已损坏，请重试")?;
     Ok(())
 }
 
@@ -284,9 +462,20 @@ pub fn upload_attachments(
     device: &crate::device::Device,
     paths: &[PathBuf],
 ) -> Result<UploadedAttachments> {
+    upload_attachments_with_bus(adb, device, paths, None)
+}
+
+pub fn upload_attachments_with_bus(
+    adb: &crate::adb::Adb,
+    device: &crate::device::Device,
+    paths: &[PathBuf],
+    bus: Option<&mut crate::amoo::AgentBus>,
+) -> Result<UploadedAttachments> {
     use crate::adb::shell_quote;
-    use std::{io::Write, process::Command, time::Duration};
-    device.verify(adb)?;
+    use std::io::Write;
+    if bus.is_none() {
+        device.verify(adb)?;
+    }
     // Reuse byte/count validation; this reads only explicitly selected local files.
     let prepared = prepare_attachments(paths)?;
     if prepared.is_empty() {
@@ -308,16 +497,7 @@ pub fn upload_attachments(
             let mut snapshot = tempfile::NamedTempFile::new()?;
             snapshot.write_all(&data)?;
             snapshot.as_file().sync_all()?;
-            let mut digest = crate::resources::python_command();
-            digest.args(["-c","import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())"]).arg(snapshot.path());
-            let hash = crate::adb::run_process(digest, None, Duration::from_secs(10))?;
-            if !hash.status.success() {
-                bail!("无法计算附件校验值")
-            }
-            let sha = String::from_utf8(hash.stdout)?.trim().to_string();
-            if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
-                bail!("附件校验值无效")
-            }
+            let sha = artifact_content_key(&data);
             let remote = format!("{directory}/{index:02}-{name}");
             adb.transfer(
                 &device.transport,
@@ -325,13 +505,6 @@ pub fn upload_attachments(
                 snapshot.path(),
                 std::path::Path::new(&remote),
             )?;
-            let actual = adb.script(
-                &device.transport,
-                &format!("sha256sum {}", shell_quote(&remote)),
-            )?;
-            if actual.split_whitespace().next() != Some(sha.as_str()) {
-                bail!("附件上传校验失败，文件未发送给 Amoo")
-            }
             items.push(UploadedAttachment {
                 name: name.into(),
                 mime: attachment["mime"]
@@ -346,13 +519,29 @@ pub fn upload_attachments(
                 height: attachment["height"].as_u64().unwrap_or(0) as u32,
             });
         }
+        if !items.is_empty() {
+            let quoted_paths = items
+                .iter()
+                .map(|item| shell_quote(&item.device_path))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let actual = adb.script(&device.transport, &format!("sha256sum {quoted_paths}"))?;
+            let mut actual_sums = actual
+                .lines()
+                .filter_map(|line| line.split_whitespace().next());
+            for item in &items {
+                if actual_sums.next() != Some(item.sha256.as_str()) {
+                    bail!("附件上传校验失败，文件未发送给 Amoo")
+                }
+            }
+        }
         let image_paths = items
             .iter()
             .filter(|a| a.mime.starts_with("image/"))
             .map(|a| a.device_path.clone())
             .collect::<Vec<_>>();
         if !image_paths.is_empty() {
-            let urls = upload_native_images(adb, device, &image_paths)?;
+            let urls = upload_native_images(adb, device, &image_paths, bus)?;
             for item in &mut items {
                 if let Some(url) = urls.get(&item.device_path) {
                     item.url = url.clone();
@@ -376,15 +565,23 @@ fn upload_native_images(
     adb: &crate::adb::Adb,
     device: &crate::device::Device,
     paths: &[String],
+    bus: Option<&mut crate::amoo::AgentBus>,
 ) -> Result<std::collections::HashMap<String, String>> {
     // Upload precedes chat.send, so this connection owns a task lease for the
     // entire native upload. The phone routes directly to its local ability;
     // its screen-off edge WebSocket and cloud-account node lists are not needed.
-    let mut bus = crate::amoo::AgentBus::connect(adb, device)
-        .context("无法连接手机的图片上传服务，图片尚未发送")?;
-    let response = bus
-        .upload_local_images(paths)
-        .context("手机图片上传未完成，草稿已保留，请稍后重试")?;
+    let response = match bus {
+        Some(bus) => bus
+            .upload_local_images(paths)
+            .context("手机图片上传未完成，草稿已保留，请稍后重试")?,
+        None => {
+            let mut owned_bus = crate::amoo::AgentBus::connect(adb, device)
+                .context("无法连接手机的图片上传服务，图片尚未发送")?;
+            owned_bus
+                .upload_local_images(paths)
+                .context("手机图片上传未完成，草稿已保留，请稍后重试")?
+        }
+    };
     native_upload_results(&response, paths)
 }
 
@@ -425,9 +622,10 @@ pub fn send_files(
     prompt: &str,
     paths: &[PathBuf],
 ) -> Result<crate::amoo::PendingReply> {
-    let uploaded = upload_attachments(adb, device, paths)?;
+    let mut bus = crate::amoo::AgentBus::connect(adb, device)?;
+    let uploaded = upload_attachments_with_bus(adb, device, paths, Some(&mut bus))?;
     // Keep uploaded bytes after an uncertain send: retrying must never lose data.
-    let mut receipt = crate::amoo::AgentBus::connect(adb, device)?.send_with_attachments(
+    let mut receipt = bus.send_with_attachments(
         key,
         &uploaded.message(prompt),
         &uploaded.wire_attachments()?,

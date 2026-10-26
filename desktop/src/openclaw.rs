@@ -4,10 +4,12 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
     fs,
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
     path::PathBuf,
+    sync::{Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -775,7 +777,44 @@ fn extract_json_objects_containing(haystack: &str, needle: &str) -> Vec<Value> {
     out
 }
 
+static CREDENTIALS_CACHE: OnceLock<Mutex<Option<(Instant, Option<OpenClawCredentials>)>>> =
+    OnceLock::new();
+static ANDROID_ID_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
 pub fn load_openclaw_credentials() -> Option<OpenClawCredentials> {
+    let cache = CREDENTIALS_CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = cache.lock() {
+        if let Some((cached_at, ref creds)) = *guard {
+            if cached_at.elapsed() < Duration::from_secs(60) {
+                return creds.clone();
+            }
+        }
+    }
+    let loaded = load_openclaw_credentials_uncached();
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((Instant::now(), loaded.clone()));
+    }
+    loaded
+}
+
+pub fn save_openclaw_credentials(creds: &OpenClawCredentials) -> Result<()> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("缺少 HOME 目录")?;
+    let cache_path = home.join(".config/stepx/openclaw_auth.json");
+    if let Some(parent) = cache_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&cache_path, serde_json::to_string_pretty(creds)?)?;
+    if let Some(cache) = CREDENTIALS_CACHE.get() {
+        if let Ok(mut guard) = cache.lock() {
+            *guard = None;
+        }
+    }
+    Ok(())
+}
+
+fn load_openclaw_credentials_uncached() -> Option<OpenClawCredentials> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
     let cache_path = home.join(".config/stepx/openclaw_auth.json");
     if let Ok(text) = fs::read_to_string(&cache_path) {
@@ -869,13 +908,7 @@ pub fn load_openclaw_credentials() -> Option<OpenClawCredentials> {
             private_key,
             device_token,
         };
-        if let Some(parent) = cache_path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let _ = fs::write(
-            &cache_path,
-            serde_json::to_string_pretty(&creds).unwrap_or_default(),
-        );
+        let _ = save_openclaw_credentials(&creds);
         return Some(creds);
     }
     None
@@ -1060,10 +1093,32 @@ impl GatewayWs {
             })
         } else {
             let android_id = if let Some(d) = device {
-                adb.shell(&d.transport, &["settings", "get", "secure", "android_id"])
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string()
+                let key = if d.serial.is_empty() {
+                    &d.transport
+                } else {
+                    &d.serial
+                };
+                let cache = ANDROID_ID_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+                let cached = cache
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.get(key).cloned())
+                    .filter(|s| !s.is_empty());
+                if let Some(id) = cached {
+                    id
+                } else {
+                    let id = adb
+                        .shell(&d.transport, &["settings", "get", "secure", "android_id"])
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
+                    if !id.is_empty() {
+                        if let Ok(mut g) = cache.lock() {
+                            g.insert(key.clone(), id.clone());
+                        }
+                    }
+                    id
+                }
             } else {
                 "23392eef6ce29cb0".to_string()
             };
@@ -1359,7 +1414,7 @@ pub fn parse_chat_history_messages(messages_arr: &[Value]) -> Vec<RealChatMessag
         let mut text = text_parts.join("\n");
         if role != "user" && text.is_empty() {
             if let Some(err) = &error_message {
-                text = format!("⚠ 手机 OpenClaw 模型请求返回错误：{err}\n模型：{provider}/{model}");
+                text = format!("手机 OpenClaw 模型请求返回错误：{err}\n模型：{provider}/{model}");
             }
         }
 
@@ -1566,7 +1621,7 @@ mod tests {
         assert!(!creds.device_id.is_empty());
         assert!(!creds.device_token.is_empty());
         if let Ok(adb) = crate::adb::Adb::discover() {
-            if let Ok(device) = crate::device::Device::inspect(&adb, "ZYPZ261A01M692000LP") {
+            if let Ok(device) = crate::device::Device::inspect(&adb, &std::env::var("STEPX_WORKSPACE_TEST_SERIAL").expect("explicit test phone")) {
                 let data = fetch_real_amoo_data(&adb, &device)
                     .expect("should fetch real amoo data from phone");
                 println!(

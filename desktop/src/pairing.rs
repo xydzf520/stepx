@@ -151,7 +151,15 @@ pub struct RememberedDevice {
     pub model: String,
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(v: &bool) -> bool {
+    *v
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Preferences {
     pub devices: Vec<RememberedDevice>,
     pub selected_serial: Option<String>,
@@ -159,8 +167,26 @@ pub struct Preferences {
     pub first_connect_done: bool,
     #[serde(default)]
     pub adb_guide_seen: bool,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub auto_sync_calendar: bool,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub auto_sync_clipboard: bool,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub wireless: std::collections::BTreeMap<String, WirelessIdentity>,
+}
+
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            devices: Vec::new(),
+            selected_serial: None,
+            first_connect_done: false,
+            adb_guide_seen: false,
+            auto_sync_calendar: true,
+            auto_sync_clipboard: true,
+            wireless: std::collections::BTreeMap::new(),
+        }
+    }
 }
 
 /// Discovery hints are not credentials. Hardware identity is verified after TLS authentication.
@@ -234,5 +260,28 @@ impl Preferences {
             model,
         });
         self.selected_serial = Some(serial);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preferences_default_and_serde_roundtrip() {
+        let p = Preferences::default();
+        assert!(p.auto_sync_clipboard);
+        assert!(p.auto_sync_calendar);
+
+        let mut p_off = p.clone();
+        p_off.auto_sync_clipboard = false;
+        let json = serde_json::to_string(&p_off).expect("serialize");
+        let p2: Preferences = serde_json::from_str(&json).expect("deserialize");
+        assert!(!p2.auto_sync_clipboard);
+
+        let p3: Preferences =
+            serde_json::from_str(r#"{"devices":[],"selected_serial":null}"#).expect("deserialize");
+        assert!(p3.auto_sync_clipboard);
+        assert!(p3.auto_sync_calendar);
     }
 }

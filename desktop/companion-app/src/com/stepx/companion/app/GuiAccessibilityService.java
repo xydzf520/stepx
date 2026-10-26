@@ -9,20 +9,28 @@ import android.view.accessibility.*;
 import org.json.*;
 import java.io.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /** Bounded screenshot/action executor shared by native MCP and independent planners. */
 public final class GuiAccessibilityService extends AccessibilityService {
     static volatile GuiAccessibilityService instance;
     static volatile long lastUserTouchRealtimeMs;
     static volatile long lastSyntheticActionRealtimeMs;
-    private JSONArray observedNodes;
-    private String observedWindow = "";
+    private volatile JSONArray observedNodes;
+    private volatile String observedWindow = "";
+    private final ExecutorService screenshotExecutor = Executors.newSingleThreadExecutor();
     final GuiTaskState task = new GuiTaskState();
     final Handler main = new Handler(Looper.getMainLooper());
     private final Runnable watchdog = new Runnable() { public void run() {
-        task.expire(SystemClock.elapsedRealtime()); main.postDelayed(this, 1000);
+        task.expire(SystemClock.elapsedRealtime());
+        main.postDelayed(this, task.active() ? 1000L : 10000L);
     }};
-    @Override protected void onServiceConnected() { instance=this; main.post(watchdog); }
+    private void scheduleWatchdog() {
+        main.removeCallbacks(watchdog);
+        main.postDelayed(watchdog, task.active() ? 1000L : 10000L);
+    }
+    @Override protected void onServiceConnected() { instance=this; scheduleWatchdog(); }
     @Override public void onAccessibilityEvent(AccessibilityEvent event) {
         if (event == null) return;
         int type = event.getEventType();
@@ -50,7 +58,7 @@ public final class GuiAccessibilityService extends AccessibilityService {
         return last > 0L && nowRealtimeMs >= last && (nowRealtimeMs - last) < windowMs;
     }
     @Override public void onInterrupt() { if(task.active()) task.stop(task.id,"系统中断了操作服务"); }
-    @Override public void onDestroy() { if(instance==this)instance=null; main.removeCallbacksAndMessages(null); super.onDestroy(); }
+    @Override public void onDestroy() { if(instance==this)instance=null; main.removeCallbacksAndMessages(null); screenshotExecutor.shutdownNow(); super.onDestroy(); }
     JSONObject status() throws JSONException {
         task.expire(SystemClock.elapsedRealtime());
         return new JSONObject().put("ok",true).put("ready",true).put("task",task.id)
@@ -67,12 +75,12 @@ public final class GuiAccessibilityService extends AccessibilityService {
             long now=SystemClock.elapsedRealtime(); String op=q.getString("op"), id=q.optString("task");
             if(op.equals("status")){answer.complete(status());return;}
             if(op.equals("user_pause")){task.userPause(id,now);PhoneGuiAgent.controlChanged("pause");answer.complete(status());return;}
-            if(op.equals("user_resume")){unlocked();task.userContinue(id,now);PhoneGuiAgent.controlChanged("resume");answer.complete(status());return;}
-            if(op.equals("user_stop")){task.userStop(id);PhoneGuiAgent.controlChanged("stop");new File(getExternalFilesDir(null),"gui-screen.png").delete();File[] captures=getExternalFilesDir(null).listFiles((dir,name)->name.matches("mcp-screen-[a-f0-9]{32}\\.jpg"));if(captures!=null)for(File file:captures)file.delete();answer.complete(status());return;}
-            if(op.equals("start")){unlocked();task.start(id,q.getString("goal"),now);answer.complete(status());return;}
-            if(op.equals("pause")){task.pause(id,now);answer.complete(status());return;}
-            if(op.equals("resume")){unlocked();task.resume(id,now);answer.complete(status());return;}
-            if(op.equals("stop")){task.stop(id,"已停止操作");new File(getExternalFilesDir(null),"gui-screen.png").delete();answer.complete(status());return;}
+            if(op.equals("user_resume")){unlocked();task.userContinue(id,now);scheduleWatchdog();PhoneGuiAgent.controlChanged("resume");answer.complete(status());return;}
+            if(op.equals("user_stop")){task.userStop(id);scheduleWatchdog();PhoneGuiAgent.controlChanged("stop");new File(getExternalFilesDir(null),"gui-screen.png").delete();File[] captures=getExternalFilesDir(null).listFiles((dir,name)->name.matches("mcp-screen-[a-f0-9]{32}\\.jpg"));if(captures!=null)for(File file:captures)file.delete();answer.complete(status());return;}
+            if(op.equals("start")){unlocked();task.start(id,q.getString("goal"),now);scheduleWatchdog();answer.complete(status());return;}
+            if(op.equals("pause")){task.pause(id,now);scheduleWatchdog();answer.complete(status());return;}
+            if(op.equals("resume")){unlocked();task.resume(id,now);scheduleWatchdog();answer.complete(status());return;}
+            if(op.equals("stop")){task.stop(id,"已停止操作");scheduleWatchdog();new File(getExternalFilesDir(null),"gui-screen.png").delete();answer.complete(status());return;}
             if(op.equals("heartbeat")){task.renew(id,now);answer.complete(status());return;}
             task.require(id,now); unlocked();
             if(!task.phase.equals("running"))throw new IllegalStateException("任务已暂停");
@@ -134,7 +142,7 @@ public final class GuiAccessibilityService extends AccessibilityService {
     }
     private void observe(CompletableFuture<JSONObject> answer) throws Exception {
         final String id=task.id;final long epoch=task.epoch;
-        takeScreenshot(0,getMainExecutor(),new TakeScreenshotCallback(){
+        takeScreenshot(0,screenshotExecutor,new TakeScreenshotCallback(){
             @Override public void onSuccess(ScreenshotResult result){
                 try(android.hardware.HardwareBuffer buffer=result.getHardwareBuffer()){
                     task.require(id,SystemClock.elapsedRealtime());

@@ -10,7 +10,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::{
     sync::atomic::{AtomicBool, Ordering},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 #[derive(Clone, Debug, Serialize)]
@@ -126,15 +126,15 @@ fn screen_state(policy: &str, power: &str) -> (Option<bool>, Option<bool>) {
 }
 
 pub(crate) fn read_screen(adb: &Adb, device: &Device) -> Result<(Option<bool>, Option<bool>)> {
-    let policy = adb.run_timeout(
-        &["-s", &device.transport, "shell", "dumpsys window policy"],
-        Duration::from_secs(5),
+    let combined = adb.script(
+        &device.transport,
+        "dumpsys window policy; printf '\\n===STEPX_POWER===\\n'; dumpsys power --brief",
     )?;
-    let power = adb.run_timeout(
-        &["-s", &device.transport, "shell", "dumpsys power --brief"],
-        Duration::from_secs(5),
-    )?;
-    Ok(screen_state(&policy, &power))
+    let (policy, power) = combined
+        .split_once("\n===STEPX_POWER===\n")
+        .or_else(|| combined.split_once("===STEPX_POWER==="))
+        .unwrap_or((&combined, ""));
+    Ok(screen_state(policy, power))
 }
 
 fn catalog_has_gui(value: &Value, depth: usize) -> bool {

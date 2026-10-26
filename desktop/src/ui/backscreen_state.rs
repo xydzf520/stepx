@@ -3,6 +3,28 @@ use super::*;
 use facloud_ui::clipboard::ClipboardContent;
 use stepx_companion::{backscreen as bs, backscreen_amoo as ba, companion_app as ca};
 
+fn days_in_calendar_month(year: i32, month: u32) -> u32 {
+    let (next_y, next_m) = if month >= 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    let Some(first_of_this) = chrono::NaiveDate::from_ymd_opt(year, month, 1) else {
+        return 30;
+    };
+    let Some(first_of_next) = chrono::NaiveDate::from_ymd_opt(next_y, next_m, 1) else {
+        return 30;
+    };
+    (first_of_next - first_of_this).num_days().clamp(28, 31) as u32
+}
+
+fn rewrite_local_calendar_ics(events: &[stepx_companion::toolbox::PhoneCalendarEvent]) {
+    let path =
+        stepx_companion::resources::user_config().join("stepx-companion/desktop-calendar.ics");
+    let _ = std::fs::remove_file(&path);
+    let _ = stepx_companion::toolbox::export_merged_calendar_ics(events);
+}
+
 #[derive(Clone, Debug)]
 pub(super) enum BackScreenAction {
     Tab(u8),
@@ -14,6 +36,7 @@ pub(super) enum BackScreenAction {
     DisplayMode(String),
     SaveBrightness,
     SaveMarquee,
+    SetMarqueePreset(String),
     ToggleMarquee,
     CameraOff,
     PrepareClear,
@@ -48,6 +71,77 @@ pub(super) enum BackScreenAction {
     PushDesktopClipboard,
     PullPhoneClipboard,
     TriggerMcpQuickAction(String),
+    CalendarCreatePreset(u8),
+    CalendarDelete(i64),
+    CalendarPrevMonth,
+    CalendarNextMonth,
+    CalendarToday,
+    CalendarSelectDate(i32, u32, u32),
+    CalendarCreateOnSelectedDate(Option<&'static str>),
+    ToggleAutoSyncCalendar,
+    ToggleAutoSyncClipboard,
+    AlarmCreatePreset(u8),
+    AlarmSelectQuickTime(&'static str),
+    AlarmCreateCustom,
+    AlarmToggle(i64, bool),
+    AlarmDelete(i64),
+    GalleryRefresh,
+    GalleryCategory(u8),
+    GallerySelect(usize),
+    GalleryZoomIn,
+    GalleryZoomOut,
+    GalleryZoomSet(u16),
+    GalleryToggleLightbox,
+    GalleryPrevPhoto,
+    GalleryNextPhoto,
+    GalleryRotateRight(String),
+    GallerySetGridCols(u8),
+    GalleryCopyPath(String),
+    GallerySaveToDesktop(String),
+    GalleryOpenOnDesktop(String),
+    GallerySendToAmoo(String),
+    GalleryImportFromDesktop,
+    GalleryCapturePhoneScreenshot,
+    GalleryDelete(String),
+    PresetFilter(u8),
+    McpQuickOpenCalendar,
+    McpQuickOpenAlarm,
+    McpToggleDnd,
+    SetBrightnessPercent(u8),
+    ApplyPreset(bs::Preset),
+    CalendarToggleDone(i64),
+    CalendarEditEvent(i64),
+    CalendarCancelEdit,
+    CalendarSendReminderToPhone(i64),
+    GalleryExportFiltered,
+    GalleryOpenExportFolder,
+    LocalSynthesize,
+    TogglePixel(usize, usize),
+    InvertFrame,
+    ShiftFrame(i32, i32),
+    ClearDiyFrame,
+    SetThresholdValue(Option<u8>),
+    RotateImage90,
+    FlipImageH,
+    CalendarStartCreateOnDate(i32, u32, u32),
+    CalendarQuickAddOnDate {
+        year: i32,
+        month: u32,
+        day: u32,
+        title: String,
+        time: String,
+    },
+    CalendarClearDay(i32, u32, u32),
+    CalendarDuplicateToTomorrow(i64),
+    CalendarPostponeOneDay(i64),
+    CalendarPrefillFromText {
+        title: String,
+        time_hint: String,
+    },
+    AlarmEdit(i64),
+    AlarmCancelEdit,
+    AlarmShiftMinutes(i64, i32),
+    AlarmToggleAll(bool),
 }
 
 enum CompanionEvent {
@@ -129,12 +223,35 @@ pub(super) struct BackScreenUiState {
     pub pomodoro_active: bool,
     pub pomodoro_started_at: Option<Instant>,
     pub pomodoro_duration_secs: u32,
+    pub pomodoro_last_remaining_secs: Option<u32>,
     pub stepos_suite: stepx_companion::toolbox::StepOsAiSuiteReport,
     pub stepos_suite_loading: bool,
+    pub calendar_year: i32,
+    pub calendar_month: u32,
+    pub selected_calendar_day: u32,
+    pub gallery_items: Vec<stepx_companion::toolbox::PhoneGalleryItem>,
+    pub gallery_loading: bool,
+    pub gallery_checked: bool,
+    pub gallery_category: u8,
+    pub gallery_selected: usize,
+    pub gallery_zoom_pct: u16,
+    pub gallery_lightbox: bool,
+    pub gallery_grid_cols: u8,
+    pub gallery_rotations: std::collections::HashMap<String, u16>,
+    pub completed_calendar_events: std::collections::HashSet<i64>,
+    pub editing_calendar_event_id: Option<i64>,
+    pub editing_alarm_id: Option<i64>,
+    pub preset_filter: u8,
+    pub last_synced_desktop_clip: String,
+    pub last_synced_phone_clip: String,
+    pub clipboard_sync_in_flight: bool,
+    pub last_clipboard_check: Instant,
 }
 
 impl Default for BackScreenUiState {
     fn default() -> Self {
+        use chrono::Datelike;
+        let today = chrono::Local::now().date_naive();
         let source = bs::Source::Preset(bs::Preset::Astronaut);
         let config = bs::PlaybackConfig::default();
         let frame = Vec::new(); // No animation or disk scan until the module is opened.
@@ -206,8 +323,29 @@ impl Default for BackScreenUiState {
             pomodoro_active: false,
             pomodoro_started_at: None,
             pomodoro_duration_secs: 25 * 60,
+            pomodoro_last_remaining_secs: None,
             stepos_suite: stepx_companion::toolbox::default_stepos_ai_suite_report(),
             stepos_suite_loading: false,
+            calendar_year: today.year(),
+            calendar_month: today.month(),
+            selected_calendar_day: today.day(),
+            gallery_items: Vec::new(),
+            gallery_loading: false,
+            gallery_checked: false,
+            gallery_category: 0,
+            gallery_selected: 0,
+            gallery_zoom_pct: 100,
+            gallery_lightbox: false,
+            gallery_grid_cols: 3,
+            gallery_rotations: std::collections::HashMap::new(),
+            completed_calendar_events: std::collections::HashSet::new(),
+            editing_calendar_event_id: None,
+            editing_alarm_id: None,
+            preset_filter: 0,
+            last_synced_desktop_clip: String::new(),
+            last_synced_phone_clip: String::new(),
+            clipboard_sync_in_flight: false,
+            last_clipboard_check: Instant::now(),
         };
         #[cfg(feature = "ui-capture")]
         if let Some(path) = std::env::args()
@@ -232,7 +370,33 @@ impl Drop for BackScreenUiState {
     }
 }
 
+pub(super) const MAX_GALLERY_ROTATIONS: usize = 256;
+
 impl BackScreenUiState {
+    /// Bound `gallery_rotations` at `MAX_GALLERY_ROTATIONS` (256) entries so rotating
+    /// many photos in long sessions never grows memory unboundedly.
+    pub(super) fn insert_gallery_rotation(&mut self, remote_path: String, deg: u16) {
+        if !self.gallery_rotations.contains_key(&remote_path) {
+            let active_remote = self
+                .gallery_items
+                .get(self.gallery_selected)
+                .map(|i| i.remote_path.as_str());
+            while self.gallery_rotations.len() >= MAX_GALLERY_ROTATIONS {
+                let victim = self
+                    .gallery_rotations
+                    .keys()
+                    .find(|k| Some(k.as_str()) != active_remote)
+                    .or_else(|| self.gallery_rotations.keys().next())
+                    .cloned();
+                let Some(victim) = victim else {
+                    break;
+                };
+                self.gallery_rotations.remove(&victim);
+            }
+        }
+        self.gallery_rotations.insert(remote_path, deg);
+    }
+
     pub fn pomodoro_remaining_secs(&self) -> u32 {
         if !self.pomodoro_active {
             return self.pomodoro_duration_secs;
@@ -355,11 +519,153 @@ impl BackScreenUiState {
 }
 
 impl Companion {
+    pub(super) fn tick_auto_clipboard_sync(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.demo_mode
+            || !self.prefs.auto_sync_clipboard
+            || self.busy
+            || self.back_screen.clipboard_sync_in_flight
+            || self.back_screen.last_clipboard_check.elapsed() < Duration::from_secs(8)
+        {
+            return;
+        }
+        let Some(device) = self.selected.clone() else {
+            return;
+        };
+        self.back_screen.last_clipboard_check = Instant::now();
+        let desk_clip = ctx.clipboard().read().plain_text.trim().to_string();
+        if !desk_clip.is_empty()
+            && desk_clip.len() <= 4096
+            && desk_clip != self.back_screen.last_synced_desktop_clip
+            && desk_clip != self.back_screen.stepos_suite.phone_clipboard.trim()
+        {
+            self.back_screen.last_synced_desktop_clip = desk_clip.clone();
+            self.back_screen.clipboard_sync_in_flight = true;
+            let (tx, rx) = async_channel::bounded(1);
+            std::thread::spawn(move || {
+                let res = Adb::discover().and_then(|adb| {
+                    stepx_companion::toolbox::push_clipboard_to_phone(&adb, &device, &desk_clip)
+                        .map(|_| desk_clip)
+                });
+                let _ = tx.send_blocking(res);
+            });
+            ctx.spawn(async move { rx.recv().await }, |me, result, ctx| {
+                me.back_screen.clipboard_sync_in_flight = false;
+                if let Ok(Ok(pushed)) = result {
+                    me.back_screen.last_synced_phone_clip = pushed.clone();
+                    me.back_screen.stepos_suite.phone_clipboard = pushed;
+                    ctx.notify();
+                }
+            });
+        } else if !self.back_screen.stepos_suite_loading {
+            self.back_screen.clipboard_sync_in_flight = true;
+            let (tx, rx) = async_channel::bounded(1);
+            std::thread::spawn(move || {
+                let res = Adb::discover().and_then(|adb| {
+                    stepx_companion::toolbox::pull_clipboard_from_phone(&adb, &device)
+                });
+                let _ = tx.send_blocking(res);
+            });
+            ctx.spawn(async move { rx.recv().await }, |me, result, ctx| {
+                me.back_screen.clipboard_sync_in_flight = false;
+                if let Ok(Ok(phone_raw)) = result {
+                    let phone_clip = phone_raw.trim().to_string();
+                    if !phone_clip.is_empty()
+                        && phone_clip != me.back_screen.last_synced_phone_clip
+                        && phone_clip != me.back_screen.last_synced_desktop_clip
+                    {
+                        me.back_screen.last_synced_phone_clip = phone_clip.clone();
+                        me.back_screen.last_synced_desktop_clip = phone_clip.clone();
+                        me.back_screen.stepos_suite.phone_clipboard = phone_clip.clone();
+                        ctx.clipboard()
+                            .write(ClipboardContent::plain_text(phone_clip));
+                        ctx.notify();
+                    }
+                }
+            });
+        }
+    }
+
+    pub(super) fn sync_gallery_image_previews(&mut self) {
+        let sel = self.back_screen.gallery_selected;
+        for (idx, item) in self.back_screen.gallery_items.iter().enumerate() {
+            if idx == sel {
+                continue;
+            }
+            if let Some(p) = item.local_thumb_path.as_deref() {
+                if !self.work.image_previews.contains_key(p) && std::path::Path::new(p).is_file() {
+                    self.work
+                        .insert_image_preview(p.to_string(), PathBuf::from(p));
+                }
+            }
+        }
+        if let Some(sel_item) = self.back_screen.gallery_items.get(sel) {
+            if let Some(p) = sel_item.local_thumb_path.as_deref() {
+                if !self.work.image_previews.contains_key(p) && std::path::Path::new(p).is_file() {
+                    self.work
+                        .insert_image_preview(p.to_string(), PathBuf::from(p));
+                }
+            }
+        }
+    }
+
+    pub(super) fn filtered_gallery_indices(&self) -> Vec<usize> {
+        let active_cat = self.back_screen.gallery_category;
+        let query = self.fields[F_GALLERY_SEARCH].text.trim().to_lowercase();
+        self.back_screen
+            .gallery_items
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, item)| {
+                let cat_ok = match active_cat {
+                    1 => item.category == "camera",
+                    2 => item.category == "screenshot" || item.category == "screenshots",
+                    3 => item.category == "pictures" || item.category == "weixin",
+                    4 => {
+                        let now_ms = chrono::Utc::now().timestamp_millis();
+                        (item.modified_ms > 0 && now_ms - item.modified_ms <= 7 * 86_400_000)
+                            || idx < 8
+                    }
+                    5 => item.category == "expansion",
+                    _ => true,
+                };
+                let search_ok = query.is_empty()
+                    || item.name.to_lowercase().contains(&query)
+                    || item.remote_path.to_lowercase().contains(&query)
+                    || item.category_label().to_lowercase().contains(&query)
+                    || item.time_label().to_lowercase().contains(&query)
+                    || item.full_datetime_label().to_lowercase().contains(&query);
+                if cat_ok && search_ok {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     pub(super) fn handle_backscreen_action(
         &mut self,
         action: &BackScreenAction,
         ctx: &mut ViewContext<Self>,
     ) {
+        if matches!(
+            action,
+            BackScreenAction::Tab(_)
+                | BackScreenAction::CalendarPrevMonth
+                | BackScreenAction::CalendarNextMonth
+                | BackScreenAction::CalendarToday
+                | BackScreenAction::CalendarSelectDate(_, _, _)
+                | BackScreenAction::CalendarStartCreateOnDate(_, _, _)
+                | BackScreenAction::GalleryCategory(_)
+                | BackScreenAction::GallerySelect(_)
+                | BackScreenAction::GalleryPrevPhoto
+                | BackScreenAction::GalleryNextPhoto
+                | BackScreenAction::GalleryToggleLightbox
+                | BackScreenAction::GallerySetGridCols(_)
+                | BackScreenAction::PresetFilter(_)
+        ) {
+            self.motion_started = Instant::now();
+        }
         if let Err(error) = self.do_backscreen_action(action, ctx) {
             self.back_screen.error = Some(format!("{error:#}"));
             self.back_screen.status = format!("{error:#}");
@@ -374,7 +680,8 @@ impl Companion {
     ) -> Result<()> {
         let is_smart_or_stepos = matches!(
             action,
-            BackScreenAction::ToggleAutoAiBreath
+            BackScreenAction::SetMarqueePreset(_)
+                | BackScreenAction::ToggleAutoAiBreath
                 | BackScreenAction::ToggleAutoNotifyFlash
                 | BackScreenAction::StartPomodoro(_)
                 | BackScreenAction::StopPomodoro
@@ -382,6 +689,64 @@ impl Companion {
                 | BackScreenAction::PushDesktopClipboard
                 | BackScreenAction::PullPhoneClipboard
                 | BackScreenAction::TriggerMcpQuickAction(_)
+                | BackScreenAction::CalendarCreatePreset(_)
+                | BackScreenAction::CalendarDelete(_)
+                | BackScreenAction::CalendarPrevMonth
+                | BackScreenAction::CalendarNextMonth
+                | BackScreenAction::CalendarToday
+                | BackScreenAction::CalendarSelectDate(_, _, _)
+                | BackScreenAction::CalendarCreateOnSelectedDate(_)
+                | BackScreenAction::CalendarStartCreateOnDate(_, _, _)
+                | BackScreenAction::CalendarQuickAddOnDate { .. }
+                | BackScreenAction::CalendarClearDay(_, _, _)
+                | BackScreenAction::CalendarDuplicateToTomorrow(_)
+                | BackScreenAction::CalendarPostponeOneDay(_)
+                | BackScreenAction::CalendarPrefillFromText { .. }
+                | BackScreenAction::CalendarToggleDone(_)
+                | BackScreenAction::CalendarEditEvent(_)
+                | BackScreenAction::CalendarSendReminderToPhone(_)
+                | BackScreenAction::ToggleAutoSyncCalendar
+                | BackScreenAction::ToggleAutoSyncClipboard
+                | BackScreenAction::AlarmCreatePreset(_)
+                | BackScreenAction::AlarmSelectQuickTime(_)
+                | BackScreenAction::AlarmCreateCustom
+                | BackScreenAction::AlarmToggle(_, _)
+                | BackScreenAction::AlarmDelete(_)
+                | BackScreenAction::AlarmEdit(_)
+                | BackScreenAction::AlarmCancelEdit
+                | BackScreenAction::AlarmShiftMinutes(_, _)
+                | BackScreenAction::AlarmToggleAll(_)
+                | BackScreenAction::GalleryRefresh
+                | BackScreenAction::GalleryCategory(_)
+                | BackScreenAction::GallerySelect(_)
+                | BackScreenAction::GalleryZoomIn
+                | BackScreenAction::GalleryZoomOut
+                | BackScreenAction::GalleryZoomSet(_)
+                | BackScreenAction::GalleryToggleLightbox
+                | BackScreenAction::GalleryPrevPhoto
+                | BackScreenAction::GalleryNextPhoto
+                | BackScreenAction::GalleryRotateRight(_)
+                | BackScreenAction::GallerySetGridCols(_)
+                | BackScreenAction::GalleryCopyPath(_)
+                | BackScreenAction::GallerySaveToDesktop(_)
+                | BackScreenAction::GalleryOpenOnDesktop(_)
+                | BackScreenAction::GallerySendToAmoo(_)
+                | BackScreenAction::GalleryImportFromDesktop
+                | BackScreenAction::GalleryCapturePhoneScreenshot
+                | BackScreenAction::GalleryDelete(_)
+                | BackScreenAction::PresetFilter(_)
+                | BackScreenAction::McpQuickOpenCalendar
+                | BackScreenAction::McpQuickOpenAlarm
+                | BackScreenAction::McpToggleDnd
+                | BackScreenAction::SetBrightnessPercent(_)
+                | BackScreenAction::CalendarCancelEdit
+                | BackScreenAction::GalleryExportFiltered
+                | BackScreenAction::GalleryOpenExportFolder
+                | BackScreenAction::LocalSynthesize
+                | BackScreenAction::TogglePixel(_, _)
+                | BackScreenAction::InvertFrame
+                | BackScreenAction::ShiftFrame(_, _)
+                | BackScreenAction::ClearDiyFrame
         );
         if !is_smart_or_stepos {
             if self.back_screen.converting_image
@@ -452,7 +817,10 @@ impl Companion {
         }
         match action {
             BackScreenAction::Tab(tab) => {
-                self.back_screen.tab = *tab;
+                if self.back_screen.tab != *tab {
+                    self.back_screen.tab = *tab;
+                    self.trigger_subtab_switch();
+                }
                 self.back_screen.scroll = Default::default();
             }
             BackScreenAction::SelectPreset(preset) => {
@@ -529,6 +897,14 @@ impl Companion {
                 self.start_backscreen_setting(move |adb, device| {
                     bs::marquee(adb, device, &text, scroll, invert)
                 })?;
+            }
+            BackScreenAction::SetMarqueePreset(preset) => {
+                self.fields[F_BACK_MARQUEE].set(preset);
+                self.matrix_marquee_on = true;
+                self.back_screen.status =
+                    format!("已填入跑马灯预设「{preset}」，点击保存即可同步至手机背屏");
+                self.status = self.back_screen.status.clone();
+                self.error = false;
             }
             BackScreenAction::ToggleMarquee => self.matrix_marquee_on = !self.matrix_marquee_on,
             BackScreenAction::CameraOff => self
@@ -620,23 +996,40 @@ impl Companion {
                 anyhow::ensure!(!self.back_screen.generating, "Amoo 正在生成，请等待或取消");
                 let prompt = self.fields[F_BACK_PROMPT].text.trim().to_string();
                 anyhow::ensure!(!prompt.is_empty(), "先描述想要的画面、功能、亮度或播放时长");
-                let device = self
-                    .selected
-                    .clone()
-                    .ok_or_else(|| anyhow::anyhow!("请先连接手机 Amoo"))?;
-                self.back_screen.active_device = Some(device.serial.clone());
-                self.back_screen.generation = Some(ba::start(
-                    Adb::discover()?,
-                    device,
-                    prompt,
-                    if self.back_screen.amoo_image {
-                        ba::Mode::Image
-                    } else {
-                        ba::Mode::Auto
-                    },
-                ));
-                self.back_screen.generating = true;
-                self.back_screen.generator_status = "正在联系手机 Amoo…".into();
+                // Always synthesize an instant local 17x23 pixel preview first so the user sees immediate results!
+                let (local_title, local_frame) = bs::synthesize_prompt_frame(&prompt);
+                self.back_screen.native_feature = None;
+                self.back_screen.source = bs::Source::Image(local_frame);
+                self.back_screen.title = local_title.clone();
+                self.back_screen.origin = "本地点阵极速合成".into();
+                self.back_screen.description =
+                    format!("已根据「{prompt}」即时合成 17×23 像素图案，可直接应用或手绘微调。");
+                self.back_screen.revision = self.back_screen.revision.wrapping_add(1);
+                self.back_screen.reset_preview();
+                if let Some(device) = self.selected.clone() {
+                    if let Ok(adb) = Adb::discover() {
+                        self.back_screen.active_device = Some(device.serial.clone());
+                        self.back_screen.generation = Some(ba::start(
+                            adb,
+                            device,
+                            prompt,
+                            if self.back_screen.amoo_image {
+                                ba::Mode::Image
+                            } else {
+                                ba::Mode::Auto
+                            },
+                        ));
+                        self.back_screen.generating = true;
+                        self.back_screen.generator_status =
+                            "已生成本地即时预览 · 正在同步联系手机 Amoo 优化…".into();
+                        self.back_screen.tab = 1;
+                        return Ok(());
+                    }
+                }
+                self.back_screen.status = format!(
+                    "已即时合成背屏点阵「{local_title}」（离线可用，连接手机后可一键应用）"
+                );
+                self.status = self.back_screen.status.clone();
                 self.back_screen.tab = 1;
             }
             BackScreenAction::CancelGenerate => {
@@ -680,10 +1073,16 @@ impl Companion {
                 self.status = note.into();
             }
             BackScreenAction::StartPomodoro(seconds) => {
-                let dur = (*seconds).clamp(60, 3600);
+                let raw_secs = if *seconds <= 60 {
+                    (*seconds).saturating_mul(60)
+                } else {
+                    *seconds
+                };
+                let dur = raw_secs.clamp(60, 3600);
                 self.back_screen.pomodoro_active = true;
                 self.back_screen.pomodoro_started_at = Some(Instant::now());
                 self.back_screen.pomodoro_duration_secs = dur;
+                self.back_screen.pomodoro_last_remaining_secs = Some(dur);
                 self.back_screen.native_feature = None;
                 self.back_screen.source = bs::Source::Preset(bs::Preset::Countdown);
                 self.back_screen.config.duration_secs = dur;
@@ -739,6 +1138,7 @@ impl Companion {
             BackScreenAction::StopPomodoro => {
                 self.back_screen.pomodoro_active = false;
                 self.back_screen.pomodoro_started_at = None;
+                self.back_screen.pomodoro_last_remaining_secs = None;
                 self.back_screen.status = "已结束专注番茄钟，恢复背屏常规预览".into();
                 self.status = self.back_screen.status.clone();
                 if let Some(device) = self.selected.clone() {
@@ -766,19 +1166,12 @@ impl Companion {
                     return Ok(());
                 }
                 let Some(device) = self.selected.clone() else {
-                    let mut report = stepx_companion::toolbox::default_stepos_ai_suite_report();
-                    report.checked = true;
-                    report.last_action_note =
-                        "已加载 StepOS 20 项系统级 MCP 能力与端侧 NPU 基准状态（连接手机可读取实时进程）"
-                            .into();
-                    self.status = report.last_action_note.clone();
-                    self.back_screen.stepos_suite = report;
+                    self.status = "请先连接手机后再读取使用统计与剪贴板".into();
                     return Ok(());
                 };
                 self.back_screen.stepos_suite_loading = true;
                 self.back_screen.stepos_suite.last_action_note =
-                    "正在读取手机 StepOS AIEngine、SafetyCenter 与 20 项原生 MCP 服务状态…".into();
-                self.status = "正在刷新 StepOS 原生状态…".into();
+                    "正在读取手机屏幕使用统计、剪贴板与系统服务状态…".into();
                 let (tx, rx) = async_channel::bounded(1);
                 std::thread::spawn(move || {
                     let res = Adb::discover().and_then(|adb| {
@@ -790,15 +1183,32 @@ impl Companion {
                     me.back_screen.stepos_suite_loading = false;
                     match result {
                         Ok(Ok(report)) => {
+                            if me.prefs.auto_sync_clipboard {
+                                let phone_clip = report.phone_clipboard.trim().to_string();
+                                if !phone_clip.is_empty()
+                                    && phone_clip != me.back_screen.last_synced_phone_clip
+                                    && phone_clip != me.back_screen.last_synced_desktop_clip
+                                {
+                                    me.back_screen.last_synced_phone_clip = phone_clip.clone();
+                                    me.back_screen.last_synced_desktop_clip = phone_clip.clone();
+                                    ctx.clipboard()
+                                        .write(ClipboardContent::plain_text(phone_clip));
+                                }
+                            }
                             let note = report.last_action_note.clone();
                             me.back_screen.stepos_suite = report;
-                            me.status = note.clone();
+                            if !me.busy {
+                                me.status = note.clone();
+                            }
                             me.tools_feedback = Some((me.tool_page, note, false));
                         }
                         Ok(Err(err)) => {
+                            me.back_screen.stepos_suite.checked = true;
                             me.back_screen.stepos_suite.last_action_note =
-                                format!("读取状态提示：{err}");
-                            me.status = format!("StepOS 原生状态刷新未完成：{err}");
+                                format!("读取状态未完成：{err}");
+                            if !me.busy {
+                                me.status = format!("读取手机统计未完成：{err}");
+                            }
                         }
                         Err(_) => {}
                     }
@@ -806,30 +1216,20 @@ impl Companion {
                 });
             }
             BackScreenAction::PushDesktopClipboard => {
-                let raw_clip = ctx.clipboard().read().plain_text;
-                let clip_text = if raw_clip.trim().is_empty() {
-                    if !self
-                        .back_screen
-                        .stepos_suite
-                        .phone_clipboard
-                        .trim()
-                        .is_empty()
-                    {
-                        self.back_screen.stepos_suite.phone_clipboard.clone()
-                    } else {
-                        "StepX 跨端协同剪贴板同步内容".into()
-                    }
-                } else {
-                    raw_clip.trim().to_string()
-                };
-                self.back_screen.stepos_suite.phone_clipboard = clip_text.clone();
                 let Some(device) = self.selected.clone() else {
-                    let note = format!(
-                        "已暂存待推送剪贴板内容：「{}」（连接手机后立即写入系统剪贴板）",
-                        clip_text.chars().take(28).collect::<String>()
-                    );
-                    self.back_screen.stepos_suite.last_action_note = note.clone();
-                    self.status = note;
+                    self.status = "请先连接手机后再推送剪贴板".into();
+                    self.error = true;
+                    return Ok(());
+                };
+                let typed = self.fields[F_OV_TEXT].text.trim().to_string();
+                let raw_clip = ctx.clipboard().read().plain_text.trim().to_string();
+                let clip_text = if !typed.is_empty() {
+                    typed
+                } else if !raw_clip.is_empty() {
+                    raw_clip
+                } else {
+                    self.status = "电脑剪贴板为空，请先复制文字或在输入框填写内容".into();
+                    self.error = true;
                     return Ok(());
                 };
                 self.back_screen.stepos_suite.last_action_note = "正在推送电脑剪贴板到手机…".into();
@@ -838,19 +1238,25 @@ impl Companion {
                 std::thread::spawn(move || {
                     let res = Adb::discover().and_then(|adb| {
                         stepx_companion::toolbox::push_clipboard_to_phone(&adb, &device, &clip_text)
+                            .map(|note| (clip_text, note))
                     });
                     let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
                 });
-                ctx.spawn(async move { rx.recv().await }, |me, result, ctx| {
+                ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
                     match result {
-                        Ok(Ok(note)) => {
+                        Ok(Ok((pushed_text, note))) => {
+                            me.back_screen.last_synced_desktop_clip = pushed_text.clone();
+                            me.back_screen.last_synced_phone_clip = pushed_text.clone();
+                            me.back_screen.stepos_suite.phone_clipboard = pushed_text;
                             me.back_screen.stepos_suite.last_action_note = note.clone();
+                            me.error = false;
                             me.status = note.clone();
                             me.tools_feedback = Some((me.tool_page, note, false));
                         }
                         Ok(Err(err)) => {
                             me.back_screen.stepos_suite.last_action_note =
                                 format!("剪贴板推送失败：{err}");
+                            me.error = true;
                             me.status = format!("剪贴板推送失败：{err}");
                         }
                         Err(_) => {}
@@ -860,15 +1266,8 @@ impl Companion {
             }
             BackScreenAction::PullPhoneClipboard => {
                 let Some(device) = self.selected.clone() else {
-                    let fallback = self.back_screen.stepos_suite.phone_clipboard.clone();
-                    ctx.clipboard()
-                        .write(ClipboardContent::plain_text(fallback.clone()));
-                    let note = format!(
-                        "已将剪贴板内容复制到电脑：「{}」",
-                        fallback.chars().take(28).collect::<String>()
-                    );
-                    self.back_screen.stepos_suite.last_action_note = note.clone();
-                    self.status = note;
+                    self.status = "请先连接手机后再拉取手机剪贴板".into();
+                    self.error = true;
                     return Ok(());
                 };
                 self.back_screen.stepos_suite.last_action_note =
@@ -881,25 +1280,29 @@ impl Companion {
                     });
                     let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
                 });
-                ctx.spawn(async move { rx.recv().await }, |me, result, ctx| {
+                ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
                     match result {
                         Ok(Ok(text)) => {
                             ctx.clipboard()
                                 .write(ClipboardContent::plain_text(text.clone()));
+                            me.back_screen.last_synced_phone_clip = text.clone();
+                            me.back_screen.last_synced_desktop_clip = text.clone();
                             let preview: String = text.chars().take(28).collect();
                             let note = format!(
-                                "已拉取手机剪贴板并写入电脑：「{}{}」",
+                                "已拉取手机剪贴板到电脑：「{}{}」",
                                 preview,
                                 if text.chars().count() > 28 { "…" } else { "" }
                             );
                             me.back_screen.stepos_suite.phone_clipboard = text;
                             me.back_screen.stepos_suite.last_action_note = note.clone();
+                            me.error = false;
                             me.status = note.clone();
                             me.tools_feedback = Some((me.tool_page, note, false));
                         }
                         Ok(Err(err)) => {
                             me.back_screen.stepos_suite.last_action_note =
                                 format!("拉取手机剪贴板失败：{err}");
+                            me.error = true;
                             me.status = format!("拉取手机剪贴板失败：{err}");
                         }
                         Err(_) => {}
@@ -909,39 +1312,2073 @@ impl Companion {
             }
             BackScreenAction::TriggerMcpQuickAction(action_key) => {
                 let key = action_key.clone();
+                let payload = self.fields[F_OV_TEXT].text.trim().to_string();
                 let Some(device) = self.selected.clone() else {
-                    let note =
-                        format!("已就绪 StepOS MCP 动作指令（{key}），连接手机后立即在手机端执行");
-                    self.back_screen.stepos_suite.last_action_note = note.clone();
-                    self.status = note;
+                    self.status = "请先连接手机后再执行快捷指令".into();
+                    self.error = true;
                     return Ok(());
                 };
-                self.back_screen.stepos_suite.last_action_note =
-                    format!("正在调用手机 StepOS 原生 MCP 能力（{key}）…");
-                self.status = self.back_screen.stepos_suite.last_action_note.clone();
+                self.back_screen.stepos_suite.last_action_note = "正在手机端执行快捷指令…".into();
+                self.status = "正在手机端执行快捷指令…".into();
+                let key_for_apply = key.clone();
                 let (tx, rx) = async_channel::bounded(1);
                 std::thread::spawn(move || {
                     let res = Adb::discover().and_then(|adb| {
-                        stepx_companion::toolbox::trigger_stepos_mcp_action(&adb, &device, &key, "")
+                        stepx_companion::toolbox::trigger_stepos_mcp_action(
+                            &adb, &device, &key, &payload,
+                        )
                     });
                     let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
                 });
-                ctx.spawn(async move { rx.recv().await }, |me, result, ctx| {
+                ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
                     match result {
                         Ok(Ok(note)) => {
+                            if key_for_apply == "toggle_dnd" {
+                                me.back_screen.stepos_suite.controls.dnd_on =
+                                    note.contains("已开启");
+                            } else if key_for_apply == "toggle_wifi" {
+                                me.back_screen.stepos_suite.controls.wifi_on = true;
+                            }
                             me.back_screen.stepos_suite.last_action_note = note.clone();
+                            me.error = false;
                             me.status = note.clone();
                             me.tools_feedback = Some((me.tool_page, note, false));
                         }
                         Ok(Err(err)) => {
                             me.back_screen.stepos_suite.last_action_note =
-                                format!("MCP 动作执行未完成：{err}");
-                            me.status = format!("MCP 动作执行未完成：{err}");
+                                format!("操作未完成：{err}");
+                            me.error = true;
+                            me.status = format!("操作未完成：{err}");
                         }
                         Err(_) => {}
                     }
                     ctx.notify();
                 });
+            }
+            BackScreenAction::CalendarCreatePreset(preset) => {
+                let preset_idx = *preset;
+                let custom_title = self.fields[F_PHONE_SCHEDULE_TITLE].text.trim().to_string();
+                let fallback_title = if custom_title.is_empty() {
+                    self.fields[F_OV_TEXT].text.trim().to_string()
+                } else {
+                    custom_title
+                };
+                let Some(device) = self.selected.clone() else {
+                    self.status = "请先连接手机后再创建手机日历日程".into();
+                    self.error = true;
+                    return Ok(());
+                };
+                self.back_screen.stepos_suite.last_action_note = "正在向手机日历写入新日程…".into();
+                self.status = "正在向手机日历写入新日程…".into();
+                let (tx, rx) = async_channel::bounded(1);
+                std::thread::spawn(move || {
+                    let res = Adb::discover().and_then(|adb| {
+                        stepx_companion::toolbox::create_phone_calendar_preset(
+                            &adb,
+                            &device,
+                            preset_idx,
+                            &fallback_title,
+                        )
+                    });
+                    let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
+                });
+                ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                    match result {
+                        Ok(Ok((_id, events, note))) => {
+                            me.fields[F_PHONE_SCHEDULE_TITLE].clear();
+                            me.back_screen.stepos_suite.checked = true;
+                            me.back_screen.stepos_suite.calendar_events = events;
+                            me.back_screen.stepos_suite.last_action_note = note.clone();
+                            me.error = false;
+                            me.status = note.clone();
+                            me.tools_feedback = Some((me.tool_page, note, false));
+                        }
+                        Ok(Err(err)) => {
+                            me.back_screen.stepos_suite.last_action_note =
+                                format!("创建日程未完成：{err}");
+                            me.error = true;
+                            me.status = format!("创建日程未完成：{err}");
+                        }
+                        Err(_) => {}
+                    }
+                    ctx.notify();
+                });
+            }
+            BackScreenAction::CalendarDelete(event_id) => {
+                let id = *event_id;
+                let removed_title = self
+                    .back_screen
+                    .stepos_suite
+                    .calendar_events
+                    .iter()
+                    .find(|e| e.id == id)
+                    .map(|e| e.title.clone());
+                self.back_screen
+                    .stepos_suite
+                    .calendar_events
+                    .retain(|e| e.id != id);
+                if self.back_screen.editing_calendar_event_id == Some(id) {
+                    self.back_screen.editing_calendar_event_id = None;
+                }
+                self.back_screen.completed_calendar_events.remove(&id);
+                if self.prefs.auto_sync_calendar {
+                    rewrite_local_calendar_ics(&self.back_screen.stepos_suite.calendar_events);
+                }
+                if self.demo_mode || self.selected.is_none() {
+                    let note = match removed_title {
+                        Some(t) => format!("已删除日程：「{t}」"),
+                        None => "已移除该日程".into(),
+                    };
+                    self.back_screen.stepos_suite.last_action_note = note.clone();
+                    self.status = note;
+                    self.error = false;
+                    return Ok(());
+                }
+                let Some(device) = self.selected.clone() else {
+                    return Ok(());
+                };
+                self.back_screen.stepos_suite.last_action_note = "正在从手机日历移除日程…".into();
+                self.status = "正在从手机日历移除日程…".into();
+                let (tx, rx) = async_channel::bounded(1);
+                std::thread::spawn(move || {
+                    let res = Adb::discover().and_then(|adb| {
+                        stepx_companion::toolbox::delete_phone_calendar_event(&adb, &device, id)
+                    });
+                    let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
+                });
+                ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                    match result {
+                        Ok(Ok((events, note))) => {
+                            me.back_screen.stepos_suite.calendar_events = events;
+                            if me.back_screen.editing_calendar_event_id == Some(id) {
+                                me.back_screen.editing_calendar_event_id = None;
+                            }
+                            me.back_screen.completed_calendar_events.remove(&id);
+                            me.back_screen.stepos_suite.last_action_note = note.clone();
+                            me.error = false;
+                            me.status = note.clone();
+                            me.tools_feedback = Some((me.tool_page, note, false));
+                        }
+                        Ok(Err(err)) => {
+                            me.back_screen.stepos_suite.last_action_note =
+                                format!("移除日程未完成：{err}");
+                            me.error = true;
+                            me.status = format!("移除日程未完成：{err}");
+                        }
+                        Err(_) => {}
+                    }
+                    ctx.notify();
+                });
+            }
+            BackScreenAction::AlarmCreatePreset(preset) => {
+                let preset_idx = *preset;
+                let custom_label = self.fields[F_PHONE_SCHEDULE_TITLE].text.trim().to_string();
+                let fallback_label = if custom_label.is_empty() {
+                    self.fields[F_OV_TEXT].text.trim().to_string()
+                } else {
+                    custom_label
+                };
+                let Some(device) = self.selected.clone() else {
+                    self.status = "请先连接手机后再创建手机闹钟".into();
+                    self.error = true;
+                    return Ok(());
+                };
+                self.back_screen.stepos_suite.last_action_note = "正在向手机时钟写入新闹钟…".into();
+                self.status = "正在向手机时钟写入新闹钟…".into();
+                let (tx, rx) = async_channel::bounded(1);
+                std::thread::spawn(move || {
+                    let res = Adb::discover().and_then(|adb| {
+                        stepx_companion::toolbox::create_phone_alarm_preset(
+                            &adb,
+                            &device,
+                            preset_idx,
+                            &fallback_label,
+                        )
+                    });
+                    let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
+                });
+                ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                    match result {
+                        Ok(Ok((_id, alarms, note))) => {
+                            me.fields[F_PHONE_SCHEDULE_TITLE].clear();
+                            me.back_screen.stepos_suite.checked = true;
+                            me.back_screen.stepos_suite.alarms = alarms;
+                            me.back_screen.stepos_suite.last_action_note = note.clone();
+                            me.error = false;
+                            me.status = note.clone();
+                            me.tools_feedback = Some((me.tool_page, note, false));
+                        }
+                        Ok(Err(err)) => {
+                            me.back_screen.stepos_suite.last_action_note =
+                                format!("创建闹钟未完成：{err}");
+                            me.error = true;
+                            me.status = format!("创建闹钟未完成：{err}");
+                        }
+                        Err(_) => {}
+                    }
+                    ctx.notify();
+                });
+            }
+            BackScreenAction::AlarmToggle(alarm_id, enabled) => {
+                let id = *alarm_id;
+                let target_enabled = *enabled;
+                if let Some(alarm) = self
+                    .back_screen
+                    .stepos_suite
+                    .alarms
+                    .iter_mut()
+                    .find(|a| a.id == id)
+                {
+                    alarm.enabled = target_enabled;
+                }
+                if self.demo_mode || self.selected.is_none() {
+                    let note = if target_enabled {
+                        "已开启闹钟".to_string()
+                    } else {
+                        "已关闭闹钟".to_string()
+                    };
+                    self.back_screen.stepos_suite.last_action_note = note.clone();
+                    self.status = note;
+                    self.error = false;
+                    return Ok(());
+                }
+                let Some(device) = self.selected.clone() else {
+                    return Ok(());
+                };
+                let (tx, rx) = async_channel::bounded(1);
+                std::thread::spawn(move || {
+                    let res = Adb::discover().and_then(|adb| {
+                        stepx_companion::toolbox::toggle_phone_alarm(
+                            &adb,
+                            &device,
+                            id,
+                            target_enabled,
+                        )
+                    });
+                    let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
+                });
+                ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                    match result {
+                        Ok(Ok((alarms, note))) => {
+                            me.back_screen.stepos_suite.alarms = alarms;
+                            me.back_screen.stepos_suite.last_action_note = note.clone();
+                            me.error = false;
+                            me.status = note.clone();
+                            me.tools_feedback = Some((me.tool_page, note, false));
+                        }
+                        Ok(Err(err)) => {
+                            me.back_screen.stepos_suite.last_action_note =
+                                format!("切换闹钟未完成：{err}");
+                            me.error = true;
+                            me.status = format!("切换闹钟未完成：{err}");
+                        }
+                        Err(_) => {}
+                    }
+                    ctx.notify();
+                });
+            }
+            BackScreenAction::AlarmDelete(alarm_id) => {
+                let id = *alarm_id;
+                if self.back_screen.editing_alarm_id == Some(id) {
+                    self.back_screen.editing_alarm_id = None;
+                }
+                self.back_screen.stepos_suite.alarms.retain(|a| a.id != id);
+                if self.demo_mode || self.selected.is_none() {
+                    let note = "已移除该闹钟".to_string();
+                    self.back_screen.stepos_suite.last_action_note = note.clone();
+                    self.status = note;
+                    self.error = false;
+                    return Ok(());
+                }
+                let Some(device) = self.selected.clone() else {
+                    return Ok(());
+                };
+                let (tx, rx) = async_channel::bounded(1);
+                std::thread::spawn(move || {
+                    let res = Adb::discover().and_then(|adb| {
+                        stepx_companion::toolbox::delete_phone_alarm(&adb, &device, id)
+                    });
+                    let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
+                });
+                ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                    match result {
+                        Ok(Ok((alarms, note))) => {
+                            if me.back_screen.editing_alarm_id == Some(id) {
+                                me.back_screen.editing_alarm_id = None;
+                            }
+                            me.back_screen.stepos_suite.alarms = alarms;
+                            me.back_screen.stepos_suite.last_action_note = note.clone();
+                            me.error = false;
+                            me.status = note.clone();
+                            me.tools_feedback = Some((me.tool_page, note, false));
+                        }
+                        Ok(Err(err)) => {
+                            me.back_screen.stepos_suite.last_action_note =
+                                format!("删除闹钟未完成：{err}");
+                            me.error = true;
+                            me.status = format!("删除闹钟未完成：{err}");
+                        }
+                        Err(_) => {}
+                    }
+                    ctx.notify();
+                });
+            }
+            BackScreenAction::SetBrightnessPercent(percent) => {
+                let target_pct = *percent;
+                let Some(device) = self.selected.clone() else {
+                    self.status = "请先连接手机后再调节屏幕亮度".into();
+                    self.error = true;
+                    return Ok(());
+                };
+                let (tx, rx) = async_channel::bounded(1);
+                std::thread::spawn(move || {
+                    let res = Adb::discover().and_then(|adb| {
+                        stepx_companion::toolbox::set_phone_brightness_percent(
+                            &adb, &device, target_pct,
+                        )
+                    });
+                    let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
+                });
+                ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                    match result {
+                        Ok(Ok((pct, note))) => {
+                            me.back_screen.stepos_suite.controls.brightness_percent = pct;
+                            me.back_screen.stepos_suite.last_action_note = note.clone();
+                            me.error = false;
+                            me.status = note.clone();
+                            me.tools_feedback = Some((me.tool_page, note, false));
+                        }
+                        Ok(Err(err)) => {
+                            me.back_screen.stepos_suite.last_action_note =
+                                format!("调节亮度未完成：{err}");
+                            me.error = true;
+                            me.status = format!("调节亮度未完成：{err}");
+                        }
+                        Err(_) => {}
+                    }
+                    ctx.notify();
+                });
+            }
+            BackScreenAction::CalendarPrevMonth => {
+                if self.back_screen.calendar_month <= 1 {
+                    self.back_screen.calendar_year -= 1;
+                    self.back_screen.calendar_month = 12;
+                } else {
+                    self.back_screen.calendar_month -= 1;
+                }
+                let max_d = days_in_calendar_month(
+                    self.back_screen.calendar_year,
+                    self.back_screen.calendar_month,
+                );
+                self.back_screen.selected_calendar_day =
+                    self.back_screen.selected_calendar_day.clamp(1, max_d);
+            }
+            BackScreenAction::CalendarNextMonth => {
+                if self.back_screen.calendar_month >= 12 {
+                    self.back_screen.calendar_year += 1;
+                    self.back_screen.calendar_month = 1;
+                } else {
+                    self.back_screen.calendar_month += 1;
+                }
+                let max_d = days_in_calendar_month(
+                    self.back_screen.calendar_year,
+                    self.back_screen.calendar_month,
+                );
+                self.back_screen.selected_calendar_day =
+                    self.back_screen.selected_calendar_day.clamp(1, max_d);
+            }
+            BackScreenAction::CalendarToday => {
+                use chrono::Datelike;
+                let today = chrono::Local::now().date_naive();
+                self.back_screen.calendar_year = today.year();
+                self.back_screen.calendar_month = today.month();
+                self.back_screen.selected_calendar_day = today.day();
+            }
+            BackScreenAction::CalendarSelectDate(y, m, d) => {
+                let year = *y;
+                let month = (*m).clamp(1, 12);
+                let max_d = days_in_calendar_month(year, month);
+                self.back_screen.calendar_year = year;
+                self.back_screen.calendar_month = month;
+                self.back_screen.selected_calendar_day = (*d).clamp(1, max_d);
+            }
+            BackScreenAction::ToggleAutoSyncCalendar => {
+                let next = !self.prefs.auto_sync_calendar;
+                self.prefs.auto_sync_calendar = next;
+                self.preferences.auto_sync_calendar = next;
+                let _ = self.preferences.save();
+                let note = if next {
+                    "已开启电脑系统日历与手机日历自动双向同步"
+                } else {
+                    "已关闭日历自动双向同步（切换为手动管理）"
+                };
+                self.status = note.into();
+                self.settings.feedback = note.into();
+                self.back_screen.stepos_suite.last_action_note = note.into();
+                if self.selected.is_some() {
+                    self.back_screen.stepos_suite_loading = false;
+                    self.handle_backscreen_action(&BackScreenAction::InspectStepOsSuite, ctx);
+                }
+            }
+            BackScreenAction::ToggleAutoSyncClipboard => {
+                let next = !self.prefs.auto_sync_clipboard;
+                self.prefs.auto_sync_clipboard = next;
+                self.preferences.auto_sync_clipboard = next;
+                let _ = self.preferences.save();
+                let note = if next {
+                    "已开启跨端剪贴板自动双向共享：电脑与手机复制内容将自动互通"
+                } else {
+                    "已关闭跨端剪贴板自动双向共享"
+                };
+                self.status = note.into();
+                self.settings.feedback = note.into();
+                self.back_screen.stepos_suite.last_action_note = note.into();
+            }
+            BackScreenAction::CalendarCreateOnSelectedDate(preset_time) => {
+                let raw_title = self.fields[F_PHONE_SCHEDULE_TITLE].text.trim().to_string();
+                let title = if raw_title.is_empty() {
+                    "桌面协同日程".to_string()
+                } else {
+                    raw_title
+                };
+                let time_str = preset_time
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| self.fields[F_CALENDAR_TIME].text.trim().to_string());
+                let y = self.back_screen.calendar_year;
+                let m = self.back_screen.calendar_month;
+                let d = self.back_screen.selected_calendar_day;
+                let auto_sync = self.prefs.auto_sync_calendar;
+                let editing_old_id = self.back_screen.editing_calendar_event_id.take();
+                let (dtstart, dtend) =
+                    stepx_companion::toolbox::parse_event_time_range(y, m, d, &time_str)?;
+                if let Some(old_id) = editing_old_id {
+                    self.back_screen
+                        .stepos_suite
+                        .calendar_events
+                        .retain(|e| e.id != old_id);
+                }
+                let local_id = editing_old_id.unwrap_or_else(|| {
+                    self.back_screen
+                        .stepos_suite
+                        .calendar_events
+                        .iter()
+                        .map(|e| e.id)
+                        .max()
+                        .unwrap_or(1000)
+                        + 1
+                });
+                let local_ev = stepx_companion::toolbox::PhoneCalendarEvent {
+                    id: local_id,
+                    title: title.clone(),
+                    dtstart,
+                    dtend,
+                    all_day: false,
+                    location: String::new(),
+                    description: "由 StepX 桌面端直接同步创建".into(),
+                    source: if auto_sync {
+                        "双端已同步".into()
+                    } else {
+                        "电脑日历".into()
+                    },
+                };
+                self.back_screen.stepos_suite.calendar_events.push(local_ev);
+                self.back_screen
+                    .stepos_suite
+                    .calendar_events
+                    .sort_by_key(|e| e.dtstart);
+                if auto_sync {
+                    rewrite_local_calendar_ics(&self.back_screen.stepos_suite.calendar_events);
+                }
+                if self.demo_mode || self.selected.is_none() {
+                    self.fields[F_PHONE_SCHEDULE_TITLE].clear();
+                    let msg = if editing_old_id.is_some() {
+                        format!("已保存日程修改：「{title}」（{y}-{m:02}-{d:02}）")
+                    } else {
+                        format!("已在 {y}-{m:02}-{d:02} 添加日程：「{title}」")
+                    };
+                    self.apply(Outcome::StepOsCalendarUpdated(
+                        self.back_screen.stepos_suite.calendar_events.clone(),
+                        msg,
+                    ));
+                    return Ok(());
+                }
+                let Some(device) = self.selected.clone() else {
+                    return Ok(());
+                };
+                self.back_screen.stepos_suite.last_action_note = if editing_old_id.is_some() {
+                    "正在保存并更新手机日历日程…".into()
+                } else {
+                    "正在向手机日历写入选中日期日程…".into()
+                };
+                self.status = self.back_screen.stepos_suite.last_action_note.clone();
+                let (tx, rx) = async_channel::bounded(1);
+                std::thread::spawn(move || {
+                    let res = Adb::discover().and_then(|adb| {
+                        if let Some(old_id) = editing_old_id {
+                            let _ = stepx_companion::toolbox::delete_phone_calendar_event(
+                                &adb, &device, old_id,
+                            );
+                        }
+                        stepx_companion::toolbox::create_calendar_event_at(
+                            &adb, &device, &title, y, m, d, &time_str, auto_sync,
+                        )
+                    });
+                    let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
+                });
+                ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                    match result {
+                        Ok(Ok((_id, events, msg))) => {
+                            me.fields[F_PHONE_SCHEDULE_TITLE].clear();
+                            me.apply(Outcome::StepOsCalendarUpdated(events, msg));
+                        }
+                        Ok(Err(err)) => {
+                            me.back_screen.stepos_suite.last_action_note =
+                                format!("保存日程未完成：{err}");
+                            me.error = true;
+                            me.status = format!("保存日程未完成：{err}");
+                        }
+                        Err(_) => {}
+                    }
+                    ctx.notify();
+                });
+            }
+            BackScreenAction::AlarmSelectQuickTime(t) => {
+                self.fields[F_ALARM_TIME].set(*t);
+                self.status = format!("已选择闹钟时间：{t}");
+            }
+            BackScreenAction::AlarmCreateCustom => {
+                let time_str = self.fields[F_ALARM_TIME].text.trim().to_string();
+                let label = self.fields[F_PHONE_SCHEDULE_TITLE].text.trim().to_string();
+                let clean_label = if label.is_empty() {
+                    "StepX 桌面提醒".to_string()
+                } else {
+                    label.clone()
+                };
+                let (hour, minutes) = stepx_companion::toolbox::parse_alarm_time_str(&time_str)?;
+                let editing_old_id = self.back_screen.editing_alarm_id.take();
+                if let Some(edit_id) = editing_old_id {
+                    if let Some(existing) = self
+                        .back_screen
+                        .stepos_suite
+                        .alarms
+                        .iter_mut()
+                        .find(|a| a.id == edit_id)
+                    {
+                        existing.hour = hour;
+                        existing.minutes = minutes;
+                        existing.message = clean_label.clone();
+                        existing.enabled = true;
+                    } else {
+                        self.back_screen.stepos_suite.alarms.push(
+                            stepx_companion::toolbox::PhoneAlarmItem {
+                                id: edit_id,
+                                hour,
+                                minutes,
+                                enabled: true,
+                                days_of_week: 0,
+                                vibrate: true,
+                                message: clean_label.clone(),
+                            },
+                        );
+                    }
+                } else {
+                    let next_id = self
+                        .back_screen
+                        .stepos_suite
+                        .alarms
+                        .iter()
+                        .map(|a| a.id)
+                        .max()
+                        .unwrap_or(100)
+                        + 1;
+                    self.back_screen.stepos_suite.alarms.push(
+                        stepx_companion::toolbox::PhoneAlarmItem {
+                            id: next_id,
+                            hour,
+                            minutes,
+                            enabled: true,
+                            days_of_week: 0,
+                            vibrate: true,
+                            message: clean_label.clone(),
+                        },
+                    );
+                }
+                if self.demo_mode || self.selected.is_none() {
+                    self.fields[F_PHONE_SCHEDULE_TITLE].clear();
+                    let msg = if editing_old_id.is_some() {
+                        format!(
+                            "已保存闹钟修改：{:02}:{:02}「{clean_label}」",
+                            hour, minutes
+                        )
+                    } else {
+                        format!(
+                            "已添加并开启 {:02}:{:02} 闹钟：「{clean_label}」",
+                            hour, minutes
+                        )
+                    };
+                    self.apply(Outcome::StepOsAlarmsUpdated(
+                        self.back_screen.stepos_suite.alarms.clone(),
+                        msg,
+                    ));
+                    return Ok(());
+                }
+                let Some(device) = self.selected.clone() else {
+                    return Ok(());
+                };
+                self.back_screen.stepos_suite.last_action_note = if editing_old_id.is_some() {
+                    "正在保存并更新手机闹钟…".into()
+                } else {
+                    "正在向手机时钟写入闹钟…".into()
+                };
+                self.status = self.back_screen.stepos_suite.last_action_note.clone();
+                let (tx, rx) = async_channel::bounded(1);
+                std::thread::spawn(move || {
+                    let res = Adb::discover().and_then(|adb| {
+                        if let Some(old_id) = editing_old_id {
+                            let _ =
+                                stepx_companion::toolbox::delete_phone_alarm(&adb, &device, old_id);
+                        }
+                        stepx_companion::toolbox::create_phone_alarm(
+                            &adb,
+                            &device,
+                            hour,
+                            minutes,
+                            &clean_label,
+                        )
+                    });
+                    let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
+                });
+                ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                    match result {
+                        Ok(Ok((_id, alarms, msg))) => {
+                            me.fields[F_PHONE_SCHEDULE_TITLE].clear();
+                            me.apply(Outcome::StepOsAlarmsUpdated(alarms, msg));
+                        }
+                        Ok(Err(err)) => {
+                            me.back_screen.stepos_suite.last_action_note =
+                                format!("创建闹钟未完成：{err}");
+                            me.error = true;
+                            me.status = format!("创建闹钟未完成：{err}");
+                        }
+                        Err(_) => {}
+                    }
+                    ctx.notify();
+                });
+            }
+            BackScreenAction::GalleryRefresh => {
+                if self.back_screen.gallery_loading {
+                    return Ok(());
+                }
+                let Some(device) = self.selected.clone() else {
+                    let (_, mut exp_items) =
+                        stepx_companion::toolbox::load_expansion_gallery_items();
+                    exp_items.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms));
+                    self.back_screen.gallery_checked = true;
+                    if !exp_items.is_empty() {
+                        let count = exp_items.len();
+                        self.apply(Outcome::PhoneGallery(
+                            exp_items,
+                            format!(
+                                "已从电脑扩容库加载 {count} 张归档照片（连接手机后可同步手机端相册）"
+                            ),
+                        ));
+                    } else {
+                        self.status = "请先连接手机后再读取手机相册".into();
+                    }
+                    return Ok(());
+                };
+                self.back_screen.gallery_loading = true;
+                self.status = "正在读取手机相册与截图缩略图…".into();
+                let (tx, rx) = async_channel::bounded(1);
+                std::thread::spawn(move || {
+                    let res = Adb::discover().and_then(|adb| {
+                        stepx_companion::toolbox::list_phone_gallery(&adb, &device)
+                    });
+                    let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
+                });
+                ctx.spawn(async move { rx.recv().await }, |me, result, ctx| {
+                    me.back_screen.gallery_loading = false;
+                    me.back_screen.gallery_checked = true;
+                    match result {
+                        Ok(Ok(items)) => {
+                            let msg = format!("已加载手机相册 {} 张照片", items.len());
+                            me.apply(Outcome::PhoneGallery(items, msg));
+                        }
+                        Ok(Err(err)) => {
+                            me.error = true;
+                            me.status = format!("读取手机相册未完成：{err}");
+                        }
+                        Err(_) => {}
+                    }
+                    ctx.notify();
+                });
+            }
+            BackScreenAction::GalleryCategory(cat) => {
+                if self.back_screen.gallery_category != *cat {
+                    self.back_screen.gallery_category = *cat;
+                    self.back_screen.gallery_selected = 0;
+                    self.trigger_subtab_switch();
+                }
+            }
+            BackScreenAction::GallerySelect(idx) => {
+                self.back_screen.gallery_selected = *idx;
+                self.sync_gallery_image_previews();
+                if let Some(item) = self.back_screen.gallery_items.get(*idx) {
+                    let needs_pull = item
+                        .local_thumb_path
+                        .as_deref()
+                        .is_none_or(|p| !std::path::Path::new(p).is_file());
+                    if needs_pull {
+                        if let Some(device) = self.selected.clone() {
+                            let remote = item.remote_path.clone();
+                            let name = item.name.clone();
+                            let sel_idx = *idx;
+                            let (tx, rx) = async_channel::bounded(1);
+                            std::thread::spawn(move || {
+                                let cache_dir = std::env::temp_dir().join("stepx-gallery-cache");
+                                let _ = std::fs::create_dir_all(&cache_dir);
+                                let safe_name: String = name
+                                    .chars()
+                                    .map(|c| {
+                                        if c.is_ascii_alphanumeric()
+                                            || c == '.'
+                                            || c == '-'
+                                            || c == '_'
+                                        {
+                                            c
+                                        } else {
+                                            '_'
+                                        }
+                                    })
+                                    .collect();
+                                let local_file =
+                                    cache_dir.join(format!("sel_{sel_idx}_{safe_name}"));
+                                let res = Adb::discover().and_then(|adb| {
+                                    storage::pull(&adb, &device, &remote, &local_file)?;
+                                    Ok(local_file)
+                                });
+                                let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
+                            });
+                            ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                                if let Ok(Ok(local_file)) = result {
+                                    let local_str = local_file.to_string_lossy().into_owned();
+                                    if let Some(slot) =
+                                        me.back_screen.gallery_items.get_mut(sel_idx)
+                                    {
+                                        slot.local_thumb_path = Some(local_str.clone());
+                                    }
+                                    me.work.insert_image_preview(local_str, local_file);
+                                    ctx.notify();
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+            BackScreenAction::GalleryZoomIn => {
+                let next = match self.back_screen.gallery_zoom_pct {
+                    0..=49 => 50,
+                    50..=99 => 100,
+                    100..=149 => 150,
+                    150..=199 => 200,
+                    200..=299 => 300,
+                    _ => 400,
+                };
+                self.back_screen.gallery_zoom_pct = next;
+                self.status = format!("照片预览已放大至 {next}%");
+                self.error = false;
+            }
+            BackScreenAction::GalleryZoomOut => {
+                let next = match self.back_screen.gallery_zoom_pct {
+                    301.. => 300,
+                    201..=300 => 200,
+                    151..=200 => 150,
+                    101..=150 => 100,
+                    _ => 50,
+                };
+                self.back_screen.gallery_zoom_pct = next;
+                self.status = format!("照片预览已缩小至 {next}%");
+                self.error = false;
+            }
+            BackScreenAction::GalleryZoomSet(pct) => {
+                let next = (*pct).clamp(50, 400);
+                self.back_screen.gallery_zoom_pct = next;
+                self.status = format!("已切换照片预览缩放比例：{next}%");
+                self.error = false;
+            }
+            BackScreenAction::GalleryToggleLightbox => {
+                self.back_screen.gallery_lightbox = !self.back_screen.gallery_lightbox;
+                self.trigger_subtab_switch();
+                self.sync_gallery_image_previews();
+                let sel = self.back_screen.gallery_selected;
+                let _ = self.do_backscreen_action(&BackScreenAction::GallerySelect(sel), ctx);
+                self.status = if self.back_screen.gallery_lightbox {
+                    format!(
+                        "已展开顶部大图暗房检视（缩放 {}%，支持旋转与翻页）",
+                        self.back_screen.gallery_zoom_pct
+                    )
+                } else {
+                    "已收起顶部大图检视，返回分栏相册视图".into()
+                };
+                self.error = false;
+            }
+            BackScreenAction::GalleryPrevPhoto | BackScreenAction::GalleryNextPhoto => {
+                let indices = self.filtered_gallery_indices();
+                if indices.is_empty() {
+                    self.status = "当前筛选下暂无可切换的照片".into();
+                    return Ok(());
+                }
+                let cur = self.back_screen.gallery_selected;
+                let pos = indices.iter().position(|&i| i == cur).unwrap_or(0);
+                let next_pos = if matches!(action, BackScreenAction::GalleryPrevPhoto) {
+                    if pos == 0 {
+                        indices.len() - 1
+                    } else {
+                        pos - 1
+                    }
+                } else {
+                    (pos + 1) % indices.len()
+                };
+                let next_idx = indices[next_pos];
+                self.do_backscreen_action(&BackScreenAction::GallerySelect(next_idx), ctx)?;
+                if let Some(item) = self.back_screen.gallery_items.get(next_idx) {
+                    self.status = format!(
+                        "已切换至第 {}/{} 张照片：{}",
+                        next_pos + 1,
+                        indices.len(),
+                        item.name
+                    );
+                    self.error = false;
+                }
+            }
+            BackScreenAction::GalleryRotateRight(remote_path) => {
+                let prev_deg = self
+                    .back_screen
+                    .gallery_rotations
+                    .get(remote_path)
+                    .copied()
+                    .unwrap_or(0);
+                let next_deg = (prev_deg + 90) % 360;
+                self.back_screen
+                    .insert_gallery_rotation(remote_path.clone(), next_deg);
+                if let Some(item_idx) = self
+                    .back_screen
+                    .gallery_items
+                    .iter()
+                    .position(|i| &i.remote_path == remote_path)
+                {
+                    let current_thumb = self.back_screen.gallery_items[item_idx]
+                        .local_thumb_path
+                        .clone()
+                        .filter(|p| std::path::Path::new(p).is_file());
+                    if let Some(thumb_str) = current_thumb {
+                        let thumb_path = PathBuf::from(&thumb_str);
+                        let img = image::open(&thumb_path)
+                            .map_err(|e| anyhow::anyhow!("读取本地预览图进行旋转失败：{e}"))?;
+                        let rotated = image::imageops::rotate90(&img);
+                        let cache_dir = std::env::temp_dir().join("stepx-gallery-cache");
+                        let _ = std::fs::create_dir_all(&cache_dir);
+                        let rot_path = cache_dir.join(format!("rot_{}_{}.png", item_idx, next_deg));
+                        rotated
+                            .save(&rot_path)
+                            .map_err(|e| anyhow::anyhow!("保存旋转后的预览图失败：{e}"))?;
+                        let rot_str = rot_path.to_string_lossy().into_owned();
+                        self.back_screen.gallery_items[item_idx].local_thumb_path =
+                            Some(rot_str.clone());
+                        self.work.insert_image_preview(rot_str, rot_path);
+                        self.status = format!(
+                            "已顺时针旋转 90°（当前 {}°）：{}",
+                            next_deg, self.back_screen.gallery_items[item_idx].name
+                        );
+                        self.error = false;
+                    } else if let Some(device) = self.selected.clone() {
+                        let remote = remote_path.clone();
+                        let name = self.back_screen.gallery_items[item_idx].name.clone();
+                        self.status = format!("正在从手机拉取并旋转 {name} ({next_deg}°)…");
+                        let (tx, rx) = async_channel::bounded(1);
+                        std::thread::spawn(move || {
+                            let cache_dir = std::env::temp_dir().join("stepx-gallery-cache");
+                            let _ = std::fs::create_dir_all(&cache_dir);
+                            let safe_name: String = name
+                                .chars()
+                                .map(|c| {
+                                    if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_'
+                                    {
+                                        c
+                                    } else {
+                                        '_'
+                                    }
+                                })
+                                .collect();
+                            let raw_file = cache_dir.join(format!("sel_{item_idx}_{safe_name}"));
+                            let res = Adb::discover().and_then(|adb| {
+                                storage::pull(&adb, &device, &remote, &raw_file)?;
+                                let img = image::open(&raw_file)?;
+                                let rotated = match next_deg {
+                                    90 => image::DynamicImage::ImageRgba8(
+                                        image::imageops::rotate90(&img),
+                                    ),
+                                    180 => image::DynamicImage::ImageRgba8(
+                                        image::imageops::rotate180(&img),
+                                    ),
+                                    270 => image::DynamicImage::ImageRgba8(
+                                        image::imageops::rotate270(&img),
+                                    ),
+                                    _ => img,
+                                };
+                                let rot_file = cache_dir
+                                    .join(format!("sel_{item_idx}_{safe_name}_rot{next_deg}.png"));
+                                rotated.save(&rot_file)?;
+                                Ok(rot_file)
+                            });
+                            let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
+                        });
+                        ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                            match result {
+                                Ok(Ok(rot_file)) => {
+                                    let rot_str = rot_file.to_string_lossy().into_owned();
+                                    if let Some(slot) =
+                                        me.back_screen.gallery_items.get_mut(item_idx)
+                                    {
+                                        slot.local_thumb_path = Some(rot_str.clone());
+                                    }
+                                    me.work.insert_image_preview(rot_str, rot_file);
+                                    me.status = format!("已完成照片旋转（{next_deg}°）");
+                                    me.error = false;
+                                }
+                                Ok(Err(err)) => {
+                                    me.error = true;
+                                    me.status = format!("旋转照片失败：{err}");
+                                }
+                                Err(_) => {}
+                            }
+                            ctx.notify();
+                        });
+                    } else {
+                        self.status = format!("已记录旋转角度 {next_deg}°（连接手机后生效）");
+                        self.error = false;
+                    }
+                }
+            }
+            BackScreenAction::GallerySetGridCols(cols) => {
+                let c = (*cols).clamp(2, 4);
+                if self.back_screen.gallery_grid_cols != c {
+                    self.back_screen.gallery_grid_cols = c;
+                    self.trigger_subtab_switch();
+                }
+                let label = match c {
+                    2 => "2列大图",
+                    4 => "4列紧凑",
+                    _ => "3列标准",
+                };
+                self.status = format!("已切换相册缩略图网格：{label}");
+                self.error = false;
+            }
+            BackScreenAction::GalleryCopyPath(text) => {
+                ctx.clipboard()
+                    .write(ClipboardContent::plain_text(text.clone()));
+                self.status = format!("已复制路径到剪贴板：{text}");
+                self.error = false;
+            }
+            BackScreenAction::PresetFilter(filter) => {
+                if self.back_screen.preset_filter != *filter {
+                    self.back_screen.preset_filter = *filter;
+                    self.trigger_subtab_switch();
+                }
+            }
+            BackScreenAction::GalleryCapturePhoneScreenshot => {
+                let Some(device) = self.selected.clone() else {
+                    self.status = "请先连接手机后再截取手机画面".into();
+                    self.error = true;
+                    return Ok(());
+                };
+                self.back_screen.gallery_loading = true;
+                self.status = "正在截取手机当前画面并存入相册…".into();
+                let (tx, rx) = async_channel::bounded(1);
+                std::thread::spawn(move || {
+                    let res = Adb::discover().and_then(|adb| {
+                        stepx_companion::toolbox::capture_phone_screenshot_to_gallery(&adb, &device)
+                    });
+                    let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
+                });
+                ctx.spawn(async move { rx.recv().await }, |me, result, ctx| {
+                    me.back_screen.gallery_loading = false;
+                    me.back_screen.gallery_checked = true;
+                    match result {
+                        Ok(Ok((items, note))) => {
+                            me.back_screen.gallery_selected = 0;
+                            me.apply(Outcome::PhoneGallery(items, note));
+                        }
+                        Ok(Err(err)) => {
+                            me.error = true;
+                            me.status = format!("截取手机画面失败：{err}");
+                        }
+                        Err(_) => {}
+                    }
+                    ctx.notify();
+                });
+            }
+            BackScreenAction::GalleryDelete(path) => {
+                let remote_path = path.clone();
+                if self
+                    .back_screen
+                    .gallery_items
+                    .iter()
+                    .any(|i| i.remote_path == remote_path && i.category == "expansion")
+                {
+                    self.page = Page::Expansion;
+                    self.error = false;
+                    self.status =
+                        "该照片已归档至电脑扩容库，已为您跳转至「电脑扩容」进行管理或还原".into();
+                    return Ok(());
+                }
+                let Some(device) = self.selected.clone() else {
+                    self.status = "请先连接手机后再删除相册图片".into();
+                    self.error = true;
+                    return Ok(());
+                };
+                self.back_screen.gallery_loading = true;
+                self.status = "正在从手机相册删除图片…".into();
+                let (tx, rx) = async_channel::bounded(1);
+                std::thread::spawn(move || {
+                    let res = Adb::discover().and_then(|adb| {
+                        stepx_companion::toolbox::delete_phone_gallery_item(
+                            &adb,
+                            &device,
+                            &remote_path,
+                        )
+                    });
+                    let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
+                });
+                ctx.spawn(async move { rx.recv().await }, |me, result, ctx| {
+                    me.back_screen.gallery_loading = false;
+                    match result {
+                        Ok(Ok(items)) => {
+                            me.apply(Outcome::PhoneGallery(
+                                items,
+                                "已从手机相册删除该图片".into(),
+                            ));
+                        }
+                        Ok(Err(err)) => {
+                            me.error = true;
+                            me.status = format!("删除相册图片未完成：{err}");
+                        }
+                        Err(_) => {}
+                    }
+                    ctx.notify();
+                });
+            }
+            BackScreenAction::GallerySaveToDesktop(path) => {
+                let remote_path = path.clone();
+                let rot_deg = self
+                    .back_screen
+                    .gallery_rotations
+                    .get(&remote_path)
+                    .copied()
+                    .unwrap_or(0);
+                let matched_item = self
+                    .back_screen
+                    .gallery_items
+                    .iter()
+                    .find(|i| i.remote_path == remote_path);
+                let is_expansion = matched_item.is_some_and(|i| i.category == "expansion");
+                let cached_local = matched_item
+                    .and_then(|i| i.local_thumb_path.as_deref())
+                    .map(PathBuf::from)
+                    .filter(|p| p.is_file());
+                let file_name = matched_item
+                    .map(|i| i.name.trim())
+                    .filter(|n| !n.is_empty())
+                    .map(ToOwned::to_owned)
+                    .or_else(|| {
+                        std::path::Path::new(&remote_path)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .map(ToOwned::to_owned)
+                    })
+                    .unwrap_or_else(|| "phone_photo.jpg".to_string());
+                let base_dir = if let Some(dir) = self
+                    .settings
+                    .value
+                    .download_directory
+                    .as_ref()
+                    .filter(|d| !d.as_os_str().is_empty())
+                {
+                    dir.clone()
+                } else {
+                    let home = std::env::var_os("HOME")
+                        .or_else(|| std::env::var_os("USERPROFILE"))
+                        .map(PathBuf::from)
+                        .unwrap_or_else(std::env::temp_dir);
+                    let pics = home.join("Pictures");
+                    if pics.is_dir() {
+                        pics
+                    } else {
+                        home.join("Downloads")
+                    }
+                };
+                if let Some(local_src) =
+                    cached_local.filter(|_| is_expansion || rot_deg > 0 || self.selected.is_none())
+                {
+                    let _ = std::fs::create_dir_all(&base_dir);
+                    let out_name = if rot_deg > 0 {
+                        let stem = std::path::Path::new(&file_name)
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("photo");
+                        format!("{stem}_rot{rot_deg}.png")
+                    } else {
+                        file_name
+                    };
+                    let dest = base_dir.join(&out_name);
+                    match std::fs::copy(&local_src, &dest) {
+                        Ok(_) => {
+                            self.error = false;
+                            self.status = format!("已保存照片到电脑：{}", dest.display());
+                        }
+                        Err(e) => {
+                            self.error = true;
+                            self.status = format!("保存照片失败：{e}");
+                        }
+                    }
+                    return Ok(());
+                }
+                let Some(device) = self.selected.clone() else {
+                    self.status = "请先连接手机后再保存图片到电脑".into();
+                    self.error = true;
+                    return Ok(());
+                };
+                let dest = base_dir.join(&file_name);
+                self.status = format!("正在将 {file_name} 保存到电脑…");
+                let (tx, rx) = async_channel::bounded(1);
+                std::thread::spawn(move || {
+                    let _ = std::fs::create_dir_all(&base_dir);
+                    let res = Adb::discover().and_then(|adb| {
+                        storage::pull(&adb, &device, &remote_path, &dest)?;
+                        Ok(dest)
+                    });
+                    let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
+                });
+                ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                    match result {
+                        Ok(Ok(saved_path)) => {
+                            me.error = false;
+                            me.status = format!("已保存手机照片到电脑：{}", saved_path.display());
+                        }
+                        Ok(Err(err)) => {
+                            me.error = true;
+                            me.status = format!("保存照片到电脑失败：{err}");
+                        }
+                        Err(_) => {}
+                    }
+                    ctx.notify();
+                });
+            }
+            BackScreenAction::GalleryOpenOnDesktop(path) => {
+                let remote_path = path.clone();
+                let cached_local = self
+                    .back_screen
+                    .gallery_items
+                    .iter()
+                    .find(|i| i.remote_path == remote_path)
+                    .and_then(|i| i.local_thumb_path.as_deref())
+                    .map(PathBuf::from)
+                    .filter(|p| p.is_file());
+                if let Some(local_path) = cached_local {
+                    match work_state::open_work_path(&local_path) {
+                        Ok(()) => {
+                            self.error = false;
+                            self.status = format!("已在电脑打开预览：{}", local_path.display());
+                        }
+                        Err(e) => {
+                            self.error = true;
+                            self.status = format!("打开图片预览失败：{e:#}");
+                        }
+                    }
+                    return Ok(());
+                }
+                let Some(device) = self.selected.clone() else {
+                    self.status = "请先连接手机后再打开图片预览".into();
+                    self.error = true;
+                    return Ok(());
+                };
+                let file_name = std::path::Path::new(&remote_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("preview.jpg")
+                    .to_string();
+                self.status = format!("正在拉取 {file_name} 并在电脑打开…");
+                let (tx, rx) = async_channel::bounded(1);
+                let remote_for_cache = remote_path.clone();
+                std::thread::spawn(move || {
+                    let cache_dir = std::env::temp_dir().join("stepx-gallery-cache");
+                    let _ = std::fs::create_dir_all(&cache_dir);
+                    let local_path = cache_dir.join(&file_name);
+                    let res = Adb::discover().and_then(|adb| {
+                        storage::pull(&adb, &device, &remote_path, &local_path)?;
+                        work_state::open_work_path(&local_path)?;
+                        Ok(local_path)
+                    });
+                    let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
+                });
+                ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                    match result {
+                        Ok(Ok(local_path)) => {
+                            if let Some(item) = me
+                                .back_screen
+                                .gallery_items
+                                .iter_mut()
+                                .find(|i| i.remote_path == remote_for_cache)
+                            {
+                                item.local_thumb_path =
+                                    Some(local_path.to_string_lossy().to_string());
+                            }
+                            me.error = false;
+                            me.status = format!("已在电脑打开预览：{}", local_path.display());
+                        }
+                        Ok(Err(err)) => {
+                            me.error = true;
+                            me.status = format!("打开图片预览失败：{err}");
+                        }
+                        Err(_) => {}
+                    }
+                    ctx.notify();
+                });
+            }
+            BackScreenAction::GallerySendToAmoo(path) => {
+                let remote_path = path.clone();
+                let matched_item = self
+                    .back_screen
+                    .gallery_items
+                    .iter()
+                    .find(|i| i.remote_path == remote_path);
+                let real_name = matched_item
+                    .map(|i| i.name.trim())
+                    .filter(|n| !n.is_empty())
+                    .map(ToOwned::to_owned)
+                    .or_else(|| {
+                        std::path::Path::new(&remote_path)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .map(ToOwned::to_owned)
+                    })
+                    .unwrap_or_else(|| "gallery_photo.jpg".to_string());
+                let cached_local = matched_item
+                    .and_then(|i| i.local_thumb_path.as_deref())
+                    .map(PathBuf::from)
+                    .filter(|p| p.is_file());
+                if let Some(local_path) = cached_local {
+                    let attach_path = if local_path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .is_some_and(|n| n == real_name)
+                    {
+                        local_path
+                    } else {
+                        let cache_dir = std::env::temp_dir().join("stepx-gallery-cache");
+                        let _ = std::fs::create_dir_all(&cache_dir);
+                        let staged = cache_dir.join(&real_name);
+                        if std::fs::copy(&local_path, &staged).is_ok() {
+                            staged
+                        } else {
+                            local_path
+                        }
+                    };
+                    let _ = self.add_amoo_paths(&[attach_path]);
+                    self.page = Page::Amoo;
+                    if self.fields[F_AMOO].text.trim().is_empty() {
+                        self.fields[F_AMOO].set("请帮我分析这张来自手机相册的图片");
+                    }
+                    self.focus = Some(F_AMOO);
+                    self.status = format!("已将照片「{real_name}」添入 Amoo 对话附件");
+                    return Ok(());
+                }
+                let Some(device) = self.selected.clone() else {
+                    self.status = "请先连接手机后再将图片发送给 Amoo".into();
+                    self.error = true;
+                    return Ok(());
+                };
+                let file_name = std::path::Path::new(&remote_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("gallery_photo.jpg")
+                    .to_string();
+                self.status = format!("正在拉取 {file_name} 并带入 Amoo 对话…");
+                let (tx, rx) = async_channel::bounded(1);
+                std::thread::spawn(move || {
+                    let cache_dir = std::env::temp_dir().join("stepx-gallery-cache");
+                    let _ = std::fs::create_dir_all(&cache_dir);
+                    let local_path = cache_dir.join(&file_name);
+                    let res = Adb::discover().and_then(|adb| {
+                        storage::pull(&adb, &device, &remote_path, &local_path)?;
+                        Ok(local_path)
+                    });
+                    let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
+                });
+                ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                    match result {
+                        Ok(Ok(local_path)) => {
+                            let _ = me.add_amoo_paths(&[local_path]);
+                            me.page = Page::Amoo;
+                            if me.fields[F_AMOO].text.trim().is_empty() {
+                                me.fields[F_AMOO].set("请帮我分析这张来自手机相册的图片");
+                            }
+                            me.focus = Some(F_AMOO);
+                            me.error = false;
+                            me.status = "已将手机相册图片添入 Amoo 对话附件".into();
+                        }
+                        Ok(Err(err)) => {
+                            me.error = true;
+                            me.status = format!("带入 Amoo 对话失败：{err}");
+                        }
+                        Err(_) => {}
+                    }
+                    ctx.notify();
+                });
+            }
+            BackScreenAction::GalleryImportFromDesktop => {
+                let Some(device) = self.selected.clone() else {
+                    self.status = "请先连接手机后再导入电脑图片".into();
+                    self.error = true;
+                    return Ok(());
+                };
+                if let Some(local_paths) = native_dialog::FileDialog::new()
+                    .add_filter("图片", &["png", "jpg", "jpeg", "webp"])
+                    .show_open_multiple_file()
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                {
+                    let count = local_paths.len();
+                    let first_name = local_paths[0]
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("image.png")
+                        .to_string();
+                    let summary = if count == 1 {
+                        first_name
+                    } else {
+                        format!("{first_name} 等 {count} 张图片")
+                    };
+                    self.back_screen.gallery_loading = true;
+                    self.status = format!("正在导入 {summary} 到手机相册 (/sdcard/Pictures)…");
+                    let (tx, rx) = async_channel::bounded(1);
+                    std::thread::spawn(move || {
+                        let res = Adb::discover().and_then(|adb| {
+                            for local_path in &local_paths {
+                                storage::push(&adb, &device, local_path, "/sdcard/Pictures")?;
+                                if let Some(fname) = local_path.file_name().and_then(|n| n.to_str())
+                                {
+                                    let _ = adb.shell(
+                                        &device.transport,
+                                        &[
+                                            "am",
+                                            "broadcast",
+                                            "-a",
+                                            "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
+                                            "-d",
+                                            &format!("file:///sdcard/Pictures/{fname}"),
+                                        ],
+                                    );
+                                }
+                            }
+                            let items =
+                                stepx_companion::toolbox::list_phone_gallery(&adb, &device)?;
+                            Ok((items, summary))
+                        });
+                        let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
+                    });
+                    ctx.spawn(async move { rx.recv().await }, |me, result, ctx| {
+                        me.back_screen.gallery_loading = false;
+                        me.back_screen.gallery_checked = true;
+                        match result {
+                            Ok(Ok((items, summary))) => {
+                                me.back_screen.gallery_selected = 0;
+                                me.apply(Outcome::PhoneGallery(
+                                    items,
+                                    format!("已将电脑图片 {summary} 导入手机相册"),
+                                ));
+                            }
+                            Ok(Err(err)) => {
+                                me.error = true;
+                                me.status = format!("导入图片到手机相册失败：{err}");
+                            }
+                            Err(_) => {}
+                        }
+                        ctx.notify();
+                    });
+                }
+            }
+            BackScreenAction::McpQuickOpenCalendar => {
+                self.handle_device_action(&Action::OpenApp("com.android.calendar".into()));
+            }
+            BackScreenAction::McpQuickOpenAlarm => {
+                self.handle_device_action(&Action::OpenApp("com.android.deskclock".into()));
+            }
+            BackScreenAction::McpToggleDnd => {
+                self.do_backscreen_action(
+                    &BackScreenAction::TriggerMcpQuickAction("toggle_dnd".into()),
+                    ctx,
+                )?;
+            }
+            BackScreenAction::ApplyPreset(preset) => {
+                self.do_backscreen_action(&BackScreenAction::SelectPreset(*preset), ctx)?;
+                self.do_backscreen_action(&BackScreenAction::Play, ctx)?;
+            }
+            BackScreenAction::CalendarToggleDone(event_id) => {
+                if !self.back_screen.completed_calendar_events.remove(event_id) {
+                    self.back_screen.completed_calendar_events.insert(*event_id);
+                    self.status = "已将日程标记为已完成".into();
+                } else {
+                    self.status = "已取消日程完成标记".into();
+                }
+                self.error = false;
+            }
+            BackScreenAction::CalendarEditEvent(event_id) => {
+                if let Some(ev) = self
+                    .back_screen
+                    .stepos_suite
+                    .calendar_events
+                    .iter()
+                    .find(|e| e.id == *event_id)
+                    .cloned()
+                {
+                    let (y, m, d) = ev.date_ymd();
+                    self.back_screen.calendar_year = y;
+                    self.back_screen.calendar_month = m;
+                    self.back_screen.selected_calendar_day = d;
+                    self.back_screen.editing_calendar_event_id = Some(*event_id);
+                    self.fields[F_PHONE_SCHEDULE_TITLE].set(&ev.title);
+                    self.fields[F_CALENDAR_TIME].set(&ev.time_range_label());
+                    self.focus_field(F_PHONE_SCHEDULE_TITLE, ctx);
+                    self.status =
+                        format!("正在编辑日程「{}」，修改后点击保存修改或按 Enter", ev.title);
+                }
+            }
+            BackScreenAction::CalendarCancelEdit => {
+                self.back_screen.editing_calendar_event_id = None;
+                self.fields[F_PHONE_SCHEDULE_TITLE].clear();
+                self.status = "已取消编辑日程".into();
+                self.error = false;
+            }
+            BackScreenAction::CalendarSendReminderToPhone(event_id) => {
+                if let Some(ev) = self
+                    .back_screen
+                    .stepos_suite
+                    .calendar_events
+                    .iter()
+                    .find(|e| e.id == *event_id)
+                    .cloned()
+                {
+                    let summary = format!("【日程提醒】{}（{}）", ev.title, ev.hm_label());
+                    ctx.clipboard()
+                        .write(ClipboardContent::plain_text(summary.clone()));
+                    self.fields[F_PHONE_SCHEDULE_TITLE].set(&ev.title);
+                    self.fields[F_CALENDAR_TIME].set(&ev.hm_label());
+                    if self.selected.is_some() {
+                        self.do_backscreen_action(&BackScreenAction::PushDesktopClipboard, ctx)?;
+                        self.status = format!("已将日程提醒「{}」同步到手机剪贴板", ev.title);
+                    } else {
+                        self.status = format!("已复制日程提醒「{}」", ev.title);
+                    }
+                }
+            }
+            BackScreenAction::GalleryExportFiltered => {
+                let indices = self.filtered_gallery_indices();
+                if indices.is_empty() {
+                    self.status = "当前筛选下没有可导出的照片".into();
+                    self.error = true;
+                    return Ok(());
+                }
+                let items: Vec<_> = indices
+                    .into_iter()
+                    .filter_map(|i| self.back_screen.gallery_items.get(i).cloned())
+                    .collect();
+                let base_dir = self
+                    .settings
+                    .value
+                    .download_directory
+                    .as_ref()
+                    .filter(|d| !d.as_os_str().is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        let home = std::env::var_os("HOME")
+                            .or_else(|| std::env::var_os("USERPROFILE"))
+                            .map(PathBuf::from)
+                            .unwrap_or_else(std::env::temp_dir);
+                        let pics = home.join("Pictures");
+                        if pics.is_dir() {
+                            pics.join("StepX_Export")
+                        } else {
+                            home.join("Downloads").join("StepX_Export")
+                        }
+                    });
+                let device = self.selected.clone();
+                let count = items.len();
+                self.status = format!(
+                    "正在导出当前筛选的 {count} 张照片到 {}…",
+                    base_dir.display()
+                );
+                let (tx, rx) = async_channel::bounded(1);
+                std::thread::spawn(move || {
+                    let _ = std::fs::create_dir_all(&base_dir);
+                    let adb = Adb::discover().ok();
+                    let mut saved = 0usize;
+                    for item in items {
+                        let dest = base_dir.join(&item.name);
+                        if let Some(local) = item
+                            .local_thumb_path
+                            .as_deref()
+                            .filter(|p| std::path::Path::new(p).is_file())
+                        {
+                            if std::fs::copy(local, &dest).is_ok() {
+                                saved += 1;
+                                continue;
+                            }
+                        }
+                        if let (Some(adb), Some(dev)) = (&adb, &device) {
+                            if storage::pull(adb, dev, &item.remote_path, &dest).is_ok() {
+                                saved += 1;
+                            }
+                        }
+                    }
+                    let _ = work_state::open_work_path(&base_dir);
+                    let _ = tx.send_blocking((saved, base_dir));
+                });
+                ctx.spawn(async move { rx.recv().await }, |me, result, ctx| {
+                    if let Ok((saved, dir)) = result {
+                        me.error = false;
+                        me.status = format!("已导出 {saved} 张照片到电脑：{}", dir.display());
+                    }
+                    ctx.notify();
+                });
+            }
+            BackScreenAction::GalleryOpenExportFolder => {
+                let base_dir = self
+                    .settings
+                    .value
+                    .download_directory
+                    .as_ref()
+                    .filter(|d| !d.as_os_str().is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        let home = std::env::var_os("HOME")
+                            .or_else(|| std::env::var_os("USERPROFILE"))
+                            .map(PathBuf::from)
+                            .unwrap_or_else(std::env::temp_dir);
+                        let pics = home.join("Pictures");
+                        if pics.is_dir() {
+                            pics
+                        } else {
+                            home.join("Downloads")
+                        }
+                    });
+                let _ = std::fs::create_dir_all(&base_dir);
+                let _ = work_state::open_work_path(&base_dir);
+                self.status = format!("已打开电脑相册保存目录：{}", base_dir.display());
+                self.error = false;
+            }
+            BackScreenAction::LocalSynthesize => {
+                let prompt = self.fields[F_BACK_PROMPT].text.trim().to_string();
+                let label_or_prompt = if prompt.is_empty() {
+                    "STEPX".to_string()
+                } else {
+                    prompt
+                };
+                let (title, frame) = bs::synthesize_prompt_frame(&label_or_prompt);
+                self.back_screen.native_feature = None;
+                self.back_screen.source = bs::Source::Image(frame);
+                self.back_screen.title = title.clone();
+                self.back_screen.origin = "本地极速点阵合成".into();
+                self.back_screen.description = format!(
+                    "已根据「{label_or_prompt}」合成 17×23 背屏点阵，可在右侧点击像素微调或直接应用到背屏。"
+                );
+                self.back_screen.revision = self.back_screen.revision.wrapping_add(1);
+                self.back_screen.reset_preview();
+                self.back_screen.status =
+                    format!("已生成背屏点阵「{title}」，可点击像素编辑或应用到手机");
+                self.status = self.back_screen.status.clone();
+                self.error = false;
+            }
+            BackScreenAction::TogglePixel(x, y) => {
+                if *x < bs::WIDTH && *y < bs::HEIGHT && !bs::is_backscreen_corner(*x, *y) {
+                    if self.back_screen.frame.len() != bs::SLOTS {
+                        self.back_screen.refresh_frame();
+                    }
+                    let mut pixels = if self.back_screen.frame.len() == bs::SLOTS {
+                        self.back_screen.frame.clone()
+                    } else {
+                        vec![0; bs::SLOTS]
+                    };
+                    let idx = *y * bs::WIDTH + *x;
+                    pixels[idx] = if pixels[idx] >= 128 { 0 } else { 255 };
+                    self.back_screen.native_feature = None;
+                    self.back_screen.source = bs::Source::Image(pixels.clone());
+                    self.back_screen.frame = pixels;
+                    self.back_screen.origin = "手绘 DIY 点阵".into();
+                    self.back_screen.revision = self.back_screen.revision.wrapping_add(1);
+                    self.back_screen.status = format!("已点亮/熄灭背屏坐标 ({}, {})", x + 1, y + 1);
+                }
+            }
+            BackScreenAction::InvertFrame => {
+                if self.back_screen.frame.len() != bs::SLOTS {
+                    self.back_screen.refresh_frame();
+                }
+                let mut pixels = self.back_screen.frame.clone();
+                for y in 0..bs::HEIGHT {
+                    for x in 0..bs::WIDTH {
+                        if !bs::is_backscreen_corner(x, y) {
+                            let idx = y * bs::WIDTH + x;
+                            pixels[idx] = 255u8.saturating_sub(pixels[idx]);
+                        }
+                    }
+                }
+                self.back_screen.native_feature = None;
+                self.back_screen.source = bs::Source::Image(pixels.clone());
+                self.back_screen.frame = pixels;
+                self.back_screen.origin = "手绘 DIY 点阵".into();
+                self.back_screen.revision = self.back_screen.revision.wrapping_add(1);
+                self.back_screen.status = "已反相当前背屏点阵画布".into();
+            }
+            BackScreenAction::ShiftFrame(dx, dy) => {
+                if self.back_screen.frame.len() != bs::SLOTS {
+                    self.back_screen.refresh_frame();
+                }
+                let old = self.back_screen.frame.clone();
+                let mut next = vec![0u8; bs::SLOTS];
+                for y in 0..bs::HEIGHT {
+                    for x in 0..bs::WIDTH {
+                        if bs::is_backscreen_corner(x, y) {
+                            continue;
+                        }
+                        let sx = x as i32 - *dx;
+                        let sy = y as i32 - *dy;
+                        if (0..bs::WIDTH as i32).contains(&sx)
+                            && (0..bs::HEIGHT as i32).contains(&sy)
+                        {
+                            next[y * bs::WIDTH + x] = old[sy as usize * bs::WIDTH + sx as usize];
+                        }
+                    }
+                }
+                self.back_screen.native_feature = None;
+                self.back_screen.source = bs::Source::Image(next.clone());
+                self.back_screen.frame = next;
+                self.back_screen.origin = "手绘 DIY 点阵".into();
+                self.back_screen.revision = self.back_screen.revision.wrapping_add(1);
+            }
+            BackScreenAction::ClearDiyFrame => {
+                let blank = vec![0u8; bs::SLOTS];
+                self.back_screen.native_feature = None;
+                self.back_screen.source = bs::Source::Image(blank.clone());
+                self.back_screen.frame = blank;
+                self.back_screen.title = "自定义手绘图案".into();
+                self.back_screen.origin = "手绘 DIY 点阵".into();
+                self.back_screen.revision = self.back_screen.revision.wrapping_add(1);
+                self.back_screen.status = "已清空画布，可直接点击右侧 17×23 灯珠绘制图案".into();
+            }
+            BackScreenAction::SetThresholdValue(val) => {
+                self.back_screen.image_options.threshold = *val;
+                self.back_screen.reconvert()?;
+            }
+            BackScreenAction::RotateImage90 => {
+                self.back_screen.image_options.rotation_deg =
+                    (self.back_screen.image_options.rotation_deg + 90) % 360;
+                self.back_screen.reconvert()?;
+            }
+            BackScreenAction::FlipImageH => {
+                self.back_screen.image_options.flip_h = !self.back_screen.image_options.flip_h;
+                self.back_screen.reconvert()?;
+            }
+            BackScreenAction::CalendarStartCreateOnDate(year, month, day) => {
+                self.page = Page::Calendar;
+                let y = *year;
+                let m = (*month).clamp(1, 12);
+                let d = (*day).clamp(1, days_in_calendar_month(y, m));
+                self.back_screen.calendar_year = y;
+                self.back_screen.calendar_month = m;
+                self.back_screen.selected_calendar_day = d;
+                self.back_screen.editing_calendar_event_id = None;
+                self.focus_field(F_PHONE_SCHEDULE_TITLE, ctx);
+                self.status = format!("已选中 {y}-{m:02}-{d:02}，请输入日程标题后点击添加");
+                self.error = false;
+            }
+            BackScreenAction::CalendarQuickAddOnDate {
+                year,
+                month,
+                day,
+                title,
+                time,
+            } => {
+                self.page = Page::Calendar;
+                let y = *year;
+                let m = (*month).clamp(1, 12);
+                let d = (*day).clamp(1, days_in_calendar_month(y, m));
+                self.back_screen.calendar_year = y;
+                self.back_screen.calendar_month = m;
+                self.back_screen.selected_calendar_day = d;
+                self.back_screen.editing_calendar_event_id = None;
+                self.fields[F_PHONE_SCHEDULE_TITLE].set(title);
+                self.fields[F_CALENDAR_TIME].set(time);
+                self.do_backscreen_action(
+                    &BackScreenAction::CalendarCreateOnSelectedDate(None),
+                    ctx,
+                )?;
+            }
+            BackScreenAction::CalendarClearDay(year, month, day) => {
+                let target_ymd = (*year, *month, *day);
+                let ids: Vec<i64> = self
+                    .back_screen
+                    .stepos_suite
+                    .calendar_events
+                    .iter()
+                    .filter(|ev| ev.date_ymd() == target_ymd)
+                    .map(|ev| ev.id)
+                    .collect();
+                if ids.is_empty() {
+                    self.status = format!("{year}-{month:02}-{day:02} 当日暂无日程可清空");
+                    self.error = false;
+                    return Ok(());
+                }
+                let count = ids.len();
+                self.back_screen
+                    .stepos_suite
+                    .calendar_events
+                    .retain(|ev| ev.date_ymd() != target_ymd);
+                for id in &ids {
+                    if self.back_screen.editing_calendar_event_id == Some(*id) {
+                        self.back_screen.editing_calendar_event_id = None;
+                    }
+                    self.back_screen.completed_calendar_events.remove(id);
+                }
+                if self.prefs.auto_sync_calendar {
+                    rewrite_local_calendar_ics(&self.back_screen.stepos_suite.calendar_events);
+                }
+                let note = format!("已清空 {year}-{month:02}-{day:02} 的 {count} 项日程");
+                self.back_screen.stepos_suite.last_action_note = note.clone();
+                self.status = note;
+                self.error = false;
+                if !self.demo_mode {
+                    if let Some(device) = self.selected.clone() {
+                        let ids_to_del = ids;
+                        let (tx, rx) = async_channel::bounded(1);
+                        std::thread::spawn(move || {
+                            let res = Adb::discover().map(|adb| {
+                                let mut latest_events = None;
+                                for id in ids_to_del {
+                                    if let Ok((evs, _)) =
+                                        stepx_companion::toolbox::delete_phone_calendar_event(
+                                            &adb, &device, id,
+                                        )
+                                    {
+                                        latest_events = Some(evs);
+                                    }
+                                }
+                                latest_events
+                            });
+                            let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
+                        });
+                        ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                            if let Ok(Ok(Some(events))) = result {
+                                me.back_screen.stepos_suite.calendar_events = events;
+                                ctx.notify();
+                            }
+                        });
+                    }
+                }
+            }
+            BackScreenAction::CalendarDuplicateToTomorrow(event_id) => {
+                let Some(ev) = self
+                    .back_screen
+                    .stepos_suite
+                    .calendar_events
+                    .iter()
+                    .find(|e| e.id == *event_id)
+                    .cloned()
+                else {
+                    return Ok(());
+                };
+                let new_start = ev.dtstart + 86_400_000;
+                let new_end = ev.dtend + 86_400_000;
+                let new_id = self
+                    .back_screen
+                    .stepos_suite
+                    .calendar_events
+                    .iter()
+                    .map(|e| e.id)
+                    .max()
+                    .unwrap_or(1000)
+                    + 1;
+                let mut dup = ev.clone();
+                dup.id = new_id;
+                dup.dtstart = new_start;
+                dup.dtend = new_end;
+                let (ny, nm, nd) = dup.date_ymd();
+                let title = dup.title.clone();
+                let desc = dup.description.clone();
+                self.back_screen.stepos_suite.calendar_events.push(dup);
+                self.back_screen
+                    .stepos_suite
+                    .calendar_events
+                    .sort_by_key(|e| e.dtstart);
+                if self.prefs.auto_sync_calendar {
+                    let _ = stepx_companion::toolbox::save_desktop_calendar_event(
+                        &title, new_start, new_end, &desc,
+                    );
+                }
+                self.back_screen.calendar_year = ny;
+                self.back_screen.calendar_month = nm;
+                self.back_screen.selected_calendar_day = nd;
+                let note = format!("已将日程「{title}」克隆到明天");
+                self.back_screen.stepos_suite.last_action_note = note.clone();
+                self.status = note;
+                self.error = false;
+                if !self.demo_mode {
+                    if let Some(device) = self.selected.clone() {
+                        let title_bg = title.clone();
+                        let desc_bg = if desc.is_empty() {
+                            "由 StepX 桌面端克隆创建".to_string()
+                        } else {
+                            desc
+                        };
+                        let (tx, rx) = async_channel::bounded(1);
+                        std::thread::spawn(move || {
+                            let res = Adb::discover().and_then(|adb| {
+                                stepx_companion::toolbox::create_phone_calendar_event(
+                                    &adb, &device, &title_bg, new_start, new_end, &desc_bg,
+                                )
+                            });
+                            let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
+                        });
+                        ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                            if let Ok(Ok((_id, events, _))) = result {
+                                me.back_screen.stepos_suite.calendar_events = events;
+                                ctx.notify();
+                            }
+                        });
+                    }
+                }
+            }
+            BackScreenAction::CalendarPostponeOneDay(event_id) => {
+                let mut updated_info: Option<(i64, String, String, i64, i64, (i32, u32, u32))> =
+                    None;
+                if let Some(ev) = self
+                    .back_screen
+                    .stepos_suite
+                    .calendar_events
+                    .iter_mut()
+                    .find(|e| e.id == *event_id)
+                {
+                    ev.dtstart += 86_400_000;
+                    ev.dtend += 86_400_000;
+                    updated_info = Some((
+                        ev.id,
+                        ev.title.clone(),
+                        ev.description.clone(),
+                        ev.dtstart,
+                        ev.dtend,
+                        ev.date_ymd(),
+                    ));
+                }
+                let Some((old_id, title, desc, new_start, new_end, (ny, nm, nd))) = updated_info
+                else {
+                    return Ok(());
+                };
+                self.back_screen
+                    .stepos_suite
+                    .calendar_events
+                    .sort_by_key(|e| e.dtstart);
+                if self.prefs.auto_sync_calendar {
+                    rewrite_local_calendar_ics(&self.back_screen.stepos_suite.calendar_events);
+                }
+                self.back_screen.calendar_year = ny;
+                self.back_screen.calendar_month = nm;
+                self.back_screen.selected_calendar_day = nd;
+                let note = format!("已将日程「{title}」顺延至 {ny}-{nm:02}-{nd:02}");
+                self.back_screen.stepos_suite.last_action_note = note.clone();
+                self.status = note;
+                self.error = false;
+                if !self.demo_mode {
+                    if let Some(device) = self.selected.clone() {
+                        let title_bg = title.clone();
+                        let desc_bg = if desc.is_empty() {
+                            "由 StepX 桌面端顺延更新".to_string()
+                        } else {
+                            desc
+                        };
+                        let (tx, rx) = async_channel::bounded(1);
+                        std::thread::spawn(move || {
+                            let res = Adb::discover().and_then(|adb| {
+                                let _ = stepx_companion::toolbox::delete_phone_calendar_event(
+                                    &adb, &device, old_id,
+                                );
+                                stepx_companion::toolbox::create_phone_calendar_event(
+                                    &adb, &device, &title_bg, new_start, new_end, &desc_bg,
+                                )
+                            });
+                            let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
+                        });
+                        ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                            if let Ok(Ok((_id, events, _))) = result {
+                                me.back_screen.stepos_suite.calendar_events = events;
+                                ctx.notify();
+                            }
+                        });
+                    }
+                }
+            }
+            BackScreenAction::CalendarPrefillFromText { title, time_hint } => {
+                self.page = Page::Calendar;
+                self.back_screen.editing_calendar_event_id = None;
+                let flat: String = title
+                    .lines()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let mut chars = flat.chars();
+                let head: String = chars.by_ref().take(60).collect();
+                let clean_title = if head.is_empty() {
+                    "消息提取日程".to_string()
+                } else if chars.next().is_some() {
+                    format!("{head}…")
+                } else {
+                    head
+                };
+                self.fields[F_PHONE_SCHEDULE_TITLE].set(&clean_title);
+                self.fields[F_CALENDAR_TIME].set(if time_hint.trim().is_empty() {
+                    "09:30-10:00"
+                } else {
+                    time_hint.trim()
+                });
+                self.focus_field(F_PHONE_SCHEDULE_TITLE, ctx);
+                self.status =
+                    format!("已从消息提取日程草稿「{clean_title}」，确认日期与时间后点击添加即可");
+                self.error = false;
+            }
+            BackScreenAction::AlarmEdit(alarm_id) => {
+                if let Some(alarm) = self
+                    .back_screen
+                    .stepos_suite
+                    .alarms
+                    .iter()
+                    .find(|a| a.id == *alarm_id)
+                    .cloned()
+                {
+                    self.page = Page::Alarms;
+                    self.back_screen.editing_alarm_id = Some(*alarm_id);
+                    self.fields[F_ALARM_TIME].set(&alarm.time_label());
+                    self.fields[F_PHONE_SCHEDULE_TITLE].set(alarm.display_title());
+                    self.focus_field(F_PHONE_SCHEDULE_TITLE, ctx);
+                    self.status = format!(
+                        "正在修改闹钟 {}（{}），修改后点击「保存闹钟修改」",
+                        alarm.time_label(),
+                        alarm.display_title()
+                    );
+                    self.error = false;
+                }
+            }
+            BackScreenAction::AlarmCancelEdit => {
+                self.back_screen.editing_alarm_id = None;
+                self.fields[F_PHONE_SCHEDULE_TITLE].clear();
+                self.status = "已取消修改闹钟".into();
+                self.error = false;
+            }
+            BackScreenAction::AlarmShiftMinutes(alarm_id, delta_mins) => {
+                let mut shifted_info: Option<(i64, String, u8, u8)> = None;
+                if let Some(alarm) = self
+                    .back_screen
+                    .stepos_suite
+                    .alarms
+                    .iter_mut()
+                    .find(|a| a.id == *alarm_id)
+                {
+                    let total_mins = (alarm.hour as i32 * 60 + alarm.minutes as i32 + *delta_mins)
+                        .rem_euclid(1440);
+                    alarm.hour = (total_mins / 60) as u8;
+                    alarm.minutes = (total_mins % 60) as u8;
+                    alarm.enabled = true;
+                    shifted_info = Some((
+                        alarm.id,
+                        alarm.display_title().to_string(),
+                        alarm.hour,
+                        alarm.minutes,
+                    ));
+                }
+                if let Some((old_id, title, new_h, new_m)) = shifted_info {
+                    let note = format!("已将闹钟「{title}」调整至 {new_h:02}:{new_m:02}");
+                    self.back_screen.stepos_suite.last_action_note = note.clone();
+                    self.status = note;
+                    self.error = false;
+                    if !self.demo_mode {
+                        if let Some(device) = self.selected.clone() {
+                            let (tx, rx) = async_channel::bounded(1);
+                            std::thread::spawn(move || {
+                                let res = Adb::discover().and_then(|adb| {
+                                    let _ = stepx_companion::toolbox::delete_phone_alarm(
+                                        &adb, &device, old_id,
+                                    );
+                                    stepx_companion::toolbox::create_phone_alarm(
+                                        &adb, &device, new_h, new_m, &title,
+                                    )
+                                });
+                                let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
+                            });
+                            ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                                if let Ok(Ok((_id, alarms, _))) = result {
+                                    me.back_screen.stepos_suite.alarms = alarms;
+                                    ctx.notify();
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+            BackScreenAction::AlarmToggleAll(enable) => {
+                let target = *enable;
+                let ids: Vec<i64> = self
+                    .back_screen
+                    .stepos_suite
+                    .alarms
+                    .iter()
+                    .map(|a| a.id)
+                    .collect();
+                for a in &mut self.back_screen.stepos_suite.alarms {
+                    a.enabled = target;
+                }
+                let note = if target {
+                    "已开启全部闹钟".to_string()
+                } else {
+                    "已关闭全部闹钟".to_string()
+                };
+                self.back_screen.stepos_suite.last_action_note = note.clone();
+                self.status = note;
+                self.error = false;
+                if !self.demo_mode && !ids.is_empty() {
+                    if let Some(device) = self.selected.clone() {
+                        let (tx, rx) = async_channel::bounded(1);
+                        std::thread::spawn(move || {
+                            let res = Adb::discover().map(|adb| {
+                                let mut latest_alarms = None;
+                                for id in ids {
+                                    if let Ok((alarms, _)) =
+                                        stepx_companion::toolbox::toggle_phone_alarm(
+                                            &adb, &device, id, target,
+                                        )
+                                    {
+                                        latest_alarms = Some(alarms);
+                                    }
+                                }
+                                latest_alarms
+                            });
+                            let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
+                        });
+                        ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                            if let Ok(Ok(Some(alarms))) = result {
+                                me.back_screen.stepos_suite.alarms = alarms;
+                                ctx.notify();
+                            }
+                        });
+                    }
+                }
             }
         }
         Ok(())
@@ -1143,7 +3580,7 @@ impl Companion {
     }
     pub(super) fn poll_backscreen(&mut self, preview_visible: bool) -> bool {
         self.back_screen
-            .set_preview_visible(preview_visible && self.selected.is_some() && !self.initializing);
+            .set_preview_visible(preview_visible && !self.initializing);
         if !self.back_screen.needs_poll() {
             return false;
         }
@@ -1541,13 +3978,18 @@ impl Companion {
             }
         }
         if self.back_screen.pomodoro_active {
-            if self.back_screen.pomodoro_remaining_secs() == 0 {
+            let remaining = self.back_screen.pomodoro_remaining_secs();
+            if remaining == 0 {
                 self.back_screen.pomodoro_active = false;
                 self.back_screen.pomodoro_started_at = None;
+                self.back_screen.pomodoro_last_remaining_secs = None;
                 self.back_screen.status =
                     "25 分钟背屏专注番茄钟已完成，手机背屏恢复默认显示".into();
                 changed = true;
-            } else if self.page == Page::BackScreen {
+            } else if self.page == Page::BackScreen
+                && self.back_screen.pomodoro_last_remaining_secs != Some(remaining)
+            {
+                self.back_screen.pomodoro_last_remaining_secs = Some(remaining);
                 changed = true;
             }
         }
@@ -1655,5 +4097,29 @@ mod lifecycle_tests {
         state.native_rx = Some(rx);
         assert!(state.needs_poll());
         assert!(!state.preview_running);
+    }
+    #[test]
+    fn default_stepos_suite_never_shows_fake_numbers_and_pomodoro_defaults_to_25m() {
+        let mut state = BackScreenUiState::default();
+        assert!(!state.stepos_suite.checked);
+        assert_eq!(state.stepos_suite.wellbeing.screen_time_minutes, 0);
+        assert_eq!(state.stepos_suite.wellbeing.unlock_count, 0);
+        assert!(state.stepos_suite.wellbeing.top_apps.is_empty());
+        assert!(state.stepos_suite.phone_clipboard.is_empty());
+        assert_eq!(state.pomodoro_duration_secs, 25 * 60);
+        state.pomodoro_active = true;
+        state.pomodoro_started_at = Some(Instant::now());
+        assert!(state.pomodoro_remaining_secs() >= 1498);
+    }
+    #[test]
+    fn gallery_zoom_lightbox_grid_and_preset_filter_defaults() {
+        let state = BackScreenUiState::default();
+        assert_eq!(state.gallery_zoom_pct, 100);
+        assert!(!state.gallery_lightbox);
+        assert_eq!(state.gallery_grid_cols, 3);
+        assert!(state.gallery_rotations.is_empty());
+        assert_eq!(state.preset_filter, 0);
+        assert!(state.editing_calendar_event_id.is_none());
+        assert!(state.editing_alarm_id.is_none());
     }
 }

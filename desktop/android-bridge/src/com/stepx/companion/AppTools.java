@@ -53,6 +53,20 @@ public final class AppTools {
     }
 
     @SuppressWarnings("unchecked")
+    static boolean isLauncherPackage(PackageManager pm, int user, String packageName) throws Exception {
+        Intent intent = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER).setPackage(packageName);
+        List<ResolveInfo> resolved = (List<ResolveInfo>) PackageManager.class
+            .getMethod("queryIntentActivitiesAsUser", Intent.class, int.class, int.class)
+            .invoke(pm, intent, PackageManager.MATCH_DISABLED_COMPONENTS, user);
+        if (resolved != null) {
+            for (ResolveInfo item : resolved) {
+                if (item.activityInfo != null && packageName.equals(item.activityInfo.packageName)) return true;
+            }
+        }
+        return false;
+    }
+
+    @SuppressWarnings("unchecked")
     public static JSONObject list(JSONObject request) throws Exception {
         PackageManager pm = Bridge.context.getPackageManager();
         int user = currentUser();
@@ -95,7 +109,7 @@ public final class AppTools {
         PackageInfo item = (PackageInfo) PackageManager.class
             .getMethod("getPackageInfoAsUser", String.class, int.class, int.class)
             .invoke(pm, name, PackageManager.MATCH_DISABLED_COMPONENTS, user);
-        return new JSONObject().put("app", metadata(pm, item, user, launcherPackages(pm, user).contains(name)));
+        return new JSONObject().put("app", metadata(pm, item, user, isLauncherPackage(pm, user, name)));
     }
 
     static JSONObject metadata(PackageManager pm, PackageInfo item, int user, boolean launcher) throws Exception {
@@ -142,16 +156,17 @@ public final class AppTools {
             drawable.draw(new Canvas(bitmap));
             boolean visible = false;
             boolean nonWhite = false;
-            for (int y = 0; y < ICON_SIZE; y++) {
-                for (int x = 0; x < ICON_SIZE; x++) {
-                    int pixel = bitmap.getPixel(x, y);
-                    if ((pixel >>> 24) != 0) visible = true;
-                    if ((pixel >>> 24) > 64 && ((pixel >> 16 & 255) < 230
-                        || (pixel >> 8 & 255) < 230 || (pixel & 255) < 230)) nonWhite = true;
-                }
+            boolean needNonWhite = "com.android.calendar".equals(app.packageName);
+            int[] pixels = new int[ICON_SIZE * ICON_SIZE];
+            bitmap.getPixels(pixels, 0, ICON_SIZE, 0, 0, ICON_SIZE, ICON_SIZE);
+            for (int pixel : pixels) {
+                if ((pixel >>> 24) != 0) visible = true;
+                if ((pixel >>> 24) > 64 && ((pixel >> 16 & 255) < 230
+                    || (pixel >> 8 & 255) < 230 || (pixel & 255) < 230)) nonWhite = true;
+                if (visible && (nonWhite || !needNonWhite)) break;
             }
             if (!visible) throw new IllegalStateException("应用图标内容为空");
-            if ("com.android.calendar".equals(app.packageName) && !nonWhite) {
+            if (needNonWhite && !nonWhite) {
                 throw new IllegalStateException("手机日历使用主题动态图标，安装包只提供空白底图");
             }
             ByteArrayOutputStream bytes = new ByteArrayOutputStream();

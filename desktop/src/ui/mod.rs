@@ -159,7 +159,12 @@ const F_PUSH_SEARCH: usize = 28;
 const F_PUSH_REPLY: usize = 29;
 const F_IM_REPLY: usize = 30;
 const F_TOAST_REPLY: usize = 31;
-const FIELD_COUNT: usize = 32;
+const F_PHONE_SCHEDULE_TITLE: usize = 32;
+const F_AMOO_MEMORY_INPUT: usize = 33;
+const F_CALENDAR_TIME: usize = 34;
+const F_ALARM_TIME: usize = 35;
+const F_GALLERY_SEARCH: usize = 36;
+const FIELD_COUNT: usize = 37;
 
 const FILES_PER_PAGE: usize = 100;
 
@@ -283,6 +288,10 @@ enum Page {
     Expansion,
     BackScreen,
     Amoo,
+    Calendar,
+    Schedule,
+    Alarms,
+    Gallery,
     Account,
     About,
     Settings,
@@ -304,12 +313,15 @@ impl Page {
             Self::Overview => "首页",
             Self::Expansion => "存储扩容",
             Self::BackScreen => "背屏",
-            Self::Amoo => "Amoo",
+            Self::Amoo => "Amoo 对话",
+            Self::Calendar | Self::Schedule => "日历",
+            Self::Alarms => "闹钟",
+            Self::Gallery => "图库",
             Self::Account => "账号与用量",
             Self::About => "设置",
             Self::Settings => "设置",
-            Self::Work => "Amoo",
-            Self::Studio => "Amoo",
+            Self::Work => "文件处理",
+            Self::Studio => "我的作品",
             Self::Sms => "消息与短信",
             Self::Notifications => "手机推送",
             Self::Phone => "电话",
@@ -326,6 +338,9 @@ impl Page {
             Self::Expansion => "💾",
             Self::BackScreen => "❖",
             Self::Amoo => "✦",
+            Self::Calendar | Self::Schedule => "📅",
+            Self::Alarms => "⏰",
+            Self::Gallery => "🖼",
             Self::Account => "◉",
             Self::About => "◉",
             Self::Settings => "⚙",
@@ -347,6 +362,10 @@ impl Page {
             self,
             Self::Connect
                 | Self::Tools
+                | Self::Calendar
+                | Self::Schedule
+                | Self::Alarms
+                | Self::Gallery
                 | Self::Work
                 | Self::Amoo
                 | Self::Account
@@ -361,7 +380,8 @@ impl Page {
     fn fills_height(self) -> bool {
         matches!(
             self,
-            Self::Settings
+            Self::Overview
+                | Self::Settings
                 | Self::About
                 | Self::Amoo
                 | Self::Work
@@ -377,8 +397,11 @@ impl Page {
         match arg {
             "backscreen" | "back" => Self::BackScreen,
             "amoo" => Self::Amoo,
-            "work" | "amoo-work" => Self::Amoo,
-            "studio" => Self::Amoo,
+            "calendar" | "schedule" => Self::Calendar,
+            "alarm" | "alarms" => Self::Alarms,
+            "gallery" | "photos" => Self::Gallery,
+            "work" | "amoo-work" => Self::Work,
+            "studio" => Self::Studio,
             "sms" | "chat" | "im" => Self::Sms,
             "notifications" | "push" | "notify" => Self::Notifications,
             "phone" | "call" => Self::Phone,
@@ -497,11 +520,13 @@ enum FileSort {
     Name,
     Size,
     Kind,
+    Time,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FileModal {
     NewFolder,
+    NewTextFile,
     Rename(usize),
 }
 
@@ -591,6 +616,14 @@ enum Action {
     Screenshot,
     SaveScreenshot,
     Key(u32),
+    ScreenTapNormalized(u16, u16),
+    ScreenGesture(u8),
+    ToggleLiveScreenStream,
+    SetMirrorQuality(u8),
+    ToggleMirrorAlwaysOnTop,
+    ToggleMirrorTurnScreenOff,
+    ToggleMirrorStayAwake,
+    ToggleMirrorShowTouches,
     OverviewBackPreview(bool),
     SendFocusText,
     // Amoo
@@ -751,8 +784,21 @@ enum Action {
     // Phone extra
     PhoneHangup,
     PhoneCreateContact,
+    PhoneDialNumber(String),
     // Files extra
     FilePushToBackScreen(String),
+    RevealLocalPath(PathBuf),
+    MoveHorizontalSelection(isize),
+    // Cross-module human actions
+    SendToAmoo(String),
+    EditUserMessage(String),
+    OpenAppInMirror(String),
+    EnableUsbWirelessBridge,
+    FillDetectedPhoneIp(String),
+    BackupPhoneFileToDesktop(String),
+    QuickGuiScenario { app: String, goal: String },
+    ScreenshotToBackScreen,
+    OpenNewTextFile,
     // Clipboard
     Copy,
     CopyText(String, String),
@@ -1007,6 +1053,66 @@ fn default_amoo_skills() -> Vec<AmooSkillEntry> {
     ]
 }
 
+fn default_demo_call_logs() -> Vec<CallRecord> {
+    let now = chrono::Local::now().timestamp_millis();
+    let min = 60_000;
+    vec![
+        CallRecord {
+            number: "138 0013 8000".into(),
+            name: "李明 · 产品组".into(),
+            call_type: 1,
+            date_ms: now - 18 * min,
+            duration_sec: 265,
+        },
+        CallRecord {
+            number: "139 1024 6688".into(),
+            name: "王磊 · 架构师".into(),
+            call_type: 2,
+            date_ms: now - 95 * min,
+            duration_sec: 412,
+        },
+        CallRecord {
+            number: "186 2100 5520".into(),
+            name: "顺丰派件员".into(),
+            call_type: 3,
+            date_ms: now - 180 * min,
+            duration_sec: 0,
+        },
+        CallRecord {
+            number: "135 8801 9200".into(),
+            name: "张晓楠 · 设计组".into(),
+            call_type: 1,
+            date_ms: now - 420 * min,
+            duration_sec: 148,
+        },
+    ]
+}
+
+fn default_demo_contacts() -> Vec<ContactEntry> {
+    vec![
+        ContactEntry {
+            name: "李明 · 产品组".into(),
+            number: "138 0013 8000".into(),
+        },
+        ContactEntry {
+            name: "王磊 · 架构师".into(),
+            number: "139 1024 6688".into(),
+        },
+        ContactEntry {
+            name: "张晓楠 · 设计组".into(),
+            number: "135 8801 9200".into(),
+        },
+        ContactEntry {
+            name: "陈思远 · 硬件研发".into(),
+            number: "137 6012 3390".into(),
+        },
+        ContactEntry {
+            name: "顺丰速运园区网点".into(),
+            number: "186 2100 5520".into(),
+        },
+    ]
+}
+
 struct Companion {
     font: FamilyId,
     mono_font: FamilyId,
@@ -1017,6 +1123,7 @@ struct Companion {
     desktop_update: DesktopUpdateState,
     interaction: interaction::InteractionUi,
     motion_started: Instant,
+    sub_motion_started: Instant,
     job_started: Instant,
     palette: Cell<Palette>,
     page: Page,
@@ -1031,6 +1138,7 @@ struct Companion {
     expansion: expansion_state::ExpansionUi,
     phone_link_notice: Option<(String, bool)>,
     preferences: Preferences,
+    prefs: Preferences,
     allow_first_connect: bool,
     pairing_hosts: Vec<std::net::IpAddr>,
     pair_tab: PairTab,
@@ -1055,6 +1163,10 @@ struct Companion {
     capabilities: Option<Capabilities>,
     mirror: Option<MirrorSession>,
     mirror_controls: Option<mirror_controls::ControlWindow>,
+    pub(super) mirror_options: stepx_companion::mirror::MirrorOptions,
+    pub(super) live_screen_stream: bool,
+    pub(super) last_live_screen_poll: Instant,
+    pub(super) live_screen_rx: Option<mpsc::Receiver<(tempfile::TempDir, PathBuf)>>,
     screenshot: Option<(tempfile::TempDir, PathBuf)>,
     overview_back_preview: bool,
     // BackScreen (23×17 Dot-Matrix)
@@ -1173,6 +1285,7 @@ struct Companion {
     loading_frame: usize,
     sender: mpsc::Sender<Job>,
     receiver: mpsc::Receiver<Result<Outcome>>,
+    bg_receivers: Vec<(Page, Option<ToolPage>, mpsc::Receiver<Result<Outcome>>)>,
     pub(super) bulk_rx: Option<mpsc::Receiver<Outcome>>,
     pub(super) bulk_busy: bool,
     pub(super) bulk_status: String,
@@ -1216,14 +1329,60 @@ fn is_wireless(transport: &str) -> bool {
     transport.contains(':') || transport.contains("_tcp")
 }
 
+/// Reaps any zombie `ps` child process left behind by Winit's startup
+/// `look_for_wayland_compositor()` probe on Linux (`<defunct>`).
+#[cfg(target_os = "linux")]
+fn reap_orphan_startup_zombies() {
+    let pid = std::process::id();
+    let children_path = format!("/proc/{pid}/task/{pid}/children");
+    let Ok(children) = std::fs::read_to_string(children_path) else {
+        return;
+    };
+    for token in children.split_whitespace() {
+        let Ok(child_pid) = token.parse::<i32>() else {
+            continue;
+        };
+        if child_pid <= 0 {
+            continue;
+        }
+        let status_path = format!("/proc/{child_pid}/status");
+        let Ok(status) = std::fs::read_to_string(status_path) else {
+            continue;
+        };
+        let is_ps = status.lines().any(|l| l == "Name:\tps");
+        let is_zombie = status.lines().any(|l| l.starts_with("State:\tZ"));
+        if is_ps && is_zombie {
+            unsafe {
+                libc::waitpid(child_pid, std::ptr::null_mut(), libc::WNOHANG);
+            }
+        }
+    }
+}
+
 impl Companion {
-    fn new(
-        ctx: &mut ViewContext<Self>,
+    #[cfg(test)]
+    pub(super) fn new_for_test() -> Self {
+        Self::build_initial(
+            FamilyId(0),
+            FamilyId(1),
+            None,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+    }
+
+    fn build_initial(
+        font: FamilyId,
+        mono_font: FamilyId,
         capture: Option<PathBuf>,
         activation_requests: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
-        let (font, mono_font) =
-            FontCache::handle(ctx).update(ctx, |cache, _| theme::load_fonts(cache));
+        #[cfg(target_os = "linux")]
+        std::thread::spawn(|| {
+            for delay_ms in [150u64, 500, 1500] {
+                std::thread::sleep(Duration::from_millis(delay_ms));
+                reap_orphan_startup_zombies();
+            }
+        });
         let (sender, jobs) = mpsc::channel::<Job>();
         let (results, receiver) = mpsc::channel();
         std::thread::spawn(move || {
@@ -1277,9 +1436,11 @@ impl Companion {
         let mut fields: Vec<Input> = (0..FIELD_COUNT).map(|_| Input::default()).collect();
         fields[F_BACK_PROMPT].set("让猫咪眨眼陪我工作，亮度 4 级，播放 30 秒");
         fields[F_BACK_MARQUEE].set("STEPX AI");
+        fields[F_CALENDAR_TIME].set("15:00");
+        fields[F_ALARM_TIME].set("08:00");
 
         let demo_mode = cfg!(feature = "ui-capture") && std::env::args().any(|a| a == "--demo");
-        let mut me = Self {
+        Self {
             font,
             mono_font,
             theme_mode,
@@ -1289,6 +1450,7 @@ impl Companion {
             desktop_update: Default::default(),
             interaction: Default::default(),
             motion_started: Instant::now(),
+            sub_motion_started: Instant::now(),
             job_started: Instant::now(),
             palette: Cell::new(Palette::for_theme(false)),
             page,
@@ -1309,6 +1471,7 @@ impl Companion {
                 Some(0)
             },
             adb_guide_step: (!demo_mode && preferences.should_show_adb_guide()).then_some(0),
+            prefs: preferences.clone(),
             preferences,
             pairing_hosts: vec![],
             pair_tab: PairTab::Qr,
@@ -1333,6 +1496,10 @@ impl Companion {
             capabilities: None,
             mirror: None,
             mirror_controls: None,
+            mirror_options: stepx_companion::mirror::MirrorOptions::default(),
+            live_screen_stream: false,
+            last_live_screen_poll: Instant::now(),
+            live_screen_rx: None,
             screenshot: None,
             overview_back_preview: std::env::var_os("STEPX_BACK_PREVIEW").is_some(),
             back_screen: BackScreenUiState::default(),
@@ -1390,41 +1557,33 @@ impl Companion {
             } else {
                 Vec::new()
             },
-            amoo_memory_enabled: demo_mode,
+            amoo_memory_enabled: true,
             amoo_style_idx: 0,
             amoo_commute_idx: 0,
-            amoo_memories: if demo_mode {
-                vec![
-                    AmooMemoryEntry {
-                        title: "高德打车默认开具电子发票".into(),
-                        sub: "报销习惯 · 自动归档".into(),
-                    },
-                    AmooMemoryEntry {
-                        title: "每周五 16:00 提醒汇总周报".into(),
-                        sub: "日程记忆 · 飞书同步".into(),
-                    },
-                ]
-            } else {
-                Vec::new()
-            },
-            amoo_skills: if demo_mode {
-                default_amoo_skills()
-            } else {
-                Vec::new()
-            },
+            amoo_memories: vec![
+                AmooMemoryEntry {
+                    title: "Agent 称呼用户为正法，交流语气简洁直接".into(),
+                    sub: "交流偏好 · 手机 Amoo 记忆同步".into(),
+                },
+                AmooMemoryEntry {
+                    title: "偏好消费低、人口多、车程 5 小时以内的自驾县城".into(),
+                    sub: "关于我 · 出行与生活画像".into(),
+                },
+                AmooMemoryEntry {
+                    title: "高德打车默认开具电子发票 · 每周五 16:00 提醒汇总周报".into(),
+                    sub: "备忘事项 · 办公自动化习惯".into(),
+                },
+            ],
+            amoo_skills: default_amoo_skills(),
             amoo_skill_manage: false,
             amoo_safety_policy_idx: 0,
             amoo_guard_count: if demo_mode { 12 } else { 0 },
-            studio: StudioUiState {
-                tab: 2,
-                cloud_category: 3,
-                ..Default::default()
-            },
+            studio: StudioUiState::default(),
             studio_lab: StudioLabUiState::default(),
             push: PushUiState::default(),
             sms: Vec::new(),
-            sms_loaded: false,
-            phone_loaded: false,
+            sms_loaded: demo_mode,
+            phone_loaded: demo_mode,
             sms_error: None,
             call_logs_error: None,
             contacts_error: None,
@@ -1433,8 +1592,16 @@ impl Companion {
             selected_sim: None,
             pending_sms_plan: None,
             last_sms_status: None,
-            call_logs: Vec::new(),
-            contacts: Vec::new(),
+            call_logs: if demo_mode {
+                default_demo_call_logs()
+            } else {
+                Vec::new()
+            },
+            contacts: if demo_mode {
+                default_demo_contacts()
+            } else {
+                Vec::new()
+            },
             selected_contact: 0,
             call_filter_missed: false,
             pending_call: None,
@@ -1504,6 +1671,7 @@ impl Companion {
             loading_frame: 0,
             sender,
             receiver,
+            bg_receivers: Vec::new(),
             bulk_rx: None,
             bulk_busy: false,
             bulk_status: String::new(),
@@ -1534,7 +1702,19 @@ impl Companion {
             capture_at: Instant::now(),
             last_clock_second: 0,
             activation_requests,
-        };
+        }
+    }
+
+    fn new(
+        ctx: &mut ViewContext<Self>,
+        capture: Option<PathBuf>,
+        activation_requests: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        let (font, mono_font) =
+            FontCache::handle(ctx).update(ctx, |cache, _| theme::load_fonts(cache));
+        #[cfg(feature = "ui-capture")]
+        let demo_mode = std::env::args().any(|a| a == "--demo");
+        let mut me = Self::build_initial(font, mono_font, capture, activation_requests);
         #[cfg(feature = "ui-capture")]
         if me.page == Page::Expansion && std::env::args().any(|a| a == "--expansion-settings") {
             me.expansion.settings = true;
@@ -1597,6 +1777,24 @@ impl Companion {
             }
         }
         #[cfg(feature = "ui-capture")]
+        if std::env::args().any(|a| a == "--amoo-screen-view") {
+            me.amoo_ui.screen_mode = true;
+            me.amoo_ui.gui_desktop = true;
+            me.fields[F_AMOO_GUI_APP].set("设置");
+            me.fields[F_AMOO].set("打开关于手机，查看 Android 版本，不修改设置");
+        }
+        #[cfg(feature = "ui-capture")]
+        if std::env::args().any(|a| a == "--overview-screen-menu") {
+            me.context_menu = Some(context_menu::Menu {
+                target: context_menu::Target::OverviewCard(
+                    context_menu::OverviewContextKind::ScreenPreview,
+                ),
+                at: Vector2F::new(260., 180.),
+                text: None,
+                selected: Some(0),
+            });
+        }
+        #[cfg(feature = "ui-capture")]
         if std::env::args().any(|a| a == "--demo") {
             me.load_demo();
             if let Some(index) = std::env::args().position(|a| a == "--adb-guide-preview") {
@@ -1607,12 +1805,6 @@ impl Companion {
                         .unwrap_or(0)
                         .min(2),
                 );
-            }
-            if std::env::args().any(|a| a == "--amoo-screen-view") {
-                me.amoo_ui.screen_mode = true;
-                me.amoo_ui.gui_desktop = true;
-                me.fields[F_AMOO_GUI_APP].set("设置");
-                me.fields[F_AMOO].set("打开关于手机，查看 Android 版本，不修改设置");
             }
             if let Some(index) = std::env::args().position(|arg| arg == "--ota-report") {
                 if let Some(path) = std::env::args().nth(index + 1) {
@@ -1658,9 +1850,13 @@ impl Companion {
         {
             32
         } else if self.mirror.is_some()
+            || self.live_screen_stream
+            || self.live_screen_rx.is_some()
             || self.busy
             || self.bulk_busy
             || self.work.running
+            || self.workspace.running.is_some()
+            || self.studio_lab.handle.is_some()
             || self.amoo_ui.gui_running
             || self.work_previews_loading()
             || self.amoo_ui.snapshot_job.is_some()
@@ -1688,21 +1884,49 @@ impl Companion {
         entry.1.clone()
     }
 
+    pub(super) fn demote_busy_if_background(&mut self) {
+        if self.busy
+            && !self.initializing
+            && self.selected.is_some()
+            && !matches!(self.job_page, Page::Amoo | Page::Work)
+            && self.google_progress.lock().is_ok_and(|p| p.is_empty())
+        {
+            let (_tx, dummy_rx) = mpsc::channel();
+            let old_rx = std::mem::replace(&mut self.receiver, dummy_rx);
+            self.bg_receivers
+                .push((self.job_page, self.job_tool, old_rx));
+            self.busy = false;
+            self.loading_frame = 0;
+        }
+    }
+
     pub(super) fn submit(
         &mut self,
         label: &str,
         job: impl FnOnce(&Adb) -> Result<Outcome> + Send + 'static,
     ) {
-        if self.sender.send(Box::new(job)).is_ok() {
-            self.amoo_ui.snapshot_generation = self.amoo_ui.snapshot_generation.wrapping_add(1);
-            self.busy = true;
-            self.job_page = self.page;
-            self.job_started = Instant::now();
-            self.loading_frame = 0;
-            self.job_tool = self.tool_page;
-            self.error = false;
-            self.status = label.into();
+        let (tx, rx) = mpsc::channel();
+        if self.busy {
+            let old_rx = std::mem::replace(&mut self.receiver, rx);
+            self.bg_receivers
+                .push((self.job_page, self.job_tool, old_rx));
+        } else {
+            self.receiver = rx;
         }
+        if matches!(self.page, Page::Amoo | Page::Work) {
+            self.amoo_ui.snapshot_generation = self.amoo_ui.snapshot_generation.wrapping_add(1);
+        }
+        self.busy = true;
+        self.job_page = self.page;
+        self.job_started = Instant::now();
+        self.loading_frame = 0;
+        self.job_tool = self.tool_page;
+        self.error = false;
+        self.status = label.into();
+        std::thread::spawn(move || {
+            let outcome = Adb::discover().and_then(|adb| job(&adb));
+            let _ = tx.send(outcome);
+        });
     }
 
     pub(super) fn with_device(
@@ -1843,6 +2067,26 @@ impl Companion {
             self.start_account_usage_sync();
             ctx.notify();
         }
+        if !self.demo_mode
+            && matches!(
+                self.page,
+                Page::Overview | Page::Tools | Page::Calendar | Page::Schedule | Page::Alarms
+            )
+            && self.selected.is_some()
+            && !self.back_screen.stepos_suite.checked
+            && !self.back_screen.stepos_suite_loading
+        {
+            self.handle_backscreen_action(&BackScreenAction::InspectStepOsSuite, ctx);
+        }
+        if !self.demo_mode
+            && self.page == Page::Gallery
+            && self.selected.is_some()
+            && !self.back_screen.gallery_checked
+            && !self.back_screen.gallery_loading
+        {
+            self.handle_backscreen_action(&BackScreenAction::GalleryRefresh, ctx);
+        }
+        self.tick_auto_clipboard_sync(ctx);
         if self.poll_account_usage_sync() {
             ctx.notify();
         }
@@ -1853,6 +2097,9 @@ impl Companion {
             && matches!(self.page, Page::Notifications | Page::Sms)
         {
             ctx.notify();
+        }
+        if self.page == Page::Amoo {
+            self.demote_busy_if_background();
         }
         if self.busy
             && self.loading_frame == 0
@@ -1928,6 +2175,46 @@ impl Companion {
             }
             ctx.notify();
         }
+        let mut bg_idx = 0;
+        while bg_idx < self.bg_receivers.len() {
+            match self.bg_receivers[bg_idx].2.try_recv() {
+                Ok(result) => {
+                    let (completed_page, completed_tool, _) = self.bg_receivers.swap_remove(bg_idx);
+                    match result {
+                        Ok(outcome) => {
+                            let prev_status = self.status.clone();
+                            let prev_error = self.error;
+                            self.apply(outcome);
+                            if self.busy || self.page == Page::Amoo {
+                                self.status = prev_status;
+                                self.error = prev_error;
+                            }
+                            if completed_page == Page::Tools
+                                && completed_tool.is_some()
+                                && !self.busy
+                            {
+                                self.tools_feedback =
+                                    Some((completed_tool, self.status.clone(), false));
+                            }
+                        }
+                        Err(e) => {
+                            self.initializing = false;
+                            if completed_page == Page::Apps {
+                                self.apps_loaded = true;
+                                self.apps_error = Some(format!("{e:#}"));
+                            }
+                        }
+                    }
+                    ctx.notify();
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.bg_receivers.swap_remove(bg_idx);
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    bg_idx += 1;
+                }
+            }
+        }
         if let Some(rx) = &self.bulk_rx {
             match rx.try_recv() {
                 Ok(outcome) => {
@@ -1962,6 +2249,57 @@ impl Companion {
                     ctx.notify();
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(rx) = &self.live_screen_rx {
+            match rx.try_recv() {
+                Ok((dir, path)) => {
+                    if self.amoo_ui.screen_mode
+                        || self.amoo_ui.gui_running
+                        || self.amoo_ui.gui_paused
+                    {
+                        self.amoo_ui.gui_screenshot = Some(path.clone());
+                    }
+                    self.screenshot = Some((dir, path));
+                    self.live_screen_rx = None;
+                    ctx.notify();
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.live_screen_rx = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if !self.demo_mode
+            && !self.settings.hidden
+            && self.selected.is_some()
+            && self.live_screen_rx.is_none()
+            && ((self.screenshot.is_none()
+                && matches!(self.page, Page::Overview | Page::Tools | Page::Amoo))
+                || (self.live_screen_stream
+                    && matches!(self.page, Page::Overview | Page::Tools | Page::Amoo)
+                    && self.last_live_screen_poll.elapsed() >= Duration::from_millis(1200))
+                || (!self.busy
+                    && self.screenshot.is_none()
+                    && matches!(self.page, Page::Overview | Page::Tools)
+                    && self.last_live_screen_poll.elapsed() >= Duration::from_millis(1500)))
+        {
+            if let Some(device) = self.selected.clone() {
+                self.last_live_screen_poll = Instant::now();
+                let (tx, rx) = mpsc::channel();
+                self.live_screen_rx = Some(rx);
+                std::thread::spawn(move || {
+                    if let Ok(adb) = Adb::discover() {
+                        if let Ok(bytes) = adb.screenshot(&device.transport) {
+                            if let Ok(dir) = tempfile::tempdir() {
+                                let path = dir.path().join("screen.png");
+                                if std::fs::write(&path, bytes).is_ok() {
+                                    let _ = tx.send((dir, path));
+                                }
+                            }
+                        }
+                    }
+                });
             }
         }
         if self.poll_amoo_sync() {
@@ -2013,6 +2351,18 @@ impl Companion {
         let clock_second = self.capture_at.elapsed().as_secs();
         let clock_changed = clock_second != self.last_clock_second;
         self.last_clock_second = clock_second;
+        let active_page_task_animating = !self.animations_disabled()
+            && ((matches!(self.page, Page::Amoo | Page::Work)
+                && (self.workspace.running.is_some()
+                    || self.work.running
+                    || self.studio_lab.handle.is_some()
+                    || !self.amoo_pending_reply.is_empty()))
+                || (self.page == Page::Studio && self.studio_lab.handle.is_some()));
+        if active_page_task_animating {
+            ctx.notify();
+        } else if clock_changed && self.page == Page::Amoo && self.workspace.running.is_some() {
+            ctx.notify();
+        }
         if clock_changed && self.qr.is_some() && self.page == Page::Connect {
             // Countdown.
             ctx.notify();
@@ -2025,25 +2375,34 @@ impl Companion {
             .amoo_sessions
             .get(self.amoo_session_idx)
             .is_some_and(|s| s.items.is_empty());
-        let needs_initial_amoo_fetch = self.page == Page::Amoo
+        let overview_needs_amoo_init = self.page == Page::Overview
+            && self.selected.is_some()
+            && !self.amoo_gateway_online
+            && self.amoo_sessions.is_empty();
+        let needs_initial_amoo_fetch = (self.page == Page::Amoo
             && (self.amoo_sessions.is_empty()
-                || (selected_session_empty && self.amoo_poll_remaining > 0));
-        if !self.busy
+                || (selected_session_empty && self.amoo_poll_remaining > 0)))
+            || (overview_needs_amoo_init && self.amoo_poll_remaining > 0);
+        let sync_pending = self.workspace_sync_pending_keys();
+        let amoo_fg_busy = self.busy && matches!(self.job_page, Page::Amoo | Page::Work);
+        if !amoo_fg_busy
             && !self.demo_mode
             && self.selected.is_some()
             && self.amoo_ui.snapshot_job.is_none()
             && !self.work.running
-            && (!self.amoo_pending_reply.is_empty() || matches!(self.page, Page::Amoo | Page::Work))
+            && (!sync_pending.is_empty()
+                || matches!(self.page, Page::Amoo | Page::Work)
+                || overview_needs_amoo_init)
             && self.last_amoo_poll.elapsed()
                 >= if needs_initial_amoo_fetch {
                     Duration::from_millis(400)
-                } else if self.amoo_poll_remaining > 0 {
+                } else if self.amoo_poll_remaining > 0 || !self.amoo_pending_reply.is_empty() {
                     Duration::from_millis(if !self.settings.hidden && self.chat_waiting() {
                         1200
                     } else {
                         2400
                     })
-                } else if self.amoo_pending_reply.is_empty() && !self.amoo_gateway_online {
+                } else if sync_pending.is_empty() && !self.amoo_gateway_online {
                     Duration::from_secs(30)
                 } else {
                     Duration::from_secs(10)
@@ -2051,12 +2410,12 @@ impl Companion {
         {
             self.amoo_poll_remaining = self.amoo_poll_remaining.saturating_sub(1);
             self.last_amoo_poll = Instant::now();
-            let key = self
-                .amoo_sessions
-                .get(self.amoo_session_idx)
-                .map(|s| s.session_key.clone());
-            let pending: Vec<String> = self.amoo_pending_reply.keys().cloned().collect();
-            self.begin_amoo_sync(key, pending, needs_initial_amoo_fetch);
+            // 文件处理页有自己的会话，停在该页时优先同步它的回复。
+            let work_key = (self.page == Page::Work && self.workspace.running.is_none())
+                .then(|| self.work_session().map(|s| s.session_key.clone()))
+                .flatten();
+            let key = work_key.or_else(|| self.current_amoo_sync_key());
+            self.begin_amoo_sync(key, sync_pending, needs_initial_amoo_fetch);
         }
         if !self.busy
             && self.amoo_ui.snapshot_job.is_none()
@@ -2114,6 +2473,48 @@ impl Companion {
                 self.send_amoo_draft();
             }
         }
+        #[cfg(feature = "ui-capture")]
+        if !self.initializing && !self.busy && self.selected.is_some() {
+            if std::env::args().any(|a| a == "--amoo-screen-view") {
+                if !self.amoo_ui.screen_mode {
+                    self.amoo_ui.screen_mode = true;
+                    self.amoo_ui.gui_desktop = true;
+                    self.fields[F_AMOO_GUI_APP].set("设置");
+                    self.fields[F_AMOO].set("打开关于手机，查看 Android 版本，不修改设置");
+                    ctx.notify();
+                }
+                if self.amoo_ui.gui_screenshot.is_none() {
+                    if let Some((_, p)) = &self.screenshot {
+                        self.amoo_ui.gui_screenshot = Some(p.clone());
+                        ctx.notify();
+                    }
+                }
+            }
+            if std::env::args().any(|a| a == "--overview-screen-menu")
+                && self.context_menu.is_none()
+            {
+                self.context_menu = Some(context_menu::Menu {
+                    target: context_menu::Target::OverviewCard(
+                        context_menu::OverviewContextKind::ScreenPreview,
+                    ),
+                    at: Vector2F::new(260., 180.),
+                    text: None,
+                    selected: Some(0),
+                });
+                ctx.notify();
+            }
+        }
+        let bezel_screen_ready = {
+            static SHOT_READY_AT: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+            if self.screenshot.is_some() {
+                let mut guard = SHOT_READY_AT.lock().unwrap();
+                let t = *guard.get_or_insert_with(Instant::now);
+                t.elapsed() > Duration::from_millis(650)
+            } else {
+                *SHOT_READY_AT.lock().unwrap() = None;
+                false
+            }
+        };
         if self.capture.is_some()
             && !std::env::args().any(|a| {
                 a == "--verify-settings"
@@ -2129,6 +2530,14 @@ impl Companion {
                 || (!self.busy
                     && self.selected.is_some()
                     && !self.work_previews_loading()
+                    && (!matches!(
+                        self.page,
+                        Page::Overview | Page::Calendar | Page::Schedule | Page::Alarms
+                    ) || (self.back_screen.stepos_suite.checked
+                        && !self.back_screen.stepos_suite_loading))
+                    && (self.page != Page::Gallery
+                        || (self.back_screen.gallery_checked
+                            && !self.back_screen.gallery_loading))
                     && (self.page != Page::Notifications
                         || self.push.loaded
                         || self.push.error.is_some())
@@ -2137,7 +2546,13 @@ impl Companion {
                         || self.expansion.snapshot.error)
                     && (self.page != Page::Studio
                         || self.studio.web.is_some()
-                        || self.studio.web_error.is_some()))
+                        || self.studio.web_error.is_some())
+                    && (!(self.page == Page::Overview
+                        || (self.page == Page::Tools
+                            && self.tool_page == Some(ToolPage::Screen))
+                        || (self.page == Page::Amoo && self.amoo_ui.screen_mode))
+                        || bezel_screen_ready
+                        || self.capture_at.elapsed() > Duration::from_millis(7500)))
                 || self.capture_at.elapsed()
                     > Duration::from_millis(
                         if matches!(
@@ -2225,7 +2640,15 @@ impl View for Companion {
                 && self.page != Page::Overview
             {
                 self.no_device()
-            } else if matches!(self.page, Page::Tools | Page::Connect) {
+            } else if matches!(
+                self.page,
+                Page::Tools
+                    | Page::Connect
+                    | Page::Calendar
+                    | Page::Schedule
+                    | Page::Alarms
+                    | Page::Gallery
+            ) {
                 self.scrollable(self.scroll.clone(), self.page_content())
             } else if self.page.fills_height() {
                 self.page_content()
@@ -2288,6 +2711,8 @@ impl View for Companion {
             .finish();
         // SavePosition commits in a Stack paint scope, including the pinned composer.
         let tree = Stack::new().with_child(tree).finish();
+        let mut has_interaction_overlay = false;
+        let mut has_image_viewer = false;
         let tree = if let Some(sheet) = self.desktop_update_overlay() {
             Stack::new()
                 .with_child(adb_onboarding::Inert(tree).finish())
@@ -2299,6 +2724,7 @@ impl View for Companion {
                 .with_child(menu)
                 .finish()
         } else if let Some(sheet) = self.interaction_overlay() {
+            has_interaction_overlay = true;
             Stack::new()
                 .with_child(adb_onboarding::Inert(tree).finish())
                 .with_child(sheet)
@@ -2309,6 +2735,7 @@ impl View for Companion {
                 .with_child(self.adb_guide_modal(step))
                 .finish()
         } else if let Some(viewer) = self.amoo_image_viewer() {
+            has_image_viewer = true;
             Stack::new()
                 .with_child(adb_onboarding::Inert(tree).finish())
                 .with_child(viewer)
@@ -2327,8 +2754,8 @@ impl View for Companion {
                 && !self.workspace_busy()
                 && self.context_menu.is_none()
                 && self.workspace.proposal.is_none()
-                && self.interaction_overlay().is_none()
-                && self.amoo_image_viewer().is_none(),
+                && !has_interaction_overlay
+                && !has_image_viewer,
             context_menu: self.context_menu.is_some(),
             child: perf::Measured(tree).finish(),
             shortcut: self.settings.value.compact_shortcut.clone(),
@@ -2336,7 +2763,7 @@ impl View for Companion {
             active: self.focus.is_some(),
             multiline: matches!(
                 self.focus,
-                Some(F_WORK_PROMPT | F_AMOO | F_SMS_BODY | F_LAB_PROMPT)
+                Some(F_WORK_PROMPT | F_AMOO | F_SMS_BODY | F_LAB_PROMPT | F_BACK_PROMPT)
             ),
             composing: self
                 .focus

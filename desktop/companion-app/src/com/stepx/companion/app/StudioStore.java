@@ -6,17 +6,21 @@ import android.util.AtomicFile;
 import org.json.*;
 import java.io.*;
 import java.nio.charset.StandardCharsets;
+import java.util.regex.Pattern;
 
 /** A private, bounded phone library. Entries are links, never fabricated skills. */
 final class StudioStore {
+    private static final Pattern ID_PATTERN=Pattern.compile("studio-[a-f0-9]{32}");
+    private static final Pattern CNTRL_PATTERN=Pattern.compile("(?s).*[\\p{Cntrl}].*");
+    private static final Pattern PATH_PATTERN=Pattern.compile("/t/[A-Za-z0-9_-]{1,128}");
     private final AtomicFile file;
     StudioStore(Context c){file=new AtomicFile(new File(c.getFilesDir(),"studio-works.json"));}
     static void validate(JSONObject w)throws Exception {
         String id=w.getString("id"),name=w.getString("name"),url=w.getString("url"),type=w.getString("category");
-        if(!id.matches("studio-[a-f0-9]{32}")||name.trim().isEmpty()||name.length()>120||name.matches("(?s).*[\\p{Cntrl}].*"))throw new IllegalArgumentException("作品名称或编号无效");
+        if(!ID_PATTERN.matcher(id).matches()||name.trim().isEmpty()||name.length()>120||CNTRL_PATTERN.matcher(name).matches())throw new IllegalArgumentException("作品名称或编号无效");
         if(!type.equals("应用")&&!type.equals("智能体")&&!type.equals("技能"))throw new IllegalArgumentException("作品类型无效");
         Uri u=Uri.parse(url);
-        if(url.length()>2048||url.contains("\\")||!"https".equals(u.getScheme())||!"studio-api.stepx.com".equals(u.getHost())||u.getUserInfo()!=null||u.getPort()!=-1||u.getQuery()!=null||u.getFragment()!=null||!u.getEncodedPath().matches("/t/[A-Za-z0-9_-]{1,128}"))throw new IllegalArgumentException("只接受官方 Studio 体验链接");
+        if(url.length()>2048||url.contains("\\")||!"https".equals(u.getScheme())||!"studio-api.stepx.com".equals(u.getHost())||u.getUserInfo()!=null||u.getPort()!=-1||u.getQuery()!=null||u.getFragment()!=null||u.getEncodedPath()==null||!PATH_PATTERN.matcher(u.getEncodedPath()).matches())throw new IllegalArgumentException("只接受官方 Studio 体验链接");
     }
     JSONArray list()throws Exception {synchronized(StudioStore.class){
         if(!file.getBaseFile().exists())return new JSONArray();

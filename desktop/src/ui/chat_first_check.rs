@@ -101,7 +101,7 @@ impl Companion {
             let screenshot = match c.step { 1=>Some("01-chat.png"),2=>Some("02-dropdown-below.png"),4=>Some("03-inline-confirmation.png"),5=>Some("04-compact-chat-draft.png"),6=>Some("05-compact-dropdown.png"),8=>Some("06-compact-conversation.png"),9=>Some("07-dropdown-above.png"),10=>Some("08-full-conversation.png"),_=>None };
             if c.captured != Some(c.step) { if let Some(name) = screenshot { capture(ctx,dir.join(name)); c.captured=Some(c.step); ctx.notify(); return; } }
             match c.step {
-                0=>{self.set_compact_mode(ShellMode::Full,ctx); self.amoo_sessions.clear(); run(self,W::New,ctx); self.page=Page::Amoo; assert_eq!(self.workspace.intent,Intent::Chat);},
+                0=>{self.set_compact_mode(ShellMode::Full,ctx); self.amoo_sessions.clear(); run(self,W::New,ctx); self.page=Page::Amoo; assert_eq!(self.workspace.intent,Intent::Auto);},
                 1=>{click(ctx,"workspace-intent-anchor");},
                 2=>{
                     assert_eq!(self.workspace.panel,0);assert!(self.context_menu.is_some());
@@ -116,9 +116,11 @@ impl Companion {
                     assert_eq!(self.workspace.intent,Intent::Files);assert!(self.context_menu.is_none());assert!(self.workspace.proposal.is_none());assert!(!self.workspace_busy());
                     c.attachment=dir.join("read-only.csv"); std::fs::write(&c.attachment,"item,amount\nA,12\nB,18\n").unwrap(); self.add_amoo_paths(&[c.attachment.clone()]).unwrap();
                     self.fields[F_AMOO].set("计算合计并整理结果表");run(self,W::Prepare,ctx);
-                    assert_eq!(self.workspace.proposal.as_ref().unwrap().steps,[Executor::Files]);assert!(!self.workspace_busy());c.task=self.workspace.active.clone().unwrap();
+                    assert!(self.workspace.proposal.is_none());assert!(!self.workspace_busy());
+                    assert_eq!(self.workspace_task().unwrap().route,Some(Intent::Files));
+                    c.task=self.workspace.active.clone().unwrap();
                 },
-                4=>{run(self,W::EditPlan,ctx);assert_eq!(self.workspace.intent,Intent::Chat);assert_eq!(self.amoo_attachments.len(),1);assert_eq!(self.fields[F_AMOO].text,"计算合计并整理结果表");self.set_compact_mode(ShellMode::MiniAi,ctx);},
+                4=>{run(self,W::Reroute(Intent::Chat),ctx);assert_eq!(self.workspace.intent,Intent::Auto);assert_eq!(self.workspace_task().unwrap().route,None);assert!(self.workspace_task().unwrap().route_note.is_empty());assert_eq!(self.amoo_attachments.len(),1);assert_eq!(self.fields[F_AMOO].text,"计算合计并整理结果表");self.set_compact_mode(ShellMode::MiniAi,ctx);},
                 5=>{assert_eq!(self.workspace.active.as_ref(),Some(&c.task));run(self,W::Menu(7),ctx);},
                 6=>{assert_eq!(self.workspace.panel,0);self.handle_action(&Action::Escape,ctx);assert!(self.context_menu.is_none());run(self,W::New,ctx);self.fields[F_AMOO].set("另一个会话的草稿");run(self,W::Select(c.task.clone()),ctx);assert_eq!(self.amoo_attachments[0].local_path.as_ref(),Some(&c.attachment));assert_eq!(self.fields[F_AMOO].text,"计算合计并整理结果表");},
                 7=>{
@@ -177,7 +179,7 @@ impl Companion {
             let run=|v:&mut Companion,a,ctx:&mut ViewContext<Self>| v.handle_action(&Action::Workspace(a),ctx);
             let reply=|v:&Companion| v.workspace_task().unwrap().turns.iter().rev().find(|t|!t.user).unwrap().text.clone();
             let send=|v:&mut Companion,prompt:&str,ctx:&mut ViewContext<Self>| {
-                assert_eq!(v.workspace.intent,Intent::Chat);v.fields[F_AMOO].set(prompt);run(v,W::Prepare,ctx);
+                assert_eq!(v.workspace.intent,Intent::Auto);v.fields[F_AMOO].set(prompt);run(v,W::Prepare,ctx);
                 assert!(v.workspace.proposal.is_none(),"chat must not create plan");assert!(v.workspace.running.is_some(),"{}",v.status);
                 assert_eq!(v.workspace.running.as_ref().unwrap().executor,Executor::Phone);
             };
@@ -190,9 +192,9 @@ impl Companion {
                 5=>{let response=reply(self);assert!(response.contains("724936"),"vision number missing: {response}");assert!(response.contains("红")&&response.contains("绿")&&response.contains("蓝"),"vision colors missing: {response}");assert_eq!(self.push.shell_mode,ShellMode::MiniAi);capture(ctx,dir.join("03-real-vision.png"));},
                 6=>{let path=dir.join("memo.txt");std::fs::write(&path,"内部测试资料\n验收代号：NEBULA-49317\n周一收入 125 元，周二收入 275 元。\n").unwrap();self.add_amoo_paths(&[path]).unwrap();send(self,"阅读附件，告诉我验收代号和两天收入合计。只用文字回答，不生成文件，不启动工作流程。",ctx);},
                 7=>{let response=reply(self);assert!(response.contains("49317")&&response.contains("400"),"file reading failed: {response}");assert!(self.workspace_task().unwrap().outputs.is_empty());capture(ctx,dir.join("04-real-file-question.png"));},
-                8=>{self.set_compact_mode(ShellMode::Full,ctx);let path=dir.join("figures.csv");std::fs::write(&path,"item,quantity,price\nA,2,15\nB,3,20\nC,1,10\n").unwrap();self.add_amoo_paths(&[path]).unwrap();run(self,W::Intent(Intent::Files),ctx);self.fields[F_AMOO].set("验收：读取附件，计算每行金额和总计，生成 result.csv 与一段简短的 analysis.md。禁止外网，不读取其他个人文件。快速完成这两个小文件。");run(self,W::Prepare,ctx);assert!(self.workspace.proposal.is_some());assert!(!self.work.running);},
+                8=>{self.set_compact_mode(ShellMode::Full,ctx);let path=dir.join("figures.csv");std::fs::write(&path,"item,quantity,price\nA,2,15\nB,3,20\nC,1,10\n").unwrap();self.add_amoo_paths(&[path]).unwrap();self.fields[F_AMOO].set("验收：读取附件，计算每行金额和总计，生成 result.csv 与一段简短的 analysis.md。禁止外网，不读取其他个人文件。快速完成这两个小文件。");},
                 9=>{capture(ctx,dir.join("05-real-confirmation.png"));},
-                10=>{run(self,W::Confirm,ctx);assert!(self.workspace.running.is_some(),"{}",self.status);assert_eq!(self.workspace.intent,Intent::Chat);},
+                10=>{run(self,W::Prepare,ctx);assert!(self.workspace.proposal.is_none());assert!(self.workspace.running.is_some(),"{}",self.status);assert_eq!(self.workspace.intent,Intent::Auto);assert_eq!(self.workspace_task().unwrap().route,Some(Intent::Files));},
                 11=>{let task=self.workspace_task().unwrap();assert!(task.steps.iter().all(|s|s.phase==stepx_companion::amoo_workspace::Phase::Done),"{:?}",task.steps);assert!(task.outputs.iter().any(|o|o.name.ends_with(".csv")));std::fs::write(dir.join("work-result.json"),serde_json::to_vec_pretty(task).unwrap()).unwrap();capture(ctx,dir.join("06-real-work-complete.png"));},
                 12=>{send(self,"工作已完成，现在只继续普通聊天：刚才表格里的总金额是多少？请直接用自然语言回答，不生成新文件，不调用桌面工具。",ctx);},
                 13=>{let response=reply(self);assert!(response.contains("100"),"post-work answer missing: {response}");assert_eq!(self.workspace_task().unwrap().steps[0].executor,Executor::Phone);assert!(!self.work.running);assert!(!response.contains("amoo_work_protocol"));capture(ctx,dir.join("07-real-back-to-chat.png"));},

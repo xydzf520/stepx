@@ -21,7 +21,9 @@ public final class AutoConnectService extends Service {
     private final Runnable refreshLink=()->showStatus(state(this));
     // Only the connection preference lives in device-protected storage. Conversations, keys
     // and files remain credential encrypted; a user's explicit pause survives upgrades.
+    private static volatile SharedPreferences cachedPrefs;
     private static synchronized SharedPreferences prefs(Context c){
+        if(cachedPrefs!=null)return cachedPrefs;
         Context device=c.createDeviceProtectedStorageContext();
         SharedPreferences stored=device.getSharedPreferences(PREFS,0);
         if(c.getSystemService(UserManager.class).isUserUnlocked()&&!stored.contains("migrated")){
@@ -30,6 +32,7 @@ public final class AutoConnectService extends Service {
             if(!stored.contains("auto_connect")&&old.contains("auto_connect"))edit.putBoolean("auto_connect",old.getBoolean("auto_connect",false));
             edit.commit();
         }
+        if(stored.contains("migrated"))cachedPrefs=stored;
         return stored;
     }
     static void rememberFirstConnection(Context c,boolean online){

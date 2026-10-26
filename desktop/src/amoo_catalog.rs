@@ -327,17 +327,10 @@ fn parse_agents(payload: &Value) -> Result<Vec<AgentInfo>> {
 }
 
 fn connect(adb: &Adb, device: &Device) -> Result<GatewayWs> {
-    device.verify(adb)?;
-    // Check the mapping result before the legacy GatewayWs constructor, which
-    // does not propagate an ADB forwarding failure of its own.
-    adb.run(&["-s", &device.transport, "forward", "tcp:18789", "tcp:18789"])?;
     GatewayWs::connect(adb, device)
 }
 
-pub fn fetch(adb: &Adb, device: &Device) -> Result<WorkCatalog> {
-    // Catalog refresh never sends a model request. Explicit permission checks
-    // and successful user turns populate account-scoped evidence below.
-    let mut catalog = WorkCatalog::default();
+fn populate_models(adb: &Adb, device: &Device, catalog: &mut WorkCatalog) {
     match verified_cloud_models(adb, device) {
         Ok(models) => {
             catalog.models_status = status(
@@ -356,18 +349,30 @@ pub fn fetch(adb: &Adb, device: &Device) -> Result<WorkCatalog> {
                 status(false, "无法核实当前账号的模型权限，请连接手机后重新验证。")
         }
     }
-    let mut ws = match connect(adb, device) {
-        Ok(ws) => ws,
+}
+
+pub fn fetch(adb: &Adb, device: &Device) -> Result<WorkCatalog> {
+    // Catalog refresh never sends a model request. Explicit permission checks
+    // and successful user turns populate account-scoped evidence below.
+    match connect(adb, device) {
+        Ok(mut ws) => fetch_with_ws(adb, device, &mut ws),
         Err(_) => {
+            let mut catalog = WorkCatalog::default();
+            populate_models(adb, device, &mut catalog);
             catalog.skills_status = status(false, "手机技能服务暂不可用");
             catalog.agents_status = status(false, "手机智能体服务暂不可用");
             catalog.tools_status = status(false, "手机工具服务暂不可用");
-            return Ok(catalog);
+            Ok(catalog)
         }
-    };
+    }
+}
+
+fn fetch_with_ws(adb: &Adb, device: &Device, ws: &mut GatewayWs) -> Result<WorkCatalog> {
+    let mut catalog = WorkCatalog::default();
+    populate_models(adb, device, &mut catalog);
     catalog.gateway_version = ws.gateway_version.clone();
     let skill_status = ws.call("skills.status", json!({}));
-    match skill_status.and_then(|p| phone_skills(&mut ws, &p)) {
+    match skill_status.and_then(|p| phone_skills(ws, &p)) {
         Ok(skills) => {
             catalog.skills_status = status(
                 true,
@@ -581,8 +586,7 @@ pub fn set_skill_enabled(
     {
         bail!("手机技能状态尚未确认，请刷新目录");
     }
-    drop(ws);
-    fetch(adb, device)
+    fetch_with_ws(adb, device, &mut ws)
 }
 
 /// Runs only an installer declared by this phone's skill status response.
@@ -627,8 +631,7 @@ pub fn install_skill(
         }) {
             bail!("手机文件已安装，但技能目录未加载，请刷新后确认");
         }
-        drop(ws);
-        return fetch(adb, device);
+        return fetch_with_ws(adb, device, &mut ws);
     }
     let skill = skills
         .iter()
@@ -647,8 +650,7 @@ pub fn install_skill(
     if result["ok"].as_bool() != Some(true) {
         bail!("技能安装未获得成功回执，请刷新目录确认");
     }
-    drop(ws);
-    fetch(adb, device)
+    fetch_with_ws(adb, device, &mut ws)
 }
 
 /// Create a new gateway agent only after an explicit user action. The workspace
@@ -676,8 +678,7 @@ pub fn create_agent(adb: &Adb, device: &Device, name: &str) -> Result<WorkCatalo
     if !after.iter().any(|agent| agent.id == id) {
         bail!("创建结果尚未出现在手机目录中，请刷新确认");
     }
-    drop(ws);
-    fetch(adb, device)
+    fetch_with_ws(adb, device, &mut ws)
 }
 
 #[cfg(test)]

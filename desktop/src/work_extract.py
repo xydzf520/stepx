@@ -1,5 +1,36 @@
 # Fixed Office text reader; never runs document macros or embedded scripts.
-import sys, zipfile, posixpath, json, xml.etree.ElementTree as ET
+import os, sys, zipfile, posixpath, json, xml.etree.ElementTree as ET
+
+def is_ignored_workspace_entry(name):
+    return (
+        not name
+        or name.startswith('.')
+        or name.startswith('~$')
+        or name.endswith(('.tmp', '.temp', '.swp', '.crdownload', '.part', '.stepxlink'))
+        or name in ('StepX Companion', '__pycache__', 'node_modules', 'target')
+    )
+
+def search_files(root_dir, query):
+    matches = []
+    if not query or len(query.encode('utf-8')) >= 500:
+        return matches
+    for entry in sorted(os.listdir(root_dir))[:100]:
+        if is_ignored_workspace_entry(entry):
+            continue
+        full_path = os.path.join(root_dir, entry)
+        if not os.path.isfile(full_path) or os.path.islink(full_path):
+            continue
+        try:
+            with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
+                for idx, line in enumerate(f, 1):
+                    if query in line:
+                        matches.append({'path': entry, 'line': idx, 'text': line.rstrip('\r\n')[:500]})
+                        if len(matches) >= 50:
+                            return matches
+        except OSError:
+            continue
+    return matches
+
 p = sys.argv[1]
 preview = '--preview' in sys.argv[2:]
 preview_sheets = []
@@ -35,9 +66,69 @@ with zipfile.ZipFile(p) as z:
         raise ValueError('文档内部文件过多或解压大小超过 64 MB')
     if 'word/document.xml' in names:
         ns = {'w':'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
+        W_P = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p'
+        W_TBL = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tbl'
+        W_VAL = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val'
         root = tree(z, 'word/document.xml')
-        for paragraph in root.findall('.//w:p', ns):
-            append(''.join(t.text or '' for t in paragraph.findall('.//w:t', ns)))
+        body = root.find('w:body', ns) or root
+        def format_para(paragraph):
+            text = ''.join(t.text or '' for t in paragraph.findall('.//w:t', ns)).strip()
+            if not text:
+                return ''
+            pstyle_el = paragraph.find('w:pPr/w:pStyle', ns)
+            pstyle = (pstyle_el.get(W_VAL) or pstyle_el.get('val') or '') if pstyle_el is not None else ''
+            pstyle_norm = pstyle.lower().replace(' ', '').replace('-', '')
+            sz_el = paragraph.find('.//w:rPr/w:sz', ns)
+            sz = (sz_el.get(W_VAL) or sz_el.get('val') or '') if sz_el is not None else ''
+            has_bold = paragraph.find('.//w:rPr/w:b', ns) is not None
+            has_italic = paragraph.find('.//w:rPr/w:i', ns) is not None
+            has_ind = paragraph.find('w:pPr/w:ind', ns) is not None
+            has_num = paragraph.find('w:pPr/w:numPr', ns) is not None
+            if pstyle_norm in ('heading1', '1', 'title') or (not pstyle and has_bold and sz in ('36', '30')):
+                return '# ' + text
+            if pstyle_norm in ('heading2', '2', 'subtitle') or (not pstyle and has_bold and sz == '26'):
+                return '## ' + text
+            if pstyle_norm in ('heading3', '3'):
+                return '### ' + text
+            if pstyle_norm in ('listparagraph', 'bullet', 'listitem') or has_num or text.startswith('•'):
+                return '- ' + text.lstrip('•').strip()
+            if pstyle_norm in ('quote', 'intensequote', 'blockquote') or (not pstyle and has_italic and has_ind):
+                return '> ' + text
+            return text
+        def format_table(tbl):
+            rows = []
+            for tr in tbl.findall('w:tr', ns):
+                cells = []
+                for tc in tr.findall('w:tc', ns):
+                    cell_parts = []
+                    for p_node in tc.findall('.//w:p', ns):
+                        t_val = ''.join(n.text or '' for n in p_node.findall('.//w:t', ns)).strip()
+                        if t_val:
+                            cell_parts.append(t_val)
+                    cells.append(' '.join(cell_parts).replace('|', '\\|').replace('\r', ' ').replace('\n', ' '))
+                if cells:
+                    rows.append(cells)
+            if not rows:
+                return
+            cols = max(len(r) for r in rows)
+            if cols == 0:
+                return
+            norm = [r + [''] * (cols - len(r)) for r in rows]
+            append('| ' + ' | '.join(norm[0]) + ' |')
+            append('| ' + ' | '.join(['---'] * cols) + ' |')
+            for r in norm[1:]:
+                append('| ' + ' | '.join(r) + ' |')
+        def walk_docx(container):
+            for child in container:
+                if child.tag == W_P:
+                    line = format_para(child)
+                    if line:
+                        append(line)
+                elif child.tag == W_TBL:
+                    format_table(child)
+                else:
+                    walk_docx(child)
+        walk_docx(body)
     elif 'xl/workbook.xml' in names:
         ns = {'s':'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
         shared = []
@@ -52,10 +143,13 @@ with zipfile.ZipFile(p) as z:
             if target:
                 name = posixpath.normpath('xl/' + target) if not target.startswith('/') else target.lstrip('/')
                 if name.startswith('xl/worksheets/') and name in names: sheets.append((sheet.get('name',name),name))
-        for label, name in sheets[:30]:
-            append('工作表: ' + label)
+        for label, name in sheets[:(3 if preview else 30)]:
+            if not preview:
+                append('工作表: ' + label)
             preview_rows = []
             for row in tree(z, name).findall('.//s:row', ns):
+                if preview and len(preview_rows) >= 20:
+                    break
                 values = []
                 preview_cells = [''] * 8
                 for cell in row.findall('s:c', ns):
@@ -77,16 +171,21 @@ with zipfile.ZipFile(p) as z:
                             if column > 8: break
                         if 1 <= column <= 8:
                             preview_cells[column-1] = (value if value != '' or not formula else '尚未计算')[:160]
-                    if formula: value = f'={formula} → {value if value != "" else "[尚无计算缓存]"}'
-                    values.append(f'{cell.get("r", "")}: {value}')
-                if preview and len(preview_rows) < 20:
+                    if not preview:
+                        if formula: value = f'={formula} → {value if value != "" else "[尚无计算缓存]"}'
+                        values.append(f'{cell.get("r", "")}: {value}')
+                if preview:
                     preview_rows.append({'row':row.get('r',''), 'cells':preview_cells})
-                append(' | '.join(values))
-                if size >= MAX_TEXT: break
-                if preview and len(preview_rows) >= 20: break
-            if preview: preview_sheets.append({'name':label, 'rows':preview_rows})
-            if size >= MAX_TEXT: break
-            if preview and len(preview_sheets) >= 3: break
+                    if len(preview_rows) >= 20:
+                        break
+                else:
+                    append(' | '.join(values))
+                    if size >= MAX_TEXT: break
+            if preview:
+                preview_sheets.append({'name':label, 'rows':preview_rows})
+                if len(preview_sheets) >= 3: break
+            elif size >= MAX_TEXT:
+                break
     elif 'ppt/presentation.xml' in names:
         ns = {'a':'http://schemas.openxmlformats.org/drawingml/2006/main'}
         rel = {'r': 'http://schemas.openxmlformats.org/package/2006/relationships'}
@@ -104,9 +203,14 @@ with zipfile.ZipFile(p) as z:
             if size >= MAX_TEXT: break
     else:
         raise ValueError('未识别的 Office 文档')
-if size >= MAX_TEXT:
-    parts.append('[达到 64 KB 阅读上限，后续内容未读取]')
-result = '\n'.join(parts)
-if not result.strip():
-    raise ValueError('文档没有可提取的文字')
-sys.stdout.write(json.dumps({'sheets':preview_sheets},ensure_ascii=False) if preview else result)
+if preview:
+    if not any(s.get('rows') for s in preview_sheets):
+        raise ValueError('文档没有可提取的文字')
+    sys.stdout.write(json.dumps({'sheets':preview_sheets},ensure_ascii=False))
+else:
+    if size >= MAX_TEXT:
+        parts.append('[达到 64 KB 阅读上限，后续内容未读取]')
+    result = '\n'.join(parts)
+    if not result.strip():
+        raise ValueError('文档没有可提取的文字')
+    sys.stdout.write(result)

@@ -16,7 +16,7 @@ impl TypedActionView for MirrorControls {
     fn handle_action(&mut self, action: &Action, ctx: &mut ViewContext<Self>) {
         if matches!(
             action,
-            Action::StopMirror | Action::Key(_) | Action::Screenshot
+            Action::StopMirror | Action::Key(_) | Action::Screenshot | Action::ScreenGesture(_)
         ) {
             #[cfg(feature = "ui-capture")]
             eprintln!("MIRROR_CONTROL_RECEIVED: {:?}", action);
@@ -93,10 +93,10 @@ impl Companion {
                     p.text2
                 };
                 let content = Flex::column()
-                    .with_spacing(4.)
+                    .with_spacing(2.)
                     .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                    .with_child(icons::draw_icon(icon, 20., fg))
-                    .with_child(Text::new(label, font, 11.).with_color(fg).finish())
+                    .with_child(icons::draw_icon(icon, 16., fg))
+                    .with_child(Text::new(label, font, 10.).with_color(fg).finish())
                     .finish();
                 ConstrainedBox::new(
                     Container::new(Align::new(content).finish())
@@ -115,7 +115,7 @@ impl Companion {
                         .finish(),
                 )
                 .with_width(72.)
-                .with_height(48.)
+                .with_height(38.)
                 .finish()
             },
         )
@@ -139,16 +139,31 @@ impl Companion {
             Flex::column()
                 .with_main_axis_size(MainAxisSize::Max)
                 .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                .with_spacing(4.)
+                .with_spacing(2.)
                 .with_child(
-                    Container::new(self.line("投屏助手", 11., p.text2))
-                        .with_vertical_padding(10.)
+                    Container::new(self.line("投屏助手", 10., p.text2))
+                        .with_vertical_padding(4.)
                         .finish(),
                 )
                 .with_child(self.fixed_w(56., self.divider()))
+                .with_child(self.mirror_tool("power", "锁屏", Lock, Action::Key(26), false))
                 .with_child(self.mirror_tool("home", "主页", Home, Action::Key(3), false))
                 .with_child(self.mirror_tool("back", "返回", ArrowLeft, Action::Key(4), false))
                 .with_child(self.mirror_tool("recent", "多任务", Menu, Action::Key(187), false))
+                .with_child(self.mirror_tool(
+                    "swipe-up",
+                    "上滑",
+                    ArrowUp,
+                    Action::ScreenGesture(0),
+                    false,
+                ))
+                .with_child(self.mirror_tool(
+                    "notif",
+                    "通知",
+                    Bell,
+                    Action::ScreenGesture(4),
+                    false,
+                ))
                 .with_child(self.fixed_w(40., self.divider()))
                 .with_child(self.mirror_tool("volume-up", "音量 +", Plus, Action::Key(24), false))
                 .with_child(self.mirror_tool(
@@ -158,13 +173,14 @@ impl Companion {
                     Action::Key(25),
                     false,
                 ))
+                .with_child(self.mirror_tool("mute", "静音", Mute, Action::Key(164), false))
                 .with_child(self.mirror_tool("capture", "截图", Camera, Action::Screenshot, false))
                 .with_child(self.spacer())
                 .with_child(self.fixed_w(56., self.divider()))
                 .with_child(self.mirror_tool("stop", "结束投屏", Close, Action::StopMirror, true))
                 .finish(),
         )
-        .with_uniform_padding(8.)
+        .with_uniform_padding(6.)
         .with_background_color(p.sidebar)
         .with_border(Border::all(1.).with_border_color(p.border))
         .with_corner_radius(CornerRadius::with_all(Radius::Pixels(theme::R_PANEL)))

@@ -9,6 +9,7 @@ import java.util.HashSet;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -25,6 +26,7 @@ public final class ImAppCatalog {
     public static final String CAT_OTHER = "other";
 
     private static final Map<String, String> DISPLAY_NAMES;
+    private static final ConcurrentHashMap<String, String> RESOLVED_APP_LABELS = new ConcurrentHashMap<String, String>();
     private static final Set<String> CORE_IM_PACKAGES;
     private static final Set<String> SOCIAL_PACKAGES;
     private static final Set<String> FINANCE_PACKAGES;
@@ -244,6 +246,10 @@ public final class ImAppCatalog {
         if (pkg == null || pkg.isEmpty()) return "未知应用";
         String builtIn = DISPLAY_NAMES.get(pkg);
         if (builtIn != null) return builtIn;
+        String cached = RESOLVED_APP_LABELS.get(pkg);
+        if (cached != null) return cached;
+        int dot = pkg.lastIndexOf('.');
+        String fallback = dot >= 0 && dot + 1 < pkg.length() ? pkg.substring(dot + 1) : pkg;
         if (context != null) {
             try {
                 PackageManager pm = context.getPackageManager();
@@ -251,14 +257,18 @@ public final class ImAppCatalog {
                     ApplicationInfo info = pm.getApplicationInfo(pkg, 0);
                     CharSequence label = pm.getApplicationLabel(info);
                     if (label != null && label.length() > 0) {
-                        return label.toString().trim();
+                        String resolved = label.toString().trim();
+                        if (!resolved.isEmpty()) {
+                            RESOLVED_APP_LABELS.put(pkg, resolved);
+                            return resolved;
+                        }
                     }
                 }
             } catch (Exception ignored) {
             }
+            RESOLVED_APP_LABELS.put(pkg, fallback);
         }
-        int dot = pkg.lastIndexOf('.');
-        return dot >= 0 && dot + 1 < pkg.length() ? pkg.substring(dot + 1) : pkg;
+        return fallback;
     }
 
     public static boolean isSystemNoiseNotification(String pkg, String title, String text, boolean ongoing) {

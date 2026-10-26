@@ -2,7 +2,7 @@
 //! White SVG masks are required: the renderer uses the red channel as icon alpha.
 use super::{widgets::El, Companion};
 use facloud_ui::{color::ColorU, elements::*};
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(super) enum UiIcon {
     Info,
@@ -73,8 +73,36 @@ pub(super) enum UiIcon {
     Wave,
     Maximize,
     Restore,
+    Contrast,
+    Ban,
+    Coffee,
+    Heart,
+    Cat,
+    AlertTriangle,
+    Flip,
+    ArrowDown,
+    ArrowRight,
+    ChevronLeft,
+    Mute,
+    Bluetooth,
+    Edit,
+    ScanText,
+    User,
+    Sparkles,
+    Archive,
+    Send,
+    CreditCard,
+    Key,
+    Activity,
+    Gift,
 }
+#[allow(non_upper_case_globals, dead_code)]
 impl UiIcon {
+    pub(super) const SpeakerMute: Self = Self::Mute;
+    pub(super) const SpeakerOff: Self = Self::Mute;
+    pub(super) const Wallet: Self = Self::CreditCard;
+    pub(super) const Sos: Self = Self::AlertTriangle;
+
     pub(super) fn path(self) -> &'static str {
         match self {
             Self::Info => "icons/Info.svg",
@@ -145,6 +173,28 @@ impl UiIcon {
             Self::Wave => "icons/Wave.svg",
             Self::Maximize => "icons/Maximize.svg",
             Self::Restore => "icons/Restore.svg",
+            Self::Contrast => "icons/Contrast.svg",
+            Self::Ban => "icons/Ban.svg",
+            Self::Coffee => "icons/Coffee.svg",
+            Self::Heart => "icons/Heart.svg",
+            Self::Cat => "icons/Cat.svg",
+            Self::AlertTriangle => "icons/AlertTriangle.svg",
+            Self::Flip => "icons/Flip.svg",
+            Self::ArrowDown => "icons/ArrowDown.svg",
+            Self::ArrowRight => "icons/ArrowRight.svg",
+            Self::ChevronLeft => "icons/ChevronLeft.svg",
+            Self::Mute => "icons/Mute.svg",
+            Self::Bluetooth => "icons/Bluetooth.svg",
+            Self::Edit => "icons/Edit.svg",
+            Self::ScanText => "icons/ScanText.svg",
+            Self::User => "icons/User.svg",
+            Self::Sparkles => "icons/Sparkles.svg",
+            Self::Archive => "icons/Archive.svg",
+            Self::Send => "icons/Send.svg",
+            Self::CreditCard => "icons/CreditCard.svg",
+            Self::Key => "icons/Key.svg",
+            Self::Activity => "icons/Activity.svg",
+            Self::Gift => "icons/Gift.svg",
         }
     }
 }
@@ -218,6 +268,28 @@ pub(super) fn asset(path: &str) -> Option<&'static [u8]> {
         "icons/Wave.svg" => include_bytes!("../../assets/icons/Wave.svg"),
         "icons/Maximize.svg" => include_bytes!("../../assets/icons/Maximize.svg"),
         "icons/Restore.svg" => include_bytes!("../../assets/icons/Restore.svg"),
+        "icons/Contrast.svg" => include_bytes!("../../assets/icons/Contrast.svg"),
+        "icons/Ban.svg" => include_bytes!("../../assets/icons/Ban.svg"),
+        "icons/Coffee.svg" => include_bytes!("../../assets/icons/Coffee.svg"),
+        "icons/Heart.svg" => include_bytes!("../../assets/icons/Heart.svg"),
+        "icons/Cat.svg" => include_bytes!("../../assets/icons/Cat.svg"),
+        "icons/AlertTriangle.svg" => include_bytes!("../../assets/icons/AlertTriangle.svg"),
+        "icons/Flip.svg" => include_bytes!("../../assets/icons/Flip.svg"),
+        "icons/ArrowDown.svg" => include_bytes!("../../assets/icons/ArrowDown.svg"),
+        "icons/ArrowRight.svg" => include_bytes!("../../assets/icons/ArrowRight.svg"),
+        "icons/ChevronLeft.svg" => include_bytes!("../../assets/icons/ChevronLeft.svg"),
+        "icons/Mute.svg" => include_bytes!("../../assets/icons/Mute.svg"),
+        "icons/Bluetooth.svg" => include_bytes!("../../assets/icons/Bluetooth.svg"),
+        "icons/Edit.svg" => include_bytes!("../../assets/icons/Edit.svg"),
+        "icons/ScanText.svg" => include_bytes!("../../assets/icons/ScanText.svg"),
+        "icons/User.svg" => include_bytes!("../../assets/icons/User.svg"),
+        "icons/Sparkles.svg" => include_bytes!("../../assets/icons/Sparkles.svg"),
+        "icons/Archive.svg" => include_bytes!("../../assets/icons/Archive.svg"),
+        "icons/Send.svg" => include_bytes!("../../assets/icons/Send.svg"),
+        "icons/CreditCard.svg" => include_bytes!("../../assets/icons/CreditCard.svg"),
+        "icons/Key.svg" => include_bytes!("../../assets/icons/Key.svg"),
+        "icons/Activity.svg" => include_bytes!("../../assets/icons/Activity.svg"),
+        "icons/Gift.svg" => include_bytes!("../../assets/icons/Gift.svg"),
         _ => return None,
     })
 }
@@ -233,84 +305,255 @@ impl Companion {
     }
 }
 pub(super) fn symbol(value: &str) -> Option<UiIcon> {
-    Some(match value {
-        "◈" | "⌂" => UiIcon::Home,
+    let trimmed = value.trim_end_matches(['\u{fe0f}', '\u{fe0e}']);
+    Some(match trimmed {
+        "◈" | "⌂" | "🏠" => UiIcon::Home,
         "❖" => UiIcon::Matrix,
         "✦" => UiIcon::Star,
+        "✨" => UiIcon::Sparkles,
         "⚡" => UiIcon::Bolt,
-        "✉" | "✉️" => UiIcon::Sms,
+        "✉" => UiIcon::Sms,
         "☎" | "📞" => UiIcon::Phone,
-        "⊞" => UiIcon::Apps,
+        "📴" => UiIcon::PhoneOff,
+        "🚫" => UiIcon::Ban,
+        "⊞" | "▣" => UiIcon::Apps,
         "⊟" => UiIcon::Tools,
         "💼" => UiIcon::Briefcase,
+        "📌" | "📍" => UiIcon::Pin,
         "⇄" | "⇅" => UiIcon::Connect,
         "📱" => UiIcon::Smartphone,
+        "📲" => UiIcon::Send,
         "📁" | "📂" => UiIcon::Folder,
         "📄" | "▤" => UiIcon::File,
+        "📝" => UiIcon::ScanText,
+        "✎" | "✏" => UiIcon::Edit,
         "🎵" => UiIcon::Music,
-        "🖼" | "🖼️" => UiIcon::Image,
-        "↓" => UiIcon::Download,
-        "↑" => UiIcon::ArrowUp,
-        "←" => UiIcon::ArrowLeft,
+        "🎬" | "📹" | "▷" => UiIcon::Video,
+        "🖼" => UiIcon::Image,
+        "📥" => UiIcon::Download,
+        "📤" => UiIcon::Upload,
+        "↓" | "⬇" => UiIcon::ArrowDown,
+        "⬆" | "↑" => UiIcon::ArrowUp,
+        "←" | "⬅" | "◀" => UiIcon::ArrowLeft,
+        "➡" => UiIcon::ArrowRight,
+        "<" => UiIcon::ChevronLeft,
         "↗" | "↙" => UiIcon::ExternalLink,
         "🔋" => UiIcon::Battery,
         "💾" => UiIcon::Storage,
-        "🌡" | "🌡️" => UiIcon::Temperature,
+        "🌡" => UiIcon::Temperature,
         "⧉" => UiIcon::Copy,
         "📋" => UiIcon::Clipboard,
         "⌨" => UiIcon::Keyboard,
         "🔉" | "🔊" => UiIcon::Speaker,
+        "🔇" => UiIcon::Mute,
         "🎤" | "🎙" => UiIcon::Mic,
         "↺" | "↶" | "↩" => UiIcon::Retry,
-        "↻" => UiIcon::Refresh,
+        "↻" | "🔄" => UiIcon::Refresh,
         "▾" => UiIcon::ChevronDown,
         "▴" => UiIcon::ChevronUp,
-        "+" | "＋" | "⊕" => UiIcon::Plus,
-        "−" | "–" => UiIcon::Minus,
+        "+" | "＋" | "⊕" | "➕" => UiIcon::Plus,
+        "−" | "–" | "—" => UiIcon::Minus,
         "✕" | "×" => UiIcon::Close,
         "✓" => UiIcon::Check,
         "🗑" => UiIcon::Trash,
-        "ⓘ" => UiIcon::Info,
-        "⚙" | "⚙️" => UiIcon::Settings,
+        "ⓘ" | "◉" => UiIcon::Info,
+        "⚠" | "🆘" => UiIcon::AlertTriangle,
+        "⚙" => UiIcon::Settings,
         "🔍" | "🔎" => UiIcon::Search,
         "📦" => UiIcon::Package,
+        "🗜" | "🗂" => UiIcon::Archive,
         "⌫" => UiIcon::Backspace,
         "📷" | "📸" => UiIcon::Camera,
-        "🔒" => UiIcon::Lock,
-        "🛡" | "🛡️" => UiIcon::Shield,
+        "🔒" | "🔑" | "🔓" => UiIcon::Lock,
+        "🛡" => UiIcon::Shield,
         "💻" | "🖥" => UiIcon::Monitor,
-        "📡" | "🌐" => UiIcon::Wifi,
-        "🕒" | "◷" => UiIcon::Clock,
-        "☀" | "☀️" => UiIcon::Sun,
+        "📡" | "🌐" | "📶" => UiIcon::Wifi,
+        "🔵" => UiIcon::Bluetooth,
+        "📅" => UiIcon::Calendar,
+        "🕒" | "◷" | "⏰" | "⏳" | "🍅" => UiIcon::Clock,
+        "☀" => UiIcon::Sun,
+        "🌓" => UiIcon::Contrast,
         "😊" => UiIcon::Smile,
         "💡" => UiIcon::Lightbulb,
         "💬" => UiIcon::Chat,
         "🔔" | "🔕" => UiIcon::Bell,
-        "🤖" => UiIcon::Cpu,
-        "⤢" => UiIcon::Maximize,
+        "🤖" | "⌘" => UiIcon::Cpu,
+        "⤢" | "⛶" => UiIcon::Maximize,
         "📎" => UiIcon::Attach,
         "▶" => UiIcon::Play,
         "⏸" => UiIcon::Pause,
-        "📊" => UiIcon::Chart,
+        "📊" | "📈" => UiIcon::Chart,
         "☰" | "≡" => UiIcon::Menu,
-        "⌘" => UiIcon::Cpu,
         "🌊" => UiIcon::Wave,
         "□" => UiIcon::Monitor,
-        "›" => UiIcon::ChevronRight,
+        "›" | "→" | ">" => UiIcon::ChevronRight,
+        "☕" | "🍜" => UiIcon::Coffee,
+        "❤" | "♥" | "💊" => UiIcon::Heart,
+        "🐱" => UiIcon::Cat,
+        "↔" => UiIcon::Flip,
+        "👤" => UiIcon::User,
+        "💳" => UiIcon::CreditCard,
+        "🏃" => UiIcon::Activity,
+        "🎂" => UiIcon::Gift,
         _ => return None,
     })
 }
-/// Only interpret leading UI glyphs, never symbols embedded in user content.
+/// Only interpret leading UI glyphs (or trailing sort/nav indicators), never symbols embedded in user content.
 pub(super) fn label_icon(value: &str) -> Option<(UiIcon, &str)> {
-    let first = value.chars().next()?;
-    let mut end = first.len_utf8();
-    if value[end..].starts_with('\u{fe0f}') {
-        end += '\u{fe0f}'.len_utf8();
-    }
-    let icon = symbol(&value[..end])?;
-    let rest = &value[end..];
-    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+    if value.is_empty() {
         return None;
     }
-    Some((icon, rest.trim_start()))
+    if let Some(rest) = value.strip_prefix("🔍-") {
+        return Some((UiIcon::Minus, rest.trim_start()));
+    }
+    if let Some(rest) = value.strip_prefix("🔍+") {
+        return Some((UiIcon::Plus, rest.trim_start()));
+    }
+    let first_byte = *value.as_bytes().first()?;
+    let leading_candidate = !((first_byte < 0x80 && !matches!(first_byte, b'+' | b'<' | b'>'))
+        || matches!(first_byte, 0xE4..=0xE9));
+    if leading_candidate {
+        let first = value.chars().next()?;
+        let mut end = first.len_utf8();
+        while value[end..].starts_with('\u{fe0f}') || value[end..].starts_with('\u{fe0e}') {
+            end += 3;
+        }
+        if let Some(icon) = symbol(&value[..end]) {
+            let rest = &value[end..];
+            if rest.is_empty()
+                || rest.starts_with(char::is_whitespace)
+                || (first as u32 >= 0x2000
+                    && !rest.starts_with(|c: char| c.is_ascii_alphanumeric()))
+            {
+                return Some((icon, rest.trim_start()));
+            }
+        }
+    }
+    // Check trailing directional / dismiss indicators on short UI labels (e.g. "降序 ↓", "升序 ↑", "下个月 >", "应用: xxx ×")
+    if value.chars().count() <= 24 {
+        for (suffix, icon) in [
+            (" ↓", UiIcon::ArrowDown),
+            (" ↑", UiIcon::ArrowUp),
+            (" >", UiIcon::ChevronRight),
+            (" ×", UiIcon::Close),
+        ] {
+            if let Some(prefix) = value.strip_suffix(suffix) {
+                if !prefix.trim().is_empty() {
+                    return Some((icon, prefix.trim_end()));
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn symbol_and_label_icon_mappings() {
+        assert_eq!(symbol("📂"), Some(UiIcon::Folder));
+        assert_eq!(
+            label_icon("📂 手机文件管理"),
+            Some((UiIcon::Folder, "手机文件管理"))
+        );
+
+        assert_eq!(symbol("💾"), Some(UiIcon::Storage));
+        assert_eq!(
+            label_icon("💾 手机存储扩容"),
+            Some((UiIcon::Storage, "手机存储扩容"))
+        );
+
+        assert_eq!(symbol("🔄"), Some(UiIcon::Refresh));
+        assert_eq!(label_icon("🔄 旋转"), Some((UiIcon::Refresh, "旋转")));
+
+        assert_eq!(symbol("⛶"), Some(UiIcon::Maximize));
+        assert_eq!(label_icon("⛶ 大图"), Some((UiIcon::Maximize, "大图")));
+
+        assert_eq!(symbol("📅"), Some(UiIcon::Calendar));
+        assert_eq!(label_icon("📅"), Some((UiIcon::Calendar, "")));
+
+        assert_eq!(symbol("⏰"), Some(UiIcon::Clock));
+        assert_eq!(label_icon("⏰"), Some((UiIcon::Clock, "")));
+
+        assert_eq!(symbol("🔑"), Some(UiIcon::Lock));
+        assert_eq!(
+            label_icon("🔑 复制验证码"),
+            Some((UiIcon::Lock, "复制验证码"))
+        );
+
+        assert_eq!(label_icon("🔍-"), Some((UiIcon::Minus, "")));
+        assert_eq!(label_icon("🔍+"), Some((UiIcon::Plus, "")));
+        assert_eq!(label_icon("+ 新建"), Some((UiIcon::Plus, "新建")));
+        assert_eq!(label_icon("普通中文标题"), None);
+        assert_eq!(label_icon("Plain ASCII Label"), None);
+        assert_eq!(label_icon(""), None);
+    }
+
+    #[test]
+    fn custom_svg_assets_and_variation_selector_mappings() {
+        let custom_icons = [
+            UiIcon::Contrast,
+            UiIcon::Ban,
+            UiIcon::Coffee,
+            UiIcon::Heart,
+            UiIcon::Cat,
+            UiIcon::AlertTriangle,
+            UiIcon::Flip,
+            UiIcon::ArrowDown,
+            UiIcon::ArrowRight,
+            UiIcon::ChevronLeft,
+            UiIcon::Mute,
+            UiIcon::Bluetooth,
+            UiIcon::Edit,
+            UiIcon::ScanText,
+            UiIcon::User,
+            UiIcon::Sparkles,
+            UiIcon::Archive,
+            UiIcon::Send,
+            UiIcon::CreditCard,
+            UiIcon::Key,
+            UiIcon::Activity,
+            UiIcon::Gift,
+        ];
+        for icon in custom_icons {
+            let bytes = asset(icon.path()).expect("custom SVG asset must exist");
+            let text = std::str::from_utf8(&bytes).expect("SVG must be valid UTF-8");
+            assert!(text.contains("<svg"), "invalid SVG for {:?}", icon);
+        }
+
+        // Variation Selector-16 (U+FE0F) stripping
+        assert_eq!(symbol("🖥️"), Some(UiIcon::Monitor));
+        assert_eq!(
+            label_icon("🖥️ 投屏窗口"),
+            Some((UiIcon::Monitor, "投屏窗口"))
+        );
+        assert_eq!(symbol("❤️"), Some(UiIcon::Heart));
+        assert_eq!(label_icon("❤️ 爱心"), Some((UiIcon::Heart, "爱心")));
+
+        // Newly mapped symbols & no-space CJK prefix
+        assert_eq!(symbol("🚫"), Some(UiIcon::Ban));
+        assert_eq!(symbol("☕"), Some(UiIcon::Coffee));
+        assert_eq!(symbol("🐱"), Some(UiIcon::Cat));
+        assert_eq!(symbol("🆘"), Some(UiIcon::AlertTriangle));
+        assert_eq!(symbol("🌓"), Some(UiIcon::Contrast));
+        assert_eq!(symbol("🔇"), Some(UiIcon::Mute));
+        assert_eq!(symbol("🔵"), Some(UiIcon::Bluetooth));
+        assert_eq!(symbol("📝"), Some(UiIcon::ScanText));
+        assert_eq!(symbol("✨"), Some(UiIcon::Sparkles));
+        assert_eq!(label_icon("⚡可秒回"), Some((UiIcon::Bolt, "可秒回")));
+
+        // Trailing sort and filter indicators
+        assert_eq!(label_icon("降序 ↓"), Some((UiIcon::ArrowDown, "降序")));
+        assert_eq!(label_icon("升序 ↑"), Some((UiIcon::ArrowUp, "升序")));
+        assert_eq!(
+            label_icon("下个月 >"),
+            Some((UiIcon::ChevronRight, "下个月"))
+        );
+        assert_eq!(
+            label_icon("应用: 微信 ×"),
+            Some((UiIcon::Close, "应用: 微信"))
+        );
+    }
 }

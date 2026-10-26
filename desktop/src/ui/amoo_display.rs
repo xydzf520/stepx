@@ -6,6 +6,30 @@ use stepx_companion::openclaw::RealChatMessage;
 /// Presentation only: native session names sometimes contain an internal plan
 /// (or the start of one). Never rename the source session or infer from prose.
 pub(super) fn session_title(title: &str) -> String {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(hit) = guard.get(title) {
+            return hit.clone();
+        }
+    }
+    let computed = compute_session_title(title);
+    if let Ok(mut guard) = cache.lock() {
+        if guard.len() > 512 {
+            guard.clear();
+        }
+        guard.insert(title.to_string(), computed.clone());
+    }
+    computed
+}
+
+pub(super) fn friendly_tool_label(raw: &str) -> &str {
+    stepx_companion::amoo::friendly_tool_label(raw)
+}
+
+fn compute_session_title(title: &str) -> String {
     fn backscreen_label(kind: &str) -> Option<&'static str> {
         match kind {
             "image" => Some("背屏图片创作"),
@@ -15,13 +39,8 @@ pub(super) fn session_title(title: &str) -> String {
             _ => None,
         }
     }
-    fn with_summary(label: &str, value: &serde_json::Value) -> String {
-        let summary = value["summary"]
-            .as_str()
-            .unwrap_or("")
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
+    fn format_label_with_summary(label: &str, summary: &str) -> String {
+        let summary = summary.split_whitespace().collect::<Vec<_>>().join(" ");
         if summary.is_empty() || summary.starts_with(['{', '<', '`']) {
             return label.into();
         }
@@ -35,7 +54,48 @@ pub(super) fn session_title(title: &str) -> String {
             }
         )
     }
+    fn with_summary(label: &str, value: &serde_json::Value) -> String {
+        let summary = value["summary"]
+            .as_str()
+            .or_else(|| value["title"].as_str())
+            .or_else(|| value["goal"].as_str())
+            .unwrap_or("");
+        format_label_with_summary(label, summary)
+    }
+    fn extract_truncated_json_field(body: &str, key: &str) -> Option<String> {
+        let pattern = format!("\"{key}\"");
+        let idx = body.find(&pattern)?;
+        let rest = body[idx + pattern.len()..].trim_start();
+        let rest = rest.strip_prefix(':')?.trim_start();
+        let rest = rest.strip_prefix('"')?;
+        let mut out = String::new();
+        let mut chars = rest.chars();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '"' => break,
+                '\\' => {
+                    if let Some(escaped) = chars.next() {
+                        match escaped {
+                            'n' | 'r' | 't' => out.push(' '),
+                            other => out.push(other),
+                        }
+                    }
+                }
+                other => out.push(other),
+            }
+        }
+        let cleaned = out.split_whitespace().collect::<Vec<_>>().join(" ");
+        let cleaned = cleaned.trim_end_matches('…').trim();
+        if cleaned.is_empty() || cleaned.starts_with(['{', '<', '`']) {
+            None
+        } else {
+            Some(cleaned.to_string())
+        }
+    }
     let trimmed = title.trim();
+    if trimmed == "main" || trimmed == "default" || trimmed.starts_with("agent:") {
+        return "主对话".into();
+    }
     let body = trimmed
         .strip_prefix("```json")
         .and_then(|s| s.trim().strip_suffix("```"))
@@ -47,10 +107,8 @@ pub(super) fn session_title(title: &str) -> String {
         .unwrap_or(trimmed)
         .trim();
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
-        if value["amoo_work"].as_u64() == Some(1)
-            && (value.get("tools").is_some() || value.get("done").is_some())
-        {
-            return with_summary("Amoo Work 工作任务", &value);
+        if value.get("amoo_work").is_some() {
+            return with_summary("文件任务", &value);
         }
         if let Some(label) = value["kind"].as_str().and_then(backscreen_label) {
             if value.get("brightness").is_some()
@@ -64,6 +122,15 @@ pub(super) fn session_title(title: &str) -> String {
             }
         }
     } else {
+        if body.starts_with('{') && body.contains("\"amoo_work\"") {
+            if let Some(summary) = extract_truncated_json_field(body, "summary")
+                .or_else(|| extract_truncated_json_field(body, "title"))
+                .or_else(|| extract_truncated_json_field(body, "goal"))
+            {
+                return format_label_with_summary("文件任务", &summary);
+            }
+            return "文件任务".into();
+        }
         // Native auto-titles can be cut in the middle of a JSON field. This
         // exact protocol-specific prefix is sufficient; generic JSON is not.
         let compact: String = body
@@ -234,11 +301,17 @@ fn tool_records(message: &RealChatMessage) -> Vec<ToolRecord> {
         .split(" · ")
         .map(str::trim)
         .filter(|name| !name.is_empty())
-        .map(|name| ToolRecord {
-            name: name.into(),
-            time_label: message.time_label.clone(),
-            detail: message.tool_authorization_failures.iter().any(|failed| failed == name)
-                .then(|| "授权超时：手机端 180 秒内未确认，此次工具调用已取消。请在手机 Amoo 中完成授权后重新发起任务；这不是执行成功。".into()),
+        .map(|name| {
+            let friendly = friendly_tool_label(name);
+            ToolRecord {
+                name: friendly.into(),
+                time_label: message.time_label.clone(),
+                detail: message
+                    .tool_authorization_failures
+                    .iter()
+                    .any(|failed| failed == name || friendly_tool_label(failed) == friendly)
+                    .then(|| "授权超时：手机端 180 秒内未确认，此次工具调用已取消。请在手机 Amoo 中完成授权后重新发起任务；这不是执行成功。".into()),
+            }
         })
         .collect()
 }
@@ -317,7 +390,7 @@ mod tests {
         );
         assert_eq!(
             session_title(r#"{"amoo_work":1,"summary":"整理会议纪要","done":true,"tools":[]}"#),
-            "Amoo Work 工作任务 · 整理会议纪要"
+            "文件任务 · 整理会议纪要"
         );
         for ordinary in [
             "  我的照片  ",
@@ -424,7 +497,7 @@ mod tests {
         );
         assert_eq!(items.len(), 4);
         assert!(
-            matches!(&items[1], AmooChatItem::ToolRecords { records, .. } if records.iter().map(|r|r.name.as_str()).collect::<Vec<_>>() == vec!["ability", "exec", "ability", "exec"])
+            matches!(&items[1], AmooChatItem::ToolRecords { records, .. } if records.iter().map(|r|r.name.as_str()).collect::<Vec<_>>() == vec!["ability", "执行终端命令", "ability", "执行终端命令"])
         );
         assert!(
             matches!(&items[2], AmooChatItem::AssistantRich { text: Some(text), .. } if text == "正在检查")
@@ -529,5 +602,28 @@ mod tests {
         let mut error = message("2", "", "assistant", "请求失败", "请求失败 · 网络错误");
         error.is_error = true;
         assert_eq!(chat_items("session", vec![reply, error], 0).len(), 2);
+    }
+
+    #[test]
+    fn friendly_tool_labels_and_clean_session_titles() {
+        assert_eq!(
+            friendly_tool_label("batch_file_upload_return_all"),
+            "批量上传文件"
+        );
+        assert_eq!(friendly_tool_label("task_result_submit"), "提交任务成果");
+        assert_eq!(friendly_tool_label("sessions_spawn"), "启动协同子智能体");
+        assert_eq!(friendly_tool_label("task_create"), "创建拆解任务");
+        assert_eq!(friendly_tool_label("text_to_image"), "AI 图像生成");
+
+        assert_eq!(session_title("main"), "主对话");
+        assert_eq!(session_title("agent:main:main"), "主对话");
+        assert_eq!(
+            session_title("{\"amoo_work\":1,\"summary\":\"整理季度财务报表\",\"tools\":["),
+            "文件任务 · 整理季度财务报表"
+        );
+        assert_eq!(
+            session_title("{\"amoo_work\":1,\"tools\":[{\"id\":\"1\""),
+            "文件任务"
+        );
     }
 }

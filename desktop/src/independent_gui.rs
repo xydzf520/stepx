@@ -28,26 +28,32 @@ pub fn run(
     )?;
     let id = start["task"].as_str().unwrap_or("").to_owned();
     ensure!(!id.is_empty(), "手机没有返回任务标识");
-    let began = Instant::now();
+    let started = Instant::now();
     let mut paused = false;
-    let mut stopping = false;
     let mut progress = String::new();
+    let mut step_number = 0usize;
     loop {
-        if control.stop.load(Ordering::Relaxed) && !stopping {
-            companion_gui::call(
+        if control.stop.load(Ordering::Relaxed) {
+            let _ = companion_gui::call(
                 adb,
                 device,
                 json!({"op":"agent","agentOp":"stop","task":id}),
-            )?;
-            stopping = true;
+            );
+            return Ok(GuiRunResult {
+                state: GuiRunState::WaitingCancelled,
+                message: "已停止手机操作。".into(),
+                invocation_id: id,
+                raw_result: None,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+            });
         }
-        if control.pause.load(Ordering::Relaxed) != paused && !stopping {
+        if control.pause.load(Ordering::Relaxed) != paused {
             paused = control.pause.load(Ordering::Relaxed);
-            companion_gui::call(
+            let _ = companion_gui::call(
                 adb,
                 device,
                 json!({"op":"agent","agentOp":if paused{"pause"}else{"resume"},"task":id}),
-            )?;
+            );
         }
         let value = match companion_gui::call(
             adb,
@@ -61,7 +67,7 @@ pub fn run(
                     message: "desktop 连接中断；任务继续由手机执行，可在伴侣查看或停止。".into(),
                     invocation_id: id,
                     raw_result: None,
-                    elapsed_ms: began.elapsed().as_millis() as u64,
+                    elapsed_ms: started.elapsed().as_millis() as u64,
                 })
             }
         };
@@ -73,11 +79,31 @@ pub fn run(
         if next != progress {
             progress = next.into();
             emit(ScreenEvent::Status(progress.clone()));
+            if !progress.trim().is_empty() {
+                step_number += 1;
+                emit(ScreenEvent::Step {
+                    number: step_number,
+                    description: progress.clone(),
+                });
+                if let Ok(png) = crate::amoo_screen::capture_png(adb, device) {
+                    emit(ScreenEvent::Screenshot {
+                        number: step_number,
+                        png,
+                    });
+                }
+            }
         }
         if !matches!(
             value["phase"].as_str(),
             Some("running" | "queued" | "paused" | "cancelling")
         ) {
+            if let Ok(png) = crate::amoo_screen::capture_png(adb, device) {
+                step_number = step_number.max(1);
+                emit(ScreenEvent::Screenshot {
+                    number: step_number,
+                    png,
+                });
+            }
             let completed = value["phase"] == "completed"
                 && value["result"]["verified"] == true
                 && value["result"]["phoneStopped"] == true;
@@ -92,19 +118,26 @@ pub fn run(
                 state,
                 message: progress,
                 invocation_id: id,
-                elapsed_ms: began.elapsed().as_millis() as u64,
+                elapsed_ms: started.elapsed().as_millis() as u64,
                 raw_result: Some(value),
             });
         }
-        if began.elapsed() > Duration::from_secs(1250) {
+        if started.elapsed() > Duration::from_secs(1250) {
             return Ok(GuiRunResult {
                 state: GuiRunState::TimedOut,
                 message: "desktop 等待超时，请在手机查看任务状态。".into(),
                 invocation_id: id,
-                elapsed_ms: began.elapsed().as_millis() as u64,
+                elapsed_ms: started.elapsed().as_millis() as u64,
                 raw_result: Some(value),
             });
         }
-        std::thread::sleep(Duration::from_secs(2));
+        for _ in 0..20 {
+            if control.stop.load(Ordering::Relaxed)
+                || control.pause.load(Ordering::Relaxed) != paused
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 }

@@ -41,10 +41,141 @@ pub struct AppInfo {
     pub icon_error: Option<String>,
 }
 
+pub fn is_curated_package(pkg: &str) -> bool {
+    let pkg = pkg.trim();
+    if pkg.starts_with("com.qualcomm.")
+        || pkg.starts_with("com.qti.")
+        || pkg.starts_with("vendor.")
+        || matches!(
+            pkg,
+            "com.stepos.exserviceui"
+                | "com.android.devicelockcontroller"
+                | "com.android.ondevicepersonalization.services"
+                | "com.android.federatedcompute.services"
+                | "com.android.traceur"
+                | "com.android.stk"
+                | "com.google.ar.core"
+                | "com.google.android.contactkeys"
+                | "com.google.android.safetycore"
+                | "com.google.android.gsf"
+        )
+    {
+        return false;
+    }
+    true
+}
+
+pub fn is_noise_system_overlay_or_shim(pkg: &str, label: &str, launchable: bool) -> bool {
+    if launchable {
+        return false;
+    }
+    let pkg = pkg.trim();
+    let lower_pkg = pkg.to_ascii_lowercase();
+    if pkg == "android"
+        || lower_pkg.contains(".overlay")
+        || lower_pkg.contains("rro")
+        || pkg.starts_with("com.android.internal.display.cutout.")
+        || pkg.starts_with("com.android.internal.systemui.navbar.")
+        || pkg.starts_with("com.android.theme.font.")
+        || pkg.starts_with("com.android.cts.")
+        || pkg.starts_with("com.android.microdroid.")
+        || pkg.starts_with("com.android.Vendorkeystore")
+        || lower_pkg.starts_with("com.android.vendorkeystore")
+        || pkg.starts_with("com.qualcomm.qti.services.systemhelper")
+        || pkg.starts_with("vendor.qti.")
+    {
+        return true;
+    }
+    label.trim().ends_with(".apk")
+}
+
+fn humanize_package_segment(seg: &str) -> String {
+    let words: Vec<String> = seg
+        .split('_')
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut chars = w.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect();
+    if words.is_empty() {
+        seg.to_string()
+    } else {
+        words.join(" ")
+    }
+}
+
+pub fn clean_app_label(pkg: &str, raw_label: &str) -> String {
+    let pkg_trimmed = pkg.trim();
+    let trimmed = raw_label.trim();
+    let looks_like_raw_id = trimmed.is_empty() || (trimmed.contains('.') && !trimmed.contains(' '));
+    if looks_like_raw_id {
+        if pkg_trimmed == "com.stepos.exserviceui"
+            || trimmed == "com.stepos.exserviceui"
+            || trimmed.starts_with("com.stepos.exserviceui.")
+        {
+            return "StepOS 扩展服务".to_string();
+        }
+        if pkg_trimmed == "com.android.ondevicepersonalization.services"
+            || trimmed == "com.android.ondevicepersonalization.services"
+            || trimmed.starts_with("com.android.ondevicepersonalization.")
+        {
+            return "设备端个性化服务".to_string();
+        }
+        if pkg_trimmed == "com.android.devicelockcontroller"
+            || trimmed == "com.android.devicelockcontroller"
+            || trimmed.starts_with("com.android.devicelockcontroller.")
+        {
+            return "设备锁控制器".to_string();
+        }
+        if pkg_trimmed == "com.android.federatedcompute.services"
+            || trimmed == "com.android.federatedcompute.services"
+            || trimmed == "com.android.appsearch.apk"
+            || pkg_trimmed == "com.android.appsearch"
+        {
+            return "系统搜索与计算服务".to_string();
+        }
+        if pkg_trimmed == "com.qualcomm.qti.xrcb"
+            || trimmed == "com.qualcomm.qti.xrcb"
+            || trimmed.starts_with("com.qualcomm.qti.xrcb.")
+        {
+            return "XR 协同服务".to_string();
+        }
+        let source = if trimmed.is_empty() {
+            pkg_trimmed
+        } else {
+            trimmed
+        };
+        let without_apk = source
+            .strip_suffix(".apk")
+            .or_else(|| source.strip_suffix(".APK"))
+            .unwrap_or(source);
+        if let Some(last) = without_apk.rsplit('.').find(|s| !s.is_empty()) {
+            if without_apk == pkg_trimmed
+                || last
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            {
+                return humanize_package_segment(last);
+            }
+            return last.to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
 impl AppInfo {
-    /// Include user apps, launchable system apps, and the integrated Amoo service.
+    /// Include launchable user apps, curated launchable system apps, and the integrated Amoo service.
     pub fn in_default_scope(&self) -> bool {
-        !self.system || self.launchable || self.package == "com.stepos.ailauncher"
+        if self.package == "com.stepos.ailauncher" {
+            return true;
+        }
+        self.launchable
+            && is_curated_package(&self.package)
+            && (!self.system || is_curated_package(&self.package))
     }
 
     pub fn can_uninstall(&self) -> bool {
@@ -118,9 +249,26 @@ fn parse_catalog(value: &Value, cache: Option<&Path>) -> Result<Vec<AppInfo>> {
         }
         // Paths in the response are never trusted as desktop file paths.
         app.icon_path = None;
-        if app.label.trim().is_empty() {
-            app.label = app.package.clone();
+        let raw_label = if app.label.trim().is_empty() {
+            app.package.clone()
+        } else {
+            app.label.clone()
+        };
+        let cleaned_label = clean_app_label(&app.package, &raw_label);
+        let is_overridden_apk = raw_label.trim() == "com.android.appsearch.apk"
+            || app.package == "com.android.federatedcompute.services";
+        if is_noise_system_overlay_or_shim(
+            &app.package,
+            if is_overridden_apk {
+                &cleaned_label
+            } else {
+                &raw_label
+            },
+            app.launchable,
+        ) {
+            continue;
         }
+        app.label = cleaned_label;
         if let Some(encoded) = row["icon_png"].as_str() {
             let result = cache_icon(encoded, cache, &app, &mut icon_bytes);
             match result {
@@ -381,16 +529,98 @@ mod tests {
     #[test]
     fn defaults_include_user_and_launcher_apps_without_changing_total() {
         let apps = [
-            application("a.user", "用户应用", false, false),
+            application("a.user", "用户应用", false, true),
+            application(
+                "com.google.ar.core",
+                "Google Play Services for AR",
+                false,
+                false,
+            ),
             application("a.camera", "相机", true, true),
             application("a.framework", "系统组件", true, false),
         ];
         assert_eq!(apps.iter().filter(|app| app.in_default_scope()).count(), 2);
-        assert_eq!(apps.len(), 3);
+        assert_eq!(apps.len(), 4);
         assert!(apps[0].can_uninstall());
-        assert!(!apps[1].can_uninstall());
-        assert!(apps[1].matches_query("相机"));
-        assert!(apps[1].matches_query("CAMERA"));
+        assert!(!apps[2].can_uninstall());
+        assert!(apps[2].matches_query("相机"));
+        assert!(apps[2].matches_query("CAMERA"));
+    }
+
+    #[test]
+    fn filters_noise_overlays_and_cleans_java_class_labels() {
+        assert!(is_noise_system_overlay_or_shim(
+            "android",
+            "Android 系统",
+            false
+        ));
+        assert!(is_noise_system_overlay_or_shim(
+            "com.android.internal.display.cutout.emulation.corner",
+            "角落刘海屏",
+            false
+        ));
+        assert!(is_noise_system_overlay_or_shim(
+            "com.android.internal.systemui.navbar.gestural",
+            "手势导航",
+            false
+        ));
+        assert!(is_noise_system_overlay_or_shim(
+            "com.android.cts.priv.ctsshim",
+            "CTS Shim",
+            false
+        ));
+        assert!(is_noise_system_overlay_or_shim(
+            "vendor.qti.hardware.cacert.server",
+            "CA Cert",
+            false
+        ));
+        assert!(is_noise_system_overlay_or_shim(
+            "com.example.res",
+            "SystemUIRes.apk",
+            false
+        ));
+        assert!(!is_noise_system_overlay_or_shim(
+            "com.tencent.mm",
+            "微信",
+            true
+        ));
+
+        assert_eq!(
+            clean_app_label(
+                "com.stepos.exserviceui",
+                "com.stepos.exserviceui.StepOSExServiceUiApp"
+            ),
+            "StepOS 扩展服务"
+        );
+        assert_eq!(
+            clean_app_label(
+                "com.android.ondevicepersonalization.services",
+                "com.android.ondevicepersonalization.services"
+            ),
+            "设备端个性化服务"
+        );
+        assert_eq!(
+            clean_app_label(
+                "com.android.devicelockcontroller",
+                "com.android.devicelockcontroller"
+            ),
+            "设备锁控制器"
+        );
+        assert_eq!(
+            clean_app_label(
+                "com.android.federatedcompute.services",
+                "com.android.appsearch.apk"
+            ),
+            "系统搜索与计算服务"
+        );
+        assert_eq!(
+            clean_app_label("com.qualcomm.qti.xrcb", "com.qualcomm.qti.xrcb"),
+            "XR 协同服务"
+        );
+        assert_eq!(
+            clean_app_label("com.example.custom", "com.example.custom.CustomServiceApp"),
+            "CustomServiceApp"
+        );
     }
 
     #[test]

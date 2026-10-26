@@ -68,7 +68,7 @@ public final class PushControlProvider extends ContentProvider {
         boolean keyguardLocked = isKeyguardLocked(context);
 
         if ("status".equals(op) || "ping".equals(op)) {
-            JSONObject snap = store.snapshot(0L);
+            JSONObject snap = store.statusSummary();
             return new JSONObject()
                 .put("ok", true)
                 .put("pong", true)
@@ -80,7 +80,7 @@ public final class PushControlProvider extends ContentProvider {
                 .put("humanTouchRecent", humanTouching)
                 .put("socketName", PushNotificationService.SOCKET_NAME)
                 .put("revision", snap.optLong("revision", store.getRevision()))
-                .put("threadCount", snap.optJSONArray("threads") != null ? snap.optJSONArray("threads").length() : 0)
+                .put("threadCount", snap.optInt("threadCount", store.getThreadCount()))
                 .put("unreadImCount", snap.optInt("unreadImCount", 0))
                 .put("activePushCount", snap.optInt("activePushCount", 0))
                 .put("totalPushCount", snap.optInt("totalPushCount", 0));

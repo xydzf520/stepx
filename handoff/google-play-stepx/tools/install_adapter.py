@@ -3,13 +3,13 @@ import sys
 """Install only the reviewed, fixed-device GMS boot adapter, preserving stock."""
 import pathlib, subprocess, json, base64, uuid, hashlib, shutil
 
-from common import ROOT, STATE as BACKUP, ADB, guard
+from common import ROOT, STATE as BACKUP, ADB, CONFIG, guard
 import argparse
 argparse.ArgumentParser(description=__doc__).parse_args()
 guard(native=True)
 STOCK_SHA = '5cfe5a88a97eca424bd4922fe813e0cc553adad0e8623105311ec1514022152f'
 baseline = json.loads((BACKUP / 'baseline.json').read_text())
-assert baseline.get('serial', 'ZYPZ261A01M692000LP') == ADB[-1], 'Wrong device baseline'
+assert baseline.get('serial', CONFIG.get('serial', '')) == ADB[-1], 'Wrong device baseline'
 assert subprocess.check_output(ADB + ['shell', 'getprop', 'ro.build.fingerprint'], text=True).strip() == baseline['fingerprint']
 assert subprocess.check_output(ADB + ['shell', 'getprop', 'persist.openclaw.zygote.path'], text=True).strip() == ''
 files = {p.name: p.read_bytes() for p in (ROOT / 'module').glob('*.py')}

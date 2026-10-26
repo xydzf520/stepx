@@ -2,7 +2,7 @@ use super::super::{
     icons::UiIcon, is_wireless, theme::*, widgets::*, Action, Companion, Page, PairTab, ToolPage,
     F_CONNECT, F_PAIR_ADDR, F_PAIR_CODE,
 };
-use facloud_ui::{assets::asset_cache::AssetSource, elements::*};
+use facloud_ui::{assets::asset_cache::AssetSource, elements::*, platform::Cursor};
 
 fn guide_can_continue(
     step: u8,
@@ -22,12 +22,21 @@ fn guide_can_continue(
 
 impl Companion {
     pub(in super::super) fn connect_actions(&self) -> Vec<El> {
-        let mut actions = vec![self.button(
-            "conn-guide",
-            "连接引导",
-            Action::ConnectGuide(Some(0)),
-            Btn::Secondary,
-        )];
+        let mut actions = vec![if self.connect_guide_step.is_some() {
+            self.button(
+                "conn-guide",
+                "收起引导",
+                Action::ConnectGuide(None),
+                Btn::Secondary,
+            )
+        } else {
+            self.button(
+                "conn-guide",
+                "连接引导",
+                Action::ConnectGuide(Some(0)),
+                Btn::Secondary,
+            )
+        }];
         actions.push(self.button(
             "conn-adb-help",
             "如何开启 ADB",
@@ -60,19 +69,39 @@ impl Companion {
             "手机扫码配对",
             "连接成功",
         ];
-        let mut body = vec![self.between(
-            self.heading(format!(
-                "新手连接 · {} / 6 · {}",
-                step + 1,
-                titles[step as usize]
-            )),
-            self.button(
-                "guide-hide",
-                "收起引导",
-                Action::ConnectGuide(None),
-                Btn::Ghost,
+        let mut body = vec![
+            self.between(
+                self.heading(format!(
+                    "新手连接 · {} / 6 · {}",
+                    step + 1,
+                    titles[step as usize]
+                )),
+                self.button(
+                    "guide-hide",
+                    "收起引导",
+                    Action::ConnectGuide(None),
+                    Btn::Ghost,
+                ),
             ),
-        )];
+            self.wrap(
+                titles
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, title)| {
+                        self.button(
+                            format!("guide-step-pill-{idx}"),
+                            format!("{}. {title}", idx + 1),
+                            Action::ConnectGuide(Some(idx as u8)),
+                            if step == idx as u8 {
+                                Btn::Primary
+                            } else {
+                                Btn::Secondary
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+        ];
         let connected = self.selected.is_some();
         let companion = &self.companion_status;
         let can_continue = guide_can_continue(
@@ -237,11 +266,30 @@ impl Companion {
         if !navigation.is_empty() {
             body.push(self.wrap(navigation));
         }
-        self.panel(body)
+        self.sub_enter(self.panel(body))
+    }
+
+    fn detected_phone_ip(&self) -> Option<String> {
+        let wifi_ip = self.cached_device_metrics().wifi_ipv4;
+        if !wifi_ip.is_empty() && wifi_ip != "未知" && wifi_ip != "未检测" {
+            return Some(wifi_ip);
+        }
+        if let Some(ip) = self.pairing_hosts.first() {
+            return Some(ip.to_string());
+        }
+        if let Some(svc) = self.mdns_services.first() {
+            if let Some(host) = svc.endpoint.split(':').next() {
+                if !host.is_empty() {
+                    return Some(host.to_string());
+                }
+            }
+        }
+        None
     }
 
     fn connection_pairing_panel(&self) -> El {
         let p = self.p();
+        let detected_ip = self.detected_phone_ip();
         let mut rows = vec![
             self.heading("无线配对"),
             self.text(
@@ -249,6 +297,38 @@ impl Companion {
                 CAPTION,
                 p.text2,
             ),
+            self.button_icon(
+                "conn-usb-wireless-bridge",
+                "已插数据线？一键开启同局域网无线连接（开启后可拔掉数据线）",
+                UiIcon::Wifi,
+                Action::EnableUsbWirelessBridge,
+                Btn::Secondary,
+            ),
+        ];
+        if let Some(ip) = &detected_ip {
+            rows.push(self.button_icon(
+                "conn-fill-detected-ip",
+                format!("填入检测到的手机 IP ({ip}:5555)"),
+                UiIcon::Bolt,
+                Action::FillDetectedPhoneIp(ip.clone()),
+                Btn::Ghost,
+            ));
+        }
+        if self.selected.is_some() {
+            rows.push(
+                Container::new(self.text(
+                    "当前手机已通过 USB 连接，系统会自动预热并维护同局域网无线备用通道，无需手动扫码配对；如需手动绑定新设备可使用下方配对方式。",
+                    CAPTION,
+                    p.success_text,
+                ))
+                .with_uniform_padding(S3)
+                .with_background_color(p.success_soft)
+                .with_border(Border::all(1.).with_border_color(p.success))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
+                .finish(),
+            );
+        }
+        rows.push(
             self.segmented(
                 "pair-mode",
                 [
@@ -260,7 +340,7 @@ impl Companion {
                 .map(|(tab, label)| (label.into(), self.pair_tab == tab, Action::PairTab(tab)))
                 .collect(),
             ),
-        ];
+        );
         match self.pair_tab {
             PairTab::Qr => {
                 if let Some(qr) = self.qr.as_ref().filter(|q| !q.expired()) {
@@ -294,6 +374,7 @@ impl Companion {
                 }
                 rows.push(self.text(if self.companion_status.pairing_ready { "StepX伴侣 → 连接 → 扫码连接电脑，或使用 Android 系统二维码配对入口。" } else { "伴侣扫码服务尚未通过核验。请使用 Android 系统「无线调试 → 使用二维码配对设备」；没有此入口时请选择 6 位配对码。" }, CAPTION, p.text2));
                 rows.push(self.button("qr-refresh", "生成新二维码", Action::Qr, Btn::Secondary));
+                rows.push(self.text("扫描无响应：确认同一网络、关闭访客隔离，检查电脑防火墙，刷新二维码；也可切换配对码填写手机显示的地址。", CAPTION, p.text3));
             }
             PairTab::Code => {
                 rows.push(self.text("手机「开发者选项 → 无线调试 → 使用配对码配对设备」，输入弹窗中的配对端口和 6 位数字。配对端口与连接端口不同。", CAPTION, p.text2));
@@ -319,8 +400,7 @@ impl Companion {
                 });
             }
         }
-        rows.push(self.text("扫描无响应：确认同一网络、关闭访客隔离，检查电脑防火墙，刷新二维码；也可切换配对码填写手机显示的地址。", CAPTION, p.text3));
-        self.panel(rows)
+        self.sub_enter(self.panel(rows))
     }
 
     pub(in super::super) fn connect_page(&self) -> El {
@@ -328,7 +408,7 @@ impl Companion {
         let mut sections = vec![];
         if let Some(step) = self.connect_guide_step {
             sections.push(self.connection_guide(step));
-        } else {
+        } else if self.selected.is_none() && self.preferences.devices.is_empty() {
             sections.push(self.panel(vec![self.between(
                 self.vstack(
                     S1,
@@ -362,6 +442,8 @@ impl Companion {
                 .selected
                 .as_ref()
                 .is_some_and(|d| d.transport == device.id);
+            let online = device.state == "device";
+            let wireless_ch = is_wireless(&device.id);
             let note = match device.state.as_str() {
                 "device" if selected => "当前使用 · 已验证",
                 "device" => "ADB 在线 · 可连接验证",
@@ -370,7 +452,7 @@ impl Companion {
                 _ => "通道不可用",
             };
             channels.push(self.divider());
-            channels.push(self.between(
+            let row_inner = self.between(
                 self.vstack(
                     S1,
                     vec![
@@ -378,7 +460,7 @@ impl Companion {
                             S2,
                             vec![
                                 self.ui_icon(
-                                    if is_wireless(&device.id) {
+                                    if wireless_ch {
                                         UiIcon::Wifi
                                     } else {
                                         UiIcon::Smartphone
@@ -391,6 +473,11 @@ impl Companion {
                                 } else {
                                     &device.model
                                 }),
+                                self.pill_badge(
+                                    if wireless_ch { "无线" } else { "USB" },
+                                    p.text2,
+                                    p.surface,
+                                ),
                             ],
                         ),
                         self.text(&device.id, CAPTION, p.text3),
@@ -399,17 +486,66 @@ impl Companion {
                 ),
                 if selected {
                     self.pill_badge("已连接", p.success_text, p.success_soft)
-                } else if device.state == "device" && !self.busy {
+                } else if online && !self.busy {
                     self.button(
                         format!("conn-select-{i}"),
                         "连接",
                         Action::Select(device.id.clone()),
                         Btn::Secondary,
                     )
+                } else if device.state == "unauthorized" {
+                    self.button(
+                        format!("conn-auth-help-{i}"),
+                        "查看授权指引",
+                        Action::AdbGuide(Some(0)),
+                        Btn::Secondary,
+                    )
                 } else {
                     self.disabled_button("等待就绪")
                 },
-            ));
+            );
+            let dev_id_dbl = device.id.clone();
+            let dev_id_menu = device.id.clone();
+            let dev_model_menu = device.model.clone();
+            channels.push(
+                Hoverable::new(
+                    self.mouse_state(format!("conn-device-row-{i}")),
+                    move |mouse| {
+                        let bg = if mouse.is_clicked() {
+                            p.accent_soft
+                        } else if mouse.is_mouse_over_element() {
+                            p.hover
+                        } else {
+                            facloud_ui::color::ColorU::transparent_black()
+                        };
+                        Container::new(row_inner)
+                            .with_horizontal_padding(S2)
+                            .with_vertical_padding(S1)
+                            .with_background_color(bg)
+                            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
+                            .finish()
+                    },
+                )
+                .with_defer_events_to_children()
+                .with_cursor(Cursor::PointingHand)
+                .on_double_click(move |ctx, _, _| {
+                    if online && !selected {
+                        ctx.dispatch_typed_action(Action::Select(dev_id_dbl.clone()));
+                    }
+                })
+                .on_right_click(move |ctx, _, at| {
+                    ctx.dispatch_typed_action(Action::ContextOpen(
+                        crate::ui::context_menu::Target::ConnectDevice {
+                            id: dev_id_menu.clone(),
+                            model: dev_model_menu.clone(),
+                            online,
+                            selected,
+                        },
+                        at,
+                    ))
+                })
+                .finish(),
+            );
         }
         let mut remembered = vec![self.heading("已信任的手机")];
         if self.preferences.devices.is_empty() {
@@ -419,12 +555,90 @@ impl Companion {
                 p.text2,
             ));
         }
-        for device in &self.preferences.devices {
-            remembered.push(self.text(
-                format!("{} · {}", device.model, device.serial),
-                CAPTION,
-                p.text2,
+        let multi_remembered = self.preferences.devices.len() > 1;
+        for (idx, device) in self.preferences.devices.iter().enumerate() {
+            let is_preferred =
+                self.preferences.selected_serial.as_deref() == Some(device.serial.as_str());
+            let is_online = self.selected.as_ref().is_some_and(|sel| {
+                sel.serial == device.serial
+                    || (!device.model.is_empty() && sel.model == device.model)
+            }) || self.devices.iter().any(|d| {
+                d.state == "device"
+                    && (d.id == device.serial
+                        || (!device.model.is_empty() && d.model == device.model))
+            });
+            let mut left = vec![self.text(&device.model, BODY, p.text)];
+            if is_online {
+                left.push(self.pill_badge("当前在线", p.success_text, p.success_soft));
+            }
+            if is_preferred {
+                left.push(self.pill_badge("默认", p.accent, p.accent_soft));
+            }
+            let mut right_actions = vec![];
+            if multi_remembered && !is_preferred {
+                right_actions.push(self.button(
+                    format!("conn-pref-{idx}"),
+                    "设为默认",
+                    Action::SetPreferredDevice(device.serial.clone()),
+                    Btn::Ghost,
+                ));
+            }
+            right_actions.push(self.button(
+                format!("conn-forget-{idx}"),
+                "移除",
+                Action::RemoveRememberedDevice(device.serial.clone()),
+                Btn::Ghost,
             ));
+            remembered.push(self.divider());
+            let rem_inner = self.between(
+                self.vstack(
+                    2.,
+                    vec![
+                        self.hstack(S2, left),
+                        self.mono(&device.serial, MICRO, p.text3),
+                    ],
+                ),
+                self.hstack(S1, right_actions),
+            );
+            let serial_dbl = device.serial.clone();
+            let serial_menu = device.serial.clone();
+            let model_menu = device.model.clone();
+            remembered.push(
+                Hoverable::new(
+                    self.mouse_state(format!("conn-remembered-row-{idx}")),
+                    move |mouse| {
+                        let bg = if mouse.is_clicked() {
+                            p.accent_soft
+                        } else if mouse.is_mouse_over_element() {
+                            p.hover
+                        } else {
+                            facloud_ui::color::ColorU::transparent_black()
+                        };
+                        Container::new(rem_inner)
+                            .with_horizontal_padding(S2)
+                            .with_vertical_padding(S1)
+                            .with_background_color(bg)
+                            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
+                            .finish()
+                    },
+                )
+                .with_defer_events_to_children()
+                .with_cursor(Cursor::PointingHand)
+                .on_double_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(Action::SetPreferredDevice(serial_dbl.clone()))
+                })
+                .on_right_click(move |ctx, _, at| {
+                    ctx.dispatch_typed_action(Action::ContextOpen(
+                        crate::ui::context_menu::Target::RememberedDevice {
+                            serial: serial_menu.clone(),
+                            model: model_menu.clone(),
+                            is_preferred,
+                        },
+                        at,
+                    ))
+                })
+                .finish(),
+            );
         }
         remembered.push(self.text(
             "相同网络内会尝试重连已配对的设备；手机关闭无线调试后需要重新开启。",

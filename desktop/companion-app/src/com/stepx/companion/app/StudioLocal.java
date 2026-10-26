@@ -14,10 +14,11 @@ import java.util.*;
 final class StudioLocal {
     static final int MAX_BYTES=2*1024*1024, CHUNK_BYTES=12*1024;
     private static final long EXPIRY=30*60*1000;
+    private static final char[] HEX="0123456789abcdef".toCharArray();
     static boolean validId(String id){return id!=null&&id.matches("local-[a-f0-9]{32}");}
     static String origin(String id){if(!validId(id))throw new IllegalArgumentException("作品编号无效");return "https://"+id+".local.stepx.invalid";}
     static boolean isDocument(String id,String raw){return (origin(id)+"/index.html").equals(raw==null?"":raw.split("#",2)[0]);}
-    static String hash(byte[] data)throws Exception {byte[] b=MessageDigest.getInstance("SHA-256").digest(data);StringBuilder s=new StringBuilder();for(byte x:b)s.append(String.format(Locale.ROOT,"%02x",x&255));return s.toString();}
+    static String hash(byte[] data)throws Exception {byte[] b=MessageDigest.getInstance("SHA-256").digest(data);char[] s=new char[b.length*2];for(int i=0;i<b.length;i++){int v=b[i]&255;s[i*2]=HEX[v>>>4];s[i*2+1]=HEX[v&15];}return new String(s);}
     private static File root(Context c)throws IOException {File f=new File(c.getFilesDir(),"studio-local");if(!f.isDirectory()&&!f.mkdirs())throw new IOException("无法创建作品目录");return f;}
     private static File dir(Context c,String id)throws IOException {if(!validId(id))throw new IOException("作品编号无效");return new File(root(c),id);}
     private static File stage(Context c,String upload)throws IOException {if(!validId(upload))throw new IOException("上传编号无效");return new File(root(c),"upload-"+upload);}
@@ -40,15 +41,17 @@ final class StudioLocal {
         if(System.currentTimeMillis()-meta.getLong("createdAt")>EXPIRY)throw new IOException("上传已过期，请重新发送");
         byte[] bytes=Base64.decode(q.getString("data"),Base64.DEFAULT);
         if(offset!=body.length()||bytes.length==0||bytes.length>CHUNK_BYTES||offset+bytes.length>meta.getInt("size"))throw new IOException("上传分片顺序或大小无效");
-        try(FileOutputStream out=new FileOutputStream(body,true)){out.write(bytes);out.getFD().sync();}
+        try(FileOutputStream out=new FileOutputStream(body,true)){out.write(bytes);}
         return new JSONObject().put("ok",true).put("upload",q.getString("upload")).put("offset",body.length());
     }
+    private static boolean containsIgnoreCase(String src,String target){int len=target.length(),max=src.length()-len;for(int i=0;i<=max;i++)if(src.regionMatches(true,i,target,0,len))return true;return false;}
     static synchronized JSONObject commit(Context c,String upload)throws Exception {
         File d=stage(c,upload);JSONObject meta=readJson(new File(d,"meta.json"));File body=new File(d,"body.part");
         if(body.length()!=meta.getInt("size")||body.length()>MAX_BYTES)throw new IOException("文件尚未完整上传");
         byte[] bytes=Files.readAllBytes(body.toPath());if(!hash(bytes).equals(meta.getString("sha256")))throw new IOException("文件校验失败，请重新发送");
         String html=StandardCharsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT).decode(ByteBuffer.wrap(bytes)).toString();
-        if(!html.toLowerCase(Locale.ROOT).contains("<html")||!html.toLowerCase(Locale.ROOT).contains("</html>"))throw new IOException("请发送完整 HTML 作品");
+        if(!containsIgnoreCase(html,"<html")||!containsIgnoreCase(html,"</html>"))throw new IOException("请发送完整 HTML 作品");
+        try(FileOutputStream o=new FileOutputStream(body,true)){o.getFD().sync();}
         if(!body.renameTo(new File(d,"index.html"))||!d.renameTo(dir(c,upload)))throw new IOException("保存作品失败");
         return new JSONObject(meta.toString()).put("ok",true);
     }

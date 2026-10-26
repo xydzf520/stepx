@@ -23,7 +23,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = Path(__file__).resolve().parent
-SERIAL = "ZYPZ261A01M692000LP"
+SERIAL = os.environ.get("STEPX_DEVICE_SERIAL") or os.environ.get("STEPX_SERIAL") or ""
 FORMAT = 1
 MAX_PRIVATE_BYTES = 8 * 1024 * 1024
 SCOPES = {

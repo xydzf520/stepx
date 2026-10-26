@@ -8,7 +8,6 @@ use serde_json::{json, Value};
 use std::{
     io::Write,
     path::{Path, PathBuf},
-    process::Command,
     sync::atomic::{AtomicU64, Ordering},
     thread,
     time::{Duration, Instant},
@@ -212,13 +211,20 @@ fn oem_exempt(text: &str) -> Result<bool> {
 /// Keep the list fixed to the app's actual camera, notification and call-state features.
 pub fn grant_runtime_permissions(adb: &Adb, device: &Device) -> Result<()> {
     device.verify(adb)?;
+    let mut script = String::new();
     for permission in RUNTIME_PERMISSIONS {
-        adb.shell(
-            &device.transport,
-            &["pm", "grant", "--user", "0", PACKAGE, permission],
-        )
-        .with_context(|| format!("StepX伴侣已安装，但授予 {permission} 失败"))?;
-        let dump = adb.shell(&device.transport, &["dumpsys", "package", PACKAGE])?;
+        script.push_str(&format!(
+            "pm grant --user 0 {PACKAGE} {permission} || {{ printf 'STEPX_GRANT_FAILED:{permission}\\n'; exit 0; }}; "
+        ));
+    }
+    script.push_str(&format!("dumpsys package {PACKAGE}"));
+    let dump = adb
+        .script(&device.transport, &script)
+        .context("StepX伴侣已安装，但授予运行权限失败")?;
+    for permission in RUNTIME_PERMISSIONS {
+        if dump.contains(&format!("STEPX_GRANT_FAILED:{permission}")) {
+            bail!("StepX伴侣已安装，但授予 {permission} 失败");
+        }
         ensure!(
             granted(&dump, permission),
             "StepX伴侣已安装，但用户 0 的 {permission} 未通过授权回读"
@@ -361,23 +367,31 @@ fn pairing_status(
 }
 
 fn read_pairing_readiness(adb: &Adb, device: &Device) -> (bool, String) {
-    let state = adb
-        .shell(
-            &device.transport,
-            &["cat", &format!("{FILES}/pairing.json")],
-        )
-        .ok()
-        .filter(|s| s.len() <= 64 * 1024)
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+    let cmd = format!(
+        "cat {FILES}/pairing.json 2>/dev/null || true; \
+         printf '\\n<<<STEPX_PAIRING_META>>>\\n'; \
+         pidof {PACKAGE} 2>/dev/null || true; \
+         printf '\\n<<<STEPX_PAIRING_TIME>>>\\n'; \
+         date +%s 2>/dev/null || true"
+    );
+    let Ok(raw) = adb.script(&device.transport, &cmd) else {
+        return pairing_status(true, &Value::Null, false, None);
+    };
+    let (pairing_raw, rest) = raw
+        .split_once("\n<<<STEPX_PAIRING_META>>>\n")
+        .unwrap_or(("", ""));
+    let (pid_raw, time_raw) = rest
+        .split_once("\n<<<STEPX_PAIRING_TIME>>>\n")
+        .unwrap_or((rest, ""));
+    let state = Some(pairing_raw.trim())
+        .filter(|s| !s.is_empty() && s.len() <= 64 * 1024)
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
         .unwrap_or(Value::Null);
-    let alive = adb
-        .shell(&device.transport, &["pidof", PACKAGE])
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false);
-    let phone_time = adb
-        .shell(&device.transport, &["date", "+%s"])
+    let alive = !pid_raw.trim().is_empty();
+    let phone_time = time_raw
+        .trim()
+        .parse::<u64>()
         .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
         .and_then(|seconds| seconds.checked_mul(1000));
     pairing_status(true, &state, alive, phone_time)
 }
@@ -423,7 +437,37 @@ fn read_status(adb: &Adb, device: &Device) -> Result<Value> {
 
 pub fn inspect(adb: &Adb, device: &Device) -> Result<CompanionStatus> {
     device.verify(adb)?;
-    let package = adb.shell(&device.transport, &["pm", "path", PACKAGE])?;
+    let script = format!(
+        "pkg=$(pm path {PACKAGE}); \
+         printf '%s\\n' \"$pkg\"; \
+         case \"$pkg\" in *package:*) ;; *) exit 0 ;; esac; \
+         printf '\\n<<<STEPX_DUMP>>>\\n'; \
+         dumpsys package {PACKAGE}; \
+         printf '\\n<<<STEPX_PID>>>\\n'; \
+         pidof {PACKAGE} 2>/dev/null || true; \
+         printf '\\n<<<STEPX_STATUS>>>\\n'; \
+         cat {STATUS} 2>/dev/null || true; \
+         printf '\\n<<<STEPX_PAIRING>>>\\n'; \
+         cat {FILES}/pairing.json 2>/dev/null || true; \
+         printf '\\n<<<STEPX_TIME>>>\\n'; \
+         date +%s 2>/dev/null || true; \
+         printf '\\n<<<STEPX_UPTIME>>>\\n'; \
+         cat /proc/uptime 2>/dev/null || true; \
+         printf '\\n<<<STEPX_BG>>>\\n'; \
+         cat {FILES}/amoo-connection.json 2>/dev/null || true; \
+         printf '\\n<<<STEPX_AMOO_META>>>\\n'; \
+         getprop ro.build.fingerprint; \
+         getprop ro.build.version.sdk; \
+         sha256sum /system/priv-app/AgentBus/AgentBus.apk 2>/dev/null || printf '\\n'; \
+         printf '\\n<<<STEPX_WIFI>>>\\n'; \
+         settings get global adb_wifi_enabled 2>/dev/null || true; \
+         printf '\\n<<<STEPX_DOZE>>>\\n'; \
+         cmd deviceidle whitelist 2>/dev/null || printf 'STEPX_DOZE_ERR\\n'; \
+         printf '\\n<<<STEPX_OEM>>>\\n'; \
+         dumpsys activity freeze whitelist 2>/dev/null || printf 'STEPX_OEM_ERR\\n'"
+    );
+    let raw = adb.script(&device.transport, &script)?;
+    let (package, rest) = raw.split_once("\n<<<STEPX_DUMP>>>\n").unwrap_or((&raw, ""));
     if !package.lines().any(|x| x.starts_with("package:")) {
         return Ok(CompanionStatus {
             checked: true,
@@ -431,79 +475,92 @@ pub fn inspect(adb: &Adb, device: &Device) -> Result<CompanionStatus> {
             ..Default::default()
         });
     }
-    let dump = adb.shell(&device.transport, &["dumpsys", "package", PACKAGE])?;
+    let (dump, rest) = rest.split_once("\n<<<STEPX_PID>>>\n").unwrap_or((rest, ""));
+    let (pid_raw, rest) = rest
+        .split_once("\n<<<STEPX_STATUS>>>\n")
+        .unwrap_or((rest, ""));
+    let (status_raw, rest) = rest
+        .split_once("\n<<<STEPX_PAIRING>>>\n")
+        .unwrap_or((rest, ""));
+    let (pairing_raw, rest) = rest
+        .split_once("\n<<<STEPX_TIME>>>\n")
+        .unwrap_or((rest, ""));
+    let (time_raw, rest) = rest
+        .split_once("\n<<<STEPX_UPTIME>>>\n")
+        .unwrap_or((rest, ""));
+    let (uptime_raw, rest) = rest.split_once("\n<<<STEPX_BG>>>\n").unwrap_or((rest, ""));
+    let (bg_raw, rest) = rest
+        .split_once("\n<<<STEPX_AMOO_META>>>\n")
+        .unwrap_or((rest, ""));
+    let (amoo_meta_raw, rest) = rest
+        .split_once("\n<<<STEPX_WIFI>>>\n")
+        .unwrap_or((rest, ""));
+    let (wifi_raw, rest) = rest
+        .split_once("\n<<<STEPX_DOZE>>>\n")
+        .unwrap_or((rest, ""));
+    let (doze_raw, oem_raw) = rest.split_once("\n<<<STEPX_OEM>>>\n").unwrap_or((rest, ""));
+
     let version = dump
         .lines()
         .find_map(|l| l.trim().strip_prefix("versionName="))
         .unwrap_or("未知")
         .to_string();
-    let permission_granted = granted(&dump, PERMISSION);
-    let permissions = permission_status(&dump);
-    let pairing_permission_granted = granted(&dump, "android.permission.MANAGE_DEBUGGING")
-        && granted(&dump, "android.permission.WRITE_SECURE_SETTINGS")
-        && granted(&dump, "android.permission.CAMERA");
-    let alive = adb
-        .shell(&device.transport, &["pidof", PACKAGE])
-        .map(|x| !x.trim().is_empty())
-        .unwrap_or(false);
-    let state = read_status(adb, device).unwrap_or(Value::Null);
-    let pairing = adb
-        .shell(
-            &device.transport,
-            &["cat", &format!("{FILES}/pairing.json")],
-        )
-        .ok()
-        .filter(|s| s.len() <= 64 * 1024)
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+    let permission_granted = granted(dump, PERMISSION);
+    let permissions = permission_status(dump);
+    let pairing_permission_granted = granted(dump, "android.permission.MANAGE_DEBUGGING")
+        && granted(dump, "android.permission.WRITE_SECURE_SETTINGS")
+        && granted(dump, "android.permission.CAMERA");
+    let alive = !pid_raw.trim().is_empty();
+    let state = Some(status_raw.trim())
+        .filter(|s| !s.is_empty() && s.len() <= 64 * 1024)
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
         .unwrap_or(Value::Null);
-    let phone_time_ms = adb
-        .shell(&device.transport, &["date", "+%s"])
+    let pairing = Some(pairing_raw.trim())
+        .filter(|s| !s.is_empty() && s.len() <= 64 * 1024)
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .unwrap_or(Value::Null);
+    let phone_time_ms = time_raw
+        .trim()
+        .parse::<u64>()
         .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
         .and_then(|seconds| seconds.checked_mul(1000));
     let (pairing_ready, pairing_message) =
         pairing_status(pairing_permission_granted, &pairing, alive, phone_time_ms);
-    let uptime_ms = adb
-        .shell(&device.transport, &["cat", "/proc/uptime"])
-        .ok()
-        .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok())
-        .map(|s| (s * 1000.) as u64);
-    let background = adb
-        .shell(
-            &device.transport,
-            &["cat", &format!("{FILES}/amoo-connection.json")],
-        )
-        .ok()
-        .filter(|s| s.len() <= 64 * 1024)
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+    let uptime_secs = uptime_raw
+        .split_whitespace()
+        .next()
+        .and_then(|s| s.parse::<f64>().ok());
+    let uptime_ms = uptime_secs.map(|s| (s * 1000.) as u64);
+    let background = Some(bg_raw.trim())
+        .filter(|s| !s.is_empty() && s.len() <= 64 * 1024)
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
         .unwrap_or(Value::Null);
     // This read-only capability gate does not start services. A saved active
     // flag cannot replace a fresh connection observation.
-    let capability = crate::amoo_background::prepare(adb, device).unwrap_or(Value::Null);
+    let mut amoo_lines = amoo_meta_raw.lines();
+    let amoo_fp = amoo_lines.next().unwrap_or("");
+    let amoo_sdk = amoo_lines.next().unwrap_or("");
+    let amoo_sha = amoo_lines.next().unwrap_or("");
+    let capability = crate::amoo_background::prepare_from_parts(
+        &device.transport,
+        &device.serial,
+        amoo_fp,
+        amoo_sdk,
+        amoo_sha,
+        dump,
+    )
+    .unwrap_or(Value::Null);
     let background_supported = capability["supported"].as_bool();
     let (background_enabled, background_ready, background_message) =
         background_capability(&background, alive, uptime_ms, &capability);
-    let wireless_enabled = adb
-        .shell(
-            &device.transport,
-            &["settings", "get", "global", "adb_wifi_enabled"],
-        )
-        .ok()
-        .and_then(|s| match s.trim() {
-            "1" => Some(true),
-            "0" => Some(false),
-            _ => None,
-        });
-    let doze_state = adb
-        .shell(&device.transport, &["cmd", "deviceidle", "whitelist"])
-        .and_then(|text| doze_exempt(&text));
+    let wireless_enabled = match wifi_raw.trim() {
+        "1" => Some(true),
+        "0" => Some(false),
+        _ => None,
+    };
+    let doze_state = doze_exempt(doze_raw);
     let doze_exempt = doze_state.as_ref().ok().copied();
-    let oem_state = adb
-        .shell(
-            &device.transport,
-            &["dumpsys", "activity", "freeze", "whitelist"],
-        )
-        .and_then(|text| oem_exempt(&text));
+    let oem_state = oem_exempt(oem_raw);
     let oem_freezer_exempt = oem_state.as_ref().ok().copied();
     let power_message = [
         doze_state
@@ -531,10 +588,7 @@ pub fn inspect(adb: &Adb, device: &Device) -> Result<CompanionStatus> {
     let last_error = state["lastError"].as_str().unwrap_or("");
     let paused = state["pausedReason"].as_str().unwrap_or("");
     let stalled = running
-        && adb
-            .shell(&device.transport, &["cat", "/proc/uptime"])
-            .ok()
-            .and_then(|text| text.split_whitespace().next()?.parse::<f64>().ok())
+        && uptime_secs
             .zip(state["uptimeMs"].as_u64())
             .is_some_and(|(uptime, updated)| uptime * 1000. - updated as f64 > 5_000.);
     let backscreen_message: String = if !permission_granted {

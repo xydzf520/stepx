@@ -22,6 +22,17 @@ import java.util.List;
 
 /** Genuine system calling, with an explicit prepare/confirm boundary. */
 final class DialTools {
+    private static volatile java.lang.reflect.Constructor<TelephonyManager> telephonyConstructor;
+
+    private static java.lang.reflect.Constructor<TelephonyManager> getTelephonyConstructor() throws Exception {
+        java.lang.reflect.Constructor<TelephonyManager> c = telephonyConstructor;
+        if (c == null) {
+            c = TelephonyManager.class.getConstructor(Context.class);
+            telephonyConstructor = c;
+        }
+        return c;
+    }
+
     static Context callingContext() {
         // createPackageContext retains ActivityThread's system op-package under
         // app_process. Attribute Telecom operations to the actual shell UID.
@@ -50,7 +61,7 @@ final class DialTools {
     }
 
     static int subscription(PhoneAccountHandle handle) throws Exception {
-        TelephonyManager manager = TelephonyManager.class.getConstructor(Context.class).newInstance(callingContext())
+        TelephonyManager manager = getTelephonyConstructor().newInstance(callingContext())
             .createForPhoneAccountHandle(handle);
         return manager == null ? SubscriptionManager.INVALID_SUBSCRIPTION_ID : manager.getSubscriptionId();
     }
@@ -66,7 +77,10 @@ final class DialTools {
     }
 
     static String label(PhoneAccountHandle handle, TelecomManager manager) throws Exception {
-        int sub = subscription(handle);
+        return label(handle, subscription(handle), manager);
+    }
+
+    static String label(PhoneAccountHandle handle, int sub, TelecomManager manager) throws Exception {
         SubscriptionInfo info = Bridge.context.getSystemService(SubscriptionManager.class).getActiveSubscriptionInfo(sub);
         if (info != null) return "卡槽 " + (info.getSimSlotIndex() + 1) + " · " + info.getDisplayName();
         return String.valueOf(manager.getPhoneAccount(handle).getLabel());
@@ -76,8 +90,16 @@ final class DialTools {
     static JSONObject inspectAccounts() throws Exception {
         TelecomManager manager = telecom();
         JSONArray result = new JSONArray();
-        for (PhoneAccountHandle handle : accounts(manager)) result.put(new JSONObject()
-            .put("subscription", subscription(handle)).put("label", label(handle, manager)));
+        for (PhoneAccountHandle handle : manager.getCallCapablePhoneAccounts()) {
+            PhoneAccount account = manager.getPhoneAccount(handle);
+            if (account != null && account.isEnabled() && account.hasCapabilities(PhoneAccount.CAPABILITY_SIM_SUBSCRIPTION)
+                && account.supportsUriScheme(PhoneAccount.SCHEME_TEL)) {
+                int sub = subscription(handle);
+                if (sub >= 0) {
+                    result.put(new JSONObject().put("subscription", sub).put("label", label(handle, sub, manager)));
+                }
+            }
+        }
         return new JSONObject().put("accounts", result).put("default_subscription", SubscriptionManager.getDefaultVoiceSubscriptionId())
             .put("in_call", manager.isInCall());
     }
@@ -107,7 +129,8 @@ final class DialTools {
         number(request);
         if (manager.isInCall()) throw new IllegalStateException("手机已有通话，请结束后再拨号");
         PhoneAccountHandle handle = select(request, manager);
-        return new JSONObject().put("subscription", subscription(handle)).put("subscription_label", label(handle, manager))
+        int sub = subscription(handle);
+        return new JSONObject().put("subscription", sub).put("subscription_label", label(handle, sub, manager))
             .put("account_key", accountKey(handle));
     }
 

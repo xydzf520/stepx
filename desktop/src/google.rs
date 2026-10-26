@@ -9,7 +9,7 @@ use crate::{
     },
 };
 use anyhow::{bail, Context, Result};
-use std::{path::PathBuf, process::Command};
+use std::path::PathBuf;
 
 const PLAY_PROTECT_SCHEMA: &str = "stepx-play-protect-certification-v1";
 
@@ -438,9 +438,15 @@ fn package_flags_clear(flags: &serde_json::Value) -> Result<bool> {
 
 pub fn inspect(device: &Device, adb: &Adb) -> Result<GoogleSuiteStatus> {
     device.verify(adb)?;
-    let packages = adb.shell(
+    let pkg_versions = adb.script(
         &device.transport,
-        &["pm", "list", "packages", "--user", "0"],
+        "pkgs=$(pm list packages --user 0 | tr -d '\\r'); \
+         for p in com.google.android.gsf com.google.android.gms com.android.vending; do \
+           if printf '%s\\n' \"$pkgs\" | grep -Fxq \"package:$p\"; then \
+             v=$(dumpsys package \"$p\" | tr -d '\\r' | sed -n 's/^[[:space:]]*versionName=//p' | head -n 1); \
+             printf '%s\\t%s\\n' \"$p\" \"${v:-版本未知}\"; \
+           fi; \
+         done",
     )?;
     let mut status = GoogleSuiteStatus {
         checked: true,
@@ -483,21 +489,16 @@ pub fn inspect(device: &Device, adb: &Adb) -> Result<GoogleSuiteStatus> {
                 "认证诊断暂不可用；权限校验成功不代表 Google 认证通过。".into()
         }
     }
-    for (package, target) in [
-        ("com.google.android.gsf", &mut status.gsf_version),
-        ("com.google.android.gms", &mut status.gms_version),
-        ("com.android.vending", &mut status.play_version),
-    ] {
-        if packages
-            .lines()
-            .any(|line| line.trim() == format!("package:{package}"))
-        {
-            let dump = adb.shell(&device.transport, &["dumpsys", "package", package])?;
-            *target = dump
-                .lines()
-                .find_map(|l| l.trim().strip_prefix("versionName="))
-                .unwrap_or("版本未知")
-                .to_string();
+    for line in pkg_versions.lines() {
+        let Some((pkg, ver)) = line.trim().split_once('\t') else {
+            continue;
+        };
+        let ver = ver.trim().to_string();
+        match pkg {
+            "com.google.android.gsf" => status.gsf_version = ver,
+            "com.google.android.gms" => status.gms_version = ver,
+            "com.android.vending" => status.play_version = ver,
+            _ => {}
         }
     }
     status.installed = [

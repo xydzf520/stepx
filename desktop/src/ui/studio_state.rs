@@ -6,6 +6,7 @@ use stepx_companion::studio::{self, CloudLibrary, Work};
 pub(super) enum StudioAction {
     Tab(u8),
     Source(u8),
+    SetFilter(u8),
     WebsiteLogin,
     WebsiteDisconnect,
     WebSelect(usize),
@@ -38,6 +39,24 @@ pub(super) enum StudioAction {
     CloudSelect(usize),
     CloudOpen,
     CloudKeep,
+    /// 「全部成果」里点某个成果：回到它所在的 Amoo 对话。
+    BackToTask(String),
+    /// 「在 Amoo 中继续改」某个对话成果：切回该对话并选中该成果继续修订。
+    ContinueOutputInAmoo(String, usize),
+    /// 「在 Amoo 中继续改」某个本机离线应用：关联或创建对话并进入应用继续改进。
+    ContinueLabInAmoo(usize),
+    /// 打开本机作品/成果文件或目录。
+    OpenPath(PathBuf),
+    /// 在系统文件管理器中定位该成果所在文件夹。
+    RevealPath(PathBuf),
+    /// 「新建作品」：回到 Amoo 开一段新对话，直接说要做什么。
+    NewInAmoo,
+    UseSavedOnPhone(usize),
+    DeleteSaved(usize),
+    SetDeliverableFilter(u8),
+    SetSortMode(u8),
+    ImportLocalFile,
+    OpenWorksFolder,
 }
 pub(super) enum StudioOutcome {
     Library(Vec<Work>, Option<String>),
@@ -50,10 +69,12 @@ pub(super) enum StudioOutcome {
         Result<CloudLibrary, String>,
     ),
 }
-#[derive(Default)]
 pub(super) struct StudioUiState {
     pub tab: u8,
     pub source: u8,
+    pub filter: u8,
+    pub deliverable_filter: u8,
+    pub sort_mode: u8,
     pub editing: bool,
     pub list_page: usize,
     pub web: Option<CloudLibrary>,
@@ -71,6 +92,35 @@ pub(super) struct StudioUiState {
     pub cloud_category: usize,
     pub cloud_checked: Option<Instant>,
     pub connecting_until: Option<Instant>,
+}
+impl Default for StudioUiState {
+    fn default() -> Self {
+        Self {
+            // 「我的作品」默认展示全部作品（Amoo 对话成果 + 本机离线应用 + 我的收藏）。
+            tab: 0,
+            source: 3,
+            filter: 0,
+            deliverable_filter: 0,
+            sort_mode: 0,
+            editing: false,
+            list_page: 0,
+            web: None,
+            web_error: None,
+            web_selected: None,
+            category: 0,
+            works: Vec::new(),
+            selected: None,
+            loaded: false,
+            qr: None,
+            phone_note: None,
+            cloud: None,
+            cloud_error: None,
+            cloud_selected: None,
+            cloud_category: 3,
+            cloud_checked: None,
+            connecting_until: None,
+        }
+    }
 }
 pub(super) const CATEGORIES: [&str; 3] = ["应用", "智能体", "技能"];
 pub(super) const BRIEFS: [(&str,&str,&str);3] = [
@@ -92,7 +142,7 @@ impl Companion {
         });
     }
     pub(super) fn tick_studio_cloud(&mut self) {
-        if !(self.page == Page::Studio || (self.page == Page::Amoo && self.workspace.panel == 4))
+        if self.page != Page::Studio
             || self.busy
             || self.demo_mode
             || self.selected.is_none()
@@ -119,6 +169,16 @@ impl Companion {
     }
     pub(super) fn refresh_studio(&mut self) {
         self.studio.loaded = true;
+        if self.page == Page::Amoo {
+            if let Ok(works) = studio::load() {
+                let prev_status = self.status.clone();
+                let prev_error = self.error;
+                self.apply_studio(StudioOutcome::Library(works, None));
+                self.status = prev_status;
+                self.error = prev_error;
+            }
+            return;
+        }
         self.submit("正在读取本机 Studio 作品…", |_| {
             Ok(Outcome::Studio(StudioOutcome::Library(
                 studio::load()?,
@@ -136,24 +196,149 @@ impl Companion {
                 action,
                 StudioAction::Tab(_)
                     | StudioAction::Source(_)
+                    | StudioAction::SetFilter(_)
                     | StudioAction::CloudCategory(_)
                     | StudioAction::CloudSelect(_)
                     | StudioAction::WebSelect(_)
                     | StudioAction::Select(_)
                     | StudioAction::ListPage(_)
                     | StudioAction::Edit(_)
+                    | StudioAction::BackToTask(_)
+                    | StudioAction::ContinueOutputInAmoo(..)
+                    | StudioAction::ContinueLabInAmoo(_)
+                    | StudioAction::OpenPath(_)
+                    | StudioAction::RevealPath(_)
+                    | StudioAction::AmooWorks
+                    | StudioAction::NewInAmoo
+                    | StudioAction::DeleteSaved(_)
+                    | StudioAction::SetDeliverableFilter(_)
+                    | StudioAction::SetSortMode(_)
+                    | StudioAction::ImportLocalFile
+                    | StudioAction::OpenWorksFolder
             )
         {
             return;
         }
         self.error = false;
         match action {
-            StudioAction::ListPage(page) => self.studio.list_page = *page,
+            StudioAction::SetDeliverableFilter(f) => {
+                self.studio.deliverable_filter = (*f).min(5);
+                self.studio.list_page = 0;
+                self.trigger_subtab_switch();
+            }
+            StudioAction::SetSortMode(m) => {
+                self.studio.sort_mode = (*m).min(2);
+                self.studio.list_page = 0;
+                self.trigger_subtab_switch();
+            }
+            StudioAction::OpenWorksFolder => {
+                let dir = stepx_companion::studio_lab::runs_directory()
+                    .ok()
+                    .filter(|p| p.exists())
+                    .or_else(|| Some(stepx_companion::settings::downloads()));
+                if let Some(folder) = dir {
+                    if let Err(e) = super::work_state::open_work_path(&folder) {
+                        self.status = e.to_string();
+                        self.error = true;
+                    }
+                }
+            }
+            StudioAction::ImportLocalFile => {
+                let picked = native_dialog::FileDialog::new()
+                    .set_title("导入本地作品到我的作品库")
+                    .add_filter(
+                        "作品与成果文件",
+                        &[
+                            "pptx", "ppt", "docx", "doc", "xlsx", "xls", "csv", "pdf", "html",
+                            "htm", "png", "jpg", "jpeg", "webp", "md", "txt",
+                        ],
+                    )
+                    .show_open_single_file();
+                match picked {
+                    Ok(Some(src)) if src.is_file() => {
+                        let name = src
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("未命名作品")
+                            .to_string();
+                        let ext = src
+                            .extension()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("")
+                            .to_ascii_lowercase();
+                        let dest_dir =
+                            stepx_companion::resources::user_state().join("studio-imported");
+                        let _ = std::fs::create_dir_all(&dest_dir);
+                        let dest_path = dest_dir.join(&name);
+                        let final_path =
+                            if src != dest_path && std::fs::copy(&src, &dest_path).is_ok() {
+                                dest_path
+                            } else {
+                                src.clone()
+                            };
+                        let kind = if matches!(ext.as_str(), "ppt" | "pptx") {
+                            "PPT 演示"
+                        } else if matches!(ext.as_str(), "xls" | "xlsx" | "csv") {
+                            "Excel 表格"
+                        } else if matches!(ext.as_str(), "html" | "htm") {
+                            "应用 · 本机导入"
+                        } else if matches!(
+                            ext.as_str(),
+                            "png" | "jpg" | "jpeg" | "webp" | "gif" | "svg"
+                        ) {
+                            "图片成果"
+                        } else {
+                            "文档报告"
+                        };
+                        let mut task = stepx_companion::amoo_workspace::Task::new(
+                            self.selected.as_ref().map(|d| d.serial.clone()),
+                            self.amoo_ui.account_scope.clone(),
+                        );
+                        task.title = format!("本地导入 · {name}");
+                        task.add_output(stepx_companion::amoo_workspace::Output {
+                            path: final_path.clone(),
+                            name: name.clone(),
+                            kind: kind.into(),
+                            lab_id: None,
+                        });
+                        self.workspace.journal.tasks.insert(0, task);
+                        let journal_path = stepx_companion::resources::user_state()
+                            .join("amoo-workspace/tasks.json");
+                        let _ = self.workspace.journal.save(&journal_path);
+                        self.studio.tab = 0;
+                        self.studio.source = 3;
+                        self.status = format!("已导入作品「{name}」到我的作品库");
+                        self.record_notice("我的作品", self.status.clone());
+                        self.motion_started = Instant::now();
+                    }
+                    Err(e) => {
+                        self.status = format!("导入失败：{e}");
+                        self.error = true;
+                    }
+                    _ => {}
+                }
+            }
+            StudioAction::SetFilter(f) => {
+                self.studio.filter = (*f).min(2);
+                self.studio.source = match *f {
+                    1 => 5,
+                    2 => 4,
+                    _ => 3,
+                };
+                self.studio.list_page = 0;
+                self.scroll = Default::default();
+                self.trigger_subtab_switch();
+            }
+            StudioAction::ListPage(page) => {
+                self.studio.list_page = *page;
+                self.trigger_subtab_switch();
+            }
             StudioAction::PhoneItem(i) => {
                 self.studio.cloud_selected = Some(*i);
                 self.studio.source = 1;
                 self.studio.cloud_category = 3;
                 self.fields[F_STUDIO_SEARCH].clear();
+                self.trigger_subtab_switch();
             }
             StudioAction::KeepWeb(i) => {
                 self.studio.web_selected = Some(*i);
@@ -169,12 +354,17 @@ impl Companion {
             }
             StudioAction::Source(source) => {
                 self.studio.list_page = 0;
-                self.studio.source = (*source).min(2);
+                self.studio.source = (*source).min(5);
+                self.studio.filter = 0;
                 self.studio.tab = 0;
                 self.fields[F_STUDIO_SEARCH].clear();
                 self.scroll = Default::default();
+                self.trigger_subtab_switch();
             }
-            StudioAction::Edit(value) => self.studio.editing = *value,
+            StudioAction::Edit(value) => {
+                self.studio.editing = *value;
+                self.trigger_subtab_switch();
+            }
             StudioAction::WebsiteLogin => {
                 self.studio.connecting_until = Some(Instant::now() + Duration::from_secs(300));
                 self.studio.cloud_checked = None;
@@ -199,7 +389,10 @@ impl Companion {
                     )))
                 });
             }
-            StudioAction::WebSelect(i) => self.studio.web_selected = Some(*i),
+            StudioAction::WebSelect(i) => {
+                self.studio.web_selected = Some(*i);
+                self.trigger_subtab_switch();
+            }
             StudioAction::WebKeep => {
                 let Some(w) = self
                     .studio
@@ -263,8 +456,12 @@ impl Companion {
                             || w.category == CATEGORIES[self.studio.cloud_category]
                     })
                 });
+                self.trigger_subtab_switch();
             }
-            StudioAction::CloudSelect(i) => self.studio.cloud_selected = Some(*i),
+            StudioAction::CloudSelect(i) => {
+                self.studio.cloud_selected = Some(*i);
+                self.trigger_subtab_switch();
+            }
             StudioAction::CloudOpen | StudioAction::CloudKeep => {
                 let Some(cloud) = self.studio.cloud.as_ref().filter(|c| c.authorized) else {
                     return;
@@ -306,14 +503,124 @@ impl Companion {
                     }
                 });
             }
+            StudioAction::BackToTask(id) => {
+                self.handle_action(&Action::Page(Page::Amoo), ctx);
+                self.handle_action(&Action::Workspace(WorkspaceAction::Select(id.clone())), ctx);
+                self.focus_field(F_AMOO, ctx);
+            }
+            StudioAction::ContinueOutputInAmoo(task_id, output_idx) => {
+                self.handle_action(&Action::Page(Page::Amoo), ctx);
+                self.handle_action(
+                    &Action::Workspace(WorkspaceAction::Select(task_id.clone())),
+                    ctx,
+                );
+                self.handle_action(
+                    &Action::Workspace(WorkspaceAction::ContinueEdit(*output_idx)),
+                    ctx,
+                );
+                self.focus_field(F_AMOO, ctx);
+            }
+            StudioAction::ContinueLabInAmoo(i) => {
+                let Some(a) = self.studio_lab.artifacts.get(*i).cloned() else {
+                    return;
+                };
+                self.handle_action(&Action::Page(Page::Amoo), ctx);
+                let existing = self
+                    .workspace
+                    .journal
+                    .tasks
+                    .iter()
+                    .find(|t| {
+                        self.workspace_visible(t)
+                            && t.outputs.iter().any(|o| o.lab_id.as_ref() == Some(&a.id))
+                    })
+                    .map(|t| t.id.clone());
+                let task_id = if let Some(id) = existing {
+                    id
+                } else {
+                    let mut task = stepx_companion::amoo_workspace::Task::new(
+                        self.selected.as_ref().map(|d| d.serial.clone()),
+                        self.amoo_ui.account_scope.clone(),
+                    );
+                    task.title = a.name.clone();
+                    task.route = Some(stepx_companion::amoo_workspace::Intent::App);
+                    task.add_output(stepx_companion::amoo_workspace::Output {
+                        path: a.html_path.clone(),
+                        name: a.name.clone(),
+                        kind: if a.passed {
+                            "应用 · 已检查"
+                        } else {
+                            "应用 · 待修复"
+                        }
+                        .into(),
+                        lab_id: Some(a.id.clone()),
+                    });
+                    let id = task.id.clone();
+                    self.workspace.journal.tasks.push(task);
+                    id
+                };
+                self.handle_action(&Action::Workspace(WorkspaceAction::Select(task_id)), ctx);
+                if let Some(out_idx) = self.workspace_task().and_then(|t| {
+                    t.outputs
+                        .iter()
+                        .position(|o| o.lab_id.as_ref() == Some(&a.id) || o.path == a.html_path)
+                }) {
+                    self.handle_action(
+                        &Action::Workspace(WorkspaceAction::ContinueEdit(out_idx)),
+                        ctx,
+                    );
+                }
+                self.focus_field(F_AMOO, ctx);
+            }
+            StudioAction::OpenPath(path) => {
+                if let Some(idx) = self
+                    .studio_lab
+                    .artifacts
+                    .iter()
+                    .position(|a| &a.html_path == path)
+                {
+                    self.handle_studio_lab_action(&StudioLabAction::PreviewAt(idx), ctx);
+                    return;
+                }
+                if let Err(e) = super::work_state::open_work_path(path) {
+                    self.status = e.to_string();
+                    self.error = true;
+                }
+            }
+            StudioAction::RevealPath(path) => {
+                let folder = if path.is_dir() {
+                    path.clone()
+                } else {
+                    path.parent()
+                        .map(std::path::Path::to_path_buf)
+                        .unwrap_or_else(|| path.clone())
+                };
+                if let Err(e) = super::work_state::open_work_path(&folder) {
+                    self.status = e.to_string();
+                    self.error = true;
+                }
+            }
+            StudioAction::NewInAmoo => {
+                self.handle_action(&Action::Page(Page::Amoo), ctx);
+                self.handle_action(&Action::Workspace(WorkspaceAction::New), ctx);
+            }
             StudioAction::Tab(tab) => {
-                self.studio.tab = if *tab == 1 { 0 } else { *tab };
+                self.studio.tab = match *tab {
+                    1 | 4 => 0,
+                    t => t,
+                };
                 if *tab == 1 {
                     self.studio.source = 2;
+                } else if *tab == 4 {
+                    self.studio.source = 4;
                 }
                 self.scroll = Default::default();
+                self.trigger_subtab_switch();
             }
-            StudioAction::Category(i) => self.studio.category = (*i).min(2),
+            StudioAction::Category(i) => {
+                self.studio.category = (*i).min(2);
+                self.trigger_subtab_switch();
+            }
             StudioAction::Select(i) => {
                 if let Some(w) = self.studio.works.get(*i) {
                     self.fields[F_STUDIO_NAME].set(&w.name);
@@ -325,6 +632,7 @@ impl Companion {
                     self.studio.selected = Some(*i);
                     self.studio.qr = None;
                     self.studio.phone_note = None;
+                    self.trigger_subtab_switch();
                 }
             }
             StudioAction::PasteLink => {
@@ -434,16 +742,18 @@ impl Companion {
                     });
                 }
             }
-            StudioAction::PhoneLibrary | StudioAction::AmooWorks => {
-                let mode = if matches!(action, StudioAction::AmooWorks) {
-                    "amoo"
-                } else {
-                    "library"
-                };
+            StudioAction::AmooWorks => {
+                self.studio.tab = 0;
+                self.studio.source = 4;
+                self.studio.filter = 0;
+                self.scroll = Default::default();
+                self.motion_started = Instant::now();
+            }
+            StudioAction::PhoneLibrary => {
                 self.with_device("正在打开手机作品入口…", move |adb, d| {
                     Ok(Outcome::Studio(StudioOutcome::Phone(
                         d.serial.clone(),
-                        studio::open_phone(adb, &d, mode, None)?,
+                        studio::open_phone(adb, &d, "library", None)?,
                     )))
                 });
             }
@@ -494,6 +804,26 @@ impl Companion {
                         "已复制创作需求；请在官网选择{}构建器并粘贴",
                         CATEGORIES[(*i).min(2)]
                     );
+                }
+            }
+            StudioAction::UseSavedOnPhone(i) => {
+                if *i < self.studio.works.len() {
+                    self.studio.selected = Some(*i);
+                    self.handle_studio_action(&StudioAction::OpenPhone, ctx);
+                }
+            }
+            StudioAction::DeleteSaved(i) => {
+                if *i < self.studio.works.len() {
+                    let removed = self.studio.works.remove(*i);
+                    if self.studio.selected == Some(*i) {
+                        self.studio.selected = (!self.studio.works.is_empty()).then_some(0);
+                    } else if let Some(sel) = self.studio.selected {
+                        if sel > *i {
+                            self.studio.selected = Some(sel - 1);
+                        }
+                    }
+                    let _ = studio::save_all(&self.studio.works);
+                    self.status = format!("已移除收藏「{}」", removed.name);
                 }
             }
         }

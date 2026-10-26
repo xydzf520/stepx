@@ -31,6 +31,8 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * Real-time notification listener, RemoteInput reply handle harvester, LocalServerSocket
@@ -45,6 +47,7 @@ public final class PushNotificationService extends NotificationListenerService {
     private Thread socketAcceptThread;
     private ConnectivityManager.NetworkCallback wifiCallback;
     private final CopyOnWriteArrayList<BufferedWriter> streamClients = new CopyOnWriteArrayList<BufferedWriter>();
+    private final ExecutorService deltaExecutor = Executors.newSingleThreadExecutor();
 
     public static boolean isConnected() {
         return instance != null;
@@ -108,20 +111,25 @@ public final class PushNotificationService extends NotificationListenerService {
         PushNotificationService svc = instance;
         int count = 0;
         long nowMs = System.currentTimeMillis();
-        for (String key : keys) {
-            if (svc != null) {
-                try {
-                    svc.cancelNotification(key);
-                } catch (Exception ignored) {
+        store.beginBatch();
+        try {
+            for (String key : keys) {
+                if (svc != null) {
+                    try {
+                        svc.cancelNotification(key);
+                    } catch (Exception ignored) {
+                    }
                 }
+                JSONObject delta = store.onNotificationRemoved(
+                    key, NotificationListenerService.REASON_CANCEL_ALL, nowMs
+                );
+                if (svc != null && delta != null) {
+                    svc.broadcastDelta(delta);
+                }
+                count++;
             }
-            JSONObject delta = store.onNotificationRemoved(
-                key, NotificationListenerService.REASON_CANCEL_ALL, nowMs
-            );
-            if (svc != null && delta != null) {
-                svc.broadcastDelta(delta);
-            }
-            count++;
+        } finally {
+            store.endBatch();
         }
         return count;
     }
@@ -154,17 +162,24 @@ public final class PushNotificationService extends NotificationListenerService {
         }
         stopSocketServer();
         unregisterWifiSelfHealCallback();
+        deltaExecutor.shutdownNow();
         super.onDestroy();
     }
 
     public void scanActiveNotifications() {
         try {
             StatusBarNotification[] active = getActiveNotifications();
-            if (active == null) return;
-            for (StatusBarNotification sbn : active) {
-                if (sbn != null) {
-                    ingestStatusBarNotification(sbn, false);
+            if (active == null || active.length == 0) return;
+            PushStore store = PushStore.get(this);
+            store.beginBatch();
+            try {
+                for (StatusBarNotification sbn : active) {
+                    if (sbn != null) {
+                        ingestStatusBarNotification(sbn, false);
+                    }
                 }
+            } finally {
+                store.endBatch();
             }
         } catch (Exception ignored) {
         }
@@ -478,12 +493,17 @@ public final class PushNotificationService extends NotificationListenerService {
                 JSONObject response;
                 try {
                     JSONObject req = new JSONObject(trimmed);
-                    if ("subscribe".equals(req.optString("op"))) {
+                    String op = req.optString("op", "");
+                    if ("subscribe".equals(op)) {
                         streamClients.addIfAbsent(writer);
                         response = new JSONObject()
                             .put("ok", true)
                             .put("subscribed", true)
                             .put("revision", PushStore.get(this).getRevision());
+                    } else if ("expansion_call".equals(op)
+                            || op.startsWith("expansion:")
+                            || "expansion".equals(req.optString("provider", ""))) {
+                        response = handleExpansionSocketRequest(req);
                     } else {
                         response = PushControlProvider.handleRequest(this, req);
                     }
@@ -513,19 +533,70 @@ public final class PushNotificationService extends NotificationListenerService {
         }
     }
 
+    private JSONObject handleExpansionSocketRequest(JSONObject req) throws Exception {
+        String op = req.optString("op", "");
+        String method = req.optString("method", "request");
+        if (op.startsWith("expansion:") && !req.has("method")) {
+            method = op.substring("expansion:".length());
+        }
+        String argStr;
+        if (req.has("arg")) {
+            Object rawArg = req.opt("arg");
+            argStr = rawArg == null ? "" : String.valueOf(rawArg);
+        } else if (req.optJSONObject("query") != null) {
+            argStr = req.optJSONObject("query").toString();
+        } else {
+            JSONObject copy = new JSONObject(req.toString());
+            if ("expansion_call".equals(op) && !method.isEmpty() && !"request".equals(method)) {
+                copy.put("op", method);
+            } else if (op.startsWith("expansion:")) {
+                copy.put("op", op.substring("expansion:".length()));
+            }
+            argStr = copy.toString();
+        }
+        Bundle bundle = getContentResolver().call(
+            android.net.Uri.parse("content://com.stepx.companion.app.expansion"),
+            method,
+            argStr,
+            null
+        );
+        if (bundle != null) {
+            String resultJson = bundle.getString("result_json");
+            if (resultJson != null && !resultJson.isEmpty()) {
+                return new JSONObject(resultJson);
+            }
+            String b64 = bundle.getString("result");
+            if (b64 != null && !b64.isEmpty()) {
+                return new JSONObject(
+                    new String(android.util.Base64.decode(b64, android.util.Base64.DEFAULT), StandardCharsets.UTF_8)
+                );
+            }
+        }
+        JSONObject q = ExpansionProvider.parseArg(method, argStr);
+        return ExpansionProvider.handleRequest(this, q);
+    }
+
     void broadcastDelta(JSONObject delta) {
         if (delta == null || streamClients.isEmpty()) return;
-        String payload = delta.toString();
-        for (BufferedWriter writer : streamClients) {
-            try {
-                synchronized (writer) {
-                    writer.write(payload);
-                    writer.write('\n');
-                    writer.flush();
+        final String payload = delta.toString();
+        try {
+            deltaExecutor.execute(new Runnable() {
+                @Override
+                public void run() {
+                    for (BufferedWriter writer : streamClients) {
+                        try {
+                            synchronized (writer) {
+                                writer.write(payload);
+                                writer.write('\n');
+                                writer.flush();
+                            }
+                        } catch (Exception broken) {
+                            streamClients.remove(writer);
+                        }
+                    }
                 }
-            } catch (Exception broken) {
-                streamClients.remove(writer);
-            }
+            });
+        } catch (Exception ignored) {
         }
     }
 }

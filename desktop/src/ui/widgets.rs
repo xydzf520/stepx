@@ -24,6 +24,76 @@ pub enum Btn {
 
 pub type El = Box<dyn Element>;
 
+type FileProbeEntry = (std::time::Instant, bool, u64, Option<(u32, u32)>);
+
+static FILE_PROBE_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, FileProbeEntry>>,
+> = std::sync::OnceLock::new();
+
+fn probe_file_cached(path: &std::path::Path, need_dims: bool) -> (bool, u64, Option<(u32, u32)>) {
+    const TTL: std::time::Duration = std::time::Duration::from_secs(2);
+    let cache =
+        FILE_PROBE_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Ok(mut map) = cache.lock() {
+        if let Some((at, is_file, len, dims)) = map.get_mut(path) {
+            if at.elapsed() < TTL {
+                if !need_dims || !*is_file || dims.is_some() {
+                    return (*is_file, *len, dims.filter(|&(w, h)| w > 0 && h > 0));
+                }
+                let probed = image::image_dimensions(path).ok().unwrap_or((0, 0));
+                *dims = Some(probed);
+                return (
+                    *is_file,
+                    *len,
+                    (probed.0 > 0 && probed.1 > 0).then_some(probed),
+                );
+            }
+        }
+    }
+    let meta = std::fs::metadata(path).ok();
+    let is_file = meta.as_ref().is_some_and(|m| m.is_file());
+    let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+    let dims_raw = if need_dims && is_file {
+        Some(image::image_dimensions(path).ok().unwrap_or((0, 0)))
+    } else {
+        None
+    };
+    if let Ok(mut map) = cache.lock() {
+        if map.len() >= 512 {
+            map.retain(|_, (at, ..)| at.elapsed() < TTL);
+            if map.len() >= 512 {
+                map.clear();
+            }
+        }
+        map.insert(
+            path.to_path_buf(),
+            (std::time::Instant::now(), is_file, len, dims_raw),
+        );
+    }
+    (is_file, len, dims_raw.filter(|&(w, h)| w > 0 && h > 0))
+}
+
+pub(super) fn cached_is_file(path: &std::path::Path) -> bool {
+    probe_file_cached(path, false).0
+}
+
+pub(super) fn cached_file_len(path: &std::path::Path) -> Option<u64> {
+    let (is_file, len, _) = probe_file_cached(path, false);
+    is_file.then_some(len)
+}
+
+pub(super) fn cached_image_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
+    probe_file_cached(path, true).2
+}
+
+pub(super) fn invalidate_cached_file(path: &std::path::Path) {
+    if let Some(cache) = FILE_PROBE_CACHE.get() {
+        if let Ok(mut map) = cache.lock() {
+            map.remove(path);
+        }
+    }
+}
+
 pub(super) fn ui_label(
     text: String,
     font: facloud_ui::fonts::FamilyId,
@@ -50,6 +120,10 @@ fn icon_label(
     color: ColorU,
     weight: Weight,
 ) -> El {
+    let rest = match icons::label_icon(rest) {
+        Some((_, stripped)) => stripped,
+        None => rest,
+    };
     let icon_size = size.max(14.);
     let image = icons::draw_icon(icon, icon_size, color);
     if rest.is_empty() {
@@ -89,6 +163,72 @@ fn icon_label(
 impl Companion {
     pub fn p(&self) -> Palette {
         self.palette.get()
+    }
+
+    pub fn hover_t(&self, mouse: &MouseState) -> f32 {
+        if self.settings.value.reduced_motion {
+            if mouse.is_mouse_over_element() {
+                1.0
+            } else {
+                0.0
+            }
+        } else {
+            let p = mouse.hover_progress().clamp(0.0, 1.0);
+            1.0 - (1.0 - p).powi(2)
+        }
+    }
+
+    pub fn toggle_switch(&self, id: impl Into<String>, on: bool, action: Action) -> El {
+        let id = id.into();
+        let p = self.p();
+        let state = self.mouse_state(id.clone());
+        let toggle = Hoverable::new(state, move |mouse| {
+            let t = self.hover_t(&mouse);
+            let clicked = mouse.is_clicked();
+            let base_track = if on { p.success } else { p.border_strong };
+            let hover_target = if on { p.success_text } else { p.text3 };
+            let hover_track = lerp_color(base_track, hover_target, 0.35);
+            let mut track_bg = lerp_color(base_track, hover_track, t);
+            if clicked {
+                track_bg = lerp_color(track_bg, p.accent, 0.18);
+            }
+            let thumb_w = if clicked { 20. } else { 18. };
+            Container::new(
+                Flex::row()
+                    .with_main_axis_size(MainAxisSize::Max)
+                    .with_main_axis_alignment(if on {
+                        MainAxisAlignment::End
+                    } else {
+                        MainAxisAlignment::Start
+                    })
+                    .with_child(
+                        ConstrainedBox::new(
+                            Container::new(Empty::new().finish())
+                                .with_background_color(rgb(255, 255, 255))
+                                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(9.)))
+                                .finish(),
+                        )
+                        .with_width(thumb_w)
+                        .with_height(18.)
+                        .finish(),
+                    )
+                    .finish(),
+            )
+            .with_uniform_padding(3.)
+            .with_background_color(track_bg)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(12.)))
+            .finish()
+        })
+        .with_cursor(Cursor::PointingHand)
+        .on_click(move |ctx, _, _| ctx.dispatch_typed_action(action.clone()))
+        .finish();
+        let control = ConstrainedBox::new(toggle)
+            .with_width(42.)
+            .with_height(24.)
+            .finish();
+        #[cfg(feature = "ui-capture")]
+        let control = super::scenario_check::control(id, control);
+        control
     }
 
     // ---- Text ----
@@ -131,7 +271,11 @@ impl Companion {
 
     pub fn caption(&self, text: impl Into<String>) -> El {
         let p = self.p();
-        self.text(text, CAPTION, p.text2)
+        let s = text.into();
+        if !s.contains('\n') && icons::label_icon(&s).is_some() {
+            return ui_label(s, self.font, CAPTION, p.text2, Weight::Normal);
+        }
+        self.text(s, CAPTION, p.text2)
     }
 
     // ---- Layout ----
@@ -215,6 +359,74 @@ impl Companion {
             .finish()
     }
 
+    pub(super) fn hover_panel(&self, id: impl Into<String>, content: El) -> El {
+        self.hover_panel_interactive(id, content, None, None, None)
+    }
+
+    pub(super) fn hover_panel_interactive(
+        &self,
+        id: impl Into<String>,
+        content: El,
+        on_click: Option<Action>,
+        on_double: Option<Action>,
+        menu_target: Option<super::context_menu::Target>,
+    ) -> El {
+        let p = self.p();
+        let state = self.mouse_state(format!("hpanel:{}", id.into()));
+        let interactive = on_click.is_some() || on_double.is_some() || menu_target.is_some();
+        let mut h = Hoverable::new(state, move |mouse| {
+            let t = self.hover_t(&mouse);
+            let border_col = lerp_color(p.border, p.border_strong, t);
+            let bg_col = if interactive {
+                let hover_bg = lerp_color(p.bg, p.hover, 0.45);
+                if mouse.is_clicked() {
+                    lerp_color(p.bg, p.press_color(p.hover), 0.55)
+                } else {
+                    lerp_color(p.bg, hover_bg, t)
+                }
+            } else {
+                p.bg
+            };
+            Container::new(content)
+                .with_uniform_padding(S4)
+                .with_background_color(bg_col)
+                .with_border(Border::all(1.).with_border_color(border_col))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_PANEL)))
+                .finish()
+        })
+        .with_defer_events_to_children();
+        if interactive {
+            h = h.with_cursor(Cursor::PointingHand);
+        }
+        if let Some(action) = on_click {
+            h = h.on_click(move |ctx, _, _| ctx.dispatch_typed_action(action.clone()));
+        }
+        if let Some(action) = on_double {
+            h = h.on_double_click(move |ctx, _, _| ctx.dispatch_typed_action(action.clone()));
+        }
+        if let Some(target) = menu_target {
+            h = h.on_right_click(move |ctx, _, at| {
+                ctx.dispatch_typed_action(Action::ContextOpen(target.clone(), at))
+            });
+        }
+        h.finish()
+    }
+
+    pub(super) fn context_target(
+        &self,
+        id: impl Into<String>,
+        target: super::context_menu::Target,
+        content: El,
+    ) -> El {
+        let state = self.mouse_state(format!("ctx:{}", id.into()));
+        Hoverable::new(state, move |_| content)
+            .with_defer_events_to_children()
+            .on_right_click(move |ctx, _, at| {
+                ctx.dispatch_typed_action(Action::ContextOpen(target.clone(), at))
+            })
+            .finish()
+    }
+
     /// Bordered list: rows separated by 1px dividers, no inner padding.
     pub fn list(&self, rows: Vec<El>) -> El {
         let p = self.p();
@@ -250,24 +462,58 @@ impl Companion {
         on_click: Option<Action>,
         on_double: Option<Action>,
     ) -> El {
+        self.list_row_with_menu(id, content, selected, on_click, on_double, None)
+    }
+
+    pub fn list_row_with_menu(
+        &self,
+        id: impl Into<String>,
+        content: El,
+        selected: bool,
+        on_click: Option<Action>,
+        on_double: Option<Action>,
+        menu_target: Option<super::context_menu::Target>,
+    ) -> El {
         let id = id.into();
         let p = self.p();
         let state = self.mouse_state(format!("row:{id}"));
-        let interactive = on_click.is_some() || on_double.is_some();
+        let interactive = on_click.is_some() || on_double.is_some() || menu_target.is_some();
         let mut row = Hoverable::new(state, move |mouse| {
-            let bg = if selected {
-                p.accent_soft
-            } else if interactive && mouse.is_mouse_over_element() {
-                p.hover
+            let t = if interactive {
+                self.hover_t(&mouse)
             } else {
-                p.bg
+                0.0
+            };
+            let clicked = interactive && mouse.is_clicked();
+            let bg = if selected {
+                if clicked {
+                    p.press_color(p.hover)
+                } else {
+                    lerp_color(p.selected, p.hover, t * 0.45)
+                }
+            } else if clicked {
+                p.press_color(p.hover)
+            } else {
+                lerp_color(ColorU::transparent_black(), p.hover, t)
+            };
+            let border = if selected {
+                Border::all(1.).with_border_color(lerp_color(p.border, p.border_strong, 0.65))
+            } else {
+                Border::all(1.).with_border_color(lerp_color(
+                    ColorU::transparent_black(),
+                    p.border,
+                    t * 0.6,
+                ))
             };
             Container::new(content)
                 .with_horizontal_padding(S3)
                 .with_vertical_padding(S2 + 2.)
                 .with_background_color(bg)
+                .with_border(border)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
                 .finish()
-        });
+        })
+        .with_defer_events_to_children();
         if interactive {
             row = row.with_cursor(Cursor::PointingHand);
         }
@@ -276,6 +522,11 @@ impl Companion {
         }
         if let Some(action) = on_double {
             row = row.on_double_click(move |ctx, _, _| ctx.dispatch_typed_action(action.clone()));
+        }
+        if let Some(target) = menu_target {
+            row = row.on_right_click(move |ctx, _, at| {
+                ctx.dispatch_typed_action(Action::ContextOpen(target.clone(), at))
+            });
         }
         let control = row.finish();
         #[cfg(feature = "ui-capture")]
@@ -321,18 +572,12 @@ impl Companion {
 
     pub fn tag(&self, text: impl Into<String>, fg: ColorU) -> El {
         let p = self.p();
-        Container::new(
-            Text::new(text.into(), self.font, MICRO)
-                .with_color(fg)
-                .with_style(Properties::default().weight(Weight::Medium))
-                .soft_wrap(false)
-                .finish(),
-        )
-        .with_horizontal_padding(6.)
-        .with_vertical_padding(2.)
-        .with_background_color(p.tag_bg)
-        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_TAG)))
-        .finish()
+        Container::new(ui_label(text.into(), self.font, MICRO, fg, Weight::Medium))
+            .with_horizontal_padding(6.)
+            .with_vertical_padding(2.)
+            .with_background_color(p.tag_bg)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_TAG)))
+            .finish()
     }
 
     pub fn dot(&self, color: ColorU) -> El {
@@ -405,68 +650,83 @@ impl Companion {
         let state = self.mouse_state(format!("btn:{id}"));
         let font = self.font;
         let control = Hoverable::new(state, move |mouse| {
-            let hovered = mouse.is_mouse_over_element();
-            let (_, border, fg) = match kind {
-                Btn::Primary => {
-                    let c = if hovered { p.accent_hover } else { p.accent };
-                    (c, c, p.on_accent)
-                }
-                Btn::Secondary => (
-                    if hovered { p.hover } else { p.bg },
-                    if hovered { p.border_strong } else { p.border },
-                    p.text,
-                ),
-                Btn::Ghost => (
-                    if hovered {
-                        p.hover
-                    } else {
-                        ColorU::transparent_black()
-                    },
-                    ColorU::transparent_black(),
-                    if hovered { p.text } else { p.text2 },
-                ),
-                Btn::Danger => (
-                    if hovered { p.danger_soft } else { p.bg },
-                    p.border,
-                    p.danger,
-                ),
-                Btn::DangerSolid => (p.danger, p.danger, p.on_accent),
+            let t = self.hover_t(&mouse);
+            let clicked = mouse.is_clicked();
+            let (rest_bg, hover_bg, press_bg, rest_border, hover_border, rest_fg, hover_fg) =
+                match kind {
+                    Btn::Primary => {
+                        let press = lerp_color(p.accent, p.text2, 0.25);
+                        (
+                            p.accent,
+                            p.accent_hover,
+                            press,
+                            p.accent,
+                            p.accent_hover,
+                            p.on_accent,
+                            p.on_accent,
+                        )
+                    }
+                    Btn::Secondary => (
+                        p.bg,
+                        p.hover,
+                        p.press_color(p.hover),
+                        p.border,
+                        p.border_strong,
+                        p.text,
+                        p.text,
+                    ),
+                    Btn::Ghost => (
+                        ColorU::transparent_black(),
+                        p.hover,
+                        p.accent_soft,
+                        ColorU::transparent_black(),
+                        ColorU::transparent_black(),
+                        p.text2,
+                        p.text,
+                    ),
+                    Btn::Danger => (
+                        p.bg,
+                        p.danger_soft,
+                        lerp_color(p.danger_soft, p.danger, 0.22),
+                        p.border,
+                        lerp_color(p.border, p.danger, 0.35),
+                        p.danger,
+                        p.danger,
+                    ),
+                    Btn::DangerSolid => {
+                        let hov = lerp_color(p.danger, ColorU::white(), 0.12);
+                        let press = lerp_color(p.danger, ColorU::black(), 0.16);
+                        (
+                            p.danger,
+                            hov,
+                            press,
+                            p.danger,
+                            hov,
+                            p.on_accent,
+                            p.on_accent,
+                        )
+                    }
+                };
+            let bg = if clicked {
+                press_bg
+            } else {
+                lerp_color(rest_bg, hover_bg, t)
             };
-            let resting = match kind {
-                Btn::Primary => p.accent,
-                Btn::Ghost => ColorU::transparent_black(),
-                Btn::DangerSolid => p.danger,
-                _ => p.bg,
-            };
-            let t = if self.settings.value.reduced_motion {
-                if hovered {
-                    1.
-                } else {
-                    0.
+            let border = if clicked {
+                match kind {
+                    Btn::Primary | Btn::DangerSolid => press_bg,
+                    Btn::Secondary => p.border_strong,
+                    Btn::Ghost => ColorU::transparent_black(),
+                    Btn::Danger => p.danger,
                 }
             } else {
-                mouse.hover_progress()
+                lerp_color(rest_border, hover_border, t)
             };
-            let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t) as u8;
-            let hover_bg = match kind {
-                Btn::Primary => p.accent_hover,
-                Btn::Danger => p.danger_soft,
-                Btn::DangerSolid => p.danger,
-                _ => p.hover,
+            let fg = if clicked && matches!(kind, Btn::Ghost) {
+                p.text
+            } else {
+                lerp_color(rest_fg, hover_fg, t)
             };
-            let mut bg = ColorU::new(
-                mix(resting.r, hover_bg.r),
-                mix(resting.g, hover_bg.g),
-                mix(resting.b, hover_bg.b),
-                mix(resting.a, hover_bg.a),
-            );
-            if mouse.is_clicked() {
-                bg = if matches!(kind, Btn::Primary) {
-                    p.accent_hover
-                } else {
-                    p.accent_soft
-                };
-            }
             Container::new(
                 ConstrainedBox::new(
                     Align::new({
@@ -506,17 +766,13 @@ impl Companion {
         let label = label.into();
         let font = self.font;
         Hoverable::new(state, move |mouse| {
-            ui_label(
-                label.clone(),
-                font,
-                BODY,
-                if mouse.is_mouse_over_element() {
-                    p.accent_hover
-                } else {
-                    p.accent
-                },
-                Weight::Normal,
-            )
+            let t = self.hover_t(&mouse);
+            let fg = if mouse.is_clicked() {
+                p.text2
+            } else {
+                lerp_color(p.accent, p.accent_hover, t)
+            };
+            ui_label(label.clone(), font, BODY, fg, Weight::Normal)
         })
         .with_cursor(Cursor::PointingHand)
         .on_click(move |ctx, _, _| ctx.dispatch_typed_action(action.clone()))
@@ -535,17 +791,13 @@ impl Companion {
         let label = label.into();
         let font = self.font;
         Hoverable::new(state, move |mouse| {
-            ui_label(
-                label.clone(),
-                font,
-                CAPTION,
-                if mouse.is_mouse_over_element() {
-                    p.accent
-                } else {
-                    p.text3
-                },
-                Weight::Normal,
-            )
+            let t = self.hover_t(&mouse);
+            let fg = if mouse.is_clicked() {
+                p.text
+            } else {
+                lerp_color(p.text3, p.accent, t)
+            };
+            ui_label(label.clone(), font, CAPTION, fg, Weight::Normal)
         })
         .with_cursor(Cursor::PointingHand)
         .on_click(move |ctx, _, _| ctx.dispatch_typed_action(action.clone()))
@@ -575,31 +827,48 @@ impl Companion {
             .map(|(i, (label, active, action))| {
                 let state = self.mouse_state(format!("seg:{id}:{i}"));
                 Hoverable::new(state, move |mouse| {
-                    let hovered = mouse.is_mouse_over_element();
-                    let mut c = Container::new(
-                        Text::new(label.clone(), font, BODY)
-                            .with_color(if active || hovered { p.text } else { p.text2 })
-                            .with_style(Properties::default().weight(if active {
-                                Weight::Medium
-                            } else {
-                                Weight::Normal
-                            }))
-                            .soft_wrap(false)
-                            .finish(),
-                    )
+                    let t = self.hover_t(&mouse);
+                    let clicked = mouse.is_clicked();
+                    let bg = if active {
+                        if clicked {
+                            lerp_color(p.bg, p.hover, 0.4)
+                        } else {
+                            p.bg
+                        }
+                    } else if clicked {
+                        p.press_color(p.hover)
+                    } else {
+                        lerp_color(ColorU::transparent_black(), p.hover, t * 0.7)
+                    };
+                    let fg = if active || clicked {
+                        p.text
+                    } else {
+                        lerp_color(p.text2, p.text, t)
+                    };
+                    let border_col = if active {
+                        lerp_color(p.border, p.border_strong, t * 0.6)
+                    } else if clicked {
+                        p.border
+                    } else {
+                        ColorU::transparent_black()
+                    };
+                    Container::new(ui_label(
+                        label.clone(),
+                        font,
+                        BODY,
+                        fg,
+                        if active {
+                            Weight::Medium
+                        } else {
+                            Weight::Normal
+                        },
+                    ))
                     .with_horizontal_padding(S3)
                     .with_vertical_padding(4.)
-                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL - 1.)));
-                    if active {
-                        c = c
-                            .with_background_color(p.bg)
-                            .with_border(Border::all(1.).with_border_color(p.border));
-                    } else {
-                        c = c.with_border(
-                            Border::all(1.).with_border_color(ColorU::transparent_black()),
-                        );
-                    }
-                    c.finish()
+                    .with_background_color(bg)
+                    .with_border(Border::all(1.).with_border_color(border_col))
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL - 1.)))
+                    .finish()
                 })
                 .with_cursor(Cursor::PointingHand)
                 .on_click(move |ctx, _, _| ctx.dispatch_typed_action(action.clone()))
@@ -688,13 +957,11 @@ impl Companion {
         let font = self.font;
         let state = self.mouse_state(format!("input:{index}"));
         let field_box = Hoverable::new(state, move |mouse| {
-            let hovered = mouse.is_mouse_over_element();
+            let t = self.hover_t(&mouse);
             let border = if focused {
                 p.accent
-            } else if hovered {
-                p.border_strong
             } else {
-                p.surface_border
+                lerp_color(p.surface_border, p.border_strong, t)
             };
             Container::new({
                 let text = Text::new(value.clone(), font, BODY)
@@ -743,15 +1010,29 @@ impl Companion {
         let label = label.into();
         let font = self.font;
         Hoverable::new(state, move |mouse| {
-            let hovered = mouse.is_mouse_over_element();
+            let t = self.hover_t(&mouse);
+            let clicked = mouse.is_clicked();
             let box_bg = if checked {
-                p.accent
-            } else if hovered {
-                p.hover
+                if clicked {
+                    lerp_color(p.accent, p.text2, 0.25)
+                } else {
+                    lerp_color(p.accent, p.accent_hover, t)
+                }
+            } else if clicked {
+                p.accent_soft
             } else {
-                p.bg
+                lerp_color(p.bg, p.hover, t)
             };
-            let box_border = if checked { p.accent } else { p.border_strong };
+            let box_border = if checked {
+                box_bg
+            } else {
+                lerp_color(p.border_strong, p.text2, t * 0.5)
+            };
+            let label_fg = if clicked {
+                p.text
+            } else {
+                lerp_color(p.text2, p.text, t)
+            };
             let mark = ConstrainedBox::new(
                 Container::new(
                     Flex::row()
@@ -777,12 +1058,13 @@ impl Companion {
                 .with_spacing(S2)
                 .with_cross_axis_alignment(CrossAxisAlignment::Center)
                 .with_child(mark)
-                .with_child(
-                    Text::new(label.clone(), font, BODY)
-                        .with_color(if hovered { p.text } else { p.text2 })
-                        .soft_wrap(false)
-                        .finish(),
-                )
+                .with_child(ui_label(
+                    label.clone(),
+                    font,
+                    BODY,
+                    label_fg,
+                    Weight::Normal,
+                ))
                 .finish()
         })
         .with_cursor(Cursor::PointingHand)
@@ -806,20 +1088,25 @@ impl Companion {
         let subtitle = subtitle.map(str::to_string);
         let font = self.font;
         Hoverable::new(state, move |mouse| {
-            let hovered = mouse.is_mouse_over_element();
+            let t = self.hover_t(&mouse);
+            let clicked = mouse.is_clicked();
             let bg = if active {
+                if clicked {
+                    lerp_color(p.accent_soft, p.hover, 0.6)
+                } else {
+                    p.accent_soft
+                }
+            } else if clicked {
                 p.accent_soft
-            } else if hovered {
-                p.hover
             } else {
-                p.surface
+                lerp_color(p.surface, p.hover, t)
             };
             let border = if active {
                 p.accent
-            } else if hovered {
+            } else if clicked {
                 p.border_strong
             } else {
-                p.border
+                lerp_color(p.border, p.border_strong, t)
             };
             let mut col = vec![
                 ui_label(
@@ -864,13 +1151,30 @@ impl Companion {
     }
 
     pub fn pill_badge(&self, text: impl Into<String>, fg: ColorU, bg: ColorU) -> El {
-        Container::new(
-            Text::new(text.into(), self.font, MICRO)
-                .with_color(fg)
-                .with_style(Properties::default().weight(Weight::Medium))
-                .soft_wrap(false)
-                .finish(),
-        )
+        Container::new(ui_label(text.into(), self.font, MICRO, fg, Weight::Medium))
+            .with_horizontal_padding(8.)
+            .with_vertical_padding(2.)
+            .with_background_color(bg)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(9.)))
+            .finish()
+    }
+
+    pub fn pill_badge_icon(
+        &self,
+        text: impl Into<String>,
+        icon: UiIcon,
+        fg: ColorU,
+        bg: ColorU,
+    ) -> El {
+        let label = text.into();
+        Container::new(icon_label(
+            icon,
+            &label,
+            self.font,
+            MICRO,
+            fg,
+            Weight::Medium,
+        ))
         .with_horizontal_padding(8.)
         .with_vertical_padding(2.)
         .with_background_color(bg)
@@ -885,6 +1189,58 @@ impl Companion {
         action: Action,
     ) -> El {
         self.link(id, label, action)
+    }
+
+    pub fn link_icon(
+        &self,
+        id: impl Into<String>,
+        label: impl Into<String>,
+        icon: UiIcon,
+        action: Action,
+    ) -> El {
+        let p = self.p();
+        let state = self.mouse_state(format!("link:{}", id.into()));
+        let label = label.into();
+        let font = self.font;
+        Hoverable::new(state, move |mouse| {
+            let t = self.hover_t(&mouse);
+            let fg = if mouse.is_clicked() {
+                p.text2
+            } else {
+                lerp_color(p.accent, p.accent_hover, t)
+            };
+            icon_label(icon, &label, font, BODY, fg, Weight::Normal)
+        })
+        .with_cursor(Cursor::PointingHand)
+        .on_click(move |ctx, _, _| ctx.dispatch_typed_action(action.clone()))
+        .finish()
+    }
+
+    pub fn ui_icon_box(
+        &self,
+        icon: UiIcon,
+        size: f32,
+        bg: ColorU,
+        fg: ColorU,
+        border: Option<ColorU>,
+    ) -> El {
+        let mut c = Container::new(
+            Flex::row()
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_main_axis_alignment(MainAxisAlignment::Center)
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_child(self.ui_icon(icon, 18., fg))
+                .finish(),
+        )
+        .with_background_color(bg)
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)));
+        if let Some(b) = border {
+            c = c.with_border(Border::all(1.).with_border_color(b));
+        }
+        ConstrainedBox::new(c.finish())
+            .with_width(size)
+            .with_height(size)
+            .finish()
     }
 
     pub fn icon_box(
@@ -991,31 +1347,579 @@ impl Companion {
         .with_width(738. * scale)
         .with_height(1660. * scale)
         .finish();
-        Stack::new()
-            .with_child(
-                ConstrainedBox::new(Rect::new().finish())
-                    .with_width(w)
-                    .with_height(h)
+        ConstrainedBox::new(
+            Stack::new()
+                .with_child(
+                    ConstrainedBox::new(Empty::new().finish())
+                        .with_width(w)
+                        .with_height(h)
+                        .finish(),
+                )
+                .with_positioned_child(
+                    screen,
+                    OffsetPositioning::offset_from_parent(
+                        pathfinder_geometry::vector::vec2f(64. * scale, 80. * scale),
+                        ParentOffsetBounds::Unbounded,
+                        ParentAnchor::TopLeft,
+                        ChildAnchor::TopLeft,
+                    ),
+                )
+                .with_positioned_child(
+                    self.phone_art("neo_front_frame.png", w, h),
+                    OffsetPositioning::offset_from_parent(
+                        pathfinder_geometry::vector::vec2f(0., 0.),
+                        ParentOffsetBounds::Unbounded,
+                        ParentAnchor::TopLeft,
+                        ChildAnchor::TopLeft,
+                    ),
+                )
+                .finish(),
+        )
+        .with_width(w)
+        .with_height(h)
+        .finish()
+    }
+
+    /// Unified interactive phone studio unit: combines the live phone screen (with direct
+    /// click-to-tap touch grid), an attached right-side hardware button rail, and an attached
+    /// bottom Android navigation bar into a single cohesive physical unit.
+    pub fn interactive_phone_bezel(
+        &self,
+        id_prefix: &str,
+        width: f32,
+        height: f32,
+        custom_shot: Option<&std::path::Path>,
+    ) -> El {
+        let p = self.p();
+        let font = self.font;
+        let scale = (width / 866.).min(height / 1817.);
+        let w = 866. * scale;
+        let h = 1817. * scale;
+        let sw = 738. * scale;
+        let sh = 1660. * scale;
+        let cell_w = sw / 5.;
+        let cell_h = sh / 9.;
+
+        let shot_path = custom_shot.or_else(|| self.screenshot.as_ref().map(|(_, p)| p.as_path()));
+        let source = if let Some(path) = shot_path {
+            facloud_ui::assets::asset_cache::AssetSource::LocalFile {
+                path: path.to_string_lossy().into_owned(),
+            }
+        } else {
+            facloud_ui::assets::asset_cache::AssetSource::Bundled {
+                path: "stepx_home_screen.png",
+            }
+        };
+
+        let screen = ConstrainedBox::new(
+            Image::new(source, CacheOption::BySize)
+                .cover()
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(77. * scale)))
+                .finish(),
+        )
+        .with_width(sw)
+        .with_height(sh)
+        .finish();
+
+        // 5-col x 9-row interactive touch matrix over the phone screen area
+        let mut grid_rows = Vec::with_capacity(9);
+        for row in 0..9u16 {
+            let mut row_cells = Vec::with_capacity(5);
+            let norm_y = row * 111 + 56;
+            for col in 0..5u16 {
+                let norm_x = col * 200 + 100;
+                let cell_id = format!("{id_prefix}-tap-{col}-{row}");
+                let state = self.mouse_state(&cell_id);
+                let cell = Hoverable::new(state, move |mouse| {
+                    let hovered = mouse.is_mouse_over_element();
+                    let clicked = mouse.is_clicked();
+                    let bg = if clicked {
+                        ColorU::new(p.accent.r, p.accent.g, p.accent.b, 58)
+                    } else if hovered {
+                        ColorU::new(p.accent.r, p.accent.g, p.accent.b, 28)
+                    } else {
+                        ColorU::transparent_black()
+                    };
+                    let mut c = Container::new(Empty::new().finish())
+                        .with_background_color(bg)
+                        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)));
+                    if hovered || clicked {
+                        c = c.with_border(Border::all(1.).with_border_color(ColorU::new(
+                            p.accent.r, p.accent.g, p.accent.b, 92,
+                        )));
+                    }
+                    ConstrainedBox::new(c.finish())
+                        .with_width(cell_w)
+                        .with_height(cell_h)
+                        .finish()
+                })
+                .with_cursor(Cursor::PointingHand)
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(Action::ScreenTapNormalized(norm_x, norm_y));
+                })
+                .on_double_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(Action::Mirror);
+                })
+                .on_right_click(move |ctx, _, at| {
+                    ctx.dispatch_typed_action(Action::ContextOpen(
+                        crate::ui::context_menu::Target::OverviewCard(
+                            crate::ui::context_menu::OverviewContextKind::ScreenPreview,
+                        ),
+                        at,
+                    ));
+                })
+                .finish();
+                #[cfg(feature = "ui-capture")]
+                let cell = super::scenario_check::control(cell_id, cell);
+                row_cells.push(cell);
+            }
+            let r = Flex::row()
+                .with_main_axis_size(MainAxisSize::Min)
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_children(row_cells)
+                .finish();
+            grid_rows.push(r);
+        }
+
+        let touch_overlay = ConstrainedBox::new(
+            Flex::column()
+                .with_main_axis_size(MainAxisSize::Min)
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_children(grid_rows)
+                .finish(),
+        )
+        .with_width(sw)
+        .with_height(sh)
+        .finish();
+
+        let phone_chassis = ConstrainedBox::new(
+            Stack::new()
+                .with_child(
+                    ConstrainedBox::new(Empty::new().finish())
+                        .with_width(w)
+                        .with_height(h)
+                        .finish(),
+                )
+                .with_positioned_child(
+                    screen,
+                    OffsetPositioning::offset_from_parent(
+                        pathfinder_geometry::vector::vec2f(64. * scale, 80. * scale),
+                        ParentOffsetBounds::Unbounded,
+                        ParentAnchor::TopLeft,
+                        ChildAnchor::TopLeft,
+                    ),
+                )
+                .with_positioned_child(
+                    self.phone_art("neo_front_frame.png", w, h),
+                    OffsetPositioning::offset_from_parent(
+                        pathfinder_geometry::vector::vec2f(0., 0.),
+                        ParentOffsetBounds::Unbounded,
+                        ParentAnchor::TopLeft,
+                        ChildAnchor::TopLeft,
+                    ),
+                )
+                .with_positioned_child(
+                    touch_overlay,
+                    OffsetPositioning::offset_from_parent(
+                        pathfinder_geometry::vector::vec2f(64. * scale, 80. * scale),
+                        ParentOffsetBounds::Unbounded,
+                        ParentAnchor::TopLeft,
+                        ChildAnchor::TopLeft,
+                    ),
+                )
+                .finish(),
+        )
+        .with_width(w)
+        .with_height(h)
+        .finish();
+
+        // Attached right-side hardware control rail (docked flush against the right edge of the phone)
+        let rail_specs = [
+            ("wake", UiIcon::Sun, "亮屏", Action::Key(224)),
+            ("lock", UiIcon::Lock, "锁屏", Action::Key(223)),
+            ("vol-up", UiIcon::Plus, "音量+", Action::Key(24)),
+            ("vol-down", UiIcon::Minus, "音量-", Action::Key(25)),
+            ("mute", UiIcon::Mute, "静音", Action::Key(164)),
+            (
+                "swipe-up",
+                UiIcon::ArrowUp,
+                "上滑",
+                Action::ScreenGesture(0),
+            ),
+            (
+                "swipe-down",
+                UiIcon::ArrowDown,
+                "下滑",
+                Action::ScreenGesture(1),
+            ),
+            ("notif", UiIcon::Bell, "通知", Action::ScreenGesture(4)),
+            ("shot", UiIcon::Camera, "截屏", Action::Screenshot),
+        ];
+
+        let mut rail_buttons = Vec::with_capacity(rail_specs.len());
+        for (suffix, icon, label, action) in rail_specs {
+            let btn_id = format!("{id_prefix}-rail-{suffix}");
+            let state = self.mouse_state(&btn_id);
+            let lbl = label.to_string();
+            let btn = Hoverable::new(state, move |mouse| {
+                let t = self.hover_t(&mouse);
+                let clicked = mouse.is_clicked();
+                let bg = if clicked {
+                    p.accent_soft
+                } else {
+                    lerp_color(p.bg, p.hover, t)
+                };
+                let fg = if clicked {
+                    p.accent
+                } else {
+                    lerp_color(p.text2, p.text, t)
+                };
+                let border = if clicked {
+                    p.accent
+                } else {
+                    lerp_color(p.border, p.border_strong, t)
+                };
+                Container::new(
+                    Flex::row()
+                        .with_main_axis_size(MainAxisSize::Min)
+                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                        .with_spacing(4.)
+                        .with_child(icons::draw_icon(icon, 12., fg))
+                        .with_child(ui_label(lbl.clone(), font, 10.5, fg, Weight::Medium))
+                        .finish(),
+                )
+                .with_horizontal_padding(6.)
+                .with_vertical_padding(4.)
+                .with_background_color(bg)
+                .with_border(Border::all(1.).with_border_color(border))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+                .finish()
+            })
+            .with_cursor(Cursor::PointingHand)
+            .on_click(move |ctx, _, _| ctx.dispatch_typed_action(action.clone()))
+            .finish();
+            #[cfg(feature = "ui-capture")]
+            let btn = super::scenario_check::control(btn_id, btn);
+            rail_buttons.push(btn);
+        }
+
+        let side_rail = Container::new(
+            Flex::column()
+                .with_main_axis_size(MainAxisSize::Min)
+                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                .with_spacing(4.)
+                .with_children(rail_buttons)
+                .finish(),
+        )
+        .with_uniform_padding(4.)
+        .with_background_color(p.surface)
+        .with_border(Border::all(1.).with_border_color(p.border))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(10.)))
+        .finish();
+
+        // Attached bottom Android navigation bar (flush underneath the phone unit)
+        let nav_specs = [
+            ("back", UiIcon::ArrowLeft, "◁ 返回", Action::Key(4)),
+            ("home", UiIcon::Home, "● 主页", Action::Key(3)),
+            ("recents", UiIcon::Apps, "▣ 多任务", Action::Key(187)),
+        ];
+        let mut nav_buttons = Vec::with_capacity(nav_specs.len());
+        for (suffix, icon, label, action) in nav_specs {
+            let btn_id = format!("{id_prefix}-nav-{suffix}");
+            let state = self.mouse_state(&btn_id);
+            let lbl = label.to_string();
+            let btn = Hoverable::new(state, move |mouse| {
+                let t = self.hover_t(&mouse);
+                let clicked = mouse.is_clicked();
+                let bg = if clicked {
+                    p.accent_soft
+                } else {
+                    lerp_color(p.bg, p.hover, t)
+                };
+                let fg = if clicked {
+                    p.accent
+                } else {
+                    lerp_color(p.text2, p.text, t)
+                };
+                let border = if clicked {
+                    p.accent
+                } else {
+                    lerp_color(p.border, p.border_strong, t)
+                };
+                Container::new(
+                    Align::new(
+                        Flex::row()
+                            .with_main_axis_size(MainAxisSize::Min)
+                            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                            .with_spacing(4.)
+                            .with_child(icons::draw_icon(icon, 12., fg))
+                            .with_child(ui_label(lbl.clone(), font, 11., fg, Weight::Medium))
+                            .finish(),
+                    )
+                    .finish(),
+                )
+                .with_horizontal_padding(6.)
+                .with_vertical_padding(5.)
+                .with_background_color(bg)
+                .with_border(Border::all(1.).with_border_color(border))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
+                .finish()
+            })
+            .with_cursor(Cursor::PointingHand)
+            .on_click(move |ctx, _, _| ctx.dispatch_typed_action(action.clone()))
+            .finish();
+            #[cfg(feature = "ui-capture")]
+            let btn = super::scenario_check::control(btn_id, btn);
+            nav_buttons.push(Expanded::new(1., btn).finish());
+        }
+
+        let total_unit_width = w + 6. + 66.;
+        let bottom_nav = ConstrainedBox::new(
+            Container::new(
+                Flex::row()
+                    .with_main_axis_size(MainAxisSize::Max)
+                    .with_spacing(4.)
+                    .with_children(nav_buttons)
                     .finish(),
             )
-            .with_positioned_child(
-                screen,
-                OffsetPositioning::offset_from_parent(
-                    pathfinder_geometry::vector::vec2f(64. * scale, 80. * scale),
-                    ParentOffsetBounds::Unbounded,
-                    ParentAnchor::TopLeft,
-                    ChildAnchor::TopLeft,
-                ),
-            )
-            .with_positioned_child(
-                self.phone_art("neo_front_frame.png", w, h),
-                OffsetPositioning::offset_from_parent(
-                    pathfinder_geometry::vector::vec2f(0., 0.),
-                    ParentOffsetBounds::Unbounded,
-                    ParentAnchor::TopLeft,
-                    ChildAnchor::TopLeft,
-                ),
-            )
+            .with_uniform_padding(4.)
+            .with_background_color(p.surface)
+            .with_border(Border::all(1.).with_border_color(p.border))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(10.)))
+            .finish(),
+        )
+        .with_width(total_unit_width)
+        .finish();
+
+        let top_unit = Flex::row()
+            .with_main_axis_size(MainAxisSize::Min)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(6.)
+            .with_child(phone_chassis)
+            .with_child(side_rail)
+            .finish();
+
+        Flex::column()
+            .with_main_axis_size(MainAxisSize::Min)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(6.)
+            .with_child(top_unit)
+            .with_child(bottom_nav)
             .finish()
     }
+
+    // ---- Conversation helpers (chat-first Amoo) ----
+
+    /// Small rounded chip. Every action runs in order on click, so a chip in
+    /// a small menu can close the menu and perform the choice in one tap.
+    /// `active` highlights the chip; `muted` renders it as a quiet hint.
+    pub fn chip(
+        &self,
+        id: impl Into<String>,
+        label: impl Into<String>,
+        icon: Option<UiIcon>,
+        actions: Vec<Action>,
+        active: bool,
+        muted: bool,
+    ) -> El {
+        let id = id.into();
+        let p = self.p();
+        let label = label.into();
+        let font = self.font;
+        let control = Hoverable::new(self.mouse_state(format!("chip:{id}")), move |mouse| {
+            let t = self.hover_t(&mouse);
+            let clicked = mouse.is_clicked();
+            let rest_fg = if muted { p.text3 } else { p.text2 };
+            let fg = if active {
+                p.accent
+            } else if clicked {
+                p.text
+            } else {
+                lerp_color(rest_fg, p.text, t)
+            };
+            let bg = if active {
+                if clicked {
+                    p.press_color(p.hover)
+                } else {
+                    lerp_color(p.accent_soft, p.hover, t * 0.6)
+                }
+            } else if clicked {
+                p.press_color(p.hover)
+            } else {
+                lerp_color(p.bg, p.hover, t)
+            };
+            let border = if active {
+                Border::all(1.).with_border_color(lerp_color(p.accent, p.accent_hover, t))
+            } else if clicked {
+                Border::all(1.).with_border_color(p.border_strong)
+            } else {
+                Border::all(1.).with_border_color(lerp_color(p.border, p.border_strong, t))
+            };
+            let content = match icon {
+                Some(icon) => icon_label(icon, &label, font, CAPTION, fg, Weight::Medium),
+                None => ui_label(label.clone(), font, CAPTION, fg, Weight::Medium),
+            };
+            Container::new(
+                ConstrainedBox::new(Align::new(content).finish())
+                    .with_height(24.)
+                    .finish(),
+            )
+            .with_horizontal_padding(S2 + 2.)
+            .with_background_color(bg)
+            .with_border(border)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(12.)))
+            .finish()
+        })
+        .with_cursor(Cursor::PointingHand)
+        .on_click(move |ctx, _, _| {
+            for action in &actions {
+                ctx.dispatch_typed_action(action.clone());
+            }
+        })
+        .finish();
+        #[cfg(feature = "ui-capture")]
+        let control = super::scenario_check::control(id, control);
+        control
+    }
+
+    /// Icon-only button with a hover tooltip. Runs every action in order.
+    pub fn icon_action(
+        &self,
+        id: impl Into<String>,
+        tooltip: impl Into<String>,
+        icon: UiIcon,
+        actions: Vec<Action>,
+        active: bool,
+    ) -> El {
+        let id = id.into();
+        let p = self.p();
+        let tooltip = tooltip.into();
+        let control = Hoverable::new(self.mouse_state(format!("iconact:{id}")), move |mouse| {
+            let hovered = mouse.is_mouse_over_element();
+            let t = self.hover_t(&mouse);
+            let clicked = mouse.is_clicked();
+            let bg = if active {
+                if clicked {
+                    p.press_color(p.hover)
+                } else {
+                    lerp_color(p.accent_soft, p.hover, t * 0.55)
+                }
+            } else if clicked {
+                p.press_color(p.hover)
+            } else {
+                lerp_color(ColorU::transparent_black(), p.hover, t)
+            };
+            let fg = if active {
+                p.accent
+            } else if clicked {
+                p.text
+            } else {
+                lerp_color(p.text2, p.text, t)
+            };
+            let button = ConstrainedBox::new(
+                Container::new(Align::new(self.ui_icon(icon, 16., fg)).finish())
+                    .with_background_color(bg)
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
+                    .finish(),
+            )
+            .with_width(30.)
+            .with_height(30.)
+            .finish();
+            if !hovered || tooltip.is_empty() {
+                return button;
+            }
+            let tip = Container::new(self.line(tooltip.clone(), MICRO, p.text))
+                .with_horizontal_padding(S2)
+                .with_vertical_padding(S1)
+                .with_background_color(p.bg)
+                .with_border(Border::all(1.).with_border_color(p.border))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
+                .finish();
+            Stack::new()
+                .with_child(button)
+                .with_positioned_child(
+                    tip,
+                    OffsetPositioning::offset_from_parent(
+                        pathfinder_geometry::vector::vec2f(0., S1),
+                        ParentOffsetBounds::WindowByPosition,
+                        ParentAnchor::BottomMiddle,
+                        ChildAnchor::TopMiddle,
+                    ),
+                )
+                .finish()
+        })
+        .with_cursor(Cursor::PointingHand)
+        .on_click(move |ctx, _, _| {
+            for action in &actions {
+                ctx.dispatch_typed_action(action.clone());
+            }
+        })
+        .finish();
+        #[cfg(feature = "ui-capture")]
+        let control = super::scenario_check::control(id, control);
+        control
+    }
+
+    /// Compact inline step indicator: done (check), active (filled dot),
+    /// pending (hollow dot) and failed (cross), each with a plain label.
+    pub fn stepper(&self, steps: Vec<(String, StepMark)>) -> El {
+        let p = self.p();
+        let dot = |fill: Option<ColorU>, ring: ColorU| -> El {
+            let mut c = Container::new(
+                ConstrainedBox::new(Empty::new().finish())
+                    .with_width(8.)
+                    .with_height(8.)
+                    .finish(),
+            )
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+            .with_border(Border::all(1.).with_border_color(ring));
+            if let Some(fill) = fill {
+                c = c.with_background_color(fill);
+            }
+            c.finish()
+        };
+        let mut items = Vec::new();
+        for (i, (label, mark)) in steps.into_iter().enumerate() {
+            if i > 0 {
+                items.push(
+                    ConstrainedBox::new(Rect::new().with_background_color(p.border).finish())
+                        .with_width(14.)
+                        .with_height(1.)
+                        .finish(),
+                );
+            }
+            let (marker, fg, weight) = match mark {
+                StepMark::Done => (
+                    self.ui_icon(UiIcon::Check, 12., p.success),
+                    p.text2,
+                    Weight::Normal,
+                ),
+                StepMark::Active => {
+                    let pulse = self.pulse_t();
+                    let fill = lerp_color(p.accent_soft, p.accent, pulse);
+                    (dot(Some(fill), p.accent), p.text, Weight::Semibold)
+                }
+                StepMark::Pending => (dot(None, p.text3), p.text3, Weight::Normal),
+                StepMark::Failed => (
+                    self.ui_icon(UiIcon::Close, 12., p.warning),
+                    p.warning,
+                    Weight::Normal,
+                ),
+            };
+            items.push(self.hstack(
+                S1 + 2.,
+                vec![marker, self.line_w(label, CAPTION, fg, weight)],
+            ));
+        }
+        self.wrap(items)
+    }
+}
+
+/// State of one item in [`Companion::stepper`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepMark {
+    Pending,
+    Active,
+    Done,
+    Failed,
 }

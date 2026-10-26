@@ -359,6 +359,8 @@ impl Keyboard {
                 let typing = self.active;
                 match k.key.as_str() {
                     "1" if cmd => Some(Action::Page(Page::Overview)),
+                    // Ctrl+2 始终打开唯一的 AI 入口「Amoo 对话」；文件处理（Page::Work）
+                    // 与「我的作品」（Page::Studio）是次要入口，不分配数字快捷键。
                     "2" if cmd => Some(Action::Page(Page::Amoo)),
                     "3" if cmd => Some(Action::Page(Page::Sms)),
                     "4" if cmd => Some(Action::Page(Page::Files)),
@@ -383,6 +385,8 @@ impl Keyboard {
                     "enter" | "return" => Some(Action::ActivateSelectedFile),
                     "up" if !typing => Some(Action::MoveFileSelection(-1)),
                     "down" if !typing => Some(Action::MoveFileSelection(1)),
+                    "left" if !typing => Some(Action::MoveHorizontalSelection(-1)),
+                    "right" if !typing => Some(Action::MoveHorizontalSelection(1)),
                     "backspace" if !typing => Some(Action::ParentDirectory),
                     "delete" if !typing => Some(Action::Trash),
                     "f2" if !typing => Some(Action::OpenRename),

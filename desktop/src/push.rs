@@ -105,9 +105,6 @@ impl ImChannel {
             "com.xingin.xhs"
             | "com.ss.android.ugc.aweme"
             | "com.taobao.idlefish"
-            | "com.taobao.taobao"
-            | "com.jingdong.app.mall"
-            | "com.xunmeng.pinduoduo"
             | "com.sina.weibo"
             | "tv.danmaku.bili"
             | "com.zhihu.android" => Self::SocialDm,
@@ -138,9 +135,6 @@ impl ImChannel {
                 } else if lower.contains("xhs")
                     || lower.contains("aweme")
                     || lower.contains("idlefish")
-                    || lower.contains("taobao")
-                    || lower.contains("jingdong")
-                    || lower.contains("pinduoduo")
                     || lower.contains("weibo")
                 {
                     Self::SocialDm
@@ -152,6 +146,9 @@ impl ImChannel {
     }
 
     pub fn matches_package(self, pkg: &str) -> bool {
+        if is_excluded_im_package(pkg) {
+            return false;
+        }
         if self == Self::All {
             return true;
         }
@@ -285,7 +282,24 @@ impl ImMessage {
 }
 
 /// Preserve local sends across snapshots, replacing them by correlated phone records.
+/// When the phone reports `unchanged == true` for a delta poll (`since_revision > 0`),
+/// preserve the previous threads, notifications, and OTP banners while keeping updated device state.
 pub fn merge_local_replies(next: &mut PushSnapshot, previous: &PushSnapshot) {
+    if next.unchanged {
+        if next.revision == 0 {
+            next.revision = previous.revision;
+        }
+        if next.threads.is_empty() {
+            next.threads = previous.threads.clone();
+        }
+        if next.notifications.is_empty() {
+            next.notifications = previous.notifications.clone();
+        }
+        if next.otp_banners.is_empty() {
+            next.otp_banners = previous.otp_banners.clone();
+        }
+        next.unchanged = false;
+    }
     for old in &previous.threads {
         let pending: Vec<_> = old
             .messages
@@ -352,7 +366,11 @@ impl ImThread {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PushNotification {
     pub key: String,
@@ -372,8 +390,12 @@ pub struct PushNotification {
     pub post_time_ms: i64,
     #[serde(alias = "isOngoing", alias = "ongoing")]
     pub is_ongoing: bool,
-    #[serde(alias = "isClearable", alias = "clearable", alias = "active")]
+    #[serde(default, alias = "clearable", alias = "isClearable")]
     pub is_clearable: bool,
+    #[serde(default = "default_true")]
+    pub active: bool,
+    #[serde(default, alias = "removedTimeMs")]
+    pub removed_time_ms: i64,
     #[serde(alias = "isGroup", alias = "group")]
     pub is_group: bool,
     pub dismissed: bool,
@@ -388,6 +410,35 @@ pub struct PushNotification {
     pub action_labels: Vec<String>,
     #[serde(alias = "urlHint")]
     pub url_hint: Option<String>,
+}
+
+impl Default for PushNotification {
+    fn default() -> Self {
+        Self {
+            key: String::new(),
+            seq_id: 0,
+            package_name: String::new(),
+            app_name: String::new(),
+            category: String::new(),
+            title: String::new(),
+            sender: String::new(),
+            text: String::new(),
+            sub_text: String::new(),
+            post_time_ms: 0,
+            is_ongoing: false,
+            is_clearable: false,
+            active: true,
+            removed_time_ms: 0,
+            is_group: false,
+            dismissed: false,
+            read: false,
+            can_reply: false,
+            thread_id: String::new(),
+            otp_code: None,
+            action_labels: Vec::new(),
+            url_hint: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -409,6 +460,7 @@ pub struct OtpBanner {
 #[serde(default)]
 pub struct PushSnapshot {
     pub revision: u64,
+    pub unchanged: bool,
     #[serde(alias = "listenerConnected")]
     pub listener_connected: bool,
     #[serde(alias = "accessibilityConnected")]
@@ -444,9 +496,11 @@ pub struct ReplyReceipt {
     pub timestamp_ms: i64,
 }
 
+const SOCKET_MISS_TTL: Duration = Duration::from_secs(15);
+
 #[derive(Clone, Copy, Debug)]
 struct ForwardCacheEntry {
-    port: u16,
+    port: Option<u16>,
     updated_at: Instant,
 }
 
@@ -461,13 +515,40 @@ fn invalidate_cached_port(serial: &str) {
     }
 }
 
-fn obtain_forwarded_port(adb: &Adb, serial: &str, force_refresh: bool) -> Result<u16> {
+fn mark_socket_unavailable(serial: &str) {
+    if let Ok(mut guard) = forward_cache().lock() {
+        guard.insert(
+            serial.to_string(),
+            ForwardCacheEntry {
+                port: None,
+                updated_at: Instant::now(),
+            },
+        );
+    }
+}
+
+fn is_socket_recently_unavailable(serial: &str, now: Instant) -> bool {
+    if let Ok(guard) = forward_cache().lock() {
+        if let Some(entry) = guard.get(serial) {
+            if entry.port.is_none()
+                && now.saturating_duration_since(entry.updated_at) < SOCKET_MISS_TTL
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn obtain_forwarded_port(adb: &Adb, serial: &str, force_refresh: bool) -> Result<(u16, bool)> {
     if !force_refresh {
         if let Ok(guard) = forward_cache().lock() {
             if let Some(entry) = guard.get(serial) {
-                // Re-establish forward if the laptop likely slept or the port is older than 5 minutes.
-                if entry.updated_at.elapsed() <= Duration::from_secs(300) {
-                    return Ok(entry.port);
+                if let Some(port) = entry.port {
+                    // Re-establish forward if the laptop likely slept or the port is older than 5 minutes.
+                    if entry.updated_at.elapsed() <= Duration::from_secs(300) {
+                        return Ok((port, true));
+                    }
                 }
             }
         }
@@ -486,25 +567,28 @@ fn obtain_forwarded_port(adb: &Adb, serial: &str, force_refresh: bool) -> Result
         guard.insert(
             serial.to_string(),
             ForwardCacheEntry {
-                port,
+                port: Some(port),
                 updated_at: Instant::now(),
             },
         );
     }
-    Ok(port)
+    Ok((port, false))
 }
 
 fn try_call_local_socket(adb: &Adb, serial: &str, request: &Value) -> Result<Value> {
+    if is_socket_recently_unavailable(serial, Instant::now()) {
+        anyhow::bail!("本地推送流连接不可用（冷却期内直接回退）");
+    }
     let mut payload = serde_json::to_vec(request)?;
     ensure!(payload.len() <= 32768, "推送请求过长");
     payload.push(b'\n');
 
     for attempt in 0..2 {
         let force_refresh = attempt > 0;
-        let port = match obtain_forwarded_port(adb, serial, force_refresh) {
-            Ok(p) => p,
+        let (port, from_cache) = match obtain_forwarded_port(adb, serial, force_refresh) {
+            Ok(res) => res,
             Err(e) => {
-                invalidate_cached_port(serial);
+                mark_socket_unavailable(serial);
                 return Err(e);
             }
         };
@@ -536,6 +620,7 @@ fn try_call_local_socket(adb: &Adb, serial: &str, request: &Value) -> Result<Val
             Ok(val) => {
                 if let Ok(mut guard) = forward_cache().lock() {
                     if let Some(entry) = guard.get_mut(serial) {
+                        entry.port = Some(port);
                         entry.updated_at = Instant::now();
                     }
                 }
@@ -547,10 +632,11 @@ fn try_call_local_socket(adb: &Adb, serial: &str, request: &Value) -> Result<Val
                 return Ok(val);
             }
             Err(err) => {
-                invalidate_cached_port(serial);
-                if attempt == 1 {
+                if !from_cache || attempt == 1 {
+                    mark_socket_unavailable(serial);
                     return Err(err);
                 }
+                invalidate_cached_port(serial);
             }
         }
     }
@@ -565,7 +651,7 @@ fn try_call_local_socket(adb: &Adb, serial: &str, request: &Value) -> Result<Val
 fn replay_safe(request: &Value) -> bool {
     matches!(
         request["op"].as_str(),
-        Some("snapshot" | "status" | "ping" | "thread_detail")
+        Some("snapshot" | "status" | "ping" | "thread_detail" | "sync_window")
     )
 }
 
@@ -619,25 +705,15 @@ pub fn call_push_provider(adb: &Adb, serial: &str, request: Value) -> Result<Val
 
 /// Ensures `PushNotificationService` is granted notification listener access on the phone.
 pub fn ensure_notification_listener(adb: &Adb, serial: &str) -> Result<bool> {
-    let _ = adb.shell(
-        serial,
-        &["cmd", "notification", "allow_listener", LISTENER_COMPONENT],
-    );
-
-    let current = adb
-        .shell(
+    let mut enabled = adb
+        .script(
             serial,
-            &[
-                "settings",
-                "--user",
-                "0",
-                "get",
-                "secure",
-                "enabled_notification_listeners",
-            ],
+            &format!(
+                "cmd notification allow_listener {LISTENER_COMPONENT} >/dev/null 2>&1 || true; settings --user 0 get secure enabled_notification_listeners"
+            ),
         )
         .unwrap_or_default();
-    let mut listeners: Vec<&str> = current
+    let mut listeners: Vec<&str> = enabled
         .trim()
         .split(':')
         .filter(|s| !s.is_empty() && *s != "null")
@@ -645,18 +721,23 @@ pub fn ensure_notification_listener(adb: &Adb, serial: &str) -> Result<bool> {
     if !listeners.contains(&LISTENER_COMPONENT) {
         listeners.push(LISTENER_COMPONENT);
         let joined = listeners.join(":");
-        let _ = adb.shell(
-            serial,
-            &[
-                "settings",
-                "--user",
-                "0",
-                "put",
-                "secure",
-                "enabled_notification_listeners",
-                &joined,
-            ],
-        );
+        if adb
+            .shell(
+                serial,
+                &[
+                    "settings",
+                    "--user",
+                    "0",
+                    "put",
+                    "secure",
+                    "enabled_notification_listeners",
+                    &joined,
+                ],
+            )
+            .is_ok()
+        {
+            enabled = joined;
+        }
     }
 
     if let Ok(status) = call_push_provider(adb, serial, json!({ "op": "status" })) {
@@ -670,38 +751,101 @@ pub fn ensure_notification_listener(adb: &Adb, serial: &str) -> Result<bool> {
         return Ok(true);
     }
 
-    let verify = adb
-        .shell(
-            serial,
-            &[
-                "settings",
-                "--user",
-                "0",
-                "get",
-                "secure",
-                "enabled_notification_listeners",
-            ],
-        )
-        .unwrap_or_default();
-    Ok(verify.contains(LISTENER_COMPONENT))
+    Ok(enabled.contains(LISTENER_COMPONENT))
+}
+
+pub fn is_excluded_im_package(pkg: &str) -> bool {
+    let trimmed = pkg.trim();
+    matches!(
+        trimmed,
+        "com.android.shell"
+            | "android"
+            | "com.android.systemui"
+            | "com.android.settings"
+            | "com.android.vending"
+            | "com.android.launcher3"
+            | "com.stepos.ailauncher"
+            | "com.stepx.companion"
+            | "com.stepx.companion.app"
+            | "com.jingdong.app.mall"
+            | "com.taobao.taobao"
+            | "com.xunmeng.pinduoduo"
+            | "com.sankuai.meituan"
+    ) || trimmed.to_ascii_lowercase().contains("launcher")
 }
 
 fn is_non_im_system_package(package_name: &str) -> bool {
-    let pkg = package_name.trim().to_ascii_lowercase();
-    pkg.contains("launcher")
-        || pkg == "com.android.systemui"
-        || pkg == "com.android.settings"
-        || pkg == "android"
-        || pkg == "com.stepx.companion"
+    is_excluded_im_package(package_name)
+}
+
+pub fn should_hide_notification(n: &PushNotification) -> bool {
+    if !n.active || n.removed_time_ms > 0 {
+        return true;
+    }
+    let pkg = n.package_name.trim();
+    if pkg == "com.android.shell"
+        || n.key.contains("stepx_e2e_test")
+        || n.key.contains("stepx_test_tag")
+    {
+        return true;
+    }
+    let title = n.title.trim();
+    let text = n.text.trim();
+    let sub_text = n.sub_text.trim();
+    if title.is_empty() && text.is_empty() && sub_text.is_empty() {
+        return true;
+    }
+    if text.is_empty() && sub_text.is_empty() && pkg == "android" {
+        return true;
+    }
+    if pkg == "android" || pkg == "com.android.systemui" {
+        const LOW_VALUE_BANNERS: [&str; 6] = [
+            "USB 文件传输",
+            "正在通过 USB",
+            "USB 调试",
+            "无线调试",
+            "选择输入法",
+            "更改键盘",
+        ];
+        if LOW_VALUE_BANNERS
+            .iter()
+            .any(|kw| title.contains(kw) || text.contains(kw))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn enrich_snapshot(mut snapshot: PushSnapshot, default_transport: &str) -> PushSnapshot {
     if snapshot.transport_mode.is_empty() {
         snapshot.transport_mode = default_transport.to_string();
     }
+    snapshot.threads.retain(|t| {
+        !is_excluded_im_package(&t.package_name)
+            && !(t.last_message.trim().is_empty()
+                && t.messages.iter().all(|m| m.text.trim().is_empty()))
+            && !t.thread_id.contains("stepx_e2e_test")
+            && !t.thread_id.contains("stepx_test_tag")
+    });
     snapshot
-        .threads
-        .retain(|t| !is_non_im_system_package(&t.package_name));
+        .notifications
+        .retain(|n| !should_hide_notification(n));
+    snapshot
+        .notifications
+        .sort_by(|a, b| b.post_time_ms.cmp(&a.post_time_ms));
+    let mut seen_notifs = std::collections::HashSet::new();
+    snapshot.notifications.retain(|n| {
+        seen_notifs.insert((
+            n.package_name.clone(),
+            n.title.trim().to_string(),
+            n.text.trim().to_string(),
+        ))
+    });
+    snapshot.otp_banners.retain(|b| {
+        !b.notification_key.contains("stepx_e2e_test")
+            && !b.notification_key.contains("stepx_test_tag")
+    });
     for notif in &mut snapshot.notifications {
         if notif.otp_code.is_none() {
             let combined = format!("{} {}", notif.title, notif.text);
@@ -751,8 +895,13 @@ pub fn fetch_snapshot(adb: &Adb, serial: &str, since_revision: u64) -> Result<Pu
         .and_then(Value::as_str)
         .unwrap_or("adb");
     let target = value.get("snapshot").unwrap_or(&value);
-    let snapshot: PushSnapshot =
+    let mut snapshot: PushSnapshot =
         serde_json::from_value(target.clone()).context("无法解析手机推送快照数据")?;
+    if value.get("unchanged").and_then(Value::as_bool) == Some(true)
+        || target.get("unchanged").and_then(Value::as_bool) == Some(true)
+    {
+        snapshot.unchanged = true;
+    }
     Ok(enrich_snapshot(snapshot, transport))
 }
 
@@ -922,12 +1071,32 @@ pub fn extract_otp_code(text: &str) -> Option<String> {
 
     let mut keyword_end_byte: Option<usize> = None;
     for kw in keywords {
-        if let Some(idx) = lower.find(kw) {
+        let mut offset = 0usize;
+        while let Some(rel) = lower[offset..].find(kw) {
+            let idx = offset + rel;
             let end = idx + kw.len();
-            keyword_end_byte = Some(match keyword_end_byte {
-                Some(prev) => prev.min(end),
-                None => end,
-            });
+            let boundary_ok = if kw.is_ascii() {
+                let prev_ok = lower[..idx]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !c.is_ascii_alphabetic() && c != '_');
+                let next_ok = !kw.ends_with(|c: char| c.is_ascii_alphabetic())
+                    || lower[end..]
+                        .chars()
+                        .next()
+                        .is_none_or(|c| !c.is_ascii_alphabetic() && c != '_');
+                prev_ok && next_ok
+            } else {
+                true
+            };
+            if boundary_ok {
+                keyword_end_byte = Some(match keyword_end_byte {
+                    Some(prev) => prev.min(end),
+                    None => end,
+                });
+                break;
+            }
+            offset = end;
         }
     }
     let kw_end = keyword_end_byte?;
@@ -1058,7 +1227,7 @@ pub fn summarize_unread_for_ai(snapshot: &PushSnapshot) -> String {
 
     let mut lines = Vec::new();
     lines.push(format!(
-        "📱 手机实时消息汇总（共 {} 个未读会话 / {} 条未读消息，{} 条验证码/取件码）：",
+        "手机实时消息汇总（共 {} 个未读会话 / {} 条未读消息，{} 条验证码/取件码）：",
         unread_threads.len(),
         total_unread_msgs,
         snapshot.otp_banners.len()
@@ -1069,9 +1238,9 @@ pub fn summarize_unread_for_ai(snapshot: &PushSnapshot) -> String {
         for (idx, thread) in unread_threads.iter().take(6).enumerate() {
             let ch = thread.channel().label();
             let reply_tag = if thread.can_remote_reply {
-                "⚡可秒回"
+                "可秒回"
             } else if thread.can_ui_reply {
-                "📱可看屏回"
+                "可看屏回"
             } else {
                 "只读"
             };
@@ -1099,7 +1268,7 @@ pub fn summarize_unread_for_ai(snapshot: &PushSnapshot) -> String {
         lines.push("\n【最新验证码与取件码】".to_string());
         for banner in snapshot.otp_banners.iter().take(3) {
             lines.push(format!(
-                "- 🔑 `{}`（来自 {} · {}）",
+                "- [验证码] `{}`（来自 {} · {}）",
                 banner.code, banner.source_app, banner.title
             ));
         }
@@ -1502,6 +1671,8 @@ pub fn demo_push_snapshot() -> PushSnapshot {
             post_time_ms: now_ms - 45_000,
             is_ongoing: false,
             is_clearable: true,
+            active: true,
+            removed_time_ms: 0,
             is_group: true,
             dismissed: false,
             read: false,
@@ -1525,6 +1696,8 @@ pub fn demo_push_snapshot() -> PushSnapshot {
             post_time_ms: now_ms - 60_000,
             is_ongoing: false,
             is_clearable: true,
+            active: true,
+            removed_time_ms: 0,
             is_group: false,
             dismissed: false,
             read: false,
@@ -1547,6 +1720,8 @@ pub fn demo_push_snapshot() -> PushSnapshot {
             post_time_ms: now_ms - 120_000,
             is_ongoing: false,
             is_clearable: true,
+            active: true,
+            removed_time_ms: 0,
             is_group: false,
             dismissed: false,
             read: false,
@@ -1570,6 +1745,8 @@ pub fn demo_push_snapshot() -> PushSnapshot {
             post_time_ms: now_ms - 195_000,
             is_ongoing: false,
             is_clearable: true,
+            active: true,
+            removed_time_ms: 0,
             is_group: false,
             dismissed: false,
             read: false,
@@ -1592,6 +1769,8 @@ pub fn demo_push_snapshot() -> PushSnapshot {
             post_time_ms: now_ms - 310_000,
             is_ongoing: false,
             is_clearable: true,
+            active: true,
+            removed_time_ms: 0,
             is_group: true,
             dismissed: false,
             read: false,
@@ -1614,6 +1793,8 @@ pub fn demo_push_snapshot() -> PushSnapshot {
             post_time_ms: now_ms - 420_000,
             is_ongoing: false,
             is_clearable: true,
+            active: true,
+            removed_time_ms: 0,
             is_group: false,
             dismissed: false,
             read: false,
@@ -1636,6 +1817,8 @@ pub fn demo_push_snapshot() -> PushSnapshot {
             post_time_ms: now_ms - 540_000,
             is_ongoing: false,
             is_clearable: true,
+            active: true,
+            removed_time_ms: 0,
             is_group: false,
             dismissed: false,
             read: false,
@@ -1659,6 +1842,8 @@ pub fn demo_push_snapshot() -> PushSnapshot {
             post_time_ms: now_ms - 780_000,
             is_ongoing: false,
             is_clearable: true,
+            active: true,
+            removed_time_ms: 0,
             is_group: false,
             dismissed: false,
             read: false,
@@ -1682,6 +1867,8 @@ pub fn demo_push_snapshot() -> PushSnapshot {
             post_time_ms: now_ms - 1_200_000,
             is_ongoing: false,
             is_clearable: true,
+            active: true,
+            removed_time_ms: 0,
             is_group: false,
             dismissed: false,
             read: false,
@@ -1716,6 +1903,7 @@ pub fn demo_push_snapshot() -> PushSnapshot {
 
     PushSnapshot {
         revision: 42,
+        unchanged: false,
         listener_connected: true,
         accessibility_connected: true,
         wifi_adb_enabled: true,
@@ -1918,6 +2106,98 @@ mod tests {
         let draft_pr = generate_smart_reply_draft(&demo.threads[2]);
         assert!(draft_pr.contains("看下") || draft_pr.contains("回复"));
     }
+
+    #[test]
+    fn filters_and_deduplicates_notifications_and_non_im_threads() {
+        let raw_json = json!({
+            "revision": 100,
+            "listenerConnected": true,
+            "threads": [
+                {
+                    "threadId": "com.jingdong.app.mall::促销",
+                    "packageName": "com.jingdong.app.mall",
+                    "title": "京东促销",
+                    "lastMessage": "限时满减"
+                },
+                {
+                    "threadId": "com.tencent.mm::empty",
+                    "packageName": "com.tencent.mm",
+                    "title": "空会话",
+                    "lastMessage": "   ",
+                    "messages": []
+                },
+                {
+                    "threadId": "com.tencent.mm::stepx_e2e_test",
+                    "packageName": "com.tencent.mm",
+                    "title": "E2E",
+                    "lastMessage": "test"
+                },
+                {
+                    "threadId": "com.tencent.mm::real",
+                    "packageName": "com.tencent.mm",
+                    "title": "真实会话",
+                    "lastMessage": "你好"
+                }
+            ],
+            "notifications": [
+                {
+                    "key": "0|com.stepx.companion.app|1|a",
+                    "packageName": "com.stepx.companion.app",
+                    "title": "StepX 伴侣权限已就绪",
+                    "text": "通知监听与无障碍已开启",
+                    "postTimeMs": 1000,
+                    "clearable": false,
+                    "active": true
+                },
+                {
+                    "key": "0|com.stepx.companion.app|2|b",
+                    "packageName": "com.stepx.companion.app",
+                    "title": "StepX 伴侣权限已就绪",
+                    "text": "通知监听与无障碍已开启",
+                    "postTimeMs": 3000,
+                    "clearable": false,
+                    "active": true
+                },
+                {
+                    "key": "0|com.android.shell|99|stepx_e2e_test",
+                    "packageName": "com.android.shell",
+                    "title": "测试通知",
+                    "text": "验证码 123456",
+                    "postTimeMs": 4000,
+                    "clearable": true,
+                    "active": true
+                },
+                {
+                    "key": "0|android|10|usb",
+                    "packageName": "android",
+                    "title": "USB 调试已连接",
+                    "text": "轻触可停用 USB 调试",
+                    "postTimeMs": 5000,
+                    "clearable": false,
+                    "active": true
+                },
+                {
+                    "key": "0|com.tencent.mm|20|removed",
+                    "packageName": "com.tencent.mm",
+                    "title": "已移除",
+                    "text": "旧消息",
+                    "postTimeMs": 6000,
+                    "clearable": true,
+                    "active": false,
+                    "removedTimeMs": 6001
+                }
+            ]
+        });
+
+        let parsed: PushSnapshot =
+            serde_json::from_value(raw_json).expect("clearable + active must not collide");
+        let enriched = enrich_snapshot(parsed, "local_socket");
+        assert_eq!(enriched.threads.len(), 1);
+        assert_eq!(enriched.threads[0].thread_id, "com.tencent.mm::real");
+        assert_eq!(enriched.notifications.len(), 1);
+        assert_eq!(enriched.notifications[0].post_time_ms, 3000);
+        assert_eq!(enriched.notifications[0].title, "StepX 伴侣权限已就绪");
+    }
 }
 
 #[cfg(test)]
@@ -1933,7 +2213,7 @@ mod reply_transport_tests {
         ] {
             assert!(!replay_safe(&json!({"op":op})));
         }
-        for op in ["snapshot", "status", "ping", "thread_detail"] {
+        for op in ["snapshot", "status", "ping", "thread_detail", "sync_window"] {
             assert!(replay_safe(&json!({"op":op})));
         }
     }
@@ -1984,5 +2264,43 @@ mod reply_merge_tests {
         let mut empty = PushSnapshot::default();
         merge_local_replies(&mut empty, &old);
         assert_eq!(empty.threads.len(), 1);
+    }
+
+    #[test]
+    fn unchanged_delta_snapshot_preserves_existing_threads_and_notifications() {
+        let prev = demo_push_snapshot();
+        let mut delta = PushSnapshot {
+            revision: prev.revision,
+            unchanged: true,
+            listener_connected: true,
+            screen_interactive: true,
+            transport_mode: "local_socket".into(),
+            ..Default::default()
+        };
+        merge_local_replies(&mut delta, &prev);
+        assert!(!delta.unchanged);
+        assert_eq!(delta.revision, prev.revision);
+        assert_eq!(delta.threads, prev.threads);
+        assert_eq!(delta.notifications, prev.notifications);
+        assert_eq!(delta.otp_banners, prev.otp_banners);
+        assert!(delta.screen_interactive);
+    }
+
+    #[test]
+    fn socket_miss_cache_blocks_repeated_forward_within_ttl() {
+        let serial = "TEST-SOCKET-MISS-SERIAL";
+        let now = Instant::now();
+        invalidate_cached_port(serial);
+        assert!(!is_socket_recently_unavailable(serial, now));
+        mark_socket_unavailable(serial);
+        assert!(is_socket_recently_unavailable(
+            serial,
+            now + Duration::from_secs(5)
+        ));
+        assert!(!is_socket_recently_unavailable(
+            serial,
+            now + SOCKET_MISS_TTL + Duration::from_secs(1)
+        ));
+        invalidate_cached_port(serial);
     }
 }

@@ -150,6 +150,14 @@ fn load_at(path: &Path) -> Result<Vec<Work>> {
 pub fn save(work: Work) -> Result<Vec<Work>> {
     save_at(&directory()?.join("works.json"), work)
 }
+pub fn save_all(works: &[Work]) -> Result<()> {
+    let path = directory()?.join("works.json");
+    let tmp = tempfile::NamedTempFile::new_in(path.parent().context("作品目录无效")?)?;
+    std::fs::write(tmp.path(), serde_json::to_vec_pretty(works)?)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(&path).map_err(|e| e.error)?;
+    Ok(())
+}
 fn save_at(path: &Path, mut work: Work) -> Result<Vec<Work>> {
     let mut all = load_at(path)?;
     if let Some(old) = all.iter().find(|w| w.url == work.url) {
@@ -210,6 +218,10 @@ fn valid_id(id: &str) -> bool {
 
 pub fn phone_call(adb: &Adb, device: &Device, request: Value) -> Result<Value> {
     device.verify(adb)?;
+    phone_call_unverified(adb, device, request)
+}
+
+pub(crate) fn phone_call_unverified(adb: &Adb, device: &Device, request: Value) -> Result<Value> {
     let encoded = STANDARD.encode(serde_json::to_vec(&request)?);
     ensure!(encoded.len() <= 32768, "作品请求过长");
     let out = adb.shell(
@@ -401,7 +413,8 @@ fn parse_web_snapshot(value: Value) -> Result<CloudLibrary> {
 }
 
 pub fn sync_cloud(adb: &Adb, device: &Device) -> Result<CloudLibrary> {
-    sync_cloud_with(|request| phone_call(adb, device, request))
+    device.verify(adb)?;
+    sync_cloud_with(|request| phone_call_unverified(adb, device, request))
 }
 fn sync_cloud_with(mut call: impl FnMut(Value) -> Result<Value>) -> Result<CloudLibrary> {
     let status = call(json!({"op":"cloud-status"}))?;

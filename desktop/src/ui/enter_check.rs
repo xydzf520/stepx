@@ -108,33 +108,34 @@ impl Companion {
                 5 => {
                     assert_eq!(self.fields[F_AMOO].text, "回车测试\n中文🙂");
                     assert!(self.fields[F_AMOO].preedit.is_empty());
+                    self.demo_mode = true;
                     run(self, W::Intent(Intent::Files), ctx);
                     key(ctx, &dir, c.stage, "enter", false);
                 }
                 6 => {
-                    assert_eq!(self.workspace.proposal.as_ref().expect("Enter dropped before workspace handler").steps, [Executor::Files]);
-                    assert!(!self.workspace_busy());
-                    // Holding/repeating Enter cannot silently approve a file task.
+                    assert!(self.workspace.proposal.is_none() && !self.workspace_busy());
+                    assert_eq!(self.workspace_task().expect("Enter dropped before workspace handler").route, Some(Intent::Files));
                     key(ctx, &dir, c.stage, "enter", false);
                 }
                 7 => {
-                    assert!(self.workspace.proposal.is_some() && !self.workspace_busy());
+                    assert!(self.workspace.proposal.is_none() && !self.workspace_busy());
                     assert_eq!(self.fields[F_AMOO].text, "回车测试\n中文🙂");
-                    run(self, W::EditPlan, ctx);
+                    run(self, W::Reroute(Intent::Chat), ctx);
+                    assert_eq!(self.workspace_task().unwrap().route, None);
                     run(self, W::Intent(Intent::Image), ctx);
                     key(ctx, &dir, c.stage, "enter", false);
                 }
                 8 => {
-                    assert_eq!(self.workspace.proposal.as_ref().unwrap().steps, [Executor::Image]);
-                    run(self, W::EditPlan, ctx);
+                    assert_eq!(self.workspace_task().unwrap().route, Some(Intent::Image));
                     self.set_compact_mode(ShellMode::Full, ctx);
                     self.focus_field(F_AMOO, ctx);
                     run(self, W::Intent(Intent::App), ctx);
                     key(ctx, &dir, c.stage, "return", false);
                 }
                 9 => {
-                    assert_eq!(self.workspace.proposal.as_ref().unwrap().steps, [Executor::App]);
-                    run(self, W::EditPlan, ctx);
+                    assert_eq!(self.workspace_task().unwrap().route, Some(Intent::App));
+                    self.demo_mode = !live;
+                    run(self, W::New, ctx);
                     self.set_compact_mode(ShellMode::MiniAi, ctx);
                     self.focus_field(F_AMOO, ctx);
                     self.fields[F_AMOO].set("这是键盘发送验收。记住测试数 47，只回答：已收到，47。不要操作手机或执行任务。");

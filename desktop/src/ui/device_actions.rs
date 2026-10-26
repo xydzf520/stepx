@@ -22,6 +22,22 @@ impl Companion {
             return;
         }
         if self.selected.is_none() {
+            if self.page == Page::Gallery
+                && !self.demo_mode
+                && !self.back_screen.gallery_checked
+                && !self.back_screen.gallery_loading
+            {
+                let (_, mut exp_items) = stepx_companion::toolbox::load_expansion_gallery_items();
+                exp_items.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms));
+                self.back_screen.gallery_checked = true;
+                if !exp_items.is_empty() {
+                    let count = exp_items.len();
+                    self.apply(Outcome::PhoneGallery(
+                        exp_items,
+                        format!("已从电脑扩容库加载 {count} 张归档照片"),
+                    ));
+                }
+            }
             return;
         }
         match self.page {
@@ -58,6 +74,10 @@ impl Companion {
                     self.handle_device_action(&Action::InspectServices);
                     return;
                 }
+                Some(ToolPage::Screen) if self.screenshot.is_none() && !self.busy => {
+                    self.handle_device_action(&Action::Screenshot);
+                    return;
+                }
                 Some(ToolPage::Device) if self.summary.is_empty() && !self.busy => {
                     self.handle_device_action(&Action::Summary);
                     return;
@@ -69,6 +89,10 @@ impl Companion {
                 return;
             }
             _ => {}
+        }
+        if self.page == Page::Amoo && !self.demo_mode {
+            self.refresh_amoo_background();
+            return;
         }
         if self.busy {
             return;
@@ -87,17 +111,21 @@ impl Companion {
                 self.handle_amoo_ui_action(&AmooUiAction::RefreshUsage)
             }
             Page::Amoo if !self.demo_mode => {
-                let key = self
-                    .amoo_sessions
-                    .get(self.amoo_session_idx)
-                    .map(|s| s.session_key.clone());
-                self.with_device("正在从后台同步 Amoo 会话…", move |adb, d| {
-                    let real = amoo::fetch(adb, &d, key.as_deref())?;
-                    let msg = format!("后台已同步 {} 个真实会话", real.sessions.len());
-                    Ok(Outcome::AmooRealData(real, msg))
-                });
+                self.refresh_amoo_background();
             }
             Page::Files if self.files.is_empty() => self.browse(self.directory.clone()),
+            Page::Gallery
+                if !self.demo_mode
+                    && !self.back_screen.gallery_checked
+                    && !self.back_screen.gallery_loading =>
+            {
+                self.back_screen.gallery_loading = true;
+                self.with_device("正在读取手机相册…", |adb, d| {
+                    let items = stepx_companion::toolbox::list_phone_gallery(adb, &d)?;
+                    let msg = format!("已加载手机相册 {} 张照片", items.len());
+                    Ok(Outcome::PhoneGallery(items, msg))
+                });
+            }
             Page::Sms if !self.demo_mode => {
                 self.with_device("正在读取短信…", |adb, d| {
                     let caps = bridge::capabilities(adb, &d).ok();
@@ -213,6 +241,8 @@ impl Companion {
         self.apps_loaded = false;
         self.apps_error = None;
         self.pending_app_uninstall = None;
+        self.live_screen_rx = None;
+        self.live_screen_stream = false;
         self.screenshot = None;
         self.selected_file = None;
         self.file_modal = None;
@@ -243,14 +273,16 @@ impl Companion {
 
     pub(super) fn filtered_files(&self) -> Vec<(usize, &Entry)> {
         let query = self.fields[F_FILE_SEARCH].text.trim().to_lowercase();
+        let in_trash = self.directory.contains(".StepXTrash");
         let mut items: Vec<(usize, &Entry)> = self
             .files
             .iter()
             .enumerate()
             .filter(|(_, e)| {
-                query.is_empty()
-                    || e.name.to_lowercase().contains(&query)
-                    || e.kind_badge().contains(&query)
+                !super::pages::files::is_hidden_phone_file_entry(&e.name, in_trash)
+                    && (query.is_empty()
+                        || e.name.to_lowercase().contains(&query)
+                        || e.kind_badge().contains(&query))
             })
             .collect();
         match self.file_sort {
@@ -266,6 +298,12 @@ impl Companion {
                     .cmp(&a.directory)
                     .then(a.kind_badge().cmp(b.kind_badge()))
                     .then(a.name.cmp(&b.name))
+            }),
+            FileSort::Time => items.sort_by(|(_, a), (_, b)| {
+                b.directory
+                    .cmp(&a.directory)
+                    .then(b.sort_time_key().cmp(&a.sort_time_key()))
+                    .then(b.name.cmp(&a.name))
             }),
         }
         items
@@ -284,30 +322,44 @@ impl Companion {
 
     pub(super) fn sms_threads(&self) -> Vec<SmsThread> {
         let query = self.fields[F_SMS_SEARCH].text.trim().to_lowercase();
+        let mut contact_names: HashMap<String, String> = HashMap::new();
+        if !query.is_empty() {
+            for c in &self.contacts {
+                let norm = stepx_companion::sms::normalize_address(&c.number);
+                let name_lower = c.name.to_lowercase();
+                contact_names
+                    .entry(norm)
+                    .and_modify(|existing| {
+                        existing.push('\n');
+                        existing.push_str(&name_lower);
+                    })
+                    .or_insert(name_lower);
+            }
+        }
         let mut threads: Vec<SmsThread> = Vec::new();
+        let mut thread_indices: HashMap<String, usize> = HashMap::new();
         for m in &self.sms {
             let matches_filter = match self.sms_filter {
                 SmsFilter::All => true,
                 SmsFilter::Incoming => m.kind == 1,
                 SmsFilter::Outgoing => m.kind == 2,
             };
-            if !matches_filter
-                || (!query.is_empty()
-                    && !m.address.to_lowercase().contains(&query)
-                    && !m.body.to_lowercase().contains(&query)
-                    && !self.contacts.iter().any(|c| {
-                        stepx_companion::sms::normalize_address(&c.number)
-                            == stepx_companion::sms::normalize_address(&m.address)
-                            && c.name.to_lowercase().contains(&query)
-                    }))
+            if !matches_filter {
+                continue;
+            }
+            let addr = m.address.trim();
+            let norm_addr = stepx_companion::sms::normalize_address(addr);
+            if !query.is_empty()
+                && !m.address.to_lowercase().contains(&query)
+                && !m.body.to_lowercase().contains(&query)
+                && !contact_names
+                    .get(&norm_addr)
+                    .is_some_and(|names| names.contains(&query))
             {
                 continue;
             }
-            let addr = m.address.trim().to_string();
-            if let Some(t) = threads.iter_mut().find(|t| {
-                stepx_companion::sms::normalize_address(&t.address)
-                    == stepx_companion::sms::normalize_address(&addr)
-            }) {
+            if let Some(&idx) = thread_indices.get(&norm_addr) {
+                let t = &mut threads[idx];
                 t.count += 1;
                 t.unread |= m.kind == 1 && !m.read;
                 if m.date_ms >= t.last_ms {
@@ -315,8 +367,9 @@ impl Companion {
                     t.last_body = m.body.clone();
                 }
             } else {
+                thread_indices.insert(norm_addr, threads.len());
                 threads.push(SmsThread {
-                    address: addr,
+                    address: addr.to_string(),
                     count: 1,
                     last_ms: m.date_ms,
                     last_body: m.body.clone(),
@@ -328,12 +381,28 @@ impl Companion {
         threads
     }
 
+    pub(super) fn is_stepos_or_system_app(app: &AppInfo) -> bool {
+        app.system
+            || app.updated_system
+            || app.package == "android"
+            || app.package.starts_with("android.")
+            || app.package.starts_with("com.android.")
+            || app.package.starts_with("vendor.")
+            || app.package.starts_with("com.qti.")
+            || app.package.starts_with("com.qualcomm.")
+            || app.package.starts_with("com.stepos.")
+            || app.package.starts_with("com.stepx.")
+            || (!app.launchable && app.package.starts_with("com.google."))
+    }
+
     pub(super) fn filtered_apps(&self) -> Vec<&AppInfo> {
         let query = self.fields[F_APP_SEARCH].text.trim();
         self.apps
             .iter()
             .filter(|app| {
-                (self.include_system_apps || app.in_default_scope()) && app.matches_query(query)
+                (self.include_system_apps
+                    || (app.in_default_scope() && !Self::is_stepos_or_system_app(app)))
+                    && app.matches_query(query)
             })
             .collect()
     }
@@ -386,10 +455,8 @@ impl Companion {
         self.selected_file = Some(i);
         Some(if entry.directory {
             Action::Browse(entry.path.clone())
-        } else if ["图片", "视频", "音频", "文档"].contains(&entry.kind_badge()) {
-            Action::OpenFile(i)
         } else {
-            Action::Download
+            Action::OpenFile(i)
         })
     }
 
@@ -407,25 +474,6 @@ impl Companion {
                 | Action::ExportApp(_)
         );
         if !is_bulk_action && self.busy && self.page == Page::Tools {
-            return;
-        }
-        if !self.demo_mode
-            && matches!(
-                action,
-                Action::AmooOpenMemory
-                    | Action::AmooOpenPersona
-                    | Action::AmooOpenSafety
-                    | Action::AmooOpenModels
-                    | Action::AmooOpenVoiceSettings
-            )
-        {
-            self.status = "此设置的后台接口尚未接入，手机配置未改变".into();
-            self.error = true;
-            return;
-        }
-        if !self.demo_mode && matches!(action, Action::AmooSendRecording) {
-            self.status = "后台语音上传尚未接入，请使用文字或附件".into();
-            self.error = true;
             return;
         }
         match action {
@@ -563,8 +611,9 @@ impl Companion {
             }),
             Action::Mirror => {
                 if !self.busy && self.mirror.is_none() {
-                    self.with_device("正在开启投屏…", |adb, d| {
-                        let session = d.mirror(adb)?;
+                    let options = self.mirror_options;
+                    self.with_device("正在开启投屏…", move |adb, d| {
+                        let session = d.mirror_with_options(adb, options)?;
                         Ok(Outcome::Mirror(d.serial, d.transport, session))
                     });
                 }
@@ -579,26 +628,89 @@ impl Companion {
             }),
             Action::Key(code) => {
                 let code = *code;
+                let sync_screen = self.mirror.is_none();
                 self.with_device("正在发送按键…", move |adb, d| {
                     d.key(adb, code)?;
+                    if sync_screen && code != 26 && code != 223 {
+                        std::thread::sleep(Duration::from_millis(180));
+                        if let Ok(bytes) = adb.screenshot(&d.transport) {
+                            if let Ok(dir) = tempfile::tempdir() {
+                                let path = dir.path().join("screen.png");
+                                if std::fs::write(&path, bytes).is_ok() {
+                                    return Ok(Outcome::ScreenshotWithNotice(
+                                        dir,
+                                        path,
+                                        "已发送按键并同步手机画面".into(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
                     Ok(Outcome::Notice("已发送按键".into()))
                 });
+            }
+            Action::ScreenTapNormalized(nx, ny) => {
+                let (nx, ny) = (*nx, *ny);
+                self.with_device(
+                    "正在点击手机屏幕并同步画面…",
+                    move |adb, d| {
+                        let (px, py) = d.tap_normalized(adb, nx, ny)?;
+                        std::thread::sleep(Duration::from_millis(220));
+                        if let Ok(bytes) = adb.screenshot(&d.transport) {
+                            if let Ok(dir) = tempfile::tempdir() {
+                                let path = dir.path().join("screen.png");
+                                if std::fs::write(&path, bytes).is_ok() {
+                                    return Ok(Outcome::ScreenshotWithNotice(
+                                        dir,
+                                        path,
+                                        format!("已点击手机屏幕坐标 ({px}, {py}) 并同步最新画面"),
+                                    ));
+                                }
+                            }
+                        }
+                        Ok(Outcome::Notice(format!("已点击手机屏幕坐标 ({px}, {py})")))
+                    },
+                );
+            }
+            Action::ScreenGesture(gesture) => {
+                let gesture = *gesture;
+                self.with_device(
+                    "正在执行屏幕手势并同步画面…",
+                    move |adb, d| {
+                        let msg = d.screen_gesture(adb, gesture)?;
+                        std::thread::sleep(Duration::from_millis(260));
+                        if let Ok(bytes) = adb.screenshot(&d.transport) {
+                            if let Ok(dir) = tempfile::tempdir() {
+                                let path = dir.path().join("screen.png");
+                                if std::fs::write(&path, bytes).is_ok() {
+                                    return Ok(Outcome::ScreenshotWithNotice(
+                                        dir,
+                                        path,
+                                        format!("{msg} · 画面已同步"),
+                                    ));
+                                }
+                            }
+                        }
+                        Ok(Outcome::Notice(msg))
+                    },
+                );
             }
             Action::Amoo | Action::AmooSnapshot | Action::AmooOpenTasks => {
                 if matches!(action, Action::AmooOpenTasks) {
                     self.amoo_show_schedules = true;
                 }
-                let key = self
-                    .amoo_sessions
-                    .get(self.amoo_session_idx)
-                    .map(|s| s.session_key.clone());
-                self.with_device("正在连接 Amoo 后台…", move |adb, d| {
-                    let real = amoo::fetch(adb, &d, key.as_deref())?;
-                    let message = format!("后台已同步 {} 个真实会话", real.sessions.len());
-                    Ok(Outcome::AmooRealData(real, message))
-                });
+                if self.selected.is_none() {
+                    self.page = Page::Connect;
+                    self.status = "请先连接设备".into();
+                    self.error = true;
+                    return;
+                }
+                self.error = false;
+                self.status = "正在后台同步对话…".into();
+                self.refresh_amoo_background();
             }
             Action::AmooResetSession => {
+                self.demote_busy_if_background();
                 self.with_device("正在后台创建新会话…", |adb, d| {
                     Ok(Outcome::AmooCreated(
                         amoo::AgentBus::connect(adb, &d)?.create_session()?,
@@ -606,6 +718,7 @@ impl Companion {
                 });
             }
             Action::AmooRetryMessage { session_key, text } => {
+                self.demote_busy_if_background();
                 if self.busy || self.amoo_pending_reply.contains_key(session_key) {
                     self.status = "上一条请求仍在处理中，请等待结果".into();
                     return;
@@ -976,6 +1089,77 @@ impl Companion {
                     Ok(Outcome::Notice(format!("已在手机上打开 {package}")))
                 });
             }
+            Action::OpenAppInMirror(package) => {
+                let package = package.clone();
+                let need_mirror = self.mirror.is_none();
+                let options = self.mirror_options;
+                self.with_device(
+                    "正在手机打开应用并启动电脑投屏…",
+                    move |adb, d| {
+                        let _ = d.open_app(adb, &package);
+                        if need_mirror {
+                            let session = d.mirror_with_options(adb, options)?;
+                            Ok(Outcome::Mirror(d.serial, d.transport, session))
+                        } else {
+                            Ok(Outcome::Notice(format!("已在投屏中打开 {package}")))
+                        }
+                    },
+                );
+            }
+            Action::EnableUsbWirelessBridge => {
+                let usb_target = self
+                    .devices
+                    .iter()
+                    .find(|d| {
+                        d.state == "device" && !d.id.contains(':') && !d.id.starts_with("adb-")
+                    })
+                    .map(|d| d.id.clone())
+                    .or_else(|| self.selected.as_ref().map(|d| d.transport.clone()));
+                let Some(transport_id) = usb_target else {
+                    self.status = "请先通过 USB 数据线连接手机并开启 USB 调试".into();
+                    self.error = true;
+                    return;
+                };
+                self.submit(
+                    "正在通过 USB 激活同局域网无线连接…",
+                    move |adb| {
+                        let _ = adb.run(&["-s", &transport_id, "tcpip", "5555"]);
+                        std::thread::sleep(Duration::from_millis(700));
+                        let raw = adb
+                            .run(&["-s", &transport_id, "shell", "ip -o -4 addr show dev wlan0"])
+                            .unwrap_or_default();
+                        let Some(ip) = raw.split_whitespace().find_map(|s| {
+                            s.split_once('/')
+                                .and_then(|(ip, _)| ip.parse::<std::net::IpAddr>().ok())
+                        }) else {
+                            anyhow::bail!(
+                                "未能读取手机局域网 Wi-Fi 地址，请确认手机与电脑连接在同一 Wi-Fi"
+                            );
+                        };
+                        let endpoint = format!("{ip}:5555");
+                        adb.run(&["connect", &endpoint])?;
+                        Ok(Outcome::Paired(endpoint))
+                    },
+                );
+            }
+            Action::BackupPhoneFileToDesktop(remote_path) => {
+                let remote_path = remote_path.clone();
+                let file_name = std::path::Path::new(&remote_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("phone_backup.bin")
+                    .to_string();
+                let dest_dir = stepx_companion::settings::downloads().join("StepX_Backup");
+                let dest = dest_dir.join(&file_name);
+                self.with_device("正在将手机文件备份到电脑…", move |adb, d| {
+                    let _ = std::fs::create_dir_all(&dest_dir);
+                    storage::pull(adb, &d, &remote_path, &dest)?;
+                    Ok(Outcome::Notice(format!(
+                        "已安全备份到电脑：{}",
+                        dest.display()
+                    )))
+                });
+            }
             Action::SendFocusText => {
                 let text = self.fields[F_OV_TEXT].text.trim().to_string();
                 if text.is_empty() {
@@ -984,8 +1168,25 @@ impl Companion {
                     return;
                 }
                 self.fields[F_OV_TEXT].clear();
+                let sync_screen = self.mirror.is_none();
                 self.with_device("正在向手机焦点输入文字…", move |adb, d| {
-                    Ok(Outcome::Notice(d.send_focus_text(adb, &text)?))
+                    let msg = d.send_focus_text(adb, &text)?;
+                    if sync_screen {
+                        std::thread::sleep(Duration::from_millis(180));
+                        if let Ok(bytes) = adb.screenshot(&d.transport) {
+                            if let Ok(dir) = tempfile::tempdir() {
+                                let path = dir.path().join("screen.png");
+                                if std::fs::write(&path, bytes).is_ok() {
+                                    return Ok(Outcome::ScreenshotWithNotice(
+                                        dir,
+                                        path,
+                                        format!("{msg} · 画面已同步"),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    Ok(Outcome::Notice(msg))
                 });
             }
             Action::AmooDropFiles(paths) => {
@@ -1002,22 +1203,34 @@ impl Companion {
             Action::AmooSendRecording => {
                 let dur = self.amoo_record_secs.max(4);
                 self.amoo_recording = false;
-                let voice_text = "请帮我查一下今天下午的日程，并在背屏开启赛博闪电提醒";
-                let agent = self.active_amoo_agent_name().to_string();
-                let reply = build_amoo_reply(voice_text, &agent);
-                if let Some(sess) = self.amoo_sessions.get_mut(self.amoo_session_idx) {
-                    sess.items.push(AmooChatItem::UserVoice {
-                        transcript: format!("“{voice_text}”"),
-                        duration_sec: dur,
-                    });
-                    sess.items.push(reply);
-                    sess.meta = "刚刚 · 语音".into();
-                    sess.status = "已完成".into();
-                    sess.status_kind = 2;
-                }
-                self.reveal_latest_chat();
-                if self.selected.is_some() {
-                    self.with_device("正在将语音发送给 Amoo…", |adb, d| {
+                if self.demo_mode {
+                    let voice_text = "请帮我查一下今天下午的日程，并在背屏开启赛博闪电提醒";
+                    let agent = self.active_amoo_agent_name().to_string();
+                    let reply = build_amoo_reply(voice_text, &agent);
+                    if let Some(sess) = self.amoo_sessions.get_mut(self.amoo_session_idx) {
+                        sess.items.push(AmooChatItem::UserVoice {
+                            transcript: format!("“{voice_text}”"),
+                            duration_sec: dur,
+                        });
+                        sess.items.push(reply);
+                        sess.meta = "刚刚 · 语音".into();
+                        sess.status = "已完成".into();
+                        sess.status_kind = 2;
+                    }
+                    self.reveal_latest_chat();
+                    if self.selected.is_some() {
+                        self.with_device("正在将语音发送给 Amoo…", |adb, d| {
+                            let msg = d.amoo_voice_wake(adb)?;
+                            match bridge::amoo_snapshot(adb, &d, false) {
+                                Ok(snap) => Ok(Outcome::AmooState(snap, msg, true)),
+                                Err(_) => Ok(Outcome::Notice(msg)),
+                            }
+                        });
+                    } else {
+                        self.status = "语音消息已发送并由 Amoo 处理完成".into();
+                    }
+                } else if self.selected.is_some() {
+                    self.with_device("正在唤醒手机端 Amoo 语音助手…", |adb, d| {
                         let msg = d.amoo_voice_wake(adb)?;
                         match bridge::amoo_snapshot(adb, &d, false) {
                             Ok(snap) => Ok(Outcome::AmooState(snap, msg, true)),
@@ -1025,28 +1238,57 @@ impl Companion {
                         }
                     });
                 } else {
-                    self.status = "语音消息已发送并由 Amoo 处理完成".into();
+                    self.status = "请先连接手机后再使用语音唤醒".into();
+                    self.error = true;
                 }
             }
             Action::AmooOpenMemory => {
-                self.with_device("正在打开 Amoo 记忆库…", |adb, d| {
-                    Ok(Outcome::Notice(d.open_amoo_memory(adb)?))
-                });
+                if self.selected.is_some() {
+                    self.with_device("正在打开 Amoo 记忆库…", |adb, d| {
+                        Ok(Outcome::Notice(d.open_amoo_memory(adb)?))
+                    });
+                } else {
+                    self.page = Page::Amoo;
+                    self.workspace.sub_view = 1;
+                    self.error = false;
+                    self.status = "已打开桌面端「记忆与自我」偏好工作台".into();
+                }
             }
             Action::AmooOpenPersona => {
-                self.with_device("正在打开个人偏好设置…", |adb, d| {
-                    Ok(Outcome::Notice(d.open_amoo_persona(adb)?))
-                });
+                if self.selected.is_some() {
+                    self.with_device("正在打开个人偏好设置…", |adb, d| {
+                        Ok(Outcome::Notice(d.open_amoo_persona(adb)?))
+                    });
+                } else {
+                    self.page = Page::Amoo;
+                    self.workspace.sub_view = 1;
+                    self.error = false;
+                    self.status = "已打开桌面端个人画像与偏好设置".into();
+                }
             }
             Action::AmooOpenSafety => {
-                self.with_device("正在打开敏感操作安全守护中心…", |adb, d| {
-                    Ok(Outcome::Notice(d.open_amoo_safety_center(adb)?))
-                });
+                if self.selected.is_some() {
+                    self.with_device("正在打开敏感操作安全守护中心…", |adb, d| {
+                        Ok(Outcome::Notice(d.open_amoo_safety_center(adb)?))
+                    });
+                } else {
+                    self.page = Page::Amoo;
+                    self.amoo_show_details = true;
+                    self.error = false;
+                    self.status = "已展开桌面端敏感操作安全守护面板".into();
+                }
             }
             Action::AmooOpenModels => {
-                self.with_device("正在打开端侧大模型管理…", |adb, d| {
-                    Ok(Outcome::Notice(d.open_amoo_model_manager(adb)?))
-                });
+                if self.selected.is_some() {
+                    self.with_device("正在打开端侧大模型管理…", |adb, d| {
+                        Ok(Outcome::Notice(d.open_amoo_model_manager(adb)?))
+                    });
+                } else {
+                    self.page = Page::Amoo;
+                    self.workspace.panel = 3;
+                    self.error = false;
+                    self.status = "已打开桌面端模型与路由配置面板".into();
+                }
             }
             Action::AmooOpenVoiceSettings => {
                 self.with_device("正在打开语音唤醒设置…", |adb, d| {
@@ -1380,7 +1622,10 @@ impl Companion {
                     } else {
                         "xdg-open"
                     };
-                    std::process::Command::new(opener).arg(&path).spawn()?;
+                    let mut child = std::process::Command::new(opener).arg(&path).spawn()?;
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                    });
                     Ok(path)
                 })();
                 match opened {
@@ -1551,6 +1796,61 @@ impl Companion {
                     self.error = true;
                     return;
                 }
+                let local_cached = std::path::Path::new(&remote_path)
+                    .is_file()
+                    .then(|| PathBuf::from(&remote_path))
+                    .or_else(|| {
+                        self.back_screen
+                            .gallery_items
+                            .iter()
+                            .find(|i| i.remote_path == *remote_path)
+                            .and_then(|i| i.local_thumb_path.as_deref())
+                            .map(PathBuf::from)
+                            .filter(|p| p.is_file())
+                    })
+                    .or_else(|| {
+                        let (_, exp_items) =
+                            stepx_companion::toolbox::load_expansion_gallery_items();
+                        exp_items
+                            .into_iter()
+                            .find(|i| i.remote_path == *remote_path)
+                            .and_then(|i| i.local_thumb_path)
+                            .map(PathBuf::from)
+                            .filter(|p| p.is_file())
+                    });
+                if let Some(local_src) = local_cached {
+                    let base = std::env::var_os("XDG_CACHE_HOME")
+                        .map(PathBuf::from)
+                        .or_else(|| {
+                            stepx_companion::resources::user_home()
+                                .map(|h| PathBuf::from(h).join(".cache"))
+                        })
+                        .unwrap_or_else(std::env::temp_dir);
+                    let directory = base.join("stepx-companion/backscreen/imports");
+                    let _ = std::fs::create_dir_all(&directory);
+                    let name = self
+                        .back_screen
+                        .gallery_items
+                        .iter()
+                        .find(|i| i.remote_path == *remote_path)
+                        .map(|i| i.name.trim())
+                        .filter(|n| !n.is_empty())
+                        .map(ToOwned::to_owned)
+                        .or_else(|| {
+                            PathBuf::from(&remote_path)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                        })
+                        .unwrap_or_else(|| "手机图片.jpg".into());
+                    let path = directory.join(format!("{:08x}-{name}", rand::random::<u32>()));
+                    let final_path = if std::fs::copy(&local_src, &path).is_ok() {
+                        path
+                    } else {
+                        local_src
+                    };
+                    self.apply(Outcome::BackScreenImportedImage(final_path));
+                    return;
+                }
                 let remote_path = remote_path.clone();
                 self.with_device(
                     "正在读取手机图片，完成后进入背屏预览…",
@@ -1596,9 +1896,28 @@ impl Companion {
                 Ok(Outcome::Files(
                     directory,
                     list,
-                    Some(format!("已新建 {name}")),
+                    Some(format!("已新建文件夹 {name}")),
                 ))
             }),
+            FileModal::NewTextFile => {
+                self.with_device("正在新建文本文件…", move |adb, d| {
+                    let filename = if name.contains('.') {
+                        name.clone()
+                    } else {
+                        format!("{name}.txt")
+                    };
+                    let tmp = std::env::temp_dir().join(&filename);
+                    std::fs::write(&tmp, "")?;
+                    storage::push(adb, &d, &tmp, &directory)?;
+                    let _ = std::fs::remove_file(&tmp);
+                    let list = storage::list(adb, &d, &directory)?;
+                    Ok(Outcome::Files(
+                        directory,
+                        list,
+                        Some(format!("已新建文本文件 {filename}")),
+                    ))
+                })
+            }
             FileModal::Rename(idx) => {
                 if let Some(entry) = self.files.get(idx).cloned() {
                     self.with_device("正在重命名…", move |adb, d| {

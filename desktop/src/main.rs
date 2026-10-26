@@ -4,6 +4,13 @@
 mod ui;
 
 fn main() -> anyhow::Result<()> {
+    // Cap Rayon's global font-indexing thread pool so 32-core workstations do not
+    // keep 32 permanent idle threads and 32 × 64 MiB malloc arenas for a 40ms startup scan.
+    if std::env::var_os("RAYON_NUM_THREADS").is_none() {
+        unsafe {
+            std::env::set_var("RAYON_NUM_THREADS", "4");
+        }
+    }
     #[cfg(target_os = "linux")]
     if std::env::args().any(|a| a == "--speech-helper") {
         return stepx_companion::speech::helper();

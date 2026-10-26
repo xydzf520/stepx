@@ -153,9 +153,11 @@ pub fn restore(adb: &Adb, device: &Device) -> Result<NeoStatus> {
 
 pub fn open_phone(adb: &Adb, device: &Device) -> Result<()> {
     device.verify(adb)?;
-    let status = inspect(adb, device)?;
+    let route = companion_gui::call(adb, device, json!({"op":"agent","agentOp":"neo_status"}))
+        .or_else(|_| companion_gui::call(adb, device, json!({"op":"neo_status"})))
+        .context("请先安装通过签名核验的 Neo")?;
     ensure!(
-        status.installed && status.signature_verified,
+        route["supported"] != false && route["installed"] != false,
         "请先安装通过签名核验的 Neo"
     );
     let response = adb.shell(

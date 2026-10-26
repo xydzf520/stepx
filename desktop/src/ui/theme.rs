@@ -74,6 +74,23 @@ pub const fn rgba(r: u8, g: u8, b: u8, a: u8) -> ColorU {
     ColorU { r, g, b, a }
 }
 
+pub fn lerp_color(a: ColorU, b: ColorU, t: f32) -> ColorU {
+    let t = t.clamp(0.0, 1.0);
+    if t <= 0.0 {
+        return a;
+    }
+    if t >= 1.0 {
+        return b;
+    }
+    let ch = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    ColorU {
+        r: ch(a.r, b.r),
+        g: ch(a.g, b.g),
+        b: ch(a.b, b.b),
+        a: ch(a.a, b.a),
+    }
+}
+
 const fn hex(rgb: u32) -> ColorU {
     ColorU {
         r: ((rgb >> 16) & 0xff) as u8,
@@ -216,6 +233,14 @@ impl Palette {
                 tag_bg: hex(0xF4F4F5),
             }
         }
+    }
+
+    pub fn press_color(&self, base: ColorU) -> ColorU {
+        lerp_color(
+            base,
+            self.border_strong,
+            if self.dark { 0.35 } else { 0.42 },
+        )
     }
 }
 

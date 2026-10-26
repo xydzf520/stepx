@@ -13,10 +13,13 @@ import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.Arrays;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /** User-started local runtime. It never starts at boot and never accepts arbitrary paths or code. */
 public final class CompanionService extends Service implements SensorEventListener {
     private final Handler h=new Handler(Looper.getMainLooper());
+    private final ExecutorService statusIo=Executors.newSingleThreadExecutor();
     private final long serviceCreatedUptimeMs=SystemClock.elapsedRealtime();
     private int serviceStartCount,lastStartId;
     private SensorManager sensors;
@@ -38,10 +41,14 @@ public final class CompanionService extends Service implements SensorEventListen
     private String resumeJobId="";
     private JSONObject lastTest;
     private String mode="stopped",requestId="",jobId="",error="",pause="",title="";
-    private long lastTick,started,lastStatus,lastFrame,accelCount,gravityCount,gyroCount,frameCount,tapTriggers;
+    private long lastTick,started,lastStatus,lastStatusWrite,lastFrame,accelCount,gravityCount,gyroCount,frameCount,tapTriggers;
+    private String lastStatusKey="";
     private float gx,gy,gz=9.8f,gyroMagnitude;
     private double tilt,neutral;
     private boolean registered=false,motionRegistered=false,standby=false,synthetic=false,calling=false,restored=true,pausedOutput=false,commandReady=false;
+    private volatile int cachedThermalStatus=0;
+    private boolean cachedPowerSave=false;
+    private long lastPowerSaveCheck=0;
     private int battery=100;
     private int[] previousFrame;
     private int brightness=5;
@@ -49,7 +56,8 @@ public final class CompanionService extends Service implements SensorEventListen
         if(Intent.ACTION_BATTERY_CHANGED.equals(i.getAction())){battery=i.getIntExtra(BatteryManager.EXTRA_LEVEL,100)*100/Math.max(1,i.getIntExtra(BatteryManager.EXTRA_SCALE,100));}
         if(Intent.ACTION_USER_PRESENT.equals(i.getAction())&&game!=null&&!synthetic){pause="手机已解锁，三敲背面重新开始";finishGame(false);}
     }};
-    private final PowerManager.OnThermalStatusChangedListener thermalListener=status->{if(status>=PowerManager.THERMAL_STATUS_SEVERE){pause="手机温度较高，已暂停背屏";stopOutput(false);}};
+    private final PowerManager.OnThermalStatusChangedListener thermalListener=status->{cachedThermalStatus=status;if(status>=PowerManager.THERMAL_STATUS_SEVERE){pause="手机温度较高，已暂停背屏";stopOutput(false);}};
+    private boolean isPowerSave(long now){if(now-lastPowerSaveCheck>=1000){cachedPowerSave=power.isPowerSaveMode();lastPowerSaveCheck=now;}return cachedPowerSave;}
     @Override public void onCreate(){super.onCreate();
         android.util.Log.i("StepXCompanion","create instance="+serviceCreatedUptimeMs);
         NotificationManager nm=getSystemService(NotificationManager.class);nm.createNotificationChannel(new NotificationChannel("backscreen","背屏与体感游戏",NotificationManager.IMPORTANCE_LOW));
@@ -57,6 +65,7 @@ public final class CompanionService extends Service implements SensorEventListen
         sensors=getSystemService(SensorManager.class);accel=sensors.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);gravity=sensors.getDefaultSensor(Sensor.TYPE_GRAVITY);gyro=sensors.getDefaultSensor(Sensor.TYPE_GYROSCOPE);rotation=sensors.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR);
         bestScore=getSharedPreferences("game_scores",0).getLong("best",0);lastGameScore=getSharedPreferences("game_scores",0).getLong("last",0);
         power=getSystemService(PowerManager.class);lock=power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,"StepX:BackscreenGame");lock.setReferenceCounted(false);
+        cachedThermalStatus=power.getCurrentThermalStatus();cachedPowerSave=power.isPowerSaveMode();lastPowerSaveCheck=SystemClock.elapsedRealtime();
         IntentFilter f=new IntentFilter(Intent.ACTION_BATTERY_CHANGED);f.addAction(Intent.ACTION_USER_PRESENT);registerReceiver(systemEvents,f,Context.RECEIVER_NOT_EXPORTED);power.addThermalStatusListener(thermalListener);
         if(checkSelfPermission(Manifest.permission.READ_PHONE_STATE)==PackageManager.PERMISSION_GRANTED){
             phone=getSystemService(TelephonyManager.class);phoneListener=new PhoneStateListener(){@Override public void onCallStateChanged(int state,String unused){calling=state!=TelephonyManager.CALL_STATE_IDLE;}};phone.listen(phoneListener,PhoneStateListener.LISTEN_CALL_STATE);
@@ -97,7 +106,7 @@ public final class CompanionService extends Service implements SensorEventListen
                     // Only failures after validation/starting the replacement need restoration.
                     preserveOutputOnFailure=false;
                     connect();register(standby);rememberGameScore();stopOutput(false);resumeConfig=null;config=next;game=null;synthetic=false;mode="animation";title=next.title;jobId=requestId;brightness=next.brightness;started=SystemClock.elapsedRealtime();pause="";frameCount=0;lastSubmitted=0;
-                    atomic(new File(getFilesDir(),"accepted.json"),raw);screen.begin(brightness,false);restored=false;pausedOutput=false;previousFrame=null;break;
+                    atomic(new File(getFilesDir(),"accepted.json"),raw);screen.begin(brightness,false);restored=false;pausedOutput=false;previousFrame=null;h.removeCallbacks(tick);h.post(tick);break;
                 }
                 default:throw new IOException("不支持的操作");
             }
@@ -125,7 +134,7 @@ public final class CompanionService extends Service implements SensorEventListen
     private void beginGame(boolean test)throws Exception{
         if(config!=null){resumeConfig=config;resumeElapsed=SystemClock.elapsedRealtime()-started;resumeJobId=jobId;}
         rememberGameScore();stopOutput(false);game=new GameCore(test);config=null;synthetic=test;mode="game";title="重力对齐";jobId=requestId;started=SystemClock.elapsedRealtime();neutral=tilt;pause="";taps.reset();frameCount=0;lastSubmitted=0;endedAt=0;faceExit.reset();
-        screen.begin(brightness,true);restored=false;pausedOutput=false;previousFrame=null;lastLockRenew=0;notifyState();
+        screen.begin(brightness,true);restored=false;pausedOutput=false;previousFrame=null;lastLockRenew=0;notifyState();h.removeCallbacks(tick);h.post(tick);
     }
     private void finishGame(boolean clearStandby){
         boolean wasTest=synthetic;boolean passed=game!=null&&game.phase.equals("won");long score=game==null?0:game.score;rememberGameScore();
@@ -150,7 +159,7 @@ public final class CompanionService extends Service implements SensorEventListen
             if(game!=null&&!synthetic&&!game.phase.equals("countdown")&&faceExit.sample(now,gz,backNormal)){pause="本局已结束，已恢复背屏";finishGame(false);}
             if(mode.equals("standby"))pause=gravityCount==0?"等待姿态传感器":gz>=7.5?"请拿起手机，将背屏朝向自己后敲三下":"";
             if(mode.equals("game")||mode.equals("animation")){
-                String gate=calling?"来电或通话中":power.isPowerSaveMode()?"系统省电模式":power.getCurrentThermalStatus()>=PowerManager.THERMAL_STATUS_SEVERE?"手机温度较高":gravityCount==0?"等待姿态传感器":gz>=7.5?"请将背屏朝向自己":"";
+                String gate=calling?"来电或通话中":isPowerSave(now)?"系统省电模式":cachedThermalStatus>=PowerManager.THERMAL_STATUS_SEVERE?"手机温度较高":gravityCount==0?"等待姿态传感器":gz>=7.5?"请将背屏朝向自己":"";
                 if(!gate.isEmpty()){
                     pause=gate;if(!pausedOutput){screen.restore(false);pausedOutput=true;restored=true;if(lock.isHeld())lock.release();}
                 }else{
@@ -168,7 +177,7 @@ public final class CompanionService extends Service implements SensorEventListen
                 }
             }
         }catch(Throwable e){error=message(e);standby=false;stopOutput(true);mode="stopped";unregister();writeStatus(true);stopForeground(STOP_FOREGROUND_REMOVE);stopSelf();}
-        writeStatus(false);h.postDelayed(this,40);
+        writeStatus(false);h.postDelayed(this,("standby".equals(mode)||pausedOutput)?200:40);
     }};
     private void render(int[]f,long now)throws Exception{lastFrame=now;if(!Arrays.equals(previousFrame,f)){screen.push(f);previousFrame=f;frameCount++;lastSubmitted=now;}}
     @Override public void onSensorChanged(SensorEvent e){
@@ -179,12 +188,15 @@ public final class CompanionService extends Service implements SensorEventListen
         }else if(e.sensor.getType()==Sensor.TYPE_GAME_ROTATION_VECTOR){rotationCount++;SensorManager.getRotationMatrixFromVector(rotationMatrix,e.values);backNormal=new double[]{rotationMatrix[2],rotationMatrix[5],rotationMatrix[8]};}
         else if(e.sensor.getType()==Sensor.TYPE_GYROSCOPE){gyroCount++;gyroMagnitude=(float)Math.sqrt(e.values[0]*e.values[0]+e.values[1]*e.values[1]+e.values[2]*e.values[2]);}
         else if(e.sensor.getType()==Sensor.TYPE_ACCELEROMETER){accelCount++;boolean trigger=taps.sample(e.timestamp/1000000L,e.values[2]-gz,Math.hypot(e.values[0]-gx,e.values[1]-gy),gyroMagnitude,gravityCount>0&&gz<7.5);
-            if(trigger&&!synthetic&&game==null){tapTriggers++;try{if(standby&&!calling&&!power.isPowerSaveMode())beginGame(false);}catch(Exception failure){error=message(failure);finishGame(true);}}
+            if(trigger&&!synthetic&&game==null){tapTriggers++;try{if(standby&&!calling&&!isPowerSave(SystemClock.elapsedRealtime()))beginGame(false);}catch(Exception failure){error=message(failure);finishGame(true);}}
         }
     }
     @Override public void onAccuracyChanged(Sensor s,int accuracy){}
     private void writeStatus(boolean force){
         long now=SystemClock.elapsedRealtime();if(!force&&now-lastStatus<250)return;lastStatus=now;
+        String stateKey=requestId+"|"+jobId+"|"+commandReady+"|"+mode+"|"+(game!=null?game.phase:mode)+"|"+title+"|"+frameCount+"|"+error+"|"+pause+"|"+restored+"|"+synthetic+"|"+standby+"|"+taps.count+"|"+tapTriggers+"|"+taps.lastReason+"|"+taps.recent.size()+"|"+serviceStartCount+"|"+lastStartId+"|"+(gravityCount>0)+"|"+(gz>=7.5f)+"|"+(game==null?0:game.score)+"|"+bestScore+"|"+lastGameScore;
+        if(!force&&stateKey.equals(lastStatusKey)&&now-lastStatusWrite<2000)return;
+        lastStatusKey=stateKey;lastStatusWrite=now;
         try{
             JSONObject j=new JSONObject().put("protocol",1).put("app","StepX伴侣").put("version","0.1.2").put("uid",android.os.Process.myUid()).put("requestId",requestId).put("jobId",jobId).put("commandReady",commandReady).put("running",!mode.equals("stopped")).put("mode",mode).put("phase",game!=null?game.phase:mode).put("appliedTitle",title).put("frameCount",frameCount).put("lastFrameUptimeMs",lastSubmitted).put("lastError",error).put("pausedReason",pause).put("settingsRestored",restored).put("synthetic",synthetic).put("standbyEnabled",standby).put("wakeLockHeld",lock!=null&&lock.isHeld()).put("timestampMs",System.currentTimeMillis()).put("uptimeMs",now).put("tiltDegrees",tilt-neutral).put("gravityZ",gz).put("tapCount",taps.count).put("tapTriggers",tapTriggers).put("outputAccepted",frameCount>0&&!pausedOutput&&(mode.equals("game")||mode.equals("animation"))).put("outputVerified",false);
             j.put("serviceCreatedUptimeMs",serviceCreatedUptimeMs).put("serviceStartCount",serviceStartCount).put("lastStartId",lastStartId).put("foregroundServiceType",getForegroundServiceType());
@@ -196,10 +208,14 @@ public final class CompanionService extends Service implements SensorEventListen
             j.put("tapHint",tapHint);
             JSONArray diagnostics=new JSONArray();for(GameCore.TapDetector.Impulse d:taps.recent)diagnostics.put(new JSONObject().put("uptimeMs",d.at).put("normalPeak",d.normal).put("lateralPeak",d.lateral).put("gyroPeak",d.gyro).put("reason",d.reason));j.put("tapDiagnostics",diagnostics);
             if(game!=null)j.put("level",Math.min(5,game.level)).put("barWidth",game.width).put("slotWidth",game.width).put("barX",game.x).put("slotX",game.target).put("barY",game.y).put("misses",game.misses).put("dropSeconds",game.dropSeconds());
-            File dir=getExternalFilesDir(null);if(dir!=null)atomic(new File(dir,"status.json"),j.toString().getBytes(StandardCharsets.UTF_8));
+            final File dir=getExternalFilesDir(null);
+            if(dir!=null){
+                final byte[] payload=j.toString().getBytes(StandardCharsets.UTF_8);
+                statusIo.execute(()->{try{atomic(new File(dir,"status.json"),payload);}catch(Exception ignored){}});
+            }
         }catch(Exception ignored){}
     }
     static void atomic(File file,byte[]data)throws Exception{File temp=new File(file.getParentFile(),file.getName()+".tmp");try(FileOutputStream out=new FileOutputStream(temp)){out.write(data);out.getFD().sync();}if(!temp.renameTo(file))throw new IOException("原子写入失败");}
-    @Override public void onDestroy(){android.util.Log.i("StepXCompanion","destroy instance="+serviceCreatedUptimeMs+" mode="+mode);h.removeCallbacksAndMessages(null);unregister();stopOutput(true);mode="stopped";writeStatus(true);try{unregisterReceiver(systemEvents);}catch(Exception ignored){}power.removeThermalStatusListener(thermalListener);if(phone!=null&&phoneListener!=null)phone.listen(phoneListener,PhoneStateListener.LISTEN_NONE);super.onDestroy();}
+    @Override public void onDestroy(){android.util.Log.i("StepXCompanion","destroy instance="+serviceCreatedUptimeMs+" mode="+mode);h.removeCallbacksAndMessages(null);unregister();stopOutput(true);mode="stopped";writeStatus(true);statusIo.shutdown();try{unregisterReceiver(systemEvents);}catch(Exception ignored){}power.removeThermalStatusListener(thermalListener);if(phone!=null&&phoneListener!=null)phone.listen(phoneListener,PhoneStateListener.LISTEN_NONE);super.onDestroy();}
     @Override public IBinder onBind(Intent i){return null;}
 }

@@ -7,9 +7,85 @@ use crate::{
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{cmp::Ordering, collections::BTreeMap, io::Write, path::Path, time::Duration};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, HashSet},
+    io::Write,
+    path::Path,
+    sync::{Mutex, OnceLock},
+    time::Duration,
+};
 
 const PROBE: &[u8] = include_bytes!("../assets/stepx-ota.jar");
+const REMOTE_DIR: &str = "/data/local/tmp/stepx-companion";
+const REMOTE_OTA_JAR: &str = "/data/local/tmp/stepx-companion/stepx-ota.jar";
+
+static VERIFIED_OTA_CACHE: OnceLock<Mutex<HashSet<(String, usize)>>> = OnceLock::new();
+
+fn ota_cache() -> &'static Mutex<HashSet<(String, usize)>> {
+    VERIFIED_OTA_CACHE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn is_ota_jar_cached(transport: &str) -> bool {
+    let key = transport.trim();
+    if key.is_empty() {
+        return false;
+    }
+    ota_cache()
+        .lock()
+        .map(|guard| guard.contains(&(key.to_string(), PROBE.len())))
+        .unwrap_or(false)
+}
+
+fn mark_ota_jar_cached(transport: &str) {
+    let key = transport.trim();
+    if key.is_empty() {
+        return;
+    }
+    if let Ok(mut guard) = ota_cache().lock() {
+        guard.insert((key.to_string(), PROBE.len()));
+    }
+}
+
+fn invalidate_ota_cache(transport: &str) {
+    let key = transport.trim();
+    if let Ok(mut guard) = ota_cache().lock() {
+        guard.retain(|(t, _)| t != key);
+    }
+}
+
+fn ensure_ota_jar(adb: &Adb, device: &Device) -> Result<()> {
+    if is_ota_jar_cached(&device.transport) {
+        return Ok(());
+    }
+    let expected_len = PROBE.len();
+    let check_cmd = format!(
+        "mkdir -p {dir} && chmod 700 {dir} && [ -f {jar} ] && [ \"$(stat -c %s {jar} 2>/dev/null)\" = \"{expected_len}\" ] && printf READY",
+        dir = shell_quote(REMOTE_DIR),
+        jar = shell_quote(REMOTE_OTA_JAR),
+    );
+    if let Ok(out) = adb.script(&device.transport, &check_cmd) {
+        if out.trim() == "READY" {
+            mark_ota_jar_cached(&device.transport);
+            return Ok(());
+        }
+    }
+    let mut file = tempfile::NamedTempFile::new()?;
+    file.write_all(PROBE)?;
+    file.as_file().sync_all()?;
+    adb.transfer(
+        &device.transport,
+        "push",
+        file.path(),
+        Path::new(REMOTE_OTA_JAR),
+    )?;
+    adb.script(
+        &device.transport,
+        &format!("chmod 600 {}", shell_quote(REMOTE_OTA_JAR)),
+    )?;
+    mark_ota_jar_cached(&device.transport);
+    Ok(())
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum OtaStatus {
@@ -185,34 +261,26 @@ pub fn check_official(
     )?;
     ensure!(launched.contains("Status: ok"), "手机官方更新界面未能启动");
     let deadline = std::time::Instant::now() + Duration::from_secs(35);
+    let stamp_q = shell_quote(stamp);
+    let poll_cmd = format!(
+        "set -- $(pidof com.stepos.update 2>/dev/null); pid=$1; \
+         if [ -z \"$pid\" ]; then printf 'STEPX_OTA_NO_PID\\n'; exit 0; fi; \
+         case \"$pid\" in *[!0-9]*) printf 'STEPX_OTA_BAD_PID\\n'; exit 0 ;; esac; \
+         logcat -d -v brief -T {stamp_q} --pid=\"$pid\" StepOSUpdate:V *:S"
+    );
     loop {
-        let pid = adb.shell(&device.transport, &["pidof", "com.stepos.update"])?;
-        let pid = pid
-            .split_whitespace()
-            .next()
-            .context("官方更新进程没有启动")?;
-        ensure!(
-            pid.bytes().all(|c| c.is_ascii_digit()),
-            "官方更新进程标识无效"
-        );
         let logs = adb
             .run_timeout(
-                &[
-                    "-s",
-                    &device.transport,
-                    "logcat",
-                    "-d",
-                    "-v",
-                    "brief",
-                    "-T",
-                    stamp,
-                    &format!("--pid={pid}"),
-                    "StepOSUpdate:V",
-                    "*:S",
-                ],
+                &["-s", &device.transport, "shell", &poll_cmd],
                 Duration::from_secs(8),
             )
             .map_err(|_| anyhow::anyhow!("无法读取官方更新器本次检查结果"))?;
+        if logs.lines().any(|line| line.trim() == "STEPX_OTA_NO_PID") {
+            anyhow::bail!("官方更新进程没有启动");
+        }
+        if logs.lines().any(|line| line.trim() == "STEPX_OTA_BAD_PID") {
+            anyhow::bail!("官方更新进程标识无效");
+        }
         if let Some(channel) = official_log_result(&logs)? {
             let mut channels = vec![channel.clone()];
             for name in ["stable", "beta", "daily"] {
@@ -348,6 +416,46 @@ pub fn install_status(adb: &Adb, device: &Device) -> Result<InstallStatus> {
     ensure!(data["error"].is_null(), "手机更新状态读取失败");
     Ok(parse_install_status(&data["install_status"]))
 }
+fn run_probe_once(adb: &Adb, device: &Device, context_only: bool) -> Result<String> {
+    let remote = format!("/data/local/tmp/stepx-ota-{:032x}", rand::random::<u128>());
+    let remote_q = shell_quote(&remote);
+    let jar_q = shell_quote(REMOTE_OTA_JAR);
+    let ctx_arg = if context_only { " --context" } else { "" };
+    let command = format!(
+        "apk=$(pm path com.stepos.update | sed -n 's/^package://p' | head -n 1); \
+         if [ -z \"$apk\" ]; then printf 'STEPX_OTA_NO_UPDATER\\n'; exit 0; fi; \
+         case \"$apk\" in /system/*|/product/*|/system_ext/*|/data/app/*) ;; *) printf 'STEPX_OTA_BAD_PATH\\n'; exit 0 ;; esac; \
+         env=$(settings get secure net_env 2>/dev/null | tr -d '\\r\\n'); \
+         case \"$env\" in dev|stg|test) ;; *) env=prod ;; esac; \
+         mkdir -m 700 {remote_q} || exit 1; \
+         CLASSPATH={jar_q} app_process / OtaProbe \"$apk\" {remote_q} \"$env\"{ctx_arg}; \
+         rm -rf {remote_q}"
+    );
+    let output = adb
+        .run_timeout(
+            &["-s", &device.transport, "shell", &command],
+            Duration::from_secs(135),
+        )
+        .context("官方 OTA 检查超时或手机连接中断，请重试")?;
+    if output
+        .lines()
+        .any(|line| line.trim() == "STEPX_OTA_NO_UPDATER")
+    {
+        anyhow::bail!("手机未安装受支持的官方更新组件");
+    }
+    if output
+        .lines()
+        .any(|line| line.trim() == "STEPX_OTA_BAD_PATH")
+    {
+        anyhow::bail!("更新组件路径不受支持");
+    }
+    let payload = output
+        .lines()
+        .find_map(|line| line.strip_prefix("STEPX_OTA_RESULT:"))
+        .context("手机更新检测组件没有返回结果")?;
+    Ok(payload.to_owned())
+}
+
 fn run_probe(
     adb: &Adb,
     device: &Device,
@@ -356,68 +464,28 @@ fn run_probe(
 ) -> Result<String> {
     device.verify(adb)?;
     progress("正在读取手机系统版本与官方更新组件…");
-    let apk = adb.shell(&device.transport, &["pm", "path", "com.stepos.update"])?;
-    let apk = apk
-        .lines()
-        .find_map(|s| s.strip_prefix("package:"))
-        .context("手机未安装受支持的官方更新组件")?;
-    ensure!(
-        apk.starts_with("/system/")
-            || apk.starts_with("/product/")
-            || apk.starts_with("/system_ext/")
-            || apk.starts_with("/data/app/"),
-        "更新组件路径不受支持"
-    );
-    let environment = adb.shell(&device.transport, &["settings", "get", "secure", "net_env"])?;
-    let environment = match environment.trim() {
-        "dev" => "dev",
-        "stg" => "stg",
-        "test" => "test",
-        _ => "prod",
+    let was_cached = is_ota_jar_cached(&device.transport);
+    ensure_ota_jar(adb, device)?;
+    progress(if context_only {
+        "正在读取官方更新组件权限与状态…"
+    } else {
+        "正在查询官方当前渠道、稳定版、测试版和每日构建…"
+    });
+    let payload = match run_probe_once(adb, device, context_only) {
+        Ok(payload) => payload,
+        Err(err)
+            if was_cached
+                && err.to_string() != "手机未安装受支持的官方更新组件"
+                && err.to_string() != "更新组件路径不受支持" =>
+        {
+            invalidate_ota_cache(&device.transport);
+            ensure_ota_jar(adb, device)?;
+            run_probe_once(adb, device, context_only)?
+        }
+        Err(err) => return Err(err),
     };
-    let remote = format!("/data/local/tmp/stepx-ota-{:032x}", rand::random::<u128>());
-    adb.shell(&device.transport, &["mkdir", "-m", "700", &remote])?;
-    let result = (|| {
-        let mut file = tempfile::NamedTempFile::new()?;
-        file.write_all(PROBE)?;
-        adb.transfer(
-            &device.transport,
-            "push",
-            file.path(),
-            Path::new(&format!("{remote}/probe.jar")),
-        )?;
-        adb.shell(
-            &device.transport,
-            &["chmod", "400", &format!("{remote}/probe.jar")],
-        )?;
-        progress(if context_only {
-            "正在读取官方更新组件权限与状态…"
-        } else {
-            "正在查询官方当前渠道、稳定版、测试版和每日构建…"
-        });
-        let command = format!(
-            "CLASSPATH={} app_process / OtaProbe {} {} {}{}",
-            shell_quote(&format!("{remote}/probe.jar")),
-            shell_quote(apk),
-            shell_quote(&remote),
-            shell_quote(environment),
-            if context_only { " --context" } else { "" }
-        );
-        let output = adb
-            .run_timeout(
-                &["-s", &device.transport, "shell", &command],
-                Duration::from_secs(135),
-            )
-            .context("官方 OTA 检查超时或手机连接中断，请重试")?;
-        let payload = output
-            .lines()
-            .find_map(|line| line.strip_prefix("STEPX_OTA_RESULT:"))
-            .context("手机更新检测组件没有返回结果")?;
-        progress("正在核对返回版本与本机系统…");
-        Ok(payload.to_owned())
-    })();
-    let _ = adb.shell(&device.transport, &["rm", "-rf", &remote]);
-    result
+    progress("正在核对返回版本与本机系统…");
+    Ok(payload)
 }
 
 fn safe_text(text: &str, limit: usize) -> String {

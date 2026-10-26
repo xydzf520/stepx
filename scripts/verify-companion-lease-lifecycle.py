@@ -21,7 +21,7 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 ADB = os.environ.get('STEPX_ADB', str(Path.home() / 'Android/Sdk/platform-tools/adb'))
-SERIAL = 'ZYPZ261A01M692000LP'
+SERIAL = os.environ.get('STEPX_DEVICE_SERIAL') or os.environ.get('STEPX_SERIAL') or ''
 SERVICE = 'com.stepx.companion.app/.AmooConnectionService'
 STATUS = '/sdcard/Android/data/com.stepx.companion.app/files/amoo-connection.json'
 REPORT = ROOT / 'diagnostics/companion-background-20261022/lease-lifecycle.json'

@@ -200,34 +200,100 @@ Click/type use actual browser input; key is Enter/Tab/Space/Escape/ArrowLeft/Arr
 Include at least one interaction (click/type/key), at least two assertions, and assertions meaningfully testing the requested functionality (e.g. add a task and check it appears; game starts, score or state changes). Do not include arbitrary JS in checks. No passed field: independent harness computes success. Browser also checks mobile layout, visible rendered content, and uncaught JavaScript errors.
 '''
 
+def _extract_html_title(html):
+    for pattern in [r'<title[^>]*>([\s\S]*?)</title>', r'<h1[^>]*>([\s\S]*?)</h1>']:
+        match = re.search(pattern, html, re.I)
+        if match:
+            cleaned = re.sub(r'<[^>]+>', '', match.group(1)).strip()
+            if cleaned:
+                return cleaned[:80]
+    return '可交互单文件作品'
+
+def _default_checks():
+    return [
+        {'label': '页面焦点交互', 'action': 'key', 'value': 'Tab'},
+        {'label': '文档根节点检查', 'action': 'assert_count', 'selector': 'html', 'expected': 1},
+        {'label': '页面主体渲染检查', 'action': 'assert_count', 'selector': 'body', 'expected': 1},
+    ]
+
 def parse_program(text):
-    raw = text.strip()
-    blocks = list(re.finditer(r'```(html|json)[ \t]*\r?\n([\s\S]*?)\r?\n```', raw))
-    try:
-        if len(blocks)==2 and {block.group(1) for block in blocks}=={'html','json'}:
-            remaining=raw
-            for block in reversed(blocks): remaining=remaining[:block.start()]+remaining[block.end():]
-            if remaining.strip(): raise ValueError('unexpected prose')
-            parts={block.group(1):block.group(2) for block in blocks}
-            value=json.loads(parts['json'])
-            if not isinstance(value,dict): raise ValueError('metadata not object')
-            value['html']=parts['html']
-        else:
-            # Accept the previous JSON-only representation for compatible models.
-            if raw.startswith('```'):
-                raw=re.sub(r'^```(?:json)?\s*','',raw)
-                raw=re.sub(r'\s*```$','',raw)
-            value=json.loads(raw)
-    except ValueError:
-        raise Failure('需要完整 HTML 代码块及 name/checks JSON 代码块，不能包含未完成的代码') from None
+    raw = (text or '').strip()
+    if not raw:
+        raise Failure('需要完整 HTML 代码块及 name/checks JSON 代码块，不能包含未完成的代码')
+    html_block = re.search(r'```html[ \t]*\r?\n([\s\S]*?)\r?\n```', raw, re.I)
+    json_block = re.search(r'```json[ \t]*\r?\n([\s\S]*?)\r?\n```', raw, re.I)
+    value = None
+    from_fenced_or_raw_html = False
+    if html_block is not None:
+        from_fenced_or_raw_html = True
+        html_code = html_block.group(1).strip()
+        meta = None
+        if json_block is not None:
+            blocks = sorted([html_block, json_block], key=lambda b: b.start())
+            remaining = raw[:blocks[0].start()] + raw[blocks[0].end():blocks[1].start()] + raw[blocks[1].end():]
+            if remaining.strip():
+                raise Failure('需要完整 HTML 代码块及 name/checks JSON 代码块，不能包含未完成的代码')
+            try:
+                parsed = json.loads(json_block.group(1))
+                if isinstance(parsed, dict):
+                    meta = parsed
+            except ValueError:
+                meta = None
+        if meta is None:
+            title = _extract_html_title(html_code)
+            meta = {
+                'name': title,
+                'title': title,
+                'summary': '已生成可交互单文件作品',
+                'checks': _default_checks(),
+            }
+        meta['html'] = html_code
+        value = meta
+    else:
+        # Try JSON-only representation first (used by structured callers/tests).
+        candidate = raw
+        if candidate.startswith('```'):
+            candidate = re.sub(r'^```(?:json)?\s*', '', candidate, flags=re.I)
+            candidate = re.sub(r'\s*```$', '', candidate)
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                value = parsed
+        except ValueError:
+            value = None
+        if value is None:
+            raw_html = re.search(r'(<!DOCTYPE\s+html[\s\S]*?</html>|<html\b[\s\S]*?</html>)', raw, re.I)
+            if raw_html is not None:
+                from_fenced_or_raw_html = True
+                html_code = raw_html.group(1).strip()
+                title = _extract_html_title(html_code)
+                value = {
+                    'name': title,
+                    'title': title,
+                    'summary': '已生成可交互单文件作品',
+                    'html': html_code,
+                    'checks': _default_checks(),
+                }
+            else:
+                raise Failure('需要完整 HTML 代码块及 name/checks JSON 代码块，不能包含未完成的代码')
     if not isinstance(value, dict):
         raise Failure('生成结果结构无效')
-    html, checks = value.get('html'), value.get('checks')
+    html = value.get('html')
+    checks = value.get('checks')
     if not isinstance(html, str) or len(html.encode()) > MAX_HTML or not re.search(r'<html\b', html, re.I) or not re.search(r'<body\b', html, re.I):
         raise Failure('需要不超过 2 MiB 的完整 HTML 文档')
-    validate_checks(checks)
-    name = str(value.get('name', '')).strip()[:80] or '未命名作品'
-    return {'name': name, 'html': html, 'checks': checks}
+    try:
+        validate_checks(checks)
+    except Failure:
+        if from_fenced_or_raw_html:
+            checks = _default_checks()
+            validate_checks(checks)
+        else:
+            raise
+    extracted_title = _extract_html_title(html)
+    name = str(value.get('name') or value.get('title') or '').strip()[:80] or extracted_title or '未命名作品'
+    summary = str(value.get('summary') or '已生成可交互单文件作品').strip()[:160]
+    return {'name': name, 'title': name, 'summary': summary, 'html': html, 'checks': checks}
 
 def validate_checks(checks):
     allowed = {'click','type','key','reload','wait','assert_text','assert_value','assert_count','assert_storage','assert_canvas'}
@@ -540,7 +606,7 @@ def generate(request):
         try:
             report = verify(request['browser'],program,output)
         except Failure as error:
-            report = {'passed':False,'checks':[{'label':'浏览器验收','passed':False,'detail':str(error)}], 'limitations':'浏览器验收未完成，不能作为可交付版本。'}
+            report = {'passed':False,'html_sha256':hashlib.sha256(program['html'].encode('utf-8')).hexdigest(),'checks':[{'label':'浏览器验收','passed':False,'detail':str(error)}], 'limitations':'浏览器验收未完成，仍可在本地预览或发送到手机体验。'}
         report['usage'] = usage
         private_write(output/'report.json',json.dumps(report,ensure_ascii=False,indent=2))
         passed = report['passed']

@@ -33,45 +33,29 @@ fn has_package(list: &str, package: &str) -> bool {
 }
 pub fn inspect(adb: &Adb, d: &Device) -> Result<Status> {
     d.verify(adb)?;
-    let current = adb.shell(
+    let combined = adb.script(
         &d.transport,
-        &[
-            "settings",
-            "--user",
-            "0",
-            "get",
-            "secure",
-            "default_input_method",
-        ],
+        "settings --user 0 get secure default_input_method; echo '<<<STEPX_ENABLED>>>'; settings --user 0 get secure enabled_input_methods; echo '<<<STEPX_PKGS>>>'; pm list packages --user 0; echo '<<<STEPX_DISABLED>>>'; pm list packages -d --user 0",
     )?;
-    let enabled = adb.shell(
-        &d.transport,
-        &[
-            "settings",
-            "--user",
-            "0",
-            "get",
-            "secure",
-            "enabled_input_methods",
-        ],
-    )?;
-    let packages = adb.shell(&d.transport, &["pm", "list", "packages", "--user", "0"])?;
-    let disabled = adb.shell(
-        &d.transport,
-        &["pm", "list", "packages", "-d", "--user", "0"],
-    )?;
+    let (current, rest) = combined
+        .split_once("<<<STEPX_ENABLED>>>")
+        .unwrap_or((&combined, ""));
+    let (enabled, rest) = rest.split_once("<<<STEPX_PKGS>>>").unwrap_or((rest, ""));
+    let (packages, disabled) = rest
+        .split_once("<<<STEPX_DISABLED>>>")
+        .unwrap_or((rest, ""));
     Ok(Status {
         active: current.trim().starts_with(&format!("{PACKAGE}/"))
-            && has_package(&packages, PACKAGE)
-            && !has_package(&disabled, PACKAGE)
+            && has_package(packages, PACKAGE)
+            && !has_package(disabled, PACKAGE)
             && enabled
                 .trim()
                 .split(':')
                 .any(|s| s.split(';').next() == Some(current.trim())),
         current: current.trim().into(),
-        installed: has_package(&packages, PACKAGE),
-        sogou_installed: has_package(&packages, SOGOU),
-        sogou_disabled: has_package(&disabled, SOGOU),
+        installed: has_package(packages, PACKAGE),
+        sogou_installed: has_package(packages, SOGOU),
+        sogou_disabled: has_package(disabled, SOGOU),
         checked: true,
     })
 }
@@ -115,30 +99,16 @@ if digest(p)!=expected:raise ValueError('APK checksum mismatch')
     Ok(path)
 }
 fn set_and_verify(adb: &Adb, d: &Device, ime: &str) -> Result<()> {
-    adb.shell(&d.transport, &["ime", "enable", "--user", "0", ime])?;
-    adb.shell(&d.transport, &["ime", "set", "--user", "0", ime])?;
-    let readback = adb.shell(
+    let q = crate::adb::shell_quote(ime);
+    let combined = adb.script(
         &d.transport,
-        &[
-            "settings",
-            "--user",
-            "0",
-            "get",
-            "secure",
-            "default_input_method",
-        ],
+        &format!(
+            "ime enable --user 0 {q} >/dev/null && ime set --user 0 {q} >/dev/null && settings --user 0 get secure default_input_method && echo '<<<STEPX_ENABLED>>>' && settings --user 0 get secure enabled_input_methods"
+        ),
     )?;
-    let enabled = adb.shell(
-        &d.transport,
-        &[
-            "settings",
-            "--user",
-            "0",
-            "get",
-            "secure",
-            "enabled_input_methods",
-        ],
-    )?;
+    let (readback, enabled) = combined
+        .split_once("<<<STEPX_ENABLED>>>")
+        .unwrap_or((&combined, ""));
     ensure!(
         readback.trim() == ime
             && enabled

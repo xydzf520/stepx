@@ -142,6 +142,9 @@ public final class ImPushCatalogTest {
             );
         }
         check(thread.messages.size() == PushStore.MAX_MESSAGES_PER_THREAD, "Messages per thread must be capped at 100");
+        check(!store.isUnchangedSnapshot(0L), "Full snapshot (sinceRevision=0) must have unchanged=false");
+        check(store.isUnchangedSnapshot(store.getRevision()), "Delta snapshot at current revision must have unchanged=true");
+        check(!store.isUnchangedSnapshot(store.getRevision() - 1), "Delta snapshot at stale revision must have unchanged=false");
 
         System.out.println("ImPushCatalogTest passed");
     }

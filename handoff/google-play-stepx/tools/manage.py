@@ -108,7 +108,9 @@ def install_apks():
     check_apks()
     for package in PACKAGES:
         meta = next(x for x in CONFIG['apks'] if x['package'] == package)
-        result = run(ADB + ['install', '--user', '0', str(DOWNLOADS / meta['filename'])], timeout=180)
+        # These provider packages must be discoverable by clients that assume a
+        # preinstalled GMS stack. This does not mark them SYSTEM/PRIVILEGED.
+        result = run(ADB + ['install', '--user', '0', '--force-queryable', str(DOWNLOADS / meta['filename'])], timeout=180)
         assert 'Success' in result.stdout, 'Installation not confirmed: ' + package
         print('Installed ' + package, flush=True)
     shell('settings', 'put', 'global', 'cn_gms_core', '1')
@@ -118,6 +120,21 @@ def install_apks():
     for package in ['com.google.android.gms', 'com.android.vending']:
         shell('cmd', 'appops', 'set', package, 'SYSTEM_EXEMPT_FROM_POWER_RESTRICTIONS', 'allow')
     print('APKs installed. Do not log in before adapter verification and an unlogged reboot test.')
+
+
+def current_permission_checks(checks):
+    """An old boot receipt is not evidence after a Play services update."""
+    dumps = {package: shell('dumpsys', 'package', package) for package in PACKAGES}
+    missing = []
+    for check in checks:
+        match = re.fullmatch(r'check (\S+) (\S+)=0', check)
+        if not match or match[1] not in dumps:
+            missing.append('unrecognized_receipt')
+            continue
+        permission = match[2]
+        if not re.search(r'^\s*' + re.escape(permission) + r': granted=true(?:\s|,|$)', dumps[match[1]], re.M):
+            missing.append(match[1] + ':' + permission)
+    return missing
 
 
 def status():
@@ -133,10 +150,90 @@ def status():
     summary.update(current_boot_matches=adapter.get('identity') == result['boot_id'],
                    current_pid_matches=str(adapter.get('target_pid')) == shell('pidof', 'system_server'),
                    permission_checks=len(checks), all_checked_granted=bool(checks) and all(x.endswith('=0') for x in checks))
+    missing = current_permission_checks(checks)
+    summary.update(current_permissions_granted=bool(checks) and not missing, missing_permissions=missing)
     print(json.dumps(summary, indent=2))
     assert summary['status'] == 'success' and summary['detached']
     assert summary['current_boot_matches'] and summary['current_pid_matches']
     assert len(checks) >= 120 and summary['all_checked_granted']
+    assert summary['current_permissions_granted'], 'Current Google permissions differ from the saved receipt'
+    return summary
+
+
+def repair_runtime():
+    """Re-run the existing pinned adapter after a package update; keep boot hooks intact."""
+    guard(native=True)
+    assert 'RUNNING_UNLOCKED' in shell('dumpsys', 'user'), 'Unlock the phone first'
+    assert shell('getprop', 'persist.openclaw.zygote.path') == '', 'Another startup operation is active'
+    assert shell('getprop', 'sys.openclaw.env.start') == '', 'Another startup operation is active'
+    expected = {name: sha256(ROOT / 'module' / name) for name in ('boot.py', 'inject.py')}
+    code = '''import os,json,hashlib,fcntl,time
+base='/usr/local/lib/stepx-gms';state='/var/lib/stepx-gms'
+def sha(path):return hashlib.sha256(open(path,'rb').read()).hexdigest()
+boot=base+'/boot.py'
+if sha(boot)!=EXPECTED['boot.py']:
+ c=json.load(open('/usr/local/lib/stepx-companion/config.json'))
+ assert sha(boot)==c['chain_sha256'], 'Unknown boot hook'
+ boot='/usr/local/lib/stepx-companion/previous-boot.py'
+assert sha(boot)==EXPECTED['boot.py'] and sha(base+'/inject.py')==EXPECTED['inject.py'], 'Adapter changed'
+lock=os.open(state+'/lock',os.O_RDWR|os.O_CREAT,0o600)
+fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+last=state+'/last.json'
+if os.path.exists(last):os.rename(last,state+'/maintenance-'+str(time.time_ns())+'.json')
+os.close(lock)
+print(json.dumps({'prepared':True}))
+'''.replace('EXPECTED', repr(expected))
+    proof = root_json(code)
+    assert proof.get('prepared'), 'Adapter repair did not prepare'
+    def trigger(value):
+        assert value in ('', '1')
+        parent = next(int(x.split()[0]) for x in shell('ps', '-A', '-o', 'PID,PPID,NAME').splitlines()
+                      if x.split()[-1] == 'openclaw_env' and x.split()[1] == '1')
+        def observed():
+            actual = shell('getprop', 'sys.openclaw.env.start')
+            if actual == value:
+                return True
+            # Factory startup consumes the trigger immediately on this firmware.
+            return value == '1' and actual == '' and any(
+                x.split()[-1] == 'openclaw_env' and x.split()[1] == '1'
+                and int(x.split()[0]) != parent
+                for x in shell('ps', '-A', '-o', 'PID,PPID,NAME').splitlines()[1:])
+        request = '''import socket,struct,json
+s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.settimeout(3)
+s.connect(PATH);n=b'sys.openclaw.env.start';v=VALUE.encode()
+s.sendall(struct.pack('<II',0x20001,len(n))+n+struct.pack('<I',len(v))+v)
+r=s.recv(4);s.close();assert len(r)==4 and struct.unpack('<I',r)[0]==0
+print(json.dumps({'requested':True}))
+'''.replace('PATH', repr('/proc/' + str(parent) + '/root/dev/socket/property_service')).replace('VALUE', repr(value))
+        try:
+            root_json(request)
+        except (RuntimeError, subprocess.SubprocessError):
+            # The start trigger terminates its own gateway; require native read-back.
+            if not observed():
+                raise
+        assert observed(), 'Factory trigger read-back failed'
+
+    # The factory init service supplies its reviewed startup context. Running
+    # the same code inside an ordinary Ubuntu child cannot restore permissions.
+    try:
+        trigger('1')
+        deadline = time.monotonic() + 55
+        while time.monotonic() < deadline:
+            time.sleep(3)
+            try:
+                value = root_json("import json,os;p='/var/lib/stepx-gms/last.json';print(json.dumps(json.load(open(p)) if os.path.exists(p) else {}))")
+            except (RuntimeError, subprocess.SubprocessError):
+                continue  # Gateway is restarting with the factory service.
+            if not value or value.get('status') == 'started':
+                continue
+            assert value.get('status') == 'success' and value.get('detached'), 'Adapter repair failed; original hooks preserved'
+            summary = status()
+            assert summary['current_permissions_granted'], 'Current Google permissions did not recover'
+            return
+        raise RuntimeError('Adapter repair timed out; inspect its saved result before retrying')
+    finally:
+        if shell('getprop', 'sys.openclaw.env.start') == '1':
+            trigger('')
 
 
 def verify():
@@ -213,7 +310,7 @@ print(json.dumps({'manifest':manifest,'actual':actual,'stock':digest('/usr/local
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
-    for name in ['preflight', 'check-apks', 'prepare', 'install-apks', 'status', 'verify', 'certification', 'recover-adapter-metadata']:
+    for name in ['preflight', 'check-apks', 'prepare', 'install-apks', 'status', 'verify', 'certification', 'recover-adapter-metadata', 'repair-runtime']:
         commands.add_parser(name)
     commands.add_parser('fetch').add_argument('--archive')
     commands.add_parser('adopt-backup').add_argument('directory')
@@ -226,7 +323,7 @@ def main():
     elif args.command == 'adopt-backup': adopt(args.directory)
     else: {'preflight': preflight, 'check-apks': check_apks, 'prepare': prepare,
            'install-apks': install_apks, 'status': status, 'verify': verify,
-           'recover-adapter-metadata': recover_metadata}[args.command]()
+           'recover-adapter-metadata': recover_metadata, 'repair-runtime': repair_runtime}[args.command]()
 
 
 if __name__ == '__main__':

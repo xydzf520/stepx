@@ -72,5 +72,6 @@ pub mod speech;
 
 pub mod input_method;
 
+pub mod amoo_route;
 pub mod amoo_workspace;
 pub mod desktop_update;

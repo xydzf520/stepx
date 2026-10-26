@@ -34,9 +34,9 @@ public final class AmooConnectionService extends Service {
     private boolean supported,registered;
     private volatile boolean closed;
     private volatile int latestStart;
-    private String lastError="",requestId="",observedLease="";
-    private long observedAt=0;
-    private int bootCount;
+    private String lastError="",requestId="",observedLease="",lastNotifiedText="",lastWrittenState="",lastWrittenMessage="";
+    private long observedAt=0,lastWriteMs=0;
+    private int bootCount,lastLeaseCount=-1;
     private final BroadcastReceiver screen=new BroadcastReceiver(){@Override public void onReceive(Context c,Intent i){
         if(worker==null)return;
         final String action=i.getAction();final long receivedAt=SystemClock.elapsedRealtime();
@@ -55,7 +55,8 @@ public final class AmooConnectionService extends Service {
         if(bootCount>=0&&preferences.getInt("wake_boot",-2)==bootCount)leases.restoreWake(preferences.getLong("wake_elapsed",-1),SystemClock.elapsedRealtime());
         leases.screen(power.isInteractive(),SystemClock.elapsedRealtime());
         getSystemService(NotificationManager.class).createNotificationChannel(new NotificationChannel("amoo_connection","电脑后台协作",NotificationManager.IMPORTANCE_LOW));
-        startForeground(18,notification("正在检查任务连接…"));
+        lastNotifiedText="正在检查任务连接…";
+        startForeground(18,notification(lastNotifiedText));
         workerThread=new HandlerThread("StepXAmooConnection");workerThread.start();worker=new Handler(workerThread.getLooper());
         IntentFilter filter=new IntentFilter(Intent.ACTION_SCREEN_OFF);filter.addAction(Intent.ACTION_SCREEN_ON);
         registerReceiver(screen,filter,Context.RECEIVER_NOT_EXPORTED);registered=true;
@@ -63,10 +64,12 @@ public final class AmooConnectionService extends Service {
     private Notification notification(String text){
         PendingIntent open=PendingIntent.getActivity(this,182,new Intent(this,MainActivity.class),PendingIntent.FLAG_UPDATE_CURRENT|PendingIntent.FLAG_IMMUTABLE);
         PendingIntent stop=PendingIntent.getForegroundService(this,183,new Intent(this,AmooConnectionService.class).putExtra("op","disable").putExtra("request_id","notification-stop"),PendingIntent.FLAG_UPDATE_CURRENT|PendingIntent.FLAG_IMMUTABLE);
-        return new Notification.Builder(this,"amoo_connection").setSmallIcon(android.R.drawable.stat_notify_sync).setContentTitle("StepX伴侣 · 后台协作").setContentText(text).setContentIntent(open).setOngoing(true).addAction(new Notification.Action.Builder(null,"停止后台协作",stop).build()).build();
+        return new Notification.Builder(this,"amoo_connection").setSmallIcon(android.R.drawable.stat_notify_sync).setContentTitle("StepX伴侣 · 后台协作").setContentText(text).setContentIntent(open).setOngoing(true).setOnlyAlertOnce(true).addAction(new Notification.Action.Builder(null,"停止后台协作",stop).build()).build();
     }
     @Override public int onStartCommand(Intent intent,int flags,int startId){
-        latestStart=startId;startForeground(18,notification("正在检查任务连接…"));
+        latestStart=startId;
+        if(lastNotifiedText.isEmpty())lastNotifiedText="正在检查任务连接…";
+        startForeground(18,notification(lastNotifiedText));
         final String id=bounded(intent==null?null:intent.getStringExtra("request_id"),"local-"+System.currentTimeMillis());
         final String op=intent==null?"status":bounded(intent.getStringExtra("op"),"status");
         final String leaseId=intent==null?"":bounded(intent.getStringExtra("lease_id"),"");
@@ -139,10 +142,18 @@ public final class AmooConnectionService extends Service {
             }catch(Exception e){lastError=message(e);if(e instanceof SecurityException)supported=false;leases.clear();active=false;}
         }else leases.screen(power.isInteractive(),now);
         if(!active&&cpu.isHeld())cpu.release();
-        writeStatus();
         long grace=supported?leases.idleGraceRemaining(enabled(),power.isInteractive(),now):0;
+        String msg=statusMessage(now);
+        String curState=(active?"connected":(grace>0?"grace":"idle"))+":"+enabled()+":"+supported+":"+power.isInteractive()+":"+requestId;
+        int curLeaseCount=leases.count(now);
+        if(!curState.equals(lastWrittenState)||!msg.equals(lastWrittenMessage)||curLeaseCount!=lastLeaseCount||lastWriteMs==0||now-lastWriteMs>=15_000L){
+            writeStatus(now,msg,curState,curLeaseCount);
+        }
         if(active||grace>0){
-            getSystemService(NotificationManager.class).notify(18,notification(statusMessage(now)));
+            if(!msg.equals(lastNotifiedText)){
+                NotificationManager nm=getSystemService(NotificationManager.class);
+                if(nm!=null){nm.notify(18,notification(msg));lastNotifiedText=msg;}
+            }
             // Idle grace observes only the existing native window. CPU lock is
             // already released above; no lease, wake request or deadline is added.
             worker.postDelayed(pulse,active?1000:Math.min(1000,grace));
@@ -158,23 +169,24 @@ public final class AmooConnectionService extends Service {
         if(!power.isInteractive()&&leases.nativeWindowRemaining(now)==0&&delay>0)return "正在等待熄屏稳定，约 "+((delay+999)/1000)+" 秒后连接。";
         return power.isInteractive()?"任务连接中，等待 Amoo 实际回执。":"已请求 Amoo 后台连接，等待实际任务回执。";
     }
-    private void writeStatus(){try{
-        long now=SystemClock.elapsedRealtime();leases.screen(power.isInteractive(),now);boolean active=enabled()&&leases.active(now);
+    private void writeStatus(long now,String msg,String curState,int curLeaseCount){try{
+        leases.screen(power.isInteractive(),now);boolean active=enabled()&&leases.active(now);
         boolean observed=active&&observedAt>0&&observedAt<=now&&now-observedAt<60_000&&leases.has(observedLease,now);
         JSONObject state=new JSONObject().put("protocol",2).put("requestId",requestId).put("request_id",requestId)
             .put("supported",supported).put("enabled",enabled()).put("active",active).put("bridgeReady",false)
-            .put("leaseCount",leases.count(now)).put("leaseExpiresElapsedMs",leases.expires(now))
+            .put("leaseCount",curLeaseCount).put("leaseExpiresElapsedMs",leases.expires(now))
             .put("uptimeMs",now).put("screenInteractive",power.isInteractive()).put("wakeLockHeld",cpu.isHeld())
             .put("wakeRequested",leases.lastWake()>=0&&leases.nativeWindowRemaining(now)>0).put("wakeRequestedElapsedMs",leases.lastWake()).put("lastWakeRequestElapsedMs",leases.lastRequest())
             .put("nextWakeInMs",active&&mayRequest(now)?leases.wakeDelay(power.isInteractive(),now):-1)
             .put("nativeWindowRemainingMs",leases.nativeWindowRemaining(now))
             .put("idleGraceRemainingMs",supported?leases.idleGraceRemaining(enabled(),power.isInteractive(),now):0).put("observedConnected",observed)
             .put("observedConnectedElapsedMs",observedAt).put("observedConnectionSource",observed?"agentbus_handshake":"")
-            .put("lastError",lastError).put("bridge",new JSONObject()).put("message",statusMessage(now));
+            .put("lastError",lastError).put("bridge",new JSONObject()).put("message",msg);
         File dir=getExternalFilesDir(null);if(dir==null)throw new IOException("伴侣状态目录不可用");dir.mkdirs();
         File temporary=new File(dir,"amoo-connection.json.tmp"),result=new File(dir,"amoo-connection.json");
         Files.write(temporary.toPath(),state.toString().getBytes(StandardCharsets.UTF_8));
         Files.move(temporary.toPath(),result.toPath(),StandardCopyOption.REPLACE_EXISTING,StandardCopyOption.ATOMIC_MOVE);
+        lastWrittenState=curState;lastWrittenMessage=msg;lastLeaseCount=curLeaseCount;lastWriteMs=now;
     }catch(Exception e){lastError=message(e);android.util.Log.e("StepXAmoo","Cannot write task state: "+e.getClass().getSimpleName());}}
     private static String message(Exception e){String text=e.getMessage();return text==null?e.getClass().getSimpleName():text;}
     @Override public void onDestroy(){closed=true;if(registered)unregisterReceiver(screen);if(worker!=null)worker.removeCallbacksAndMessages(null);if(cpu!=null&&cpu.isHeld())cpu.release();if(workerThread!=null)workerThread.quitSafely();super.onDestroy();}

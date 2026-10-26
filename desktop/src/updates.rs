@@ -7,7 +7,7 @@ use crate::{
 };
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::{cmp::Ordering, collections::BTreeMap, path::PathBuf, process::Command, time::Duration};
+use std::{cmp::Ordering, collections::BTreeMap, path::PathBuf, time::Duration};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct UpdateConfig {
@@ -277,34 +277,18 @@ pub struct PhoneVersion {
 }
 pub fn phone_version(adb: &Adb, device: &Device) -> Result<PhoneVersion> {
     device.verify(adb)?;
-    let firmware = adb.shell(&device.transport, &["getprop", "ro.build.aios_version"])?;
-    let firmware = if firmware.trim().is_empty() {
-        adb.shell(&device.transport, &["getprop", "ro.build.display.id"])?
-    } else {
-        firmware
-    };
-    let security_patch = adb.shell(
+    let raw = adb.script(
         &device.transport,
-        &["getprop", "ro.build.version.security_patch"],
+        "v=$(getprop ro.build.aios_version); if [ -z \"$v\" ]; then v=$(getprop ro.build.display.id); fi; printf '%s\\n' \"$v\"; getprop ro.build.version.security_patch; cmd package resolve-activity --brief -a stepos.settings.SYSTEM_UPDATE_SETTINGS 2>/dev/null || true",
     )?;
-    let resolved = adb.shell(
-        &device.transport,
-        &[
-            "cmd",
-            "package",
-            "resolve-activity",
-            "--brief",
-            "-a",
-            "stepos.settings.SYSTEM_UPDATE_SETTINGS",
-        ],
-    )?;
+    let mut lines = raw.lines();
+    let firmware = lines.next().unwrap_or("").trim().to_owned();
+    let security_patch = lines.next().unwrap_or("").trim().to_owned();
     Ok(PhoneVersion {
         serial: device.serial.clone(),
-        firmware: firmware.trim().to_owned(),
-        security_patch: security_patch.trim().to_owned(),
-        has_update_page: resolved
-            .lines()
-            .any(|line| line.trim().starts_with("com.stepos.update/")),
+        firmware,
+        security_patch,
+        has_update_page: lines.any(|line| line.trim().starts_with("com.stepos.update/")),
     })
 }
 pub fn open_phone_update(adb: &Adb, device: &Device) -> Result<()> {

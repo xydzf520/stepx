@@ -102,7 +102,9 @@ pub fn scan(
 ) -> Result<(Vec<Transport>, Vec<Service>)> {
     let before = parse_devices(&adb.run_timeout(&["devices", "-l"], Duration::from_secs(3))?);
     let services = crate::discovery::discover_services(adb).unwrap_or_default();
-    connect_remembered(adb, prefs, &services, paired_hosts, &before);
+    if !connect_remembered(adb, prefs, &services, paired_hosts, &before) {
+        return Ok((before, services));
+    }
     Ok((
         parse_devices(&adb.run_timeout(&["devices", "-l"], Duration::from_secs(3))?),
         services,
@@ -115,7 +117,8 @@ fn connect_remembered(
     services: &[Service],
     paired_hosts: &[IpAddr],
     before: &[Transport],
-) {
+) -> bool {
+    let mut attempted = false;
     for endpoint in targets(prefs, services, paired_hosts) {
         if before
             .iter()
@@ -123,6 +126,7 @@ fn connect_remembered(
         {
             continue;
         }
+        attempted = true;
         if adb
             .run_timeout(&["connect", &endpoint], Duration::from_secs(2))
             .is_err()
@@ -146,6 +150,7 @@ fn connect_remembered(
             let _ = adb.run_timeout(&["disconnect", &endpoint], Duration::from_secs(2));
         }
     }
+    attempted
 }
 
 #[cfg(test)]

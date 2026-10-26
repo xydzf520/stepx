@@ -10,11 +10,16 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.security.MessageDigest;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 /** Files move only over the already-authorized desktop connection; this app opens no server. */
 final class TransferStore {
     static final long MAX_BYTES=256L*1024*1024;
     static final String AUTHORITY="com.stepx.companion.app.transfers";
+    private static final ConcurrentHashMap<String,String> DIGEST_CACHE=new ConcurrentHashMap<>();
+    private static volatile String cachedLinkPath="";
+    private static volatile long cachedLinkMtime=-1L,cachedLinkLen=-1L;
+    private static volatile JSONObject cachedLinkJson;
     private final Context context;
     static final class Link {
         final String id,name; final boolean online;
@@ -32,7 +37,15 @@ final class TransferStore {
     TransferStore(Context c){context=c.getApplicationContext();}
     File root()throws IOException {File f=context.getExternalFilesDir(null);if(f==null)throw new IOException("手机存储暂不可用");if(!f.exists()&&!f.mkdirs())throw new IOException("无法创建传输目录");return f;}
     Link link(){try{
-        JSONObject j=readJson(new File(root(),"desktop-link.json"));String id=j.optString("desktopId"),name=j.optString("computerName","电脑");long now=System.currentTimeMillis(),updated=j.optLong("updatedAtMs"),expires=j.optLong("expiresAtMs");
+        File file=new File(root(),"desktop-link.json");
+        long mtime=file.lastModified(),len=file.length();
+        String path=file.getAbsolutePath();
+        JSONObject j=cachedLinkJson;
+        if(j==null||mtime<=0||mtime!=cachedLinkMtime||len!=cachedLinkLen||!path.equals(cachedLinkPath)){
+            j=readJson(file);
+            cachedLinkPath=path;cachedLinkMtime=mtime;cachedLinkLen=len;cachedLinkJson=j;
+        }
+        String id=j.optString("desktopId"),name=j.optString("computerName","电脑");long now=System.currentTimeMillis(),updated=j.optLong("updatedAtMs"),expires=j.optLong("expiresAtMs");
         boolean valid=j.optInt("protocol")==1&&uuid(id)&&j.optBoolean("connected")&&now>=updated-5000&&now-updated<=30000&&expires>=now&&expires<=updated+120000;
         return new Link(id,name,valid);
     }catch(Exception ignored){return new Link("","",false);}}
@@ -95,9 +108,22 @@ final class TransferStore {
     static void writeJson(File f,JSONObject j)throws Exception {File tmp=new File(f.getParentFile(),f.getName()+".tmp");Files.write(tmp.toPath(),j.toString().getBytes(StandardCharsets.UTF_8));Files.move(tmp.toPath(),f.toPath(),StandardCopyOption.ATOMIC_MOVE,StandardCopyOption.REPLACE_EXISTING);}
     private static String hex(byte[] data){StringBuilder s=new StringBuilder();for(byte b:data)s.append(String.format(Locale.ROOT,"%02x",b&255));return s.toString();}
     File verifiedFile(String direction,String id)throws Exception {
-        Entry e=get(direction,id);File f=new File(directory(direction,id,false),e.name);MessageDigest d=MessageDigest.getInstance("SHA-256");byte[] b=new byte[65536];long size=0;
-        try(InputStream in=new FileInputStream(f)){int n;while((n=in.read(b))!=-1){size+=n;if(size>MAX_BYTES)throw new IOException("文件超过大小限制");d.update(b,0,n);}}
-        if(size!=e.size||!hex(d.digest()).equals(e.sha256))throw new IOException("文件校验未通过，请重新传输");return f;
+        Entry e=get(direction,id);File payload=new File(directory(direction,id,false),e.name);
+        long len=payload.length(),mtime=payload.lastModified();
+        String cacheKey=payload.getAbsolutePath()+":"+len+":"+mtime;
+        String digestHex=DIGEST_CACHE.get(cacheKey);
+        if(digestHex==null){
+            MessageDigest d=MessageDigest.getInstance("SHA-256");byte[] b=new byte[65536];long size=0;
+            try(InputStream in=new FileInputStream(payload)){int n;while((n=in.read(b))!=-1){size+=n;if(size>MAX_BYTES)throw new IOException("文件超过大小限制");d.update(b,0,n);}}
+            if(size!=e.size)throw new IOException("文件校验未通过，请重新传输");
+            digestHex=hex(d.digest());
+            if(payload.length()==len&&payload.lastModified()==mtime){
+                if(DIGEST_CACHE.size()>512)DIGEST_CACHE.clear();
+                DIGEST_CACHE.put(cacheKey,digestHex);
+            }
+        }
+        if(len!=e.size||!digestHex.equals(e.sha256))throw new IOException("文件校验未通过，请重新传输");
+        return payload;
     }
     void save(Entry entry,Uri destination)throws Exception {File f=verifiedFile(entry.direction,entry.id);try(InputStream in=new FileInputStream(f);OutputStream out=context.getContentResolver().openOutputStream(destination,"wt")){if(out==null)throw new IOException("无法写入所选位置");byte[] buf=new byte[65536];int n;while((n=in.read(buf))!=-1)out.write(buf,0,n);}}
     void delete(Entry e)throws IOException {deleteDirectory(directory(e.direction,e.id,false));}

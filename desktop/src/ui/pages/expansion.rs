@@ -81,19 +81,61 @@ impl Companion {
     fn ex_button(&self, id: impl Into<String>, text: &str, a: EA, style: Btn) -> El {
         self.button(id, text, Action::Expansion(a), style)
     }
+    fn ex_button_icon(
+        &self,
+        id: &str,
+        label: impl Into<String>,
+        icon: UiIcon,
+        a: EA,
+        kind: Btn,
+    ) -> El {
+        self.button_icon(format!("ex-{id}"), label, icon, Action::Expansion(a), kind)
+    }
     pub(in super::super) fn expansion_card(&self) -> El {
         let p = self.p();
         let s = &self.expansion.snapshot;
+        let effective_files: Vec<Value> = {
+            let mut merged = s.files.clone();
+            if let Some(arr) = s.status["recentFiles"].as_array() {
+                for item in arr {
+                    let key = item["id"]
+                        .as_str()
+                        .or_else(|| item["name"].as_str())
+                        .unwrap_or("");
+                    if !key.is_empty()
+                        && !merged.iter().any(|existing| {
+                            existing["id"].as_str() == Some(key)
+                                || existing["name"].as_str() == Some(key)
+                        })
+                    {
+                        merged.push(item.clone());
+                    }
+                }
+            }
+            if merged.is_empty() && self.demo_mode && std::env::var_os("STEPX_EMPTY").is_none() {
+                expansion_state::demo_files()
+            } else {
+                merged
+            }
+        };
+        let is_archived_item = |j: &Value| {
+            let st = j["state"].as_str().unwrap_or("");
+            st.is_empty() || st == "archived" || st == "已迁移"
+        };
+        let item_category = |j: &Value| -> &'static str { expansion_state::expansion_item_kind(j) };
         let bytes = s.status["releasedBytes"].as_u64().unwrap_or_else(|| {
-            s.files
+            effective_files
                 .iter()
-                .filter(|j| j["state"] == "archived")
+                .filter(|j| is_archived_item(j))
                 .map(|j| j["size"].as_u64().unwrap_or(0))
                 .sum()
         });
-        let count = s.status["count"]
-            .as_u64()
-            .unwrap_or_else(|| s.files.iter().filter(|j| j["state"] == "archived").count() as u64);
+        let count = s.status["count"].as_u64().unwrap_or_else(|| {
+            effective_files
+                .iter()
+                .filter(|j| is_archived_item(j))
+                .count() as u64
+        });
         let headline = self.between(
             self.hstack(
                 S2,
@@ -165,7 +207,7 @@ impl Companion {
             s.phase.clone()
         } else {
             if s.phase.is_empty() {
-                "正在检查迁移条件…".into()
+                "正在检查迁移条件 · 只读取清单，不会误删文件".into()
             } else {
                 s.phase.clone()
             }
@@ -207,14 +249,153 @@ impl Companion {
         if let Some(j) = s.active.as_ref() {
             children.push(self.text(label(j, "name"), CAPTION, p.text));
         } else {
-            let mut recent = s.files.iter().collect::<Vec<_>>();
-            recent.sort_by_key(|j| std::cmp::Reverse(j["archivedAt"].as_u64().unwrap_or(0)));
+            let mut recent = effective_files
+                .iter()
+                .filter(|j| j["state"] != "failed")
+                .collect::<Vec<_>>();
+            recent.sort_by_key(|j| {
+                (
+                    std::cmp::Reverse(is_archived_item(j)),
+                    std::cmp::Reverse(j["archivedAt"].as_u64().unwrap_or(0)),
+                )
+            });
             if let Some(j) = recent.first() {
                 children.push(self.between(
                     self.line(format!("最近迁移 · {}", label(j, "name")), CAPTION, p.text2),
                     self.line(state(j), CAPTION, p.text3),
                 ));
             }
+        }
+        if self.page == Page::Expansion {
+            let e = &self.expansion;
+            let cat_stats = |cat_key: &str| -> (u64, u64, u64) {
+                let mut cnt = 0u64;
+                let mut sz = 0u64;
+                for j in &effective_files {
+                    if is_archived_item(j) && item_category(j) == cat_key {
+                        cnt += 1;
+                        sz += j["size"].as_u64().unwrap_or(0);
+                    }
+                }
+                let phone_cnt = s.report["counts"][cat_key].as_u64().unwrap_or(0);
+                (cnt, sz, phone_cnt)
+            };
+            let (archived_photos, photos_bytes, phone_photos) = cat_stats("photos");
+            let (archived_videos, videos_bytes, phone_videos) = cat_stats("videos");
+            let (archived_docs, docs_bytes, phone_docs) = cat_stats("documents");
+            let (archived_audio, audio_bytes, phone_audio) = cat_stats("audio");
+            children.push(
+                self.hstack(
+                    S3,
+                    [
+                        (
+                            "照片",
+                            archived_photos,
+                            photos_bytes,
+                            phone_photos,
+                            UiIcon::Image,
+                        ),
+                        (
+                            "视频",
+                            archived_videos,
+                            videos_bytes,
+                            phone_videos,
+                            UiIcon::Video,
+                        ),
+                        ("文档", archived_docs, docs_bytes, phone_docs, UiIcon::File),
+                        (
+                            "音频",
+                            archived_audio,
+                            audio_bytes,
+                            phone_audio,
+                            UiIcon::Music,
+                        ),
+                    ]
+                    .into_iter()
+                    .map(|(cat_label, cnt, cat_bytes, phone_cnt, icon)| {
+                        let summary_text = if cnt > 0 && cat_bytes > 0 {
+                            format!("{cnt} 项已归档 · {}", storage::format_bytes(cat_bytes))
+                        } else if cnt > 0 {
+                            format!("{cnt} 项已归档")
+                        } else if phone_cnt > 0 {
+                            format!("0 项已归档 · 手机 {phone_cnt} 项")
+                        } else {
+                            "0 项已归档".to_string()
+                        };
+                        Expanded::new(
+                            1.,
+                            Container::new(self.vstack(
+                                S1,
+                                vec![
+                                    self.hstack(
+                                        S1,
+                                        vec![
+                                            self.ui_icon(icon, 16., p.text2),
+                                            self.line(cat_label, CAPTION, p.text2),
+                                        ],
+                                    ),
+                                    self.line_w(summary_text, SUBHEAD, p.text, Weight::Semibold),
+                                ],
+                            ))
+                            .with_uniform_padding(S2)
+                            .with_background_color(p.surface)
+                            .with_border(Border::all(1.).with_border_color(p.border))
+                            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
+                            .finish(),
+                        )
+                        .finish()
+                    })
+                    .collect(),
+                ),
+            );
+            children.push(self.divider());
+            let rule_line = format!(
+                "当前规则：{}  ·  电脑位置：{}",
+                expansion_state::ExpansionUi::policy_summary(&s.status["policy"]),
+                e.config
+                    .folder
+                    .as_ref()
+                    .map(|f| f.join("StepX Storage").display().to_string())
+                    .unwrap_or_else(|| "未设置".into())
+            );
+            let has_configured_rule = !s.status["policy"]["desktopId"]
+                .as_str()
+                .unwrap_or("")
+                .is_empty();
+            let mut rule_actions = Vec::new();
+            if s.status["policy"]["enabled"] == true {
+                rule_actions.push(self.ex_button(
+                    "exp-pause",
+                    "暂停自动迁移",
+                    EA::Pause,
+                    Btn::Secondary,
+                ));
+            } else if has_configured_rule {
+                rule_actions.push(self.ex_button(
+                    "exp-enable",
+                    "恢复自动迁移",
+                    EA::Enable,
+                    Btn::Primary,
+                ));
+            }
+            rule_actions.push(self.ex_button_icon(
+                "exp-manual-import-card",
+                "手动归档文件",
+                UiIcon::Plus,
+                EA::ManualImportLocalFiles,
+                Btn::Secondary,
+            ));
+            rule_actions.push(self.ex_button_icon(
+                "exp-open-current",
+                "打开电脑扩容文件夹",
+                UiIcon::Folder,
+                EA::OpenFolder,
+                Btn::Secondary,
+            ));
+            children.push(self.between(
+                self.text(rule_line, CAPTION, p.text2),
+                self.wrap(rule_actions),
+            ));
         }
         self.panel(children)
     }
@@ -223,6 +404,20 @@ impl Companion {
             return vec![];
         }
         vec![
+            self.ex_button_icon(
+                "exp-hdr-open-folder",
+                "打开电脑扩容文件夹",
+                UiIcon::Folder,
+                EA::OpenFolder,
+                Btn::Secondary,
+            ),
+            self.ex_button_icon(
+                "exp-hdr-manual-import",
+                "手动归档文件",
+                UiIcon::Plus,
+                EA::ManualImportLocalFiles,
+                Btn::Secondary,
+            ),
             self.ex_button("exp-refresh", "检查迁移", EA::Refresh, Btn::Secondary),
             self.ex_button("exp-settings", "设置自动迁移", EA::Settings, Btn::Primary),
         ]
@@ -277,20 +472,24 @@ impl Companion {
                     + report["invalidCount"].as_u64().unwrap_or(0),
             ),
         ];
+        let checked_label = report["checkedAt"]
+            .as_i64()
+            .and_then(chrono::DateTime::from_timestamp_millis)
+            .map(|at| {
+                format!(
+                    "检查于 {}",
+                    at.with_timezone(&chrono::Local).format("%H:%M:%S")
+                )
+            });
+        let header_right = if preview {
+            self.ex_button("exp-preview-refresh", "重新检查", EA::Inspect, Btn::Ghost)
+        } else if let Some(lbl) = &checked_label {
+            self.pill_badge(lbl, p.text2, p.hover)
+        } else {
+            Empty::new().finish()
+        };
         let mut rows = vec![
-            self.between(
-                self.heading(title),
-                self.ex_button(
-                    if preview {
-                        "exp-preview-refresh"
-                    } else {
-                        "exp-report-refresh"
-                    },
-                    "重新检查",
-                    if preview { EA::Inspect } else { EA::Refresh },
-                    Btn::Ghost,
-                ),
-            ),
+            self.between(self.heading(title), header_right),
             self.hstack(
                 S4,
                 metrics
@@ -317,7 +516,7 @@ impl Companion {
             ),
             self.text(
                 format!(
-                    "识别到：{} 张照片 · {} 个视频 · {} 份文档",
+                    "识别到：{} 张照片 · {} 个视频 · {} 份文档（照片/视频：DCIM 与 Camera；文档：Documents / Download）",
                     report["counts"]["photos"],
                     report["counts"]["videos"],
                     report["counts"]["documents"]
@@ -369,19 +568,6 @@ impl Companion {
         }
         if report["partial"] == true {
             rows.push(self.text("文件较多，本次清单统计不完整。", CAPTION, p.warning));
-        }
-        if let Some(at) = report["checkedAt"]
-            .as_i64()
-            .and_then(chrono::DateTime::from_timestamp_millis)
-        {
-            rows.push(self.text(
-                format!(
-                    "检查于 {} · 照片 / 视频：DCIM 根目录与 Camera；文档：Documents / Download",
-                    at.with_timezone(&chrono::Local).format("%H:%M:%S")
-                ),
-                CAPTION,
-                p.text3,
-            ));
         }
         self.panel(rows)
     }
@@ -442,12 +628,22 @@ impl Companion {
                                         vec![self.ui_icon(icon, 20., p.text), self.heading(name)],
                                     ),
                                     self.text(note, CAPTION, p.text2),
-                                    self.ex_button(
-                                        format!("exp-type-{key}"),
-                                        if on { "✓ 已选择" } else { "选择" },
-                                        EA::Type(key.into()),
-                                        if on { Btn::Primary } else { Btn::Secondary },
-                                    ),
+                                    if on {
+                                        self.ex_button_icon(
+                                            &format!("exp-type-{key}"),
+                                            "已选择",
+                                            UiIcon::Check,
+                                            EA::Type(key.into()),
+                                            Btn::Primary,
+                                        )
+                                    } else {
+                                        self.ex_button(
+                                            format!("exp-type-{key}"),
+                                            "选择",
+                                            EA::Type(key.into()),
+                                            Btn::Secondary,
+                                        )
+                                    },
                                 ]),
                             )
                             .finish(),
@@ -465,24 +661,32 @@ impl Companion {
                         self.text("迁移后的原件保存在这里。请使用长期连接、空间充足的磁盘，并保留这个目录。",BODY,p.text2)]));
                     sections.push(self.panel(vec![
                         self.heading("连接与权限"),
-                        self.text(
-                            if e.snapshot.online {
-                                "✓ 手机已连接，USB 与无线 ADB 均可使用"
-                            } else {
-                                "请先连接手机；连接成功后继续"
-                            },
-                            BODY,
-                            p.text2,
-                        ),
-                        self.text(
-                            if e.snapshot.status["permission"] == true {
-                                "✓ 手机已授予文件管理权限"
-                            } else {
-                                "请在手机伴侣 → 文件 → 存储扩容中开启文件管理权限"
-                            },
-                            BODY,
-                            p.text2,
-                        ),
+                        if e.snapshot.online {
+                            self.hstack(
+                                6.,
+                                vec![
+                                    self.ui_icon(UiIcon::Check, 14., p.success),
+                                    self.line("手机已连接，USB 与无线 ADB 均可使用", BODY, p.text2),
+                                ],
+                            )
+                        } else {
+                            self.line("请先连接手机；连接成功后继续", BODY, p.text2)
+                        },
+                        if e.snapshot.status["permission"] == true {
+                            self.hstack(
+                                6.,
+                                vec![
+                                    self.ui_icon(UiIcon::Check, 14., p.success),
+                                    self.line("手机已授予文件管理权限", BODY, p.text2),
+                                ],
+                            )
+                        } else {
+                            self.line(
+                                "请在手机伴侣 → 文件 → 存储扩容中开启文件管理权限",
+                                BODY,
+                                p.text2,
+                            )
+                        },
                     ]));
                 }
                 _ => {
@@ -498,129 +702,6 @@ impl Companion {
             }
         } else {
             sections.push(self.expansion_card());
-            sections.push(self.panel(vec![
-                self.between(
-                    self.heading("当前迁移规则"),
-                    self.ex_button("exp-edit-rule", "修改规则", EA::Settings, Btn::Secondary),
-                ),
-                self.text(
-                    expansion_state::ExpansionUi::policy_summary(&e.snapshot.status["policy"]),
-                    BODY,
-                    p.text,
-                ),
-                self.text(
-                    format!(
-                            "电脑位置：{}",
-                            e.config
-                                .folder
-                                .as_ref()
-                                .map(|f| f.join("StepX Storage").display().to_string())
-                                .unwrap_or_else(|| "未设置".into())
-                        ),
-                    CAPTION,
-                    p.text2,
-                ),
-                self.wrap(vec![
-                    if e.snapshot.status["policy"]["enabled"] == true {
-                        self.ex_button("exp-pause", "暂停自动迁移", EA::Pause, Btn::Secondary)
-                    } else {
-                        self.ex_button("exp-setup", "设置并开启", EA::Settings, Btn::Primary)
-                    },
-                    self.ex_button(
-                        "exp-open-current",
-                        "打开电脑文件夹",
-                        EA::OpenFolder,
-                        Btn::Ghost,
-                    ),
-                ]),
-            ]));
-            if e.snapshot.online {
-                sections.push(self.expansion_report_card(&e.snapshot.report, false));
-            }
-            let archived_photos = e
-                .snapshot
-                .files
-                .iter()
-                .filter(|j| j["state"] == "archived" && j["kind"] == "photos")
-                .count() as u64;
-            let archived_videos = e
-                .snapshot
-                .files
-                .iter()
-                .filter(|j| j["state"] == "archived" && j["kind"] == "videos")
-                .count() as u64;
-            let archived_docs = e
-                .snapshot
-                .files
-                .iter()
-                .filter(|j| j["state"] == "archived" && j["kind"] == "documents")
-                .count() as u64;
-            let browse_pc_btn = if let Some(folder) = &self.expansion.config.folder {
-                self.button(
-                    "exp-browse-pc-folder",
-                    "打开电脑扩容目录浏览原件",
-                    Action::StudioOpenUrl(folder.to_string_lossy().into_owned()),
-                    Btn::Secondary,
-                )
-            } else {
-                self.ex_button(
-                    "exp-browse-pc-folder",
-                    "打开电脑扩容目录浏览原件",
-                    EA::OpenFolder,
-                    Btn::Secondary,
-                )
-            };
-            sections.push(self.panel(vec![
-                self.between(
-                    self.heading("电脑扩容媒体库概览与直达"),
-                    self.button(
-                        "exp-jump-phone-files",
-                        "浏览手机文件",
-                        Action::Page(Page::Files),
-                        Btn::Ghost,
-                    ),
-                ),
-                self.hstack(
-                    S3,
-                    [
-                        ("照片", archived_photos, UiIcon::Image),
-                        ("视频", archived_videos, UiIcon::Video),
-                        ("文档", archived_docs, UiIcon::File),
-                    ]
-                    .into_iter()
-                    .map(|(cat_label, cnt, icon)| {
-                        Expanded::new(
-                            1.,
-                            Container::new(self.vstack(
-                                S1,
-                                vec![
-                                    self.hstack(
-                                        S1,
-                                        vec![
-                                            self.ui_icon(icon, 16., p.text2),
-                                            self.line(cat_label, CAPTION, p.text2),
-                                        ],
-                                    ),
-                                    self.line_w(
-                                        format!("{cnt} 项已归档"),
-                                        SUBHEAD,
-                                        p.text,
-                                        Weight::Semibold,
-                                    ),
-                                ],
-                            ))
-                            .with_uniform_padding(S3)
-                            .with_background_color(p.surface)
-                            .with_border(Border::all(1.).with_border_color(p.border))
-                            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
-                            .finish(),
-                        )
-                        .finish()
-                    })
-                    .collect(),
-                ),
-                self.wrap(vec![browse_pc_btn]),
-            ]));
         }
         if !e.feedback.is_empty() {
             sections.push(self.text(
@@ -652,42 +733,79 @@ impl Companion {
         };
 
         if !e.settings && !all_files.is_empty() {
-            let view_switcher = self.hstack(
-                S2,
-                vec![
-                    self.ex_button(
-                        "exp-view-grid",
-                        "缩略图时间轴墙",
-                        EA::SetGalleryGrid(true),
-                        if e.gallery_grid_mode {
-                            Btn::Primary
-                        } else {
-                            Btn::Secondary
-                        },
-                    ),
-                    self.ex_button(
-                        "exp-view-list",
-                        "清单列表",
-                        EA::SetGalleryGrid(false),
-                        if !e.gallery_grid_mode {
-                            Btn::Primary
-                        } else {
-                            Btn::Secondary
-                        },
-                    ),
-                ],
-            );
+            let mut switcher_btns = vec![
+                self.ex_button(
+                    "exp-view-grid",
+                    "网格视图",
+                    EA::SetGalleryGrid(true),
+                    if e.gallery_grid_mode {
+                        Btn::Primary
+                    } else {
+                        Btn::Secondary
+                    },
+                ),
+                self.ex_button(
+                    "exp-view-list",
+                    "列表视图",
+                    EA::SetGalleryGrid(false),
+                    if !e.gallery_grid_mode {
+                        Btn::Primary
+                    } else {
+                        Btn::Secondary
+                    },
+                ),
+            ];
+            if e.gallery_grid_mode {
+                for (cols, label_txt) in [(2u8, "2列大图"), (3, "3列标准"), (4, "4列紧凑")]
+                {
+                    let active = e.grid_cols == cols;
+                    switcher_btns.push(self.ex_button(
+                        format!("exp-grid-cols-{cols}"),
+                        label_txt,
+                        EA::SetGridCols(cols),
+                        if active { Btn::Secondary } else { Btn::Ghost },
+                    ));
+                }
+            }
+            let view_switcher = self.wrap(switcher_btns);
             sections.push(self.between(self.heading("已扩容文件 · 迁移记录"), view_switcher));
-            let mut controls = vec![];
-            for (k, n) in [
-                ("all", "全部"),
-                ("photos", "照片"),
-                ("videos", "视频"),
-                ("documents", "文档"),
+            let total_cnt = all_files.len();
+            let photos_cnt = all_files
+                .iter()
+                .filter(|j| expansion_state::expansion_item_kind(j) == "photos")
+                .count();
+            let videos_cnt = all_files
+                .iter()
+                .filter(|j| expansion_state::expansion_item_kind(j) == "videos")
+                .count();
+            let docs_cnt = all_files
+                .iter()
+                .filter(|j| expansion_state::expansion_item_kind(j) == "documents")
+                .count();
+            let audio_cnt = all_files
+                .iter()
+                .filter(|j| expansion_state::expansion_item_kind(j) == "audio")
+                .count();
+            let mut controls = vec![self.ex_button(
+                "exp-category-all",
+                &format!("全部 ({total_cnt})"),
+                EA::Filter("all".into()),
+                if e.config.kind == "all" {
+                    Btn::Primary
+                } else {
+                    Btn::Secondary
+                },
+            )];
+            for (k, icon, n) in [
+                ("photos", UiIcon::Image, format!("照片 ({photos_cnt})")),
+                ("videos", UiIcon::Video, format!("视频 ({videos_cnt})")),
+                ("documents", UiIcon::File, format!("文档 ({docs_cnt})")),
+                ("audio", UiIcon::Music, format!("音频 ({audio_cnt})")),
             ] {
-                controls.push(self.ex_button(
-                    format!("exp-category-{k}"),
+                controls.push(self.ex_button_icon(
+                    &format!("exp-category-{k}"),
                     n,
+                    icon,
                     EA::Filter(k.into()),
                     if e.config.kind == k {
                         Btn::Primary
@@ -709,17 +827,22 @@ impl Companion {
                     },
                 ));
             }
-            sorts.push(self.ex_button(
+            sorts.push(self.ex_button_icon(
                 "exp-direction",
                 if e.config.descending {
-                    "降序 ↓"
+                    "降序"
                 } else {
-                    "升序 ↑"
+                    "升序"
+                },
+                if e.config.descending {
+                    UiIcon::ArrowDown
+                } else {
+                    UiIcon::ArrowUp
                 },
                 EA::Descending,
                 Btn::Ghost,
             ));
-            let status_filters = [
+            let status_filters: Vec<El> = [
                 ("all", "全部状态"),
                 ("archived", "已迁移"),
                 ("restored", "已恢复"),
@@ -741,36 +864,33 @@ impl Companion {
                 )
             })
             .collect();
+            let mut search_row = vec![self.input(
+                F_GALLERY_SEARCH,
+                "搜索归档文件名 / 路径 / 日期…",
+                Some(240.),
+            )];
+            if !self.fields[F_GALLERY_SEARCH].text.trim().is_empty() {
+                search_row.push(self.button(
+                    "exp-clear-search",
+                    "清空搜索",
+                    Action::ClearField(F_GALLERY_SEARCH),
+                    Btn::Ghost,
+                ));
+            }
             sections.push(self.panel(vec![
-                self.text(
-                    "筛选文件库 · 只改变下面显示的记录，不改变迁移规则",
-                    CAPTION,
-                    p.text2,
+                self.between(
+                    self.text(
+                        "筛选文件库 · 只改变下面显示的记录，不改变迁移规则",
+                        CAPTION,
+                        p.text2,
+                    ),
+                    self.hstack(S2, search_row),
                 ),
                 self.between(self.wrap(controls), self.wrap(sorts)),
                 self.wrap(status_filters),
             ]));
-            let mut files = all_files
-                .iter()
-                .filter(|j| {
-                    (e.config.kind == "all" || j["kind"] == e.config.kind)
-                        && (e.config.filter == "all" || j["state"] == e.config.filter)
-                })
-                .collect::<Vec<_>>();
-            files.sort_by(|a, b| {
-                let order = match e.config.sort.as_str() {
-                    "name" => label(a, "name")
-                        .to_lowercase()
-                        .cmp(&label(b, "name").to_lowercase()),
-                    "size" => a["size"].as_u64().cmp(&b["size"].as_u64()),
-                    _ => a["modified"].as_u64().cmp(&b["modified"].as_u64()),
-                };
-                if e.config.descending {
-                    order.reverse()
-                } else {
-                    order
-                }
-            });
+            let files_owned = self.expansion_filtered_files();
+            let files: Vec<&Value> = files_owned.iter().collect();
             if files.is_empty() {
                 sections.push(self.panel(if all_files.is_empty() {
                     vec![
@@ -785,7 +905,7 @@ impl Companion {
                 } else {
                     vec![
                         self.heading("没有符合筛选条件的记录"),
-                        self.text("切换为“全部”和“全部状态”可查看其他文件。迁移规则未改变。", BODY, p.text2),
+                        self.text("切换为“全部”和“全部状态”或清空搜索词可查看其他文件。迁移规则未改变。", BODY, p.text2),
                     ]
                 }));
             } else if e.gallery_grid_mode {
@@ -794,6 +914,11 @@ impl Companion {
             } else {
                 for j in files.iter().take(e.limit) {
                     let id = label(j, "id");
+                    let phone_rel = label(j, "path");
+                    let is_archived = j["state"] == "archived";
+                    let local_media_path =
+                        expansion_state::resolve_media_local_path(&self.expansion.config, j);
+                    let selected = e.selected_media_id.as_deref() == Some(id.as_str());
                     let date = chrono::DateTime::from_timestamp_millis(
                         j["modified"].as_i64().unwrap_or(0),
                     )
@@ -811,54 +936,116 @@ impl Companion {
                     let mut actions = vec![
                         self.ex_button(
                             format!("exp-open-{id}"),
-                            "打开原件",
+                            "打开文件",
                             EA::Open(id.clone()),
-                            Btn::Secondary,
+                            Btn::Primary,
                         ),
                         self.ex_button(
-                            format!("exp-ai-{id}"),
-                            "AI 分析",
-                            EA::AnalyzeWithAmoo(id.clone()),
-                            Btn::Ghost,
+                            format!("exp-reveal-{id}"),
+                            "在文件夹中显示",
+                            EA::RevealInFolder(id.clone()),
+                            Btn::Secondary,
                         ),
                     ];
-                    if j["state"] == "archived" {
+                    if is_archived {
                         actions.push(self.ex_button(
                             format!("exp-restore-{id}"),
-                            "恢复到手机",
-                            EA::Restore(id),
+                            "还原回手机",
+                            EA::Restore(id.clone()),
                             Btn::Ghost,
                         ));
                     }
-                    sections.push(self.panel(vec![
-                        self.between(
-                            self.hstack(
-                                S2,
-                                vec![
-                                    self.ui_icon(icon, 20., p.text2),
-                                    self.heading(label(j, "name")),
-                                ],
+                    actions.push(self.ex_button(
+                        format!("exp-ai-{id}"),
+                        "发给 Amoo",
+                        EA::AnalyzeWithAmoo(id.clone()),
+                        Btn::Ghost,
+                    ));
+                    let row_content = self.vstack(
+                        S3,
+                        vec![
+                            self.between(
+                                self.hstack(
+                                    S2,
+                                    vec![
+                                        self.ui_icon(icon, 20., p.text2),
+                                        self.heading(label(j, "name")),
+                                    ],
+                                ),
+                                self.pill_badge(state(j), p.text2, p.hover),
                             ),
-                            self.pill_badge(state(j), p.text2, p.hover),
-                        ),
-                        self.text(
-                            format!(
-                                "{date} · {} · {}",
-                                storage::format_bytes(j["size"].as_u64().unwrap_or(0)),
-                                label(j, "path")
+                            self.text(
+                                format!(
+                                    "{date} · {} · {}",
+                                    storage::format_bytes(j["size"].as_u64().unwrap_or(0)),
+                                    phone_rel
+                                ),
+                                CAPTION,
+                                p.text3,
                             ),
-                            CAPTION,
-                            p.text3,
-                        ),
-                        self.wrap(actions),
-                    ]));
+                            self.wrap(actions),
+                        ],
+                    );
+                    let click_id = id.clone();
+                    let dbl_id = id.clone();
+                    let menu_id = id.clone();
+                    let row_state = self.mouse_state(format!("exp-list-row:{id}"));
+                    sections.push(
+                        Hoverable::new(row_state, move |mouse| {
+                            let hovered = mouse.is_mouse_over_element();
+                            let border_col = if mouse.is_clicked() || selected || hovered {
+                                p.accent
+                            } else {
+                                p.border
+                            };
+                            Container::new(row_content)
+                                .with_uniform_padding(S4)
+                                .with_background_color(p.bg)
+                                .with_border(
+                                    Border::all(if selected { 1.5 } else { 1. })
+                                        .with_border_color(border_col),
+                                )
+                                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_PANEL)))
+                                .finish()
+                        })
+                        .with_defer_events_to_children()
+                        .with_cursor(facloud_ui::platform::Cursor::PointingHand)
+                        .on_click(move |ctx, _, _| {
+                            ctx.dispatch_typed_action(Action::Expansion(EA::SelectMedia(Some(
+                                click_id.clone(),
+                            ))))
+                        })
+                        .on_double_click(move |ctx, _, _| {
+                            ctx.dispatch_typed_action(Action::Expansion(EA::Open(dbl_id.clone())))
+                        })
+                        .on_right_click(move |ctx, _, at| {
+                            ctx.dispatch_typed_action(Action::ContextOpen(
+                                crate::ui::context_menu::Target::ExpansionItem {
+                                    id: menu_id.clone(),
+                                    local_path: local_media_path.clone(),
+                                    phone_path: phone_rel.to_string(),
+                                    is_archived,
+                                },
+                                at,
+                            ))
+                        })
+                        .finish(),
+                    );
                 }
             }
             if files.len() > e.limit {
                 sections.push(self.ex_button("exp-more", "加载更多", EA::More, Btn::Secondary));
             }
         }
-        let body = self.pane_scroll(self.scroll.clone(), self.vstack(S4, sections));
+        let body = self.sub_enter(
+            self.pane_scroll(
+                self.scroll.clone(),
+                Container::new(self.vstack(S4, sections))
+                    .with_padding_right(S2)
+                    .with_padding_bottom(S5)
+                    .finish(),
+            ),
+        );
         if !e.settings {
             return body;
         }
@@ -923,6 +1110,7 @@ impl Companion {
 
     fn expansion_timeline_gallery(&self, files: &[&Value]) -> Vec<El> {
         let p = self.p();
+        let cols = (self.expansion.grid_cols as usize).clamp(2, 4);
         let mut groups: Vec<(String, Vec<&Value>)> = Vec::new();
         for j in files {
             let bucket = timeline_date_bucket(j);
@@ -954,12 +1142,12 @@ impl Companion {
                 self.pill_badge(format!("共 {} 项", items.len()), p.text2, p.hover),
             );
             out.push(header);
-            for chunk in items.chunks(3) {
-                let mut row_cards = Vec::with_capacity(3);
+            for chunk in items.chunks(cols) {
+                let mut row_cards = Vec::with_capacity(cols);
                 for j in chunk {
                     row_cards.push(Expanded::new(1., self.expansion_media_card(j)).finish());
                 }
-                while row_cards.len() < 3 {
+                while row_cards.len() < cols {
                     row_cards.push(Expanded::new(1., Empty::new().finish()).finish());
                 }
                 out.push(self.hstack(S3, row_cards));
@@ -976,19 +1164,26 @@ impl Companion {
         let kind = j["kind"].as_str().unwrap_or("");
         let size_str = storage::format_bytes(j["size"].as_u64().unwrap_or(0));
         let ext_badge = media_ext_badge(j);
+        let cols = (self.expansion.grid_cols as usize).clamp(2, 4);
+        let thumb_h = match cols {
+            2 => 180.0,
+            4 => 96.0,
+            _ => 124.0,
+        };
+        let deg = self
+            .expansion
+            .media_rotations
+            .get(&id)
+            .copied()
+            .unwrap_or(0)
+            % 360;
+        let selected = self.expansion.selected_media_id.as_deref() == Some(id.as_str());
 
-        let resolved_local =
-            stepx_companion::storage_expansion::local_file(&self.expansion.config, j)
-                .ok()
-                .or_else(|| {
-                    j["localPath"]
-                        .as_str()
-                        .filter(|s| !s.is_empty())
-                        .map(PathBuf::from)
-                        .filter(|path| path.is_file())
-                });
+        let rotated_cache = expansion_state::rotated_media_cache_path(&id, deg);
+        let resolved_local = rotated_cache
+            .or_else(|| expansion_state::resolve_media_local_path(&self.expansion.config, j));
         let is_local_image = resolved_local.as_ref().is_some_and(|path| {
-            path.is_file()
+            cached_is_file(path)
                 && path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
                     matches!(
                         e.to_ascii_lowercase().as_str(),
@@ -997,7 +1192,22 @@ impl Companion {
                 })
         });
 
-        let preview_area = if is_local_image {
+        let dims_opt = resolved_local
+            .as_ref()
+            .and_then(|p| cached_image_dimensions(p));
+
+        let badge_label = match (dims_opt, deg) {
+            (Some((w, h)), d) if d != 0 => format!("{ext_badge} · {w}×{h} · {d}°"),
+            (Some((w, h)), _) => format!("{ext_badge} · {w}×{h}"),
+            (None, d) if d != 0 => format!("{ext_badge} · {d}°"),
+            (None, _) => format!("{ext_badge} · 原图"),
+        };
+
+        let local_media_path = resolved_local.clone();
+        let phone_rel = path_str.clone();
+        let is_archived = j["state"] == "archived";
+
+        let raw_preview = if is_local_image {
             let local_path = resolved_local.unwrap();
             let img = ConstrainedBox::new(
                 Image::new(
@@ -1009,14 +1219,19 @@ impl Companion {
                 .contain()
                 .finish(),
             )
-            .with_height(118.)
+            .with_max_width(thumb_h * 1.8)
+            .with_height(thumb_h)
             .finish();
-            let badge = self.pill_badge(format!("{ext_badge} · 原图"), p.text, p.bg);
+            let badge = self.pill_badge(badge_label, p.text, p.bg);
             Stack::new()
                 .with_child(
                     Container::new(img)
                         .with_background_color(p.surface)
-                        .with_border(Border::all(1.).with_border_color(p.border))
+                        .with_border(Border::all(1.).with_border_color(if selected {
+                            p.accent
+                        } else {
+                            p.border
+                        }))
                         .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
                         .finish(),
                 )
@@ -1044,14 +1259,19 @@ impl Companion {
                 .contain()
                 .finish(),
             )
-            .with_height(118.)
+            .with_max_width(thumb_h * 1.8)
+            .with_height(thumb_h)
             .finish();
             let badge = self.pill_badge(format!("{ext_badge} · 缩略图"), p.text, p.bg);
             Stack::new()
                 .with_child(
                     Container::new(img)
                         .with_background_color(p.surface)
-                        .with_border(Border::all(1.).with_border_color(p.border))
+                        .with_border(Border::all(1.).with_border_color(if selected {
+                            p.accent
+                        } else {
+                            p.border
+                        }))
                         .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
                         .finish(),
                 )
@@ -1096,11 +1316,15 @@ impl Companion {
                 )
                 .with_uniform_padding(S2)
                 .with_background_color(p.surface)
-                .with_border(Border::all(1.).with_border_color(p.border))
+                .with_border(Border::all(1.).with_border_color(if selected {
+                    p.accent
+                } else {
+                    p.border
+                }))
                 .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
                 .finish(),
             )
-            .with_height(118.)
+            .with_height(thumb_h)
             .finish()
         };
 
@@ -1113,31 +1337,83 @@ impl Companion {
             self.pill_badge(badge_text, badge_fg, badge_bg),
             self.mono(&size_str, MICRO, p.text2),
         );
-        let actions = self.wrap(vec![
+        let mut action_btns = vec![
             self.ex_button(
                 format!("exp-open-{id}"),
-                "打开原件",
+                "打开文件",
                 EA::Open(id.clone()),
+                Btn::Primary,
+            ),
+            self.ex_button(
+                format!("exp-reveal-{id}"),
+                "在文件夹中显示",
+                EA::RevealInFolder(id.clone()),
                 Btn::Secondary,
             ),
-            self.ex_button(
+        ];
+        if is_archived {
+            action_btns.push(self.ex_button(
                 format!("exp-restore-{id}"),
-                "回传手机",
+                "还原回手机",
                 EA::Restore(id.clone()),
                 Btn::Ghost,
-            ),
-            self.ex_button(
-                format!("exp-ai-{id}"),
-                "AI 分析",
-                EA::AnalyzeWithAmoo(id),
-                Btn::Ghost,
-            ),
-        ]);
-        self.panel(vec![
-            preview_area,
-            self.line_w(&name, BODY, p.text, Weight::Medium),
-            meta_row,
-            actions,
-        ])
+            ));
+        }
+        action_btns.push(self.ex_button(
+            format!("exp-ai-{id}"),
+            "发给 Amoo",
+            EA::AnalyzeWithAmoo(id.clone()),
+            Btn::Ghost,
+        ));
+        let actions = self.wrap(action_btns);
+        let card_inner = self.vstack(
+            S3,
+            vec![
+                raw_preview,
+                self.line_w(&name, BODY, p.text, Weight::Medium),
+                meta_row,
+                actions,
+            ],
+        );
+        let click_id = id.clone();
+        let dbl_id = id.clone();
+        let menu_id = id.clone();
+        let card_state = self.mouse_state(format!("exp-card:{id}"));
+        Hoverable::new(card_state, move |mouse| {
+            let hovered = mouse.is_mouse_over_element();
+            let border_col = if mouse.is_clicked() || selected || hovered {
+                p.accent
+            } else {
+                p.border
+            };
+            Container::new(card_inner)
+                .with_uniform_padding(S4)
+                .with_background_color(p.bg)
+                .with_border(
+                    Border::all(if selected { 1.5 } else { 1. }).with_border_color(border_col),
+                )
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_PANEL)))
+                .finish()
+        })
+        .with_defer_events_to_children()
+        .with_cursor(facloud_ui::platform::Cursor::PointingHand)
+        .on_click(move |ctx, _, _| {
+            ctx.dispatch_typed_action(Action::Expansion(EA::SelectMedia(Some(click_id.clone()))))
+        })
+        .on_double_click(move |ctx, _, _| {
+            ctx.dispatch_typed_action(Action::Expansion(EA::Open(dbl_id.clone())))
+        })
+        .on_right_click(move |ctx, _, at| {
+            ctx.dispatch_typed_action(Action::ContextOpen(
+                crate::ui::context_menu::Target::ExpansionItem {
+                    id: menu_id.clone(),
+                    local_path: local_media_path.clone(),
+                    phone_path: phone_rel.to_string(),
+                    is_archived,
+                },
+                at,
+            ))
+        })
+        .finish()
     }
 }
