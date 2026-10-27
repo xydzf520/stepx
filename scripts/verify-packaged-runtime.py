@@ -68,6 +68,13 @@ print('Packaged signer, Unicode paths, imports and file lock: PASS')
     adb=copy/'tools/bin'/('adb.exe' if os.name=='nt' else 'adb')
     run_checked([str(adb),'version'],env,15)
     run_checked([str(python),'-X','utf8','-c',code,str(copy)],env,45)
+    # Use the client command, including the argv used by store APK validation.
+    run_checked([str(copy/binary_name),'--check-apk',str(apk)],env,45)
+    result = subprocess.run([str(copy/binary_name),'--check-apk',str(copy/'tampered.apk')],
+                            env=env,capture_output=True,encoding='utf-8',errors='replace',timeout=45)
+    assert result.returncode != 0, 'Client accepted a modified APK signature'
+    assert 'EOF while parsing' not in result.stderr, 'Client masked APK failure with JSON EOF'
+    print('Client APK verification and modified-signature rejection: PASS')
     run_checked([str(python),'-B','-X','utf8',str(copy/'scripts/test-host-runtime.py')],env,30)
 if os.name=='nt':
     binary=(root/'stepx-companion.exe').read_bytes();pe=struct.unpack_from('<I',binary,0x3c)[0]

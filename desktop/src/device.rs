@@ -475,21 +475,66 @@ fn validate_generic_apk_identity(value: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
-fn check_generic_apk(path: &std::path::Path) -> Result<String> {
+fn apk_verification_command(path: &std::path::Path) -> Command {
     let mut command = crate::resources::python_command();
     command
         .arg(crate::resources::root().join("scripts/companion_apk.py"))
-        .arg("--package")
         .arg("--verify-signature")
+        .arg("--package")
         .arg(path);
-    let output = crate::adb::run_process(command, None, std::time::Duration::from_secs(45))?;
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .context("无法核对 APK 包名，尚未安装；请重新解压完整客户端安装包")?;
-    validate_generic_apk_identity(&value)?;
+    command
+}
+
+fn parse_apk_verification(output: &std::process::Output) -> Result<serde_json::Value> {
+    let parsed = serde_json::from_slice::<serde_json::Value>(&output.stdout);
+    // The helper may exit before it can write JSON (argument/import/runtime errors).
+    // Preserve that diagnostic instead of masking it with a JSON EOF error.
     if !output.status.success() {
-        bail!("APK 包名校验未完成，尚未安装");
+        let structured = parsed.as_ref().ok().and_then(|v| v["error"].as_str());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = structured
+            .unwrap_or(stderr.trim())
+            .chars()
+            .take(600)
+            .collect::<String>();
+        if detail.is_empty() {
+            bail!(
+                "APK 校验工具异常退出（{}），尚未安装；请重试或更新客户端",
+                output.status
+            );
+        }
+        bail!("APK 校验未完成，尚未安装：{detail}");
     }
-    Ok(value["package"].as_str().unwrap().to_string())
+    let value = parsed
+        .map_err(|_| anyhow::anyhow!("APK 校验工具未返回有效结果，尚未安装；请重试或更新客户端"))?;
+    if value["ok"] != true {
+        bail!(
+            "APK 校验未通过，尚未安装：{}",
+            value["error"].as_str().unwrap_or("缺少成功回执")
+        );
+    }
+    anyhow::ensure!(
+        value["package"].as_str().is_some_and(|p| !p.is_empty()),
+        "APK 包名校验未返回有效结果，尚未安装"
+    );
+    Ok(value)
+}
+
+/// Read and verify an APK locally. Does not install or contact a phone.
+pub fn verify_apk_identity(path: &std::path::Path) -> Result<String> {
+    let output = crate::adb::run_process(
+        apk_verification_command(path),
+        None,
+        std::time::Duration::from_secs(45),
+    )?;
+    let value = parse_apk_verification(&output)?;
+    Ok(value["package"].as_str().unwrap().to_owned())
+}
+
+fn check_generic_apk(path: &std::path::Path) -> Result<String> {
+    let package = verify_apk_identity(path)?;
+    validate_generic_apk_identity(&serde_json::json!({"ok": true, "package": package}))?;
+    Ok(package)
 }
 
 /// Validate a store download before showing it as ready, and again on the immutable install snapshot.
@@ -3330,8 +3375,79 @@ pub fn parse_wm_size(output: &str) -> (u32, u32) {
 
 #[cfg(test)]
 mod generic_apk_install_tests {
-    use super::validate_generic_apk_identity;
+    use super::{apk_verification_command, parse_apk_verification, validate_generic_apk_identity};
     use serde_json::json;
+
+    fn helper_output(success: bool, stdout: &[u8], stderr: &[u8]) -> std::process::Output {
+        #[cfg(unix)]
+        let status = {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(if success { 0 } else { 2 << 8 })
+        };
+        #[cfg(windows)]
+        let status = {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(if success { 0 } else { 2 })
+        };
+        std::process::Output {
+            status,
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+        }
+    }
+
+    #[test]
+    fn real_apk_helper_accepts_client_arguments_and_unicode_paths() {
+        // This must reach file validation, not argparse's "expected one argument".
+        let missing = tempfile::tempdir().unwrap().path().join("支付宝 测试.apk");
+        let output = crate::adb::run_process(
+            apk_verification_command(&missing),
+            None,
+            std::time::Duration::from_secs(15),
+        )
+        .unwrap();
+        assert!(!output.status.success());
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error"], "请选择有效的本地 APK 安装包");
+    }
+
+    #[test]
+    fn failed_helper_preserves_diagnostic_instead_of_json_eof() {
+        let output = helper_output(false, b"", b"argument --package: expected one argument");
+        let error = parse_apk_verification(&output).unwrap_err().to_string();
+        assert!(error.contains("expected one argument"));
+        assert!(!error.contains("EOF"));
+        assert!(!error.contains("重新解压"));
+        let output = helper_output(
+            false,
+            br#"{"ok":false,"error":"Signature rejected"}"#,
+            b"traceback",
+        );
+        let error = parse_apk_verification(&output).unwrap_err().to_string();
+        assert!(error.contains("Signature rejected"));
+        assert!(!error.contains("traceback"));
+    }
+
+    #[test]
+    fn invalid_or_failed_verification_never_succeeds() {
+        for stdout in [
+            b"".as_slice(),
+            b"not JSON",
+            b"null",
+            br#"{"ok":true}"#,
+            br#"{"ok":true,"package":""}"#,
+            br#"{"ok":false,"package":"com.example.app"}"#,
+        ] {
+            assert!(parse_apk_verification(&helper_output(true, stdout, b"")).is_err());
+        }
+        let valid = br#"{"ok":true,"package":"com.example.app"}"#;
+        assert_eq!(
+            parse_apk_verification(&helper_output(true, valid, b"warning")).unwrap()["package"],
+            "com.example.app"
+        );
+        assert!(parse_apk_verification(&helper_output(false, valid, b"failed")).is_err());
+    }
 
     #[test]
     fn companion_package_uses_dedicated_installation() {

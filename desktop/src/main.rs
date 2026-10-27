@@ -21,7 +21,7 @@ fn main() -> anyhow::Result<()> {
     if std::env::args().any(|a| {
         matches!(
             a.as_str(),
-            "--version" | "-V" | "--help" | "-h" | "--doctor" | "--check-runtime"
+            "--version" | "-V" | "--help" | "-h" | "--doctor" | "--check-runtime" | "--check-apk"
         )
     }) {
         // Attach only to an existing terminal. Double-click never creates one.
@@ -53,6 +53,14 @@ fn main() -> anyhow::Result<()> {
     if !cfg!(feature = "ui-capture") && std::env::args().any(|arg| arg == "--capture-ui") {
         anyhow::bail!("截图构建需要 cargo run --features ui-capture -- --capture-ui <path>");
     }
+    if let Some(index) = std::env::args().position(|arg| arg == "--check-apk") {
+        let path = std::env::args_os()
+            .nth(index + 1)
+            .ok_or_else(|| anyhow::anyhow!("用法：--check-apk <APK 文件>；仅校验，不安装"))?;
+        let package = stepx_companion::device::verify_apk_identity(std::path::Path::new(&path))?;
+        println!("APK verified: {package}");
+        return Ok(());
+    }
     if std::env::args().any(|arg| arg == "--check-runtime") {
         let adb = stepx_companion::adb::Adb::discover()?;
         let version = adb.run(&["version"])?;
@@ -66,7 +74,16 @@ fn main() -> anyhow::Result<()> {
             "安装运行时校验失败：{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        println!("ADB OK; Python OK; APK signature verification OK");
+        // Exercise the exact command used by store downloads and APK installs,
+        // not only the Python module imported directly above.
+        let package = stepx_companion::device::verify_apk_identity(
+            &stepx_companion::resources::root().join("desktop/assets/stepx-companion.apk"),
+        )?;
+        anyhow::ensure!(
+            package == "com.stepx.companion.app",
+            "随包 APK 包名校验失败"
+        );
+        println!("ADB OK; Python OK; APK package and signature verification OK");
         return Ok(());
     }
     if std::env::args().any(|arg| arg == "--doctor") {
