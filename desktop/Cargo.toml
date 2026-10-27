@@ -1,6 +1,6 @@
 [package]
 name = "stepx-companion"
-version = "0.2.59"
+version = "0.2.60"
 edition = "2021"
 license = "AGPL-3.0-only"
 

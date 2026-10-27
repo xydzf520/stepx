@@ -17,6 +17,12 @@ Linux / macOS / Windows · Rust 原生客户端 · 当前主要适配 PZ261A
 
 面向 **STEPX Neo / PZ261A** 用户的社区项目，与 STEPX、Amoo、Google 无官方隶属关系。客户端当前以 STEPX / PZ261A 设备识别为入口，普通 Android 不在本版支持范围；专有能力还需要对应固件和账号。
 
+## 0.2.60：更新提示更明确
+
+修复“安装包已准备好，却无法判断为什么不能重启”的问题：列出具体待处理事项，直接返回相应页面处理；修复已提交的创作描述误拦截。保留安装包，不会自动发送或清空草稿。
+
+[下载最新版](https://github.com/xydzf520/stepx/releases/latest) · [本次修复](docs/RELEASE_NOTES.md)
+
 ## 0.2.59：应用获取与局域网投屏
 
 新增 **应用商店**：按分类搜索、查看详情和下载来源，在电脑下载 APK、安装到连接的手机、检查已装应用更新。新增 **局域网投屏**：手机连着电脑，另一台设备扫码即可在浏览器看画面；是否允许远端操作由电脑控制。
@@ -29,7 +35,7 @@ Linux / macOS / Windows · Rust 原生客户端 · 当前主要适配 PZ261A
 
 *客户端实际渲染，使用演示数据；来源版本和下载可用性随上游变化。*
 
-[0.2.50 → 0.2.59 更新说明](docs/RELEASE_NOTES.md) · [兼容性与验证范围](docs/CROSS_PLATFORM_0_2_59.md) · [全部更新](CHANGELOG.md)
+[0.2.50 → 0.2.59 更新说明](https://github.com/xydzf520/stepx/releases/tag/v0.2.59) · [兼容性与验证范围](docs/CROSS_PLATFORM_0_2_59.md) · [全部更新](CHANGELOG.md)
 
 ## 特色功能
 
@@ -100,10 +106,10 @@ Studio 首次网页登录需要本人完成；之后可以复用已授权会话�
 
 | 电脑 | 下载包 | 注意事项 |
 | --- | --- | --- |
-| Windows x64 | `StepX-Companion-0.2.59-windows-x86_64.zip` | 必要时安装手机 USB 驱动；无商业代码签名 |
-| macOS Apple Silicon | `StepX-Companion-0.2.59-macos-arm64.zip` | 包内为 `.app`；ad-hoc 签名，未 Apple 公证 |
-| macOS Intel | `StepX-Companion-0.2.59-macos-x86_64.zip` | 与 ARM 版分开下载；旧系统未全面验证 |
-| Linux x64 | `StepX-Companion-0.2.59-linux-x86_64.tar.gz` | Ubuntu 24.04 构建基线，glibc 2.39+；旧环境可源码构建 |
+| Windows x64 | `StepX-Companion-0.2.60-windows-x86_64.zip` | 必要时安装手机 USB 驱动；无商业代码签名 |
+| macOS Apple Silicon | `StepX-Companion-0.2.60-macos-arm64.zip` | 包内为 `.app`；ad-hoc 签名，未 Apple 公证 |
+| macOS Intel | `StepX-Companion-0.2.60-macos-x86_64.zip` | 与 ARM 版分开下载；旧系统未全面验证 |
+| Linux x64 | `StepX-Companion-0.2.60-linux-x86_64.tar.gz` | Ubuntu 24.04 构建基线，glibc 2.39+；旧环境可源码构建 |
 
 发布包提供 **ADB、scrcpy、Python、Java 与 APK 校验工具**，无需预装 Android Studio。请完整解压，不要只复制可执行文件。每个包附 SHA-256；Windows/macOS 的原生构建与运行时验证不等于所有实体电脑均已联调。[完整验证边界 →](docs/CROSS_PLATFORM_0_2_59.md)
 

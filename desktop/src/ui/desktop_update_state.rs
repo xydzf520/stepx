@@ -1,5 +1,6 @@
 //! One startup check, explicit downloads, and a fixed-footer entry in both shells.
 use super::{theme::*, widgets::*, *};
+use facloud_ui::TypedActionView;
 use stepx_companion::{desktop_update as updater, storage::format_bytes};
 #[derive(Clone, Debug)]
 pub(super) enum DesktopUpdateAction {
@@ -9,7 +10,16 @@ pub(super) enum DesktopUpdateAction {
     Download,
     Cancel,
     Install,
+    Resolve(Box<Action>),
 }
+/// A restart prerequisite is not a download failure. Keep it actionable and
+/// recompute it from live state rather than latching a generic red error.
+struct RestartBlocker {
+    title: &'static str,
+    detail: String,
+    action: Action,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum Phase {
     #[default]
@@ -42,6 +52,7 @@ pub(super) struct DesktopUpdateState {
     pub fraction_from: f32,
     pub fraction: f32,
     pub fraction_at: Instant,
+    pub blockers_scroll: ClippedScrollStateHandle,
 }
 impl Default for DesktopUpdateState {
     fn default() -> Self {
@@ -61,6 +72,7 @@ impl Default for DesktopUpdateState {
             fraction_from: 0.,
             fraction: 0.,
             fraction_at: Instant::now(),
+            blockers_scroll: Default::default(),
         }
     }
 }
@@ -99,8 +111,184 @@ impl DesktopUpdateState {
     }
 }
 impl Companion {
+    fn desktop_restart_blockers(&self) -> Vec<RestartBlocker> {
+        let mut rows = Vec::new();
+        let mut add = |condition, title, detail: String, action| {
+            if condition {
+                rows.push(RestartBlocker {
+                    title,
+                    detail,
+                    action,
+                });
+            }
+        };
+        // Unsaved settings first: navigation must not discard them just to
+        // inspect a task or draft on another page.
+        add(
+            self.settings_dirty(),
+            "设置尚未保存",
+            "请确认保存或放弃本次设置更改。".into(),
+            Action::Page(Page::Settings),
+        );
+        add(
+            self.expansion.dirty(),
+            "迁移规则尚未保存",
+            "请在存储扩容中确认保存或放弃更改。".into(),
+            Action::Page(Page::Expansion),
+        );
+        add(
+            self.studio_config_dirty(),
+            "模型设置尚未保存",
+            "请确认保存模型地址、模型名称或密钥。".into(),
+            Action::Settings(SettingsAction::Models),
+        );
+        add(
+            self.busy,
+            "当前操作尚未结束",
+            self.status.clone(),
+            Action::Page(self.job_page),
+        );
+        add(
+            self.work.running || self.workspace.running.is_some(),
+            "Amoo 任务正在执行",
+            "等待任务完成，或在任务中停止后再更新。".into(),
+            Action::Page(Page::Amoo),
+        );
+        add(
+            !self.amoo_pending_reply.is_empty(),
+            "Amoo 正在等待回复",
+            "请在对话中查看进度；切换页面不会结束任务。".into(),
+            Action::Page(Page::Amoo),
+        );
+        add(
+            self.studio_lab.handle.is_some(),
+            "应用创作正在执行",
+            "请等待创作完成，或先停止任务。".into(),
+            Action::Page(Page::Studio),
+        );
+        add(
+            self.updates.busy || self.updates.transfer.is_some(),
+            "手机更新任务尚未结束",
+            "请等待下载、安装或取消操作完成。".into(),
+            Action::OpenTool(Some(ToolPage::Updates)),
+        );
+        add(
+            self.expansion.snapshot.active.is_some() || self.expansion.pending.is_some(),
+            "文件迁移或规则保存正在进行",
+            "请等待当前文件校验与保存完成。".into(),
+            Action::Page(Page::Expansion),
+        );
+        add(
+            self.back_screen.companion_busy
+                || self.back_screen.generating
+                || self.back_screen.applying_native,
+            "背屏任务正在执行",
+            "请等待当前背屏生成或应用完成。".into(),
+            Action::Page(Page::BackScreen),
+        );
+        add(
+            self.amoo_ui.gui_running,
+            "手机看屏任务正在执行",
+            "请先在 Amoo 中完成或停止任务。".into(),
+            Action::Page(Page::Amoo),
+        );
+        add(
+            self.push.sending_thread.is_some(),
+            "消息正在发送",
+            "请等待手机返回发送结果，避免重复发送。".into(),
+            Action::Page(Page::Sms),
+        );
+        add(
+            self.app_store.tasks.values().any(|t| t.stage.is_active()),
+            "应用下载或安装正在进行",
+            "请等待应用商店中的任务完成。".into(),
+            Action::Page(Page::AppStore),
+        );
+        add(
+            self.bulk_busy,
+            "批量应用操作正在进行",
+            "请等待当前操作完成。".into(),
+            Action::Page(Page::Apps),
+        );
+        add(
+            self.settings.staging.is_some() || self.workspace.delivery.is_some(),
+            "文件正在发送到手机",
+            "请等待手机接收结果。".into(),
+            Action::Page(Page::Amoo),
+        );
+        for (field, title, page) in [
+            (F_AMOO, "Amoo 对话有未发送草稿", Page::Amoo),
+            (F_WORK_PROMPT, "文件处理有未发送草稿", Page::Work),
+            (F_SMS_BODY, "短信有未发送草稿", Page::Sms),
+            (F_PUSH_REPLY, "通知回复有未发送草稿", Page::Notifications),
+            (F_IM_REPLY, "消息回复有未发送草稿", Page::Sms),
+            (F_TOAST_REPLY, "通知弹窗有未发送草稿", Page::Notifications),
+            (F_LAB_PROMPT, "应用创作有未提交描述", Page::Studio),
+        ] {
+            let text = self.fields[field].text.trim();
+            // Studio intentionally retains the submitted prompt for revisions.
+            // It is not a new draft once its artifact records that exact input.
+            let submitted = field == F_LAB_PROMPT
+                && !text.is_empty()
+                && self
+                    .studio_lab
+                    .artifact_prompts
+                    .values()
+                    .any(|p| p.trim() == text);
+            add(
+                !text.is_empty() && !submitted,
+                title,
+                format!(
+                    "{} 字未发送。请返回编辑处理；更新不会自动发送或清空。",
+                    text.chars().count()
+                ),
+                Action::Page(page),
+            );
+        }
+        add(
+            !self.amoo_attachments.is_empty(),
+            "Amoo 对话还有待发送附件",
+            format!("{} 个附件仍在输入框中。", self.amoo_attachments.len()),
+            Action::Page(Page::Amoo),
+        );
+        add(
+            !self.work.attachments.is_empty(),
+            "文件处理还有待发送附件",
+            format!("{} 个附件仍在输入框中。", self.work.attachments.len()),
+            Action::Page(Page::Work),
+        );
+        rows
+    }
+
     pub(super) fn initialize_desktop_updates(&mut self, ctx: &mut ViewContext<Self>) {
         if self.demo_mode || self.capture.is_some() {
+            #[cfg(feature = "ui-capture")]
+            if self.demo_mode && std::env::var_os("STEPX_UPDATE_PREVIEW").is_some() {
+                self.desktop_update.open = true;
+                self.desktop_update.phase = Phase::Ready;
+                self.busy = false;
+                self.work.running = false;
+                self.workspace.running = None;
+                self.amoo_pending_reply.clear();
+                self.discard_settings();
+                self.amoo_attachments.clear();
+                self.work.attachments.clear();
+                for f in [
+                    F_AMOO,
+                    F_WORK_PROMPT,
+                    F_SMS_BODY,
+                    F_PUSH_REPLY,
+                    F_IM_REPLY,
+                    F_TOAST_REPLY,
+                    F_LAB_PROMPT,
+                ] {
+                    self.fields[f].clear();
+                }
+                if std::env::var("STEPX_UPDATE_PREVIEW").as_deref() == Ok("blocked") {
+                    self.settings.draft.reduced_motion = !self.settings.value.reduced_motion;
+                    self.fields[F_AMOO].set("测试草稿：周末计划，保留但不要发送。");
+                }
+            }
             return;
         }
         self.desktop_update.notice = updater::last_result().unwrap_or_default();
@@ -181,35 +369,11 @@ impl Companion {
                 }
             }
             A::Install if self.desktop_update.phase == Phase::Ready => {
-                let blocked = self.busy
-                    || self.work.running
-                    || self.chat_waiting()
-                    || self.updates.busy
-                    || self.updates.transfer.is_some()
-                    || self.expansion.snapshot.active.is_some()
-                    || self.expansion.pending.is_some()
-                    || self.back_screen.companion_busy
-                    || self.back_screen.generating
-                    || self.back_screen.applying_native
-                    || self.amoo_ui.gui_running
-                    || self.settings_dirty()
-                    || self.expansion.dirty()
-                    || self.studio_config_dirty()
-                    || [
-                        F_AMOO,
-                        F_WORK_PROMPT,
-                        F_SMS_BODY,
-                        F_PUSH_REPLY,
-                        F_IM_REPLY,
-                        F_TOAST_REPLY,
-                        F_LAB_PROMPT,
-                    ]
-                    .iter()
-                    .any(|i| !self.fields[*i].text.trim().is_empty())
-                    || !self.amoo_attachments.is_empty()
-                    || !self.work.attachments.is_empty();
-                if blocked {
-                    self.desktop_update.error="请先完成正在执行的任务，并发送或清空对话草稿、保存设置后再重启。安装包已保留。".into();
+                let blockers = self.desktop_restart_blockers();
+                if !blockers.is_empty() {
+                    // Show the live checklist below; do not turn a prerequisite
+                    // into a sticky download error or discard any user input.
+                    self.desktop_update.error.clear();
                 } else if let Some(dir) = self.desktop_update.ready.clone() {
                     self.desktop_update.error.clear();
                     match updater::prepare(&dir) {
@@ -220,6 +384,28 @@ impl Companion {
                         Err(e) => self.desktop_update_failure(e.to_string()),
                     }
                 }
+            }
+            A::Resolve(action) => {
+                self.desktop_update.open = false;
+                // Return locally to the editor without discarding staged settings.
+                self.set_compact_mode(ShellMode::Full, ctx);
+                match action.as_ref() {
+                    Action::Page(page) => {
+                        self.page = *page;
+                        self.focus = None;
+                    }
+                    Action::OpenTool(tool) => {
+                        self.page = Page::Tools;
+                        self.tool_page = *tool;
+                    }
+                    Action::Settings(SettingsAction::Models) => {
+                        self.page = Page::Amoo;
+                        self.workspace.panel = 5;
+                    }
+                    _ => self.handle_action(action, ctx),
+                }
+                self.back_screen
+                    .set_preview_visible(self.page == Page::BackScreen);
             }
             _ => {}
         }
@@ -371,6 +557,11 @@ impl Companion {
         let u = &self.desktop_update;
         let p = self.p();
         let a = |v| Action::DesktopUpdate(v);
+        let blockers = if u.phase == Phase::Ready {
+            self.desktop_restart_blockers()
+        } else {
+            Vec::new()
+        };
         let mut parts = vec![
             self.between(
                 self.heading("更新 StepX Companion"),
@@ -381,7 +572,16 @@ impl Companion {
                     Btn::Secondary,
                 ),
             ),
-            self.line_w(u.label(), 22., p.text, facloud_ui::fonts::Weight::Semibold),
+            self.line_w(
+                if blockers.is_empty() {
+                    u.label()
+                } else {
+                    "安装包已就绪，重启前还有待处理事项".into()
+                },
+                22.,
+                p.text,
+                facloud_ui::fonts::Weight::Semibold,
+            ),
         ];
         if let Some(r) = &u.release {
             parts.push(self.text(
@@ -435,7 +635,47 @@ impl Companion {
             parts.push(self.loading_line());
         }
         if u.phase == Phase::Ready {
-            parts.push(self.text("安装包已校验。点击下方按钮将关闭并重新打开客户端，更新后生效。设置与个人文件会保留。",BODY,p.text2));
+            parts.push(self.text(
+                if blockers.is_empty() {
+                    "安装包已校验，可以安装并重启。已保存的设置与个人文件会保留。"
+                } else {
+                    "下载和校验已完成。请处理下面列出的事项；安装包会保留，无需重新下载。"
+                },
+                BODY,
+                p.text2,
+            ));
+            if !blockers.is_empty() {
+                let rows = blockers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| {
+                        self.vstack(
+                            S1,
+                            vec![
+                                self.between(
+                                    self.heading(b.title),
+                                    self.button(
+                                        &format!("desktop-update-resolve-{i}"),
+                                        "前往处理",
+                                        a(DesktopUpdateAction::Resolve(Box::new(b.action.clone()))),
+                                        Btn::Secondary,
+                                    ),
+                                ),
+                                self.text(&b.detail, CAPTION, p.text2),
+                                self.divider(),
+                            ],
+                        )
+                    })
+                    .collect();
+                parts.push(
+                    ConstrainedBox::new(self.pane_scroll(
+                        self.desktop_update.blockers_scroll.clone(),
+                        self.vstack(S3, rows),
+                    ))
+                    .with_max_height(220.)
+                    .finish(),
+                );
+            }
         }
         if u.phase == Phase::Ahead {
             parts.push(self.text("本机版本较新，继续使用即可；不会降级安装。", BODY, p.text2));
@@ -472,8 +712,16 @@ impl Companion {
             )),
             Phase::Ready => buttons.push(self.button(
                 "desktop-update-install",
-                "安装并重启",
-                a(DesktopUpdateAction::Install),
+                if blockers.is_empty() {
+                    "安装并重启"
+                } else {
+                    "处理第一项"
+                },
+                if let Some(b) = blockers.first() {
+                    a(DesktopUpdateAction::Resolve(Box::new(b.action.clone())))
+                } else {
+                    a(DesktopUpdateAction::Install)
+                },
                 Btn::Primary,
             )),
             Phase::Current | Phase::Ahead | Phase::Idle | Phase::Failed => {
@@ -541,6 +789,95 @@ impl Companion {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn idle() -> Companion {
+        let mut app = Companion::new_for_test();
+        app.discard_settings();
+        app
+    }
+    #[test]
+    fn idle_update_has_no_restart_blockers() {
+        let app = idle();
+        assert!(app.desktop_restart_blockers().is_empty());
+    }
+    #[test]
+    fn drafts_are_identified_without_exposing_or_clearing_contents() {
+        let mut app = idle();
+        app.fields[F_SMS_BODY].set("私密短信草稿");
+        let blockers = app.desktop_restart_blockers();
+        assert_eq!(blockers.len(), 1);
+        assert_eq!(blockers[0].title, "短信有未发送草稿");
+        assert!(matches!(blockers[0].action, Action::Page(Page::Sms)));
+        assert!(!blockers[0].detail.contains("私密"));
+        assert_eq!(app.fields[F_SMS_BODY].text, "私密短信草稿");
+        app.fields[F_SMS_BODY].clear();
+        assert!(app.desktop_restart_blockers().is_empty());
+    }
+    #[test]
+    fn completed_studio_prompt_is_not_a_draft_but_revision_is() {
+        let mut app = idle();
+        app.fields[F_LAB_PROMPT].set("制作专注时钟");
+        app.studio_lab
+            .artifact_prompts
+            .insert("clock".into(), "制作专注时钟".into());
+        assert!(app.desktop_restart_blockers().is_empty());
+        app.fields[F_LAB_PROMPT].set("制作专注时钟，再增加提醒");
+        assert_eq!(
+            app.desktop_restart_blockers()[0].title,
+            "应用创作有未提交描述"
+        );
+    }
+    #[test]
+    fn pending_reply_blocks_restart_outside_chat_page() {
+        let mut app = idle();
+        app.page = Page::Overview;
+        app.amoo_pending_reply.insert(
+            "session".into(),
+            stepx_companion::amoo::PendingReply {
+                key: "session".into(),
+                text: "test".into(),
+                run_id: "run".into(),
+            },
+        );
+        assert!(app
+            .desktop_restart_blockers()
+            .iter()
+            .any(|r| r.title == "Amoo 正在等待回复"));
+    }
+    #[test]
+    fn unsaved_settings_are_shown_first() {
+        let mut app = idle();
+        app.fields[F_AMOO].set("保留草稿");
+        app.settings.draft.reduced_motion = !app.settings.value.reduced_motion;
+        assert_eq!(app.desktop_restart_blockers()[0].title, "设置尚未保存");
+        app.discard_settings();
+        assert_eq!(
+            app.desktop_restart_blockers()[0].title,
+            "Amoo 对话有未发送草稿"
+        );
+    }
+    #[test]
+    fn app_install_and_message_send_are_protected() {
+        use app_store_state::{StoreTaskStage, StoreTaskState};
+        let mut app = idle();
+        app.app_store.tasks.insert(
+            "pkg".into(),
+            StoreTaskState {
+                package: "pkg".into(),
+                app_name: "应用".into(),
+                target_version: "1".into(),
+                stage: StoreTaskStage::Installing,
+                is_downgrade: false,
+            },
+        );
+        app.push.sending_thread = Some("thread".into());
+        let rows = app.desktop_restart_blockers();
+        assert!(rows.iter().any(|r| r.title == "应用下载或安装正在进行"));
+        assert!(rows.iter().any(|r| r.title == "消息正在发送"));
+        app.app_store.tasks.get_mut("pkg").unwrap().stage = StoreTaskStage::Completed("ok".into());
+        app.push.sending_thread = None;
+        assert!(app.desktop_restart_blockers().is_empty());
+    }
+
     #[test]
     fn footer_is_reserved_for_actionable_updates() {
         let mut state = DesktopUpdateState::default();
