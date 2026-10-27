@@ -2,6 +2,8 @@
 
 从 **0.2.50** 升级。本次重点是应用商店、局域网投屏，以及更真实的设备状态。内容按发布代码整理，不把旧版已有能力算成新增。
 
+[完整界面更新视频 · 3:09](https://github.com/xydzf520/stepx/releases/download/v0.2.59/StepX-Companion-0.2.59-update-wechat.mp4) · [1080p 高清版](https://github.com/xydzf520/stepx/releases/download/v0.2.59/StepX-Companion-0.2.59-update-1080p.mp4)
+
 ## 这次能感受到什么
 
 - **应用商店**：在电脑分类浏览、搜索应用，查看详情、截图与来源；结合手机已安装列表检查更新，下载 APK 或安装到当前手机。上游商店的下载和版本可用性可能变化。

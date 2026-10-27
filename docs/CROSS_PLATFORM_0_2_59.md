@@ -12,6 +12,21 @@
 
 四平台均从发布提交构建；失败的目标不算验证通过。结果以本版关联的 GitHub Actions 为准。
 
+## 本次结果
+
+发布代码：`8823ece6413fbfeefabbbe048a30db1df607eecf`。四个平台的核心测试、界面状态测试、运行时验证、发行构建与打包检查均通过：[完整构建记录](https://github.com/xydzf520/stepx/actions/runs/40531462849)。
+
+下载后再次核对了四包 SHA-256、压缩包完整性、CPU 架构、ADB / Python / Java / APK 校验工具；Linux 包还在清除开发 SDK 环境、使用中文路径的条件下通过运行时检查。
+
+本地回归共 424 项 Rust 核心、接口约定与界面测试及 407 项 Python 测试通过。Linux + PZ261A 实机验证了 H.264 画面持续解码及 HTTP JPEG 接收；这些结果不扩展为全部第三方应用、电视或其他手机已验证。
+
+| 安装包 | SHA-256 |
+| --- | --- |
+| Linux x64 | `1b301cccf966b903aa74c48566d732fec7656c0178821cf7e8652da00cc0bc23` |
+| Windows x64 | `ccfcfa7852c36a1a5720d9ea5265470e43a316c6a9647ff0d5ac8d2d40ed1796` |
+| macOS ARM64 | `1081c1cc9213b6a703048dcccfa3713209c1e1410f1b6124e208bc720c14909c` |
+| macOS Intel | `bb9ed5ce3615260be5d45bae94894483c68553c632c5dcd9ae9277c48f72140f` |
+
 ## 重点回归
 
 - 设备身份变化时停止操作；连接引导需要真实安装/权限/无线就绪条件。

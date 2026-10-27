@@ -23,6 +23,12 @@ Linux / macOS / Windows · Rust 原生客户端 · 当前主要适配 PZ261A
 
 这次也修正了安装与状态反馈：APK 包名和签名校验、阻止静默卸载降级，未知电池指标保持未知；静止投屏停止重复传输，帧率按实际采集显示。
 
+[观看 3 分 9 秒更新视频](https://github.com/xydzf520/stepx/releases/download/v0.2.59/StepX-Companion-0.2.59-update-wechat.mp4) · [微信分享文案](docs/UPDATE_0_2_59_WECHAT.md)
+
+![应用商店实际界面](docs/images/app-store-0.2.59.png)
+
+*客户端实际渲染，使用演示数据；来源版本和下载可用性随上游变化。*
+
 [0.2.50 → 0.2.59 更新说明](docs/RELEASE_NOTES.md) · [兼容性与验证范围](docs/CROSS_PLATFORM_0_2_59.md) · [全部更新](CHANGELOG.md)
 
 ## 特色功能
@@ -78,7 +84,7 @@ Linux / macOS / Windows · Rust 原生客户端 · 当前主要适配 PZ261A
 | **设备状态** | 首页电池、温度、存储、可获取的 Token 用量；底部统一显示连接、版本、加载与更新状态 |
 | **连接恢复** | USB 引导、扫码/数字配对、已信任设备发现；同局域网动态端口重连，适配固件可配置重启恢复 |
 
-![桌面首页](docs/images/overview-0.2.50.png)
+![桌面首页](docs/images/overview-0.2.59.png)
 
 *以上为应用实际渲染的演示界面，使用虚构数据，不代表所有机型均已通过端到端测试。*
 
