@@ -122,10 +122,10 @@ impl LanCastUiState {
                 running: false,
                 port,
                 host_ip: host_ip.clone(),
-                web_url: format!("http://{host_ip}:{port}/cast"),
-                ts_url: format!("http://{host_ip}:{port}/live.ts"),
-                hls_url: format!("http://{host_ip}:{port}/live.m3u8"),
-                mjpeg_url: format!("http://{host_ip}:{port}/stream.mjpeg"),
+                web_url: String::new(),
+                ts_url: String::new(),
+                hls_url: String::new(),
+                mjpeg_url: String::new(),
                 qr_png_path: None,
                 active_clients: 0,
                 frames_captured: 0,
@@ -703,17 +703,17 @@ impl Companion {
             "lan-cast-quality",
             vec![
                 (
-                    "720p 流畅".into(),
+                    "流畅 · 960".into(),
                     stats.quality == LanCastQuality::Smooth720p,
                     Action::LanCast(LanCastAction::SetQuality(LanCastQuality::Smooth720p)),
                 ),
                 (
-                    "1080p 高清".into(),
+                    "清晰 · 1280".into(),
                     stats.quality == LanCastQuality::Hd1080p,
                     Action::LanCast(LanCastAction::SetQuality(LanCastQuality::Hd1080p)),
                 ),
                 (
-                    "原画超清".into(),
+                    "高画质 · 1600".into(),
                     stats.quality == LanCastQuality::UltraNative,
                     Action::LanCast(LanCastAction::SetQuality(LanCastQuality::UltraNative)),
                 ),
@@ -1137,19 +1137,19 @@ impl Companion {
                 Btn::Secondary,
             ));
         }
-        right_btns.push(self.button_icon(
+        if !url.is_empty() { right_btns.push(self.button_icon(
             copy_id,
             "复制",
             UiIcon::Clipboard,
             Action::CopyText(url.to_string(), format!("已复制投屏地址：{url}")),
             Btn::Ghost,
-        ));
+        )); }
         Container::new(self.between(
             self.vstack(
                 2.,
                 vec![
                     self.line_w(title, CAPTION, p.text, Weight::Medium),
-                    self.mono(url, CAPTION, p.accent),
+                    self.mono(if url.is_empty() { "开启投屏后生成本次访问链接" } else { url }, CAPTION, p.accent),
                 ],
             ),
             self.hstack(S2, right_btns),
