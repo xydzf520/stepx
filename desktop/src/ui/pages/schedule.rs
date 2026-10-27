@@ -5,8 +5,8 @@
 
 use super::super::{
     backscreen_state::BackScreenAction, icons::UiIcon, theme::*, widgets::*,
-    workspace_state::WorkspaceAction, Action, Companion, Page, PushAction, F_ALARM_TIME,
-    F_CALENDAR_TIME, F_PHONE_SCHEDULE_TITLE,
+    workspace_state::WorkspaceAction, Action, Companion, Page, PushAction, F_ALARM_LABEL,
+    F_ALARM_TIME, F_CALENDAR_TIME, F_PHONE_SCHEDULE_TITLE,
 };
 use chrono::{Datelike, Local, NaiveDate};
 use facloud_ui::{
@@ -225,7 +225,7 @@ impl Companion {
                     self.button_icon(
                         "cal-nav-prev",
                         "上个月",
-                        UiIcon::ArrowLeft,
+                        UiIcon::ChevronLeft,
                         Action::BackScreen(BackScreenAction::CalendarPrevMonth),
                         Btn::Secondary,
                     ),
@@ -288,7 +288,7 @@ impl Companion {
                             .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
                             .finish(),
                     )
-                    .with_height(78.)
+                    .with_height(92.)
                     .finish()
                 } else {
                     let d = day_num as u32;
@@ -303,7 +303,7 @@ impl Companion {
                         .take(2)
                         .map(|ev| {
                             let label =
-                                truncate_chars(&format!("{} {}", ev.hm_label(), ev.title), 10);
+                                truncate_chars(&format!("{} {}", ev.hm_label(), ev.title), 7);
                             let is_sys = ev.source.contains("system")
                                 || ev.source.contains("desktop")
                                 || ev.source.contains("local")
@@ -384,18 +384,7 @@ impl Companion {
                             .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
                             .finish()
                         } else if event_count > 0 {
-                            Container::new(
-                                Text::new(format!("{event_count}项"), font, MICRO)
-                                    .with_color(p.accent)
-                                    .with_style(Properties::default().weight(Weight::Medium))
-                                    .soft_wrap(false)
-                                    .finish(),
-                            )
-                            .with_horizontal_padding(5.)
-                            .with_vertical_padding(1.)
-                            .with_background_color(if is_selected { p.bg } else { p.accent_soft })
-                            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
-                            .finish()
+                            self.line(format!("{event_count}项"), MICRO, p.text3)
                         } else {
                             Empty::new().finish()
                         };
@@ -476,7 +465,7 @@ impl Companion {
                                 )))
                                 .finish(),
                         )
-                        .with_height(78.)
+                        .with_height(92.)
                         .finish()
                     })
                     .with_defer_events_to_children()
@@ -1202,7 +1191,7 @@ impl Companion {
             alarm_scenario_presets.into_iter().enumerate()
         {
             let active_scen = current_alarm_time == qt_str
-                && self.fields[F_PHONE_SCHEDULE_TITLE].text.trim() == tpl_label;
+                && self.fields[F_ALARM_LABEL].text.trim() == tpl_label;
             let state = self.mouse_state(format!("alarm-scen-chip:{idx}"));
             let font = self.font;
             let label_str = btn_label.to_string();
@@ -1255,8 +1244,8 @@ impl Companion {
                     ctx.dispatch_typed_action(Action::BackScreen(
                         BackScreenAction::AlarmSelectQuickTime(qt_str),
                     ));
-                    ctx.dispatch_typed_action(Action::Focus(F_PHONE_SCHEDULE_TITLE));
-                    ctx.dispatch_typed_action(Action::ClearField(F_PHONE_SCHEDULE_TITLE));
+                    ctx.dispatch_typed_action(Action::Focus(F_ALARM_LABEL));
+                    ctx.dispatch_typed_action(Action::ClearField(F_ALARM_LABEL));
                     ctx.dispatch_typed_action(Action::Insert(note_str.clone()));
                 })
                 .finish(),
@@ -1313,7 +1302,7 @@ impl Companion {
         create_alarm_items.push(self.wrap(alarm_scenario_chips));
         create_alarm_items.push(self.wrap(quick_time_chips));
         create_alarm_items.push(self.input(
-            F_PHONE_SCHEDULE_TITLE,
+            F_ALARM_LABEL,
             "输入闹钟标签备注（如：早起打卡 / 会议提醒）…",
             None,
         ));

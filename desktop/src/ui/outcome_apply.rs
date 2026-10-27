@@ -73,6 +73,7 @@ pub(super) enum Outcome {
     PhoneGallery(Vec<stepx_companion::toolbox::PhoneGalleryItem>, String),
     StepOsCalendarUpdated(Vec<stepx_companion::toolbox::PhoneCalendarEvent>, String),
     StepOsAlarmsUpdated(Vec<stepx_companion::toolbox::PhoneAlarmItem>, String),
+    StepOsSuite(stepx_companion::toolbox::StepOsAiSuiteReport),
 }
 
 impl Companion {
@@ -80,9 +81,12 @@ impl Companion {
         match outcome {
             Outcome::BulkFailed(page, _tool, err) => {
                 self.record_notice("操作未完成", err.clone());
-                if page == Page::Apps {
+                if matches!(page, Page::Apps | Page::AppStore) {
                     self.apps_loaded = true;
                     self.apps_error = Some(err.clone());
+                }
+                if page == Page::Tools {
+                    self.back_screen.stepos_suite_loading = false;
                 }
                 self.error = true;
                 self.status = err;
@@ -187,6 +191,9 @@ impl Companion {
                 }
                 if let Some(next_transport) = failed_over_to {
                     self.connection_watch.disconnected_at = None;
+                    if let Some(srv) = &self.lan_cast.server {
+                        srv.set_serial(next_transport.clone());
+                    }
                     let msg = if is_wireless(&next_transport) {
                         format!(
                             "USB 已断开，已无感切换至无线通道 {next_transport} · 对话与任务不中断"
@@ -196,7 +203,11 @@ impl Companion {
                     };
                     self.record_notice("多通道热备切换", msg.clone());
                     self.error = false;
-                    self.status = msg;
+                    if self.mirror.is_some() {
+                        self.restart_active_mirror(msg);
+                    } else {
+                        self.status = msg;
+                    }
                 } else if disconnected {
                     self.connection_watch.detached_serial =
                         self.selected.as_ref().map(|d| d.serial.clone());
@@ -218,7 +229,11 @@ impl Companion {
                     self.connection_watch.detached_serial = None;
                     self.connection_watch.disconnected_at = None;
                     self.connection_watch.identity_at = None;
+                    if let Some(srv) = &self.lan_cast.server {
+                        srv.set_serial(device.transport.clone());
+                    }
                     self.selected = Some(device);
+                    self.connect_guide_step = None;
                     self.initializing = false;
                     self.error = false;
                     self.workspace.reconciled_sessions.clear();
@@ -259,24 +274,14 @@ impl Companion {
                     self.status = format!("已连接 {}", device.model);
                 }
                 self.initializing = false;
+                if let Some(srv) = &self.lan_cast.server {
+                    srv.set_serial(device.transport.clone());
+                }
                 self.selected = Some(device);
                 self.summary = summary;
-                // Keep an explicitly opened connection page visible after discovery.
-                // Normal launches already start on Overview; active guides advance here.
-                if self.page == Page::Connect && self.connect_guide_step.is_some() {
-                    self.connect_guide_step = Some(
-                        if self.connect_guide_step.is_some_and(|step| step >= 3)
-                            && self
-                                .selected
-                                .as_ref()
-                                .is_some_and(|d| is_wireless(&d.transport))
-                        {
-                            5
-                        } else {
-                            2
-                        },
-                    );
-                }
+                // Collapse the newbie wizard once a device is connected; the user can
+                // still open it manually via "连接引导" in the Connect page header.
+                self.connect_guide_step = None;
                 if self.page == Page::Overview {
                     self.with_device_bulk("正在读取应用数量与图标…", |adb, d| {
                         Ok(Outcome::Apps(apps::catalog(adb, &d)?))
@@ -673,19 +678,23 @@ impl Companion {
                 self.apps_error = None;
                 self.status = format!("已读取 {} 个应用", apps.len());
                 self.apps = apps;
+                self.sync_app_store_with_installed();
             }
             Outcome::ApkInstalled(msg, apps) => {
                 self.apps_loaded = true;
                 self.apps_error = None;
                 self.status = msg;
                 self.apps = apps;
+                self.sync_app_store_with_installed();
             }
             Outcome::Mirror(serial, transport, child) => {
-                if self
-                    .selected
-                    .as_ref()
-                    .is_some_and(|d| d.serial == serial && d.transport == transport)
-                {
+                if let Some(selected) = self.selected.as_mut().filter(|d| d.serial == serial) {
+                    if !transport.is_empty() && selected.transport != transport {
+                        selected.transport = transport.clone();
+                        if let Some(srv) = &self.lan_cast.server {
+                            srv.set_serial(transport);
+                        }
+                    }
                     self.status = child.started_message().into();
                     self.mirror = Some(child);
                 } else {
@@ -805,7 +814,17 @@ impl Companion {
             }
             Outcome::CompanionStatus(companion, msg) => {
                 self.companion_status = companion;
-                self.status = msg;
+                if self.page == Page::Connect
+                    || (self.page == Page::Tools && self.tool_page == Some(ToolPage::Companion))
+                {
+                    let short = msg
+                        .split(['；', '。'])
+                        .next()
+                        .unwrap_or(&msg)
+                        .trim()
+                        .to_string();
+                    self.status = if short.is_empty() { msg } else { short };
+                }
             }
             Outcome::InputMethod(report, message) => {
                 self.fcitx5_active = report.active;
@@ -824,6 +843,12 @@ impl Companion {
             Outcome::DeepAmooGranted(msg) => {
                 self.deep_amoo_granted = true;
                 self.amoo_bg_keepalive = true;
+                self.back_screen.stepos_suite.gui_accessibility_enabled = true;
+                self.back_screen.stepos_suite.notification_listener_enabled = true;
+                self.back_screen.stepos_suite.mcp_permission_granted = true;
+                self.back_screen.stepos_suite.screen_perception_ready = true;
+                self.back_screen.stepos_suite.last_action_note = msg.clone();
+                self.tools_feedback = Some((self.tool_page, msg.clone(), false));
                 self.status = msg;
             }
             Outcome::DeepBackScreenGranted(msg) => {
@@ -856,6 +881,19 @@ impl Companion {
                 self.back_screen.stepos_suite.last_action_note = msg.clone();
                 self.error = false;
                 self.status = msg;
+            }
+            Outcome::StepOsSuite(report) => {
+                self.back_screen.stepos_suite_loading = false;
+                let phone_clip = report.phone_clipboard.trim().to_string();
+                if !phone_clip.is_empty() {
+                    self.back_screen.record_clipboard_history(&phone_clip);
+                }
+                let note = report.last_action_note.clone();
+                self.back_screen.stepos_suite = report;
+                if !self.busy {
+                    self.status = note.clone();
+                }
+                self.tools_feedback = Some((self.tool_page, note, false));
             }
         }
     }

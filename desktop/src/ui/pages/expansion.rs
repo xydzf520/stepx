@@ -447,7 +447,7 @@ impl Companion {
                     BODY,
                     p.text2,
                 ),
-                self.ex_button(
+                self.wrap(vec![self.ex_button(
                     if preview {
                         "exp-preview-retry"
                     } else {
@@ -456,7 +456,7 @@ impl Companion {
                     "重新检查",
                     if preview { EA::Inspect } else { EA::Refresh },
                     Btn::Secondary,
-                ),
+                )]),
             ]);
         }
         let metrics = [
@@ -628,7 +628,7 @@ impl Companion {
                                         vec![self.ui_icon(icon, 20., p.text), self.heading(name)],
                                     ),
                                     self.text(note, CAPTION, p.text2),
-                                    if on {
+                                    self.wrap(vec![if on {
                                         self.ex_button_icon(
                                             &format!("exp-type-{key}"),
                                             "已选择",
@@ -643,7 +643,7 @@ impl Companion {
                                             EA::Type(key.into()),
                                             Btn::Secondary,
                                         )
-                                    },
+                                    }]),
                                 ]),
                             )
                             .finish(),
@@ -900,7 +900,12 @@ impl Companion {
                             BODY,
                             p.text2,
                         ),
-                        self.ex_button("exp-empty-settings", "设置迁移规则", EA::Settings, Btn::Primary),
+                        self.wrap(vec![self.ex_button(
+                            "exp-empty-settings",
+                            "设置迁移规则",
+                            EA::Settings,
+                            Btn::Primary,
+                        )]),
                     ]
                 } else {
                     vec![
@@ -938,7 +943,7 @@ impl Companion {
                             format!("exp-open-{id}"),
                             "打开文件",
                             EA::Open(id.clone()),
-                            Btn::Primary,
+                            Btn::Secondary,
                         ),
                         self.ex_button(
                             format!("exp-reveal-{id}"),
@@ -1034,7 +1039,12 @@ impl Companion {
                 }
             }
             if files.len() > e.limit {
-                sections.push(self.ex_button("exp-more", "加载更多", EA::More, Btn::Secondary));
+                sections.push(self.wrap(vec![self.ex_button(
+                    "exp-more",
+                    "加载更多",
+                    EA::More,
+                    Btn::Secondary,
+                )]));
             }
         }
         let body = self.sub_enter(
@@ -1342,7 +1352,7 @@ impl Companion {
                 format!("exp-open-{id}"),
                 "打开文件",
                 EA::Open(id.clone()),
-                Btn::Primary,
+                Btn::Secondary,
             ),
             self.ex_button(
                 format!("exp-reveal-{id}"),

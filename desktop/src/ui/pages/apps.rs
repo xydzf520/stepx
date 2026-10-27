@@ -1,7 +1,8 @@
 use super::super::{
-    icons::UiIcon, settings_state::SettingsAction, theme::*, widgets::*, Action, Companion,
-    ToolPage, F_APP_SEARCH,
+    app_store_state::AppStoreAction, icons::UiIcon, settings_state::SettingsAction, theme::*,
+    widgets::*, Action, Companion, Page, ToolPage, F_APP_SEARCH,
 };
+use crate::app_store::{check_store_install_state, StoreInstallState};
 use facloud_ui::{color::ColorU, elements::*, fonts::Weight, platform::Cursor};
 use stepx_companion::{apps::AppInfo, storage::format_bytes};
 
@@ -128,8 +129,50 @@ impl Companion {
             .with_child(self.installed_app_icon(app))
             .with_child(Expanded::new(1., self.vstack(S1, info_lines)).finish())
             .finish();
-        let heading = self.between(info, self.pill_badge(kind, p.text2, p.surface));
+        let store_match = self
+            .app_store
+            .catalog
+            .iter()
+            .find(|s| s.package == *package);
+        let store_state = store_match
+            .map(|s| check_store_install_state(std::slice::from_ref(app), s))
+            .unwrap_or(StoreInstallState::NotInstalled);
+        let mut right_badges = Vec::new();
+        if let StoreInstallState::Updatable { latest_version, .. } = &store_state {
+            right_badges.push(self.pill_badge_icon(
+                format!("可更新至 v{latest_version}"),
+                UiIcon::Upload,
+                p.blue,
+                rgba(p.blue.r, p.blue.g, p.blue.b, if p.dark { 38 } else { 24 }),
+            ));
+        }
+        right_badges.push(self.pill_badge(kind, p.text2, p.surface));
+        let heading = self.between(info, self.hstack(S1 + 2., right_badges));
         let mut actions = Vec::new();
+        if let StoreInstallState::Updatable { latest_version, .. } = &store_state {
+            actions.push(self.button_icon(
+                format!("app-store-upd:{package}"),
+                format!("更新至 v{latest_version}"),
+                UiIcon::Download,
+                Action::AppStore(AppStoreAction::InstallOrUpdate {
+                    package: package.clone(),
+                }),
+                Btn::Secondary,
+            ));
+        }
+        if store_match.is_some() {
+            actions.push(self.chip(
+                format!("app-store-detail:{package}"),
+                "商店详情 / 历史版本",
+                Some(UiIcon::Package),
+                vec![
+                    Action::Page(Page::AppStore),
+                    Action::AppStore(AppStoreAction::SelectApp(package.clone())),
+                ],
+                false,
+                false,
+            ));
+        }
         if app.launchable && app.enabled {
             actions.push(self.button(
                 format!("app-open:{package}"),
@@ -339,7 +382,7 @@ impl Companion {
                     Action::Settings(SettingsAction::SetAppsFilter(1)),
                 ),
                 (
-                    format!("StepOS 与系统组件 ({stepos_sys_count})"),
+                    format!("系统组件 ({stepos_sys_count})"),
                     self.settings.apps_filter == 2,
                     Action::Settings(SettingsAction::SetAppsFilter(2)),
                 ),
@@ -380,13 +423,6 @@ impl Companion {
                 UiIcon::Connect,
                 Action::Settings(SettingsAction::ToggleAppsSort),
                 Btn::Secondary,
-            ),
-            self.button_icon(
-                "app-toolbar-install-apk",
-                "安装 APK",
-                UiIcon::Plus,
-                Action::InstallApk,
-                Btn::Primary,
             ),
             self.input(F_APP_SEARCH, "搜索应用名称或包名…", Some(240.)),
         ];
@@ -442,12 +478,25 @@ impl Companion {
             rows.push(self.installed_app_row(app));
         }
         if rows.is_empty() {
+            let store_btn_label = if query.is_empty() {
+                "去应用商店浏览安装".to_string()
+            } else {
+                format!("去应用商店搜索「{query}」")
+            };
+            let store_btn_actions = if query.is_empty() {
+                vec![Action::Page(Page::AppStore)]
+            } else {
+                vec![
+                    Action::Page(Page::AppStore),
+                    Action::AppStore(AppStoreAction::QuickSearch(query.to_string())),
+                ]
+            };
             rows.push(
                 Container::new(
                     Align::new(self.vstack(
                         S2,
                         vec![
-                            self.line_w(
+                            Align::new(self.line_w(
                                 if self.apps_error.is_some() {
                                     "应用列表读取失败"
                                 } else if !self.apps_loaded {
@@ -460,20 +509,35 @@ impl Companion {
                                 HEADING,
                                 p.text,
                                 Weight::Medium,
-                            ),
-                            self.line(
+                            ))
+                            .finish(),
+                            Align::new(self.line(
                                 if let Some(error) = self.apps_error.as_deref() {
                                     error
                                 } else if !self.apps_loaded {
                                     "连接手机后点击刷新列表。"
                                 } else if self.apps.is_empty() {
-                                    "可以安装 APK，或刷新列表重新读取。"
+                                    "可以安装 APK，或前往应用商店下载安装。"
                                 } else {
-                                    "调整搜索内容，或切换到全部应用。"
+                                    "本机未安装匹配应用，可前往应用商店多源检索并一键安装。"
                                 },
                                 CAPTION,
                                 p.text2,
-                            ),
+                            ))
+                            .finish(),
+                            Align::new(
+                                Container::new(self.chip(
+                                    "apps-empty-goto-store",
+                                    store_btn_label,
+                                    Some(UiIcon::Search),
+                                    store_btn_actions,
+                                    true,
+                                    false,
+                                ))
+                                .with_margin_top(S2)
+                                .finish(),
+                            )
+                            .finish(),
                         ],
                     ))
                     .finish(),

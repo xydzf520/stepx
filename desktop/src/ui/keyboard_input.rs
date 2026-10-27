@@ -212,6 +212,9 @@ impl Companion {
         if i == F_FILE_SEARCH {
             self.file_page = 0;
         }
+        if i == F_STORE_SEARCH {
+            self.on_store_search_edited();
+        }
     }
 }
 

@@ -74,17 +74,47 @@ impl Companion {
                     self.handle_device_action(&Action::InspectServices);
                     return;
                 }
-                Some(ToolPage::Screen) if self.screenshot.is_none() && !self.busy => {
-                    self.handle_device_action(&Action::Screenshot);
+                Some(ToolPage::Screen) => {
+                    if !self.lan_cast.auto_started && self.selected.is_some() {
+                        self.lan_cast.auto_started = true;
+                        if let Ok(stats) = self.ensure_lan_cast_server_started() {
+                            self.lan_cast.status_note = Some((
+                                format!("局域网多协议投屏网关已就绪：{}", stats.web_url),
+                                false,
+                            ));
+                        }
+                        self.trigger_lan_cast_discovery();
+                    }
                     return;
                 }
                 Some(ToolPage::Device) if self.summary.is_empty() && !self.busy => {
                     self.handle_device_action(&Action::Summary);
                     return;
                 }
+                None
+                | Some(
+                    ToolPage::Clipboard
+                    | ToolPage::McpHub
+                    | ToolPage::AiSafety
+                    | ToolPage::Wellbeing,
+                ) if !self.back_screen.stepos_suite.checked
+                    && !self.back_screen.stepos_suite_loading
+                    && self.selected.is_some() =>
+                {
+                    self.back_screen.stepos_suite_loading = true;
+                    self.with_device_bulk(
+                        "正在读取 StepOS 原生服务、屏幕统计与双端剪贴板…",
+                        |adb, d| {
+                            Ok(Outcome::StepOsSuite(
+                                stepx_companion::toolbox::inspect_stepos_ai_suite(adb, &d)?,
+                            ))
+                        },
+                    );
+                    return;
+                }
                 _ => return,
             },
-            Page::Apps if !self.apps_loaded => {
+            Page::Apps | Page::AppStore if !self.apps_loaded => {
                 self.handle_device_action(&Action::Apps);
                 return;
             }
@@ -230,6 +260,7 @@ impl Companion {
             F_SMS_TO,
             F_SMS_BODY,
             F_PHONE_DIAL,
+            F_PHONE_CONTACT_NAME,
             F_CONTACT_SEARCH,
             F_SMS_SEARCH,
         ] {
@@ -268,6 +299,31 @@ impl Companion {
     pub(super) fn stop_mirror(&mut self) {
         if let Some(child) = self.mirror.take() {
             child.stop_in_background();
+        }
+    }
+
+    pub(super) fn restart_active_mirror(&mut self, status_prefix: String) {
+        self.error = false;
+        self.demote_busy_if_background();
+        if self.mirror.is_some() && !self.busy {
+            self.stop_mirror();
+            let options = self.mirror_options;
+            self.with_device(
+                &format!("{status_prefix}，正在无缝切换投屏通道…"),
+                move |adb, d| {
+                    let active_transport = d
+                        .resolve_active_transport(adb)
+                        .unwrap_or_else(|_| d.transport.clone());
+                    let session =
+                        stepx_companion::mirror::start_with_options(adb, &active_transport, options)?;
+                    Ok(Outcome::Mirror(d.serial, active_transport, session))
+                },
+            );
+        } else {
+            self.status = status_prefix;
+            if self.page == Page::Tools && self.tool_page == Some(ToolPage::Screen) {
+                self.tools_feedback = Some((Some(ToolPage::Screen), self.status.clone(), false));
+            }
         }
     }
 
@@ -472,6 +528,8 @@ impl Companion {
                 | Action::NeoInspect
                 | Action::Apps
                 | Action::ExportApp(_)
+                | Action::Mirror
+                | Action::OpenAppInMirror(_)
         );
         if !is_bulk_action && self.busy && self.page == Page::Tools {
             return;
@@ -610,17 +668,25 @@ impl Companion {
                 Ok(Outcome::Summary(summary, caps))
             }),
             Action::Mirror => {
+                self.demote_busy_if_background();
                 if !self.busy && self.mirror.is_none() {
                     let options = self.mirror_options;
                     self.with_device("正在开启投屏…", move |adb, d| {
-                        let session = d.mirror_with_options(adb, options)?;
-                        Ok(Outcome::Mirror(d.serial, d.transport, session))
+                        let active_transport = d
+                            .resolve_active_transport(adb)
+                            .unwrap_or_else(|_| d.transport.clone());
+                        let session = stepx_companion::mirror::start_with_options(
+                            adb,
+                            &active_transport,
+                            options,
+                        )?;
+                        Ok(Outcome::Mirror(d.serial, active_transport, session))
                     });
                 }
             }
             Action::Screenshot => self.with_device("正在截图…", |adb, d| {
-                d.verify(adb)?;
-                let bytes = adb.screenshot(&d.transport)?;
+                let active_transport = d.resolve_active_transport(adb)?;
+                let bytes = adb.screenshot(&active_transport)?;
                 let dir = tempfile::tempdir()?;
                 let path = dir.path().join("screen.png");
                 std::fs::write(&path, bytes)?;
@@ -631,8 +697,17 @@ impl Companion {
                 let sync_screen = self.mirror.is_none();
                 self.with_device("正在发送按键…", move |adb, d| {
                     d.key(adb, code)?;
-                    if sync_screen && code != 26 && code != 223 {
-                        std::thread::sleep(Duration::from_millis(180));
+                    let should_refresh_preview =
+                        sync_screen && (code != 26 && code != 223 || code == 223 || code == 26);
+                    if should_refresh_preview {
+                        let delay_ms = if code == 224 {
+                            320
+                        } else if code == 223 || code == 26 {
+                            220
+                        } else {
+                            180
+                        };
+                        std::thread::sleep(Duration::from_millis(delay_ms));
                         if let Ok(bytes) = adb.screenshot(&d.transport) {
                             if let Ok(dir) = tempfile::tempdir() {
                                 let path = dir.path().join("screen.png");
@@ -1090,6 +1165,7 @@ impl Companion {
                 });
             }
             Action::OpenAppInMirror(package) => {
+                self.demote_busy_if_background();
                 let package = package.clone();
                 let need_mirror = self.mirror.is_none();
                 let options = self.mirror_options;
@@ -1098,8 +1174,15 @@ impl Companion {
                     move |adb, d| {
                         let _ = d.open_app(adb, &package);
                         if need_mirror {
-                            let session = d.mirror_with_options(adb, options)?;
-                            Ok(Outcome::Mirror(d.serial, d.transport, session))
+                            let active_transport = d
+                                .resolve_active_transport(adb)
+                                .unwrap_or_else(|_| d.transport.clone());
+                            let session = stepx_companion::mirror::start_with_options(
+                                adb,
+                                &active_transport,
+                                options,
+                            )?;
+                            Ok(Outcome::Mirror(d.serial, active_transport, session))
                         } else {
                             Ok(Outcome::Notice(format!("已在投屏中打开 {package}")))
                         }
@@ -1343,13 +1426,20 @@ impl Companion {
                 });
             }
             Action::PhoneCreateContact => {
-                let name = self.fields[F_CONTACT_SEARCH].text.trim().to_string();
+                let mut name = self.fields[F_PHONE_CONTACT_NAME].text.trim().to_string();
+                if name.is_empty() {
+                    name = self.fields[F_STUDIO_NAME].text.trim().to_string();
+                }
+                if name.is_empty() {
+                    name = self.fields[F_CONTACT_SEARCH].text.trim().to_string();
+                }
                 let number = self.fields[F_PHONE_DIAL].text.trim().to_string();
                 if name.is_empty() || number.is_empty() {
-                    self.status = "请在联系人搜索框填写姓名，并在拨号框填写号码".into();
+                    self.status = "请在联系人姓名框填写姓名，并在拨号框填写号码".into();
                     self.error = true;
                     return;
                 }
+                self.fields[F_PHONE_CONTACT_NAME].clear();
                 self.with_device(
                     "正在向手机通讯录写入新联系人…",
                     move |adb, d| Ok(Outcome::Notice(d.create_contact(adb, &name, &number)?)),

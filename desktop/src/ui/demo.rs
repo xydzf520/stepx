@@ -209,25 +209,110 @@ impl Companion {
         ];
         self.selected_file = Some(6);
         self.apps = [
-            "com.tencent.mm",
-            "com.eg.android.AlipayGphone",
-            "com.stepos.ailauncher",
-            "com.sankuai.meituan",
-            "com.ss.android.ugc.aweme",
-            "com.autonavi.minimap",
-            "tv.danmaku.bili",
+            ("com.tencent.mm", "8.0.55", 2760u64),
+            ("com.eg.android.AlipayGphone", "10.6.86.8000", 106868000u64),
+            ("com.stepos.ailauncher", "1.4.2", 10402u64),
+            ("com.sankuai.meituan", "12.24.400", 1224400u64),
+            ("com.ss.android.ugc.aweme", "31.8.0", 310800u64),
+            ("com.autonavi.minimap", "15.06.0", 150600u64),
+            ("tv.danmaku.bili", "8.32.0", 8320200u64),
         ]
         .iter()
-        .map(|s| stepx_companion::apps::AppInfo {
+        .map(|(s, ver, code)| stepx_companion::apps::AppInfo {
             package: (*s).into(),
             label: stepx_companion::device::friendly_app_name(s)
                 .unwrap_or(s)
                 .into(),
+            version_name: (*ver).into(),
+            version_code: *code,
             enabled: true,
             launchable: true,
             ..stepx_companion::apps::AppInfo::default()
         })
         .collect();
+        if let Ok(cat) = std::env::var("STEPX_STORE_CATEGORY") {
+            match cat.trim() {
+                "all" => {
+                    self.app_store.category = stepx_companion::app_store::StoreCategory::All;
+                }
+                "social" | "global" => {
+                    self.app_store.category = stepx_companion::app_store::StoreCategory::Social;
+                }
+                "media" => {
+                    self.app_store.category = stepx_companion::app_store::StoreCategory::Media;
+                }
+                "productivity" | "office" => {
+                    self.app_store.category =
+                        stepx_companion::app_store::StoreCategory::Productivity;
+                }
+                "tools" | "nas" | "geek" => {
+                    self.app_store.category = stepx_companion::app_store::StoreCategory::Tools;
+                }
+                "lifestyle" | "daily" => {
+                    self.app_store.category = stepx_companion::app_store::StoreCategory::Lifestyle;
+                }
+                "updatable" => {
+                    self.app_store.category = stepx_companion::app_store::StoreCategory::Updatable;
+                }
+                "installed" => {
+                    self.app_store.category = stepx_companion::app_store::StoreCategory::Installed;
+                }
+                _ => {}
+            }
+        }
+        if let Ok(sub) = std::env::var("STEPX_STORE_SUBTAG") {
+            let trimmed = sub.trim().to_string();
+            if !trimmed.is_empty() {
+                self.app_store.sub_tag = Some(trimmed);
+            }
+        }
+        if let Ok(p) = std::env::var("STEPX_STORE_PAGE") {
+            if let Ok(idx) = p.parse::<usize>() {
+                self.app_store.page = idx;
+            }
+        }
+        if let Ok(search_q) = std::env::var("STEPX_STORE_SEARCH") {
+            let q = search_q.trim().to_string();
+            if !q.is_empty() {
+                self.fields[F_STORE_SEARCH].set(&q);
+                self.app_store.last_search_query = q.clone();
+                let hits = if std::env::var_os("STEPX_STORE_LIVE_SEARCH").is_some() {
+                    stepx_companion::app_store::search_multi_source(&q)
+                        .unwrap_or_else(|_| stepx_companion::app_store::search_instant_local(&q).0)
+                } else {
+                    stepx_companion::app_store::search_instant_local(&q).0
+                };
+                self.app_store.search_results = Some(hits);
+            }
+        }
+        self.prefetch_current_store_page_icons();
+        if let Ok(uninst_pkg) = std::env::var("STEPX_STORE_UNINSTALL_CONFIRM") {
+            if !uninst_pkg.trim().is_empty() {
+                self.app_store.pending_uninstall = Some(uninst_pkg.trim().to_string());
+            }
+        }
+        if let Ok(sel_pkg) = std::env::var("STEPX_STORE_SELECT") {
+            let trimmed = sel_pkg.trim().to_string();
+            if !trimmed.is_empty() {
+                self.app_store.selected_package = Some(trimmed.clone());
+                if let Ok(lb_idx) = std::env::var("STEPX_STORE_LIGHTBOX") {
+                    let idx = lb_idx.parse::<usize>().unwrap_or(0);
+                    let app_name = self
+                        .app_store
+                        .catalog
+                        .iter()
+                        .find(|a| a.package == trimmed)
+                        .map(|a| a.name.clone())
+                        .unwrap_or_else(|| trimmed.clone());
+                    self.app_store.lightbox = Some(app_store_state::StoreLightboxState {
+                        package: trimmed,
+                        app_name,
+                        screenshot_idx: idx,
+                        zoom_pct: 100,
+                    });
+                }
+            }
+        }
         self.apps_loaded = true;
         self.apps_error = None;
         self.preferences.devices = vec![stepx_companion::pairing::RememberedDevice {
@@ -241,10 +326,42 @@ impl Companion {
         self.companion_status.checked = true;
         self.companion_status.installed = true;
         self.companion_status.permission_granted = true;
+        self.companion_status.pairing_permission_granted = true;
+        self.companion_status.pairing_ready = true;
+        self.companion_status.wireless_enabled = Some(true);
+        self.companion_status.version = "0.1.32".into();
+        self.companion_status.message = "已待机，等待电脑应用配置".into();
         self.companion_status.running = true;
         self.back_screen.companion_installed = Some(true);
         self.back_screen.companion_permission = true;
-        self.back_screen.companion_status = "StepX伴侣已就绪 · 背屏权限已开启".into();
+        self.back_screen.companion_status = "v0.1.32 · 已待机，等待电脑应用配置".into();
+        if let Ok(tab_str) = std::env::var("STEPX_BACK_TAB") {
+            if let Ok(tab) = tab_str.trim().parse::<u8>() {
+                self.back_screen.tab = tab;
+            }
+        }
+        if std::env::var_os("STEPX_CONNECT_WIRELESS").is_some() {
+            self.selected = Some(Device {
+                transport: "192.168.1.5:46315".into(),
+                serial: "ZYPZ261A01M69200105".into(),
+                model: "StepX PZ261A".into(),
+                android: "16".into(),
+                product: "pandora".into(),
+            });
+            self.devices = vec![Transport {
+                id: "192.168.1.5:46315".into(),
+                state: "device".into(),
+                model: "PZ261A".into(),
+            }];
+            self.connect_guide_step = None;
+        }
+        if let Ok(step_str) = std::env::var("STEPX_CONNECT_GUIDE_STEP") {
+            if step_str.trim() == "none" {
+                self.connect_guide_step = None;
+            } else if let Ok(step) = step_str.trim().parse::<u8>() {
+                self.connect_guide_step = Some(step);
+            }
+        }
         self.back_screen.stepos_suite.checked = true;
         self.back_screen.stepos_suite.wellbeing.screen_time_minutes = 164;
         self.back_screen.stepos_suite.wellbeing.unlock_count = 38;

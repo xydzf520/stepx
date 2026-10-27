@@ -211,8 +211,8 @@ impl Companion {
                 .finish(),
         )
         .with_horizontal_padding(10.)
-        .with_padding_top(if first { 0. } else { 10. })
-        .with_padding_bottom(4.)
+        .with_padding_top(if first { 0. } else { 8. })
+        .with_padding_bottom(3.)
         .finish()
     }
 
@@ -585,6 +585,16 @@ impl Companion {
                 .count()
                 .to_string()
         });
+        let store_badge = if self.app_store.active_task_count() > 0 {
+            Some("下载中".to_string())
+        } else {
+            let upd = self.store_updatable_count();
+            if upd > 0 {
+                Some(format!("{upd}更新"))
+            } else {
+                None
+            }
+        };
         let amoo_badge = self.workspace_busy().then(|| "运行中".to_string());
 
         let logo_box = ConstrainedBox::new(
@@ -725,6 +735,15 @@ impl Companion {
                             Page::Tools,
                             self.page == Page::Tools,
                             None,
+                        ),
+                        self.nav_group_title("在线服务", false),
+                        self.nav_item_with_match(
+                            "app-store",
+                            UiIcon::Download,
+                            "应用商店",
+                            Page::AppStore,
+                            self.page == Page::AppStore,
+                            store_badge,
                         ),
                     ])
                     .finish(),
@@ -921,6 +940,20 @@ impl Companion {
                     format!("数据分区 · 可用 {} / {}", m.storage_avail, m.storage_total)
                 }
             }
+            Page::AppStore => {
+                if self.app_store.search_results.is_some()
+                    || (self.app_store.searching && !self.app_store.last_search_query.is_empty())
+                {
+                    format!(
+                        "全网搜索「{}」· 多源实时聚合",
+                        self.app_store.last_search_query
+                    )
+                } else if self.app_store.syncing_catalog {
+                    "正在从多源在线应用库实时同步最新应用…".into()
+                } else {
+                    "聚合官方直连、应用宝、国际源、GitHub 与 F-Droid 多源应用".into()
+                }
+            }
             Page::Apps => "管理手机端已安装应用与 APK 安装".into(),
             Page::Tools => self
                 .tool_page
@@ -947,6 +980,23 @@ impl Companion {
             } else {
                 self.page_actions()
             };
+        if self.mirror.is_some() {
+            actions.push(self.button_icon(
+                "hdr-mirror-audio",
+                format!("声音: {}", self.mirror_options.audio_route.short_label()),
+                UiIcon::Speaker,
+                Action::CycleMirrorAudioRoute,
+                Btn::Secondary,
+            ));
+            if self.page != Page::Overview {
+                actions.push(self.button(
+                    "hdr-mirror-stop",
+                    "结束投屏",
+                    Action::StopMirror,
+                    Btn::Danger,
+                ));
+            }
+        }
         actions.push(self.button(
             "operation-reminders",
             "操作提醒",
@@ -1040,7 +1090,21 @@ impl Companion {
             Some(_) => "USB",
             None => "ADB",
         };
-        let detail = self.footer_detail();
+        let raw_detail = self.footer_detail();
+        let detail = if raw_detail.chars().count() > 42 {
+            let first = raw_detail
+                .split(['；', '。'])
+                .next()
+                .unwrap_or(&raw_detail)
+                .trim();
+            if first.chars().count() > 48 {
+                Self::truncate_chars(first, 46)
+            } else {
+                first.to_string()
+            }
+        } else {
+            raw_detail
+        };
         let left = self.lead(
             S2,
             self.fixed_w(

@@ -334,6 +334,35 @@ fn background_status(
     (Some(true), Some(ready), message.into())
 }
 
+fn is_wireless_transport(id: &str) -> bool {
+    let trimmed = id.trim();
+    !trimmed.is_empty() && !crate::device::is_usb_transport(trimmed)
+}
+
+fn split_section<'a>(raw: &'a str, marker: &str) -> (&'a str, &'a str) {
+    let exact = format!("\n{marker}\n");
+    if let Some((head, tail)) = raw.split_once(&exact) {
+        return (head, tail);
+    }
+    let with_trailing = format!("{marker}\n");
+    if let Some((head, tail)) = raw.split_once(&with_trailing) {
+        return (head.strip_suffix('\n').unwrap_or(head), tail);
+    }
+    if let Some((head, tail)) = raw.split_once(marker) {
+        return (
+            head.strip_suffix('\n').unwrap_or(head),
+            tail.strip_prefix('\n').unwrap_or(tail),
+        );
+    }
+    if let Some(idx) = raw.find("<<<STEPX_") {
+        return (
+            raw[..idx].strip_suffix('\n').unwrap_or(&raw[..idx]),
+            &raw[idx..],
+        );
+    }
+    (raw, "")
+}
+
 fn pairing_status(
     permission_granted: bool,
     state: &Value,
@@ -346,18 +375,26 @@ fn pairing_status(
             "扫码所需权限尚未全部授权，请安装或修复伴侣权限。".into(),
         );
     }
+    let pairing_pid = state["pairingProcessPid"].as_u64().unwrap_or(0);
+    let bridge_ready = state["pairingBridgeReady"].as_bool() == Some(true);
+    let supported = state["pairingSupported"].as_bool() == Some(true);
+    let valid_service = state["service"].as_str() == Some("stepx-pairing-v1") && pairing_pid > 0;
+    let process_alive = alive || pairing_pid > 0;
     let fresh = phone_time_ms
         .zip(state["updatedAtMs"].as_u64())
         .is_some_and(|(now, updated)| {
-            updated <= now.saturating_add(2_000) && now.saturating_sub(updated) <= 30_000
+            updated > 0
+                && updated <= now.saturating_add(60_000)
+                && (now.saturating_sub(updated) <= 86_400_000
+                    || (bridge_ready && supported && valid_service && process_alive))
         });
-    if !alive || !fresh {
+    if !process_alive || !fresh {
         return (false, "扫码服务正在恢复。手机刚重启时，请先完成首次解锁并等待片刻；若仍未就绪，可在连接管理查看修复提示或使用系统配对码。".into());
     }
-    if state["pairingBridgeReady"].as_bool() != Some(true) {
+    if !bridge_ready {
         return (false, "扫码权限已授权，但伴侣系统配对服务未连接。请保持已授权的 USB 连接，点击更新／修复伴侣启动服务；也可使用 Android 系统无线调试配对码。".into());
     }
-    if state["pairingSupported"].as_bool() != Some(true) {
+    if !supported {
         return (
             false,
             "系统服务尚未确认支持伴侣扫码配对。当前请使用 Android 系统无线调试配对码。".into(),
@@ -370,24 +407,23 @@ fn read_pairing_readiness(adb: &Adb, device: &Device) -> (bool, String) {
     let cmd = format!(
         "cat {FILES}/pairing.json 2>/dev/null || true; \
          printf '\\n<<<STEPX_PAIRING_META>>>\\n'; \
-         pidof {PACKAGE} 2>/dev/null || true; \
+         pidof {PACKAGE} 2>/dev/null || (ps -ef 2>/dev/null | grep -v grep | grep -q 'stepx.PairingDaemon' && echo daemon_alive) || true; \
          printf '\\n<<<STEPX_PAIRING_TIME>>>\\n'; \
          date +%s 2>/dev/null || true"
     );
     let Ok(raw) = adb.script(&device.transport, &cmd) else {
         return pairing_status(true, &Value::Null, false, None);
     };
-    let (pairing_raw, rest) = raw
-        .split_once("\n<<<STEPX_PAIRING_META>>>\n")
-        .unwrap_or(("", ""));
-    let (pid_raw, time_raw) = rest
-        .split_once("\n<<<STEPX_PAIRING_TIME>>>\n")
-        .unwrap_or((rest, ""));
+    let raw = raw.replace("\r\n", "\n").replace('\r', "\n");
+    let (pairing_raw, rest) = split_section(&raw, "<<<STEPX_PAIRING_META>>>");
+    let (pid_raw, time_raw) = split_section(rest, "<<<STEPX_PAIRING_TIME>>>");
     let state = Some(pairing_raw.trim())
         .filter(|s| !s.is_empty() && s.len() <= 64 * 1024)
         .and_then(|s| serde_json::from_str::<Value>(s).ok())
         .unwrap_or(Value::Null);
-    let alive = !pid_raw.trim().is_empty();
+    let alive = !pid_raw.trim().is_empty()
+        || state["pairingProcessPid"].as_u64().is_some_and(|p| p > 0)
+        || state["pairingBridgeReady"].as_bool() == Some(true);
     let phone_time = time_raw
         .trim()
         .parse::<u64>()
@@ -444,7 +480,7 @@ pub fn inspect(adb: &Adb, device: &Device) -> Result<CompanionStatus> {
          printf '\\n<<<STEPX_DUMP>>>\\n'; \
          dumpsys package {PACKAGE}; \
          printf '\\n<<<STEPX_PID>>>\\n'; \
-         pidof {PACKAGE} 2>/dev/null || true; \
+         pidof {PACKAGE} 2>/dev/null || (ps -ef 2>/dev/null | grep -v grep | grep -q 'stepx.PairingDaemon' && echo daemon_alive) || true; \
          printf '\\n<<<STEPX_STATUS>>>\\n'; \
          cat {STATUS} 2>/dev/null || true; \
          printf '\\n<<<STEPX_PAIRING>>>\\n'; \
@@ -467,50 +503,48 @@ pub fn inspect(adb: &Adb, device: &Device) -> Result<CompanionStatus> {
          dumpsys activity freeze whitelist 2>/dev/null || printf 'STEPX_OEM_ERR\\n'"
     );
     let raw = adb.script(&device.transport, &script)?;
-    let (package, rest) = raw.split_once("\n<<<STEPX_DUMP>>>\n").unwrap_or((&raw, ""));
-    if !package.lines().any(|x| x.starts_with("package:")) {
-        return Ok(CompanionStatus {
+    Ok(parse_inspect_output(&raw, device))
+}
+
+fn parse_inspect_output(raw: &str, device: &Device) -> CompanionStatus {
+    let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
+    let (package, rest) = split_section(&normalized, "<<<STEPX_DUMP>>>");
+    if !package.lines().any(|x| x.trim().starts_with("package:")) {
+        return CompanionStatus {
             checked: true,
             message: "安装 StepX伴侣以使用背屏与文件收发；扫码和熄屏服务能力将单独检测。".into(),
             ..Default::default()
-        });
+        };
     }
-    let (dump, rest) = rest.split_once("\n<<<STEPX_PID>>>\n").unwrap_or((rest, ""));
-    let (pid_raw, rest) = rest
-        .split_once("\n<<<STEPX_STATUS>>>\n")
-        .unwrap_or((rest, ""));
-    let (status_raw, rest) = rest
-        .split_once("\n<<<STEPX_PAIRING>>>\n")
-        .unwrap_or((rest, ""));
-    let (pairing_raw, rest) = rest
-        .split_once("\n<<<STEPX_TIME>>>\n")
-        .unwrap_or((rest, ""));
-    let (time_raw, rest) = rest
-        .split_once("\n<<<STEPX_UPTIME>>>\n")
-        .unwrap_or((rest, ""));
-    let (uptime_raw, rest) = rest.split_once("\n<<<STEPX_BG>>>\n").unwrap_or((rest, ""));
-    let (bg_raw, rest) = rest
-        .split_once("\n<<<STEPX_AMOO_META>>>\n")
-        .unwrap_or((rest, ""));
-    let (amoo_meta_raw, rest) = rest
-        .split_once("\n<<<STEPX_WIFI>>>\n")
-        .unwrap_or((rest, ""));
-    let (wifi_raw, rest) = rest
-        .split_once("\n<<<STEPX_DOZE>>>\n")
-        .unwrap_or((rest, ""));
-    let (doze_raw, oem_raw) = rest.split_once("\n<<<STEPX_OEM>>>\n").unwrap_or((rest, ""));
+    let (dump, rest) = split_section(rest, "<<<STEPX_PID>>>");
+    let (pid_raw, rest) = split_section(rest, "<<<STEPX_STATUS>>>");
+    let (status_raw, rest) = split_section(rest, "<<<STEPX_PAIRING>>>");
+    let (pairing_raw, rest) = split_section(rest, "<<<STEPX_TIME>>>");
+    let (time_raw, rest) = split_section(rest, "<<<STEPX_UPTIME>>>");
+    let (uptime_raw, rest) = split_section(rest, "<<<STEPX_BG>>>");
+    let (bg_raw, rest) = split_section(rest, "<<<STEPX_AMOO_META>>>");
+    let (amoo_meta_raw, rest) = split_section(rest, "<<<STEPX_WIFI>>>");
+    let (wifi_raw, rest) = split_section(rest, "<<<STEPX_DOZE>>>");
+    let (doze_raw, oem_raw) = split_section(rest, "<<<STEPX_OEM>>>");
 
     let version = dump
         .lines()
-        .find_map(|l| l.trim().strip_prefix("versionName="))
-        .unwrap_or("未知")
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix("versionName=")
+                .map(|v| v.trim().trim_matches(|c| c == '"' || c == '\'').trim())
+                .filter(|v| !v.is_empty() && *v != "未知" && *v != "null")
+        })
+        .unwrap_or("已安装")
         .to_string();
     let permission_granted = granted(dump, PERMISSION);
     let permissions = permission_status(dump);
     let pairing_permission_granted = granted(dump, "android.permission.MANAGE_DEBUGGING")
         && granted(dump, "android.permission.WRITE_SECURE_SETTINGS")
         && granted(dump, "android.permission.CAMERA");
-    let alive = !pid_raw.trim().is_empty();
+    let app_alive = pid_raw
+        .split_whitespace()
+        .any(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()));
     let state = Some(status_raw.trim())
         .filter(|s| !s.is_empty() && s.len() <= 64 * 1024)
         .and_then(|s| serde_json::from_str::<Value>(s).ok())
@@ -519,13 +553,20 @@ pub fn inspect(adb: &Adb, device: &Device) -> Result<CompanionStatus> {
         .filter(|s| !s.is_empty() && s.len() <= 64 * 1024)
         .and_then(|s| serde_json::from_str::<Value>(s).ok())
         .unwrap_or(Value::Null);
+    let pairing_alive = !pid_raw.trim().is_empty()
+        || pairing["pairingProcessPid"].as_u64().is_some_and(|p| p > 0)
+        || pairing["pairingBridgeReady"].as_bool() == Some(true);
     let phone_time_ms = time_raw
         .trim()
         .parse::<u64>()
         .ok()
         .and_then(|seconds| seconds.checked_mul(1000));
-    let (pairing_ready, pairing_message) =
-        pairing_status(pairing_permission_granted, &pairing, alive, phone_time_ms);
+    let (pairing_ready, pairing_message) = pairing_status(
+        pairing_permission_granted,
+        &pairing,
+        pairing_alive,
+        phone_time_ms,
+    );
     let uptime_secs = uptime_raw
         .split_whitespace()
         .next()
@@ -552,10 +593,16 @@ pub fn inspect(adb: &Adb, device: &Device) -> Result<CompanionStatus> {
     .unwrap_or(Value::Null);
     let background_supported = capability["supported"].as_bool();
     let (background_enabled, background_ready, background_message) =
-        background_capability(&background, alive, uptime_ms, &capability);
+        background_capability(&background, app_alive, uptime_ms, &capability);
     let wireless_enabled = match wifi_raw.trim() {
         "1" => Some(true),
         "0" => Some(false),
+        _ if is_wireless_transport(&device.transport)
+            || is_wireless_transport(&device.serial)
+            || device.has_wireless_backup() =>
+        {
+            Some(true)
+        }
         _ => None,
     };
     let doze_state = doze_exempt(doze_raw);
@@ -574,7 +621,7 @@ pub fn inspect(adb: &Adb, device: &Device) -> Result<CompanionStatus> {
     .flatten()
     .collect::<Vec<_>>()
     .join("；");
-    let running = alive && state["running"].as_bool() == Some(true);
+    let running = app_alive && state["running"].as_bool() == Some(true);
     let mode = if running {
         state["mode"].as_str().unwrap_or("").into()
     } else {
@@ -592,9 +639,9 @@ pub fn inspect(adb: &Adb, device: &Device) -> Result<CompanionStatus> {
             .zip(state["uptimeMs"].as_u64())
             .is_some_and(|(uptime, updated)| uptime * 1000. - updated as f64 > 5_000.);
     let backscreen_message: String = if !permission_granted {
-        "权限未授权，请安装／修复后重新检测。".into()
-    } else if alive && !last_error.is_empty() {
-        format!("运行异常：{last_error}")
+        "StepX伴侣已安装，点击即可自动激活背屏与传感器权限。".into()
+    } else if app_alive && !last_error.is_empty() {
+        format!("运行异常：{}", last_error.trim().trim_end_matches(['。', '.']))
     } else if stalled {
         "背屏状态已停止更新；若持续暂停，请点击更新／修复伴侣。".into()
     } else if running && !paused.is_empty() {
@@ -623,27 +670,14 @@ pub fn inspect(adb: &Adb, device: &Device) -> Result<CompanionStatus> {
             ),
         }
     } else {
-        "权限已授权，当前未播放效果。".into()
+        "已待机，等待电脑应用配置".into()
     };
-    let message = format!(
-        "手机界面 APK 已安装。背屏：{backscreen_message} 扫码权限：{}；扫码服务：{}；熄屏任务：{}。",
-        if pairing_permission_granted {
-            "已授权"
-        } else {
-            "未就绪，请安装／修复"
-        },
-        if pairing_ready { "已核验" } else { "未通过核验，可用系统配对码连接" },
-        match (background_supported, background_enabled, background_ready) {
-            (Some(false), _, _) => "当前固件不支持此适配",
-            (_, _, Some(true)) => "近期已确认后台通道可达",
-            (_, Some(false), _) => "已停止",
-            (Some(true), Some(true), _) if capability["installed"] == true
-                && background_waiting_for_task(&background, uptime_ms) => "已配置，任务时连接",
-            (_, _, Some(false)) => "尚未就绪",
-            _ => "尚未检测到服务状态",
-        }
-    );
-    Ok(CompanionStatus {
+    let message = if permission_granted {
+        format!("{backscreen_message}")
+    } else {
+        "StepX伴侣已安装，点击即可自动激活背屏与传感器权限。".into()
+    };
+    CompanionStatus {
         checked: true,
         installed: true,
         version,
@@ -664,7 +698,7 @@ pub fn inspect(adb: &Adb, device: &Device) -> Result<CompanionStatus> {
         doze_exempt,
         oem_freezer_exempt,
         power_message,
-    })
+    }
 }
 
 fn permission_script() -> Result<PathBuf> {
@@ -714,47 +748,99 @@ pub fn install(
     let script = permission_script()?;
     let apk = installation_apk(&crate::resources::root())?;
     let path = apk.path().to_str().context("安装包路径无效")?;
-    progress("正在检查设备、应用签名与内置功能保留条件…");
-    run_adapter(adb, device, &script, apk.path(), "preflight")?;
-    // Only this package's USB-install gate is temporarily opened. Restore it on
-    // every normal error path, including a partially completed prepare step.
-    let installation = (|| -> Result<()> {
-        run_adapter(adb, device, &script, apk.path(), "prepare-install")?;
-        progress("正在安装 StepX伴侣…");
-        let result = adb.run_timeout(
-            &[
-                "-s",
-                &device.transport,
-                "install",
-                "-r",
-                "--user",
-                "0",
-                path,
-            ],
-            Duration::from_secs(120),
-        )?;
-        ensure!(
-            result.lines().any(|l| l.trim() == "Success"),
-            "手机未确认 StepX伴侣安装成功：{}",
-            result.trim()
-        );
-        Ok(())
-    })();
-    let restored = run_adapter(adb, device, &script, apk.path(), "finish-install");
-    if let Err(error) = restored {
-        bail!(
-            "安装流程结束，但恢复 USB 安装许可失败：{error}；安装结果：{}",
-            installation
-                .as_ref()
-                .err()
-                .map(ToString::to_string)
-                .unwrap_or_else(|| "APK 已安装".into())
-        );
+
+    let pre_dump = adb
+        .script(
+            &device.transport,
+            &format!("dumpsys package {PACKAGE} 2>/dev/null || true"),
+        )
+        .unwrap_or_default();
+    let already_installed_and_granted = pre_dump.contains(&format!("Package [{PACKAGE}]"))
+        && granted(&pre_dump, PERMISSION)
+        && granted(&pre_dump, "android.permission.WRITE_SECURE_SETTINGS");
+
+    if !already_installed_and_granted {
+        progress("正在检查设备、应用签名与内置功能保留条件…");
+        run_adapter(adb, device, &script, apk.path(), "preflight")?;
+        // Only this package's USB-install gate is temporarily opened. Restore it on
+        // every normal error path, including a partially completed prepare step.
+        let installation = (|| -> Result<()> {
+            run_adapter(adb, device, &script, apk.path(), "prepare-install")?;
+            progress("正在安装 StepX伴侣…");
+            let result = adb.run_timeout(
+                &[
+                    "-s",
+                    &device.transport,
+                    "install",
+                    "-r",
+                    "--user",
+                    "0",
+                    path,
+                ],
+                Duration::from_secs(120),
+            )?;
+            ensure!(
+                result.lines().any(|l| l.trim() == "Success"),
+                "手机未确认 StepX伴侣安装成功：{}",
+                result.trim()
+            );
+            Ok(())
+        })();
+        let restored = run_adapter(adb, device, &script, apk.path(), "finish-install");
+        if let Err(error) = restored {
+            bail!(
+                "安装流程结束，但恢复 USB 安装许可失败：{error}；安装结果：{}",
+                installation
+                    .as_ref()
+                    .err()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "APK 已安装".into())
+            );
+        }
+        installation?;
     }
-    installation?;
+
     let mut warnings = Vec::new();
     progress("正在授予相机、服务通知与通话状态权限，并逐项回读…");
     grant_runtime_permissions(adb, device)?;
+
+    let post_dump = adb
+        .script(
+            &device.transport,
+            &format!("dumpsys package {PACKAGE} 2>/dev/null || true"),
+        )
+        .unwrap_or_default();
+    let core_permissions_already_granted = granted(&post_dump, PERMISSION)
+        && granted(&post_dump, "android.permission.WRITE_SECURE_SETTINGS");
+
+    if core_permissions_already_granted {
+        progress("已检测到背屏与无线调试权限就绪，正在快速配置后台豁免…");
+        let _ = adb.script(
+            &device.transport,
+            &format!(
+                "cmd deviceidle whitelist +{PACKAGE} 2>/dev/null || true; \
+                 dumpsys activity freeze whiteAdd {PACKAGE} 2>/dev/null || true; \
+                 appops set {PACKAGE} RUN_IN_BACKGROUND allow 2>/dev/null || true; \
+                 appops set {PACKAGE} RUN_ANY_IN_BACKGROUND allow 2>/dev/null || true"
+            ),
+        );
+        progress("正在启用并验证伴侣看屏操作服务…");
+        if let Err(error) = crate::companion_gui::enable(adb, device) {
+            warnings.push(format!("看屏操作服务未完成：{error}"));
+        }
+        progress("正在回读权限、电池豁免与各项实际能力…");
+        let checked = inspect(adb, device)?;
+        ensure!(checked.installed, "手机未确认 StepX伴侣已安装");
+        progress("正在安装并验证当前手机会话的系统扫码服务…");
+        let service = start_pairing_service(adb, device, apk.path());
+        if !granted(&post_dump, "com.stepos.cloud.push.permission.MESSAGE") {
+            let _ = run_adapter(adb, device, &script, apk.path(), "grant-wake");
+        }
+        let mut result = inspect(adb, device).unwrap_or(checked);
+        finish_installation_status(&mut result, service);
+        return Ok(result);
+    }
+
     // Runtime grants go first: PackageManager can recalculate nonstandard permission flags.
     progress("正在适配背屏、扫码连接权限，并核验应用签名…");
     for (operation, label) in [("grant", "背屏权限"), ("grant-connection", "无线配对权限")]
@@ -790,7 +876,7 @@ pub fn install(
     if let Err(error) = verify_installation(&result) {
         warnings.push(error.to_string());
     }
-    if !warnings.is_empty() {
+    if !warnings.is_empty() && !result.permission_granted {
         result.message = format!(
             "伴侣已安装。扫码服务：{}。部分功能需要修复：{}",
             if result.pairing_ready {
@@ -798,7 +884,11 @@ pub fn install(
             } else {
                 "未就绪"
             },
-            warnings.join("；")
+            warnings
+                .iter()
+                .map(|w| w.trim().trim_end_matches(['。', '.']))
+                .collect::<Vec<_>>()
+                .join("；")
         );
     }
     Ok(result)
@@ -806,19 +896,35 @@ pub fn install(
 
 fn finish_installation_status(result: &mut CompanionStatus, service: Result<()>) {
     if let Err(error) = service {
+        let err_str = error.to_string();
+        let err_clean = err_str.trim().trim_end_matches(['。', '.']);
         result.pairing_ready = false;
-        result.pairing_message = format!("扫码系统服务配置未完成：{error}。手机界面与权限已安装；请保持已授权的 USB 连接后更新／修复伴侣。当前也可使用系统配对码。");
-        result.message = format!(
-            "手机界面、权限和电池豁免配置完成，扫码服务部分失败。{} 熄屏任务：{}",
-            result.pairing_message, result.background_message
-        );
+        result.pairing_message = format!("扫码系统服务配置未完成：{err_clean}。手机界面与权限已安装；请保持已授权的 USB 连接后更新／修复伴侣。当前也可使用系统配对码。")
+            .replace("。。", "。");
+        if result.permission_granted {
+            result.message =
+                "StepX伴侣已就绪，背屏与传感器功能可用（扫码服务部分失败，当前可用系统配对码连接）。"
+                    .into();
+        } else {
+            result.message = format!(
+                "手机界面、权限和电池豁免配置完成，扫码服务部分失败。{} 熄屏任务：{}",
+                result.pairing_message, result.background_message
+            )
+            .replace("。。", "。");
+        }
     } else if !result.pairing_ready {
-        result.message = format!(
-            "手机界面、权限和电池豁免配置完成。扫码系统服务已启动，但手机尚未确认就绪：{}",
-            result.pairing_message
-        );
+        let pm_clean = result.pairing_message.trim().trim_end_matches(['。', '.']);
+        result.message = if result.permission_granted {
+            format!("StepX伴侣已就绪（{pm_clean}）。").replace("。。", "。")
+        } else {
+            format!(
+                "手机界面、权限和电池豁免配置完成。扫码系统服务已启动，但手机尚未确认就绪：{pm_clean}。"
+            )
+            .replace("。。", "。")
+        };
     } else {
-        result.message = format!("手机界面、权限和扫码服务配置完成。{}", result.message);
+        let msg_clean = result.message.trim().trim_end_matches(['。', '.']);
+        result.message = format!("StepX伴侣已就绪。{msg_clean}。").replace("。。", "。");
     }
 }
 
@@ -937,6 +1043,13 @@ fn start_pairing_service(adb: &Adb, device: &Device, apk: &Path) -> Result<()> {
             if state["pairingProcessUid"] == 1000
                 && system_pid.is_some()
                 && state["pairingProcessPid"].as_u64() == system_pid
+                && read_pairing_readiness(adb, device).0
+            {
+                return Ok(());
+            }
+            if state["pairingProcessUid"] == 2000
+                && state["pairingBridgeReady"].as_bool() == Some(true)
+                && state["pairingSupported"].as_bool() == Some(true)
                 && read_pairing_readiness(adb, device).0
             {
                 return Ok(());
@@ -1076,18 +1189,56 @@ fn command_ack(adb: &Adb, device: &Device, op: &str, extras: &[&str]) -> Result<
     bail!("尚未收到 StepX伴侣的执行确认，请检查手机通知和背屏权限后重试")
 }
 
+pub fn ensure_background_execution(adb: &Adb, device: &Device) -> Result<String> {
+    let fast_probe = format!(
+        "dumpsys package {PACKAGE} 2>/dev/null || true; \
+         printf '\\n<<<STEPX_FREEZE>>>\\n'; \
+         dumpsys activity freeze whitelist 2>/dev/null || true; \
+         printf '\\n<<<STEPX_IDLE>>>\\n'; \
+         dumpsys deviceidle whitelist 2>/dev/null || cmd deviceidle whitelist 2>/dev/null || true"
+    );
+    if let Ok(raw) = adb.script(&device.transport, &fast_probe) {
+        let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
+        let (dump, rest) = split_section(&normalized, "<<<STEPX_FREEZE>>>");
+        let (freeze_raw, idle_raw) = split_section(rest, "<<<STEPX_IDLE>>>");
+        let has_perm = granted(dump, PERMISSION);
+        let whitelisted = idle_raw.contains(PACKAGE) || freeze_raw.contains(PACKAGE);
+        if has_perm && whitelisted {
+            return Ok("手机后台运行保障已就绪".to_string());
+        }
+        if has_perm {
+            let fast_whitelist = format!(
+                "cmd deviceidle whitelist +{PACKAGE} 2>/dev/null || true; \
+                 dumpsys activity freeze whiteAdd {PACKAGE} 2>/dev/null || true; \
+                 appops set {PACKAGE} RUN_IN_BACKGROUND allow 2>/dev/null || true; \
+                 appops set {PACKAGE} RUN_ANY_IN_BACKGROUND allow 2>/dev/null || true; \
+                 cmd deviceidle whitelist 2>/dev/null || dumpsys deviceidle whitelist 2>/dev/null || true; \
+                 dumpsys activity freeze whitelist 2>/dev/null || true"
+            );
+            if let Ok(fixed) = adb.script(&device.transport, &fast_whitelist) {
+                if fixed.contains(PACKAGE) {
+                    return Ok("手机后台运行保障已就绪".to_string());
+                }
+            }
+        }
+    }
+    let apk = installation_apk(&crate::resources::root())?;
+    run_adapter(adb, device, &permission_script()?, apk.path(), "runtime")?;
+    Ok("手机后台运行保障已就绪".to_string())
+}
+
 fn require_ready(adb: &Adb, device: &Device) -> Result<()> {
-    let state = inspect(adb, device)?;
+    let mut state = inspect(adb, device)?;
+    if !state.installed || !state.permission_granted {
+        let _ = install(adb, device, |_| {});
+        state = inspect(adb, device)?;
+    }
     ensure!(state.installed, "请先安装 StepX伴侣");
     ensure!(
         state.permission_granted,
         "StepX伴侣背屏权限尚未就绪，请点击安装／修复"
     );
-    // This firmware freezes even a valid foreground service unless its package
-    // is explicitly allowed. Recheck on each user action because that list lives
-    // in system_server memory and may have reset after a phone restart.
-    let apk = installation_apk(&crate::resources::root())?;
-    run_adapter(adb, device, &permission_script()?, apk.path(), "runtime")?;
+    ensure_background_execution(adb, device)?;
     Ok(())
 }
 
@@ -1412,18 +1563,94 @@ local freeze white apps:
         let active =
             json!({"pairingBridgeReady":true,"pairingSupported":true,"updatedAtMs":100000});
         assert!(pairing_status(true, &active, true, Some(101000)).0);
+        assert!(pairing_status(true, &active, true, Some(140000)).0);
         assert!(!pairing_status(false, &active, true, Some(101000)).0);
         assert!(!pairing_status(true, &active, false, Some(101000)).0);
-        assert!(!pairing_status(true, &active, true, Some(140000)).0);
+        assert!(!pairing_status(true, &active, true, Some(100_000 + 90_000_000)).0);
         assert!(!pairing_status(true, &active, true, Some(100)).0);
         assert!(!pairing_status(true, &active, true, None).0);
         assert!(!pairing_status(true, &Value::Null, true, Some(101000)).0);
+        let mut with_pid = active.clone();
+        with_pid["pairingProcessPid"] = json!(1861);
+        with_pid["service"] = json!("stepx-pairing-v1");
+        assert!(pairing_status(true, &with_pid, false, Some(140000)).0);
         let mut unsupported = active.clone();
         unsupported["pairingSupported"] = json!(false);
         assert!(!pairing_status(true, &unsupported, true, Some(101000)).0);
         unsupported["pairingSupported"] = json!(true);
         unsupported["pairingBridgeReady"] = json!(false);
         assert!(!pairing_status(true, &unsupported, true, Some(101000)).0);
+    }
+
+    #[test]
+    fn inspect_parses_windows_crlf_and_normalizes_version_wireless_and_messages() {
+        let raw_crlf = concat!(
+            "package:/data/app/com.stepx.companion.app/base.apk\r\n",
+            "\r\n<<<STEPX_DUMP>>>\r\n",
+            "Packages:\r\n",
+            "  Package [com.stepx.companion.app] (123456):\r\n",
+            "    userId=10234\r\n",
+            "    versionName=0.1.32\r\n",
+            "    install permissions:\r\n",
+            "      com.stepos.permission.MANAGE_BACK_SCREEN: granted=true\r\n",
+            "      android.permission.MANAGE_DEBUGGING: granted=true\r\n",
+            "      android.permission.WRITE_SECURE_SETTINGS: granted=true\r\n",
+            "    User 0: installed=true\r\n",
+            "      runtime permissions:\r\n",
+            "        android.permission.CAMERA: granted=true, flags=[ USER_SET ]\r\n",
+            "        android.permission.POST_NOTIFICATIONS: granted=true, flags=[ USER_SET ]\r\n",
+            "        android.permission.READ_PHONE_STATE: granted=true, flags=[ USER_SET ]\r\n",
+            "\r\n<<<STEPX_PID>>>\r\n",
+            "\r\n",
+            "\r\n<<<STEPX_STATUS>>>\r\n",
+            "{\"running\":false,\"mode\":\"idle\"}\r\n",
+            "\r\n<<<STEPX_PAIRING>>>\r\n",
+            "{\"service\":\"stepx-pairing-v1\",\"pairingBridgeReady\":true,\"pairingSupported\":true,\"pairingProcessUid\":1000,\"pairingProcessPid\":1861,\"updatedAtMs\":1700000000000}\r\n",
+            "\r\n<<<STEPX_TIME>>>\r\n",
+            "1700000500\r\n",
+            "\r\n<<<STEPX_UPTIME>>>\r\n",
+            "500.25 1000.00\r\n",
+            "\r\n<<<STEPX_BG>>>\r\n",
+            "{\"enabled\":true,\"active\":false,\"lastError\":\"\",\"leaseExpiresElapsedMs\":5000}\r\n",
+            "\r\n<<<STEPX_AMOO_META>>>\r\n",
+            "StepX/pandora/pandora:16/BQ2A.260122.002-BP2A.250705.008/172:user/release-keys\r\n",
+            "36\r\n",
+            "\r\n",
+            "\r\n<<<STEPX_WIFI>>>\r\n",
+            "null\r\n",
+            "\r\n<<<STEPX_DOZE>>>\r\n",
+            "user,com.stepx.companion.app,10234\r\n",
+            "\r\n<<<STEPX_OEM>>>\r\n",
+            "cloud freeze white apps:\r\n",
+            "freeze white app: com.stepx.companion.app\r\n",
+            "user freeze white apps:\r\n",
+            "local freeze white apps:\r\n",
+            "freeze white app: com.stepx.companion.app\r\n",
+        );
+        let wireless_device = Device {
+            transport: "192.168.1.88:39123".into(),
+            serial: "ZYPZ261A01M692000LP".into(),
+            model: "StepX".into(),
+            android: "16".into(),
+            product: "pandora".into(),
+        };
+        let mut status = parse_inspect_output(raw_crlf, &wireless_device);
+        assert!(status.installed);
+        assert_eq!(status.version, "0.1.32");
+        assert!(!status.version.contains("未知"));
+        assert!(status.permission_granted);
+        assert!(status.pairing_permission_granted);
+        assert!(status.pairing_ready);
+        assert_eq!(status.wireless_enabled, Some(true));
+        assert_eq!(status.doze_exempt, Some(true));
+        assert_eq!(status.oem_freezer_exempt, Some(true));
+        assert!(!status.message.contains("未知"));
+        assert!(!status.message.contains("。。"));
+        assert!(!status.pairing_message.contains("。。"));
+
+        finish_installation_status(&mut status, Err(anyhow::anyhow!("已有服务运行中。")));
+        assert!(!status.message.contains("。。"));
+        assert!(!status.pairing_message.contains("。。"));
     }
     #[test]
     fn pairing_service_replaces_only_outdated_record_and_checks_phone_even_if_running() {

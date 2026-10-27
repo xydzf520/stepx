@@ -1,6 +1,6 @@
 use super::super::{
     icons::UiIcon, theme::*, widgets::*, Action, Companion, Page, PushAction, F_CONTACT_SEARCH,
-    F_PHONE_DIAL, F_STUDIO_NAME,
+    F_PHONE_CONTACT_NAME, F_PHONE_DIAL,
 };
 use chrono::{Local, TimeZone};
 use facloud_ui::{color::ColorU, elements::*, fonts::Weight, platform::Cursor};
@@ -522,22 +522,22 @@ impl Companion {
         .with_height(36.)
         .finish();
 
-        let detail_box = Container::new(self.between(
-            self.hstack(
-                10.,
-                vec![
-                    sel_avatar,
-                    Flex::column()
-                        .with_spacing(2.)
-                        .with_cross_axis_alignment(CrossAxisAlignment::Start)
-                        .with_child(self.line_w(&sel.name, CAPTION, p.text, Weight::Semibold))
-                        .with_child(self.mono(&sel.number, CAPTION, p.text2))
-                        .finish(),
-                ],
-            ),
-            self.hstack(
-                6.,
-                vec![
+        let detail_box = Container::new(self.vstack(
+            10.,
+            vec![
+                self.hstack(
+                    10.,
+                    vec![
+                        sel_avatar,
+                        Flex::column()
+                            .with_spacing(2.)
+                            .with_cross_axis_alignment(CrossAxisAlignment::Start)
+                            .with_child(self.line_w(&sel.name, CAPTION, p.text, Weight::Semibold))
+                            .with_child(self.mono(&sel.number, CAPTION, p.text2))
+                            .finish(),
+                    ],
+                ),
+                self.wrap(vec![
                     self.button(
                         "ph-sel-copy",
                         "复制",
@@ -559,8 +559,8 @@ impl Companion {
                         Action::PhoneCall(sel.number.clone()),
                         Btn::Primary,
                     ),
-                ],
-            ),
+                ]),
+            ],
         ))
         .with_uniform_padding(14.)
         .with_background_color(p.surface)
@@ -796,9 +796,9 @@ impl Companion {
                             ),
                             Action::PhoneSelectSim(sim.id),
                             if self.selected_call_sim == Some(sim.id) {
-                                Btn::Secondary
+                                Btn::Primary
                             } else {
-                                Btn::Ghost
+                                Btn::Secondary
                             },
                         )
                     })
@@ -994,11 +994,11 @@ impl Companion {
             );
         } else {
             bottom_call_items.push(self.input(
-                F_STUDIO_NAME,
+                F_PHONE_CONTACT_NAME,
                 "输入联系人姓名（选填，可直接存为联系人）",
                 None,
             ));
-            let col3_name_draft = self.fields[F_STUDIO_NAME].text.trim().to_string();
+            let col3_name_draft = self.fields[F_PHONE_CONTACT_NAME].text.trim().to_string();
             let col2_name_draft = self.fields[F_CONTACT_SEARCH].text.trim().to_string();
             let save_ct_state = self.mouse_state("ph-save-ct");
             let font = self.font;
@@ -1052,7 +1052,7 @@ impl Companion {
                     ctx.dispatch_typed_action(Action::ClearField(F_CONTACT_SEARCH));
                     ctx.dispatch_typed_action(Action::Insert(col3_name_draft.clone()));
                 } else if col2_name_draft.is_empty() {
-                    ctx.dispatch_typed_action(Action::Focus(F_STUDIO_NAME));
+                    ctx.dispatch_typed_action(Action::Focus(F_PHONE_CONTACT_NAME));
                 }
                 ctx.dispatch_typed_action(Action::PhoneCreateContact);
             })

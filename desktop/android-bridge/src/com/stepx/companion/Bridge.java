@@ -212,11 +212,13 @@ public final class Bridge {
             throw new IOException("无法读取当前手机的 Amoo 设备标识，消息未发送");
         String id = rows.getJSONObject(0).optString("value", "");
         if (id.isEmpty()) throw new IOException("Amoo 设备标识为空，消息未发送");
+        boolean locked = context.getSystemService(KeyguardManager.class).isKeyguardLocked();
         return new JSONObject().put("device_id", id)
             .put("device_model", android.os.Build.MODEL)
             .put("os_version", android.os.Build.VERSION.RELEASE)
             .put("app_version", context.getPackageManager().getPackageInfo(PKG, 0).versionName)
-            .put("screenLockState", context.getSystemService(KeyguardManager.class).isKeyguardLocked() ? "0" : "1");
+            .put("rawScreenLockState", locked ? "0" : "1")
+            .put("screenLockState", locked ? "0" : "1");
     }
 
     static JSONObject capabilities() throws Exception {

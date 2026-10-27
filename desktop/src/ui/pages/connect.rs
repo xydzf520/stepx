@@ -158,25 +158,50 @@ impl Companion {
                 body.push(self.text("安装时配置相机、通知、通话状态和电池优化豁免。已适配的 StepX 172 固件支持开机恢复：重启后首次手动解锁，已配对电脑在同一局域网自动连接。新电脑、新 Wi-Fi 仍需首次授权；安装结果会说明未完成的能力。", CAPTION, p.text3));
             }
             3 => {
-                body.push(self.text(if companion.pairing_ready { "手机和电脑连接同一局域网。在手机 StepX伴侣「连接」页开启无线调试，确认 Android 的当前 Wi-Fi 信任提示。不要使用访客网络或阻止设备互访的网络。" } else { "手机和电脑连接同一局域网。在手机「设置 → 开发者选项 → 无线调试」手动开启，确认系统的 Wi-Fi 信任提示。伴侣扫码服务未通过核验时，可直接使用下方系统配对码完成连接。" }, BODY, p.text));
-                if !companion.pairing_ready {
-                    body.push(self.text(&companion.pairing_message, CAPTION, p.warning));
-                    body.push(self.button(
-                        "guide-system-pair",
-                        "改用系统配对码",
-                        Action::PairTab(PairTab::Code),
-                        Btn::Secondary,
+                let wireless = self
+                    .selected
+                    .as_ref()
+                    .is_some_and(|d| is_wireless(&d.transport));
+                let wireless_ready = wireless || companion.wireless_enabled == Some(true);
+                body.push(self.text(
+                    if companion.pairing_ready {
+                        "手机和电脑连接同一局域网。在手机 StepX伴侣「连接」页开启无线调试，确认 Android 的当前 Wi-Fi 信任提示。不要使用访客网络或阻止设备互访的网络。"
+                    } else {
+                        "手机和电脑连接同一局域网。在手机「设置 → 开发者选项 → 无线调试」手动开启，确认系统的 Wi-Fi 信任提示。"
+                    },
+                    BODY,
+                    p.text,
+                ));
+                if wireless_ready {
+                    body.push(self.text(
+                        if wireless {
+                            "当前已通过无线调试连接，可直接进入下一步或收起引导。"
+                        } else {
+                            "已检测到手机无线调试开启，可继续下一步完成配对。"
+                        },
+                        CAPTION,
+                        p.success,
+                    ));
+                } else {
+                    if !companion.pairing_ready && !companion.pairing_message.is_empty() {
+                        body.push(self.text(&companion.pairing_message, CAPTION, p.warning));
+                        body.push(self.button(
+                            "guide-system-pair",
+                            "改用系统配对码",
+                            Action::PairTab(PairTab::Code),
+                            Btn::Secondary,
+                        ));
+                    }
+                    body.push(self.text(
+                        match companion.wireless_enabled {
+                            Some(true) => "已检测到手机无线调试开启，可继续下一步完成配对。",
+                            Some(false) => "无线调试尚未开启；在手机确认后点击「检测伴侣状态」。",
+                            None => "请在手机开启「无线调试」，或直接点击「下一步」使用配对码连接。",
+                        },
+                        CAPTION,
+                        p.text2,
                     ));
                 }
-                body.push(self.text(
-                    match companion.wireless_enabled {
-                        Some(true) => "已检测到无线调试开启。请确认手机和电脑在同一网络后继续。",
-                        Some(false) => "无线调试尚未开启；在手机确认后点击「检测伴侣状态」。",
-                        None => "尚未读到无线调试状态，请先完成手机端操作并重新检测。",
-                    },
-                    CAPTION,
-                    p.text2,
-                ));
                 body.push(self.wrap(vec![
                     if connected && companion.installed && !self.busy {
                         self.button(
@@ -290,6 +315,11 @@ impl Companion {
     fn connection_pairing_panel(&self) -> El {
         let p = self.p();
         let detected_ip = self.detected_phone_ip();
+        let connected = self.selected.is_some();
+        let wireless = self
+            .selected
+            .as_ref()
+            .is_some_and(|d| is_wireless(&d.transport));
         let mut rows = vec![
             self.heading("无线配对"),
             self.text(
@@ -297,24 +327,41 @@ impl Companion {
                 CAPTION,
                 p.text2,
             ),
-            self.button_icon(
+        ];
+        if !wireless {
+            rows.push(self.button_icon(
                 "conn-usb-wireless-bridge",
-                "已插数据线？一键开启同局域网无线连接（开启后可拔掉数据线）",
+                "已插数据线？一键开启同局域网无线连接（开启后可拔线）",
                 UiIcon::Wifi,
                 Action::EnableUsbWirelessBridge,
                 Btn::Secondary,
-            ),
-        ];
-        if let Some(ip) = &detected_ip {
-            rows.push(self.button_icon(
-                "conn-fill-detected-ip",
-                format!("填入检测到的手机 IP ({ip}:5555)"),
-                UiIcon::Bolt,
-                Action::FillDetectedPhoneIp(ip.clone()),
-                Btn::Ghost,
             ));
         }
-        if self.selected.is_some() {
+        if let Some(ip) = &detected_ip {
+            if !wireless {
+                rows.push(self.button_icon(
+                    "conn-fill-detected-ip",
+                    format!("填入检测到的手机 IP ({ip}:5555)"),
+                    UiIcon::Bolt,
+                    Action::FillDetectedPhoneIp(ip.clone()),
+                    Btn::Ghost,
+                ));
+            }
+        }
+        if wireless {
+            rows.push(
+                Container::new(self.text(
+                    "当前手机已通过局域网无线连接，无需数据线即可使用全部功能。如需配对其他手机，可使用下方方式。",
+                    CAPTION,
+                    p.success_text,
+                ))
+                .with_uniform_padding(S3)
+                .with_background_color(p.success_soft)
+                .with_border(Border::all(1.).with_border_color(p.success))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
+                .finish(),
+            );
+        } else if connected {
             rows.push(
                 Container::new(self.text(
                     "当前手机已通过 USB 连接，系统会自动预热并维护同局域网无线备用通道，无需手动扫码配对；如需手动绑定新设备可使用下方配对方式。",
@@ -365,16 +412,36 @@ impl Companion {
                         p.text2,
                     ));
                     rows.push(self.text(format!("配对服务：{}", qr.service), MICRO, p.text3));
-                } else {
+                    rows.push(self.button("qr-refresh", "生成新二维码", Action::Qr, Btn::Secondary));
                     rows.push(self.text(
-                        "二维码尚未生成或已经过期，请点击生成二维码。",
-                        BODY,
+                        "可使用 StepX伴侣「扫码连接电脑」或 Android 系统「无线调试 → 使用二维码配对设备」扫描。",
+                        CAPTION,
                         p.text2,
                     ));
+                } else if connected && self.qr.is_none() {
+                    rows.push(self.button("qr-refresh", "生成二维码", Action::Qr, Btn::Secondary));
+                    rows.push(self.text(
+                        "点击上方「生成二维码」，即可用另一台手机扫码配对连接。",
+                        CAPTION,
+                        p.text2,
+                    ));
+                } else {
+                    rows.push(self.button("qr-refresh", "生成二维码", Action::Qr, Btn::Primary));
+                    rows.push(self.text(
+                        "二维码尚未生成或已经过期，请点击上方「生成二维码」后用手机扫描。",
+                        CAPTION,
+                        p.text2,
+                    ));
+                    rows.push(self.text(
+                        if self.companion_status.pairing_ready {
+                            "StepX伴侣 → 连接 → 扫码连接电脑，或使用 Android 系统二维码配对入口。"
+                        } else {
+                            "可使用 Android 系统「无线调试 → 使用二维码配对设备」扫码，或切换 6 位配对码连接。"
+                        },
+                        CAPTION,
+                        p.text3,
+                    ));
                 }
-                rows.push(self.text(if self.companion_status.pairing_ready { "StepX伴侣 → 连接 → 扫码连接电脑，或使用 Android 系统二维码配对入口。" } else { "伴侣扫码服务尚未通过核验。请使用 Android 系统「无线调试 → 使用二维码配对设备」；没有此入口时请选择 6 位配对码。" }, CAPTION, p.text2));
-                rows.push(self.button("qr-refresh", "生成新二维码", Action::Qr, Btn::Secondary));
-                rows.push(self.text("扫描无响应：确认同一网络、关闭访客隔离，检查电脑防火墙，刷新二维码；也可切换配对码填写手机显示的地址。", CAPTION, p.text3));
             }
             PairTab::Code => {
                 rows.push(self.text("手机「开发者选项 → 无线调试 → 使用配对码配对设备」，输入弹窗中的配对端口和 6 位数字。配对端口与连接端口不同。", CAPTION, p.text2));

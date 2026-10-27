@@ -1664,6 +1664,31 @@ impl Companion {
                             Action::Mirror
                         }),
                     );
+                    for (route, text) in [
+                        (
+                            stepx_companion::mirror::MirrorAudioRoute::Pc,
+                            "声音：电脑端播放 (PC)",
+                        ),
+                        (
+                            stepx_companion::mirror::MirrorAudioRoute::Phone,
+                            "声音：手机端播放",
+                        ),
+                        (
+                            stepx_companion::mirror::MirrorAudioRoute::Both,
+                            "声音：电脑+手机双端同播",
+                        ),
+                    ] {
+                        let prefix = if self.mirror_options.audio_route == route {
+                            "✓ "
+                        } else {
+                            ""
+                        };
+                        push(
+                            &format!("{prefix}{text}"),
+                            "",
+                            Some(Action::SetMirrorAudioRoute(route)),
+                        );
+                    }
                     push(
                         "打开投屏与实时触控工坊",
                         "",
@@ -2408,6 +2433,11 @@ mod intent_tests {
             .collect();
         assert!(screen_labels.iter().any(|l| l.contains("实时画面同步")));
         assert!(screen_labels.iter().any(|l| l.contains("独立高帧率投屏")));
+        assert!(screen_labels
+            .iter()
+            .any(|l| l == "✓ 声音：电脑端播放 (PC)"));
+        assert!(screen_labels.iter().any(|l| l == "声音：手机端播放"));
+        assert!(screen_labels.iter().any(|l| l == "声音：电脑+手机双端同播"));
         assert!(screen_labels
             .iter()
             .any(|l| l.contains("打开投屏与实时触控工坊")));

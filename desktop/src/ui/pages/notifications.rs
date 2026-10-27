@@ -221,10 +221,13 @@ impl Companion {
                 };
                 (bg, border, fg, Weight::Normal)
             };
-            let text_el = ui_label(label.clone(), font, MICRO, fg, weight);
             let inner = match icon {
-                Some(ic) => self.hstack(5., vec![self.ui_icon(ic, 13., fg), text_el]),
-                None => text_el,
+                Some(ic) => super::super::icons::icon_label(ic, &label, font, MICRO, fg, weight),
+                None => facloud_ui::elements::Text::new(label.clone(), font, MICRO)
+                    .with_color(fg)
+                    .with_style(facloud_ui::fonts::Properties::default().weight(weight))
+                    .soft_wrap(false)
+                    .finish(),
             };
             Container::new(inner)
                 .with_horizontal_padding(10.)
@@ -315,33 +318,6 @@ impl Companion {
                 Action::Push(PushAction::SelectAppFilter(None)),
             ));
         }
-
-        let quick_group_tabs: [(u8, Option<UiIcon>, &str); 4] = [
-            (0u8, None, "全部通知"),
-            (1u8, Some(UiIcon::Key), "验证码/取件码"),
-            (2u8, Some(UiIcon::Chat), "社交通讯"),
-            (3u8, Some(UiIcon::Settings), "系统与服务"),
-        ];
-        let quick_group_pills: Vec<El> = quick_group_tabs
-            .into_iter()
-            .map(|(grp, icon, label)| {
-                let count = base_notifications
-                    .iter()
-                    .filter(|n| matches_notif_quick_group(n, grp))
-                    .count();
-                self.push_pill_btn(
-                    format!("notif-grp-{grp}"),
-                    if count > 0 {
-                        format!("{label} {count}")
-                    } else {
-                        label.to_string()
-                    },
-                    icon,
-                    self.push.notif_category == grp,
-                    Action::Push(PushAction::SetNotifCategory(grp)),
-                )
-            })
-            .collect();
 
         // Top OTP & Pickup Code Summary Bar
         let top_otp_pickup_banner: Option<El> = if self.push.prefs.privacy_mask {
@@ -744,7 +720,6 @@ impl Companion {
             8.,
             vec![
                 self.input(F_PUSH_SEARCH, "搜索推送通知或验证码…", None),
-                self.wrap(quick_group_pills),
                 self.wrap(category_pills),
                 self.between(
                     self.checkbox_row(
@@ -993,21 +968,15 @@ impl Companion {
                             self.vstack(
                                 4.,
                                 vec![
-                                    self.hstack(
-                                        8.,
-                                        vec![
-                                            self.line_w(
-                                                if n.title.is_empty() {
-                                                    app_label
-                                                } else {
-                                                    n.title.as_str()
-                                                },
-                                                SUBHEAD,
-                                                p.text,
-                                                Weight::Semibold,
-                                            ),
-                                            self.mono(&n.package_name, MICRO, p.text3),
-                                        ],
+                                    self.line_w(
+                                        if n.title.is_empty() {
+                                            app_label
+                                        } else {
+                                            n.title.as_str()
+                                        },
+                                        SUBHEAD,
+                                        p.text,
+                                        Weight::Semibold,
                                     ),
                                     self.wrap(meta_badges),
                                 ],

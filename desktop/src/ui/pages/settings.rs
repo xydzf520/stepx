@@ -612,9 +612,7 @@ impl Companion {
             .top_left()
             .finish(),
         );
-        let footer_opt = if tab == 4 && !self.settings_dirty() {
-            None
-        } else if self.settings_dirty() {
+        let footer_opt = if self.settings_dirty() {
             Some(self.edit_footer(
                 format!("{} 项更改未保存", self.settings_changes().len()),
                 "先确认变更，再保存生效",
@@ -625,41 +623,7 @@ impl Companion {
                 "确认保存",
             ))
         } else {
-            Some(
-                Container::new(
-                    Align::new(
-                        ConstrainedBox::new(self.between(
-                            self.hstack(
-                                S2,
-                                vec![
-                                    self.line_w("设置已保存", CAPTION, p.text2, Weight::Medium),
-                                    self.line(
-                                        "· 修改启动或保活选项后在此确认保存",
-                                        CAPTION,
-                                        p.text3,
-                                    ),
-                                ],
-                            ),
-                            self.hstack(
-                                S2,
-                                vec![
-                                    self.disabled_button("放弃更改"),
-                                    self.disabled_button("确认保存"),
-                                ],
-                            ),
-                        ))
-                        .with_max_width(800.)
-                        .finish(),
-                    )
-                    .top_left()
-                    .finish(),
-                )
-                .with_horizontal_padding(S5)
-                .with_vertical_padding(S3)
-                .with_background_color(p.bg)
-                .with_border(Border::top(1.).with_border_color(p.border))
-                .finish(),
-            )
+            None
         };
         let mut right_col = Flex::column()
             .with_main_axis_size(MainAxisSize::Max)

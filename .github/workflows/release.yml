@@ -5,7 +5,7 @@ on:
       version:
         description: Release version (without v)
         required: true
-        default: '0.2.50'
+        default: '0.2.59'
 permissions:
   contents: read
 jobs:
@@ -88,5 +88,5 @@ jobs:
             gh release upload "v$RELEASE_VERSION" dist/* --clobber
             gh release edit "v$RELEASE_VERSION" --target "$GITHUB_SHA" --notes-file docs/RELEASE_NOTES.md
           else
-            gh release create "v$RELEASE_VERSION" dist/* --target "$GITHUB_SHA" --draft --title "StepX Companion $RELEASE_VERSION · Amoo 连续创作、相册与自动重连" --notes-file docs/RELEASE_NOTES.md
+            gh release create "v$RELEASE_VERSION" dist/* --target "$GITHUB_SHA" --draft --title "StepX Companion $RELEASE_VERSION · 应用商店、局域网投屏与可靠性修复" --notes-file docs/RELEASE_NOTES.md
           fi

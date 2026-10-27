@@ -6,6 +6,7 @@ use facloud_ui::{TypedActionView, WeakViewHandle, WindowId};
 struct MirrorControls {
     owner: WeakViewHandle<Companion>,
     actions: mpsc::Sender<Action>,
+    audio_route: stepx_companion::mirror::MirrorAudioRoute,
 }
 
 impl Entity for MirrorControls {
@@ -16,7 +17,14 @@ impl TypedActionView for MirrorControls {
     fn handle_action(&mut self, action: &Action, ctx: &mut ViewContext<Self>) {
         if matches!(
             action,
-            Action::StopMirror | Action::Key(_) | Action::Screenshot | Action::ScreenGesture(_)
+            Action::StopMirror
+                | Action::Key(_)
+                | Action::Screenshot
+                | Action::ScreenGesture(_)
+                | Action::CycleMirrorAudioRoute
+                | Action::SetMirrorAudioRoute(_)
+                | Action::OpenTool(_)
+                | Action::LanCast(_)
         ) {
             #[cfg(feature = "ui-capture")]
             eprintln!("MIRROR_CONTROL_RECEIVED: {:?}", action);
@@ -34,9 +42,10 @@ impl View for MirrorControls {
         let _ = self.actions.send(Action::StopMirror);
     }
     fn render(&self, app: &AppContext) -> El {
+        let route = self.audio_route;
         self.owner
             .upgrade(app)
-            .map(|owner| owner.read(app, |view, _| view.mirror_control_panel()))
+            .map(|owner| owner.read(app, |view, _| view.mirror_control_panel_with_route(route)))
             .unwrap_or_else(|| Rect::new().finish())
     }
 }
@@ -67,6 +76,7 @@ pub(super) struct ControlWindow {
     visible: bool,
     busy: bool,
     dark: bool,
+    audio_route: stepx_companion::mirror::MirrorAudioRoute,
 }
 
 impl Companion {
@@ -115,7 +125,7 @@ impl Companion {
                         .finish(),
                 )
                 .with_width(72.)
-                .with_height(38.)
+                .with_height(36.)
                 .finish()
             },
         )
@@ -133,6 +143,13 @@ impl Companion {
     }
 
     fn mirror_control_panel(&self) -> El {
+        self.mirror_control_panel_with_route(self.mirror_options.audio_route)
+    }
+
+    fn mirror_control_panel_with_route(
+        &self,
+        audio_route: stepx_companion::mirror::MirrorAudioRoute,
+    ) -> El {
         let p = self.p();
         use icons::UiIcon::*;
         Container::new(
@@ -165,6 +182,13 @@ impl Companion {
                     false,
                 ))
                 .with_child(self.fixed_w(40., self.divider()))
+                .with_child(self.mirror_tool(
+                    "audio-route",
+                    audio_route.short_label(),
+                    Speaker,
+                    Action::CycleMirrorAudioRoute,
+                    false,
+                ))
                 .with_child(self.mirror_tool("volume-up", "音量 +", Plus, Action::Key(24), false))
                 .with_child(self.mirror_tool(
                     "volume-down",
@@ -175,6 +199,13 @@ impl Companion {
                 ))
                 .with_child(self.mirror_tool("mute", "静音", Mute, Action::Key(164), false))
                 .with_child(self.mirror_tool("capture", "截图", Camera, Action::Screenshot, false))
+                .with_child(self.mirror_tool(
+                    "lan-cast",
+                    "局域网",
+                    Wifi,
+                    Action::OpenTool(Some(ToolPage::Screen)),
+                    false,
+                ))
                 .with_child(self.spacer())
                 .with_child(self.fixed_w(56., self.divider()))
                 .with_child(self.mirror_tool("stop", "结束投屏", Close, Action::StopMirror, true))
@@ -216,12 +247,20 @@ impl Companion {
             pathfinder_geometry::rect::RectF::new(vec2f(b[0], b[1]), vec2f(b[2], b[3]))
         };
         let dark = self.theme_mode.is_dark(ctx.system_theme());
+        let audio_route = self.mirror_options.audio_route;
         if let Some(window) = &mut self.mirror_controls {
             if let Some(view) = window.view.upgrade(ctx) {
-                if window.busy != self.busy || window.dark != dark {
-                    view.update(ctx, |_, ctx| ctx.notify());
+                if window.busy != self.busy
+                    || window.dark != dark
+                    || window.audio_route != audio_route
+                {
+                    view.update(ctx, |controls, ctx| {
+                        controls.audio_route = audio_route;
+                        ctx.notify();
+                    });
                     window.busy = self.busy;
                     window.dark = dark;
+                    window.audio_route = audio_route;
                 }
             } else {
                 self.stop_mirror();
@@ -271,7 +310,11 @@ impl Companion {
                 ..Default::default()
             },
             move |ctx| ControlsRoot {
-                child: ctx.add_typed_action_view(move |_| MirrorControls { owner, actions }),
+                child: ctx.add_typed_action_view(move |_| MirrorControls {
+                    owner,
+                    actions,
+                    audio_route,
+                }),
             },
         );
         let controls = view.read(ctx, |root, _| root.child.downgrade());
@@ -283,6 +326,7 @@ impl Companion {
             visible: true,
             busy: self.busy,
             dark,
+            audio_route,
         });
     }
 

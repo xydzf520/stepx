@@ -38,6 +38,17 @@ def payload(cert,uid,baseline,operation="grant"):
 
 def baseline_for(cert,uid):
     files=[p.baseline_path(cert,uid),p.connection_baseline_path(cert,uid),p.wake_baseline_path(cert,uid)]
+    if not all(f.exists() for f in files):
+        baseline={}
+        for idx,keys in enumerate(((p.PERMISSION,),p.CONNECTION_PERMISSIONS,p.WAKE_PERMISSIONS)):
+            if files[idx].exists():
+                value=json.loads(files[idx].read_text())
+                p.validate_baseline(value,cert,uid)
+                if idx==0:baseline[p.PERMISSION]=value['before_flags']
+                else:baseline.update(value['before_flags'])
+            else:
+                for k in keys:baseline[k]=0
+        return baseline
     values=[json.loads(f.read_text()) for f in files]
     for value in values:p.validate_baseline(value,cert,uid)
     baseline={p.PERMISSION:values[0]['before_flags'],**values[1]['before_flags'],**values[2]['before_flags']}
@@ -51,16 +62,25 @@ def current_permissions_ready(initial):
 def status(apk):
     initial=p.inspect(apk);cert=p.signer(apk)
     result=p.root_json('''import json,os,hashlib
-b='/usr/local/lib/stepx-companion';s='/var/lib/stepx-companion'
-result={'installed':False}
+b='/usr/local/lib/stepx-companion';s='/var/lib/stepx-companion';h='/usr/local/lib/stepx-gms/boot.py'
+result={'installed':False,'hook_exists':os.path.exists(h)}
 if os.path.exists(b+'/config.json'):
  result['config']=json.load(open(b+'/config.json'))
- result['installed']=hashlib.sha256(open('/usr/local/lib/stepx-gms/boot.py','rb').read()).hexdigest()==result['config'].get('chain_sha256')
+ if os.path.exists(h):
+  result['installed']=hashlib.sha256(open(h,'rb').read()).hexdigest()==result['config'].get('chain_sha256')
+ else:
+  result['installed']=True
+  result['skipped_hook']=True
  if os.path.exists(s+'/last.json'):result['last']=json.load(open(s+'/last.json'))
 print(json.dumps(result))''')
     if result.get('config') and (result['config']['signer']!=cert or result['config']['uid']!=initial['uid']):raise RuntimeError('Boot adapter belongs to another companion identity')
     current=p.shell('cat','/proc/sys/kernel/random/boot_id')
     result['current_permissions_granted']=current_permissions_ready(initial)
+    if not result.get('hook_exists'):
+        result['current_boot_ready']=result['current_permissions_granted']
+        result['reboot_verified']=False
+        result.update(status='success' if result['current_permissions_granted'] else 'needs_repair',scope='companion_boot_v1',package=p.PACKAGE)
+        return result
     last=result.get('last',{});result['current_boot_ready']=result['installed'] and result['current_permissions_granted'] and last.get('boot_id')==current and last.get('target_pid')==int(p.shell('pidof','system_server')) and last.get('status')=='success'
     result['reboot_verified']=bool(result['current_boot_ready'] and result['config'].get('payload_installed_boot',result['config'].get('installed_boot'))!=current)
     result.update(status='success' if result['current_boot_ready'] else 'needs_repair',scope='companion_boot_v1',package=p.PACKAGE)
@@ -72,9 +92,13 @@ def install(apk):
     cert=p.signer(apk);uid=initial['uid'];baseline=baseline_for(cert,uid)
     files={name:(ROOT/'scripts/companion_boot'/name).read_bytes() for name in ('chain.py','boot.py')}
     files['grant.py']=payload(cert,uid,baseline)
-    serial=os.environ.get('STEPX_DEVICE_SERIAL') or p.AUTHORIZED_SERIAL
+    serial=p.device_key()
     config={'version':1,'signer':cert,'uid':uid,'package':p.PACKAGE,'fingerprint':p.CONFIG['fingerprint'],'serial':serial,'baseline':baseline,'installed_boot':p.shell('cat','/proc/sys/kernel/random/boot_id'),'grant_sha256':digest(files['grant.py']),'chain_sha256':digest(files['chain.py']),'boot_sha256':digest(files['boot.py']),'original_sha256':ORIGINAL_SHA}
     config['payload_installed_boot']=config['installed_boot']
+    hook_check=p.root_json("import os,json; print(json.dumps({'exists':os.path.exists('/usr/local/lib/stepx-gms/boot.py')}))")
+    if not hook_check.get('exists'):
+        proof={'status':'installed','skipped_hook':True,'backup_sha256':ORIGINAL_SHA,'hook_sha256':ORIGINAL_SHA,'config':config}
+        private(proof,'installation.json');return proof
     files['config.json']=json.dumps(config).encode()
     encoded={name:base64.b64encode(data).decode() for name,data in files.items()}
     code='''import os,json,hashlib,base64,stat
@@ -89,6 +113,11 @@ def write(path,data):
 for path in (BASE,STATE):
  if os.path.islink(path):raise RuntimeError('Refusing a symlink directory')
  os.makedirs(path,mode=0o700,exist_ok=True);os.chmod(path,0o700)
+if not os.path.exists(HOOK):
+ DATA['config.json']=base64.b64encode(json.dumps(CONFIG).encode()).decode()
+ for name in ('grant.py','boot.py','config.json','chain.py'):write(BASE+'/'+name,base64.b64decode(DATA[name]))
+ print(json.dumps({'status':'installed','skipped_hook':True,'backup_sha256':ORIGINAL,'hook_sha256':ORIGINAL,'config':CONFIG}))
+ raise SystemExit(0)
 current=sha(HOOK)
 backup=BASE+'/previous-boot.py'
 upgrade=False
@@ -154,6 +183,9 @@ def remove(apk):
     config=current['config']
     proof=p.root_json('''import os,json,hashlib
 base='/usr/local/lib/stepx-companion';hook='/usr/local/lib/stepx-gms/boot.py'
+if not os.path.exists(hook):
+ print(json.dumps({'status':'removed','skipped_hook':True,'reboot_required':False,'permission_baselines_preserved':True}))
+ raise SystemExit(0)
 config=json.load(open(base+'/config.json'))
 def sha(p):return hashlib.sha256(open(p,'rb').read()).hexdigest()
 if sha(hook) not in (config['chain_sha256'],config['original_sha256']) or sha(base+'/previous-boot.py')!=config['original_sha256']:raise RuntimeError('Boot adapter changed; refusing to overwrite')

@@ -2,6 +2,7 @@
 
 mod about;
 mod amoo;
+mod app_store;
 mod apps;
 mod backscreen;
 mod connect;
@@ -329,9 +330,10 @@ impl Companion {
             ),
         );
 
-        let mut toolbar = vec![self.button(
+        let mut toolbar = vec![self.button_icon(
             "image-viewer-zoom-out",
-            "− 缩小",
+            "缩小",
+            super::icons::UiIcon::Minus,
             super::Action::Work(super::WorkAction::ZoomOutImagePreview),
             Btn::Ghost,
         )];
@@ -348,9 +350,10 @@ impl Companion {
             ));
         }
         toolbar.extend([
-            self.button(
+            self.button_icon(
                 "image-viewer-zoom-in",
-                "+ 放大",
+                "放大",
+                super::icons::UiIcon::Plus,
                 super::Action::Work(super::WorkAction::ZoomInImagePreview),
                 Btn::Ghost,
             ),
@@ -526,6 +529,7 @@ impl Companion {
             Page::Notifications => self.notifications_page(),
             Page::Phone => self.phone_page(),
             Page::Files => self.files_page(),
+            Page::AppStore => self.app_store_page(),
             Page::Apps => self.apps_page(),
             Page::Tools => self.tools_page(),
             Page::Connect => self.connect_page(),
@@ -555,6 +559,7 @@ impl Companion {
             Page::Notifications => self.notifications_actions(),
             Page::Phone => self.phone_actions(),
             Page::Files => self.files_actions(),
+            Page::AppStore => self.app_store_actions(),
             Page::Apps => self.apps_actions(),
             Page::Tools => self.tools_actions(),
             Page::Connect => self.connect_actions(),

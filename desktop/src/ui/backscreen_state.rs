@@ -142,6 +142,8 @@ pub(super) enum BackScreenAction {
     AlarmCancelEdit,
     AlarmShiftMinutes(i64, i32),
     AlarmToggleAll(bool),
+    McpCategoryFilter(u8),
+    PushSpecificClipboard(String),
 }
 
 enum CompanionEvent {
@@ -246,6 +248,22 @@ pub(super) struct BackScreenUiState {
     pub last_synced_phone_clip: String,
     pub clipboard_sync_in_flight: bool,
     pub last_clipboard_check: Instant,
+    pub clipboard_history: Vec<String>,
+    pub mcp_category_filter: u8,
+}
+
+impl BackScreenUiState {
+    pub fn record_clipboard_history(&mut self, text: &str) {
+        let clean = text.trim();
+        if clean.is_empty() {
+            return;
+        }
+        self.clipboard_history.retain(|item| item != clean);
+        self.clipboard_history.insert(0, clean.to_string());
+        if self.clipboard_history.len() > 8 {
+            self.clipboard_history.truncate(8);
+        }
+    }
 }
 
 impl Default for BackScreenUiState {
@@ -346,6 +364,8 @@ impl Default for BackScreenUiState {
             last_synced_phone_clip: String::new(),
             clipboard_sync_in_flight: false,
             last_clipboard_check: Instant::now(),
+            clipboard_history: Vec::new(),
+            mcp_category_filter: 0,
         };
         #[cfg(feature = "ui-capture")]
         if let Some(path) = std::env::args()
@@ -1183,8 +1203,11 @@ impl Companion {
                     me.back_screen.stepos_suite_loading = false;
                     match result {
                         Ok(Ok(report)) => {
+                            let phone_clip = report.phone_clipboard.trim().to_string();
+                            if !phone_clip.is_empty() {
+                                me.back_screen.record_clipboard_history(&phone_clip);
+                            }
                             if me.prefs.auto_sync_clipboard {
-                                let phone_clip = report.phone_clipboard.trim().to_string();
                                 if !phone_clip.is_empty()
                                     && phone_clip != me.back_screen.last_synced_phone_clip
                                     && phone_clip != me.back_screen.last_synced_desktop_clip
@@ -1245,6 +1268,50 @@ impl Companion {
                 ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
                     match result {
                         Ok(Ok((pushed_text, note))) => {
+                            me.back_screen.record_clipboard_history(&pushed_text);
+                            me.back_screen.last_synced_desktop_clip = pushed_text.clone();
+                            me.back_screen.last_synced_phone_clip = pushed_text.clone();
+                            me.back_screen.stepos_suite.phone_clipboard = pushed_text;
+                            me.back_screen.stepos_suite.last_action_note = note.clone();
+                            me.error = false;
+                            me.status = note.clone();
+                            me.tools_feedback = Some((me.tool_page, note, false));
+                        }
+                        Ok(Err(err)) => {
+                            me.back_screen.stepos_suite.last_action_note =
+                                format!("剪贴板推送失败：{err}");
+                            me.error = true;
+                            me.status = format!("剪贴板推送失败：{err}");
+                        }
+                        Err(_) => {}
+                    }
+                    ctx.notify();
+                });
+            }
+            BackScreenAction::PushSpecificClipboard(text) => {
+                let Some(device) = self.selected.clone() else {
+                    self.status = "请先连接手机后再推送剪贴板".into();
+                    self.error = true;
+                    return Ok(());
+                };
+                let clip_text = text.trim().to_string();
+                if clip_text.is_empty() {
+                    return Ok(());
+                }
+                self.back_screen.stepos_suite.last_action_note = "正在推送剪贴板记录到手机…".into();
+                self.status = "正在推送剪贴板记录到手机…".into();
+                let (tx, rx) = async_channel::bounded(1);
+                std::thread::spawn(move || {
+                    let res = Adb::discover().and_then(|adb| {
+                        stepx_companion::toolbox::push_clipboard_to_phone(&adb, &device, &clip_text)
+                            .map(|note| (clip_text, note))
+                    });
+                    let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
+                });
+                ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                    match result {
+                        Ok(Ok((pushed_text, note))) => {
+                            me.back_screen.record_clipboard_history(&pushed_text);
                             me.back_screen.last_synced_desktop_clip = pushed_text.clone();
                             me.back_screen.last_synced_phone_clip = pushed_text.clone();
                             me.back_screen.stepos_suite.phone_clipboard = pushed_text;
@@ -1285,6 +1352,7 @@ impl Companion {
                         Ok(Ok(text)) => {
                             ctx.clipboard()
                                 .write(ClipboardContent::plain_text(text.clone()));
+                            me.back_screen.record_clipboard_history(&text);
                             me.back_screen.last_synced_phone_clip = text.clone();
                             me.back_screen.last_synced_desktop_clip = text.clone();
                             let preview: String = text.chars().take(28).collect();
@@ -1310,9 +1378,25 @@ impl Companion {
                     ctx.notify();
                 });
             }
+            BackScreenAction::McpCategoryFilter(cat) => {
+                self.back_screen.mcp_category_filter = *cat;
+            }
             BackScreenAction::TriggerMcpQuickAction(action_key) => {
                 let key = action_key.clone();
-                let payload = self.fields[F_OV_TEXT].text.trim().to_string();
+                let payload = if key == "open_clip_url_phone" {
+                    self.back_screen
+                        .stepos_suite
+                        .phone_clipboard
+                        .trim()
+                        .to_string()
+                } else {
+                    let s = self.fields[F_OV_TEXT].text.trim().to_string();
+                    if s.is_empty() {
+                        self.fields[F_PHONE_SCHEDULE_TITLE].text.trim().to_string()
+                    } else {
+                        s
+                    }
+                };
                 let Some(device) = self.selected.clone() else {
                     self.status = "请先连接手机后再执行快捷指令".into();
                     self.error = true;
@@ -1337,7 +1421,14 @@ impl Companion {
                                 me.back_screen.stepos_suite.controls.dnd_on =
                                     note.contains("已开启");
                             } else if key_for_apply == "toggle_wifi" {
-                                me.back_screen.stepos_suite.controls.wifi_on = true;
+                                me.back_screen.stepos_suite.controls.wifi_on =
+                                    !note.contains("已关闭");
+                            } else if key_for_apply == "toggle_bluetooth" {
+                                me.back_screen.stepos_suite.controls.bluetooth_on =
+                                    !note.contains("已关闭");
+                            } else if key_for_apply == "toggle_screen_perception" {
+                                me.back_screen.stepos_suite.screen_perception_ready =
+                                    note.contains("已开启");
                             }
                             me.back_screen.stepos_suite.last_action_note = note.clone();
                             me.error = false;
@@ -1472,7 +1563,14 @@ impl Companion {
             }
             BackScreenAction::AlarmCreatePreset(preset) => {
                 let preset_idx = *preset;
-                let custom_label = self.fields[F_PHONE_SCHEDULE_TITLE].text.trim().to_string();
+                let custom_label = {
+                    let l = self.fields[F_ALARM_LABEL].text.trim().to_string();
+                    if l.is_empty() {
+                        self.fields[F_PHONE_SCHEDULE_TITLE].text.trim().to_string()
+                    } else {
+                        l
+                    }
+                };
                 let fallback_label = if custom_label.is_empty() {
                     self.fields[F_OV_TEXT].text.trim().to_string()
                 } else {
@@ -1500,6 +1598,7 @@ impl Companion {
                 ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
                     match result {
                         Ok(Ok((_id, alarms, note))) => {
+                            me.fields[F_ALARM_LABEL].clear();
                             me.fields[F_PHONE_SCHEDULE_TITLE].clear();
                             me.back_screen.stepos_suite.checked = true;
                             me.back_screen.stepos_suite.alarms = alarms;
@@ -1848,7 +1947,14 @@ impl Companion {
             }
             BackScreenAction::AlarmCreateCustom => {
                 let time_str = self.fields[F_ALARM_TIME].text.trim().to_string();
-                let label = self.fields[F_PHONE_SCHEDULE_TITLE].text.trim().to_string();
+                let label = {
+                    let l = self.fields[F_ALARM_LABEL].text.trim().to_string();
+                    if l.is_empty() {
+                        self.fields[F_PHONE_SCHEDULE_TITLE].text.trim().to_string()
+                    } else {
+                        l
+                    }
+                };
                 let clean_label = if label.is_empty() {
                     "StepX 桌面提醒".to_string()
                 } else {
@@ -1904,6 +2010,7 @@ impl Companion {
                     );
                 }
                 if self.demo_mode || self.selected.is_none() {
+                    self.fields[F_ALARM_LABEL].clear();
                     self.fields[F_PHONE_SCHEDULE_TITLE].clear();
                     let msg = if editing_old_id.is_some() {
                         format!(
@@ -1951,6 +2058,7 @@ impl Companion {
                 ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
                     match result {
                         Ok(Ok((_id, alarms, msg))) => {
+                            me.fields[F_ALARM_LABEL].clear();
                             me.fields[F_PHONE_SCHEDULE_TITLE].clear();
                             me.apply(Outcome::StepOsAlarmsUpdated(alarms, msg));
                         }
@@ -3266,8 +3374,8 @@ impl Companion {
                     self.page = Page::Alarms;
                     self.back_screen.editing_alarm_id = Some(*alarm_id);
                     self.fields[F_ALARM_TIME].set(&alarm.time_label());
-                    self.fields[F_PHONE_SCHEDULE_TITLE].set(alarm.display_title());
-                    self.focus_field(F_PHONE_SCHEDULE_TITLE, ctx);
+                    self.fields[F_ALARM_LABEL].set(alarm.display_title());
+                    self.focus_field(F_ALARM_LABEL, ctx);
                     self.status = format!(
                         "正在修改闹钟 {}（{}），修改后点击「保存闹钟修改」",
                         alarm.time_label(),
@@ -3278,6 +3386,7 @@ impl Companion {
             }
             BackScreenAction::AlarmCancelEdit => {
                 self.back_screen.editing_alarm_id = None;
+                self.fields[F_ALARM_LABEL].clear();
                 self.fields[F_PHONE_SCHEDULE_TITLE].clear();
                 self.status = "已取消修改闹钟".into();
                 self.error = false;
@@ -3677,10 +3786,15 @@ impl Companion {
                     self.back_screen.companion_installed = Some(status.installed);
                     self.back_screen.companion_permission = status.permission_granted;
                     let phone_message = status.message.clone();
-                    self.back_screen.companion_status = if status.version.is_empty() {
-                        status.message
+                    self.back_screen.companion_status = if status
+                        .version
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_digit())
+                    {
+                        format!("v{} · {}", status.version, status.message)
                     } else {
-                        format!("{} · {}", status.version, status.message)
+                        status.message
                     };
                     if status.running || self.back_screen.companion_mode != "native" {
                         self.back_screen.companion_mode = status.mode;

@@ -149,9 +149,10 @@ impl Companion {
                 Action::OpenNewTextFile,
                 Btn::Secondary,
             ),
-            self.button(
+            self.button_icon(
                 "files-mkdir",
-                "＋ 新建文件夹",
+                "新建文件夹",
+                UiIcon::Plus,
                 Action::OpenNewFolder,
                 Btn::Secondary,
             ),
@@ -168,7 +169,13 @@ impl Companion {
                 Action::Browse(self.directory.clone()),
                 Btn::Secondary,
             ),
-            self.button("files-upload", "↑ 上传文件", Action::Upload, Btn::Primary),
+            self.button_icon(
+                "files-upload",
+                "上传文件",
+                UiIcon::Upload,
+                Action::Upload,
+                Btn::Primary,
+            ),
         ]
     }
 
@@ -216,26 +223,15 @@ impl Companion {
                     .filter(|j| j["state"] == "archived")
                     .count() as u64
             });
-        let context_hint = if self.page == Page::Files {
-            format!("当前目录：{}", self.directory)
+        let right_info = if archived_count > 0 {
+            self.pill_badge(
+                format!("电脑已归档 {archived_count} 项"),
+                p.success_text,
+                p.success_soft,
+            )
         } else {
-            "原件存电脑 · 手机留入口".to_string()
+            self.pill_badge("电脑本地归档 · 释放手机空间", p.text2, p.tag_bg)
         };
-        let right_info = self.hstack(
-            S2,
-            vec![
-                if archived_count > 0 {
-                    self.pill_badge(
-                        format!("电脑已归档 {archived_count} 项"),
-                        p.success_text,
-                        p.success_soft,
-                    )
-                } else {
-                    self.pill_badge("电脑本地归档 · 释放手机空间", p.text2, p.tag_bg)
-                },
-                self.line(context_hint, MICRO, p.text3),
-            ],
-        );
         Container::new(self.between(mode_seg, right_info))
             .with_horizontal_padding(S3)
             .with_vertical_padding(6.)
@@ -559,7 +555,7 @@ impl Companion {
                 S2,
                 vec![
                     if self.directory == "/sdcard" {
-                        self.disabled_button("↑ 上一级")
+                        self.disabled_button("上一级")
                     } else {
                         self.button_icon(
                             "files-up-inline",
@@ -703,9 +699,10 @@ impl Companion {
                         CAPTION,
                         p.text,
                     ),
-                    self.button(
+                    self.button_icon(
                         "trash-restore",
-                        "↺ 撤销并恢复",
+                        "撤销并恢复",
+                        UiIcon::Refresh,
                         Action::Restore,
                         Btn::Secondary,
                     ),
@@ -748,31 +745,10 @@ impl Companion {
             .finish()
         };
 
-        let dir_arrow = if self.expansion.files_desc {
-            "↓"
-        } else {
-            "↑"
-        };
-        let name_hdr = if self.expansion.files_sort == "name" {
-            format!("名称 {dir_arrow}")
-        } else {
-            "名称".into()
-        };
-        let date_hdr = if self.expansion.files_sort == "time" {
-            format!("日期 / 目录 {dir_arrow}")
-        } else {
-            "日期 / 目录".into()
-        };
-        let kind_hdr = if self.expansion.files_sort == "kind" {
-            format!("类型 {dir_arrow}")
-        } else {
-            "类型".into()
-        };
-        let size_hdr = if self.expansion.files_sort == "size" {
-            format!("大小 {dir_arrow}")
-        } else {
-            "大小".into()
-        };
+        let name_hdr = "名称";
+        let date_hdr = "日期 / 目录";
+        let kind_hdr = "类型";
+        let size_hdr = "大小";
 
         let table_header = Hoverable::new(self.mouse_state("files-table-hdr-ctx"), move |_| {
             ConstrainedBox::new(
@@ -1282,7 +1258,7 @@ impl Companion {
                     format!("rx-open-{idx}"),
                     "打开",
                     Action::Studio(StudioAction::OpenPath(r_path.clone())),
-                    Btn::Primary,
+                    Btn::Secondary,
                 ),
                 self.button(
                     format!("rx-reveal-{idx}"),
@@ -1368,9 +1344,10 @@ impl Companion {
                     Action::ActivateSelectedFile,
                     Btn::Primary,
                 ));
-                cross_actions.push(self.button(
+                cross_actions.push(self.button_icon(
                     "file-detail-download",
-                    "↓ 下载到电脑",
+                    "下载到电脑",
+                    UiIcon::Download,
                     Action::Download,
                     Btn::Secondary,
                 ));

@@ -24,7 +24,13 @@ pub enum Btn {
 
 pub type El = Box<dyn Element>;
 
-type FileProbeEntry = (std::time::Instant, bool, u64, Option<(u32, u32)>);
+struct FileProbeEntry {
+    at: std::time::Instant,
+    is_file: bool,
+    len: u64,
+    dims: Option<(u32, u32)>,
+    is_black: Option<bool>,
+}
 
 static FILE_PROBE_CACHE: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, FileProbeEntry>>,
@@ -35,16 +41,20 @@ fn probe_file_cached(path: &std::path::Path, need_dims: bool) -> (bool, u64, Opt
     let cache =
         FILE_PROBE_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     if let Ok(mut map) = cache.lock() {
-        if let Some((at, is_file, len, dims)) = map.get_mut(path) {
-            if at.elapsed() < TTL {
-                if !need_dims || !*is_file || dims.is_some() {
-                    return (*is_file, *len, dims.filter(|&(w, h)| w > 0 && h > 0));
+        if let Some(entry) = map.get_mut(path) {
+            if entry.at.elapsed() < TTL {
+                if !need_dims || !entry.is_file || entry.dims.is_some() {
+                    return (
+                        entry.is_file,
+                        entry.len,
+                        entry.dims.filter(|&(w, h)| w > 0 && h > 0),
+                    );
                 }
                 let probed = image::image_dimensions(path).ok().unwrap_or((0, 0));
-                *dims = Some(probed);
+                entry.dims = Some(probed);
                 return (
-                    *is_file,
-                    *len,
+                    entry.is_file,
+                    entry.len,
                     (probed.0 > 0 && probed.1 > 0).then_some(probed),
                 );
             }
@@ -59,18 +69,75 @@ fn probe_file_cached(path: &std::path::Path, need_dims: bool) -> (bool, u64, Opt
         None
     };
     if let Ok(mut map) = cache.lock() {
+        let prev_is_black = map
+            .get(path)
+            .filter(|prev| prev.is_file == is_file && prev.len == len)
+            .and_then(|prev| prev.is_black);
+        let prev_dims = map
+            .get(path)
+            .filter(|prev| prev.is_file == is_file && prev.len == len)
+            .and_then(|prev| prev.dims);
         if map.len() >= 512 {
-            map.retain(|_, (at, ..)| at.elapsed() < TTL);
+            map.retain(|_, entry| entry.at.elapsed() < TTL);
             if map.len() >= 512 {
                 map.clear();
             }
         }
         map.insert(
             path.to_path_buf(),
-            (std::time::Instant::now(), is_file, len, dims_raw),
+            FileProbeEntry {
+                at: std::time::Instant::now(),
+                is_file,
+                len,
+                dims: dims_raw.or(prev_dims),
+                is_black: prev_is_black,
+            },
         );
     }
     (is_file, len, dims_raw.filter(|&(w, h)| w > 0 && h > 0))
+}
+
+fn probe_image_is_black(path: &std::path::Path) -> bool {
+    let Ok(img) = image::open(path) else {
+        return false;
+    };
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    if w == 0 || h == 0 {
+        return false;
+    }
+    for gy in 1..9u32 {
+        let y = ((h as u64 * gy as u64) / 9).min(h.saturating_sub(1) as u64) as u32;
+        for gx in 1..9u32 {
+            let x = ((w as u64 * gx as u64) / 9).min(w.saturating_sub(1) as u64) as u32;
+            let px = rgba.get_pixel(x, y).0;
+            if px[0] > 10 || px[1] > 10 || px[2] > 10 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+pub(super) fn cached_image_is_black(path: &std::path::Path) -> bool {
+    let (is_file, _, _) = probe_file_cached(path, false);
+    if !is_file {
+        return false;
+    }
+    let cache =
+        FILE_PROBE_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Ok(map) = cache.lock() {
+        if let Some(black) = map.get(path).and_then(|entry| entry.is_black) {
+            return black;
+        }
+    }
+    let black = probe_image_is_black(path);
+    if let Ok(mut map) = cache.lock() {
+        if let Some(entry) = map.get_mut(path) {
+            entry.is_black = Some(black);
+        }
+    }
+    black
 }
 
 pub(super) fn cached_is_file(path: &std::path::Path) -> bool {
@@ -112,7 +179,7 @@ pub(super) fn ui_label(
     icon_label(icon, rest, font, size, color, weight)
 }
 
-fn icon_label(
+pub(super) fn icon_label(
     icon: UiIcon,
     rest: &str,
     font: facloud_ui::fonts::FamilyId,
@@ -1401,6 +1468,8 @@ impl Companion {
         let cell_h = sh / 9.;
 
         let shot_path = custom_shot.or_else(|| self.screenshot.as_ref().map(|(_, p)| p.as_path()));
+        let screen_is_black = shot_path.is_some_and(cached_image_is_black)
+            || std::env::var_os("STEPX_SCREEN_OFF").is_some();
         let source = if let Some(path) = shot_path {
             facloud_ui::assets::asset_cache::AssetSource::LocalFile {
                 path: path.to_string_lossy().into_owned(),
@@ -1411,15 +1480,27 @@ impl Companion {
             }
         };
 
-        let screen = ConstrainedBox::new(
-            Image::new(source, CacheOption::BySize)
-                .cover()
-                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(77. * scale)))
-                .finish(),
-        )
-        .with_width(sw)
-        .with_height(sh)
-        .finish();
+        let screen = if screen_is_black {
+            ConstrainedBox::new(
+                Container::new(Empty::new().finish())
+                    .with_background_color(rgb(0x09, 0x09, 0x0B))
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(77. * scale)))
+                    .finish(),
+            )
+            .with_width(sw)
+            .with_height(sh)
+            .finish()
+        } else {
+            ConstrainedBox::new(
+                Image::new(source, CacheOption::BySize)
+                    .cover()
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(77. * scale)))
+                    .finish(),
+            )
+            .with_width(sw)
+            .with_height(sh)
+            .finish()
+        };
 
         // 5-col x 9-row interactive touch matrix over the phone screen area
         let mut grid_rows = Vec::with_capacity(9);
@@ -1455,7 +1536,11 @@ impl Companion {
                 })
                 .with_cursor(Cursor::PointingHand)
                 .on_click(move |ctx, _, _| {
-                    ctx.dispatch_typed_action(Action::ScreenTapNormalized(norm_x, norm_y));
+                    if screen_is_black {
+                        ctx.dispatch_typed_action(Action::ScreenGesture(7));
+                    } else {
+                        ctx.dispatch_typed_action(Action::ScreenTapNormalized(norm_x, norm_y));
+                    }
                 })
                 .on_double_click(move |ctx, _, _| {
                     ctx.dispatch_typed_action(Action::Mirror);
@@ -1492,23 +1577,82 @@ impl Companion {
         .with_height(sh)
         .finish();
 
+        let mut chassis_stack = Stack::new()
+            .with_child(
+                ConstrainedBox::new(Empty::new().finish())
+                    .with_width(w)
+                    .with_height(h)
+                    .finish(),
+            )
+            .with_positioned_child(
+                screen,
+                OffsetPositioning::offset_from_parent(
+                    pathfinder_geometry::vector::vec2f(64. * scale, 80. * scale),
+                    ParentOffsetBounds::Unbounded,
+                    ParentAnchor::TopLeft,
+                    ChildAnchor::TopLeft,
+                ),
+            );
+        if screen_is_black {
+            let compact_bezel = sw < 150.;
+            let (icon_sz, title_txt, title_sz, sub_txt, sub_sz, h_pad, v_pad) = if compact_bezel {
+                (18., "手机当前已息屏", 11., "点击画面点亮解锁", 9.5, 8., 8.)
+            } else {
+                (22., "手机当前处于息屏", 12.5, "点击画面点亮并解锁", 10.5, 12., 10.)
+            };
+            let screen_off_overlay = ConstrainedBox::new(
+                Align::new(
+                    Container::new(
+                        Flex::column()
+                            .with_main_axis_size(MainAxisSize::Min)
+                            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                            .with_spacing(5.)
+                            .with_child(icons::draw_icon(
+                                UiIcon::Sun,
+                                icon_sz,
+                                rgb(0xE4, 0xE4, 0xE7),
+                            ))
+                            .with_child(
+                                Text::new(title_txt, font, title_sz)
+                                    .with_color(rgb(0xF4, 0xF4, 0xF5))
+                                    .with_style(Properties::default().weight(Weight::Semibold))
+                                    .soft_wrap(false)
+                                    .finish(),
+                            )
+                            .with_child(
+                                Text::new(sub_txt, font, sub_sz)
+                                    .with_color(rgb(0xA1, 0xA1, 0xAA))
+                                    .soft_wrap(false)
+                                    .finish(),
+                            )
+                            .finish(),
+                    )
+                    .with_horizontal_padding(h_pad)
+                    .with_vertical_padding(v_pad)
+                    .with_background_color(ColorU::new(0x18, 0x18, 0x1B, 215))
+                    .with_border(Border::all(1.).with_border_color(ColorU::new(
+                        0x3F, 0x3F, 0x46, 180,
+                    )))
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(10.)))
+                    .finish(),
+                )
+                .finish(),
+            )
+            .with_width(sw)
+            .with_height(sh)
+            .finish();
+            chassis_stack = chassis_stack.with_positioned_child(
+                screen_off_overlay,
+                OffsetPositioning::offset_from_parent(
+                    pathfinder_geometry::vector::vec2f(64. * scale, 80. * scale),
+                    ParentOffsetBounds::Unbounded,
+                    ParentAnchor::TopLeft,
+                    ChildAnchor::TopLeft,
+                ),
+            );
+        }
         let phone_chassis = ConstrainedBox::new(
-            Stack::new()
-                .with_child(
-                    ConstrainedBox::new(Empty::new().finish())
-                        .with_width(w)
-                        .with_height(h)
-                        .finish(),
-                )
-                .with_positioned_child(
-                    screen,
-                    OffsetPositioning::offset_from_parent(
-                        pathfinder_geometry::vector::vec2f(64. * scale, 80. * scale),
-                        ParentOffsetBounds::Unbounded,
-                        ParentAnchor::TopLeft,
-                        ChildAnchor::TopLeft,
-                    ),
-                )
+            chassis_stack
                 .with_positioned_child(
                     self.phone_art("neo_front_frame.png", w, h),
                     OffsetPositioning::offset_from_parent(
@@ -1579,20 +1723,30 @@ impl Companion {
                 } else {
                     lerp_color(p.border, p.border_strong, t)
                 };
-                Container::new(
-                    Flex::row()
-                        .with_main_axis_size(MainAxisSize::Min)
-                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                        .with_spacing(4.)
-                        .with_child(icons::draw_icon(icon, 12., fg))
-                        .with_child(ui_label(lbl.clone(), font, 10.5, fg, Weight::Medium))
-                        .finish(),
+                ConstrainedBox::new(
+                    Container::new(
+                        Flex::row()
+                            .with_main_axis_size(MainAxisSize::Min)
+                            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                            .with_spacing(4.)
+                            .with_child(icons::draw_icon(icon, 12., fg))
+                            .with_child(
+                                Text::new(lbl.clone(), font, 10.5)
+                                    .with_color(fg)
+                                    .with_style(Properties::default().weight(Weight::Medium))
+                                    .soft_wrap(false)
+                                    .finish(),
+                            )
+                            .finish(),
+                    )
+                    .with_horizontal_padding(6.)
+                    .with_vertical_padding(4.)
+                    .with_background_color(bg)
+                    .with_border(Border::all(1.).with_border_color(border))
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+                    .finish(),
                 )
-                .with_horizontal_padding(6.)
-                .with_vertical_padding(4.)
-                .with_background_color(bg)
-                .with_border(Border::all(1.).with_border_color(border))
-                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+                .with_width(58.)
                 .finish()
             })
             .with_cursor(Cursor::PointingHand)
@@ -1603,25 +1757,29 @@ impl Companion {
             rail_buttons.push(btn);
         }
 
-        let side_rail = Container::new(
-            Flex::column()
-                .with_main_axis_size(MainAxisSize::Min)
-                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-                .with_spacing(4.)
-                .with_children(rail_buttons)
-                .finish(),
+        let side_rail = ConstrainedBox::new(
+            Container::new(
+                Flex::column()
+                    .with_main_axis_size(MainAxisSize::Min)
+                    .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                    .with_spacing(4.)
+                    .with_children(rail_buttons)
+                    .finish(),
+            )
+            .with_uniform_padding(4.)
+            .with_background_color(p.surface)
+            .with_border(Border::all(1.).with_border_color(p.border))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(10.)))
+            .finish(),
         )
-        .with_uniform_padding(4.)
-        .with_background_color(p.surface)
-        .with_border(Border::all(1.).with_border_color(p.border))
-        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(10.)))
+        .with_width(66.)
         .finish();
 
         // Attached bottom Android navigation bar (flush underneath the phone unit)
         let nav_specs = [
-            ("back", UiIcon::ArrowLeft, "◁ 返回", Action::Key(4)),
-            ("home", UiIcon::Home, "● 主页", Action::Key(3)),
-            ("recents", UiIcon::Apps, "▣ 多任务", Action::Key(187)),
+            ("back", UiIcon::ArrowLeft, "返回", Action::Key(4)),
+            ("home", UiIcon::Home, "主页", Action::Key(3)),
+            ("recents", UiIcon::Apps, "多任务", Action::Key(187)),
         ];
         let mut nav_buttons = Vec::with_capacity(nav_specs.len());
         for (suffix, icon, label, action) in nav_specs {
@@ -1653,7 +1811,13 @@ impl Companion {
                             .with_cross_axis_alignment(CrossAxisAlignment::Center)
                             .with_spacing(4.)
                             .with_child(icons::draw_icon(icon, 12., fg))
-                            .with_child(ui_label(lbl.clone(), font, 11., fg, Weight::Medium))
+                            .with_child(
+                                Text::new(lbl.clone(), font, 11.)
+                                    .with_color(fg)
+                                    .with_style(Properties::default().weight(Weight::Medium))
+                                    .soft_wrap(false)
+                                    .finish(),
+                            )
                             .finish(),
                     )
                     .finish(),

@@ -1,43 +1,10 @@
 use super::super::{
-    backscreen_state::BackScreenAction, icons::UiIcon, studio_state::StudioAction, theme::*,
-    update_state::UpdateAction, widgets::*, work_state::WorkAction, Action, Companion, Page,
-    ToolOperation, ToolPage, F_OV_TEXT,
+    backscreen_state::BackScreenAction, icons::UiIcon, theme::*, update_state::UpdateAction,
+    widgets::*, Action, Companion, Page, ToolOperation, ToolPage, F_OV_TEXT,
+    F_PHONE_SCHEDULE_TITLE,
 };
-use facloud_ui::{color::ColorU, elements::*, fonts::Weight, platform::Cursor};
+use facloud_ui::{elements::*, fonts::Weight};
 use stepx_companion::{storage::format_bytes, toolbox::FileInfo};
-
-fn file_category_badge(path: &str, p: &Palette) -> (UiIcon, &'static str, ColorU, ColorU) {
-    let lower = path.to_ascii_lowercase();
-    if lower.contains("micromsg") || lower.contains("wechat") || lower.contains("weixin") {
-        (UiIcon::Chat, "微信缓存", p.success_text, p.success_soft)
-    } else if lower.ends_with(".mp4")
-        || lower.ends_with(".mov")
-        || lower.ends_with(".mkv")
-        || lower.ends_with(".avi")
-    {
-        (UiIcon::Video, "视频", p.accent, p.accent_soft)
-    } else if lower.ends_with(".apk")
-        || lower.ends_with(".zip")
-        || lower.ends_with(".7z")
-        || lower.ends_with(".rar")
-        || lower.ends_with(".tar")
-        || lower.ends_with(".gz")
-    {
-        (UiIcon::Package, "安装包/压缩包", p.warning, p.warning_soft)
-    } else if lower.ends_with(".pdf")
-        || lower.ends_with(".doc")
-        || lower.ends_with(".docx")
-        || lower.ends_with(".xls")
-        || lower.ends_with(".xlsx")
-        || lower.ends_with(".ppt")
-        || lower.ends_with(".pptx")
-        || lower.ends_with(".txt")
-    {
-        (UiIcon::File, "文档", p.text2, p.surface)
-    } else {
-        (UiIcon::Folder, "文件", p.text2, p.surface)
-    }
-}
 
 impl Companion {
     fn storage_actions(&self) -> Vec<El> {
@@ -73,21 +40,13 @@ impl Companion {
     ) -> El {
         let p = self.p();
         let name = file.path.rsplit('/').next().unwrap_or(&file.path);
-        let (cat_icon, cat_label, cat_fg, cat_bg) = file_category_badge(&file.path, &p);
         let mut details = vec![
-            self.hstack(
-                S2,
-                vec![
-                    self.pill_badge_icon(cat_label, cat_icon, cat_fg, cat_bg),
-                    self.line_w(name, BODY, p.text, Weight::Medium),
-                ],
-            ),
+            self.line_w(name, BODY, p.text, Weight::Medium),
             self.line(&file.path, CAPTION, p.text2),
         ];
         if let Some(keep) = keep {
             details.push(self.line(format!("保留：{keep}"), CAPTION, p.text3));
         }
-        let menu_op = operation.clone();
         let action = match operation {
             Some(operation)
                 if !self.busy
@@ -113,198 +72,38 @@ impl Companion {
                 Btn::Secondary,
             ),
         };
-        let row_inner = self.between(
+        Container::new(self.between(
             self.vstack(S1, details),
             self.hstack(
-                S3,
+                S4,
                 vec![
                     self.mono(format_bytes(file.bytes), CAPTION, p.text2),
-                    self.button_icon(
-                        format!("tool-backup-file-{index}"),
-                        "先备份到电脑",
-                        UiIcon::Storage,
-                        Action::BackupPhoneFileToDesktop(file.path.clone()),
-                        Btn::Secondary,
-                    ),
-                    self.button_icon(
-                        format!("tool-copy-path-{index}"),
-                        "复制路径",
-                        UiIcon::Clipboard,
-                        Action::CopyText(file.path.clone(), "已复制手机文件路径".into()),
-                        Btn::Ghost,
-                    ),
                     action,
                 ],
             ),
-        );
-        let dbl_path = file.path.clone();
-        let menu_path = file.path.clone();
-        Hoverable::new(
-            self.mouse_state(format!("tool-file-row-{index}")),
-            move |mouse| {
-                let bg = if mouse.is_clicked() {
-                    p.accent_soft
-                } else if mouse.is_mouse_over_element() {
-                    p.hover
-                } else {
-                    ColorU::transparent_black()
-                };
-                Container::new(row_inner)
-                    .with_uniform_padding(S3)
-                    .with_background_color(bg)
-                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
-                    .finish()
-            },
-        )
-        .with_defer_events_to_children()
-        .with_cursor(Cursor::PointingHand)
-        .on_double_click(move |ctx, _, _| {
-            ctx.dispatch_typed_action(Action::LocateToolFile(dbl_path.clone()))
-        })
-        .on_right_click(move |ctx, _, at| {
-            ctx.dispatch_typed_action(Action::ContextOpen(
-                crate::ui::context_menu::Target::ToolFile {
-                    path: menu_path.clone(),
-                    operation: menu_op.clone(),
-                },
-                at,
-            ))
-        })
+        ))
+        .with_uniform_padding(S3)
         .finish()
     }
 
     fn input_method_tool_page(&self) -> El {
         let p = self.p();
         let r = &self.input_method;
-        self.vstack(
-            S4,
-            vec![
-                self.panel(vec![
-                    self.hstack(
-                        S2,
-                        vec![
-                            self.ui_icon(UiIcon::Keyboard, 18., p.text),
-                            self.heading("电脑打字直输手机 & 剪贴板同步工作台"),
-                        ],
-                    ),
-                    self.text(
-                        "在电脑键盘输入长句、链接或密码，一键发送到手机当前输入框或双向同步剪贴板。",
-                        CAPTION,
-                        p.text2,
-                    ),
-                    self.input(
-                        F_OV_TEXT,
-                        "在电脑输入文字，一键发送到手机当前输入框或手机剪贴板…",
-                        None,
-                    ),
-                    self.wrap(vec![
-                        self.button_icon(
-                            "ime-send-focus-text",
-                            "发送到手机输入框",
-                            UiIcon::Send,
-                            Action::SendFocusText,
-                            Btn::Primary,
-                        ),
-                        self.button_icon(
-                            "ime-push-clipboard",
-                            "写入手机剪贴板",
-                            UiIcon::Clipboard,
-                            Action::BackScreen(BackScreenAction::PushDesktopClipboard),
-                            Btn::Secondary,
-                        ),
-                        self.button_icon(
-                            "ime-pull-clipboard",
-                            "拉取手机剪贴板到电脑",
-                            UiIcon::Download,
-                            Action::BackScreen(BackScreenAction::PullPhoneClipboard),
-                            Btn::Secondary,
-                        ),
-                        self.button_icon(
-                            "ime-refresh-list",
-                            "刷新输入法列表",
-                            UiIcon::Refresh,
-                            Action::InspectInputMethod,
-                            Btn::Ghost,
-                        ),
-                    ]),
-                ]),
-                self.panel(vec![
-                    self.heading("小企鹅中文输入法"),
-                    self.text(
-                        "开源中文输入法，支持拼音、中文候选与中英文切换。",
-                        BODY,
-                        p.text2,
-                    ),
-                    self.divider(),
-                    self.line(
-                        if !r.checked {
-                            "尚未读取手机状态"
-                        } else if r.active {
-                            "默认输入法：小企鹅 Fcitx5"
-                        } else {
-                            "默认输入法：其他输入法"
-                        },
-                        BODY,
-                        p.text,
-                    ),
-                    self.text(
-                        if !r.checked {
-                            "读取后显示真实安装与默认状态。"
-                        } else if !r.sogou_installed {
-                            "搜狗：当前用户未安装"
-                        } else if r.sogou_disabled {
-                            "搜狗：已停用"
-                        } else {
-                            "搜狗：已安装，可在切换后停用"
-                        },
-                        CAPTION,
-                        p.text2,
-                    ),
-                    self.wrap(if self.busy {
-                        vec![self.disabled_button("正在处理，请稍候…")]
-                    } else {
-                        vec![
-                            self.button(
-                                "ime-install",
-                                "一键安装并使用",
-                                Action::SwitchInputMethodFcitx5(true),
-                                Btn::Primary,
-                            ),
-                            self.button(
-                                "ime-refresh",
-                                "刷新状态",
-                                Action::InspectInputMethod,
-                                Btn::Secondary,
-                            ),
-                            self.button(
-                                "ime-settings",
-                                "手机输入法设置",
-                                Action::OpenInputSettings,
-                                Btn::Secondary,
-                            ),
-                            self.button(
-                                "ime-restore",
-                                "恢复搜狗…",
-                                Action::SwitchInputMethodFcitx5(false),
-                                Btn::Ghost,
-                            ),
-                        ]
-                    }),
-                    self.text(
-                        "确认后应用到当前手机：校验安装包 → 启用小企鹅 → 核对默认输入法 → 停用搜狗。已有输入法和词库不删除，系统安全输入法保留。",
-                        CAPTION,
-                        p.text2,
-                    ),
-                    self.link_muted(
-                        "ime-source",
-                        "官方项目与开源说明",
-                        Action::StudioOpenUrl(
-                            "https://github.com/fcitx5-android/fcitx5-android".into(),
-                        ),
-                    ),
-                ]),
-            ],
-        )
+        self.panel(vec![
+            self.heading("小企鹅中文输入法"),
+            self.text("开源中文输入法，支持拼音、中文候选与中英文切换。",BODY,p.text2),
+            self.divider(),
+            self.line(if !r.checked {"尚未读取手机状态"} else if r.active {"默认输入法：小企鹅 Fcitx5"} else {"默认输入法：其他输入法"},BODY,p.text),
+            self.text(if !r.checked {"读取后显示真实安装与默认状态。"} else if !r.sogou_installed {"搜狗：当前用户未安装"} else if r.sogou_disabled {"搜狗：已停用"} else {"搜狗：已安装，可在切换后停用"},CAPTION,p.text2),
+            self.wrap(if self.busy {vec![self.disabled_button("正在处理，请稍候…")]} else {vec![
+                self.button("ime-install","一键安装并使用",Action::SwitchInputMethodFcitx5(true),Btn::Primary),
+                self.button("ime-refresh","刷新状态",Action::InspectInputMethod,Btn::Secondary),
+                self.button("ime-settings","手机输入法设置",Action::OpenInputSettings,Btn::Secondary),
+                self.button("ime-restore","恢复搜狗…",Action::SwitchInputMethodFcitx5(false),Btn::Ghost),
+            ]}),
+            self.text("确认后应用到当前手机：校验安装包 → 启用小企鹅 → 核对默认输入法 → 停用搜狗。已有输入法和词库不删除，系统安全输入法保留。",CAPTION,p.text2),
+            self.link_muted("ime-source","官方项目与开源说明",Action::StudioOpenUrl("https://github.com/fcitx5-android/fcitx5-android".into())),
+        ])
     }
 
     fn storage_tool_page(&self) -> El {
@@ -344,16 +143,7 @@ impl Companion {
             ]));
         }
         if let Some(result) = &self.tools_last_result {
-            sections.push(self.panel(vec![self.between(
-                self.text(result, CAPTION, p.text),
-                self.button_icon(
-                    "tools-copy-last-result",
-                    "复制处理结果",
-                    UiIcon::Clipboard,
-                    Action::CopyText(result.clone(), "已复制处理结果".into()),
-                    Btn::Ghost,
-                ),
-            )]));
+            sections.push(self.panel(vec![self.text(result, CAPTION, p.text)]));
         }
 
         let (system_title, system_note) = match &self.system_compression {
@@ -462,16 +252,6 @@ impl Companion {
                     ),
                 ]));
         }
-        let tab_counts = self.storage_report.as_ref().map(|r| {
-            [
-                r.documents.len(),
-                r.duplicates
-                    .iter()
-                    .map(|g| g.len().saturating_sub(1))
-                    .sum::<usize>(),
-                r.largest.len(),
-            ]
-        });
         sections.push(
             self.hstack(
                 S2,
@@ -479,16 +259,15 @@ impl Companion {
                     .into_iter()
                     .enumerate()
                     .map(|(i, label)| {
-                        let active = self.tools_tab as usize == i;
-                        let text = match tab_counts {
-                            Some(counts) => format!("{label} ({})", counts[i]),
-                            None => label.to_string(),
-                        };
                         self.button(
                             format!("tools-tab-{i}"),
-                            text,
+                            if self.tools_tab as usize == i {
+                                format!("{label} · 当前")
+                            } else {
+                                label.to_string()
+                            },
                             Action::ToolTab(i as u8),
-                            if active { Btn::Primary } else { Btn::Secondary },
+                            Btn::Secondary,
                         )
                     })
                     .collect(),
@@ -521,24 +300,7 @@ impl Companion {
             report.unreadable,
             report.hash_skipped
         );
-        sections.push(self.between(
-            self.text(scope.clone(), CAPTION, p.text2),
-            self.button_icon(
-                "tools-copy-storage-scope",
-                "复制扫描摘要",
-                UiIcon::Clipboard,
-                Action::CopyText(
-                    format!(
-                        "{scope}\n可用空间：{} · 数据分区总量：{} · 重复副本大小：{}",
-                        format_bytes(report.available_bytes),
-                        format_bytes(report.total_bytes),
-                        format_bytes(report.duplicate_bytes)
-                    ),
-                    "已复制存储扫描报告".into(),
-                ),
-                Btn::Ghost,
-            ),
-        ));
+        sections.push(self.text(scope, CAPTION, p.text2));
         sections.push(self.text(
             match self.tools_tab {
                 0 => "仅压缩文本文档，每个文件最多 256 MiB。压缩无收益时保留原文件。",
@@ -673,6 +435,84 @@ impl Companion {
             Some(ToolPage::Device) => {
                 vec![self.button("device-check", "重新检测", Action::Summary, Btn::Secondary)]
             }
+            Some(ToolPage::Clipboard) => vec![
+                self.button(
+                    "clip-hdr-pull",
+                    "拉取手机剪贴板",
+                    Action::BackScreen(BackScreenAction::PullPhoneClipboard),
+                    Btn::Secondary,
+                ),
+                self.button(
+                    "clip-hdr-push",
+                    "推送电脑剪贴板",
+                    Action::BackScreen(BackScreenAction::PushDesktopClipboard),
+                    Btn::Primary,
+                ),
+            ],
+            Some(ToolPage::McpHub) => vec![self.button_icon(
+                "mcp-hdr-refresh",
+                "刷新服务状态",
+                UiIcon::Refresh,
+                Action::BackScreen(BackScreenAction::InspectStepOsSuite),
+                Btn::Secondary,
+            )],
+            Some(ToolPage::AiSafety) => vec![
+                self.button_icon(
+                    "ai-hdr-refresh",
+                    "刷新状态",
+                    UiIcon::Refresh,
+                    Action::BackScreen(BackScreenAction::InspectStepOsSuite),
+                    Btn::Secondary,
+                ),
+                self.button(
+                    "ai-hdr-grant",
+                    "一键修复 AI 权限",
+                    Action::GrantDeepAmooPerms,
+                    Btn::Primary,
+                ),
+            ],
+            Some(ToolPage::Wellbeing) => vec![
+                self.button_icon(
+                    "wb-hdr-refresh",
+                    "刷新统计",
+                    UiIcon::Refresh,
+                    Action::BackScreen(BackScreenAction::InspectStepOsSuite),
+                    Btn::Secondary,
+                ),
+                self.button(
+                    "wb-hdr-alphame",
+                    "打开 AlphaMe",
+                    Action::BackScreen(BackScreenAction::TriggerMcpQuickAction(
+                        "open_alphame".into(),
+                    )),
+                    Btn::Primary,
+                ),
+            ],
+            Some(ToolPage::Screen) => vec![
+                self.button_icon(
+                    "screen-hdr-scan-lan",
+                    "扫描局域网设备",
+                    UiIcon::Refresh,
+                    Action::LanCast(super::super::LanCastAction::ScanDevices),
+                    Btn::Secondary,
+                ),
+                if self.lan_cast.is_running() {
+                    self.button(
+                        "screen-hdr-stop-lan",
+                        "停止局域网广播",
+                        Action::LanCast(super::super::LanCastAction::StopServer),
+                        Btn::Danger,
+                    )
+                } else {
+                    self.button_icon(
+                        "screen-hdr-start-lan",
+                        "开启局域网投屏",
+                        UiIcon::Wifi,
+                        Action::LanCast(super::super::LanCastAction::StartServer),
+                        Btn::Primary,
+                    )
+                },
+            ],
             _ => vec![],
         }
     }
@@ -696,9 +536,9 @@ impl Companion {
 
     fn tool_card(&self, tool: ToolPage) -> El {
         let p = self.p();
-        let (icon, state) = match tool {
+        let (symbol, state) = match tool {
             ToolPage::InputMethod => (
-                UiIcon::Keyboard,
+                "⌨",
                 if self.input_method.active {
                     "小企鹅已启用"
                 } else {
@@ -707,14 +547,14 @@ impl Companion {
                 .into(),
             ),
             ToolPage::Storage => (
-                UiIcon::File,
+                "▤",
                 self.storage_report
                     .as_ref()
                     .map(|s| format!("可用 {}", format_bytes(s.available_bytes)))
                     .unwrap_or("进入后扫描".into()),
             ),
             ToolPage::Google => (
-                UiIcon::Shield,
+                "G",
                 if !self.google_suite.checked {
                     "待检测"
                 } else if self.google_suite.compatibility_active {
@@ -727,13 +567,9 @@ impl Companion {
                 .into(),
             ),
             ToolPage::Companion => (
-                UiIcon::Smartphone,
+                "📱",
                 if self.companion_status.installed {
-                    if self.companion_status.version.trim().is_empty() {
-                        "已安装 · 已就绪".into()
-                    } else {
-                        format!("已安装 · {}", self.companion_status.version)
-                    }
+                    format!("已安装 · {}", self.companion_status.version)
                 } else if self.companion_status.checked {
                     "等待安装".into()
                 } else {
@@ -741,7 +577,7 @@ impl Companion {
                 },
             ),
             ToolPage::Neo => (
-                UiIcon::Sparkles,
+                "✦",
                 if self.neo_status.selected {
                     "手机执行已接入"
                 } else if self.neo_status.installed {
@@ -751,9 +587,9 @@ impl Companion {
                 }
                 .into(),
             ),
-            ToolPage::Apk => (UiIcon::Apps, "选择本地文件".into()),
+            ToolPage::Apk => ("⊞", "选择本地文件".into()),
             ToolPage::Services => (
-                UiIcon::Menu,
+                "≡",
                 if self.system_services.is_empty() {
                     "进入后检测".into()
                 } else {
@@ -761,61 +597,102 @@ impl Companion {
                 },
             ),
             ToolPage::Screen => (
-                UiIcon::Monitor,
-                if self.mirror.is_some() {
+                "□",
+                if self.lan_cast.is_running() {
+                    "局域网投屏广播中"
+                } else if self.mirror.is_some() {
                     "正在投屏"
                 } else {
-                    "按需开启"
+                    "本机 / 局域网投屏"
                 }
                 .into(),
             ),
-            ToolPage::Device => (UiIcon::Home, "读取手机状态".into()),
-            ToolPage::Updates => (UiIcon::Refresh, self.updates.title().to_owned()),
+            ToolPage::Clipboard => (
+                "⇄",
+                if self.prefs.auto_sync_clipboard {
+                    "自动双向同步中".into()
+                } else if !self.back_screen.stepos_suite.phone_clipboard.is_empty() {
+                    "已同步剪贴板".into()
+                } else {
+                    "跨端秒传".into()
+                },
+            ),
+            ToolPage::McpHub => {
+                let suite = &self.back_screen.stepos_suite;
+                let ready = suite.mcp_services.iter().filter(|s| s.ready).count();
+                (
+                    "⚡",
+                    format!("{ready} / {} 项服务在线", suite.mcp_services.len()),
+                )
+            }
+            ToolPage::AiSafety => {
+                let suite = &self.back_screen.stepos_suite;
+                (
+                    "🛡",
+                    if suite.aiengine_running {
+                        format!(
+                            "端侧 NPU 在线 · {} 算子",
+                            suite.aiengine_ability_count.max(33)
+                        )
+                    } else {
+                        "端侧 NPU 按需唤醒".into()
+                    },
+                )
+            }
+            ToolPage::Wellbeing => {
+                let wb = &self.back_screen.stepos_suite.wellbeing;
+                (
+                    "◉",
+                    if wb.screen_time_minutes > 0 || wb.unlock_count > 0 {
+                        format!(
+                            "今日 {} · 解锁 {} 次",
+                            stepx_companion::toolbox::format_duration_minutes(
+                                wb.screen_time_minutes
+                            ),
+                            wb.unlock_count
+                        )
+                    } else {
+                        "进入后读取统计".into()
+                    },
+                )
+            }
+            ToolPage::Device => ("◈", "读取手机状态".into()),
+            ToolPage::Updates => ("↻", self.updates.title().to_owned()),
         };
-        let content = self.vstack(
-            S3,
-            vec![
-                self.between(
-                    self.hstack(
-                        S3,
-                        vec![
-                            self.ui_icon_box(icon, 36., p.surface, p.text2, None),
-                            self.heading(tool.title()),
-                        ],
-                    ),
-                    self.line(
-                        if self.selected.is_none() && tool != ToolPage::Updates {
-                            "需要连接手机".into()
-                        } else {
-                            state
-                        },
-                        MICRO,
-                        p.text3,
-                    ),
+        self.panel(vec![
+            self.between(
+                self.hstack(
+                    S3,
+                    vec![
+                        self.icon_box(symbol, 32., p.surface, p.text2, None),
+                        self.heading(tool.title()),
+                    ],
                 ),
-                self.text(tool.description(), BODY, p.text2),
-                self.between(
-                    self.line(
-                        ["", "空间整理", "应用与服务", "设备协同"][tool.category() as usize],
-                        CAPTION,
-                        p.text3,
-                    ),
-                    self.button(
-                        format!("tool-open-{tool:?}"),
-                        "› 打开工具",
-                        Action::OpenTool(Some(tool)),
-                        Btn::Secondary,
-                    ),
+                self.line(
+                    if self.selected.is_none() && tool != ToolPage::Updates {
+                        "需要连接手机".into()
+                    } else {
+                        state
+                    },
+                    MICRO,
+                    p.text3,
                 ),
-            ],
-        );
-        self.hover_panel_interactive(
-            format!("tool-card-{tool:?}"),
-            content,
-            Some(Action::OpenTool(Some(tool))),
-            Some(Action::OpenTool(Some(tool))),
-            Some(crate::ui::context_menu::Target::ToolCard(tool)),
-        )
+            ),
+            self.text(tool.description(), BODY, p.text2),
+            self.between(
+                self.line(
+                    ["", "空间整理", "应用与服务", "设备协同"][tool.category() as usize],
+                    CAPTION,
+                    p.text3,
+                ),
+                self.button(
+                    format!("tool-open-{tool:?}"),
+                    "› 打开工具",
+                    Action::OpenTool(Some(tool)),
+                    Btn::Secondary,
+                ),
+            ),
+        ])
     }
 
     pub(in super::super) fn tools_page(&self) -> El {
@@ -860,6 +737,7 @@ impl Companion {
             parts.push(self.panel(vec![self.text(progress, CAPTION, p.accent)]));
         } else if let Some((tool, message, error)) = &self.tools_feedback {
             if self.tool_page != Some(ToolPage::InputMethod)
+                && (self.tool_page != Some(ToolPage::Screen) || *error)
                 && (self.tool_page.is_none() || self.tool_page == *tool)
             {
                 let label = format!(
@@ -867,43 +745,12 @@ impl Companion {
                     tool.map(ToolPage::title).unwrap_or("小工具"),
                     message
                 );
-                parts.push(self.panel(vec![self.between(
-                    self.text(
-                        label.clone(),
-                        CAPTION,
-                        if *error { p.danger } else { p.text2 },
-                    ),
-                    self.button_icon(
-                        "tools-copy-feedback",
-                        "复制反馈信息",
-                        UiIcon::Clipboard,
-                        Action::CopyText(label, "已复制工具输出".into()),
-                        Btn::Ghost,
-                    ),
+                parts.push(self.panel(vec![self.text(
+                    label,
+                    CAPTION,
+                    if *error { p.danger } else { p.text2 },
                 )]));
             }
-        }
-        if !self.content.trim().is_empty() && self.output_page == Page::Tools {
-            parts.push(self.context_target(
-                "tools-run-output",
-                crate::ui::context_menu::Target::CopyableText {
-                    title: "诊断/执行结果".into(),
-                    text: self.content.clone(),
-                },
-                self.panel(vec![
-                    self.between(
-                        self.heading("工具运行输出"),
-                        self.button_icon(
-                            "tools-copy-run-output",
-                            "复制运行输出",
-                            UiIcon::Clipboard,
-                            Action::CopyText(self.content.clone(), "已复制工具运行输出".into()),
-                            Btn::Secondary,
-                        ),
-                    ),
-                    self.mono(&self.content, CAPTION, p.text2),
-                ]),
-            ));
         }
         if let Some(action) = self.tool_confirmation.as_deref() {
             let message = match action {
@@ -952,20 +799,59 @@ impl Companion {
         }
         match self.tool_page {
             None => {
-                parts.push(self.vstack(S2, vec![self.heading("工具集合"), self.text("按需要选择工具，检测和操作结果会留在这里。", BODY, p.text2)]));
-                parts.push(self.segmented("tool-categories", ["全部", "空间整理", "应用与服务", "设备协同"].into_iter().enumerate().map(|(i, title)|
-                    (format!("{title} · {}",ToolPage::ALL.iter().filter(|t|i==0 || t.category()==i as u8).count()), i as u8 == self.tool_category, Action::ToolCategory(i as u8))
-                ).collect()));
-                let tools: Vec<_> = ToolPage::ALL.into_iter().filter(|t| self.tool_category == 0 || t.category() == self.tool_category).collect();
+                parts.push(self.vstack(
+                    S2,
+                    vec![
+                        self.heading("工具集合"),
+                        self.text(
+                            "按需要选择功能模块，检测和操作结果会实时保留在对应工具页内。",
+                            BODY,
+                            p.text2,
+                        ),
+                    ],
+                ));
+                parts.push(self.segmented(
+                    "tool-categories",
+                    ["全部", "空间整理", "应用与服务", "设备协同"]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, title)| {
+                            (
+                                format!(
+                                    "{title} · {}",
+                                    ToolPage::ALL
+                                        .iter()
+                                        .filter(|t| i == 0 || t.category() == i as u8)
+                                        .count()
+                                ),
+                                i as u8 == self.tool_category,
+                                Action::ToolCategory(i as u8),
+                            )
+                        })
+                        .collect(),
+                ));
+                let tools: Vec<_> = ToolPage::ALL
+                    .into_iter()
+                    .filter(|t| self.tool_category == 0 || t.category() == self.tool_category)
+                    .collect();
                 for row in tools.chunks(2) {
-                    let mut cards: Vec<El> = row.iter().map(|t| Expanded::new(1., self.tool_card(*t)).finish()).collect();
-                    if row.len() == 1 { cards.push(Expanded::new(1., Empty::new().finish()).finish()); }
+                    let mut cards: Vec<El> = row
+                        .iter()
+                        .map(|t| Expanded::new(1., self.tool_card(*t)).finish())
+                        .collect();
+                    if row.len() == 1 {
+                        cards.push(Expanded::new(1., Empty::new().finish()).finish());
+                    }
                     parts.push(self.hstack(S4, cards));
                 }
             }
             Some(ToolPage::Updates) => parts.push(self.updates_tool_page()),
             Some(ToolPage::Companion) => parts.push(self.companion_tool_page()),
             Some(ToolPage::Neo) => parts.push(self.neo_tool_page()),
+            Some(ToolPage::Clipboard) => parts.push(self.clipboard_tool_page()),
+            Some(ToolPage::McpHub) => parts.push(self.mcp_hub_tool_page()),
+            Some(ToolPage::AiSafety) => parts.push(self.ai_safety_tool_page()),
+            Some(ToolPage::Wellbeing) => parts.push(self.wellbeing_tool_page()),
             Some(_) if self.selected.is_none() => {}
             Some(ToolPage::InputMethod) => parts.push(self.input_method_tool_page()),
             Some(ToolPage::Storage) => parts.push(self.storage_tool_page()),
@@ -976,362 +862,7 @@ impl Companion {
                 self.hstack(S2, vec![self.utility_button("tool-apk", "选择 APK…", Action::InstallApk, true), self.button("tool-app-list", "已安装应用", Action::Page(Page::Apps), Btn::Secondary)]),
             ])),
             Some(ToolPage::Screen) => {
-                let status_badge = if self.live_screen_stream {
-                    self.tag("● 实时连拍同步中", p.success)
-                } else if self.mirror.is_some() {
-                    self.tag("● 独立窗投屏中", p.accent)
-                } else {
-                    self.tag("单击画面直接触控", p.text2)
-                };
-
-                let left_studio = self.panel(vec![
-                    self.between(
-                        self.hstack(
-                            S2,
-                            vec![
-                                self.ui_icon(UiIcon::Smartphone, 18., p.text),
-                                self.heading("手机屏幕实时触控台"),
-                            ],
-                        ),
-                        status_badge,
-                    ),
-                    self.wrap(vec![
-                        self.button_icon(
-                            "screen-toggle-live",
-                            if self.live_screen_stream {
-                                "暂停内嵌连拍"
-                            } else {
-                                "开启内嵌实时画面"
-                            },
-                            UiIcon::Refresh,
-                            Action::ToggleLiveScreenStream,
-                            if self.live_screen_stream {
-                                Btn::Primary
-                            } else {
-                                Btn::Secondary
-                            },
-                        ),
-                        self.button_icon(
-                            "screen-refresh-now",
-                            "立即刷新画面",
-                            UiIcon::Camera,
-                            Action::Screenshot,
-                            Btn::Secondary,
-                        ),
-                        if self.mirror.is_some() {
-                            self.button(
-                                "mirror-control-stop",
-                                "结束独立投屏",
-                                Action::StopMirror,
-                                Btn::Danger,
-                            )
-                        } else {
-                            self.utility_button(
-                                "mirror-control-start",
-                                "独立高帧率窗口 (scrcpy)",
-                                Action::Mirror,
-                                true,
-                            )
-                        },
-                    ]),
-                    Container::new(
-                        Align::new(self.interactive_phone_bezel("tool-screen", 216., 452., None))
-                            .finish(),
-                    )
-                    .with_vertical_padding(S2)
-                    .finish(),
-                    self.text(
-                        "提示：单击屏幕画面直接触控手机对应坐标 · 双击画面开启 60/120帧 独立投屏 · 右侧与底部按键操作后自动刷新画面",
-                        CAPTION,
-                        p.text3,
-                    ),
-                ]);
-
-                let panel_quality = self.panel(vec![
-                    self.between(
-                        self.hstack(
-                            S2,
-                            vec![
-                                self.ui_icon(UiIcon::Monitor, 18., p.text),
-                                self.heading("独立窗口投屏画质与模式"),
-                            ],
-                        ),
-                        self.line("scrcpy 硬件解码", CAPTION, p.text3),
-                    ),
-                    self.wrap(vec![
-                        self.chip(
-                            "mirror-quality-0",
-                            "720P 流畅 (30帧)",
-                            Some(UiIcon::Monitor),
-                            vec![Action::SetMirrorQuality(0)],
-                            self.mirror_options.quality == 0,
-                            false,
-                        ),
-                        self.chip(
-                            "mirror-quality-1",
-                            "1080P 高清 (60帧)",
-                            Some(UiIcon::Monitor),
-                            vec![Action::SetMirrorQuality(1)],
-                            self.mirror_options.quality == 1,
-                            false,
-                        ),
-                        self.chip(
-                            "mirror-quality-2",
-                            "原画超清 (120帧)",
-                            Some(UiIcon::Sparkles),
-                            vec![Action::SetMirrorQuality(2)],
-                            self.mirror_options.quality >= 2,
-                            false,
-                        ),
-                    ]),
-                    self.wrap(vec![
-                        self.chip(
-                            "mirror-opt-top",
-                            "窗口始终置顶",
-                            Some(UiIcon::Pin),
-                            vec![Action::ToggleMirrorAlwaysOnTop],
-                            self.mirror_options.always_on_top,
-                            false,
-                        ),
-                        self.chip(
-                            "mirror-opt-screen-off",
-                            "投屏时手机息屏省电",
-                            Some(UiIcon::Lock),
-                            vec![Action::ToggleMirrorTurnScreenOff],
-                            self.mirror_options.turn_screen_off,
-                            false,
-                        ),
-                        self.chip(
-                            "mirror-opt-awake",
-                            "保持手机屏幕常亮",
-                            Some(UiIcon::Sun),
-                            vec![Action::ToggleMirrorStayAwake],
-                            self.mirror_options.stay_awake,
-                            false,
-                        ),
-                        self.chip(
-                            "mirror-opt-touches",
-                            "显示手机触控点轨迹",
-                            Some(UiIcon::Smartphone),
-                            vec![Action::ToggleMirrorShowTouches],
-                            self.mirror_options.show_touches,
-                            false,
-                        ),
-                    ]),
-                ]);
-
-                let panel_gestures = self.panel(vec![
-                    self.between(
-                        self.hstack(
-                            S2,
-                            vec![
-                                self.ui_icon(UiIcon::Bolt, 18., p.text),
-                                self.heading("屏幕手势与系统状态栏"),
-                            ],
-                        ),
-                        self.line("执行后自动同步画面", CAPTION, p.text3),
-                    ),
-                    self.wrap(vec![
-                        self.button_icon(
-                            "screen-gesture-unlock",
-                            "一键点亮并解锁",
-                            UiIcon::Sun,
-                            Action::ScreenGesture(7),
-                            Btn::Primary,
-                        ),
-                        self.button_icon(
-                            "screen-gesture-up",
-                            "上滑翻页",
-                            UiIcon::ArrowUp,
-                            Action::ScreenGesture(0),
-                            Btn::Secondary,
-                        ),
-                        self.button_icon(
-                            "screen-gesture-down",
-                            "下滑刷新",
-                            UiIcon::ArrowDown,
-                            Action::ScreenGesture(1),
-                            Btn::Secondary,
-                        ),
-                        self.button_icon(
-                            "screen-gesture-left",
-                            "左滑切屏",
-                            UiIcon::ArrowLeft,
-                            Action::ScreenGesture(2),
-                            Btn::Secondary,
-                        ),
-                        self.button_icon(
-                            "screen-gesture-right",
-                            "右滑返回",
-                            UiIcon::ArrowRight,
-                            Action::ScreenGesture(3),
-                            Btn::Secondary,
-                        ),
-                        self.button_icon(
-                            "screen-gesture-notif",
-                            "下拉通知栏",
-                            UiIcon::Bell,
-                            Action::ScreenGesture(4),
-                            Btn::Secondary,
-                        ),
-                        self.button_icon(
-                            "screen-gesture-qs",
-                            "展开快捷设置",
-                            UiIcon::Settings,
-                            Action::ScreenGesture(5),
-                            Btn::Secondary,
-                        ),
-                        self.button_icon(
-                            "screen-gesture-collapse",
-                            "收起状态栏",
-                            UiIcon::ChevronUp,
-                            Action::ScreenGesture(6),
-                            Btn::Ghost,
-                        ),
-                    ]),
-                    self.wrap(vec![
-                        self.button_icon("screen-key-wake", "唤醒亮屏", UiIcon::Sun, Action::Key(224), Btn::Secondary),
-                        self.button_icon("screen-key-sleep", "锁屏", UiIcon::Lock, Action::Key(223), Btn::Secondary),
-                        self.button_icon("screen-key-home", "桌面", UiIcon::Home, Action::Key(3), Btn::Secondary),
-                        self.button_icon("screen-key-back", "返回", UiIcon::ArrowLeft, Action::Key(4), Btn::Secondary),
-                        self.button_icon("screen-key-recents", "多任务", UiIcon::Apps, Action::Key(187), Btn::Secondary),
-                        self.button_icon("screen-key-vol-up", "音量+", UiIcon::Speaker, Action::Key(24), Btn::Secondary),
-                        self.button_icon("screen-key-vol-down", "音量-", UiIcon::Speaker, Action::Key(25), Btn::Secondary),
-                        self.button_icon("screen-key-mute", "静音", UiIcon::Mute, Action::Key(164), Btn::Ghost),
-                    ]),
-                ]);
-
-                let panel_input = self.panel(vec![
-                    self.hstack(
-                        S2,
-                        vec![
-                            self.ui_icon(UiIcon::Keyboard, 18., p.text),
-                            self.heading("向手机直接打字与剪贴板同步"),
-                        ],
-                    ),
-                    Flex::row()
-                        .with_main_axis_size(MainAxisSize::Max)
-                        .with_spacing(S2)
-                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                        .with_child(
-                            Expanded::new(
-                                1.,
-                                self.input(F_OV_TEXT, "向手机当前焦点输入框直接发送文字…", None),
-                            )
-                            .finish(),
-                        )
-                        .with_child(self.button(
-                            "screen-send-text",
-                            "发送文字",
-                            Action::SendFocusText,
-                            Btn::Primary,
-                        ))
-                        .finish(),
-                    self.wrap(vec![
-                        self.button_icon(
-                            "screen-key-enter",
-                            "发送回车 (Enter)",
-                            UiIcon::Send,
-                            Action::Key(66),
-                            Btn::Secondary,
-                        ),
-                        self.button_icon(
-                            "screen-key-backspace",
-                            "退格删除 (Backspace)",
-                            UiIcon::Backspace,
-                            Action::Key(67),
-                            Btn::Secondary,
-                        ),
-                        self.button_icon(
-                            "screen-key-media",
-                            "播放/暂停媒体",
-                            UiIcon::Play,
-                            Action::Key(85),
-                            Btn::Secondary,
-                        ),
-                        self.button_icon(
-                            "screen-clip-push",
-                            "电脑剪贴板发手机",
-                            UiIcon::Upload,
-                            Action::BackScreen(BackScreenAction::PushDesktopClipboard),
-                            Btn::Secondary,
-                        ),
-                        self.button_icon(
-                            "screen-clip-pull",
-                            "拉取手机剪贴板",
-                            UiIcon::Download,
-                            Action::BackScreen(BackScreenAction::PullPhoneClipboard),
-                            Btn::Secondary,
-                        ),
-                    ]),
-                ]);
-
-                let mut shot_actions = vec![
-                    self.utility_button("tool-shot", "截取画面", Action::Screenshot, true),
-                    if self.screenshot.is_some() {
-                        self.utility_button("tool-save-shot", "保存截图", Action::SaveScreenshot, false)
-                    } else {
-                        self.disabled_button("保存截图")
-                    },
-                ];
-                if let Some((_, path)) = &self.screenshot {
-                    let path_str = path.to_string_lossy().into_owned();
-                    shot_actions.push(self.button_icon(
-                        "tool-zoom-shot",
-                        "全屏放大看图",
-                        UiIcon::Search,
-                        Action::Work(WorkAction::OpenPreview(path_str.clone())),
-                        Btn::Secondary,
-                    ));
-                    shot_actions.push(self.button_icon(
-                        "tool-open-shot-sys",
-                        "系统看图打开",
-                        UiIcon::Image,
-                        Action::Studio(StudioAction::OpenPath(path.clone())),
-                        Btn::Secondary,
-                    ));
-                    shot_actions.push(self.button_icon(
-                        "tool-reveal-shot-dir",
-                        "打开所在文件夹",
-                        UiIcon::Folder,
-                        Action::RevealLocalPath(path.clone()),
-                        Btn::Secondary,
-                    ));
-                    shot_actions.push(self.button_icon(
-                        "tool-copy-shot-path",
-                        "复制路径",
-                        UiIcon::Clipboard,
-                        Action::CopyText(path_str, "已复制截图本地路径".into()),
-                        Btn::Ghost,
-                    ));
-                    shot_actions.push(self.button_icon(
-                        "tool-shot-to-backscreen",
-                        "转为背屏像素画",
-                        UiIcon::Sparkles,
-                        Action::ScreenshotToBackScreen,
-                        Btn::Secondary,
-                    ));
-                }
-                let panel_shot = self.panel(vec![
-                    self.heading("画面截图与跨端流转"),
-                    self.text("截取当前手机画面，预览后支持全屏放大查看、转背屏像素画或选择保存位置。", BODY, p.text2),
-                    self.wrap(shot_actions),
-                ]);
-
-                let right_hub = self.vstack(
-                    S4,
-                    vec![panel_quality, panel_gestures, panel_input, panel_shot],
-                );
-
-                parts.push(
-                    Flex::row()
-                        .with_main_axis_size(MainAxisSize::Max)
-                        .with_spacing(S4)
-                        .with_cross_axis_alignment(CrossAxisAlignment::Start)
-                        .with_child(Expanded::new(5., left_studio).finish())
-                        .with_child(Expanded::new(7., right_hub).finish())
-                        .finish(),
-                );
+                parts.push(self.screen_and_lan_cast_tool_page());
             }
             Some(ToolPage::Services) => {
                 parts.push(self.panel(vec![self.text("仅列出已适配的服务。停用会影响对应功能，请逐项选择；当前输入法不允许停用。", BODY, p.text2),
@@ -1339,84 +870,19 @@ impl Companion {
                 if self.system_services.is_empty() { parts.push(self.panel(vec![self.text("尚无检测结果，请点击刷新状态。", BODY, p.text2)])); }
                 for (i, service) in self.system_services.iter().enumerate() {
                     let can_toggle = service.safe_to_remove && !service.status_note.contains("当前默认") && service.status_note != "未安装";
-                    let enabled = service.enabled;
-                    parts.push(self.hover_panel_interactive(
-                        format!("tool-service-row-{i}"),
-                        self.vstack(
-                            S3,
-                            vec![
-                                self.between(
-                                    self.vstack(S1, vec![self.heading(&service.name), self.line(&service.status_note, CAPTION, p.text2)]),
-                                    if can_toggle {
-                                        self.utility_button(
-                                            &format!("tool-service-{i}"),
-                                            if enabled { "停用" } else { "启用" },
-                                            Action::PrepareUtility(Box::new(Action::ToggleSystemService(
-                                                service.package.clone(),
-                                                !enabled,
-                                            ))),
-                                            false,
-                                        )
-                                    } else {
-                                        self.disabled_button("不可停用")
-                                    },
-                                ),
-                                self.between(
-                                    self.text(&service.package, CAPTION, p.text3),
-                                    self.button_icon(
-                                        format!("tool-service-copy-{i}"),
-                                        "复制包名",
-                                        UiIcon::Clipboard,
-                                        Action::CopyText(service.package.clone(), "已复制系统服务包名".into()),
-                                        Btn::Ghost,
-                                    ),
-                                ),
-                            ],
-                        ),
-                        None,
-                        can_toggle.then(|| {
-                            Action::PrepareUtility(Box::new(Action::ToggleSystemService(
-                                service.package.clone(),
-                                !enabled,
-                            )))
-                        }),
-                        Some(crate::ui::context_menu::Target::ServiceRow {
-                            name: service.name.clone(),
-                            pkg: service.package.clone(),
-                            enabled,
-                        }),
-                    ));
+                    parts.push(self.panel(vec![self.between(self.vstack(S1, vec![self.heading(&service.name), self.line(&service.status_note, CAPTION, p.text2)]),
+                        if can_toggle { self.utility_button(&format!("tool-service-{i}"), if service.enabled { "停用" } else { "启用" }, Action::PrepareUtility(Box::new(Action::ToggleSystemService(service.package.clone(), !service.enabled))), false) } else { self.disabled_button("不可停用") }),
+                        self.text(&service.package, CAPTION, p.text3),
+                    ]));
                 }
             }
             Some(ToolPage::Device) => {
                 let report = self.selected.as_ref().map(|d| format!("型号：{}\nAndroid：{}\n连接：{}\n\n{}", d.model, d.android, d.transport, self.summary)).unwrap_or_default();
-                parts.push(self.context_target(
-                    "tools-device-report",
-                    crate::ui::context_menu::Target::CopyableText {
-                        title: "诊断/执行结果".into(),
-                        text: report.clone(),
-                    },
-                    self.panel(vec![
-                        self.between(
-                            self.heading("设备状态"),
-                            if !self.summary.is_empty() {
-                                self.button_icon(
-                                    "tool-copy-report",
-                                    "复制设备报告",
-                                    UiIcon::Clipboard,
-                                    Action::CopyText(report.clone(), "已复制设备检测结果".into()),
-                                    Btn::Secondary,
-                                )
-                            } else {
-                                Empty::new().finish()
-                            },
-                        ),
-                        self.text(if self.summary.is_empty() { "尚无检测结果，请点击重新检测。" } else { &report }, BODY, p.text2),
-                    ]),
-                ));
+                parts.push(self.panel(vec![self.heading("设备状态"), self.text(if self.summary.is_empty() { "尚无检测结果，请点击重新检测。" } else { &report }, BODY, p.text2)]));
+                if !self.summary.is_empty() { parts.push(self.button("tool-copy-report", "复制检测结果", Action::CopyText(report, "已复制设备检测结果".into()), Btn::Secondary)); }
             }
         }
-        self.sub_enter(self.vstack(S4, parts))
+        self.vstack(S4, parts)
     }
 
     fn updates_tool_page(&self) -> El {
@@ -1837,121 +1303,24 @@ impl Companion {
     fn neo_tool_page(&self) -> El {
         let p = self.p();
         let neo = &self.neo_status;
-        let mut rows = vec![
-            self.panel(vec![
-                self.heading("StepX伴侣 · 手机屏幕自动操作与伴侣服务状态"),
-                self.text("GUI Agent 集成在 StepX伴侣内，在手机上看屏、规划与执行，断开电脑后也可使用。Amoo 可以委派任务，伴侣提供暂停、继续和停止控制。", BODY, p.text2),
-                self.text("选择内置 GUI Agent 的完整 StepX伴侣 APK。安装会核对签名与内置组件，保留伴侣数据，并启用本模块的无障碍服务；操作哪些应用由你在手机确认。", CAPTION, p.text3),
-                self.hstack(S2, vec![
-                    self.utility_button("neo-install", if neo.companion_installed { "更新 StepX伴侣…" } else { "安装 StepX伴侣…" }, Action::NeoInstall, true),
-                    self.button("neo-ime", if self.neo_enable_ime { "增强中文输入：开启" } else { "增强中文输入：可选" }, Action::NeoIme(!self.neo_enable_ime), Btn::Secondary),
-                ]),
-                self.text("增强中文输入会启用 Agent 输入法；任务结束恢复原键盘。普通文字输入仍可使用无障碍。", CAPTION, p.text3),
+        let mut rows = vec![self.panel(vec![
+            self.heading("StepX伴侣 · 内置 GUI Agent"),
+            self.text("GUI Agent 集成在 StepX伴侣内，在手机上看屏、规划与执行，断开电脑后也可使用。Amoo 可以委派任务，伴侣提供暂停、继续和停止控制。", BODY, p.text2),
+            self.text("选择内置 GUI Agent 的完整 StepX伴侣 APK。安装会核对签名与内置组件，保留伴侣数据，并启用本模块的无障碍服务；操作哪些应用由你在手机确认。", CAPTION, p.text3),
+            self.hstack(S2, vec![
+                self.utility_button("neo-install", if neo.companion_installed { "更新 StepX伴侣…" } else { "安装 StepX伴侣…" }, Action::NeoInstall, true),
+                self.button("neo-ime", if self.neo_enable_ime { "增强中文输入：开启" } else { "增强中文输入：可选" }, Action::NeoIme(!self.neo_enable_ime), Btn::Secondary),
             ]),
-            self.panel(vec![
-                self.hstack(
-                    S2,
-                    vec![
-                        self.ui_icon(UiIcon::Bolt, 18., p.text),
-                        self.heading("一键下发手机操作任务"),
-                    ],
-                ),
-                self.text(
-                    "无需编写复杂指令，点击下方常用场景即可一键在手机端执行屏幕操作或转入 Amoo 操控台。",
-                    CAPTION,
-                    p.text2,
-                ),
-                self.wrap(vec![
-                    self.button_icon(
-                        "neo-quick-wake",
-                        "点亮并解锁屏幕",
-                        UiIcon::Sun,
-                        Action::QuickGuiScenario {
-                            app: "当前屏幕".into(),
-                            goal: "点亮屏幕".into(),
-                        },
-                        Btn::Secondary,
-                    ),
-                    self.button_icon(
-                        "neo-quick-shot",
-                        "截取当前手机画面",
-                        UiIcon::Camera,
-                        Action::QuickGuiScenario {
-                            app: "当前屏幕".into(),
-                            goal: "截取手机画面".into(),
-                        },
-                        Btn::Secondary,
-                    ),
-                    self.button_icon(
-                        "neo-quick-ocr",
-                        "提取手机屏幕文字",
-                        UiIcon::ScanText,
-                        Action::QuickGuiScenario {
-                            app: "当前屏幕".into(),
-                            goal: "提取屏幕文字".into(),
-                        },
-                        Btn::Secondary,
-                    ),
-                    self.button_icon(
-                        "neo-quick-wifi",
-                        "打开手机 Wi-Fi 设置",
-                        UiIcon::Wifi,
-                        Action::QuickGuiScenario {
-                            app: "设置".into(),
-                            goal: "Wi-Fi 设置".into(),
-                        },
-                        Btn::Secondary,
-                    ),
-                    self.button_icon(
-                        "neo-quick-bt",
-                        "打开手机蓝牙设置",
-                        UiIcon::Bluetooth,
-                        Action::QuickGuiScenario {
-                            app: "设置".into(),
-                            goal: "蓝牙设置".into(),
-                        },
-                        Btn::Secondary,
-                    ),
-                    self.button_icon(
-                        "neo-quick-amoo",
-                        "进入 Amoo 操控台自定义任务",
-                        UiIcon::Cpu,
-                        Action::QuickGuiScenario {
-                            app: "".into(),
-                            goal: "".into(),
-                        },
-                        Btn::Primary,
-                    ),
-                ]),
-            ]),
-        ];
+            self.text("增强中文输入会启用 Agent 输入法；任务结束恢复原键盘。普通文字输入仍可使用无障碍。", CAPTION, p.text3),
+        ])];
         if neo.checked {
             let state = |ready: bool| if ready { "已就绪" } else { "待配置" };
-            let neo_summary = format!(
-                "伴侣内置版本：{}\n状态说明：{}\n签名核验：{} · 无障碍启用：{} · 电池豁免：{}\n任务路由：{} · 增强输入法：{}",
-                if neo.installed { neo.version.as_str() } else { "未安装" },
-                neo.message,
-                state(neo.signature_verified),
-                state(neo.accessibility_enabled),
-                state(neo.doze_exempt),
-                if neo.selected { "Neo" } else { "未启用" },
-                if neo.ime_enabled { "已启用" } else { "未启用" }
-            );
             rows.push(self.panel(vec![
-                self.between(
-                    self.heading(if neo.installed {
-                        format!("伴侣内置版本 · {}", neo.version)
-                    } else {
-                        "等待安装内置 GUI Agent 的伴侣版本".into()
-                    }),
-                    self.button_icon(
-                        "neo-copy-status",
-                        "复制状态报告",
-                        UiIcon::Clipboard,
-                        Action::CopyText(neo_summary, "已复制 GUI Agent 状态报告".into()),
-                        Btn::Ghost,
-                    ),
-                ),
+                self.heading(if neo.installed {
+                    format!("伴侣内置版本 · {}", neo.version)
+                } else {
+                    "等待安装内置 GUI Agent 的伴侣版本".into()
+                }),
                 self.text(&neo.message, BODY, p.text2),
                 self.text(
                     format!(
@@ -1990,12 +1359,1274 @@ impl Companion {
             ]));
         }
         if neo.recovery_available {
-            rows.push(self.panel(vec![self.heading("恢复设置"),
-                self.text("仅撤销本机添加的 GUI Agent 组件配置。伴侣原有无障碍、后台豁免、文件服务和数据保持原样。", CAPTION, p.text2),
-                self.utility_button("neo-restore", "撤销组件配置", Action::PrepareUtility(Box::new(Action::NeoRestore)), false),
+            rows.push(self.panel(vec![
+                self.heading("恢复设置"),
+                self.text(
+                    "仅撤销本机添加的 GUI Agent 组件配置。伴侣原有无障碍、后台豁免、文件服务和数据保持原样。",
+                    CAPTION,
+                    p.text2,
+                ),
+                self.utility_button(
+                    "neo-restore",
+                    "撤销组件配置",
+                    Action::PrepareUtility(Box::new(Action::NeoRestore)),
+                    false,
+                ),
             ]));
         }
         self.vstack(S4, rows)
+    }
+
+    fn extract_url_from_text(text: &str) -> Option<String> {
+        for token in text.split_whitespace() {
+            let trimmed = token.trim_matches(|c: char| {
+                matches!(
+                    c,
+                    '"' | '\''
+                        | '“'
+                        | '”'
+                        | '（'
+                        | '）'
+                        | '('
+                        | ')'
+                        | '['
+                        | ']'
+                        | '<'
+                        | '>'
+                        | ','
+                        | '，'
+                        | '。'
+                        | ';'
+                )
+            });
+            if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+                return Some(trimmed.to_string());
+            }
+        }
+        None
+    }
+
+    fn extract_otp_from_text(text: &str) -> Option<String> {
+        let mut cur = String::new();
+        for ch in text.chars() {
+            if ch.is_ascii_digit() {
+                cur.push(ch);
+            } else {
+                if (4..=8).contains(&cur.len()) {
+                    return Some(cur);
+                }
+                cur.clear();
+            }
+        }
+        if (4..=8).contains(&cur.len()) {
+            Some(cur)
+        } else {
+            None
+        }
+    }
+
+    fn clipboard_tool_page(&self) -> El {
+        let p = self.p();
+        let suite = &self.back_screen.stepos_suite;
+        let auto_sync = self.prefs.auto_sync_clipboard;
+        let phone_clip = suite.phone_clipboard.trim();
+        let detected_url = Self::extract_url_from_text(phone_clip);
+        let detected_otp = if detected_url.is_none() {
+            Self::extract_otp_from_text(phone_clip)
+        } else {
+            None
+        };
+
+        let mut phone_actions = vec![
+            self.button(
+                "clip-pull-now",
+                "拉取手机剪贴板到电脑",
+                Action::BackScreen(BackScreenAction::PullPhoneClipboard),
+                Btn::Primary,
+            ),
+            if !phone_clip.is_empty() {
+                self.button(
+                    "clip-copy-pc",
+                    "复制到电脑剪贴板",
+                    Action::CopyText(
+                        phone_clip.to_string(),
+                        "已将手机剪贴板内容复制到电脑".into(),
+                    ),
+                    Btn::Secondary,
+                )
+            } else {
+                self.disabled_button("复制到电脑剪贴板")
+            },
+            if !phone_clip.is_empty() {
+                self.button(
+                    "clip-to-amoo",
+                    "带入 Amoo 对话",
+                    Action::SendToAmoo(phone_clip.to_string()),
+                    Btn::Secondary,
+                )
+            } else {
+                self.disabled_button("带入 Amoo 对话")
+            },
+        ];
+        if let Some(url) = &detected_url {
+            phone_actions.push(self.button(
+                "clip-open-url-pc",
+                "在电脑浏览器打开链接",
+                Action::StudioOpenUrl(url.clone()),
+                Btn::Secondary,
+            ));
+            phone_actions.push(self.button(
+                "clip-open-url-phone",
+                "在手机浏览器打开链接",
+                Action::BackScreen(BackScreenAction::TriggerMcpQuickAction(
+                    "open_clip_url_phone".into(),
+                )),
+                Btn::Ghost,
+            ));
+        }
+        if let Some(otp) = &detected_otp {
+            phone_actions.push(self.button(
+                "clip-copy-otp",
+                format!("仅复制验证码 {otp}"),
+                Action::CopyText(otp.clone(), format!("已复制验证码 {otp}")),
+                Btn::Secondary,
+            ));
+        }
+
+        let mut smart_badges = vec![self.pill_badge(
+            if suite.checked {
+                "实时桥接已就绪"
+            } else {
+                "支持 USB / 无线"
+            },
+            p.success,
+            p.surface,
+        )];
+        if detected_url.is_some() {
+            smart_badges.push(self.pill_badge("识别到网页链接", p.accent, p.accent_soft));
+        }
+        if let Some(otp) = &detected_otp {
+            smart_badges.push(self.pill_badge(
+                format!("识别到数字码 {otp}"),
+                p.accent,
+                p.accent_soft,
+            ));
+        }
+
+        let mut history_items: Vec<String> = self.back_screen.clipboard_history.clone();
+        if !phone_clip.is_empty() && !history_items.iter().any(|h| h == phone_clip) {
+            history_items.insert(0, phone_clip.to_string());
+        }
+
+        let mut history_rows = vec![
+            self.between(
+                self.heading("最近跨端剪贴板记录"),
+                self.line(
+                    format!("共 {} 条缓存记录", history_items.len()),
+                    CAPTION,
+                    p.text3,
+                ),
+            ),
+            self.text(
+                "本次会话中双端同步过的文本、链接或口令会自动保存在下方，支持一键复制到电脑或重新写回手机。",
+                CAPTION,
+                p.text2,
+            ),
+        ];
+        if history_items.is_empty() {
+            history_rows.push(self.text(
+                "暂无同步记录。点击上方「拉取手机剪贴板」或「推送到手机」后，历史条目会显示在这里。",
+                BODY,
+                p.text3,
+            ));
+        } else {
+            for (idx, item) in history_items.iter().enumerate() {
+                history_rows.push(self.divider());
+                history_rows.push(self.between(
+                    self.vstack(
+                        S1,
+                        vec![
+                            self.mono(item, BODY, p.text),
+                            self.line(
+                                if idx == 0 {
+                                    "最新同步内容"
+                                } else {
+                                    "历史同步记录"
+                                },
+                                MICRO,
+                                p.text3,
+                            ),
+                        ],
+                    ),
+                    self.hstack(
+                        S2,
+                        vec![
+                            self.button(
+                                format!("clip-hist-copy-{idx}"),
+                                "复制到电脑",
+                                Action::CopyText(item.clone(), "已复制剪贴板历史条目".into()),
+                                Btn::Secondary,
+                            ),
+                            self.button(
+                                format!("clip-hist-push-{idx}"),
+                                "推送到手机",
+                                Action::BackScreen(BackScreenAction::PushSpecificClipboard(
+                                    item.clone(),
+                                )),
+                                Btn::Ghost,
+                            ),
+                        ],
+                    ),
+                ));
+            }
+        }
+
+        self.vstack(
+            S4,
+            vec![
+                self.panel(vec![
+                    self.between(
+                        self.hstack(
+                            S2,
+                            vec![
+                                self.heading("双端剪贴板双向同步舱"),
+                                self.pill_badge(
+                                    if auto_sync {
+                                        "自动双向同步中"
+                                    } else {
+                                        "手动同步模式"
+                                    },
+                                    if auto_sync { p.success } else { p.text2 },
+                                    p.surface,
+                                ),
+                            ],
+                        ),
+                        self.hstack(
+                            S2,
+                            vec![
+                                self.button(
+                                    "clip-toggle-autosync",
+                                    if auto_sync {
+                                        "关闭自动双向同步"
+                                    } else {
+                                        "开启自动双向同步"
+                                    },
+                                    Action::BackScreen(BackScreenAction::ToggleAutoSyncClipboard),
+                                    if auto_sync {
+                                        Btn::Secondary
+                                    } else {
+                                        Btn::Primary
+                                    },
+                                ),
+                                self.button(
+                                    "clip-inspect-now",
+                                    "刷新状态",
+                                    Action::BackScreen(BackScreenAction::InspectStepOsSuite),
+                                    Btn::Ghost,
+                                ),
+                            ],
+                        ),
+                    ),
+                    self.text(
+                        "解决电脑与手机之间频繁手动输入长链接、验证码、账号口令和终端指令的痛点。开启自动双向同步后，任意一端复制文本即可在 3 秒内自动流转至另一端。",
+                        BODY,
+                        p.text2,
+                    ),
+                ]),
+                self.panel(vec![
+                    self.between(
+                        self.heading("手机系统剪贴板当前内容"),
+                        self.hstack(S2, smart_badges),
+                    ),
+                    Container::new(self.vstack(
+                        S1,
+                        vec![
+                            self.line("StepOS 系统剪贴板实时读数 (IClipboard)", MICRO, p.text3),
+                            self.mono(
+                                if phone_clip.is_empty() {
+                                    "（当前手机剪贴板为空，或尚未读取；点击下方「拉取手机剪贴板到电脑」即可立即读取）"
+                                } else {
+                                    phone_clip
+                                },
+                                BODY,
+                                if phone_clip.is_empty() { p.text3 } else { p.text },
+                            ),
+                        ],
+                    ))
+                    .with_uniform_padding(S3)
+                    .with_background_color(p.surface)
+                    .with_border(Border::all(1.).with_border_color(p.border))
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
+                    .finish(),
+                    self.wrap(phone_actions),
+                ]),
+                self.panel(vec![
+                    self.between(
+                        self.heading("电脑向手机跨端速传"),
+                        self.line("留空时直接读取电脑系统剪贴板推送", CAPTION, p.text3),
+                    ),
+                    self.input(
+                        F_OV_TEXT,
+                        "在此输入或粘贴文本、网页链接、口令（留空则直接推送电脑当前复制的内容）…",
+                        None,
+                    ),
+                    self.wrap(vec![
+                        self.button(
+                            "clip-push-typed",
+                            "推送到手机剪贴板",
+                            Action::BackScreen(BackScreenAction::PushDesktopClipboard),
+                            Btn::Primary,
+                        ),
+                        self.button(
+                            "clip-push-note",
+                            "写入手机剪贴板并打开 Amoo 速记",
+                            Action::BackScreen(BackScreenAction::TriggerMcpQuickAction(
+                                "note_create".into(),
+                            )),
+                            Btn::Secondary,
+                        ),
+                        if !self.fields[F_OV_TEXT].text.is_empty() {
+                            self.button(
+                                "clip-clear-typed",
+                                "清空输入框",
+                                Action::ClearField(F_OV_TEXT),
+                                Btn::Ghost,
+                            )
+                        } else {
+                            Empty::new().finish()
+                        },
+                    ]),
+                ]),
+                self.panel(history_rows),
+            ],
+        )
+    }
+
+    fn mcp_service_action_key(id: &str) -> &'static str {
+        if id.contains("CalendarAbs") || id.contains("CalendarEvent") {
+            "calendar_event"
+        } else if id.contains("AlarmMCP") {
+            "alarm_15m"
+        } else if id.contains("GalleryMCP") {
+            "open_gallery"
+        } else if id.contains("FileManager") || id.contains("packageinstaller") {
+            "open_filemanager"
+        } else if id.contains("VoiceAbility") {
+            "voice_tts"
+        } else if id.contains("settings") {
+            "toggle_dnd"
+        } else if id.contains("ScreenMCP") {
+            "open_screen_perception"
+        } else if id.contains("agentsafetycenter") || id.contains("permissioncontroller") {
+            "open_safety_ledger"
+        } else if id.contains("dialer") {
+            "open_dialer"
+        } else if id.contains("mms") {
+            "open_mms"
+        } else if id.contains("TaskRobot") || id.contains("agentbus") || id.contains("CommonAbility") {
+            "wake_amoo_assistant"
+        } else {
+            "open_aiengine"
+        }
+    }
+
+    fn mcp_hub_tool_page(&self) -> El {
+        let p = self.p();
+        let suite = &self.back_screen.stepos_suite;
+        let ready_count = suite.mcp_services.iter().filter(|s| s.ready).count();
+        let cat_filter = self.back_screen.mcp_category_filter;
+        let categories = ["全部", "日程与时间", "相册与文件", "语音与系统", "安全与自动化"];
+
+        let filtered_services: Vec<_> = suite
+            .mcp_services
+            .iter()
+            .filter(|s| cat_filter == 0 || s.category == categories[cat_filter as usize])
+            .collect();
+
+        let mut service_rows = Vec::new();
+        for chunk in filtered_services.chunks(2) {
+            let mut row_cards = Vec::new();
+            for item in chunk {
+                let act_key = Self::mcp_service_action_key(&item.id);
+                let card = Container::new(self.vstack(
+                    S2,
+                    vec![
+                        self.between(
+                            self.hstack(
+                                S2,
+                                vec![
+                                    self.line_w(&item.title, BODY, p.text, Weight::Medium),
+                                    self.pill_badge(
+                                        &item.category,
+                                        p.accent,
+                                        p.accent_soft,
+                                    ),
+                                ],
+                            ),
+                            self.line(
+                                if item.ready { "已就绪" } else { "待唤醒" },
+                                MICRO,
+                                if item.ready { p.success } else { p.warning },
+                            ),
+                        ),
+                        self.mono(&item.id, MICRO, p.text3),
+                        self.between(
+                            self.line("com.stepos.mcp.sdk.TOOLS_SERVICE", MICRO, p.text3),
+                            self.button(
+                                format!("mcp-srv-act-{}", item.id),
+                                format!("› {}", item.quick_action_label),
+                                Action::BackScreen(BackScreenAction::TriggerMcpQuickAction(
+                                    act_key.into(),
+                                )),
+                                Btn::Secondary,
+                            ),
+                        ),
+                    ],
+                ))
+                .with_uniform_padding(S3)
+                .with_background_color(p.surface)
+                .with_border(Border::all(1.).with_border_color(p.border))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
+                .finish();
+                row_cards.push(Expanded::new(1., card).finish());
+            }
+            if row_cards.len() == 1 {
+                row_cards.push(Expanded::new(1., Empty::new().finish()).finish());
+            }
+            service_rows.push(self.hstack(S3, row_cards));
+        }
+
+        self.vstack(
+            S4,
+            vec![
+                self.panel(vec![
+                    self.between(
+                        self.hstack(
+                            S2,
+                            vec![
+                                self.heading("StepOS 原生 MCP 能力中心（AgentBus 总线编排）"),
+                                self.pill_badge(
+                                    format!("{ready_count} / {} 项已就绪", suite.mcp_services.len()),
+                                    p.success,
+                                    p.surface,
+                                ),
+                            ],
+                        ),
+                        self.button(
+                            "mcp-refresh-top",
+                            "刷新总线状态",
+                            Action::BackScreen(BackScreenAction::InspectStepOsSuite),
+                            Btn::Secondary,
+                        ),
+                    ),
+                    self.text(
+                        "StepOS 在框架层 (/apex/com.stepos.framework) 内置标准化 MCP 工具服务协议 (com.stepos.mcp.sdk.TOOLS_SERVICE)，由系统级 AgentBus 统一调度日历、闹钟、相册、系统设置、语音与安全中心，打破应用孤岛，让桌面端可一键直控手机底层服务。",
+                        BODY,
+                        p.text2,
+                    ),
+                    self.divider(),
+                    self.between(
+                        self.line_w(&suite.agentbus_status, CAPTION, p.text, Weight::Medium),
+                        if !suite.thermal_summary.is_empty() {
+                            self.line(&suite.thermal_summary, CAPTION, p.accent)
+                        } else {
+                            self.line("支持 USB 与局域网无线直连调用", CAPTION, p.text3)
+                        },
+                    ),
+                ]),
+                self.panel(vec![
+                    self.between(
+                        self.heading("手机系统状态快捷控制舱"),
+                        self.line(
+                            format!(
+                                "勿扰：{} · Wi-Fi：{} · 蓝牙：{} · 亮度：{}%",
+                                if suite.controls.dnd_on { "开启" } else { "关闭" },
+                                if suite.controls.wifi_on { "开启" } else { "关闭" },
+                                if suite.controls.bluetooth_on { "开启" } else { "关闭" },
+                                suite.controls.brightness_percent
+                            ),
+                            CAPTION,
+                            p.accent,
+                        ),
+                    ),
+                    self.text(
+                        "通过系统设置与媒体会话 MCP 通道，直接在电脑端切换手机勿扰模式、无线开关、屏幕亮度（支持 12-bit 4095 级高精背光）与媒体音量：",
+                        CAPTION,
+                        p.text2,
+                    ),
+                    self.wrap(vec![
+                        self.button(
+                            "mcp-ctrl-dnd",
+                            if suite.controls.dnd_on {
+                                "勿扰模式：已开启（点击关闭）"
+                            } else {
+                                "勿扰模式：已关闭（点击开启）"
+                            },
+                            Action::BackScreen(BackScreenAction::TriggerMcpQuickAction(
+                                "toggle_dnd".into(),
+                            )),
+                            if suite.controls.dnd_on {
+                                Btn::Primary
+                            } else {
+                                Btn::Secondary
+                            },
+                        ),
+                        self.button(
+                            "mcp-ctrl-wifi",
+                            if suite.controls.wifi_on {
+                                "手机 Wi-Fi：已开启（切换）"
+                            } else {
+                                "手机 Wi-Fi：已关闭（开启）"
+                            },
+                            Action::BackScreen(BackScreenAction::TriggerMcpQuickAction(
+                                "toggle_wifi".into(),
+                            )),
+                            Btn::Secondary,
+                        ),
+                        self.button(
+                            "mcp-ctrl-bt",
+                            if suite.controls.bluetooth_on {
+                                "手机蓝牙：已开启（切换）"
+                            } else {
+                                "手机蓝牙：已关闭（开启）"
+                            },
+                            Action::BackScreen(BackScreenAction::TriggerMcpQuickAction(
+                                "toggle_bluetooth".into(),
+                            )),
+                            Btn::Secondary,
+                        ),
+                    ]),
+                    self.divider(),
+                    self.between(
+                        self.line("手机屏幕亮度快捷档位", CAPTION, p.text2),
+                        self.hstack(
+                            S2,
+                            [
+                                (25u8, "25% 柔和"),
+                                (50u8, "50% 标准"),
+                                (75u8, "75% 明亮"),
+                                (100u8, "100% 户外"),
+                            ]
+                            .into_iter()
+                            .map(|(pct, label)| {
+                                self.button(
+                                    format!("mcp-bright-{pct}"),
+                                    label,
+                                    Action::BackScreen(BackScreenAction::SetBrightnessPercent(pct)),
+                                    if (suite.controls.brightness_percent as i16 - pct as i16).abs()
+                                        <= 12
+                                    {
+                                        Btn::Primary
+                                    } else {
+                                        Btn::Secondary
+                                    },
+                                )
+                            })
+                            .collect(),
+                        ),
+                    ),
+                    self.between(
+                        self.line("手机媒体音量快捷调节", CAPTION, p.text2),
+                        self.hstack(
+                            S2,
+                            vec![
+                                self.button(
+                                    "mcp-vol-mute",
+                                    "静音",
+                                    Action::BackScreen(BackScreenAction::TriggerMcpQuickAction(
+                                        "volume_mute".into(),
+                                    )),
+                                    Btn::Ghost,
+                                ),
+                                self.button(
+                                    "mcp-vol-down",
+                                    "音量 -",
+                                    Action::BackScreen(BackScreenAction::TriggerMcpQuickAction(
+                                        "volume_down".into(),
+                                    )),
+                                    Btn::Secondary,
+                                ),
+                                self.button(
+                                    "mcp-vol-50",
+                                    "50% 适中",
+                                    Action::BackScreen(BackScreenAction::TriggerMcpQuickAction(
+                                        "volume_50".into(),
+                                    )),
+                                    Btn::Secondary,
+                                ),
+                                self.button(
+                                    "mcp-vol-up",
+                                    "音量 +",
+                                    Action::BackScreen(BackScreenAction::TriggerMcpQuickAction(
+                                        "volume_up".into(),
+                                    )),
+                                    Btn::Secondary,
+                                ),
+                            ],
+                        ),
+                    ),
+                ]),
+                self.panel(vec![
+                    self.between(
+                        self.heading("跨应用 MCP 快捷动作执行台"),
+                        self.line("支持自定义备注/标题参数", CAPTION, p.text3),
+                    ),
+                    self.input(
+                        F_PHONE_SCHEDULE_TITLE,
+                        "可选：输入闹钟备注、新建日程标题或速记内容（留空则使用默认说明）…",
+                        None,
+                    ),
+                    self.wrap(vec![
+                        self.button(
+                            "mcp-act-alarm15",
+                            "设 15 分钟后手机闹钟",
+                            Action::BackScreen(BackScreenAction::TriggerMcpQuickAction(
+                                "alarm_15m".into(),
+                            )),
+                            Btn::Primary,
+                        ),
+                        self.button(
+                            "mcp-act-alarm08",
+                            "设 08:00 早间闹钟",
+                            Action::BackScreen(BackScreenAction::TriggerMcpQuickAction(
+                                "alarm_0800".into(),
+                            )),
+                            Btn::Secondary,
+                        ),
+                        self.button(
+                            "mcp-act-cal",
+                            "在手机新建日程",
+                            Action::BackScreen(BackScreenAction::TriggerMcpQuickAction(
+                                "calendar_event".into(),
+                            )),
+                            Btn::Secondary,
+                        ),
+                        self.button(
+                            "mcp-act-todo",
+                            "创建手机待办提醒",
+                            Action::BackScreen(BackScreenAction::TriggerMcpQuickAction(
+                                "todo_create".into(),
+                            )),
+                            Btn::Secondary,
+                        ),
+                        self.button(
+                            "mcp-act-note",
+                            "写入速记并唤起 Amoo",
+                            Action::BackScreen(BackScreenAction::TriggerMcpQuickAction(
+                                "note_create".into(),
+                            )),
+                            Btn::Secondary,
+                        ),
+                        self.button(
+                            "mcp-act-voice",
+                            "唤醒手机语音助手",
+                            Action::BackScreen(BackScreenAction::TriggerMcpQuickAction(
+                                "voice_tts".into(),
+                            )),
+                            Btn::Secondary,
+                        ),
+                        self.button(
+                            "mcp-act-gallery",
+                            "打开手机系统相册",
+                            Action::BackScreen(BackScreenAction::TriggerMcpQuickAction(
+                                "open_gallery".into(),
+                            )),
+                            Btn::Ghost,
+                        ),
+                    ]),
+                ]),
+                self.panel(vec![
+                    self.between(
+                        self.heading("StepOS 20 项系统级 MCP 服务矩阵"),
+                        self.line(
+                            format!("当前显示 {} 项服务", filtered_services.len()),
+                            CAPTION,
+                            p.text3,
+                        ),
+                    ),
+                    self.segmented(
+                        "mcp-cat-tabs",
+                        categories
+                            .into_iter()
+                            .enumerate()
+                            .map(|(idx, label)| {
+                                let count = suite
+                                    .mcp_services
+                                    .iter()
+                                    .filter(|s| idx == 0 || s.category == label)
+                                    .count();
+                                (
+                                    format!("{label} · {count}"),
+                                    cat_filter == idx as u8,
+                                    Action::BackScreen(BackScreenAction::McpCategoryFilter(
+                                        idx as u8,
+                                    )),
+                                )
+                            })
+                            .collect(),
+                    ),
+                    self.vstack(S3, service_rows),
+                ]),
+            ],
+        )
+    }
+
+    fn ai_safety_tool_page(&self) -> El {
+        let p = self.p();
+        let suite = &self.back_screen.stepos_suite;
+        let perm_label = |ok: bool| {
+            if ok {
+                "已授权 / 就绪"
+            } else {
+                "待唤醒 / 授权"
+            }
+        };
+        let perm_color = |ok: bool| if ok { p.success } else { p.warning };
+
+        self.vstack(
+            S4,
+            vec![
+                self.panel(vec![
+                    self.between(
+                        self.hstack(
+                            S2,
+                            vec![
+                                self.heading("StepOS 端侧大模型引擎 (com.stepos.aiengine)"),
+                                self.pill_badge(
+                                    if suite.aiengine_running {
+                                        "端侧 NPU 在线"
+                                    } else {
+                                        "按需唤醒"
+                                    },
+                                    if suite.aiengine_running {
+                                        p.success
+                                    } else {
+                                        p.text2
+                                    },
+                                    p.surface,
+                                ),
+                                if !suite.aiengine_htp_status.is_empty() {
+                                    self.pill_badge(
+                                        &suite.aiengine_htp_status,
+                                        p.accent,
+                                        p.accent_soft,
+                                    )
+                                } else {
+                                    Empty::new().finish()
+                                },
+                            ],
+                        ),
+                        self.line(
+                            format!("已注册 {} 项端侧算子", suite.aiengine_ability_count.max(33)),
+                            CAPTION,
+                            p.accent,
+                        ),
+                    ),
+                    self.text(&suite.aiengine_model_summary, BODY, p.text),
+                    self.text(
+                        "基于高通 QNN HTP (NPU) 与 MNN 异构加速引擎，提供零云端延迟、数据不出端侧的本地 AI 推理能力。涵盖屏幕视觉理解 (stepos-gui-agent / stepos-perception)、相册语义检索 (mnn-clip)、实时语音识别与合成 (stepos-asr / stepos-tts)、短信智能解析 (stepos-sms-parse) 以及 29 类隐私与安全风险分类器 (stepos-risk-classify)。",
+                        CAPTION,
+                        p.text2,
+                    ),
+                    if !suite.thermal_summary.is_empty() {
+                        self.line(&suite.thermal_summary, CAPTION, p.text3)
+                    } else {
+                        Empty::new().finish()
+                    },
+                    self.wrap(vec![
+                        self.button(
+                            "ai-open-model-mgr",
+                            "在手机打开端侧模型管理",
+                            Action::BackScreen(BackScreenAction::TriggerMcpQuickAction(
+                                "open_aiengine".into(),
+                            )),
+                            Btn::Primary,
+                        ),
+                        self.button(
+                            "ai-open-engine-settings",
+                            "端侧 AI 引擎设置",
+                            Action::BackScreen(BackScreenAction::TriggerMcpQuickAction(
+                                "open_aiengine_settings".into(),
+                            )),
+                            Btn::Secondary,
+                        ),
+                        self.button(
+                            "ai-refresh-telemetry",
+                            "刷新 NPU 与算子状态",
+                            Action::BackScreen(BackScreenAction::InspectStepOsSuite),
+                            Btn::Ghost,
+                        ),
+                    ]),
+                ]),
+                self.panel(vec![
+                    self.between(
+                        self.vstack(
+                            S1,
+                            vec![
+                                self.heading("AI 核心感知与操控权限四维矩阵"),
+                                self.text(
+                                    "当手机 GUI Agent 或跨端协同动作无法执行时，可在此逐项排查或一键自动修复全部底层授权。",
+                                    CAPTION,
+                                    p.text2,
+                                ),
+                            ],
+                        ),
+                        self.utility_button(
+                            "ai-heal-all-perms",
+                            "一键修复全部 AI 权限",
+                            Action::GrantDeepAmooPerms,
+                            true,
+                        ),
+                    ),
+                    self.divider(),
+                    self.between(
+                        self.vstack(
+                            S1,
+                            vec![
+                                self.line_w(
+                                    "1. 屏幕视觉感知 (ScreenMCPService · 识屏理解授权)",
+                                    BODY,
+                                    p.text,
+                                    Weight::Medium,
+                                ),
+                                self.text(
+                                    "允许端侧模型与 Amoo 在任务执行期间读取当前屏幕画面与布局树，用于看屏问答与 GUI 自动规划。",
+                                    CAPTION,
+                                    p.text2,
+                                ),
+                            ],
+                        ),
+                        self.hstack(
+                            S2,
+                            vec![
+                                self.line(
+                                    perm_label(suite.screen_perception_ready),
+                                    CAPTION,
+                                    perm_color(suite.screen_perception_ready),
+                                ),
+                                self.button(
+                                    "ai-toggle-perception",
+                                    if suite.screen_perception_ready {
+                                        "关闭识屏授权"
+                                    } else {
+                                        "开启识屏授权"
+                                    },
+                                    Action::BackScreen(BackScreenAction::TriggerMcpQuickAction(
+                                        "toggle_screen_perception".into(),
+                                    )),
+                                    Btn::Secondary,
+                                ),
+                                self.button(
+                                    "ai-open-perception",
+                                    "手机设置",
+                                    Action::BackScreen(BackScreenAction::TriggerMcpQuickAction(
+                                        "open_screen_perception".into(),
+                                    )),
+                                    Btn::Ghost,
+                                ),
+                            ],
+                        ),
+                    ),
+                    self.divider(),
+                    self.between(
+                        self.vstack(
+                            S1,
+                            vec![
+                                self.line_w(
+                                    "2. 无障碍 GUI 自动化操控 (Accessibility · 接管操作手机)",
+                                    BODY,
+                                    p.text,
+                                    Weight::Medium,
+                                ),
+                                self.text(
+                                    "允许内置 GUI Agent 与 StepOS TaskRobot 执行点击、滑动与文本输入；遇到支付或锁屏验证时自动暂停由用户接管。",
+                                    CAPTION,
+                                    p.text2,
+                                ),
+                            ],
+                        ),
+                        self.hstack(
+                            S2,
+                            vec![
+                                self.line(
+                                    perm_label(suite.gui_accessibility_enabled),
+                                    CAPTION,
+                                    perm_color(suite.gui_accessibility_enabled),
+                                ),
+                                self.button(
+                                    "ai-open-operate-phone",
+                                    "接管权限设置",
+                                    Action::BackScreen(BackScreenAction::TriggerMcpQuickAction(
+                                        "open_operate_phone".into(),
+                                    )),
+                                    Btn::Secondary,
+                                ),
+                            ],
+                        ),
+                    ),
+                    self.divider(),
+                    self.between(
+                        self.vstack(
+                            S1,
+                            vec![
+                                self.line_w(
+                                    "3. 系统通知实时监听 (NotificationListener · 跨端推送与验证码提取)",
+                                    BODY,
+                                    p.text,
+                                    Weight::Medium,
+                                ),
+                                self.text(
+                                    "用于桌面端实时接收手机通知、快递取件码汇总、验证码秒级提取与背屏通知呼吸闪动。",
+                                    CAPTION,
+                                    p.text2,
+                                ),
+                            ],
+                        ),
+                        self.line(
+                            perm_label(suite.notification_listener_enabled),
+                            CAPTION,
+                            perm_color(suite.notification_listener_enabled),
+                        ),
+                    ),
+                    self.divider(),
+                    self.between(
+                        self.vstack(
+                            S1,
+                            vec![
+                                self.line_w(
+                                    "4. AgentBus 原生 MCP 桥接鉴权 (ACCESS_MCP_SERVICES)",
+                                    BODY,
+                                    p.text,
+                                    Weight::Medium,
+                                ),
+                                self.text(
+                                    "授权 AgentBus 跨应用调用日历、闹钟、相册、文件管理与系统控制等 20 项原生 MCP 服务。",
+                                    CAPTION,
+                                    p.text2,
+                                ),
+                            ],
+                        ),
+                        self.line(
+                            perm_label(suite.mcp_permission_granted),
+                            CAPTION,
+                            perm_color(suite.mcp_permission_granted),
+                        ),
+                    ),
+                ]),
+                self.panel(vec![
+                    self.between(
+                        self.heading("AI 安全审计台账 (com.stepos.agentsafetycenter)"),
+                        self.pill_badge(
+                            if suite.safety_center_running {
+                                "安全台账实时记录中"
+                            } else {
+                                "按需唤醒"
+                            },
+                            if suite.safety_center_running {
+                                p.success
+                            } else {
+                                p.text2
+                            },
+                            p.surface,
+                        ),
+                    ),
+                    self.text(
+                        "StepOS AI 安全审计中心会完整记录每一次智能体调用系统能力、读取屏幕或执行跨应用操作的审计轨迹 (LedgerProvider)，并支持按应用粒度随时收回智能体权限。",
+                        BODY,
+                        p.text2,
+                    ),
+                    self.wrap(vec![
+                        self.button(
+                            "ai-open-safety-ledger",
+                            "在手机打开 AI 安全审计台账",
+                            Action::BackScreen(BackScreenAction::TriggerMcpQuickAction(
+                                "open_safety_ledger".into(),
+                            )),
+                            Btn::Primary,
+                        ),
+                        self.button(
+                            "ai-open-perm-mgr",
+                            "打开智能体权限管理中心",
+                            Action::BackScreen(BackScreenAction::TriggerMcpQuickAction(
+                                "open_agent_perm_manager".into(),
+                            )),
+                            Btn::Secondary,
+                        ),
+                    ]),
+                ]),
+            ],
+        )
+    }
+
+    fn wellbeing_tool_page(&self) -> El {
+        let p = self.p();
+        let suite = &self.back_screen.stepos_suite;
+        let wb = &suite.wellbeing;
+        let max_mins = wb
+            .top_apps
+            .iter()
+            .map(|(_, _, m)| *m)
+            .max()
+            .unwrap_or(1)
+            .max(1);
+
+        let metrics = [
+            (
+                "今日手机亮屏时长",
+                stepx_companion::toolbox::format_duration_minutes(wb.screen_time_minutes),
+            ),
+            ("今日解锁次数", format!("{} 次", wb.unlock_count)),
+            ("今日统计活跃应用", format!("{} 款应用", wb.top_apps.len())),
+        ]
+        .into_iter()
+        .map(|(label, val)| {
+            Expanded::new(
+                1.,
+                Container::new(self.vstack(
+                    S1,
+                    vec![
+                        self.line(label, CAPTION, p.text2),
+                        self.line_w(val, METRIC, p.text, Weight::Semibold),
+                    ],
+                ))
+                .with_uniform_padding(S3)
+                .with_background_color(p.surface)
+                .with_border(Border::all(1.).with_border_color(p.border))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
+                .finish(),
+            )
+            .finish()
+        })
+        .collect();
+
+        let mut app_rows = vec![
+            self.between(
+                self.heading("今日高频应用使用时长排行"),
+                self.line("基于 Android UsageStats 实时统计", CAPTION, p.text3),
+            ),
+            self.text(
+                "直观展示今日前台使用时间最长的手机应用，支持一键在手机打开应用，或对后台耗电/分心应用执行强制停止。",
+                CAPTION,
+                p.text2,
+            ),
+        ];
+
+        if wb.top_apps.is_empty() {
+            app_rows.push(self.text(
+                "今日暂无高频应用统计或正在读取中，请点击右上角「刷新统计」获取最新数据。",
+                BODY,
+                p.text3,
+            ));
+        } else {
+            for (idx, (name, pkg, mins)) in wb.top_apps.iter().enumerate() {
+                let pct = ((*mins as u64 * 100) / max_mins as u64).clamp(6, 100) as u8;
+                let total_share = if wb.screen_time_minutes > 0 {
+                    ((*mins as u64 * 100) / wb.screen_time_minutes as u64).min(100)
+                } else {
+                    0
+                };
+                app_rows.push(self.divider());
+                app_rows.push(self.between(
+                    self.vstack(
+                        S1,
+                        vec![
+                            self.hstack(
+                                S2,
+                                vec![
+                                    self.line_w(
+                                        format!("{}. {name}", idx + 1),
+                                        BODY,
+                                        p.text,
+                                        Weight::Medium,
+                                    ),
+                                    self.pill_badge(
+                                        format!(
+                                            "{} · 占亮屏 {}%",
+                                            stepx_companion::toolbox::format_duration_minutes(
+                                                *mins
+                                            ),
+                                            total_share
+                                        ),
+                                        p.accent,
+                                        p.accent_soft,
+                                    ),
+                                ],
+                            ),
+                            self.mono(pkg, MICRO, p.text3),
+                        ],
+                    ),
+                    self.hstack(
+                        S2,
+                        vec![
+                            self.button(
+                                format!("wb-open-app-{idx}"),
+                                "在手机打开",
+                                Action::OpenApp(pkg.clone()),
+                                Btn::Secondary,
+                            ),
+                            self.button(
+                                format!("wb-stop-app-{idx}"),
+                                "强制停止",
+                                Action::BackScreen(BackScreenAction::TriggerMcpQuickAction(
+                                    format!("force_stop:{pkg}"),
+                                )),
+                                Btn::Ghost,
+                            ),
+                        ],
+                    ),
+                ));
+                app_rows.push(self.progress(Some(pct), p.accent));
+            }
+        }
+
+        let pomodoro_active = self.back_screen.pomodoro_active;
+        let pomodoro_mins = (self.back_screen.pomodoro_duration_secs / 60).max(1);
+
+        self.vstack(
+            S4,
+            vec![
+                self.panel(vec![
+                    self.between(
+                        self.heading("数字健康与屏幕使用统计"),
+                        self.button(
+                            "wb-refresh-btn",
+                            "刷新使用统计",
+                            Action::BackScreen(BackScreenAction::InspectStepOsSuite),
+                            Btn::Secondary,
+                        ),
+                    ),
+                    self.hstack(S3, metrics),
+                ]),
+                self.panel(app_rows),
+                self.panel(vec![
+                    self.between(
+                        self.hstack(
+                            S2,
+                            vec![
+                                self.heading("跨端专注番茄钟（桌面 + 手机背屏联动）"),
+                                self.pill_badge(
+                                    if pomodoro_active {
+                                        format!("专注倒计时进行中 · {pomodoro_mins} 分钟")
+                                    } else {
+                                        "背屏进度条联动".into()
+                                    },
+                                    if pomodoro_active { p.success } else { p.text2 },
+                                    p.surface,
+                                ),
+                            ],
+                        ),
+                        if pomodoro_active {
+                            self.button(
+                                "wb-pomo-stop",
+                                "结束专注番茄钟",
+                                Action::BackScreen(BackScreenAction::StopPomodoro),
+                                Btn::Danger,
+                            )
+                        } else {
+                            self.line("开启后手机背屏同步显示倒计时点阵", CAPTION, p.text3)
+                        },
+                    ),
+                    self.text(
+                        "启动专注倒计时后，桌面端与手机背屏将同步展示实时专注进度条，配合手机勿扰模式帮助你远离分心通知。",
+                        BODY,
+                        p.text2,
+                    ),
+                    self.wrap(vec![
+                        self.button(
+                            "wb-pomo-15",
+                            "15 分钟轻度专注",
+                            Action::BackScreen(BackScreenAction::StartPomodoro(15)),
+                            Btn::Secondary,
+                        ),
+                        self.button(
+                            "wb-pomo-25",
+                            "25 分钟标准番茄钟",
+                            Action::BackScreen(BackScreenAction::StartPomodoro(25)),
+                            Btn::Primary,
+                        ),
+                        self.button(
+                            "wb-pomo-45",
+                            "45 分钟深度心流",
+                            Action::BackScreen(BackScreenAction::StartPomodoro(45)),
+                            Btn::Secondary,
+                        ),
+                        self.button(
+                            "wb-pomo-dnd",
+                            "同步切换手机勿扰模式",
+                            Action::BackScreen(BackScreenAction::TriggerMcpQuickAction(
+                                "toggle_dnd".into(),
+                            )),
+                            Btn::Ghost,
+                        ),
+                    ]),
+                ]),
+                self.panel(vec![
+                    self.between(
+                        self.heading("AlphaMe 个人数字分身与场景画像 (com.stepos.alphame)"),
+                        self.pill_badge(
+                            if wb.alphame_running {
+                                "AlphaMe 服务在线"
+                            } else {
+                                "按需唤醒"
+                            },
+                            if wb.alphame_running {
+                                p.success
+                            } else {
+                                p.text2
+                            },
+                            p.surface,
+                        ),
+                    ),
+                    self.text(
+                        "AlphaMe 负责维护你的端侧个人画像、家庭与公司常用地址、场景 Wi-Fi 自动感知、车载蓝牙触发策略以及 Amoo 长期个人记忆，让手机与桌面智能体无需重复询问你的日常偏好。",
+                        BODY,
+                        p.text2,
+                    ),
+                    self.wrap(vec![
+                        self.button(
+                            "wb-open-alphame",
+                            "打开 AlphaMe 个人画像中心",
+                            Action::BackScreen(BackScreenAction::TriggerMcpQuickAction(
+                                "open_alphame".into(),
+                            )),
+                            Btn::Primary,
+                        ),
+                        self.button(
+                            "wb-open-alphame-addr",
+                            "常用地址管理（家 / 公司）",
+                            Action::BackScreen(BackScreenAction::TriggerMcpQuickAction(
+                                "open_alphame_address".into(),
+                            )),
+                            Btn::Secondary,
+                        ),
+                        self.button(
+                            "wb-open-alphame-wifi",
+                            "场景 Wi-Fi 绑定",
+                            Action::BackScreen(BackScreenAction::TriggerMcpQuickAction(
+                                "open_alphame_wifi".into(),
+                            )),
+                            Btn::Secondary,
+                        ),
+                        self.button(
+                            "wb-open-alphame-bt",
+                            "车载蓝牙绑定",
+                            Action::BackScreen(BackScreenAction::TriggerMcpQuickAction(
+                                "open_alphame_bt".into(),
+                            )),
+                            Btn::Secondary,
+                        ),
+                        self.button(
+                            "wb-open-amoo-mem",
+                            "打开 Amoo 记忆中心",
+                            Action::BackScreen(BackScreenAction::TriggerMcpQuickAction(
+                                "open_amoo_memory".into(),
+                            )),
+                            Btn::Ghost,
+                        ),
+                    ]),
+                ]),
+            ],
+        )
     }
 
     fn companion_tool_page(&self) -> El {
@@ -2061,30 +2692,6 @@ impl Companion {
                     )
                 } else {
                     self.disabled_button("在手机打开伴侣")
-                },
-                if companion.checked {
-                    self.button_icon(
-                        "companion-copy-diag",
-                        "复制检测结果",
-                        UiIcon::Clipboard,
-                        Action::CopyText(
-                            format!(
-                                "StepX伴侣：{}\n说明：{}\n后台连接：{}\n配对服务：{}",
-                                if companion.installed {
-                                    &companion.version
-                                } else {
-                                    "未安装"
-                                },
-                                companion.message,
-                                companion.background_message,
-                                companion.pairing_message
-                            ),
-                            "已复制 StepX伴侣检测输出".into(),
-                        ),
-                        Btn::Ghost,
-                    )
-                } else {
-                    Empty::new().finish()
                 },
             ]),
         ])];
@@ -2170,31 +2777,7 @@ impl Companion {
         let p = self.p();
         let g = &self.google_suite;
         let mut rows = vec![
-            self.between(
-                self.heading("Google Play 安装与检测"),
-                if g.checked {
-                    self.button_icon(
-                        "google-copy-diag",
-                        "复制诊断摘要",
-                        UiIcon::Clipboard,
-                        Action::CopyText(
-                            format!(
-                                "Google 服务检测：{}\nGSF：{} · GMS：{} · Play：{}\n兼容补丁：{}\n官方认证：{}",
-                                g.verification_note,
-                                if g.gsf_version.is_empty() { "未检测到" } else { &g.gsf_version },
-                                if g.gms_version.is_empty() { "未检测到" } else { &g.gms_version },
-                                if g.play_version.is_empty() { "未检测到" } else { &g.play_version },
-                                g.compatibility_note,
-                                g.certification_note
-                            ),
-                            "已复制 Google 服务诊断结果".into(),
-                        ),
-                        Btn::Ghost,
-                    )
-                } else {
-                    Empty::new().finish()
-                },
-            ),
+            self.heading("Google Play 安装与检测"),
             self.text(
                 if !g.checked {
                     "请先检测手机上已有的 Google 服务。"
@@ -2280,12 +2863,11 @@ impl Companion {
             ),
         ));
         if g.checked && !g.play_version.is_empty() {
-            let open_primary = buttons.is_empty() && self.tool_confirmation.is_none();
             buttons.push(self.utility_button(
                 "tool-google-open",
                 "在手机打开 Play",
                 Action::OpenApp("com.android.vending".into()),
-                open_primary,
+                self.tool_confirmation.is_none(),
             ));
         }
         if !buttons.is_empty() {

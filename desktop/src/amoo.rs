@@ -19,10 +19,262 @@ use std::{
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const AMOO_CONTEXT_TTL: Duration = Duration::from_secs(60);
+const LIVE_DEVICE_CONTEXT_MARKER: &str = "\n\n[StepX 真机实时硬件、电子三包保修与电池健康档案";
 
 static AMOO_CONTEXT_CACHE: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, (Instant, Value)>>,
 > = std::sync::OnceLock::new();
+
+fn should_inject_device_telemetry(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    [
+        "保修",
+        "三包",
+        "激活",
+        "序列号",
+        "sn",
+        "asn",
+        "关于本机",
+        "本机信息",
+        "手机配置",
+        "硬件",
+        "型号",
+        "电池健康",
+        "电池寿命",
+        "soh",
+        "循环次数",
+        "充电循环",
+        "旁路",
+        "快充",
+        "电池容量",
+        "温度",
+        "发热",
+        "发烫",
+        "热力",
+        "npu",
+        "算力",
+        "手机状态",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw))
+}
+
+fn format_live_device_telemetry_block(raw: &str, device: &Device) -> Option<String> {
+    if raw.trim().is_empty() {
+        return None;
+    }
+    let kv = |key: &str| -> String {
+        let prefix = format!("{key}=");
+        raw.lines()
+            .find_map(|line| line.trim().strip_prefix(&prefix))
+            .map(str::trim)
+            .filter(|v| !v.is_empty() && !v.eq_ignore_ascii_case("null"))
+            .unwrap_or("")
+            .to_string()
+    };
+    let non_empty = |primary: String, fallback: &str| -> String {
+        if primary.is_empty() {
+            fallback.to_string()
+        } else {
+            primary
+        }
+    };
+
+    let marketname = non_empty(kv("MARKETNAME"), "未读取");
+    let model = non_empty(
+        kv("MODEL"),
+        if device.model.is_empty() {
+            "未读取"
+        } else {
+            &device.model
+        },
+    );
+    let device_code = non_empty(
+        kv("DEVICE_CODE"),
+        if device.product.is_empty() {
+            "未读取"
+        } else {
+            &device.product
+        },
+    );
+    let serialno = non_empty(
+        kv("SERIALNO"),
+        if device.serial.is_empty() {
+            "未读取"
+        } else {
+            &device.serial
+        },
+    );
+    let asn = non_empty(kv("ASN"), "未读取");
+    let net_sn = non_empty(kv("NET_SN"), "未读取");
+    let cmiit = non_empty(kv("CMIIT"), "未读取");
+    let display_id = non_empty(kv("DISPLAY_ID"), "未读取");
+    let release = non_empty(
+        kv("RELEASE"),
+        if device.android.is_empty() {
+            "未读取"
+        } else {
+            &device.android
+        },
+    );
+
+    let soh = non_empty(kv("SOH"), "未读取");
+    let normalize_mah = |val: String, default_mah: &str| -> String {
+        if let Ok(n) = val.trim().parse::<u64>() {
+            if n > 100_000 {
+                return (n / 1000).to_string();
+            } else if n > 0 {
+                return n.to_string();
+            }
+        }
+        default_mah.to_string()
+    };
+    let design_cap = normalize_mah(kv("DESIGN_CAP"), "未读取");
+    let charge_cnt = normalize_mah(kv("CHARGE_CNT"), "未读取");
+
+    let cycle_line = kv("CYCLE_LINE");
+    let cycle_count = cycle_line
+        .split_once("android.os.extra.CYCLE_COUNT=")
+        .map(|(_, rest)| {
+            rest.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "未读取".to_string());
+
+    let batt_val = |key: &str| -> String {
+        raw.lines()
+            .find_map(|l| l.trim().strip_prefix(key))
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string()
+    };
+    let level = non_empty(batt_val("level:"), "未知");
+    let voltage = batt_val("voltage:")
+        .parse::<u32>()
+        .ok()
+        .filter(|v| *v > 0)
+        .map(|v| format!("{:.2}", f64::from(v) / 1000.0))
+        .unwrap_or_else(|| "未读取".to_string());
+    let temp = batt_val("temperature:")
+        .parse::<i32>()
+        .ok()
+        .map(|t| format!("{:.1}", f64::from(t) / 10.0))
+        .unwrap_or_else(|| "未读取".to_string());
+
+    let fast_charge_raw = kv("FAST_CHARGE");
+    let fast_charge = match fast_charge_raw.as_str() {
+        "1" | "true" => "已开启".to_string(),
+        "0" | "false" => "已关闭".to_string(),
+        other if !other.is_empty() => other.to_string(),
+        _ => "未读取".to_string(),
+    };
+
+    let ups_mode = kv("UPS_MODE");
+    let ups_limit = non_empty(kv("UPS_LIMIT"), "未读取");
+    let ups_desc = if ups_mode == "1" {
+        format!("已开启（阈值 {ups_limit}%）")
+    } else if ups_mode == "0" {
+        format!("未开启（设定阈值 {ups_limit}%）")
+    } else {
+        "未读取".to_string()
+    };
+
+    let zram_raw = kv("ZRAM");
+    let zram_desc = non_empty(zram_raw, "未读取");
+    let camera_raw = non_empty(kv("CAMERA"), "未读取");
+
+    let mut thermal_parts = Vec::new();
+    if let Some((_, thermal_sec)) = raw.split_once("---THERMAL---") {
+        for line in thermal_sec.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let name = line
+                .split_once("mName=")
+                .map(|(_, r)| {
+                    r.split(|c: char| c == ',' || c == '}' || c.is_whitespace())
+                        .next()
+                        .unwrap_or("")
+                })
+                .unwrap_or("");
+            let val = line
+                .split_once("mValue=")
+                .map(|(_, r)| {
+                    r.split(|c: char| c == ',' || c == '}' || c.is_whitespace())
+                        .next()
+                        .unwrap_or("")
+                })
+                .and_then(|v| v.parse::<f32>().ok());
+            if !name.is_empty() {
+                if let Some(v) = val {
+                    thermal_parts.push(format!("{name}: {v:.1} °C"));
+                }
+            }
+        }
+    }
+    let thermal_line = if thermal_parts.is_empty() {
+        String::new()
+    } else {
+        format!("\n- 核心与壳温热力传感器：{}", thermal_parts.join(" · "))
+    };
+
+    Some(format!(
+        "{LIVE_DEVICE_CONTEXT_MARKER}（设备只读快照；仅引用已读取的数据。未读取项请明确说明未知，不推断保修或认证状态）]\n\
+- 机型与代号：{marketname} ({model} / {device_code})\n\
+- 设备序列号 (SN)：{serialno}\n\
+- 硬件三包码 (ASN)：{asn}\n\
+- 入网序列号 (Net SN)：{net_sn} · CMIIT ID：{cmiit}\n\
+- 电子三包保修状态：未查询官方保修服务，无法确认是否在保\n\
+- 系统固件版本：Android {release} · {display_id}\n\
+- 电池寿命与循环：健康度 (SOH) {soh}% · 充电循环 {cycle_count} 次 · 设计容量 {design_cap} mAh · 当前剩余容量 {charge_cnt} mAh\n\
+- 实时电源与快充：电量 {level}% · 电压 {voltage} V · 电池温度 {temp} °C · 智慧快充 {fast_charge} · 旁路供电 {ups_desc}\n\
+- ZRAM 配置与相机属性：{zram_desc} · {camera_raw}{thermal_line}"
+    ))
+}
+
+fn collect_live_device_telemetry_block(adb: &Adb, device: &Device) -> Option<String> {
+    if device.transport.is_empty() {
+        return None;
+    }
+    let script = r#"echo "MARKETNAME=$(getprop ro.product.marketname 2>/dev/null)"
+echo "MODEL=$(getprop ro.product.model 2>/dev/null)"
+echo "DEVICE_CODE=$(getprop ro.product.device 2>/dev/null)"
+echo "SERIALNO=$(getprop ro.serialno 2>/dev/null)"
+echo "ASN=$(getprop ro.boot.hardware.asn 2>/dev/null)"
+echo "NET_SN=$(getprop ro.StepOS.net.sn 2>/dev/null)"
+echo "DISPLAY_ID=$(getprop ro.build.display.id 2>/dev/null)"
+echo "RELEASE=$(getprop ro.build.version.release 2>/dev/null)"
+echo "CMIIT=$(getprop ro.product.cmiit.id 2>/dev/null)"
+echo "CAMERA=$(getprop ro.vendor.stepos.camera.info 2>/dev/null)"
+echo "ZRAM=$(getprop persist.vendor.stepos.smart_zram.cfg 2>/dev/null)"
+echo "SOH=$(cat /sys/class/zy_charger/soh 2>/dev/null || true)"
+echo "DESIGN_CAP=$(cat /sys/class/zy_charger/design_capacity 2>/dev/null || true)"
+echo "CHARGE_CNT=$(cat /sys/class/zy_charger/charge_counter 2>/dev/null || true)"
+echo "UPS_MODE=$(cat /sys/class/zy_charger/ups_mode 2>/dev/null || true)"
+echo "UPS_LIMIT=$(cat /sys/class/zy_charger/ups_mode_soc_limit 2>/dev/null || true)"
+echo "FAST_CHARGE=$(settings get global stepos_fast_charge 2>/dev/null || true)"
+echo "CYCLE_LINE=$(dumpsys activity broadcasts 2>/dev/null | grep -m1 'android.os.extra.CYCLE_COUNT' || true)"
+echo "---BATTERY---"
+dumpsys battery 2>/dev/null || true
+echo "---THERMAL---"
+dumpsys thermalservice 2>/dev/null | grep -E 'mName=(cpu-0-0|gpuss-0|nsp-0|skin-therm)' | head -n 6 || true"#;
+    let raw = adb.script(&device.transport, script).ok()?;
+    format_live_device_telemetry_block(&raw, device)
+}
+
+fn enrich_prompt_with_live_device_telemetry(adb: &Adb, device: &Device, text: &str) -> String {
+    if !should_inject_device_telemetry(text) || text.contains(LIVE_DEVICE_CONTEXT_MARKER) {
+        return text.to_string();
+    }
+    if let Some(block) = collect_live_device_telemetry_block(adb, device) {
+        format!("{text}{block}")
+    } else {
+        text.to_string()
+    }
+}
 
 fn amoo_context_cache(
 ) -> &'static std::sync::Mutex<std::collections::HashMap<String, (Instant, Value)>> {
@@ -974,10 +1226,15 @@ impl AgentBus {
         context["msg_id"] = json!(&run_id);
         context["channelMessageId"] = json!(&run_id);
         context["trace_id"] = json!(format!("tr-{run_id}"));
+        let outbound_text = if should_inject_device_telemetry(text) {
+            enrich_prompt_with_live_device_telemetry(&self._forward.adb, &self.device, text)
+        } else {
+            text.to_string()
+        };
         let payload = self
             .call(
                 "chat.send",
-                json!({"sessionId":key,"text":text,"stepclaw":context,
+                json!({"sessionId":key,"text":outbound_text,"stepclaw":context,
                     "attachments":attachments,"idempotencyKey":run_id}),
             )
             .context("发送结果未能确认，请先刷新会话再决定是否重试；输入内容已保留")?;
@@ -1400,6 +1657,13 @@ pub(crate) fn parse_messages(rows: &[Value]) -> Result<Vec<RealChatMessage>> {
             .unwrap_or_default();
         if role == "user" {
             attachments.extend(take_native_attachments(&mut text));
+            if let Some((clean, _)) = text.split_once(LIVE_DEVICE_CONTEXT_MARKER) {
+                text = clean.trim_end().to_string();
+            } else if let Some((clean, _)) =
+                text.split_once(LIVE_DEVICE_CONTEXT_MARKER.trim_start())
+            {
+                text = clean.trim_end().to_string();
+            }
         }
         for tool in row["toolCalls"].as_array().into_iter().flatten() {
             if !matches!(
@@ -2257,4 +2521,67 @@ mod tests {
         assert_eq!(status_fresh, "进行中");
         assert_eq!(kind_fresh, 1);
     }
+
+    #[test]
+    fn live_device_telemetry_matches_hardware_queries_and_strips_marker_from_user_history() {
+        assert!(should_inject_device_telemetry("看下手机的保修情况"));
+        assert!(should_inject_device_telemetry("电池健康度和循环次数"));
+        assert!(!should_inject_device_telemetry("上海的天气"));
+
+        let device = Device {
+            transport: "STEPX_TEST_DEVICE".into(),
+            serial: "STEPX_TEST_DEVICE".into(),
+            model: "PZ261A".into(),
+            android: "16".into(),
+            product: "pandora".into(),
+        };
+        let raw = "\
+MARKETNAME=STEPX Neo
+MODEL=PZ261A
+DEVICE_CODE=pandora
+SERIALNO=STEPX_TEST_DEVICE
+ASN=ASN123456789
+NET_SN=NET987654
+DISPLAY_ID=Step AOS 1.0.0
+RELEASE=16
+CMIIT=2025CP1234
+SOH=100
+DESIGN_CAP=6150000
+CHARGE_CNT=6020000
+UPS_MODE=0
+UPS_LIMIT=80
+FAST_CHARGE=1
+CYCLE_LINE=Bundle[{android.os.extra.CYCLE_COUNT=15}]
+---BATTERY---
+  level: 88
+  voltage: 4180
+  temperature: 312
+---THERMAL---
+  Temperature{mValue=34.5, mType=0, mName=skin-therm, mStatus=0}
+";
+        let block = format_live_device_telemetry_block(raw, &device).expect("telemetry block");
+        assert!(block.starts_with(LIVE_DEVICE_CONTEXT_MARKER));
+        assert!(block.contains("ASN123456789"));
+        assert!(block.contains("健康度 (SOH) 100% · 充电循环 15 次 · 设计容量 6150 mAh"));
+
+        let enriched = format!("看下手机的保修情况{block}");
+        let parsed = parse_messages(&[
+            json!({"role": "user", "text": enriched}),
+            json!({"role": "assistant", "text": "尚未查询官方保修状态。"}),
+        ])
+        .unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].text, "看下手机的保修情况");
+    }
+    #[test]
+    fn missing_telemetry_never_implies_warranty_or_sensor_values() {
+        let device = Device { transport: "test".into(), serial: String::new(), model: String::new(), android: String::new(), product: String::new() };
+        let block = format_live_device_telemetry_block("SOH=\nDESIGN_CAP=\n", &device).unwrap();
+        assert!(block.contains("健康度 (SOH) 未读取"));
+        assert!(block.contains("无法确认是否在保"));
+        assert!(!block.contains("6150"));
+        assert!(!block.contains("已认证"));
+        assert!(!block.contains("16 GB"));
+    }
+
 }

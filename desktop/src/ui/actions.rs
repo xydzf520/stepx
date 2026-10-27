@@ -180,6 +180,12 @@ impl TypedActionView for Companion {
             self.handle_update_action(action, ctx);
             return;
         }
+        if let Action::AppStore(action) = action {
+            self.handle_app_store_action(action.clone(), ctx);
+            self.sync_ime(ctx);
+            ctx.notify();
+            return;
+        }
         if let Action::BackScreen(action) = action {
             self.handle_backscreen_action(action, ctx);
             self.sync_ime(ctx);
@@ -324,7 +330,10 @@ impl TypedActionView for Companion {
             // need the same dispatcher (and guards) as a button click; the
             // device-only handler silently ignores them.
             match action {
-                Action::Workspace(_) | Action::Studio(_) | Action::AmooUi(_) => {
+                Action::Workspace(_)
+                | Action::Studio(_)
+                | Action::AmooUi(_)
+                | Action::AppStore(_) => {
                     self.handle_action(&action, ctx);
                 }
                 _ => self.handle_device_action(&action),
@@ -357,14 +366,27 @@ impl Companion {
                         self.work.trim_idle_previews();
                     }
                 }
-                if self.page != *page || (*page == Page::Tools && self.tool_page.is_some()) {
+                if self.page != *page
+                    || (*page == Page::Tools && self.tool_page.is_some())
+                    || (*page == Page::AppStore && self.app_store.selected_package.is_some())
+                {
                     self.trigger_subtab_switch();
+                }
+                if *page == Page::AppStore && self.page == Page::AppStore {
+                    self.app_store.selected_package = None;
+                    self.app_store.lightbox = None;
                 }
                 self.set_compact_mode(ShellMode::Full, ctx);
                 if let Some(i) = self.focus {
                     self.fields[i].preedit.clear();
                 }
                 self.page = *page;
+                if *page == Page::AppStore {
+                    self.prefetch_current_store_page_icons();
+                    if !self.demo_mode {
+                        self.ensure_store_online_catalog_synced();
+                    }
+                }
                 if *page == Page::Amoo {
                     self.demote_busy_if_background();
                 }
@@ -430,6 +452,9 @@ impl Companion {
                 self.tool_confirmation = None;
                 self.focus = None;
                 self.scroll = Default::default();
+                if *tool == Some(ToolPage::Screen) && !self.demo_mode {
+                    self.trigger_lan_cast_discovery();
+                }
                 self.auto_load_for_page();
             }
             Action::NeoIme(enabled) => {
@@ -780,6 +805,13 @@ impl Companion {
                 if *i == F_FILE_SEARCH {
                     self.file_page = 0;
                 }
+                if *i == F_STORE_SEARCH {
+                    self.app_store.page = 0;
+                    self.app_store.search_results = None;
+                    self.app_store.last_search_query.clear();
+                    self.app_store.searching = false;
+                    self.prefetch_current_store_page_icons();
+                }
             }
             Action::FocusSearch => {
                 let target = match self.page {
@@ -787,6 +819,7 @@ impl Companion {
                     Page::Notifications => Some(F_PUSH_SEARCH),
                     Page::Phone => Some(F_CONTACT_SEARCH),
                     Page::Files => Some(F_FILE_SEARCH),
+                    Page::AppStore => Some(F_STORE_SEARCH),
                     Page::Apps => Some(F_APP_SEARCH),
                     Page::Amoo => Some(F_AMOO_SEARCH),
                     Page::Work => Some(if self.work.tab == 0 {
@@ -841,9 +874,10 @@ impl Companion {
                     Page::Phone => &[F_CONTACT_SEARCH, F_PHONE_DIAL],
                     Page::Files if self.file_modal.is_some() => &[F_FILE_NAME, F_FILE_SEARCH],
                     Page::Files => &[F_FILE_SEARCH],
+                    Page::AppStore => &[F_STORE_SEARCH],
                     Page::Apps => &[F_APP_SEARCH],
                     Page::Calendar | Page::Schedule => &[F_PHONE_SCHEDULE_TITLE, F_CALENDAR_TIME],
-                    Page::Alarms => &[F_ALARM_TIME, F_PHONE_SCHEDULE_TITLE],
+                    Page::Alarms => &[F_ALARM_TIME, F_ALARM_LABEL],
                     Page::Gallery => &[F_GALLERY_SEARCH],
                     Page::Tools
                     | Page::Account
@@ -867,6 +901,25 @@ impl Companion {
                 }
                 self.tool_confirmation = None;
                 self.tools_pending = None;
+                if self.page == Page::AppStore {
+                    if self.app_store.lightbox.is_some() {
+                        self.app_store.lightbox = None;
+                        return true;
+                    }
+                    if self.app_store.pending_uninstall.is_some() {
+                        self.app_store.pending_uninstall = None;
+                        return true;
+                    }
+                    if self.app_store.pending_downgrade_reinstall.is_some() {
+                        self.app_store.pending_downgrade_reinstall = None;
+                        return true;
+                    }
+                    if self.focus.is_none() && self.app_store.selected_package.is_some() {
+                        self.app_store.selected_package = None;
+                        self.trigger_subtab_switch();
+                        return true;
+                    }
+                }
                 if self.amoo_plus_open {
                     self.amoo_plus_open = false;
                 } else if self.amoo_recording {
@@ -1506,12 +1559,20 @@ impl Companion {
                     1 => "1080P 高清 (60帧 · 8Mbps)",
                     _ => "原画超清 (120帧 · 16Mbps)",
                 };
-                self.status = format!("已切换独立投屏画质档位：{label}");
-                self.error = false;
+                self.restart_active_mirror(format!("已切换独立投屏画质档位：{label}"));
+            }
+            Action::SetMirrorAudioRoute(route) => {
+                self.mirror_options.audio_route = *route;
+                self.restart_active_mirror(format!("投屏声音已切换为「{}」", route.label()));
+            }
+            Action::CycleMirrorAudioRoute => {
+                let next = self.mirror_options.audio_route.next();
+                self.mirror_options.audio_route = next;
+                self.restart_active_mirror(format!("投屏声音已切换为「{}」", next.label()));
             }
             Action::ToggleMirrorAlwaysOnTop => {
                 self.mirror_options.always_on_top = !self.mirror_options.always_on_top;
-                self.status = format!(
+                let msg = format!(
                     "投屏窗口始终置顶：{}",
                     if self.mirror_options.always_on_top {
                         "已开启"
@@ -1519,11 +1580,11 @@ impl Companion {
                         "已关闭"
                     }
                 );
-                self.error = false;
+                self.restart_active_mirror(msg);
             }
             Action::ToggleMirrorTurnScreenOff => {
                 self.mirror_options.turn_screen_off = !self.mirror_options.turn_screen_off;
-                self.status = format!(
+                let msg = format!(
                     "投屏时手机息屏省电：{}",
                     if self.mirror_options.turn_screen_off {
                         "已开启"
@@ -1531,11 +1592,11 @@ impl Companion {
                         "已关闭"
                     }
                 );
-                self.error = false;
+                self.restart_active_mirror(msg);
             }
             Action::ToggleMirrorStayAwake => {
                 self.mirror_options.stay_awake = !self.mirror_options.stay_awake;
-                self.status = format!(
+                let msg = format!(
                     "投屏期间保持手机常亮：{}",
                     if self.mirror_options.stay_awake {
                         "已开启"
@@ -1543,11 +1604,11 @@ impl Companion {
                         "已关闭"
                     }
                 );
-                self.error = false;
+                self.restart_active_mirror(msg);
             }
             Action::ToggleMirrorShowTouches => {
                 self.mirror_options.show_touches = !self.mirror_options.show_touches;
-                self.status = format!(
+                let msg = format!(
                     "投屏显示触控点轨迹：{}",
                     if self.mirror_options.show_touches {
                         "已开启"
@@ -1555,7 +1616,10 @@ impl Companion {
                         "已关闭"
                     }
                 );
-                self.error = false;
+                self.restart_active_mirror(msg);
+            }
+            Action::LanCast(act) => {
+                self.handle_lan_cast_action(act, ctx);
             }
             Action::SaveScreenshot => self.save_screenshot(),
             Action::AmooSelectModel(idx) => {
@@ -1709,6 +1773,7 @@ impl Companion {
                     return None;
                 }
                 Some(F_STUDIO_NAME) | Some(F_STUDIO_URL) => Action::Studio(StudioAction::Save),
+                Some(F_STORE_SEARCH) => Action::AppStore(AppStoreAction::SearchSubmit),
                 Some(F_PHONE_DIAL) => Action::PhoneCall(self.fields[F_PHONE_DIAL].text.clone()),
                 Some(F_CALENDAR_TIME) => {
                     self.handle_backscreen_action(
@@ -1717,7 +1782,7 @@ impl Companion {
                     );
                     return None;
                 }
-                Some(F_ALARM_TIME) => {
+                Some(F_ALARM_TIME) | Some(F_ALARM_LABEL) => {
                     self.handle_backscreen_action(&BackScreenAction::AlarmCreateCustom, ctx);
                     return None;
                 }
@@ -1842,6 +1907,7 @@ impl Companion {
                 }
                 Page::Phone => Action::ReadPhone,
                 Page::Files => Action::Browse(self.directory.clone()),
+                Page::AppStore => Action::AppStore(AppStoreAction::RefreshCatalog),
                 Page::Apps => Action::Apps,
                 Page::Tools => match self.tool_page {
                     Some(ToolPage::Updates) => {
@@ -1855,6 +1921,15 @@ impl Companion {
                     Some(ToolPage::Services) => Action::InspectServices,
                     Some(ToolPage::Screen) => Action::Screenshot,
                     Some(ToolPage::Device) => Action::Summary,
+                    Some(
+                        ToolPage::Clipboard
+                        | ToolPage::McpHub
+                        | ToolPage::AiSafety
+                        | ToolPage::Wellbeing,
+                    ) => {
+                        self.handle_backscreen_action(&BackScreenAction::InspectStepOsSuite, ctx);
+                        return None;
+                    }
                     _ => return None,
                 },
             },

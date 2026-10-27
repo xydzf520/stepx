@@ -22,6 +22,7 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = Path(os.environ.get('STEPX_GOOGLE_HOME', ROOT / 'handoff/google-play-stepx')).resolve()
 sys.path.insert(0, str(WORKFLOW / 'tools'))
+import common
 from common import ADB, CONFIG, guard, root_json, shell
 from host_runtime import file_lock, sdk_tool, sdk_command, java_environment, subprocess_options
 from companion_apk import ensure_update_preserves_runtime, signer_digests
@@ -38,6 +39,10 @@ AUTHORIZED_SERIAL = os.environ.get('STEPX_SERIAL') or os.environ.get('STEPX_DEVI
 LOADER_SHA256 = '279305289749acada3f9951c816d7e9f00367dce4331d4396c04554e4685fbf8'
 WORKER_SHA256 = '71be97798c805fc803b8eef47f9188aadd0c17f23a2b12ac607e8fa242ed188a'
 STATE = Path(os.environ.get('XDG_STATE_HOME', Path.home() / '.local/state')) / 'stepx-companion/permissions'
+
+
+def device_key() -> str:
+    return os.environ.get('STEPX_DEVICE_SERIAL', '').strip() or ADB[-1]
 
 
 def tool(name):
@@ -158,7 +163,7 @@ INSTALL_VALUE = 'StepX伴侣:1'
 
 
 def install_gate_path():
-    return STATE / ('install-gate-' + hashlib.sha256(ADB[-1].encode()).hexdigest()[:24] + '.json')
+    return STATE / ('install-gate-' + hashlib.sha256(device_key().encode()).hexdigest()[:24] + '.json')
 
 
 def prepare_install(apk, trusted_apk=None):
@@ -169,7 +174,7 @@ def prepare_install(apk, trusted_apk=None):
     if path.exists():
         raise RuntimeError('上次安装的单应用授权待恢复，请先执行 finish-install')
     previous = shell('settings', 'get', 'secure', INSTALL_KEY)
-    baseline = {'package': PACKAGE, 'key': INSTALL_KEY, 'serial': ADB[-1],
+    baseline = {'package': PACKAGE, 'key': INSTALL_KEY, 'serial': device_key(),
                 'fingerprint': CONFIG['fingerprint'], 'signer': signer(apk),
                 'previous': None if previous == 'null' else previous,
                 'temporary': INSTALL_VALUE, 'created_at': int(time.time()),
@@ -191,7 +196,8 @@ def finish_install():
     if not path.exists():
         return {'status': 'unchanged', 'package': PACKAGE, 'restore_required': False}
     baseline = json.loads(path.read_text())
-    if baseline.get('package') != PACKAGE or baseline.get('key') != INSTALL_KEY or baseline.get('serial') != ADB[-1] or baseline.get('fingerprint') != CONFIG['fingerprint'] or baseline.get('temporary') != INSTALL_VALUE:
+    allowed_serials = {s for s in (device_key(), ADB[-1], os.environ.get('STEPX_DEVICE_SERIAL', '')) if s}
+    if baseline.get('package') != PACKAGE or baseline.get('key') != INSTALL_KEY or baseline.get('serial') not in allowed_serials or baseline.get('fingerprint') != CONFIG['fingerprint'] or baseline.get('temporary') != INSTALL_VALUE:
         raise RuntimeError('USB installation recovery baseline mismatch')
     previous = baseline.get('previous')
     if previous is not None and (not isinstance(previous, str) or len(previous) > 512):
@@ -213,7 +219,7 @@ def finish_install():
 
 
 def baseline_path(cert, uid):
-    return STATE / (hashlib.sha256((ADB[-1] + cert + ':' + str(uid)).encode()).hexdigest()[:24] + '.json')
+    return STATE / (hashlib.sha256((device_key() + cert + ':' + str(uid)).encode()).hexdigest()[:24] + '.json')
 
 
 def validate_baseline(prior, cert, uid):
@@ -254,7 +260,7 @@ def runtime_identity(cert, uid):
     pid = shell('pidof', 'system_server')
     if not re.fullmatch(r'[0-9a-f-]{36}', boot) or not re.fullmatch(r'[1-9][0-9]*', pid):
         raise RuntimeError('Unable to verify the current OEM freezer runtime')
-    identity = {'serial': ADB[-1], 'fingerprint': CONFIG['fingerprint'], 'package': PACKAGE,
+    identity = {'serial': device_key(), 'fingerprint': CONFIG['fingerprint'], 'package': PACKAGE,
                 'signer': cert, 'uid': uid, 'boot_id': boot, 'system_server_pid': int(pid)}
     key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:24]
     return identity, STATE / ('runtime-' + key + '.json')
@@ -463,7 +469,7 @@ save(out);os._exit(0)
 '''
 
 
-def verify_system_server_stable(target_pid, seconds=20):
+def verify_system_server_stable(target_pid, seconds: int = 20):
     """A successful native return does not exclude a delayed ART/GC crash."""
     until=time.monotonic()+seconds
     while True:
@@ -485,8 +491,9 @@ def run_bounded_android_worker(code, target_pid, preserve_verified_result=None, 
     if any(properties.values()):
         raise RuntimeError('Another StepClaw startup operation is active; companion permission was not changed')
     expected_launcher = hashlib.sha256((WORKFLOW / 'module/launcher.py').read_bytes()).hexdigest()
+    allowed_launchers = {s for s in (expected_launcher, getattr(common, 'STOCK_SHA', None), CONFIG.get('stock_sha256', '')) if s}
     before = root_json("import os,json,hashlib; print(json.dumps({'launcher':hashlib.sha256(open('/usr/local/bin/ubuntu_zygote','rb').read()).hexdigest(),'root_available':os.geteuid()==0}))")
-    if before.get('launcher') != expected_launcher or before.get('root_available') is not True:
+    if before.get('launcher') not in allowed_launchers or before.get('root_available') is not True:
         raise RuntimeError('Existing StepClaw/Google launcher differs from the verified installation')
     google_before = {}
     for package in ('com.google.android.gms', 'com.android.vending'):
@@ -627,7 +634,7 @@ os.environ['STEPX_SYSTEM_SERVER_PID']={str(target_pid)!r}
 
 def connection_baseline_path(cert, uid):
     # Deliberately separate from the legacy backscreen permission baseline.
-    return STATE / ('connection-' + hashlib.sha256((ADB[-1] + cert + ':' + str(uid)).encode()).hexdigest()[:24] + '.json')
+    return STATE / ('connection-' + hashlib.sha256((device_key() + cert + ':' + str(uid)).encode()).hexdigest()[:24] + '.json')
 
 
 def validate_connection_flags(flags):
@@ -711,7 +718,7 @@ def connection_permissions(apk, operation):
     prior = json.loads(state_path.read_text()) if state_path.exists() else None
     if prior:
         validate_baseline(prior, cert, initial['uid'])
-        allowed_serials = {s for s in (ADB[-1], os.environ.get('STEPX_DEVICE_SERIAL', '')) if s}
+        allowed_serials = {s for s in (device_key(), ADB[-1], os.environ.get('STEPX_DEVICE_SERIAL', '')) if s}
         if prior.get('scope') != CONNECTION_SCOPE or prior.get('serial') not in allowed_serials:
             raise RuntimeError('Connection permission baseline scope/device mismatch')
         validate_connection_flags(prior.get('before_flags'))
@@ -730,7 +737,7 @@ def connection_permissions(apk, operation):
         before_flags = {name: readback['permissions'][name]['before_flags'] for name in CONNECTION_PERMISSIONS}
         validate_connection_flags(before_flags)
         prior = {'signer': cert, 'fingerprint': CONFIG['fingerprint'], 'uid': initial['uid'],
-                 'serial': ADB[-1], 'scope': CONNECTION_SCOPE, 'before_flags': before_flags,
+                 'serial': device_key(), 'scope': CONNECTION_SCOPE, 'before_flags': before_flags,
                  'created_at': int(time.time())}
         private_json(state_path, prior)
     try:
@@ -742,7 +749,7 @@ def connection_permissions(apk, operation):
         before_flags = {name: readback['permissions'][name]['before_flags'] for name in CONNECTION_PERMISSIONS}
         validate_connection_flags(before_flags)
         prior = {'signer': cert, 'fingerprint': CONFIG['fingerprint'], 'uid': initial['uid'],
-                 'serial': ADB[-1], 'scope': CONNECTION_SCOPE, 'before_flags': before_flags,
+                 'serial': device_key(), 'scope': CONNECTION_SCOPE, 'before_flags': before_flags,
                  'created_at': int(time.time())}
         private_json(state_path, prior)
         result = inject_connection(cert, operation, prior['before_flags'], initial['uid'])
@@ -752,7 +759,7 @@ def connection_permissions(apk, operation):
 
 def wake_baseline_path(cert, uid):
     # Independent of both backscreen and connection recovery baselines.
-    return STATE / ('wake-' + hashlib.sha256((ADB[-1] + cert + ':' + str(uid)).encode()).hexdigest()[:24] + '.json')
+    return STATE / ('wake-' + hashlib.sha256((device_key() + cert + ':' + str(uid)).encode()).hexdigest()[:24] + '.json')
 
 
 def validate_wake_flags(flags):
@@ -840,7 +847,7 @@ def wake_permissions(apk, operation):
     prior = json.loads(state_path.read_text()) if state_path.exists() else None
     if prior:
         validate_baseline(prior, cert, initial['uid'])
-        allowed_serials = {s for s in (ADB[-1], os.environ.get('STEPX_DEVICE_SERIAL', '')) if s}
+        allowed_serials = {s for s in (device_key(), ADB[-1], os.environ.get('STEPX_DEVICE_SERIAL', '')) if s}
         if (prior.get('scope') != WAKE_SCOPE or prior.get('serial') not in allowed_serials or
                 prior.get('owner') != WAKE_OWNER):
             raise RuntimeError('Wake permission baseline scope/device mismatch')
@@ -860,7 +867,7 @@ def wake_permissions(apk, operation):
         before_flags = {name: readback['permissions'][name]['before_flags'] for name in WAKE_PERMISSIONS}
         validate_wake_flags(before_flags)
         prior = {'signer': cert, 'fingerprint': CONFIG['fingerprint'], 'uid': initial['uid'],
-                 'serial': ADB[-1], 'scope': WAKE_SCOPE, 'owner': WAKE_OWNER, 'before_flags': before_flags,
+                 'serial': device_key(), 'scope': WAKE_SCOPE, 'owner': WAKE_OWNER, 'before_flags': before_flags,
                  'created_at': int(time.time())}
         private_json(state_path, prior)
     try:
@@ -872,7 +879,7 @@ def wake_permissions(apk, operation):
         before_flags = {name: readback['permissions'][name]['before_flags'] for name in WAKE_PERMISSIONS}
         validate_wake_flags(before_flags)
         prior = {'signer': cert, 'fingerprint': CONFIG['fingerprint'], 'uid': initial['uid'],
-                 'serial': ADB[-1], 'scope': WAKE_SCOPE, 'owner': WAKE_OWNER, 'before_flags': before_flags,
+                 'serial': device_key(), 'scope': WAKE_SCOPE, 'owner': WAKE_OWNER, 'before_flags': before_flags,
                  'created_at': int(time.time())}
         private_json(state_path, prior)
         result = inject_wake(cert, operation, prior['before_flags'], initial['uid'])

@@ -1,6 +1,7 @@
 //! Shared outline icon family. Assets use a 24 px grid and rounded 1.75 px strokes.
 //! White SVG masks are required: the renderer uses the red channel as icon alpha.
 use super::{widgets::El, Companion};
+pub(super) use super::widgets::icon_label;
 use facloud_ui::{color::ColorU, elements::*};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -328,14 +329,14 @@ pub(super) fn symbol(value: &str) -> Option<UiIcon> {
         "📝" => UiIcon::ScanText,
         "✎" | "✏" => UiIcon::Edit,
         "🎵" => UiIcon::Music,
-        "🎬" | "📹" | "▷" => UiIcon::Video,
+        "🎬" | "📹" => UiIcon::Video,
         "🖼" => UiIcon::Image,
         "📥" => UiIcon::Download,
         "📤" => UiIcon::Upload,
         "↓" | "⬇" => UiIcon::ArrowDown,
         "⬆" | "↑" => UiIcon::ArrowUp,
-        "←" | "⬅" | "◀" => UiIcon::ArrowLeft,
-        "➡" => UiIcon::ArrowRight,
+        "←" | "⬅" | "◀" | "◁" | "‹" => UiIcon::ArrowLeft,
+        "➡" | "▷" => UiIcon::ArrowRight,
         "<" => UiIcon::ChevronLeft,
         "↗" | "↙" => UiIcon::ExternalLink,
         "🔋" => UiIcon::Battery,
@@ -398,7 +399,7 @@ pub(super) fn symbol(value: &str) -> Option<UiIcon> {
         _ => return None,
     })
 }
-/// Only interpret leading UI glyphs (or trailing sort/nav indicators), never symbols embedded in user content.
+/// Only interpret leading UI glyphs, never bare ASCII symbols or symbols embedded in user content.
 pub(super) fn label_icon(value: &str) -> Option<(UiIcon, &str)> {
     if value.is_empty() {
         return None;
@@ -420,27 +421,16 @@ pub(super) fn label_icon(value: &str) -> Option<(UiIcon, &str)> {
         }
         if let Some(icon) = symbol(&value[..end]) {
             let rest = &value[end..];
-            if rest.is_empty()
-                || rest.starts_with(char::is_whitespace)
-                || (first as u32 >= 0x2000
-                    && !rest.starts_with(|c: char| c.is_ascii_alphanumeric()))
-            {
+            let matched = if first.is_ascii() {
+                rest.starts_with(' ') && !rest.trim_start().is_empty()
+            } else {
+                rest.is_empty()
+                    || rest.starts_with(char::is_whitespace)
+                    || (first as u32 >= 0x2000
+                        && !rest.starts_with(|c: char| c.is_ascii_alphanumeric()))
+            };
+            if matched {
                 return Some((icon, rest.trim_start()));
-            }
-        }
-    }
-    // Check trailing directional / dismiss indicators on short UI labels (e.g. "降序 ↓", "升序 ↑", "下个月 >", "应用: xxx ×")
-    if value.chars().count() <= 24 {
-        for (suffix, icon) in [
-            (" ↓", UiIcon::ArrowDown),
-            (" ↑", UiIcon::ArrowUp),
-            (" >", UiIcon::ChevronRight),
-            (" ×", UiIcon::Close),
-        ] {
-            if let Some(prefix) = value.strip_suffix(suffix) {
-                if !prefix.trim().is_empty() {
-                    return Some((icon, prefix.trim_end()));
-                }
             }
         }
     }
@@ -544,16 +534,14 @@ mod tests {
         assert_eq!(symbol("✨"), Some(UiIcon::Sparkles));
         assert_eq!(label_icon("⚡可秒回"), Some((UiIcon::Bolt, "可秒回")));
 
-        // Trailing sort and filter indicators
-        assert_eq!(label_icon("降序 ↓"), Some((UiIcon::ArrowDown, "降序")));
-        assert_eq!(label_icon("升序 ↑"), Some((UiIcon::ArrowUp, "升序")));
-        assert_eq!(
-            label_icon("下个月 >"),
-            Some((UiIcon::ChevronRight, "下个月"))
-        );
-        assert_eq!(
-            label_icon("应用: 微信 ×"),
-            Some((UiIcon::Close, "应用: 微信"))
-        );
+        // Hollow triangles and bare ASCII symbols / trailing suffixes
+        assert_eq!(symbol("◁"), Some(UiIcon::ArrowLeft));
+        assert_eq!(symbol("▷"), Some(UiIcon::ArrowRight));
+        assert_eq!(label_icon("+"), None);
+        assert_eq!(label_icon("+86"), None);
+        assert_eq!(label_icon("降序 ↓"), None);
+        assert_eq!(label_icon("升序 ↑"), None);
+        assert_eq!(label_icon("下个月 >"), None);
+        assert_eq!(label_icon("应用: 微信 ×"), None);
     }
 }

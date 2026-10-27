@@ -1400,6 +1400,8 @@ pub fn inspect_stepos_ai_suite(adb: &Adb, device: &Device) -> Result<StepOsAiSui
         "settings get secure enabled_accessibility_services 2>/dev/null || true; ",
         "echo '===NOTIF==='; ",
         "settings get secure enabled_notification_listeners 2>/dev/null || true; ",
+        "echo '===PERCEPTION==='; ",
+        "settings get global stepos_agentsafetycenter_screen_perception_enabled 2>/dev/null || true; ",
         "echo '===AIENGINE==='; ",
         "dumpsys activity service com.stepos.aiengine/.service.AIEngineManagerService 2>/dev/null | head -n 60 || true; ",
         "echo '===AGENTBUS==='; ",
@@ -1550,6 +1552,7 @@ fn parse_stepos_ai_suite_output(raw: &str) -> StepOsAiSuiteReport {
     let mut ps_lines = Vec::new();
     let mut acc_text = String::new();
     let mut notif_text = String::new();
+    let mut perception_text = String::new();
     let mut clip_lines = Vec::new();
     let mut aiengine_lines = Vec::new();
     let mut agentbus_lines = Vec::new();
@@ -1568,6 +1571,10 @@ fn parse_stepos_ai_suite_output(raw: &str) -> StepOsAiSuiteReport {
             }
             "===NOTIF===" => {
                 section = "notif";
+                continue;
+            }
+            "===PERCEPTION===" => {
+                section = "perception";
                 continue;
             }
             "===CLIP===" => {
@@ -1604,6 +1611,11 @@ fn parse_stepos_ai_suite_output(raw: &str) -> StepOsAiSuiteReport {
                 if !trimmed.is_empty() && trimmed != "null" {
                     notif_text.push_str(trimmed);
                     notif_text.push(' ');
+                }
+            }
+            "perception" => {
+                if !trimmed.is_empty() && trimmed != "null" {
+                    perception_text.push_str(trimmed);
                 }
             }
             "clip" => {
@@ -1654,7 +1666,11 @@ fn parse_stepos_ai_suite_output(raw: &str) -> StepOsAiSuiteReport {
             || acc_text.contains("alphame"));
     report.notification_listener_enabled = !notif_text.trim().is_empty();
     report.mcp_permission_granted = agentbus_alive || report.safety_center_running;
-    report.screen_perception_ready = report.gui_accessibility_enabled || report.aiengine_running;
+    report.screen_perception_ready = match perception_text.trim() {
+        "1" | "true" => true,
+        "0" | "false" => false,
+        _ => report.gui_accessibility_enabled || report.aiengine_running,
+    };
 
     // Parse AIEngineManagerService telemetry (Registered abilities, QNN HTP buckets, active holders)
     let mut ability_count: u32 = 0;
@@ -2625,7 +2641,7 @@ pub fn list_phone_gallery(adb: &Adb, device: &Device) -> Result<Vec<PhoneGallery
                 if remaining <= 64 {
                     break;
                 }
-                if !active.contains(path.to_string_lossy().as_ref())
+                if !active.contains::<str>(path.to_string_lossy().as_ref())
                     && std::fs::remove_file(&path).is_ok()
                 {
                     remaining -= 1;
@@ -2677,8 +2693,17 @@ pub fn set_phone_brightness_percent(
 ) -> Result<(u8, String)> {
     device.verify(adb)?;
     let clamped = percent.clamp(5, 100);
-    let raw = ((clamped as u32 * 255) / 100).clamp(10, 255);
-    let script = format!("settings put system screen_brightness {raw} >/dev/null 2>&1");
+    let raw_4095 = ((clamped as u32 * 4095) / 100).clamp(40, 4095);
+    let raw_255 = ((clamped as u32 * 255) / 100).clamp(10, 255);
+    let script = format!(
+        "CUR=$(settings get system screen_brightness 2>/dev/null || echo 1024); \
+         settings put system screen_brightness_mode 0 >/dev/null 2>&1 || true; \
+         if [ \"$CUR\" -gt 255 ] 2>/dev/null; then \
+           settings put system screen_brightness {raw_4095} >/dev/null 2>&1; \
+         else \
+           settings put system screen_brightness {raw_255} >/dev/null 2>&1; \
+         fi"
+    );
     adb.script(&device.transport, &script)?;
     Ok((clamped, format!("已将手机屏幕亮度调节为 {clamped}%")))
 }
@@ -2690,6 +2715,22 @@ pub fn trigger_stepos_mcp_action(
     payload: &str,
 ) -> Result<String> {
     device.verify(adb)?;
+    if let Some(pkg) = action_key.strip_prefix("force_stop:") {
+        let clean_pkg = pkg.trim();
+        if clean_pkg.is_empty()
+            || !clean_pkg
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+        {
+            bail!("无效的应用包名：{clean_pkg}");
+        }
+        let script = format!("am force-stop {clean_pkg} >/dev/null 2>&1");
+        adb.script(&device.transport, &script)?;
+        return Ok(format!(
+            "已强制停止手机应用：{} ({clean_pkg})",
+            friendly_package_name(clean_pkg)
+        ));
+    }
     match action_key {
         "alarm_15m" => {
             let target = Local::now() + ChronoDuration::minutes(15);
@@ -2794,8 +2835,177 @@ pub fn trigger_stepos_mcp_action(
             }
         }
         "toggle_wifi" => {
-            adb.script(&device.transport, "svc wifi enable >/dev/null 2>&1 || true")?;
-            Ok("已确保手机 Wi-Fi 处于启用状态".into())
+            let script = concat!(
+                "CUR=$(settings get global wifi_on 2>/dev/null || echo 1); ",
+                "if [ \"$CUR\" = \"1\" ] || [ \"$CUR\" = \"2\" ]; then ",
+                "  svc wifi disable >/dev/null 2>&1 || cmd wifi set-wifi-enabled disabled >/dev/null 2>&1 || true; ",
+                "  echo WIFI_OFF; ",
+                "else ",
+                "  svc wifi enable >/dev/null 2>&1 || cmd wifi set-wifi-enabled enabled >/dev/null 2>&1 || true; ",
+                "  echo WIFI_ON; ",
+                "fi"
+            );
+            let out = adb.script(&device.transport, script)?;
+            if out.contains("WIFI_OFF") {
+                Ok("已关闭手机 Wi-Fi".into())
+            } else {
+                Ok("已开启手机 Wi-Fi".into())
+            }
+        }
+        "toggle_bluetooth" => {
+            let script = concat!(
+                "CUR=$(settings get global bluetooth_on 2>/dev/null || echo 1); ",
+                "if [ \"$CUR\" = \"1\" ]; then ",
+                "  cmd bluetooth_manager disable >/dev/null 2>&1 || svc bluetooth disable >/dev/null 2>&1 || true; ",
+                "  echo BT_OFF; ",
+                "else ",
+                "  cmd bluetooth_manager enable >/dev/null 2>&1 || svc bluetooth enable >/dev/null 2>&1 || true; ",
+                "  echo BT_ON; ",
+                "fi"
+            );
+            let out = adb.script(&device.transport, script)?;
+            if out.contains("BT_OFF") {
+                Ok("已关闭手机蓝牙".into())
+            } else {
+                Ok("已开启手机蓝牙".into())
+            }
+        }
+        "volume_up" => {
+            adb.script(
+                &device.transport,
+                "cmd media_session volume --show --stream 3 --adj raise >/dev/null 2>&1 || input keyevent 24 >/dev/null 2>&1 || true",
+            )?;
+            Ok("已调高手机媒体音量".into())
+        }
+        "volume_down" => {
+            adb.script(
+                &device.transport,
+                "cmd media_session volume --show --stream 3 --adj lower >/dev/null 2>&1 || input keyevent 25 >/dev/null 2>&1 || true",
+            )?;
+            Ok("已调低手机媒体音量".into())
+        }
+        "volume_mute" => {
+            adb.script(
+                &device.transport,
+                "cmd media_session volume --show --stream 3 --set 0 >/dev/null 2>&1 || input keyevent 164 >/dev/null 2>&1 || true",
+            )?;
+            Ok("已将手机媒体音量静音".into())
+        }
+        "volume_50" => {
+            adb.script(
+                &device.transport,
+                "cmd media_session volume --show --stream 3 --set 30 >/dev/null 2>&1 || true",
+            )?;
+            Ok("已将手机媒体音量设为 50%".into())
+        }
+        "toggle_screen_perception" => {
+            let script = concat!(
+                "CUR=$(settings get global stepos_agentsafetycenter_screen_perception_enabled 2>/dev/null || echo 1); ",
+                "if [ \"$CUR\" = \"0\" ]; then ",
+                "  settings put global stepos_agentsafetycenter_screen_perception_enabled 1 >/dev/null 2>&1 || true; ",
+                "  echo PERC_ON; ",
+                "else ",
+                "  settings put global stepos_agentsafetycenter_screen_perception_enabled 0 >/dev/null 2>&1 || true; ",
+                "  echo PERC_OFF; ",
+                "fi"
+            );
+            let out = adb.script(&device.transport, script)?;
+            if out.contains("PERC_ON") {
+                Ok("已开启 StepOS 屏幕视觉感知授权".into())
+            } else {
+                Ok("已关闭 StepOS 屏幕视觉感知授权".into())
+            }
+        }
+        "open_screen_perception" => {
+            let script = concat!(
+                "am start -a stepos.intent.action.AGENT_SCREEN_PERCEPTION >/dev/null 2>&1 || ",
+                "am start -a stepos.intent.action.AGENT_SAFETY_CENTER_LAUNCHER >/dev/null 2>&1 || true"
+            );
+            adb.script(&device.transport, script)?;
+            Ok("已在手机打开屏幕视觉感知授权设置".into())
+        }
+        "open_operate_phone" => {
+            let script = concat!(
+                "am start -a stepos.intent.action.AGENT_OPERATE_PHONE >/dev/null 2>&1 || ",
+                "am start -a android.settings.ACCESSIBILITY_SETTINGS >/dev/null 2>&1 || true"
+            );
+            adb.script(&device.transport, script)?;
+            Ok("已在手机打开 AI 接管操作手机授权设置".into())
+        }
+        "open_agent_perm_manager" => {
+            let script = concat!(
+                "am start -a stepos.intent.action.AGENT_PERMISSION_MANAGER >/dev/null 2>&1 || ",
+                "am start -a stepos.intent.action.AGENT_SAFETY_CENTER_LAUNCHER >/dev/null 2>&1 || true"
+            );
+            adb.script(&device.transport, script)?;
+            Ok("已在手机打开 AI 智能体权限管理中心".into())
+        }
+        "open_aiengine_settings" => {
+            let script = concat!(
+                "am start -a com.stepos.aiengine.action.AI_ENGINE_SETTINGS >/dev/null 2>&1 || ",
+                "am start -a com.stepos.aiengine.action.MODEL_MANAGER >/dev/null 2>&1 || true"
+            );
+            adb.script(&device.transport, script)?;
+            Ok("已在手机打开端侧 AI 引擎设置".into())
+        }
+        "open_alphame_address" => {
+            let script = concat!(
+                "am start -a com.stepos.alphame.action.ADDRESS_PICKER >/dev/null 2>&1 || ",
+                "am start -a com.stepos.alphame.action.personal_preference >/dev/null 2>&1 || true"
+            );
+            adb.script(&device.transport, script)?;
+            Ok("已在手机打开 AlphaMe 常用地址管理（家 / 公司）".into())
+        }
+        "open_alphame_wifi" => {
+            let script = concat!(
+                "am start -a com.stepos.alphame.action.SELECT_WIFI >/dev/null 2>&1 || ",
+                "am start -a com.stepos.alphame.action.personal_preference >/dev/null 2>&1 || true"
+            );
+            adb.script(&device.transport, script)?;
+            Ok("已在手机打开 AlphaMe 场景 Wi-Fi 绑定".into())
+        }
+        "open_alphame_bt" => {
+            let script = concat!(
+                "am start -a com.stepos.alphame.action.SELECT_CAR_BLUETOOTH >/dev/null 2>&1 || ",
+                "am start -a com.stepos.alphame.action.personal_preference >/dev/null 2>&1 || true"
+            );
+            adb.script(&device.transport, script)?;
+            Ok("已在手机打开 AlphaMe 车载蓝牙绑定".into())
+        }
+        "open_filemanager" => {
+            adb.script(
+                &device.transport,
+                "monkey -p com.stepos.filemanager -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 || true",
+            )?;
+            Ok("已在手机打开文件管理".into())
+        }
+        "open_dialer" => {
+            adb.script(
+                &device.transport,
+                "am start -a android.intent.action.DIAL >/dev/null 2>&1 || true",
+            )?;
+            Ok("已在手机打开拨号盘".into())
+        }
+        "open_mms" => {
+            adb.script(
+                &device.transport,
+                "monkey -p com.android.mms -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 || true",
+            )?;
+            Ok("已在手机打开短信应用".into())
+        }
+        "open_clip_url_phone" => {
+            let url = payload
+                .split_whitespace()
+                .find(|t| t.starts_with("http://") || t.starts_with("https://"))
+                .unwrap_or(payload.trim());
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                bail!("剪贴板中未检测到有效网页链接");
+            }
+            let quoted = shell_quote(url);
+            let script =
+                format!("am start -a android.intent.action.VIEW -d {quoted} >/dev/null 2>&1");
+            adb.script(&device.transport, &script)?;
+            Ok(format!("已在手机浏览器打开剪贴板链接：{url}"))
         }
         "open_gallery" => {
             adb.script(
@@ -3111,6 +3321,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires explicit physical-device fixture and changes phone state"]
     fn real_device_stepos_suite_clipboard_mcp_and_pomodoro_end_to_end() {
         let Ok(adb) = Adb::discover() else {
             return;

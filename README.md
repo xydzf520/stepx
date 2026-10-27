@@ -7,7 +7,7 @@
 
 **在电脑聊 Amoo、处理文件、创作图片和小应用；压缩与释放手机空间，设置背屏、玩体感游戏，还能安装 Google Play。**
 
-投屏控制 · 文件互传 · 应用管理 · 相册与日程 · 手机伴侣
+投屏控制 · 局域网观看 · 文件互传 · 应用商店与管理 · 相册与日程 · 手机伴侣
 
 Linux / macOS / Windows · Rust 原生客户端 · 当前主要适配 PZ261A
 
@@ -17,17 +17,13 @@ Linux / macOS / Windows · Rust 原生客户端 · 当前主要适配 PZ261A
 
 面向 **STEPX Neo / PZ261A** 用户的社区项目，与 STEPX、Amoo、Google 无官方隶属关系。客户端当前以 STEPX / PZ261A 设备识别为入口，普通 Android 不在本版支持范围；专有能力还需要对应固件和账号。
 
-## 0.2.25 → 0.2.50：从对话到持续创作
+## 0.2.59：应用获取与局域网投屏
 
-**同机真机实测：Amoo 连续会话读取耗时减少约 53%，电话基础信息读取减少约 31%。** 这是预热后的读取环节中位数，不代表模型生成或全应用提速。[测试方法与全部结果](docs/PERFORMANCE_0_2_50.md)。
+新增 **应用商店**：按分类搜索、查看详情和下载来源，在电脑下载 APK、安装到连接的手机、检查已装应用更新。新增 **局域网投屏**：手机连着电脑，另一台设备扫码即可在浏览器看画面；是否允许远端操作由电脑控制。
 
-本次把重点放在日常使用：Amoo 流式回复、围绕成果继续修改，相册与电脑扩容文件联动，日历与闹钟集中查看，以及扫码和已配对设备自动重连。
+这次也修正了安装与状态反馈：APK 包名和签名校验、阻止静默卸载降级，未知电池指标保持未知；静止投屏停止重复传输，帧率按实际采集显示。
 
-[本次更新说明](docs/RELEASE_NOTES.md) · [新旧版本对照](docs/UPDATE_0_2_50.md) · [兼容性与验证范围](docs/CROSS_PLATFORM_0_2_50.md)
-
-[<img src="docs/images/update-0.2.50-cover.jpg" width="300" alt="0.2.25 到 0.2.50 竖版更新视频" />](https://github.com/xydzf520/stepx/releases/download/v0.2.50/StepX-Companion-0.2.50-update-wechat.mp4)
-
-[观看 / 下载竖版更新视频](https://github.com/xydzf520/stepx/releases/download/v0.2.50/StepX-Companion-0.2.50-update-wechat.mp4) · 适合微信聊天和群分享，**4 分 03 秒**，配重点中文字幕与自然女生合成配音。界面截图使用演示数据，流程示意会单独标注。
+[0.2.50 → 0.2.59 更新说明](docs/RELEASE_NOTES.md) · [兼容性与验证范围](docs/CROSS_PLATFORM_0_2_59.md) · [全部更新](CHANGELOG.md)
 
 ## 特色功能
 
@@ -73,7 +69,9 @@ Linux / macOS / Windows · Rust 原生客户端 · 当前主要适配 PZ261A
 | 能力 | 可以做什么 |
 | --- | --- |
 | **投屏与控制** | USB / 无线查看画面；鼠标键盘操作；跟随画面的侧栏提供主页、返回、多任务、音量、截图和结束投屏 |
+| **局域网投屏** | 手机连接本电脑后，同网浏览器扫码观看；每次启动独立链接，远端控制默认关闭。DLNA / 旧版 AirPlay 为实验性适配 |
 | **文件互传** | 目录导航、上传下载、双击打开、右键菜单、重命名与回收站；传输状态和校验结果可查 |
+| **应用商店** | 分类搜索、详情与截图、来源选择、下载 APK、安装及更新检查；安装前核对包名与签名 |
 | **应用管理** | 真实名称与图标，查看列表、安装 APK、导出及卸载；操作前显示范围和确认 |
 | **短信、电话、通知** | 读取手机返回的数据，在支持授权下发短信、拨号、回复通知；失败原因明确显示 |
 | **相册、日历、闹钟** | 在电脑整理手机照片，查看日程及闹钟，关联 Amoo 处理入口 |
@@ -96,12 +94,12 @@ Studio 首次网页登录需要本人完成；之后可以复用已授权会话�
 
 | 电脑 | 下载包 | 注意事项 |
 | --- | --- | --- |
-| Windows x64 | `StepX-Companion-0.2.50-windows-x86_64.zip` | 必要时安装手机 USB 驱动；无商业代码签名 |
-| macOS Apple Silicon | `StepX-Companion-0.2.50-macos-arm64.zip` | 包内为 `.app`；ad-hoc 签名，未 Apple 公证 |
-| macOS Intel | `StepX-Companion-0.2.50-macos-x86_64.zip` | 与 ARM 版分开下载；旧系统未全面验证 |
-| Linux x64 | `StepX-Companion-0.2.50-linux-x86_64.tar.gz` | Ubuntu 24.04 构建基线，glibc 2.39+；旧环境可源码构建 |
+| Windows x64 | `StepX-Companion-0.2.59-windows-x86_64.zip` | 必要时安装手机 USB 驱动；无商业代码签名 |
+| macOS Apple Silicon | `StepX-Companion-0.2.59-macos-arm64.zip` | 包内为 `.app`；ad-hoc 签名，未 Apple 公证 |
+| macOS Intel | `StepX-Companion-0.2.59-macos-x86_64.zip` | 与 ARM 版分开下载；旧系统未全面验证 |
+| Linux x64 | `StepX-Companion-0.2.59-linux-x86_64.tar.gz` | Ubuntu 24.04 构建基线，glibc 2.39+；旧环境可源码构建 |
 
-发布包提供 **ADB、scrcpy、Python、Java 与 APK 校验工具**，无需预装 Android Studio。请完整解压，不要只复制可执行文件。每个包附 SHA-256；Windows/macOS 的原生构建与运行时验证不等于所有实体电脑均已联调。[完整验证边界 →](docs/CROSS_PLATFORM_0_2_50.md)
+发布包提供 **ADB、scrcpy、Python、Java 与 APK 校验工具**，无需预装 Android Studio。请完整解压，不要只复制可执行文件。每个包附 SHA-256；Windows/macOS 的原生构建与运行时验证不等于所有实体电脑均已联调。[完整验证边界 →](docs/CROSS_PLATFORM_0_2_59.md)
 
 主要设备为 PZ261A；高级权限/重启恢复适配 Android 16 / 172 固件，未知固件不跳过检查强装。普通 Android 目前会被客户端设备识别拦截，不列入支持范围；手机伴侣最低 Android 13。同局域网自动发现需要设备互访和 mDNS，防火墙或访客网络隔离可能阻止连接。
 

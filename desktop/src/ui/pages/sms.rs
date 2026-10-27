@@ -229,7 +229,11 @@ fn resolve_sender_info(
 ) -> (String, String) {
     let norm = norm_addr(addr);
     if let Some(c) = contacts.iter().find(|c| norm_addr(&c.number) == norm) {
-        let badge = c.name.chars().next().unwrap_or('联').to_string();
+        let first = c.name.trim().chars().next();
+        let badge = match first {
+            Some(ch) if ch != '+' && !ch.is_ascii_digit() => ch.to_string(),
+            _ => "短".to_string(),
+        };
         return (c.name.clone(), badge);
     }
     let label = if addr.is_empty() {
@@ -237,10 +241,7 @@ fn resolve_sender_info(
     } else {
         addr
     };
-    (
-        label.into(),
-        label.chars().next().unwrap_or('#').to_string(),
-    )
+    (label.into(), "短".to_string())
 }
 
 fn im_avatar_style(package_name: &str, app_name: &str) -> (String, ColorU, ColorU) {
@@ -286,10 +287,21 @@ pub(super) fn is_pickup_code_text(code: &str, text: &str) -> bool {
 
 fn compact_thread_title(title: &str, max_chars: usize) -> String {
     let trimmed = title.trim();
-    if trimmed.chars().count() > max_chars {
-        format!("{}…", trimmed.chars().take(max_chars).collect::<String>())
+    let stripped = trimmed
+        .strip_prefix("+86 ")
+        .or_else(|| trimmed.strip_prefix("+86-"))
+        .or_else(|| trimmed.strip_prefix("+86"))
+        .unwrap_or(trimmed)
+        .trim();
+    let limit = if stripped.is_ascii() {
+        max_chars.max(15)
     } else {
-        trimmed.to_string()
+        max_chars
+    };
+    if stripped.chars().count() > limit {
+        format!("{}…", stripped.chars().take(limit).collect::<String>())
+    } else {
+        stripped.to_string()
     }
 }
 
@@ -610,9 +622,9 @@ impl Companion {
                             title_row,
                             self.line(
                                 if !snapshot.screen_interactive || snapshot.keyguard_locked {
-                                    format!("{} · 熄屏锁屏可后台无感秒回", t.package_name)
+                                    format!("{app_label} · 熄屏锁屏可后台无感秒回")
                                 } else {
-                                    format!("{} · 支持静默秒回与屏上气泡同步", t.package_name)
+                                    format!("{app_label} · 支持静默秒回与屏上气泡同步")
                                 },
                                 MICRO,
                                 p.text3,
@@ -1249,7 +1261,7 @@ impl Companion {
             .finish();
 
             let display_title = compact_thread_title(&t.title, 11);
-            let is_long_title = t.title.trim().chars().count() > 11;
+            let is_long_title = display_title.ends_with('…');
             let mut title_badges = vec![
                 self.line_w(display_title, CAPTION, p.text, Weight::Semibold),
                 self.pill_badge(app_label, p.text2, p.tag_bg),
@@ -1440,13 +1452,25 @@ impl Companion {
                 } else {
                     rgb(0x52, 0x52, 0x5B)
                 };
+                let display_name = compact_thread_title(&t.name, 11);
+                let is_long_name = display_name.ends_with('…');
+                let avatar_label = if t.badge.is_empty()
+                    || t.name.starts_with('+')
+                    || t.name.chars().next().is_some_and(|c| c.is_ascii_digit())
+                    || t.badge.starts_with('+')
+                    || t.badge.chars().next().is_some_and(|c| c.is_ascii_digit())
+                {
+                    "短".to_string()
+                } else {
+                    t.badge.clone()
+                };
                 let avatar = ConstrainedBox::new(
                     Container::new(
                         Flex::row()
                             .with_main_axis_size(MainAxisSize::Max)
                             .with_main_axis_alignment(MainAxisAlignment::Center)
                             .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                            .with_child(self.line_w(&t.badge, CAPTION, avatar_fg, Weight::Semibold))
+                            .with_child(self.line_w(&avatar_label, CAPTION, avatar_fg, Weight::Semibold))
                             .finish(),
                     )
                     .with_background_color(avatar_bg)
@@ -1473,8 +1497,6 @@ impl Companion {
                     preview_line
                 };
 
-                let display_name = compact_thread_title(&t.name, 11);
-                let is_long_name = t.name.trim().chars().count() > 11;
                 let mut title_items =
                     vec![self.line_w(display_name, CAPTION, p.text, Weight::Semibold)];
                 if let Some(code) = &t.otp_code {
@@ -1696,29 +1718,11 @@ impl Companion {
                 .finish(),
         );
 
-        let search_and_new_row = Flex::row()
-            .with_main_axis_size(MainAxisSize::Max)
-            .with_spacing(8.)
-            .with_cross_axis_alignment(CrossAxisAlignment::Center)
-            .with_child(
-                Expanded::new(
-                    1.,
-                    self.input(
-                        F_SMS_SEARCH,
-                        "搜索微信/钉钉/飞书会话、联系人、号码或验证码…",
-                        None,
-                    ),
-                )
-                .finish(),
-            )
-            .with_child(self.button_icon(
-                "sms-left-new",
-                "新建短信",
-                UiIcon::Plus,
-                Action::NewSms,
-                Btn::Primary,
-            ))
-            .finish();
+        let search_and_new_row = self.input(
+            F_SMS_SEARCH,
+            "搜索微信/钉钉/飞书会话、联系人、号码或验证码…",
+            None,
+        );
 
         let mut left_top_controls = vec![search_and_new_row, self.wrap(channel_pills)];
         if self.push.im_channel == ImChannel::Sms {

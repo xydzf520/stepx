@@ -42,7 +42,7 @@ def save(path, value):
 
 
 def record_path():
-    return STATE / (hashlib.sha256(permissions.ADB[-1].encode()).hexdigest()[:24] + '.json')
+    return STATE / (hashlib.sha256(permissions.device_key().encode()).hexdigest()[:24] + '.json')
 
 
 def system_session():
@@ -70,7 +70,7 @@ def preflight(apk):
     return {'service': 'stepx-pairing-v1', 'package': permissions.PACKAGE,
             'signer': permissions.signer(apk), 'companion_uid': companion['uid'],
             'dex_sha256': hashlib.sha256(payload).hexdigest(),
-            'serial': permissions.ADB[-1], 'fingerprint': permissions.CONFIG['fingerprint'],
+            'serial': permissions.device_key(), 'fingerprint': permissions.CONFIG['fingerprint'],
             'boot_id': permissions.shell('cat', '/proc/sys/kernel/random/boot_id'),
             'system_session': system_session(),
             'scope': 'current_device_session', 'reboot_verified': False,

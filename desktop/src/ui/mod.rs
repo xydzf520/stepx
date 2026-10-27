@@ -10,17 +10,21 @@
 #![allow(dead_code)]
 
 mod actions;
+mod app_store_state;
 mod desktop_update_state;
 mod device_actions;
 mod github_stars;
 mod keyboard_input;
+mod lan_cast_state;
 mod outcome_apply;
 #[cfg(all(feature = "ui-capture", target_os = "linux"))]
 mod shell_details_check;
 mod shortcuts;
+use app_store_state::{AppStoreAction, AppStoreUiState};
 use desktop_update_state::{DesktopUpdateAction, DesktopUpdateState};
 use device_actions::parent_dir;
 use keyboard_input::{Input, Keyboard};
+use lan_cast_state::{LanCastAction, LanCastUiState};
 use outcome_apply::{read_result, Outcome};
 mod adb_onboarding;
 mod amoo_composer;
@@ -116,7 +120,7 @@ use stepx_companion::{
         CallRecord, ContactEntry, Device, ExpressParcelInfo, GoogleSuiteStatus, SystemServiceInfo,
         Transport,
     },
-    mirror::MirrorSession,
+    mirror::{MirrorAudioRoute, MirrorSession},
     openclaw::{self, RealAmooData},
     pairing::{self, Preferences, QrSession, Service},
     phone,
@@ -164,7 +168,10 @@ const F_AMOO_MEMORY_INPUT: usize = 33;
 const F_CALENDAR_TIME: usize = 34;
 const F_ALARM_TIME: usize = 35;
 const F_GALLERY_SEARCH: usize = 36;
-const FIELD_COUNT: usize = 37;
+const F_STORE_SEARCH: usize = 37;
+const F_ALARM_LABEL: usize = 38;
+const F_PHONE_CONTACT_NAME: usize = 39;
+const FIELD_COUNT: usize = 40;
 
 const FILES_PER_PAGE: usize = 100;
 
@@ -301,6 +308,7 @@ enum Page {
     Notifications,
     Phone,
     Files,
+    AppStore,
     Apps,
     Tools,
     Connect,
@@ -326,6 +334,7 @@ impl Page {
             Self::Notifications => "手机推送",
             Self::Phone => "电话",
             Self::Files => "文件",
+            Self::AppStore => "应用商店",
             Self::Apps => "应用",
             Self::Tools => "小工具",
             Self::Connect => "连接设备",
@@ -350,6 +359,7 @@ impl Page {
             Self::Notifications => "🔔",
             Self::Phone => "☎",
             Self::Files => "▤",
+            Self::AppStore => "🛍",
             Self::Apps => "⊞",
             Self::Tools => "⊟",
             Self::Connect => "⇄",
@@ -373,6 +383,7 @@ impl Page {
                 | Self::Settings
                 | Self::Studio
                 | Self::Expansion
+                | Self::AppStore
         )
     }
 
@@ -407,6 +418,7 @@ impl Page {
             "phone" | "call" => Self::Phone,
             "files" => Self::Files,
             "expansion" => Self::Expansion,
+            "app-store" | "store" | "appstore" => Self::AppStore,
             "apps" => Self::Apps,
             "tools" | "toolbox" => Self::Tools,
             "account" => Self::Account,
@@ -428,22 +440,30 @@ enum ToolPage {
     Neo,
     Apk,
     Screen,
+    Clipboard,
+    McpHub,
+    AiSafety,
+    Wellbeing,
     Services,
     InputMethod,
     Device,
 }
 #[allow(dead_code)]
 impl ToolPage {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 14] = [
         Self::Updates,
         Self::Storage,
         Self::Google,
         Self::Companion,
         Self::Neo,
         Self::Apk,
+        Self::Screen,
+        Self::Clipboard,
+        Self::McpHub,
+        Self::AiSafety,
+        Self::Wellbeing,
         Self::Services,
         Self::InputMethod,
-        Self::Screen,
         Self::Device,
     ];
     fn title(self) -> &'static str {
@@ -455,6 +475,10 @@ impl ToolPage {
             Self::Neo => "内置 GUI Agent",
             Self::Apk => "APK 安装",
             Self::Screen => "截图与投屏",
+            Self::Clipboard => "双端剪贴板",
+            Self::McpHub => "MCP 原生能力",
+            Self::AiSafety => "端侧模型与安全",
+            Self::Wellbeing => "数字健康与分身",
             Self::Services => "系统服务",
             Self::InputMethod => "手机输入法",
             Self::Device => "设备检测",
@@ -468,7 +492,11 @@ impl ToolPage {
             Self::Companion => "安装手机伴侣，管理后台连接、扫码配对与背屏权限。",
             Self::Neo => "更新 StepX伴侣内置 GUI Agent，手机独立看屏、规划与执行。",
             Self::Apk => "从电脑选择 APK，安装到当前连接的手机。",
-            Self::Screen => "截取手机画面，或在独立窗口中操作手机。",
+            Self::Screen => "本机高清投屏、局域网多协议跨机投屏（DLNA / AirPlay / Web / Miracast）与截图。",
+            Self::Clipboard => "电脑与手机剪贴板实时双向秒传、验证码提取、链接跨端打开与同步记录。",
+            Self::McpHub => "StepOS 20 项系统级 MCP 服务状态监测、快捷系统控制（音量/亮度/勿扰/网络）与跨应用调度。",
+            Self::AiSafety => "管理端侧大模型 NPU 引擎（AIEngine）、AI 安全审计台账与四大核心感知操控权限一键修复。",
+            Self::Wellbeing => "查看今日手机亮屏时长、解锁次数、高频应用可视化排行、背屏专注番茄钟与 AlphaMe 个人画像。",
             Self::Services => "查看可管理的系统服务，按需停用或恢复。",
             Self::InputMethod => "安装小企鹅中文输入法，切换默认并停用搜狗；支持恢复。",
             Self::Device => "读取设备、电量与存储信息，复制检测结果。",
@@ -477,7 +505,13 @@ impl ToolPage {
     fn category(self) -> u8 {
         match self {
             Self::Storage => 1,
-            Self::Google | Self::Neo | Self::Apk | Self::Services | Self::InputMethod => 2,
+            Self::Google
+            | Self::Neo
+            | Self::Apk
+            | Self::McpHub
+            | Self::AiSafety
+            | Self::Services
+            | Self::InputMethod => 2,
             _ => 3,
         }
     }
@@ -490,6 +524,10 @@ impl ToolPage {
             "neo" | "gui-agent" => Some(Self::Neo),
             "apk" => Some(Self::Apk),
             "screen" => Some(Self::Screen),
+            "clipboard" | "clip" => Some(Self::Clipboard),
+            "mcp" | "mcp-hub" | "mcphub" => Some(Self::McpHub),
+            "ai-safety" | "aisafety" | "aiengine" | "safety" => Some(Self::AiSafety),
+            "wellbeing" | "alphame" | "health" => Some(Self::Wellbeing),
             "services" => Some(Self::Services),
             "input-method" => Some(Self::InputMethod),
             "device" => Some(Self::Device),
@@ -543,6 +581,7 @@ enum Action {
     AmooOpenScheduledSession(String),
     // Navigation & appearance & window
     Page(Page),
+    AppStore(AppStoreAction),
     Push(PushAction),
     Work(WorkAction),
     Workspace(WorkspaceAction),
@@ -620,10 +659,13 @@ enum Action {
     ScreenGesture(u8),
     ToggleLiveScreenStream,
     SetMirrorQuality(u8),
+    SetMirrorAudioRoute(MirrorAudioRoute),
+    CycleMirrorAudioRoute,
     ToggleMirrorAlwaysOnTop,
     ToggleMirrorTurnScreenOff,
     ToggleMirrorStayAwake,
     ToggleMirrorShowTouches,
+    LanCast(LanCastAction),
     OverviewBackPreview(bool),
     SendFocusText,
     // Amoo
@@ -1164,6 +1206,7 @@ struct Companion {
     mirror: Option<MirrorSession>,
     mirror_controls: Option<mirror_controls::ControlWindow>,
     pub(super) mirror_options: stepx_companion::mirror::MirrorOptions,
+    pub(super) lan_cast: LanCastUiState,
     pub(super) live_screen_stream: bool,
     pub(super) last_live_screen_poll: Instant,
     pub(super) live_screen_rx: Option<mpsc::Receiver<(tempfile::TempDir, PathBuf)>>,
@@ -1250,6 +1293,7 @@ struct Companion {
     permanent_delete: bool,
     trashed: Option<Trashed>,
     // Apps & Privileged System Management
+    pub(super) app_store: AppStoreUiState,
     apps: Vec<AppInfo>,
     apps_loaded: bool,
     apps_error: Option<String>,
@@ -1434,6 +1478,11 @@ impl Companion {
             }
         });
         let mut fields: Vec<Input> = (0..FIELD_COUNT).map(|_| Input::default()).collect();
+        if let Ok(q) = std::env::var("STEPX_STORE_QUERY") {
+            if !q.trim().is_empty() {
+                fields[F_STORE_SEARCH].set(q.trim());
+            }
+        }
         fields[F_BACK_PROMPT].set("让猫咪眨眼陪我工作，亮度 4 级，播放 30 秒");
         fields[F_BACK_MARQUEE].set("STEPX AI");
         fields[F_CALENDAR_TIME].set("15:00");
@@ -1497,6 +1546,7 @@ impl Companion {
             mirror: None,
             mirror_controls: None,
             mirror_options: stepx_companion::mirror::MirrorOptions::default(),
+            lan_cast: LanCastUiState::default(),
             live_screen_stream: false,
             last_live_screen_poll: Instant::now(),
             live_screen_rx: None,
@@ -1620,6 +1670,7 @@ impl Companion {
             trash_confirm: false,
             permanent_delete: false,
             trashed: None,
+            app_store: AppStoreUiState::new(),
             apps: vec![],
             apps_loaded: false,
             apps_error: None,
@@ -1860,6 +1911,7 @@ impl Companion {
             || self.amoo_ui.gui_running
             || self.work_previews_loading()
             || self.amoo_ui.snapshot_job.is_some()
+            || self.app_store.has_active_work()
             || (self.page == Page::BackScreen && self.back_screen.preview_running)
         {
             100
@@ -2052,6 +2104,24 @@ impl Companion {
         if self.poll_updates() && self.page == Page::Tools {
             ctx.notify();
         }
+        if self.tick_lan_cast() {
+            ctx.notify();
+        }
+        if self.poll_app_store(ctx) {
+            ctx.notify();
+        }
+        if !self.demo_mode && self.page == Page::AppStore {
+            self.ensure_store_online_catalog_synced();
+        }
+        if !self.demo_mode
+            && self.page == Page::AppStore
+            && self.apps_loaded
+            && !self.apps.is_empty()
+            && !self.app_store.update_checked_once
+            && !self.app_store.checking_updates
+        {
+            self.handle_app_store_action(AppStoreAction::CheckUpdates, ctx);
+        }
         if self.poll_work() && matches!(self.page, Page::Work | Page::Amoo) {
             ctx.notify();
         }
@@ -2077,6 +2147,31 @@ impl Companion {
             && !self.back_screen.stepos_suite_loading
         {
             self.handle_backscreen_action(&BackScreenAction::InspectStepOsSuite, ctx);
+        }
+        if !self.demo_mode
+            && self.page == Page::Tools
+            && self.tool_page == Some(ToolPage::Screen)
+            && self.selected.is_some()
+        {
+            if !self.lan_cast.is_running() && self.lan_cast.status_note.is_none() {
+                if let Ok(stats) = self.ensure_lan_cast_server_started() {
+                    self.lan_cast.status_note = Some((
+                        format!("局域网多协议投屏网关已启动：{} · MPEG-TS {}", stats.web_url, stats.ts_url),
+                        false,
+                    ));
+                    ctx.notify();
+                }
+            }
+            if !self.lan_cast.scanning
+                && self
+                    .lan_cast
+                    .discovery
+                    .as_ref()
+                    .is_none_or(|d| d.scanned_at_hms.is_empty())
+            {
+                self.trigger_lan_cast_discovery();
+                ctx.notify();
+            }
         }
         if !self.demo_mode
             && self.page == Page::Gallery
@@ -2128,7 +2223,7 @@ impl Companion {
             match result {
                 Err(e) => {
                     self.initializing = false;
-                    if self.job_page == Page::Apps {
+                    if matches!(self.job_page, Page::Apps | Page::AppStore) {
                         self.apps_loaded = true;
                         self.apps_error = Some(format!("{e:#}"));
                     }
@@ -2199,7 +2294,7 @@ impl Companion {
                         }
                         Err(e) => {
                             self.initializing = false;
-                            if completed_page == Page::Apps {
+                            if matches!(completed_page, Page::Apps | Page::AppStore) {
                                 self.apps_loaded = true;
                                 self.apps_error = Some(format!("{e:#}"));
                             }
@@ -2286,11 +2381,29 @@ impl Companion {
         {
             if let Some(device) = self.selected.clone() {
                 self.last_live_screen_poll = Instant::now();
+                let fast_jpeg = self
+                    .lan_cast
+                    .server
+                    .as_ref()
+                    .map(|srv| srv.latest_jpeg_bytes())
+                    .filter(|b| !b.is_empty());
                 let (tx, rx) = mpsc::channel();
                 self.live_screen_rx = Some(rx);
                 std::thread::spawn(move || {
+                    if let Some(jpeg) = fast_jpeg {
+                        if let Ok(dir) = tempfile::tempdir() {
+                            let path = dir.path().join("screen.jpg");
+                            if std::fs::write(&path, jpeg).is_ok() {
+                                let _ = tx.send((dir, path));
+                                return;
+                            }
+                        }
+                    }
                     if let Ok(adb) = Adb::discover() {
-                        if let Ok(bytes) = adb.screenshot(&device.transport) {
+                        let transport = device
+                            .resolve_active_transport(&adb)
+                            .unwrap_or_else(|_| device.transport.clone());
+                        if let Ok(bytes) = adb.screenshot(&transport) {
                             if let Ok(dir) = tempfile::tempdir() {
                                 let path = dir.path().join("screen.png");
                                 if std::fs::write(&path, bytes).is_ok() {
@@ -2530,11 +2643,21 @@ impl Companion {
                 || (!self.busy
                     && self.selected.is_some()
                     && !self.work_previews_loading()
-                    && (!matches!(
+                    && (!(matches!(
                         self.page,
                         Page::Overview | Page::Calendar | Page::Schedule | Page::Alarms
-                    ) || (self.back_screen.stepos_suite.checked
-                        && !self.back_screen.stepos_suite_loading))
+                    ) || (self.page == Page::Tools
+                        && matches!(
+                            self.tool_page,
+                            None | Some(
+                                ToolPage::Clipboard
+                                    | ToolPage::McpHub
+                                    | ToolPage::AiSafety
+                                    | ToolPage::Wellbeing
+                            )
+                        )))
+                        || (self.back_screen.stepos_suite.checked
+                            && !self.back_screen.stepos_suite_loading))
                     && (self.page != Page::Gallery
                         || (self.back_screen.gallery_checked
                             && !self.back_screen.gallery_loading))
@@ -2548,11 +2671,14 @@ impl Companion {
                         || self.studio.web.is_some()
                         || self.studio.web_error.is_some())
                     && (!(self.page == Page::Overview
-                        || (self.page == Page::Tools
-                            && self.tool_page == Some(ToolPage::Screen))
                         || (self.page == Page::Amoo && self.amoo_ui.screen_mode))
                         || bezel_screen_ready
-                        || self.capture_at.elapsed() > Duration::from_millis(7500)))
+                        || self.capture_at.elapsed() > Duration::from_millis(7500))
+                    && (!(self.page == Page::Tools
+                        && self.tool_page == Some(ToolPage::Screen))
+                        || (!self.lan_cast.scanning
+                            && self.lan_cast.stats().frames_captured > 0)
+                        || self.capture_at.elapsed() > Duration::from_millis(5500)))
                 || self.capture_at.elapsed()
                     > Duration::from_millis(
                         if matches!(

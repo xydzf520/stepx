@@ -218,32 +218,7 @@ impl Companion {
     }
     fn workspace_thread_bar(&self, title: &str, compact: bool) -> El {
         let p = self.p();
-        let right = if compact {
-            self.workspace_connection_badge()
-        } else {
-            self.hstack(
-                S2,
-                vec![
-                    self.workspace_connection_badge(),
-                    self.chip(
-                        "workspace-thread-open-gui",
-                        "操作手机",
-                        Some(UiIcon::Smartphone),
-                        vec![Action::AmooUi(AmooUiAction::GuiMode(true))],
-                        self.amoo_ui.screen_mode,
-                        false,
-                    ),
-                    self.chip(
-                        "workspace-thread-model",
-                        "模型与设置",
-                        Some(UiIcon::Cpu),
-                        vec![Action::Workspace(W::Menu(1))],
-                        !self.workspace.history && matches!(self.workspace.panel, 1 | 5),
-                        false,
-                    ),
-                ],
-            )
-        };
+        let right = self.workspace_connection_badge();
         self.workspace_column(
             Container::new(self.between(
                 self.line_w(
@@ -382,35 +357,35 @@ impl Companion {
             (
                 "guide-chat",
                 UiIcon::Chat,
-                "💬 手机对话与查信息",
+                "手机对话与查信息",
                 "直接提问或查天气、日程、手机信息",
                 Action::Workspace(W::Intent(Intent::Chat)),
             ),
             (
                 "guide-files",
                 UiIcon::File,
-                "📄 生成 PPT / Word / 表格",
+                "生成 PPT / Word / 表格",
                 "输入主题自动生成本机可编辑文档",
                 Action::Workspace(W::QuickScenario(2)),
             ),
             (
                 "guide-app",
                 UiIcon::Play,
-                "🎮 制作小游戏 / 网页应用",
+                "制作小游戏 / 网页应用",
                 "一句话生成可试玩、可发手机的应用",
                 Action::Workspace(W::QuickScenario(0)),
             ),
             (
                 "guide-gui",
                 UiIcon::Smartphone,
-                "📱 实时操作手机屏幕",
+                "实时操作手机屏幕",
                 "投屏接管手机，AI 自动点击滑动",
                 Action::AmooUi(AmooUiAction::GuiMode(true)),
             ),
             (
                 "guide-screen",
                 UiIcon::Sparkles,
-                "✨ 手机背屏像素点阵",
+                "手机背屏像素点阵",
                 "输入图案描述生成并推送到背屏",
                 Action::Workspace(W::QuickScenario(5)),
             ),
@@ -418,7 +393,6 @@ impl Companion {
         let guide_cards: Vec<El> = guides
             .into_iter()
             .map(|(id, icon, title, desc, action)| {
-                let clean_title = title.split_once(' ').map(|(_, r)| r).unwrap_or(title);
                 let card = self.hover_panel_interactive(
                     format!("workspace-{id}"),
                     self.vstack(
@@ -430,7 +404,7 @@ impl Companion {
                                     self.ui_icon(icon, 15., p.accent),
                                     Expanded::new(
                                         1.,
-                                        self.line_w(clean_title, CAPTION, p.text, Weight::Semibold),
+                                        self.line_w(title, CAPTION, p.text, Weight::Semibold),
                                     )
                                     .finish(),
                                 ],
@@ -474,7 +448,7 @@ impl Companion {
                 Expanded::new(1., self.text(error, CAPTION, p.danger)).finish(),
                 self.chip(
                     "workspace-dismiss-error",
-                    "知道了 ×",
+                    "知道了",
                     Some(UiIcon::Close),
                     vec![Action::Workspace(W::DismissError)],
                     false,
@@ -572,7 +546,7 @@ impl Companion {
         .with_border(Border::top(1.).with_border_color(p.border))
         .finish();
         self.fixed_w(
-            248.,
+            260.,
             Container::new(
                 Flex::column()
                     .with_main_axis_size(MainAxisSize::Max)
@@ -645,7 +619,7 @@ impl Companion {
                             self.ui_icon(icon, 16., if selected { p.accent } else { p.text2 }),
                             Expanded::new(
                                 1.,
-                                ConstrainedBox::new(self.vstack(
+                                self.vstack(
                                     S1,
                                     vec![
                                         self.line_w(
@@ -660,9 +634,7 @@ impl Companion {
                                         ),
                                         self.line(subtitle, MICRO, p.text3),
                                     ],
-                                ))
-                                .with_min_width(168.)
-                                .finish(),
+                                ),
                             )
                             .finish(),
                             self.icon_action(
@@ -712,15 +684,13 @@ impl Companion {
                             self.ui_icon(UiIcon::Smartphone, 16., p.text2),
                             Expanded::new(
                                 1.,
-                                ConstrainedBox::new(self.vstack(
+                                self.vstack(
                                     S1,
                                     vec![
                                         self.line_w(label, BODY, p.text, Weight::Medium),
                                         self.line("手机会话", MICRO, p.text3),
                                     ],
-                                ))
-                                .with_min_width(168.)
-                                .finish(),
+                                ),
                             )
                             .finish(),
                             self.icon_action(
@@ -2377,7 +2347,7 @@ impl Companion {
             self.wrap(vec![
                 self.ws_button(
                     "memory-add-btn",
-                    "＋ 添加记忆",
+                    "添加记忆",
                     UiIcon::Plus,
                     W::AddMemory,
                     Btn::Primary,

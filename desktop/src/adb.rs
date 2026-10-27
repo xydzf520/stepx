@@ -82,7 +82,9 @@ impl Adb {
             Some(format!("{code}\n").into_bytes()),
             Duration::from_secs(25),
         )?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = String::from_utf8_lossy(&output.stdout)
+            .replace("\r\n", "\n")
+            .replace('\r', "\n");
         if output.status.success() && stdout.contains("Successfully paired") {
             Ok("配对成功。正在查找连接端口…".into())
         } else {
@@ -139,8 +141,13 @@ pub fn shell_quote(value: &str) -> String {
 }
 
 pub fn checked_text(output: Output) -> Result<String> {
-    let text = String::from_utf8(output.stdout).context("ADB 返回了非 UTF-8 文本")?;
-    let err = String::from_utf8_lossy(&output.stderr);
+    let text = String::from_utf8(output.stdout)
+        .context("ADB 返回了非 UTF-8 文本")?
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let err = String::from_utf8_lossy(&output.stderr)
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
     if !output.status.success()
         || [
             "SecurityException",

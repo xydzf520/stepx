@@ -156,7 +156,11 @@ impl Companion {
         let inner_box = self.vstack(
             S2,
             vec![
-                ConstrainedBox::new(image_el).with_height(220.0).finish(),
+                Container::new(ConstrainedBox::new(image_el).with_height(220.0).finish())
+                    .with_background_color(p.surface)
+                    .with_border(Border::all(1.).with_border_color(p.border))
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
+                    .finish(),
                 self.between(
                     self.hstack(
                         6.,
@@ -316,22 +320,25 @@ impl Companion {
         }
 
         let controls = self.wrap(vec![
-            self.button(
+            self.button_icon(
                 "gallery-lb-prev",
-                "← 上一张",
+                "上一张",
+                UiIcon::ArrowLeft,
                 Action::BackScreen(BackScreenAction::GalleryPrevPhoto),
                 Btn::Secondary,
             ),
             self.pill_badge(pos_label, p.text2, p.surface),
-            self.button(
+            self.button_icon(
                 "gallery-lb-next",
-                "› 下一张",
+                "下一张",
+                UiIcon::ArrowRight,
                 Action::BackScreen(BackScreenAction::GalleryNextPhoto),
                 Btn::Secondary,
             ),
-            self.button(
+            self.button_icon(
                 "gallery-lb-zoom-out",
-                "− 缩小",
+                "缩小",
+                UiIcon::Minus,
                 Action::BackScreen(BackScreenAction::GalleryZoomOut),
                 Btn::Secondary,
             ),
@@ -355,15 +362,17 @@ impl Companion {
                     Btn::Secondary
                 },
             ),
-            self.button(
+            self.button_icon(
                 "gallery-lb-zoom-in",
-                "+ 放大",
+                "放大",
+                UiIcon::Plus,
                 Action::BackScreen(BackScreenAction::GalleryZoomIn),
                 Btn::Secondary,
             ),
-            self.button(
+            self.button_icon(
                 "gallery-lb-rot",
-                "↻ 旋转 90°",
+                "旋转 90°",
+                UiIcon::Refresh,
                 Action::BackScreen(BackScreenAction::GalleryRotateRight(
                     item.remote_path.clone(),
                 )),
@@ -436,16 +445,18 @@ impl Companion {
             .unwrap_or(0);
 
         let mut nav_controls = vec![
-            self.button(
+            self.button_icon(
                 format!("{id_prefix}-prev"),
-                "← 上一张",
+                "上一张",
+                UiIcon::ArrowLeft,
                 Action::BackScreen(BackScreenAction::GalleryPrevPhoto),
                 Btn::Secondary,
             ),
             self.pill_badge(pos_label, p.text2, p.surface),
-            self.button(
+            self.button_icon(
                 format!("{id_prefix}-next"),
-                "› 下一张",
+                "下一张",
+                UiIcon::ArrowRight,
                 Action::BackScreen(BackScreenAction::GalleryNextPhoto),
                 Btn::Secondary,
             ),
@@ -463,13 +474,14 @@ impl Companion {
                     Btn::Secondary
                 },
             ),
-            self.button(
+            self.button_icon(
                 format!("{id_prefix}-rot"),
                 if rot_deg > 0 {
-                    format!("↻ 旋转 90° ({rot_deg}°)")
+                    format!("旋转 90° ({rot_deg}°)")
                 } else {
-                    "↻ 旋转 90°".into()
+                    "旋转 90°".into()
                 },
+                UiIcon::Refresh,
                 Action::BackScreen(BackScreenAction::GalleryRotateRight(
                     item.remote_path.clone(),
                 )),
@@ -654,22 +666,28 @@ impl Companion {
         let is_recent = |idx: usize, item: &PhoneGalleryItem| -> bool {
             (item.modified_ms > 0 && now_ms - item.modified_ms <= 7 * 86_400_000) || idx < 8
         };
-        let total_count = items.len();
-        let camera_count = items.iter().filter(|i| i.category == "camera").count();
-        let screenshot_count = items
-            .iter()
+        let visible_items = items.iter().filter(|i| !i.name.starts_with('.'));
+        let total_count = visible_items.clone().count();
+        let camera_count = visible_items
+            .clone()
+            .filter(|i| i.category == "camera")
+            .count();
+        let screenshot_count = visible_items
+            .clone()
             .filter(|i| i.category == "screenshot" || i.category == "screenshots")
             .count();
-        let weixin_count = items
-            .iter()
+        let weixin_count = visible_items
+            .clone()
             .filter(|i| i.category == "pictures" || i.category == "weixin")
             .count();
         let recent_count = items
             .iter()
             .enumerate()
-            .filter(|(idx, i)| is_recent(*idx, i))
+            .filter(|(idx, i)| !i.name.starts_with('.') && is_recent(*idx, i))
             .count();
-        let expansion_count = items.iter().filter(|i| i.category == "expansion").count();
+        let expansion_count = visible_items
+            .filter(|i| i.category == "expansion")
+            .count();
         let active_cat = self.back_screen.gallery_category;
         let grid_cols = self.back_screen.gallery_grid_cols.clamp(2, 4);
         let grid_cols_usize = grid_cols as usize;
@@ -679,6 +697,9 @@ impl Companion {
             .iter()
             .enumerate()
             .filter(|(idx, item)| {
+                if item.name.starts_with('.') {
+                    return false;
+                }
                 let cat_ok = match active_cat {
                     1 => item.category == "camera",
                     2 => item.category == "screenshot" || item.category == "screenshots",
@@ -1032,10 +1053,9 @@ impl Companion {
                             self.line_w(&item.name, CAPTION, p.text, Weight::Semibold),
                             self.mono(
                                 format!(
-                                    "{} · {} ({})",
+                                    "{} · {}",
                                     item.size_label(),
                                     item.full_datetime_label(),
-                                    item.time_label()
                                 ),
                                 MICRO,
                                 p.text2,

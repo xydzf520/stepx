@@ -193,34 +193,12 @@ impl Companion {
         }
         composer.push(self.lab_prompt());
         composer.push(self.between(
-            self.wrap(vec![
-                self.ui_icon(
-                    UiIcon::Bolt,
-                    16.,
-                    if configured || phone_ready {
-                        p.success
-                    } else {
-                        p.text3
-                    },
-                ),
-                if configured {
-                    self.pill_badge(
-                        format!("自有模型 · {}", self.studio_lab.config.model),
-                        p.success,
-                        p.surface,
-                    )
-                } else if phone_ready {
-                    self.pill_badge("手机已连接", p.success, p.surface)
-                } else {
-                    self.line("还没有填写模型服务", CAPTION, p.text2)
-                },
-                self.button(
-                    "lab-config",
-                    "模型服务",
-                    Action::Studio(StudioAction::Tab(3)),
-                    Btn::Ghost,
-                ),
-            ]),
+            self.wrap(vec![self.button(
+                "lab-config",
+                "模型服务",
+                Action::Studio(StudioAction::Tab(3)),
+                Btn::Ghost,
+            )]),
             if running {
                 self.lab_button("stop", "停止", Lab::Stop, Btn::Secondary)
             } else if self.fields[F_LAB_PROMPT].text.trim().is_empty() {
@@ -677,7 +655,7 @@ impl Companion {
                 "请先在「连接设置」里连接官网。"
             }));
         }
-        cloud.push(
+        cloud.push(self.wrap(vec![
             if self
                 .studio_lab_cloud_feedback()
                 .is_some_and(|f| f.receipt.is_some())
@@ -708,7 +686,7 @@ impl Companion {
             } else {
                 self.disabled_button("新建官网项目并同步")
             },
-        );
+        ]));
         if let Some(feedback) = self.studio_lab_cloud_feedback() {
             if let Some(note) = &feedback.note {
                 cloud.push(self.text(note, CAPTION, p.success));

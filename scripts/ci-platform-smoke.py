@@ -5,6 +5,8 @@ root=Path(__file__).resolve().parents[1]
 def run(*args): subprocess.run([sys.executable,'-X','utf8',*args],cwd=root,check=True,timeout=240)
 run('-m','unittest','discover','-s','desktop/tests','-p','test_desktop_update.py')
 run('scripts/test-host-runtime.py')
+run('-m','unittest','discover','-s','desktop/tests','-p','test_store_download.py')
+run('-m','unittest','discover','-s','desktop/tests','-p','test_companion_system.py')
 paths=[shutil.which(x) for x in ['google-chrome','chromium','msedge','chrome']]
 paths += ['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome','/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge']
 for key in ['PROGRAMFILES','PROGRAMFILES(X86)','LOCALAPPDATA']:

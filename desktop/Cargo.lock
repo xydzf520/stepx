@@ -4922,7 +4922,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stepx-companion"
-version = "0.2.50"
+version = "0.2.59"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -4937,6 +4937,7 @@ dependencies = [
  "markdown_parser",
  "mdns-sd",
  "native-dialog",
+ "openh264",
  "pathfinder_geometry",
  "qrcode",
  "quick-xml 0.37.4",

@@ -1,6 +1,8 @@
 #![cfg_attr(all(windows, feature = "desktop-ui"), windows_subsystem = "windows")]
 
 #[cfg(feature = "desktop-ui")]
+pub use stepx_companion::app_store;
+#[cfg(feature = "desktop-ui")]
 mod ui;
 
 fn main() -> anyhow::Result<()> {
@@ -45,7 +47,7 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     if std::env::args().any(|arg| arg == "--help" || arg == "-h") {
-        println!("StepX Companion · 手机与电脑的桌面伴侣 (macOS / Windows / Linux)\n\n运行：stepx-companion\n诊断连接：stepx-companion --doctor\n扫码配对：stepx-companion --pair-qr\n简洁模式：--compact（Amoo 对话 / 手机通知统一小窗）；兼容 --mini-ai、--mini-notify\n界面主题：--light | --dark（默认跟随系统主题，或设置 STEPX_THEME=light|dark）\n界面截图（需要 ui-capture feature）：--capture-ui /absolute/path.png\n指定初始页：--page overview|amoo|sms|notifications|files|apps|tools|connect\n工具详情：--page tools --tool updates|storage|google|companion|neo|apk|screen|services|input-method|device");
+        println!("StepX Companion · 手机与电脑的桌面伴侣 (macOS / Windows / Linux)\n\n运行：stepx-companion\n诊断连接：stepx-companion --doctor\n扫码配对：stepx-companion --pair-qr\n简洁模式：--compact（Amoo 对话 / 手机通知统一小窗）；兼容 --mini-ai、--mini-notify\n界面主题：--light | --dark（默认跟随系统主题，或设置 STEPX_THEME=light|dark）\n界面截图（需要 ui-capture feature）：--capture-ui /absolute/path.png\n指定初始页：--page overview|amoo|sms|notifications|files|apps|tools|connect\n工具详情：--page tools --tool updates|storage|google|companion|neo|apk|screen|services|input-method|device|clipboard|mcp-hub|ai-safety|wellbeing");
         return Ok(());
     }
     if !cfg!(feature = "ui-capture") && std::env::args().any(|arg| arg == "--capture-ui") {

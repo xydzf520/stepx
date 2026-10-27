@@ -47,9 +47,9 @@ pub fn backup_transports_for(keys: &[&str]) -> Vec<String> {
 }
 
 /// Priority of a transport ID (lower is higher priority):
-/// 1 = physical USB serial (`ZYPZ261A01M692000LP`)
+/// 1 = physical USB serial (`STEPX_TEST_DEVICE`)
 /// 2 = explicit wireless IP:Port (`10.0.1.177:34883`)
-/// 3 = mDNS TLS service (`adb-ZYPZ261A01M692000LP-jYyV3X._adb-tls-connect._tcp`)
+/// 3 = mDNS TLS service (`adb-STEPX_TEST_DEVICE-jYyV3X._adb-tls-connect._tcp`)
 pub fn transport_priority(id: &str) -> u8 {
     let trimmed = id.trim();
     if trimmed.starts_with("adb-") || trimmed.contains("._adb-tls-") {
@@ -91,6 +91,107 @@ pub fn canonical_serial_from_transport(id: &str) -> Option<String> {
         return None;
     }
     Some(trimmed.to_string())
+}
+
+/// Resolve an online ADB transport for a device, automatically falling back to
+/// wireless IP:port / mDNS or USB backup transports when `preferred` goes offline.
+pub fn resolve_online_transport(
+    adb: &Adb,
+    preferred: &str,
+    serial: &str,
+    model: &str,
+    backups: &[String],
+) -> Result<String> {
+    if !preferred.trim().is_empty() {
+        if let Ok(got) = adb.run_timeout(
+            &["-s", preferred, "shell", "getprop", "ro.serialno"],
+            std::time::Duration::from_secs(3),
+        ) {
+            let got = got.trim();
+            if !got.is_empty() && (serial.is_empty() || got == serial) {
+                return Ok(preferred.to_string());
+            }
+            if !got.is_empty() && !serial.is_empty() && got != serial {
+                bail!("设备身份已变化，请重新选择手机。此次操作没有执行。");
+            }
+        }
+    }
+
+    let mut candidates: Vec<String> = Vec::new();
+    for b in backups {
+        let t = b.trim();
+        if !t.is_empty() && t != preferred && !candidates.iter().any(|c| c == t) {
+            candidates.push(t.to_string());
+        }
+    }
+    let canonical = canonical_serial_from_transport(preferred).unwrap_or_default();
+    let model_key = if !model.is_empty() {
+        format!("model:{model}")
+    } else {
+        String::new()
+    };
+    for b in backup_transports_for(&[preferred, serial, &canonical, &model_key]) {
+        if !b.is_empty() && b != preferred && !candidates.contains(&b) {
+            candidates.push(b);
+        }
+    }
+
+    let mut online_in_adb: Vec<String> = Vec::new();
+    if let Ok(raw) = adb.run_timeout(&["devices", "-l"], std::time::Duration::from_secs(3)) {
+        for line in raw.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 && parts[1] == "device" {
+                let id = parts[0];
+                online_in_adb.push(id.to_string());
+                let line_model = parts
+                    .iter()
+                    .find_map(|p| p.strip_prefix("model:"))
+                    .unwrap_or("");
+                let line_serial = canonical_serial_from_transport(id);
+                let matches_device = (!serial.is_empty()
+                    && line_serial.as_deref() == Some(serial))
+                    || (!model.is_empty() && line_model == model)
+                    || line_model.eq_ignore_ascii_case("PZ261A")
+                    || line_model.to_lowercase().contains("stepx");
+                if matches_device && !candidates.iter().any(|c| c == id) {
+                    candidates.push(id.to_string());
+                }
+            }
+        }
+    }
+
+    candidates.sort_by(|a, b| {
+        transport_priority(a)
+            .cmp(&transport_priority(b))
+            .then_with(|| a.cmp(b))
+    });
+
+    for cand in candidates {
+        if cand.contains(':')
+            && !cand.starts_with("adb-")
+            && !online_in_adb.iter().any(|o| o == &cand)
+        {
+            let _ = adb.run_timeout(
+                &["connect", &cand],
+                std::time::Duration::from_millis(1600),
+            );
+        }
+        if let Ok(got) = adb.run_timeout(
+            &["-s", &cand, "shell", "getprop", "ro.serialno"],
+            std::time::Duration::from_secs(3),
+        ) {
+            let got = got.trim();
+            if !got.is_empty() && (serial.is_empty() || got == serial) {
+                return Ok(cand);
+            }
+        }
+    }
+
+    let final_serial = adb.shell(preferred, &["getprop", "ro.serialno"])?;
+    if !serial.is_empty() && final_serial.trim() != serial {
+        bail!("设备身份已变化，请重新选择手机。此次操作没有执行。");
+    }
+    Ok(preferred.to_string())
 }
 
 impl Transport {
@@ -374,11 +475,12 @@ fn validate_generic_apk_identity(value: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
-fn check_generic_apk(path: &std::path::Path) -> Result<()> {
+fn check_generic_apk(path: &std::path::Path) -> Result<String> {
     let mut command = crate::resources::python_command();
     command
         .arg(crate::resources::root().join("scripts/companion_apk.py"))
         .arg("--package")
+        .arg("--verify-signature")
         .arg(path);
     let output = crate::adb::run_process(command, None, std::time::Duration::from_secs(45))?;
     let value: serde_json::Value = serde_json::from_slice(&output.stdout)
@@ -386,6 +488,18 @@ fn check_generic_apk(path: &std::path::Path) -> Result<()> {
     validate_generic_apk_identity(&value)?;
     if !output.status.success() {
         bail!("APK 包名校验未完成，尚未安装");
+    }
+    Ok(value["package"].as_str().unwrap().to_string())
+}
+
+/// Validate a store download before showing it as ready, and again on the immutable install snapshot.
+pub fn check_store_apk(path: &std::path::Path, expected_package: &str) -> Result<()> {
+    let actual = check_generic_apk(path)?;
+    validate_store_package(&actual, expected_package)
+}
+fn validate_store_package(actual: &str, expected: &str) -> Result<()> {
+    if expected.is_empty() || actual != expected {
+        bail!("下载包名与所选应用不一致（预期 {expected}，实际 {actual}），已阻止安装，手机数据未改变");
     }
     Ok(())
 }
@@ -460,18 +574,47 @@ impl Device {
         Ok(device)
     }
 
+    /// Resolve the active online transport for this device, automatically failing over
+    /// to online wireless/USB backup transports when the primary transport goes offline.
+    pub fn resolve_active_transport(&self, adb: &Adb) -> Result<String> {
+        resolve_online_transport(
+            adb,
+            &self.transport,
+            &self.serial,
+            &self.model,
+            &self.backup_transports(),
+        )
+    }
+
     /// A transport/IP can be reassigned. Recheck hardware identity before every operation.
     pub fn verify(&self, adb: &Adb) -> Result<()> {
-        let serial = adb.shell(&self.transport, &["getprop", "ro.serialno"])?;
-        if serial.trim() != self.serial {
-            bail!("设备身份已变化，请重新选择手机。此次操作没有执行。");
-        }
-        Ok(())
+        self.resolve_active_transport(adb).map(|_| ())
     }
 
     pub fn summary(&self, adb: &Adb) -> Result<String> {
-        self.verify(adb)?;
-        let raw = adb.script(&self.transport, "dumpsys battery; df -h /data /sdcard; wm size; ip -o -4 addr show dev wlan0 2>/dev/null || true")?;
+        let transport = self.resolve_active_transport(adb)?;
+        let script = concat!(
+            "dumpsys battery; df -h /data /sdcard; wm size; ip -o -4 addr show dev wlan0 2>/dev/null || true; ",
+            "echo '<<<STEPOS_DEEP>>>'; ",
+            "echo \"marketname:$(getprop ro.product.marketname)\"; ",
+            "echo \"asn:$(getprop ro.boot.hardware.asn)\"; ",
+            "echo \"netsn:$(getprop ro.StepOS.net.sn)\"; ",
+            "echo \"serialno:$(getprop ro.serialno)\"; ",
+            "echo \"display_id:$(getprop ro.build.display.id)\"; ",
+            "echo \"cmiit:$(getprop ro.product.cmiit.id)\"; ",
+            "echo \"camera_info:$(getprop ro.vendor.stepos.camera.info)\"; ",
+            "echo \"zram_cfg:$(getprop persist.vendor.stepos.smart_zram.cfg)\"; ",
+            "echo \"soh:$(cat /sys/class/zy_charger/soh 2>/dev/null || cat /sys/class/zy_charger/fusion_soh 2>/dev/null)\"; ",
+            "echo \"design_cap:$(cat /sys/class/zy_charger/design_capacity 2>/dev/null)\"; ",
+            "echo \"charge_cnt:$(cat /sys/class/zy_charger/charge_counter 2>/dev/null)\"; ",
+            "echo \"ups_mode:$(cat /sys/class/zy_charger/ups_mode 2>/dev/null)\"; ",
+            "echo \"ups_limit:$(cat /sys/class/zy_charger/ups_mode_soc_limit 2>/dev/null)\"; ",
+            "echo \"fast_charge:$(settings get global stepos_fast_charge 2>/dev/null)\"; ",
+            "echo \"cycle_line:$(dumpsys activity broadcasts 2>/dev/null | grep -m1 'android.os.extra.CYCLE_COUNT' || true)\"; ",
+            "echo \"keyguard_locked:$(dumpsys window policy 2>/dev/null | grep -m1 'showing=' || true)\"; ",
+            "dumpsys thermalservice 2>/dev/null | grep -E 'Temperature\\{mValue=.*mName=(cpu-0-0|gpuss-0|nsp-0|skin-therm)' | head -n 8 || true"
+        );
+        let raw = adb.script(&transport, script)?;
         Ok(format_summary(&raw))
     }
 
@@ -484,31 +627,34 @@ impl Device {
         {
             bail!("不支持的按键");
         }
-        self.verify(adb)?;
-        adb.shell(&self.transport, &["input", "keyevent", &code.to_string()])?;
+        let transport = self.resolve_active_transport(adb)?;
+        adb.shell(&transport, &["input", "keyevent", &code.to_string()])?;
         Ok(())
     }
 
     pub fn screen_resolution(&self, adb: &Adb) -> (u32, u32) {
-        adb.shell(&self.transport, &["wm", "size"])
+        let transport = self
+            .resolve_active_transport(adb)
+            .unwrap_or_else(|_| self.transport.clone());
+        adb.shell(&transport, &["wm", "size"])
             .map(|raw| parse_wm_size(&raw))
             .unwrap_or((1080, 2400))
     }
 
     pub fn tap_normalized(&self, adb: &Adb, norm_x: u16, norm_y: u16) -> Result<(u32, u32)> {
-        self.verify(adb)?;
+        let transport = self.resolve_active_transport(adb)?;
         let (w, h) = self.screen_resolution(adb);
         let px = ((norm_x.min(1000) as u32) * w / 1000).clamp(1, w.saturating_sub(1));
         let py = ((norm_y.min(1000) as u32) * h / 1000).clamp(1, h.saturating_sub(1));
         adb.shell(
-            &self.transport,
+            &transport,
             &["input", "tap", &px.to_string(), &py.to_string()],
         )?;
         Ok((px, py))
     }
 
     pub fn screen_gesture(&self, adb: &Adb, gesture: u8) -> Result<String> {
-        self.verify(adb)?;
+        let transport = self.resolve_active_transport(adb)?;
         let (w, h) = self.screen_resolution(adb);
         let cx = w / 2;
         let cy = h / 2;
@@ -519,7 +665,7 @@ impl Device {
         match gesture {
             0 => {
                 adb.shell(
-                    &self.transport,
+                    &transport,
                     &[
                         "input",
                         "swipe",
@@ -534,7 +680,7 @@ impl Device {
             }
             1 => {
                 adb.shell(
-                    &self.transport,
+                    &transport,
                     &[
                         "input",
                         "swipe",
@@ -549,7 +695,7 @@ impl Device {
             }
             2 => {
                 adb.shell(
-                    &self.transport,
+                    &transport,
                     &[
                         "input",
                         "swipe",
@@ -564,7 +710,7 @@ impl Device {
             }
             3 => {
                 adb.shell(
-                    &self.transport,
+                    &transport,
                     &[
                         "input",
                         "swipe",
@@ -579,7 +725,7 @@ impl Device {
             }
             4 => {
                 let _ = adb.shell(
-                    &self.transport,
+                    &transport,
                     &["cmd", "statusbar", "expand-notifications"],
                 );
                 Ok("已展开手机通知栏".into())
@@ -1107,22 +1253,100 @@ impl Device {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("应用");
-        if out.contains("Success") {
-            Ok(format!("已成功安装 APK：{file_name}"))
-        } else {
-            Ok(format!("APK 安装完成（{file_name}）：{}", out.trim()))
+        if !out.lines().any(|line| line.trim() == "Success") {
+            return Err(anyhow::anyhow!("APK 安装失败：{}", out.trim()));
         }
+        Ok(format!("已成功安装 APK：{file_name}"))
+    }
+
+    pub fn install_apk_with_options(
+        &self,
+        adb: &Adb,
+        path: &std::path::Path,
+        allow_downgrade: bool,
+        expected_package: &str,
+        clean_reinstall_pkg: Option<&str>,
+    ) -> Result<String> {
+        if !path.is_file() {
+            bail!("请选择一个有效的本地 APK 安装包文件");
+        }
+        let is_apk = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("apk"));
+        if !is_apk {
+            bail!("仅支持安装 .apk 格式的 Android 应用包");
+        }
+        // Never remove an existing app as an automatic downgrade workaround.
+        if clean_reinstall_pkg.is_some() {
+            bail!("降级可能需要卸载并清除应用数据，客户端不会自动执行；请先自行备份并在手机确认卸载，再安装所需版本");
+        }
+        let mut snapshot = tempfile::Builder::new().suffix(".apk").tempfile()?;
+        let mut source = std::fs::File::open(path)?;
+        std::io::copy(&mut source, &mut snapshot)?;
+        snapshot.as_file().sync_all()?;
+        check_store_apk(snapshot.path(), expected_package)?;
+        let transport = self.resolve_active_transport(adb)?;
+        let path_str = snapshot.path().to_str().context("APK 路径无效")?;
+        let result = if clean_reinstall_pkg.is_none() && allow_downgrade {
+            adb.run_timeout(
+                &["-s", &transport, "install", "-r", "-d", path_str],
+                std::time::Duration::from_secs(180),
+            )
+        } else {
+            adb.run_timeout(
+                &["-s", &transport, "install", "-r", path_str],
+                std::time::Duration::from_secs(180),
+            )
+        };
+        let out = match result {
+            Ok(out) => out,
+            Err(err) => {
+                let msg = err.to_string();
+                if msg.contains("INSTALL_FAILED_VERSION_DOWNGRADE") {
+                    bail!(
+                        "INSTALL_FAILED_VERSION_DOWNGRADE: 手机拒绝直接覆盖降级（{}）",
+                        msg.trim()
+                    );
+                }
+                return Err(anyhow::anyhow!("APK 安装失败：{}", msg.trim()));
+            }
+        };
+        if out.contains("INSTALL_FAILED_VERSION_DOWNGRADE") {
+            bail!(
+                "INSTALL_FAILED_VERSION_DOWNGRADE: 手机拒绝直接覆盖降级（{}）",
+                out.trim()
+            );
+        }
+        if !out.lines().any(|line| line.trim() == "Success") {
+            return Err(anyhow::anyhow!("APK 安装失败：{}", out.trim()));
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("应用");
+        Ok(format!("已成功安装 APK：{file_name}"))
     }
 
     pub fn open_app(&self, adb: &Adb, package: &str) -> Result<()> {
         if package.is_empty()
             || !package
                 .chars()
-                .all(|c| c.is_ascii_alphanumeric() || "._".contains(c))
+                .all(|c| c.is_ascii_alphanumeric() || "._/$".contains(c))
         {
             bail!("无效的应用包名");
         }
         self.verify(adb)?;
+        if package.contains('/') {
+            adb.script(
+                &self.transport,
+                &format!(
+                    "input keyevent 224 >/dev/null 2>&1 || true; wm dismiss-keyguard >/dev/null 2>&1 || true; am start -n {}",
+                    crate::adb::shell_quote(package)
+                ),
+            )?;
+            return Ok(());
+        }
         let component = adb.shell(
             &self.transport,
             &[
@@ -1154,8 +1378,8 @@ impl Device {
         adb: &Adb,
         options: crate::mirror::MirrorOptions,
     ) -> Result<MirrorSession> {
-        self.verify(adb)?;
-        crate::mirror::start_with_options(adb, &self.transport, options)
+        let transport = self.resolve_active_transport(adb)?;
+        crate::mirror::start_with_options(adb, &transport, options)
     }
 
     pub fn force_stop_app(&self, adb: &Adb, package: &str) -> Result<String> {
@@ -1166,15 +1390,15 @@ impl Device {
         {
             bail!("无效的应用包名");
         }
-        self.verify(adb)?;
-        adb.shell(&self.transport, &["am", "force-stop", package])?;
+        let transport = self.resolve_active_transport(adb)?;
+        adb.shell(&transport, &["am", "force-stop", package])?;
         let label = friendly_app_name(package).unwrap_or(package);
         Ok(format!("已强行停止应用：{label} ({package})"))
     }
 
     pub fn hangup_call(&self, adb: &Adb) -> Result<String> {
-        self.verify(adb)?;
-        adb.shell(&self.transport, &["input", "keyevent", "6"])?;
+        let transport = self.resolve_active_transport(adb)?;
+        adb.shell(&transport, &["input", "keyevent", "6"])?;
         Ok("已向手机发送挂断指令 (KEYCODE_ENDCALL = 6)".into())
     }
 
@@ -1408,7 +1632,7 @@ impl Device {
     /// Grants deep Amoo & OpenClaw permissions + background keep-alive (`oom_score_adj = -800`).
     pub fn grant_deep_amoo_permissions(&self, adb: &Adb) -> Result<String> {
         self.verify(adb)?;
-        let mut cmds = Vec::with_capacity(18);
+        let mut cmds = Vec::with_capacity(64);
         for pkg in ["com.stepos.ailauncher", "com.stepos.stepclaw"] {
             cmds.push(format!(
                 "dumpsys deviceidle whitelist +{pkg} >/dev/null 2>&1 || true"
@@ -1429,6 +1653,35 @@ impl Device {
             cmds.push(format!(
                 "am set-standby-bucket {pkg} active >/dev/null 2>&1 || true"
             ));
+        }
+        for pkg in [
+            "com.stepos.weather",
+            "com.stepos.ailauncher",
+            "com.stepos.ability",
+            "com.stepos.stepclaw",
+            "com.stepos.agentsafetycenter",
+            "com.stepx.companion.app",
+        ] {
+            for perm in [
+                "android.permission.ACCESS_FINE_LOCATION",
+                "android.permission.ACCESS_COARSE_LOCATION",
+                "android.permission.ACCESS_BACKGROUND_LOCATION",
+            ] {
+                cmds.push(format!(
+                    "pm grant {pkg} {perm} >/dev/null 2>&1 || true"
+                ));
+            }
+            for op in [
+                "FINE_LOCATION",
+                "COARSE_LOCATION",
+                "TURN_SCREEN_ON",
+                "RUN_IN_BACKGROUND",
+                "RUN_ANY_IN_BACKGROUND",
+            ] {
+                cmds.push(format!(
+                    "cmd appops set {pkg} {op} allow >/dev/null 2>&1 || true"
+                ));
+            }
         }
         let _ = adb.script(&self.transport, &cmds.join("; "));
         // Also use root_bridge to lock oom_score_adj = -800 on openclaw gateway & ailauncher processes
@@ -2157,6 +2410,14 @@ pub struct DeviceMetrics {
     pub storage_used: String,
     pub storage_avail: String,
     pub storage_percent: Option<u8>,
+    pub warranty_status: String,
+    pub hardware_sn: String,
+    pub battery_soh: String,
+    pub battery_capacity: String,
+    pub thermal_summary: String,
+    pub hardware_spec: String,
+    pub firmware_version: String,
+    pub lockscreen_continuity: String,
 }
 
 impl DeviceMetrics {
@@ -2195,6 +2456,22 @@ impl DeviceMetrics {
                         metrics.storage_percent = pct.trim().trim_end_matches('%').parse().ok();
                     }
                 }
+            } else if let Some(value) = line.strip_prefix("保修状态") {
+                metrics.warranty_status = value.trim().to_string();
+            } else if let Some(value) = line.strip_prefix("硬件序列号") {
+                metrics.hardware_sn = value.trim().to_string();
+            } else if let Some(value) = line.strip_prefix("电池寿命") {
+                metrics.battery_soh = value.trim().to_string();
+            } else if let Some(value) = line.strip_prefix("实时容量") {
+                metrics.battery_capacity = value.trim().to_string();
+            } else if let Some(value) = line.strip_prefix("算力热力") {
+                metrics.thermal_summary = value.trim().to_string();
+            } else if let Some(value) = line.strip_prefix("硬件配置") {
+                metrics.hardware_spec = value.trim().to_string();
+            } else if let Some(value) = line.strip_prefix("系统固件") {
+                metrics.firmware_version = value.trim().to_string();
+            } else if let Some(value) = line.strip_prefix("屏幕锁定") {
+                metrics.lockscreen_continuity = value.trim().to_string();
             }
         }
         metrics
@@ -2417,7 +2694,7 @@ pub fn parse_contacts(raw: &str) -> Vec<ContactEntry> {
     list
 }
 
-pub fn format_summary(raw: &str) -> String {
+fn format_base_summary(raw: &str) -> String {
     let value = |key: &str| {
         raw.lines()
             .find_map(|line| line.trim().strip_prefix(key))
@@ -2510,6 +2787,130 @@ pub fn format_summary(raw: &str) -> String {
     } else {
         result.push_str("\n\n存储信息暂不可用");
     }
+    result
+}
+
+pub fn format_summary(raw: &str) -> String {
+    let Some((base_raw, deep_raw)) = raw.split_once("<<<STEPOS_DEEP>>>") else {
+        return format_base_summary(raw);
+    };
+    let mut result = format_base_summary(base_raw);
+    let deep_val = |key: &str| {
+        deep_raw
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(key))
+            .map(str::trim)
+            .filter(|v| !v.is_empty() && !v.eq_ignore_ascii_case("null"))
+            .unwrap_or("")
+    };
+    let _marketname = {
+        let v = deep_val("marketname:");
+        if v.is_empty() { "STEPX Neo" } else { v }
+    };
+    let asn = {
+        let v = deep_val("asn:");
+        if v.is_empty() { "未检测" } else { v }
+    };
+    let netsn = deep_val("netsn:");
+    let serialno = {
+        let v = deep_val("serialno:");
+        if !v.is_empty() {
+            v
+        } else if !netsn.is_empty() {
+            netsn
+        } else {
+            "未检测"
+        }
+    };
+    let display_id = {
+        let v = deep_val("display_id:");
+        let cmiit = deep_val("cmiit:");
+        if v.is_empty() {
+            "未读取".to_string()
+        } else if !cmiit.is_empty() {
+            format!("{v} · CMIIT {cmiit}")
+        } else {
+            v.to_string()
+        }
+    };
+    let soh = {
+        let v = deep_val("soh:");
+        if v.is_empty() { "未读取" } else { v }
+    };
+    let cycles = deep_val("cycle_line:")
+        .split_once("android.os.extra.CYCLE_COUNT=")
+        .map(|(_, rest)| {
+            rest.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "未读取".to_string());
+    let parse_mah = |raw_val: &str, default_mah: &str| -> String {
+        raw_val
+            .parse::<u64>()
+            .ok()
+            .filter(|v| *v > 0)
+            .map(|v| if v > 100_000 { v / 1000 } else { v }.to_string())
+            .unwrap_or_else(|| default_mah.to_string())
+    };
+    let design_mah = parse_mah(deep_val("design_cap:"), "未读取");
+    let remaining_mah = parse_mah(deep_val("charge_cnt:"), "未读取");
+    let fast_charge_label = match deep_val("fast_charge:") {
+        "1" => "已开启",
+        "0" => "已关闭",
+        _ => "未读取",
+    };
+    let ups_limit = {
+        let v = deep_val("ups_limit:");
+        if v.is_empty() { "未读取" } else { v }
+    };
+    let bypass_label = if deep_val("ups_mode:") == "1" {
+        format!("已开启 ({ups_limit}%)")
+    } else if deep_val("ups_mode:") == "0" {
+        format!("待命 ({ups_limit}%)")
+    } else {
+        "未读取".to_string()
+    };
+    let parse_temp = |sensor: &str| -> String {
+        let needle = format!("mName={sensor}");
+        deep_raw
+            .lines()
+            .find(|line| line.contains(&needle) && line.contains("mValue="))
+            .and_then(|line| line.split_once("mValue="))
+            .and_then(|(_, rest)| rest.split([',', '}']).next())
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .map(|v| format!("{v:.1} °C"))
+            .unwrap_or_else(|| "--".to_string())
+    };
+    let cpu_temp = parse_temp("cpu-0-0");
+    let npu_temp = {
+        let nsp = parse_temp("nsp-0");
+        if nsp != "--" {
+            nsp
+        } else {
+            parse_temp("gpuss-0")
+        }
+    };
+    let skin_temp = parse_temp("skin-therm");
+    let camera_info = deep_val("camera_info:");
+    let camera_summary = if camera_info.is_empty() { "未读取" } else { camera_info };
+    let keyguard_line = deep_val("keyguard_locked:");
+    let lock_continuity_label = if keyguard_line.contains("showing=true") {
+        "已锁屏"
+    } else if keyguard_line.contains("showing=false") {
+        "已解锁"
+    } else { "未读取" };
+    result.push_str(&format!(
+        "\n\n保修状态  未查询官方保修状态\n\
+         硬件序列号  ASN {asn} · SN {serialno}\n\
+         电池寿命  SOH {soh}% · 循环 {cycles} 次 · 设计 {design_mah} mAh\n\
+         实时容量  {remaining_mah} mAh · 智慧快充{fast_charge_label} · 旁路供电{bypass_label}\n\
+         算力热力  CPU {cpu_temp} · NPU {npu_temp} · 机身 {skin_temp}\n\
+         硬件配置  相机属性：{camera_summary}\n\
+         系统固件  {display_id}\n\
+         屏幕锁定  {lock_continuity_label}"
+    ));
     result
 }
 
@@ -2973,9 +3374,9 @@ mod generic_apk_install_tests {
         let sample = "\
 List of devices attached
 ASGXVB1806001948       device usb:3-3.1 product:CLT-AL00 model:CLT_AL00 device:HWCLT transport_id:2
-ZYPZ261A01M692000LP    device usb:3-1.4 product:pandora model:PZ261A device:pandora transport_id:4
+STEPX_TEST_DEVICE    device usb:3-1.4 product:pandora model:PZ261A device:pandora transport_id:4
 10.0.1.177:34883       device product:pandora model:PZ261A device:pandora transport_id:7
-adb-ZYPZ261A01M692000LP-jYyV3X._adb-tls-connect._tcp device product:pandora model:PZ261A device:pandora transport_id:1
+adb-STEPX_TEST_DEVICE-jYyV3X._adb-tls-connect._tcp device product:pandora model:PZ261A device:pandora transport_id:1
 ";
         let transports = parse_devices(sample);
         assert_eq!(transports.len(), 2);
@@ -2983,13 +3384,13 @@ adb-ZYPZ261A01M692000LP-jYyV3X._adb-tls-connect._tcp device product:pandora mode
         assert_eq!(transports[0].model, "CLT_AL00");
         assert!(transports[0].backup_transports().is_empty());
 
-        assert_eq!(transports[1].id, "ZYPZ261A01M692000LP");
+        assert_eq!(transports[1].id, "STEPX_TEST_DEVICE");
         assert_eq!(transports[1].model, "PZ261A");
         assert_eq!(
             transports[1].backup_transports(),
             vec![
                 "10.0.1.177:34883".to_string(),
-                "adb-ZYPZ261A01M692000LP-jYyV3X._adb-tls-connect._tcp".to_string(),
+                "adb-STEPX_TEST_DEVICE-jYyV3X._adb-tls-connect._tcp".to_string(),
             ]
         );
 
@@ -2999,51 +3400,51 @@ adb-ZYPZ261A01M692000LP-jYyV3X._adb-tls-connect._tcp device product:pandora mode
             rededuped[1].backup_transports(),
             vec![
                 "10.0.1.177:34883".to_string(),
-                "adb-ZYPZ261A01M692000LP-jYyV3X._adb-tls-connect._tcp".to_string(),
+                "adb-STEPX_TEST_DEVICE-jYyV3X._adb-tls-connect._tcp".to_string(),
             ]
         );
 
         assert_eq!(
-            canonical_serial_from_transport("adb-ZYPZ261A01M692000LP-jYyV3X._adb-tls-connect._tcp"),
-            Some("ZYPZ261A01M692000LP".to_string())
+            canonical_serial_from_transport("adb-STEPX_TEST_DEVICE-jYyV3X._adb-tls-connect._tcp"),
+            Some("STEPX_TEST_DEVICE".to_string())
         );
-        assert_eq!(transport_priority("ZYPZ261A01M692000LP"), 1);
+        assert_eq!(transport_priority("STEPX_TEST_DEVICE"), 1);
         assert_eq!(transport_priority("10.0.1.177:34883"), 2);
         assert_eq!(
-            transport_priority("adb-ZYPZ261A01M692000LP-jYyV3X._adb-tls-connect._tcp"),
+            transport_priority("adb-STEPX_TEST_DEVICE-jYyV3X._adb-tls-connect._tcp"),
             3
         );
 
         let devices = deduplicate_multi_transport_devices(vec![
             Device {
-                transport: "adb-ZYPZ261A01M692000LP-jYyV3X._adb-tls-connect._tcp".into(),
-                serial: "ZYPZ261A01M692000LP".into(),
+                transport: "adb-STEPX_TEST_DEVICE-jYyV3X._adb-tls-connect._tcp".into(),
+                serial: "STEPX_TEST_DEVICE".into(),
                 model: "PZ261A".into(),
                 android: "16".into(),
                 product: "pandora".into(),
             },
             Device {
                 transport: "10.0.1.177:34883".into(),
-                serial: "ZYPZ261A01M692000LP".into(),
+                serial: "STEPX_TEST_DEVICE".into(),
                 model: "PZ261A".into(),
                 android: "16".into(),
                 product: "pandora".into(),
             },
             Device {
-                transport: "ZYPZ261A01M692000LP".into(),
-                serial: "ZYPZ261A01M692000LP".into(),
+                transport: "STEPX_TEST_DEVICE".into(),
+                serial: "STEPX_TEST_DEVICE".into(),
                 model: "PZ261A".into(),
                 android: "16".into(),
                 product: "pandora".into(),
             },
         ]);
         assert_eq!(devices.len(), 1);
-        assert_eq!(devices[0].transport, "ZYPZ261A01M692000LP");
+        assert_eq!(devices[0].transport, "STEPX_TEST_DEVICE");
         assert_eq!(
             devices[0].backup_transports(),
             vec![
                 "10.0.1.177:34883".to_string(),
-                "adb-ZYPZ261A01M692000LP-jYyV3X._adb-tls-connect._tcp".to_string(),
+                "adb-STEPX_TEST_DEVICE-jYyV3X._adb-tls-connect._tcp".to_string(),
             ]
         );
     }
@@ -3058,4 +3459,98 @@ adb-ZYPZ261A01M692000LP-jYyV3X._adb-tls-connect._tcp device product:pandora mode
         );
         assert_eq!(parse_wm_size(""), (1080, 2400));
     }
+
+    #[test]
+    fn formats_stepos_deep_summary_and_preserves_legacy_summary() {
+        use super::{format_summary, DeviceMetrics};
+
+        let legacy_raw = "\
+  level: 100
+  scale: 100
+  status: 5
+  health: 2
+  voltage: 4449
+  temperature: 317
+/dev/block/dm-52  218G   17G  201G   8% /data
+Physical size: 1260x2800
+24: wlan0    inet 10.0.1.177/24 brd 10.0.1.255 scope global wlan0
+";
+        let legacy_summary = format_summary(legacy_raw);
+        assert!(!legacy_summary.contains("保修状态"));
+        let legacy_metrics = DeviceMetrics::from_summary(&legacy_summary);
+        assert_eq!(legacy_metrics.battery_level, Some(100));
+        assert_eq!(legacy_metrics.charging_state, "电量已满");
+        assert_eq!(legacy_metrics.temperature, "31.7 °C");
+        assert_eq!(legacy_metrics.voltage, "4.45 V");
+        assert_eq!(legacy_metrics.screen_size, "1260 × 2800");
+        assert_eq!(legacy_metrics.wifi_ipv4, "10.0.1.177");
+        assert_eq!(legacy_metrics.storage_total, "218G");
+        assert_eq!(legacy_metrics.warranty_status, "");
+
+        let deep_raw = format!(
+            "{legacy_raw}\n<<<STEPOS_DEEP>>>\n\
+             marketname:STEPX Neo\n\
+             asn:ASN_TEST_DEVICE\n\
+             netsn:NET_TEST_DEVICE\n\
+             serialno:STEPX_TEST_DEVICE\n\
+             display_id:StepOS_Neo_V1.0.20260417\n\
+             cmiit:2026CP3403\n\
+             camera_info:FrontMain: ov50d40 50M;BackMain: ov50e40 50M;BackWide: ov50d40 50M;BackTele: s5kjn5 50M;\n\
+             zram_cfg:enable=true|8G,12G,16G,24G|50%,50%,50%,50%\n\
+             soh:100\n\
+             design_cap:6150000\n\
+             charge_cnt:6150000\n\
+             ups_mode:0\n\
+             ups_limit:80\n\
+             fast_charge:1\n\
+             cycle_line:Bundle[{{android.os.extra.CYCLE_COUNT=3, android.os.extra.MAXIMUM_CAPACITY_PERCENT=100}}]\n\
+             keyguard_locked:showing=true\n\
+             Temperature{{mValue=41.6, mType=0, mName=cpu-0-0, mStatus=0}}\n\
+             Temperature{{mValue=39.3, mType=2, mName=nsp-0, mStatus=0}}\n\
+             Temperature{{mValue=35.421, mType=3, mName=skin-therm, mStatus=0}}\n"
+        );
+        let deep_summary = format_summary(&deep_raw);
+        let deep_metrics = DeviceMetrics::from_summary(&deep_summary);
+        assert_eq!(deep_metrics.warranty_status, "未查询官方保修状态");
+        assert_eq!(
+            deep_metrics.hardware_sn,
+            "ASN ASN_TEST_DEVICE · SN STEPX_TEST_DEVICE"
+        );
+        assert_eq!(
+            deep_metrics.battery_soh,
+            "SOH 100% · 循环 3 次 · 设计 6150 mAh"
+        );
+        assert_eq!(
+            deep_metrics.battery_capacity,
+            "6150 mAh · 智慧快充已开启 · 旁路供电待命 (80%)"
+        );
+        assert_eq!(
+            deep_metrics.thermal_summary,
+            "CPU 41.6 °C · NPU 39.3 °C · 机身 35.4 °C"
+        );
+        assert_eq!(
+            deep_metrics.hardware_spec,
+            "相机属性：FrontMain: ov50d40 50M;BackMain: ov50e40 50M;BackWide: ov50d40 50M;BackTele: s5kjn5 50M;"
+        );
+        assert_eq!(
+            deep_metrics.firmware_version,
+            "StepOS_Neo_V1.0.20260417 · CMIIT 2026CP3403"
+        );
+        assert_eq!(deep_metrics.lockscreen_continuity, "已锁屏");
+    }
+    #[test]
+    fn store_package_identity_must_match_selection() {
+        assert!(super::validate_store_package("com.example.other", "com.example.target").is_err());
+        assert!(super::validate_store_package("com.example.target", "").is_err());
+        assert!(super::validate_store_package("com.example.target", "com.example.target").is_ok());
+    }
+    #[test]
+    fn missing_deep_sensor_values_remain_unknown() {
+        let s = super::format_summary("level: 50\n<<<STEPOS_DEEP>>>\nsoh:\ndesign_cap:\n");
+        assert!(s.contains("SOH 未读取"));
+        assert!(s.contains("未查询官方保修状态"));
+        assert!(!s.contains("6150"));
+        assert!(!s.contains("LPDDR5X"));
+    }
+
 }

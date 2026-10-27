@@ -114,6 +114,7 @@ impl Companion {
         let game = state.tab == 4;
         let game_frame = game_preview_frame(state.elapsed_ms);
         let preview_frame = if game { &game_frame } else { &state.frame };
+        let editable_canvas = !game && state.tab != 3 && state.native_feature.is_none();
         let mut parts = vec![
             self.between(
                 self.bs_title(UiIcon::Matrix, if game { "玩法预览" } else { "点阵预览" }),
@@ -142,46 +143,54 @@ impl Companion {
             Align::new(self.hstack(
                 S4,
                 vec![
-                        self.phone_rear_housing(100., 210., preview_frame, 3.6, 0.95),
-                        ConstrainedBox::new(
-                            self.vstack(
-                                S2,
-                                vec![
-                                    self.line("点阵放大 (可点击手绘)", MICRO, p.text3),
-                                    Container::new(
-                                        super::super::led_grid::LedGrid::new(
-                                            preview_frame,
-                                            3.6,
-                                            0.95,
-                                        )
-                                        .on_pixel_click(|x, y| {
-                                            Action::BackScreen(BsAction::TogglePixel(x, y))
-                                        })
-                                        .finish(),
-                                    )
-                                    .with_uniform_padding(S2)
-                                    .with_background_color(rgb(24, 24, 30))
-                                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(
-                                        R_CONTROL,
-                                    )))
-                                    .finish(),
-                                ],
+                    self.phone_rear_housing(100., 210., preview_frame, 3.6, 0.95),
+                    ConstrainedBox::new(self.vstack(
+                        S2,
+                        vec![
+                            self.line(
+                                if editable_canvas {
+                                    "手绘点阵"
+                                } else {
+                                    "实时点阵"
+                                },
+                                MICRO,
+                                p.text3,
                             ),
-                        )
-                        .with_width(100.)
-                        .finish(),
-                    ],
+                            Container::new(
+                                super::super::led_grid::LedGrid::new(
+                                    preview_frame,
+                                    3.6,
+                                    0.95,
+                                )
+                                .on_pixel_click(|x, y| {
+                                    Action::BackScreen(BsAction::TogglePixel(x, y))
+                                })
+                                .finish(),
+                            )
+                            .with_uniform_padding(S2)
+                            .with_background_color(rgb(24, 24, 30))
+                            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(
+                                R_CONTROL,
+                            )))
+                            .finish(),
+                        ],
+                    ))
+                    .with_width(104.)
+                    .finish(),
+                ],
             ))
             .finish(),
             self.mono("17 × 23 · 379 灯珠", MICRO, p.text2),
-            self.hstack(
+        ];
+        if editable_canvas {
+            parts.push(self.hstack(
                 6.,
                 vec![
                     self.ui_icon(UiIcon::Lightbulb, 13., p.text3),
                     self.line("点击上方灯阵格可直接手绘/擦除像素", MICRO, p.text3),
                 ],
-            ),
-            self.wrap(vec![
+            ));
+            parts.push(self.wrap(vec![
                 self.bs_button_icon(
                     "diy-invert",
                     "反相",
@@ -224,31 +233,31 @@ impl Companion {
                     BsAction::ClearDiyFrame,
                     Btn::Ghost,
                 ),
-            ]),
-            self.bs_button(
-                "preview-toggle",
-                if state.preview_running {
-                    "暂停预览"
-                } else {
-                    "播放预览"
-                },
-                BsAction::TogglePreview,
-                Btn::Secondary,
-            ),
-            self.text(
-                if game {
-                    "面对背屏，左倾向左、右倾向右。翻到正面结束本局。"
-                } else {
-                    &state.status
-                },
-                CAPTION,
-                if state.error.is_some() && !game {
-                    p.danger
-                } else {
-                    p.text2
-                },
-            ),
-        ];
+            ]));
+        }
+        parts.push(self.bs_button(
+            "preview-toggle",
+            if state.preview_running {
+                "暂停预览"
+            } else {
+                "播放预览"
+            },
+            BsAction::TogglePreview,
+            Btn::Secondary,
+        ));
+        parts.push(self.text(
+            if game {
+                "面对背屏，左倾向左、右倾向右。翻到正面结束本局。"
+            } else {
+                &state.status
+            },
+            CAPTION,
+            if state.error.is_some() && !game {
+                p.danger
+            } else {
+                p.text2
+            },
+        ));
         if !state.applied_title.is_empty() {
             parts.push(self.divider());
             parts.push(self.line("手机当前", MICRO, p.text3));
@@ -267,7 +276,6 @@ impl Companion {
                 Btn::Secondary,
             ));
         }
-        let needs_companion = game || (state.native_feature.is_none() && !state.temporary_app());
         let primary = if self.selected.is_none() {
             self.disabled_button("请先连接手机")
         } else if state.converting_image {
@@ -276,23 +284,6 @@ impl Companion {
             self.disabled_button("正在同步手机…")
         } else if state.generating {
             self.disabled_button("等待 Amoo 生成")
-        } else if needs_companion && state.companion_installed == Some(false) {
-            self.bs_button(
-                "install-companion",
-                "一键安装并启用背屏伴侣",
-                BsAction::CompanionInstall,
-                Btn::Primary,
-            )
-        } else if needs_companion
-            && state.companion_installed == Some(true)
-            && !state.companion_permission
-        {
-            self.bs_button(
-                "install-companion",
-                "修复 StepX伴侣权限",
-                BsAction::CompanionInstall,
-                Btn::Primary,
-            )
         } else if game {
             self.bs_button("arm-game", "启用三敲启动", BsAction::GameArm, Btn::Primary)
         } else {
@@ -318,12 +309,6 @@ impl Companion {
                 BsAction::CompanionStop,
                 Btn::Secondary,
             ));
-        }
-        if needs_companion
-            && !state.companion_status.is_empty()
-            && (self.selected.is_none() || state.companion_status != "连接手机后检测 StepX伴侣")
-        {
-            parts.push(self.text(&state.companion_status, MICRO, p.text2));
         }
         parts.push(self.text(
             if game {
@@ -1350,16 +1335,16 @@ impl Companion {
                 p.text2,
             ),
         ];
-        if state.companion_installed == Some(true)
-            && state.companion_permission
-            && !state.companion_busy
-        {
-            game.push(self.wrap(vec![self.bs_button(
-                "game-now",
-                "立即开始一局",
-                BsAction::GameStart,
-                Btn::Primary,
-            )]));
+        if self.selected.is_some() && !state.companion_busy {
+            game.push(self.wrap(vec![
+                self.bs_button("game-now", "立即开始一局", BsAction::GameStart, Btn::Primary),
+                self.bs_button(
+                    "game-arm-right",
+                    "启用三敲启动",
+                    BsAction::GameArm,
+                    Btn::Secondary,
+                ),
+            ]));
         }
         let mut companion = vec![
             self.between(
@@ -1380,9 +1365,45 @@ impl Companion {
                     p.surface,
                 ),
             ),
-            self.text(&state.companion_status, CAPTION, p.text2),
+            self.wrap(vec![
+                self.pill_badge(
+                    if state.companion_installed == Some(true) {
+                        "伴侣应用：已安装"
+                    } else {
+                        "伴侣应用：待检测"
+                    },
+                    if state.companion_installed == Some(true) {
+                        p.success_text
+                    } else {
+                        p.text2
+                    },
+                    if state.companion_installed == Some(true) {
+                        p.success_soft
+                    } else {
+                        p.surface
+                    },
+                ),
+                self.pill_badge(
+                    if state.companion_permission {
+                        "背屏驱动：已就绪"
+                    } else {
+                        "背屏驱动：点击应用自动激活"
+                    },
+                    if state.companion_permission {
+                        p.success_text
+                    } else {
+                        p.accent
+                    },
+                    if state.companion_permission {
+                        p.success_soft
+                    } else {
+                        p.accent_soft
+                    },
+                ),
+                self.pill_badge("姿态传感：三敲与重力感应", p.text2, p.surface),
+            ]),
             self.text(
-                "游戏在手机本地运行，传感器控制与动画无需电脑往返。安装后可以断开 USB。",
+                "游戏在手机本地运行，传感器控制与动画无需电脑往返。点击上方开始后将自动激活背屏驱动。",
                 CAPTION,
                 p.text3,
             ),
@@ -1398,7 +1419,7 @@ impl Companion {
                 self.bs_button(
                     "companion-install",
                     if state.companion_installed == Some(true) {
-                        "更新 StepX伴侣"
+                        "更新或修复伴侣"
                     } else {
                         "安装 StepX伴侣"
                     },
@@ -1406,13 +1427,6 @@ impl Companion {
                     Btn::Secondary,
                 ),
             ]));
-        }
-        if state.companion_installed == Some(true) && !state.companion_permission {
-            companion.push(self.text(
-                "背屏权限尚未就绪，请更新伴侣后重新检测。",
-                CAPTION,
-                p.warning,
-            ));
         }
         if let Some(error) = &state.error {
             companion.push(self.text(error, CAPTION, p.danger));

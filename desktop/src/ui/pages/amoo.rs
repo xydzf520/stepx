@@ -1165,16 +1165,6 @@ impl Companion {
                             } else {
                                 Empty::new().finish()
                             },
-                            self.button(
-                                "amoo-subheader-mode-toggle",
-                                if phone_mode {
-                                    "返回对话"
-                                } else {
-                                    "操作手机"
-                                },
-                                Action::AmooUi(AmooUiAction::GuiMode(!phone_mode)),
-                                Btn::Secondary,
-                            ),
                         ],
                     ),
                 ))
@@ -2110,12 +2100,12 @@ impl Companion {
                 CAPTION,
                 p.text2,
             ));
-            detail_parts.push(self.button(
+            detail_parts.push(self.wrap(vec![self.button(
                 "amoo-details-schedules",
                 "查看定时任务",
                 Action::AmooOpenTasks,
                 Btn::Secondary,
-            ));
+            )]));
             detail_parts.push(self.divider());
             detail_parts.push(self.heading("更多能力"));
             detail_parts.push(self.text(
@@ -2123,29 +2113,34 @@ impl Companion {
                 CAPTION,
                 p.text2,
             ));
-            detail_parts.push(self.button(
-                "amoo-details-work",
-                "生成文件",
-                Action::Work(super::super::WorkAction::Tab(0)),
-                Btn::Secondary,
-            ));
-            detail_parts.push(self.button(
-                "amoo-details-skills",
-                "浏览与安装技能",
-                Action::Work(super::super::WorkAction::Tab(2)),
-                Btn::Ghost,
-            ));
-            detail_parts.push(self.button(
-                "amoo-details-models",
-                "查看可用模型",
-                Action::Work(super::super::WorkAction::Tab(1)),
-                Btn::Ghost,
-            ));
-            Container::new(self.vstack(S3, detail_parts))
-                .with_uniform_padding(S4)
-                .with_background_color(p.surface)
-                .with_border(Border::left(1.).with_border_color(p.border))
-                .finish()
+            detail_parts.push(self.wrap(vec![
+                self.button(
+                    "amoo-details-work",
+                    "生成文件",
+                    Action::Work(super::super::WorkAction::Tab(0)),
+                    Btn::Secondary,
+                ),
+                self.button(
+                    "amoo-details-skills",
+                    "浏览与安装技能",
+                    Action::Work(super::super::WorkAction::Tab(2)),
+                    Btn::Ghost,
+                ),
+                self.button(
+                    "amoo-details-models",
+                    "查看可用模型",
+                    Action::Work(super::super::WorkAction::Tab(1)),
+                    Btn::Ghost,
+                ),
+            ]));
+            self.pane_scroll(
+                self.scroll_aux.clone(),
+                Container::new(self.vstack(S3, detail_parts))
+                    .with_uniform_padding(S4)
+                    .with_background_color(p.surface)
+                    .with_border(Border::left(1.).with_border_color(p.border))
+                    .finish(),
+            )
         };
         let mut layout = Flex::row()
             .with_main_axis_size(MainAxisSize::Max)

@@ -133,9 +133,15 @@ if __name__ == '__main__':
     import sys
     parser = argparse.ArgumentParser(description='Read APK package identity without device operations')
     parser.add_argument('--package', type=Path, required=True)
+    parser.add_argument('--verify-signature', action='store_true')
     args = parser.parse_args()
     try:
-        print(json.dumps({'ok': True, 'package': apk_package(args.package)}, ensure_ascii=False))
+        package = apk_package(args.package)
+        if args.verify_signature:
+            proof = run(sdk_command('apksigner') + ['verify', '--print-certs', args.package])
+            if not signer_digests(proof):
+                raise RuntimeError('APK 签名校验未通过')
+        print(json.dumps({'ok': True, 'package': package}, ensure_ascii=False))
     except Exception as error:
         print(json.dumps({'ok': False, 'error': str(error)}, ensure_ascii=False))
         sys.exit(1)

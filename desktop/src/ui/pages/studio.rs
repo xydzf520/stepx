@@ -499,12 +499,7 @@ impl Companion {
             .collect(),
         );
         let right_action = if matches!(source, 3 | 5) {
-            self.st_button(
-                "st-open-lab",
-                "用自己的模型做应用",
-                St::Tab(2),
-                Btn::Secondary,
-            )
+            Empty::new().finish()
         } else if source == 4 {
             self.st_button(
                 "st-all-new",
@@ -577,7 +572,12 @@ impl Companion {
             content.push(self.panel(vec![
                 self.heading("暂未同步成功"),
                 self.text(e, BODY, p.text2),
-                self.st_button("st-retry", "重新同步", St::CloudRefresh, Btn::Secondary),
+                self.wrap(vec![self.st_button(
+                    "st-retry",
+                    "重新同步",
+                    St::CloudRefresh,
+                    Btn::Secondary,
+                )]),
             ]));
         }
         let Some(library) = library.filter(|c| c.authorized) else {
@@ -963,13 +963,13 @@ impl Companion {
         ];
         if website {
             if let Some(url) = w.editor() {
-                children.push(self.button_icon(
+                children.push(self.wrap(vec![self.button_icon(
                     "st-edit-project",
                     "继续编辑",
                     UiIcon::ExternalLink,
                     Action::StudioOpenUrl(url),
                     Btn::Primary,
-                ));
+                )]));
             }
             children.push(self.text(
                 "直接在独立工作窗口打开对应项目，自动复用伴侣内的官网登录。",
@@ -985,12 +985,12 @@ impl Companion {
             if let Some((i, item)) = phone {
                 children.push(self.heading("在手机上试用"));
                 children.push(self.text("已在 Amoo 我的作品找到此项目。", BODY, p.text2));
-                children.push(self.st_button(
+                children.push(self.wrap(vec![self.st_button(
                     "st-switch-phone",
                     "查看手机版本",
                     St::PhoneItem(i),
                     Btn::Secondary,
-                ));
+                )]));
                 if item.experience().is_none() {
                     children.push(self.caption("技能与智能体需要在 Amoo 中确认安装。"));
                 }
@@ -1020,7 +1020,7 @@ impl Companion {
                     },
                 ]));
         } else {
-            children.push(self.st_button(
+            children.push(self.wrap(vec![self.st_button(
                 "st-use-phone",
                 if w.experience().is_some() {
                     "在手机打开"
@@ -1029,7 +1029,7 @@ impl Companion {
                 },
                 St::UsePhone(index),
                 Btn::Primary,
-            ));
+            )]));
             let mut actions = vec![];
             if w.experience().is_some() {
                 actions.push(self.st_button(
@@ -1239,12 +1239,12 @@ impl Companion {
             ),
         ];
         if w.shareable() {
-            content.push(self.st_button(
+            content.push(self.wrap(vec![self.st_button(
                 "st-open-saved",
                 "在手机打开",
                 St::OpenPhone,
                 Btn::Primary,
-            ));
+            )]));
             content.push(self.wrap(vec![
                 self.st_button(
                     "st-send-phone",
@@ -1256,13 +1256,13 @@ impl Companion {
                 self.st_button("st-pin", "添加手机桌面图标", St::Pin, Btn::Secondary),
             ]));
         } else {
-            content.push(self.button_icon(
+            content.push(self.wrap(vec![self.button_icon(
                 "st-open-editor",
                 "继续编辑",
                 UiIcon::ExternalLink,
                 Action::StudioOpenUrl(w.url.clone()),
                 Btn::Primary,
-            ));
+            )]));
             content.push(self.caption("项目入口需要官网账号，不能当作公开体验链接分享。"));
         }
         content.push(self.wrap(vec![

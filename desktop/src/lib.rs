@@ -74,4 +74,6 @@ pub mod input_method;
 
 pub mod amoo_route;
 pub mod amoo_workspace;
+pub mod app_store;
 pub mod desktop_update;
+pub mod lan_cast;
