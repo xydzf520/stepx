@@ -4,7 +4,7 @@
 //! ("多源显示一个"):
 //! 1. `StoreSource::Tencent` — 应用宝实时源 (`sj.qq.com` / `a.app.qq.com`)
 //! 2. `StoreSource::Official` — 厂商官方直连 (绿联云、极空间、飞牛、群晖 Archive、Tailscale 等)
-//! 3. `StoreSource::Global` — 国际应用源 (`ws75.aptoide.com` / 全球正版签名分发)
+//! 3. `StoreSource::Global` — 国际应用源 (`ws75.aptoide.com` / 第三方应用分发)
 //! 4. `StoreSource::GitHub` — GitHub Releases 开源直连
 //! 5. `StoreSource::FDroid` — F-Droid 开源仓库
 //! 6. `StoreSource::StepOs` — StepOS 商店源 (`api-app.stepaos.com`)
@@ -1287,7 +1287,7 @@ fn quick_curated_app(
             download_url: download_url.into(),
             updated_at: "2026-04-10".into(),
             md5: String::new(),
-            changelog: format!("{}官方签名高速分发", source.short_label()),
+            changelog: format!("{}应用分发", source.short_label()),
         }],
         vec![],
         vec![],
@@ -1585,7 +1585,7 @@ pub fn curated_catalog() -> Vec<StoreApp> {
                     download_url: "https://pool.apk.aptoide.com/appupdater/com-synology-dsfile-609-71533269-c72d47021b2df58898d5f23c3edbcabd.apk".into(),
                     updated_at: "2025-11-20".into(),
                     md5: "c72d47021b2df58898d5f23c3edbcabd".into(),
-                    changelog: "国际应用源官方签名镜像".into(),
+                    changelog: "国际应用源第三方镜像".into(),
                 },
             ],
             vec![
@@ -2208,7 +2208,7 @@ pub fn curated_catalog() -> Vec<StoreApp> {
                     download_url: "https://pool.apk.aptoide.com/appupdater/com-twitter-android-312372001-77256171-b7472c0013ef4a9eb2145bb812f3ce04.apk".into(),
                     updated_at: "2026-04-12".into(),
                     md5: "b7472c0013ef4a9eb2145bb812f3ce04".into(),
-                    changelog: "国际应用源官方签名直连 (v12.37.2-prod.01)".into(),
+                    changelog: "国际应用源下载链接 (v12.37.2-prod.01)".into(),
                 },
                 StoreSourceOffer {
                     source: StoreSource::Official,
@@ -2278,7 +2278,7 @@ pub fn curated_catalog() -> Vec<StoreApp> {
                     download_url: "https://pool.apk.aptoide.com/catnamiw/com-facebook-katana-475612067-77061235-0380e424eeae80e9c7a75adaffaf2273.apk".into(),
                     updated_at: "2026-04-11".into(),
                     md5: "0380e424eeae80e9c7a75adaffaf2273".into(),
-                    changelog: "国际应用源官方签名版 (v583.0.0.25.55)".into(),
+                    changelog: "国际应用源分发版本 (v583.0.0.25.55)".into(),
                 },
                 StoreSourceOffer {
                     source: StoreSource::Official,
@@ -2363,7 +2363,7 @@ pub fn curated_catalog() -> Vec<StoreApp> {
                 download_url: "https://pool.apk.aptoide.com/oyunmarketm/com-instagram-android-384109472-75386997-c4e738810942023dbd3c3b141f771f2a.apk".into(),
                 updated_at: "2026-04-10".into(),
                 md5: "c4e738810942023dbd3c3b141f771f2a".into(),
-                changelog: "国际应用源官方签名直连".into(),
+                changelog: "国际应用源下载链接".into(),
             }],
             vec![],
             vec![],
@@ -2435,7 +2435,7 @@ pub fn curated_catalog() -> Vec<StoreApp> {
                 download_url: "https://pool.apk.aptoide.com/bjwawesome/com-google-android-youtube-1561304941-77159460-80b8257791e266770ef089e4710bfb77.apk".into(),
                 updated_at: "2026-04-11".into(),
                 md5: "80b8257791e266770ef089e4710bfb77".into(),
-                changelog: "国际应用源官方签名版 (v21.42.243)".into(),
+                changelog: "国际应用源分发版本 (v21.42.243)".into(),
             }],
             vec![],
             vec![],
@@ -2525,7 +2525,7 @@ pub fn curated_catalog() -> Vec<StoreApp> {
                 download_url: "https://pool.apk.aptoide.com/sirkesyone-applikes/com-spotify-music-146291969-76813363-d6d9317a1214fcf7c94ecdbf92ae4a1a.apk".into(),
                 updated_at: "2026-04-04".into(),
                 md5: "d6d9317a1214fcf7c94ecdbf92ae4a1a".into(),
-                changelog: "国际应用源官方正版构建".into(),
+                changelog: "国际应用源分发构建".into(),
             }],
             vec![],
             vec![],
@@ -2615,7 +2615,7 @@ pub fn curated_catalog() -> Vec<StoreApp> {
                 download_url: "https://pool.apk.aptoide.com/appupdater/com-whatsapp-264300400-77275459-550fde3c806dacb1e1e5428f09894057.apk".into(),
                 updated_at: "2026-04-08".into(),
                 md5: "550fde3c806dacb1e1e5428f09894057".into(),
-                changelog: "国际应用源官方签名版".into(),
+                changelog: "国际应用源分发版本".into(),
             }],
             vec![],
             vec![],
@@ -2645,7 +2645,7 @@ pub fn curated_catalog() -> Vec<StoreApp> {
                 download_url: "https://pool.apk.aptoide.com/appupdater/com-facebook-orca-343412933-75513915-dae9bc97d1c129eb4e521b4601fe2463.apk".into(),
                 updated_at: "2026-04-09".into(),
                 md5: "dae9bc97d1c129eb4e521b4601fe2463".into(),
-                changelog: "国际应用源官方签名版".into(),
+                changelog: "国际应用源分发版本".into(),
             }],
             vec![],
             vec![],
@@ -3109,7 +3109,7 @@ pub fn curated_catalog() -> Vec<StoreApp> {
                     download_url: "https://d.apkpure.com/b/APK/com.openai.chatgpt?versionCode=397".into(),
                     updated_at: "2026-04-12".into(),
                     md5: "".into(),
-                    changelog: "国际应用源 OpenAI 官方签名直连 (v1.2024.289)".into(),
+                    changelog: "国际应用源 OpenAI 下载链接 (v1.2024.289)".into(),
                 },
                 StoreSourceOffer {
                     source: StoreSource::Official,
@@ -3186,7 +3186,7 @@ pub fn curated_catalog() -> Vec<StoreApp> {
                 download_url: "https://pool.apk.aptoide.com/appupdater/com-google-android-apps-bard-345-77185245-05d309c43261a8a8faed020c99a1ba35.apk".into(),
                 updated_at: "2026-04-11".into(),
                 md5: "05d309c43261a8a8faed020c99a1ba35".into(),
-                changelog: "国际应用源 Google 官方签名直连".into(),
+                changelog: "国际应用源 Google 下载链接".into(),
             }],
             vec![],
             vec![],
@@ -3215,7 +3215,7 @@ pub fn curated_catalog() -> Vec<StoreApp> {
                 download_url: "https://pool.apk.aptoide.com/appupdater/ai-perplexity-app-android-260671-77223912-2ab349b601e91e8042ed504f755cfa19.apk".into(),
                 updated_at: "2026-04-11".into(),
                 md5: "2ab349b601e91e8042ed504f755cfa19".into(),
-                changelog: "国际应用源 Perplexity 官方签名直连".into(),
+                changelog: "国际应用源 Perplexity 下载链接".into(),
             }],
             vec![],
             vec![],
@@ -3244,7 +3244,7 @@ pub fn curated_catalog() -> Vec<StoreApp> {
                 download_url: "https://pool.apk.aptoide.com/appupdater/ai-x-grok-11251200-77279753-3b6e07135431707bf6dacb168126fe9d.apk".into(),
                 updated_at: "2026-04-12".into(),
                 md5: "3b6e07135431707bf6dacb168126fe9d".into(),
-                changelog: "国际应用源 xAI 官方签名直连".into(),
+                changelog: "国际应用源 xAI 下载链接".into(),
             }],
             vec![],
             vec![],
@@ -3273,7 +3273,7 @@ pub fn curated_catalog() -> Vec<StoreApp> {
                 download_url: "https://pool.apk.aptoide.com/sirkesyone-applikes/com-microsoft-copilot-440922003-76812735-60a87c03c9cadff9761635f868a27f3a.apk".into(),
                 updated_at: "2026-04-09".into(),
                 md5: "60a87c03c9cadff9761635f868a27f3a".into(),
-                changelog: "国际应用源微软官方签名直连".into(),
+                changelog: "国际应用源微软下载链接".into(),
             }],
             vec![],
             vec![],
@@ -3302,7 +3302,7 @@ pub fn curated_catalog() -> Vec<StoreApp> {
                 download_url: "https://pool.apk.aptoide.com/appupdater/com-poe-android-3077006-76666619-b2bc38c7bff9f2017fd58107940a2088.apk".into(),
                 updated_at: "2026-04-08".into(),
                 md5: "b2bc38c7bff9f2017fd58107940a2088".into(),
-                changelog: "国际应用源 Quora 官方签名直连".into(),
+                changelog: "国际应用源 Quora 下载链接".into(),
             }],
             vec![],
             vec![],
@@ -3331,7 +3331,7 @@ pub fn curated_catalog() -> Vec<StoreApp> {
                 download_url: "https://pool.apk.aptoide.com/appupdater/com-openai-sora-2607100-73938065-9b40bd10cf4fb8fc34da6b9224d56477.apk".into(),
                 updated_at: "2026-04-07".into(),
                 md5: "9b40bd10cf4fb8fc34da6b9224d56477".into(),
-                changelog: "国际应用源 OpenAI 官方签名直连".into(),
+                changelog: "国际应用源 OpenAI 下载链接".into(),
             }],
             vec![],
             vec![],
@@ -4356,7 +4356,7 @@ def run_tencent_job(job):
                 except Exception:
                     rating = 0.0
 
-                dev = (it.get("developer") or it.get("operator") or "").strip() or "应用宝认证开发商"
+                dev = (it.get("developer") or it.get("operator") or "").strip() or "开发者未提供"
                 icon_u = (it.get("icon") or "").strip().replace("http://", "https://")
                 if icon_u.endswith(".svg") or "yyb-icon" in icon_u:
                     icon_u = ""
@@ -4623,7 +4623,7 @@ pub fn fetch_online_catalog_from_upstream() -> Result<(Vec<StoreApp>, String, us
         let default_dev = match source {
             StoreSource::Global => "International Developer",
             StoreSource::FDroid => "F-Droid Open Source",
-            _ => "应用宝认证开发商",
+            _ => "开发者未提供",
         };
         let dev = item
             .get("developer")
@@ -4991,7 +4991,7 @@ def search_tencent(q):
                         "version_name": ver or "最新版",
                         "version_code": int(it.get("version_code") or 0),
                         "size_bytes": size_b,
-                        "developer": dev or "应用宝认证开发者",
+                        "developer": dev or "开发者未提供",
                         "icon_url": icon,
                         "download_url": dl,
                         "md5": md5,
@@ -5148,7 +5148,7 @@ pub fn search_multi_source(query: &str) -> Result<Vec<StoreApp>> {
                 let dev = item
                     .get("developer")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("应用宝认证开发者")
+                    .unwrap_or("开发者未提供")
                     .to_string();
                 let icon_url = item
                     .get("icon_url")
@@ -5320,7 +5320,7 @@ pub fn expand_category_catalog_batch(
                     let dev = item
                         .get("developer")
                         .and_then(|v| v.as_str())
-                        .unwrap_or("应用宝认证开发者")
+                        .unwrap_or("开发者未提供")
                         .to_string();
                     let icon_url = item
                         .get("icon_url")
@@ -5808,7 +5808,7 @@ def check_one(pkg):
                             "name": name,
                             "version_name": ver,
                             "size_bytes": sz,
-                            "developer": dev or "应用宝认证开发商",
+                            "developer": dev or "开发者未提供",
                             "icon_url": icon_u,
                             "download_url": dl_u,
                         }

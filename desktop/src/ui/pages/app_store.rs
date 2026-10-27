@@ -66,12 +66,12 @@ fn source_badge_colors(source: StoreSource, p: &Palette) -> (ColorU, ColorU) {
 
 fn source_verify_badge(source: StoreSource, p: &Palette) -> (&'static str, ColorU, ColorU) {
     match source {
-        StoreSource::Official => ("官方直连校验", p.success_text, p.success_soft),
-        StoreSource::Tencent => ("腾讯正版签名", p.blue, blue_soft(p)),
-        StoreSource::Global => ("全球正版签名", p.indigo, indigo_soft(p)),
-        StoreSource::GitHub => ("开源 Release 校验", p.indigo, indigo_soft(p)),
+        StoreSource::Official => ("安装前校验", p.success_text, p.success_soft),
+        StoreSource::Tencent => ("安装前校验", p.blue, blue_soft(p)),
+        StoreSource::Global => ("第三方来源", p.indigo, indigo_soft(p)),
+        StoreSource::GitHub => ("开源发布", p.indigo, indigo_soft(p)),
         StoreSource::FDroid => ("F-Droid 可复现构建", p.warning, p.warning_soft),
-        StoreSource::StepOs => ("StepOS 平台认证", p.text2, p.tag_bg),
+        StoreSource::StepOs => ("平台来源", p.text2, p.tag_bg),
     }
 }
 
@@ -2054,7 +2054,7 @@ impl Companion {
                     ),
                 ),
                 self.line(
-                    "可安装历史旧版；若手机已安装更高版本，支持自动引导卸载并降级重装：",
+                    "历史版本能否覆盖安装由 Android 决定；客户端不会自动卸载或清除应用数据。",
                     MICRO,
                     p.text3,
                 ),
@@ -2126,7 +2126,7 @@ impl Companion {
         let icp_or_sig = if !app.icp_number.trim().is_empty() {
             app.icp_number.trim().to_string()
         } else {
-            "APK V2/V3 签名与完整性校验".to_string()
+            "未提供备案信息".to_string()
         };
 
         let spec_rows = vec![
@@ -2160,7 +2160,7 @@ impl Companion {
             ),
             self.divider(),
             self.store_spec_row(
-                "备案/签名",
+                "备案信息",
                 self.line(icp_or_sig, CAPTION, p.text2),
             ),
         ];
