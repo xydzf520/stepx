@@ -1583,7 +1583,8 @@ fn frame_pacer_loop(
     // Sample actual frames, including zero FPS on a static screen. Never generate fake frames.
     let tick_interval = Duration::from_millis(250);
     let mut window_start = Instant::now();
-    let mut last_seq_seen = 0u64;
+    // Existing buffered frames predate this measurement window.
+    let mut last_seq_seen = shared.0.lock().unwrap().frame_seq;
     let mut bootstrap_attempted = false;
     let started_at = Instant::now();
 
@@ -2947,11 +2948,15 @@ mod tests {
 
     #[test]
     fn static_frames_are_not_repeated_or_reported_as_30_fps() {
-        let state = Arc::new((Mutex::new(SharedStreamState {latest_jpeg: vec![1,2,3], frame_seq: 1, ..Default::default()}), Condvar::new()));
+        let state = Arc::new((Mutex::new(SharedStreamState {latest_jpeg: vec![1,2,3], frame_seq: 1, fps_x10: 300, ..Default::default()}), Condvar::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let shared = state.clone(); let signal = stop.clone();
         let worker = thread::spawn(move || frame_pacer_loop(PathBuf::from("must-not-run-adb"), Arc::new(Mutex::new("fixture".into())), signal, Arc::new(AtomicU8::new(0)), shared, Arc::new(AtomicU64::new(0))));
-        thread::sleep(Duration::from_millis(1100));
+        // Wait for a sample instead of assuming two ticks fit a fixed sleep on CI.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state.0.lock().unwrap().fps_x10 != 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
         stop.store(true, Ordering::Relaxed); worker.join().unwrap();
         let state = state.0.lock().unwrap();
         assert_eq!(state.frame_seq, 1);
