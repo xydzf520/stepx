@@ -92,7 +92,8 @@ final class TransferStore {
         }
         result.sort((a,b)->Long.compare(b.createdAt,a.createdAt));return result;
     }
-    Entry enqueue(Uri uri,Link target)throws Exception {
+    Entry enqueue(Uri uri,Link target)throws Exception {return enqueue(uri,target,false);}
+    Entry enqueue(Uri uri,Link target,boolean workAllowed)throws Exception {
         Link current=link();if(!target.online||!current.online||!current.id.equals(target.id))throw new IOException("电脑连接已变化，请重新选择文件发送");
         String name="文件";long reported=-1;
         try(Cursor cursor=context.getContentResolver().query(uri,new String[]{OpenableColumns.DISPLAY_NAME,OpenableColumns.SIZE},null,null,null)){if(cursor!=null&&cursor.moveToFirst()){int n=cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME),s=cursor.getColumnIndex(OpenableColumns.SIZE);if(n>=0&&!cursor.isNull(n))name=cursor.getString(n);if(s>=0&&!cursor.isNull(s))reported=cursor.getLong(s);}}
@@ -101,11 +102,11 @@ final class TransferStore {
             MessageDigest digest=MessageDigest.getInstance("SHA-256");long size=0;byte[] buffer=new byte[65536];
             try(InputStream in=context.getContentResolver().openInputStream(uri);FileOutputStream out=new FileOutputStream(file)){if(in==null)throw new IOException("无法读取所选文件");int count;while((count=in.read(buffer))!=-1){size+=count;if(size>MAX_BYTES)throw new IOException("单个文件最多支持 256 MB");out.write(buffer,0,count);digest.update(buffer,0,count);}out.getFD().sync();}
             current=link();if(!current.online||!current.id.equals(target.id))throw new IOException("电脑连接已断开，请连接后重新发送");
-            JSONObject manifest=new JSONObject().put("protocol",1).put("id",id).put("name",name).put("size",size).put("sha256",hex(digest.digest())).put("status","queued").put("createdAt",System.currentTimeMillis()).put("targetDesktopId",target.id).put("computerName",target.name);
+            JSONObject manifest=new JSONObject().put("protocol",1).put("id",id).put("name",name).put("size",size).put("sha256",hex(digest.digest())).put("status","queued").put("createdAt",System.currentTimeMillis()).put("targetDesktopId",target.id).put("computerName",target.name).put("workAllowed",workAllowed);
             writeJson(new File(dir,"manifest.json"),manifest);return get("outbox",id);
         }catch(Exception e){deleteDirectory(dir);throw e;}
     }
-    static void writeJson(File f,JSONObject j)throws Exception {File tmp=new File(f.getParentFile(),f.getName()+".tmp");Files.write(tmp.toPath(),j.toString().getBytes(StandardCharsets.UTF_8));Files.move(tmp.toPath(),f.toPath(),StandardCopyOption.ATOMIC_MOVE,StandardCopyOption.REPLACE_EXISTING);}
+    static void writeJson(File f,JSONObject j)throws Exception {File tmp=new File(f.getParentFile(),f.getName()+".tmp");try(FileOutputStream out=new FileOutputStream(tmp)){out.write(j.toString().getBytes(StandardCharsets.UTF_8));out.getFD().sync();}Files.move(tmp.toPath(),f.toPath(),StandardCopyOption.ATOMIC_MOVE,StandardCopyOption.REPLACE_EXISTING);}
     private static String hex(byte[] data){StringBuilder s=new StringBuilder();for(byte b:data)s.append(String.format(Locale.ROOT,"%02x",b&255));return s.toString();}
     File verifiedFile(String direction,String id)throws Exception {
         Entry e=get(direction,id);File payload=new File(directory(direction,id,false),e.name);

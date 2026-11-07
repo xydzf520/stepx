@@ -20,6 +20,14 @@
         },
         "task": {
           "type": "string"
+        },
+        "executionMode": {
+          "type": "string",
+          "enum": [
+            "foreground",
+            "background"
+          ],
+          "description": "foreground 操作手机主屏；background 使用系统 MDI 虚拟屏，需已安装系统适配，失败不自动切到主屏。不绕过锁屏。省略使用伴侣所选模式。"
         }
       },
       "required": [
@@ -69,7 +77,8 @@
                 "swipe",
                 "input",
                 "back",
-                "home"
+                "home",
+                "launch"
               ]
             },
             "x": {
@@ -92,12 +101,88 @@
             },
             "text": {
               "type": "string"
+            },
+            "package": {
+              "type": "string",
+              "description": "当 action.type=launch 时要启动的应用包名。"
             }
           },
           "required": [
             "type"
           ],
           "additionalProperties": false
+        }
+      },
+      "required": [
+        "op"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "stepx_desktop_work",
+    "description": "把用户在 StepX伴侣“交给 Amoo 处理”中选中的手机资料交给已配对电脑。files 列出已授权资料，start(goal,fileIds,requestId) 创建任务（requestId 为 UUID，重试必须复用），电脑使用手机 Amoo 账号规划并用本地工具分析表格、制作文档/PPT，原资料不变，成果校验后回手机。status(task) 查询，cancel(task) 取消。仅 completed 且 files 中 delivered=true 可报告已送达；queued/running 要继续 status，不要只说稍后处理。需要 desktop 在线；不需要公网服务器。不接受任意路径或 shell。 失败或已停止后，用户明确要求重试时调用 retry(task,requestId)，会创建关联的新任务；同一原任务重复 retry 返回同一次重试。cancelling 表示尚未确认停止。",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "op": {
+          "type": "string",
+          "enum": [
+            "files",
+            "start",
+            "status",
+            "cancel",
+            "retry"
+          ]
+        },
+        "goal": {
+          "type": "string"
+        },
+        "requestId": {
+          "type": "string"
+        },
+        "fileIds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "task": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "op"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "stepx_expansion",
+    "description": "查询或按需取回已通过 StepX伴侣无线扩容迁移到配对电脑冷数据仓的手机文件。status 查询无线扩容状态与统计；list 按关键词过滤列出已扩容文件；get(item_id) 查询单个扩容文件元数据；request(item_id) 请求从已连接电脑取回并恢复原件到手机。",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "op": {
+          "type": "string",
+          "enum": [
+            "status",
+            "list",
+            "get",
+            "request"
+          ]
+        },
+        "item_id": {
+          "type": "string",
+          "description": "当 op=get 或 op=request 时目标扩容文件的唯一标识 ID。"
+        },
+        "query": {
+          "type": "string",
+          "description": "当 op=list 时按文件名、路径或类型筛选的可选关键词。"
+        },
+        "limit": {
+          "type": "integer",
+          "description": "当 op=list 时返回的最大条目数（默认 20，最大 100）。"
         }
       },
       "required": [

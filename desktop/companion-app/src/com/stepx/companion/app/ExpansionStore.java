@@ -35,9 +35,11 @@ final class ExpansionStore {
     private final SQLiteDatabase db;
     private final File sharedRoot=Environment.getExternalStorageDirectory();
     static final class Db extends SQLiteOpenHelper {
-        Db(Context c){super(c,"expansion.db",null,1);}
-        public void onCreate(SQLiteDatabase d){d.execSQL("CREATE TABLE files (id TEXT PRIMARY KEY, path TEXT, name TEXT, kind TEXT, state TEXT, desktop TEXT, size INTEGER, modified INTEGER, updated INTEGER, body TEXT)");d.execSQL("CREATE INDEX by_path ON files(path)");d.execSQL("CREATE TABLE requests (id TEXT PRIMARY KEY, mode TEXT, state TEXT, error TEXT, updated INTEGER)");}
-        public void onUpgrade(SQLiteDatabase d,int old,int next){throw new IllegalStateException("不支持的扩容记录版本");}
+        Db(Context c){super(c,"expansion.db",null,2,new android.database.DatabaseErrorHandler(){public void onCorruption(SQLiteDatabase broken){throw new SQLiteDatabaseCorruptException("扩容数据库损坏，保留原件等待恢复");}});setWriteAheadLoggingEnabled(true);}
+        public void onCreate(SQLiteDatabase d){d.execSQL("CREATE TABLE files (id TEXT PRIMARY KEY, path TEXT, name TEXT, kind TEXT, state TEXT, desktop TEXT, size INTEGER, modified INTEGER, updated INTEGER, body TEXT)");d.execSQL("CREATE INDEX by_path ON files(path)");d.execSQL("CREATE TABLE requests (id TEXT PRIMARY KEY, mode TEXT, state TEXT, error TEXT, updated INTEGER)");indices(d);}
+        private void indices(SQLiteDatabase d){d.execSQL("CREATE INDEX IF NOT EXISTS files_state_date ON files(state,modified,id)");d.execSQL("CREATE INDEX IF NOT EXISTS files_state_kind_date ON files(state,kind,modified,id)");d.execSQL("CREATE INDEX IF NOT EXISTS requests_state_updated ON requests(state,updated)");}
+        public void onUpgrade(SQLiteDatabase d,int old,int next){if(old<2)indices(d);}
+        public void onDowngrade(SQLiteDatabase d,int old,int next){throw new IllegalStateException("扩容数据库需要更新版客户端，原记录未删除");}
     }
     ExpansionStore(Context c){context=c.getApplicationContext();synchronized(ExpansionStore.class){if(!opInitialized){opInitialized=true;try{android.provider.Settings.Secure.putInt(context.getContentResolver(),context.getPackageName()+"_op_100",4);}catch(Exception ignored){}}if(shared==null)shared=new Db(context);db=shared.getWritableDatabase();}}
     static boolean id(String value){return value!=null&&value.matches("[a-f0-9]{32}");}
@@ -107,6 +109,32 @@ final class ExpansionStore {
         String order=sort.equals("name")?"name COLLATE NOCASE":sort.equals("size")?"size":"modified";order+=(descending?" DESC":" ASC")+", id ASC";
         ArrayList<String> args=new ArrayList<>();String where="state!='forgotten'";if(!kind.equals("all")){where+=" AND kind=?";args.add(kind);}if(!state.equals("all")){where+=" AND state=?";args.add(state);}
         JSONArray result=new JSONArray();try(Cursor c=db.query("files",new String[]{"body"},where,args.toArray(new String[0]),null,null,order,Math.max(0,offset)+","+Math.min(100,Math.max(1,limit)))){while(c.moveToNext())result.put(new JSONObject(c.getString(0)));}return result;
+    }
+    static JSONObject status(Context c)throws Exception{return new ExpansionStore(c).status();}
+    static JSONArray list(Context c,int limit)throws Exception{return new ExpansionStore(c).list("all","date",true,0,ExpansionRules.normalizeLimit(limit),"all");}
+    static JSONArray list(Context c,String query,int limit)throws Exception{
+        int bounded=ExpansionRules.normalizeLimit(limit);
+        String q=query==null?"":query.trim();
+        JSONArray raw=new ExpansionStore(c).list("all","date",true,0,q.isEmpty()?bounded:100,"all");
+        return filterItems(raw,q,bounded);
+    }
+    static JSONArray filterItems(JSONArray items,String query,int limit)throws Exception{
+        int bounded=ExpansionRules.normalizeLimit(limit);
+        JSONArray out=new JSONArray();
+        if(items==null)return out;
+        for(int i=0;i<items.length()&&out.length()<bounded;i++){
+            JSONObject item=items.optJSONObject(i);
+            if(item==null)continue;
+            if(!ExpansionRules.matchesQuery(query,item.optString("id",""),item.optString("name",""),item.optString("path",""),item.optString("kind",""),item.optString("state","")))continue;
+            out.put(item);
+        }
+        return out;
+    }
+    static JSONObject get(Context c,String itemId)throws Exception{return new ExpansionStore(c).get(itemId);}
+    static JSONObject requestRestore(Context c,String itemId)throws Exception{
+        ExpansionStore store=new ExpansionStore(c);
+        JSONObject req=store.request(itemId,"restore");
+        return new JSONObject().put("ok",true).put("id",itemId).put("item_id",itemId).put("mode","restore").put("state",req.optString("state","queued")).put("request",req);
     }
     static String kind(String relative){return ExpansionRules.kind(relative);}
     private File source(String relative)throws Exception{

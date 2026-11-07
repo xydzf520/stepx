@@ -19,9 +19,12 @@ public final class AmooConnectionService extends Service {
     private static final String NATIVE_PACKAGE="com.stepos.agentbus";
     private static final String NATIVE_PATH="/system/priv-app/AgentBus/AgentBus.apk";
     private static final String NATIVE_SHA="50a1bbd6af20d1cceff335e2336cff04e08d3718cf4cad581a86954c354f2a48";
+    private static final String NATIVE_SHA_12="e89a65e1a153e87fdec850caffe9a19db4ed70244754e847e0c512c540a902f8";
     private static final String FINGERPRINT="StepX/pandora/pandora:16/BQ2A.260122.002-BP2A.250705.008/172:user/release-keys";
+    private static final String FINGERPRINT_12="StepX/pandora/pandora:16/BQ2A.260122.002-BP2A.250705.008/12:user/release-keys";
     private static final String MESSAGE_PERMISSION="com.stepos.cloud.push.permission.MESSAGE";
-    private static final String[] PERMISSIONS={"com.stepos.permission.MANAGE_BACK_SCREEN","android.permission.MANAGE_DEBUGGING","android.permission.WRITE_SECURE_SETTINGS","android.permission.CAMERA","android.permission.POST_NOTIFICATIONS","android.permission.READ_PHONE_STATE","android.permission.WAKE_LOCK","android.permission.FOREGROUND_SERVICE","android.permission.FOREGROUND_SERVICE_SPECIAL_USE","android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE","android.permission.INTERNET","android.permission.ACCESS_NETWORK_STATE","android.permission.ACCESS_WIFI_STATE","android.permission.CHANGE_NETWORK_STATE",MESSAGE_PERMISSION};
+    // Background connectivity is independent of camera, pairing and back-screen access.
+    private static final String[] PERMISSIONS={"com.stepos.cloud.push.permission.MESSAGE","android.permission.WAKE_LOCK","android.permission.FOREGROUND_SERVICE","android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE","android.permission.INTERNET","android.permission.ACCESS_NETWORK_STATE","android.permission.ACCESS_WIFI_STATE","android.permission.CHANGE_NETWORK_STATE"};
     static boolean permissionsGranted(Context context){for(String permission:PERMISSIONS)if(context.checkSelfPermission(permission)!=PackageManager.PERMISSION_GRANTED)return false;return true;}
     private final Handler main=new Handler(Looper.getMainLooper());
     private final AmooLeaseState leases=new AmooLeaseState();
@@ -30,6 +33,7 @@ public final class AmooConnectionService extends Service {
     private Handler worker;
     private PowerManager power;
     private PowerManager.WakeLock cpu;
+    private android.net.wifi.WifiManager.WifiLock wifiLock;
     private SharedPreferences preferences;
     private boolean supported,registered;
     private volatile boolean closed;
@@ -50,10 +54,16 @@ public final class AmooConnectionService extends Service {
     @Override public void onCreate(){
         super.onCreate();
         power=getSystemService(PowerManager.class);cpu=power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,"StepX:amoo-task");cpu.setReferenceCounted(false);
+        try{
+            android.net.wifi.WifiManager wm=getSystemService(android.net.wifi.WifiManager.class);
+            if(wm!=null){wifiLock=wm.createWifiLock(android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF,"StepX:amoo-wifi");wifiLock.setReferenceCounted(false);}
+        }catch(Exception ignored){}
         preferences=getSharedPreferences("amoo_connection",0);
         bootCount=Settings.Global.getInt(getContentResolver(),"boot_count",-1);
-        if(bootCount>=0&&preferences.getInt("wake_boot",-2)==bootCount)leases.restoreWake(preferences.getLong("wake_elapsed",-1),SystemClock.elapsedRealtime());
-        leases.screen(power.isInteractive(),SystemClock.elapsedRealtime());
+        long nowElapsed=SystemClock.elapsedRealtime();
+        if(bootCount>=0&&preferences.getInt("wake_boot",-2)==bootCount)leases.restoreWake(preferences.getLong("wake_elapsed",-1),nowElapsed);
+        boolean interactive=power.isInteractive();
+        leases.screen(interactive,interactive?nowElapsed:Math.max(0L,nowElapsed-AmooLeaseState.OFF_SETTLE_MS));
         getSystemService(NotificationManager.class).createNotificationChannel(new NotificationChannel("amoo_connection","电脑后台协作",NotificationManager.IMPORTANCE_LOW));
         lastNotifiedText="正在检查任务连接…";
         startForeground(18,notification(lastNotifiedText));
@@ -79,13 +89,14 @@ public final class AmooConnectionService extends Service {
     private static String bounded(String value,String fallback){if(value==null)return fallback;return value.substring(0,Math.min(value.length(),100));}
     private boolean enabled(){return preferences.getBoolean("enabled",true);}
     private void verify() throws Exception {
-        if(Build.VERSION.SDK_INT!=36||!FINGERPRINT.equals(Build.FINGERPRINT))throw new SecurityException("当前手机固件尚未完成后台协作适配");
+        if(Build.VERSION.SDK_INT!=36||(!FINGERPRINT.equals(Build.FINGERPRINT)&&!FINGERPRINT_12.equals(Build.FINGERPRINT)))throw new SecurityException("当前手机固件尚未完成后台协作适配");
         ApplicationInfo app=getPackageManager().getApplicationInfo(NATIVE_PACKAGE,0);
         if(app.uid!=1000||!NATIVE_PATH.equals(app.sourceDir))throw new SecurityException("Amoo 原生服务身份发生变化");
         if(!supported){
             MessageDigest digest=MessageDigest.getInstance("SHA-256");try(InputStream in=new FileInputStream(NATIVE_PATH)){byte[] b=new byte[65536];int n;while((n=in.read(b))>0)digest.update(b,0,n);}
             StringBuilder hash=new StringBuilder();for(byte b:digest.digest())hash.append(String.format(java.util.Locale.ROOT,"%02x",b&255));
-            if(!NATIVE_SHA.equals(hash.toString()))throw new SecurityException("Amoo 原生服务版本已变化，请先更新适配");
+            String actualSha=hash.toString();
+            if(!NATIVE_SHA.equals(actualSha)&&!NATIVE_SHA_12.equals(actualSha))throw new SecurityException("Amoo 原生服务版本已变化，请先更新适配");
             ActivityInfo receiver=getPackageManager().getReceiverInfo(new ComponentName(NATIVE_PACKAGE,NATIVE_PACKAGE+".push.PushReceiver"),0);
             if(!receiver.exported||!receiver.enabled||!MESSAGE_PERMISSION.equals(receiver.permission))throw new SecurityException("Amoo 受保护后台入口不匹配");
         }
@@ -130,6 +141,7 @@ public final class AmooConnectionService extends Service {
             try{
                 verify();
                 cpu.acquire(Math.min(AmooLeaseState.TTL_MS+5_000,Math.max(1,leases.expires(now)-now+5_000)));
+                if(wifiLock!=null&&!wifiLock.isHeld())try{wifiLock.acquire();}catch(Exception ignored){}
                 long delay=leases.wakeDelay(power.isInteractive(),now);
                 if(!closed&&delay==0&&mayRequest(now)){
                     Intent wake=new Intent("com.stepos.push.intent.MESSAGE").setComponent(new ComponentName(NATIVE_PACKAGE,NATIVE_PACKAGE+".push.PushReceiver"));
@@ -142,6 +154,7 @@ public final class AmooConnectionService extends Service {
             }catch(Exception e){lastError=message(e);if(e instanceof SecurityException)supported=false;leases.clear();active=false;}
         }else leases.screen(power.isInteractive(),now);
         if(!active&&cpu.isHeld())cpu.release();
+        if(!active&&wifiLock!=null&&wifiLock.isHeld())try{wifiLock.release();}catch(Exception ignored){}
         long grace=supported?leases.idleGraceRemaining(enabled(),power.isInteractive(),now):0;
         String msg=statusMessage(now);
         String curState=(active?"connected":(grace>0?"grace":"idle"))+":"+enabled()+":"+supported+":"+power.isInteractive()+":"+requestId;
@@ -189,6 +202,6 @@ public final class AmooConnectionService extends Service {
         lastWrittenState=curState;lastWrittenMessage=msg;lastLeaseCount=curLeaseCount;lastWriteMs=now;
     }catch(Exception e){lastError=message(e);android.util.Log.e("StepXAmoo","Cannot write task state: "+e.getClass().getSimpleName());}}
     private static String message(Exception e){String text=e.getMessage();return text==null?e.getClass().getSimpleName():text;}
-    @Override public void onDestroy(){closed=true;if(registered)unregisterReceiver(screen);if(worker!=null)worker.removeCallbacksAndMessages(null);if(cpu!=null&&cpu.isHeld())cpu.release();if(workerThread!=null)workerThread.quitSafely();super.onDestroy();}
+    @Override public void onDestroy(){closed=true;if(registered)unregisterReceiver(screen);if(worker!=null)worker.removeCallbacksAndMessages(null);if(cpu!=null&&cpu.isHeld())cpu.release();if(wifiLock!=null&&wifiLock.isHeld())try{wifiLock.release();}catch(Exception ignored){}if(workerThread!=null)workerThread.quitSafely();super.onDestroy();}
     @Override public IBinder onBind(Intent intent){return null;}
 }

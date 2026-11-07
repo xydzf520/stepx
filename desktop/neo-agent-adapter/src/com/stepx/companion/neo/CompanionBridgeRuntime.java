@@ -84,7 +84,24 @@ final class CompanionBridgeRuntime {
     }
     synchronized JSONObject request(JSONObject q) {
         try {
-            switch (q.optString("op")) {
+            CompanionMdiRuntime mdi=CompanionMdiRuntime.get(context);
+            String op=q.optString("op");
+            if(op.equals("start")&&"background".equals(q.optString("executionMode"))){
+                require(!busy(),"busy","请先结束手机前台任务");
+                refreshFullScope(Config.load(context));
+                JSONObject result;try{result=mdi.request(q);}
+                catch(Exception e){return CompanionBridgeProvider.failure("mdi_not_ready",PrivateText.redact(String.valueOf(e.getMessage())));}
+                context.getSharedPreferences("mdi-route",0).edit().putBoolean("last",true).commit();
+                return result;
+            }
+            if(java.util.Arrays.asList("status","pause","resume","stop").contains(op)
+                &&mdi.hasRecord()&&context.getSharedPreferences("mdi-route",0).getBoolean("last",false))return mdi.request(q);
+            if(op.equals("start")){
+                require(!mdi.active(),"busy","请先结束后台虚拟屏任务");
+                context.getSharedPreferences("mdi-route",0).edit().putBoolean("last",false).commit();
+            }
+            switch (op) {
+                case "mdi_probe": return CompanionMdiBus.probe();
                 case "host_ui": CompanionHostSurface.update(q.optBoolean("visible"));return new JSONObject().put("ok",true);
                 case "status": return status();
                 case "config": return configure(q);
@@ -107,7 +124,7 @@ final class CompanionBridgeRuntime {
     }
     private boolean busy() {
         ControlService service = ControlService.instance;
-        return record.optString("state").equals("planning") || (service != null && service.busy());
+        return CompanionMdiRuntime.get(context).active() || record.optString("state").equals("planning") || (service != null && service.busy());
     }
     private JSONObject configure(JSONObject q) throws Exception {
         if (!q.has("endpoint") && !q.has("model") && !q.has("key")) return publicConfig();

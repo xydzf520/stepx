@@ -17,6 +17,7 @@ public final class PairingBridgeProvider extends ContentProvider {
     private static volatile String ownedPairingId="";
     private static volatile long pairingStarted;
     private static volatile boolean nativePortReady;
+    private static volatile String lastPublishedStatus=null;
     private HandlerThread resultsThread;
     @Override public boolean onCreate(){
         resultsThread=new HandlerThread("StepXPairingResults");resultsThread.start();Handler results=new Handler(resultsThread.getLooper());
@@ -45,11 +46,16 @@ public final class PairingBridgeProvider extends ContentProvider {
         try{
             if(!DESCRIPTOR.equals(candidate.getInterfaceDescriptor()))throw new SecurityException("Wrong pairing interface");
             JSONObject status=exchange(candidate,pid,uid,new JSONObject().put("op","pairing_status"));
+            String statusKey=status==null?"":status.toString();
+            boolean changed=false;
             synchronized(PairingBridgeProvider.class){
-                if(service!=candidate){candidate.linkToDeath(()->invalidate(getContext(),candidate),0);service=candidate;servicePid=pid;serviceUid=uid;}
+                if(service!=candidate){candidate.linkToDeath(()->invalidate(getContext(),candidate),0);service=candidate;servicePid=pid;serviceUid=uid;changed=true;}
+                if(!statusKey.equals(lastPublishedStatus)){lastPublishedStatus=statusKey;changed=true;}
             }
-            publish(getContext(),status);
-            AutoConnectService.resume(getContext());
+            if(changed){
+                publish(getContext(),status);
+                AutoConnectService.resume(getContext());
+            }
             Bundle answer=new Bundle();answer.putBoolean("accepted",true);return answer;
         }catch(Exception e){throw new IllegalStateException("Unable to verify scoped pairing service",e);}finally{Binder.restoreCallingIdentity(identity);}
     }
@@ -65,6 +71,21 @@ public final class PairingBridgeProvider extends ContentProvider {
             return result;
         }catch(Exception error){if(begin)ownedPairingId="";throw error;}
     }
+    /** In-process adapter API; Binder donation is verified on every registration. */
+    public static JSONObject mdi(JSONObject request)throws Exception {
+        IBinder target; synchronized(PairingBridgeProvider.class){target=service;}
+        if(target==null||!target.isBinderAlive())throw new IOException("MDI 系统服务未连接，请从电脑更新伴侣服务");
+        Parcel data=Parcel.obtain(),reply=Parcel.obtain();
+        try {
+            data.writeInterfaceToken(DESCRIPTOR);data.writeString(request.toString());
+            if(!target.transact(IBinder.FIRST_CALL_TRANSACTION+1,data,reply,0))throw new IOException("MDI 需要更新伴侣系统服务");
+            reply.readException();String raw=reply.readString();
+            if(raw==null||raw.length()>700000)throw new IOException("MDI 返回无效");
+            JSONObject value=new JSONObject(raw);
+            if(!value.optBoolean("ok"))throw new IOException(value.optString("error","MDI 执行失败"));
+            return value;
+        }finally{data.recycle();reply.recycle();}
+    }
     private static JSONObject exchange(IBinder target,int pid,int uid,JSONObject request)throws Exception{
         Parcel data=Parcel.obtain(),reply=Parcel.obtain();
         try{
@@ -77,7 +98,7 @@ public final class PairingBridgeProvider extends ContentProvider {
         }finally{data.recycle();reply.recycle();}
     }
     private static void invalidate(Context context,IBinder expected){
-        synchronized(PairingBridgeProvider.class){if(service!=expected)return;service=null;servicePid=0;serviceUid=0;ownedPairingId="";}
+        synchronized(PairingBridgeProvider.class){if(service!=expected)return;service=null;servicePid=0;serviceUid=0;ownedPairingId="";lastPublishedStatus=null;}
         publish(context,null);
     }
     private static void publish(Context context,JSONObject status){try{

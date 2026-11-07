@@ -134,6 +134,20 @@ final class DialTools {
             .put("account_key", accountKey(handle));
     }
 
+    static JSONObject control(JSONObject request) throws Exception {
+        TelecomManager manager = telecom();
+        boolean ringing = (Boolean)TelecomManager.class.getMethod("isRinging").invoke(manager);
+        String state = ringing ? "ringing" : manager.isInCall() ? "active" : "idle";
+        if (!state.equals(request.getString("state")) || "idle".equals(state))
+            throw new IllegalStateException("通话状态已变化，请刷新后重试");
+        String action = request.getString("action");
+        if ("answer".equals(action) && ringing) manager.acceptRingingCall();
+        else if ("hangup".equals(action)) {
+            if (!manager.endCall()) throw new IllegalStateException("手机未接受挂断请求");
+        } else throw new IllegalArgumentException("当前通话不支持此操作");
+        return new JSONObject().put("submitted", true);
+    }
+
     static JSONObject call(JSONObject request) throws Exception {
         String id = request.getString("id");
         if (!id.matches("[a-f0-9]{32}")) throw new IllegalArgumentException("呼叫请求标识无效");

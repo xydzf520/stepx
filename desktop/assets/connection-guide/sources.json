@@ -1,0 +1,39 @@
+{
+  "author": "Google / Android Developers",
+  "license": "CC BY 4.0",
+  "license_url": "https://creativecommons.org/licenses/by/4.0/",
+  "retrieved_on": "2026-11-07",
+  "description": "Real official device screenshots, not screenshots of the currently attached PZ261A. Cropped only to remove surrounding rows; no controls or text regenerated. Chinese steps are rendered separately by the app.",
+  "images": {
+    "build-number.png": {
+      "url": "https://developer.android.com/static/codelabs/basic-android-kotlin-compose-connect-device/img/fc5ee039dab58109.png",
+      "page": "https://developer.android.com/codelabs/basic-android-kotlin-compose-connect-device",
+      "crop": null
+    },
+    "usb-debugging.png": {
+      "url": "https://developer.android.com/static/codelabs/basic-android-kotlin-compose-connect-device/img/cfc535f28f645d95.png",
+      "page": "https://developer.android.com/codelabs/basic-android-kotlin-compose-connect-device",
+      "crop": [
+        92,
+        390,
+        751,
+        526
+      ]
+    },
+    "allow-usb.png": {
+      "url": "https://developer.android.com/static/codelabs/basic-android-kotlin-compose-connect-device/img/ade9c70a580ffbee.png",
+      "page": "https://developer.android.com/codelabs/basic-android-kotlin-compose-connect-device",
+      "crop": null
+    },
+    "wireless-setting.png": {
+      "url": "https://developer.android.com/static/studio/images/run/adb_wifi-wireless_debugging_setting.png",
+      "page": "https://developer.android.com/studio/run/device",
+      "crop": [
+        0,
+        0,
+        365,
+        412
+      ]
+    }
+  }
+}

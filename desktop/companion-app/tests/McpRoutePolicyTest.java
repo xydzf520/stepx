@@ -5,8 +5,19 @@ public final class McpRoutePolicyTest {
     public static void main(String[] args){
         check(McpRoutePolicy.visible("stepx_gui_control",false));
         check(McpRoutePolicy.visible("stepx_gui_agent",false));
+        check(McpRoutePolicy.visible("stepx_desktop_work",false));
+        check(McpRoutePolicy.visible("stepx_expansion",false));
         check(!McpRoutePolicy.visible("stepx_gui_control",true));
         check(McpRoutePolicy.visible("stepx_gui_agent",true));
+        check(McpRoutePolicy.visible("stepx_desktop_work",true));
+        check(McpRoutePolicy.visible("stepx_expansion",true));
+        check(!McpRoutePolicy.visible("unknown_tool",false));
+        check(!McpRoutePolicy.visible(null,false));
+        for(String op:new String[]{"status","list","get","request"}){
+            check(McpRoutePolicy.isExpansionOperation(op));
+        }
+        check(!McpRoutePolicy.isExpansionOperation("delete"));
+        check(!McpRoutePolicy.isExpansionOperation(null));
         for(String op:new String[]{"status","stop"})check(McpRoutePolicy.legacyOperation(op,true));
         for(String op:new String[]{"start","observe","action","pause","resume"}){
             check(McpRoutePolicy.legacyOperation(op,false));

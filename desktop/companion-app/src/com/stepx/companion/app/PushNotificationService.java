@@ -8,6 +8,13 @@ import android.content.ComponentName;
 import android.content.ContentResolver;
 import android.content.Context;
 import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.Path;
+import android.graphics.RectF;
+import android.graphics.drawable.BitmapDrawable;
+import android.graphics.drawable.Drawable;
+import android.graphics.drawable.Icon;
 import android.net.Credentials;
 import android.net.LocalServerSocket;
 import android.net.LocalSocket;
@@ -22,9 +29,11 @@ import android.os.Process;
 import android.provider.Settings;
 import android.service.notification.NotificationListenerService;
 import android.service.notification.StatusBarNotification;
+import android.util.Base64;
 import org.json.JSONObject;
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
+import java.io.ByteArrayOutputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
 import java.nio.charset.StandardCharsets;
@@ -48,6 +57,7 @@ public final class PushNotificationService extends NotificationListenerService {
     private ConnectivityManager.NetworkCallback wifiCallback;
     private final CopyOnWriteArrayList<BufferedWriter> streamClients = new CopyOnWriteArrayList<BufferedWriter>();
     private final ExecutorService deltaExecutor = Executors.newSingleThreadExecutor();
+    private PhoneCallMonitor callMonitor;
 
     public static boolean isConnected() {
         return instance != null;
@@ -97,12 +107,14 @@ public final class PushNotificationService extends NotificationListenerService {
             } catch (Exception ignored) {
             }
         }
-        JSONObject delta = PushStore.get(context).onNotificationRemoved(
+        PushStore store = PushStore.get(context);
+        JSONObject delta = store.onNotificationRemoved(
             trimmed, NotificationListenerService.REASON_CANCEL, System.currentTimeMillis()
         );
         if (svc != null && delta != null) {
             svc.broadcastDelta(delta);
         }
+        SmartBackScreenController.get(context).onNotificationsUpdated(context, store);
     }
 
     public static int dismissAllNotifications(Context context, String categoryFilter) throws Exception {
@@ -131,7 +143,55 @@ public final class PushNotificationService extends NotificationListenerService {
         } finally {
             store.endBatch();
         }
+        SmartBackScreenController.get(context).onNotificationsUpdated(context, store);
         return count;
+    }
+
+    public static JSONObject postLiveCapsule(Context context, JSONObject q) throws Exception {
+        return PushControlProvider.postLiveCapsule(context, q);
+    }
+
+    public static JSONObject dismissLiveCapsule(Context context, String tag) throws Exception {
+        JSONObject res = PushControlProvider.dismissLiveCapsule(context, tag);
+        PushNotificationService svc = instance;
+        if (svc != null && tag != null && !tag.trim().isEmpty()) {
+            try {
+                StatusBarNotification[] active = svc.getActiveNotifications();
+                if (active != null) {
+                    for (StatusBarNotification sbn : active) {
+                        if (sbn != null
+                                && "com.stepx.companion.app".equals(sbn.getPackageName())
+                                && sbn.getId() == PushControlProvider.LIVE_CAPSULE_NOTIFICATION_ID
+                                && tag.trim().equals(sbn.getTag())) {
+                            svc.cancelNotification(sbn.getKey());
+                        }
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        return res;
+    }
+
+    public static JSONObject clearLiveCapsules(Context context) throws Exception {
+        JSONObject res = PushControlProvider.clearLiveCapsules(context);
+        PushNotificationService svc = instance;
+        if (svc != null) {
+            try {
+                StatusBarNotification[] active = svc.getActiveNotifications();
+                if (active != null) {
+                    for (StatusBarNotification sbn : active) {
+                        if (sbn != null
+                                && "com.stepx.companion.app".equals(sbn.getPackageName())
+                                && sbn.getId() == PushControlProvider.LIVE_CAPSULE_NOTIFICATION_ID) {
+                            svc.cancelNotification(sbn.getKey());
+                        }
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        return res;
     }
 
     @Override
@@ -139,6 +199,10 @@ public final class PushNotificationService extends NotificationListenerService {
         super.onListenerConnected();
         instance = this;
         running = true;
+        if (callMonitor != null) callMonitor.stop();
+        callMonitor = new PhoneCallMonitor(this);
+        callMonitor.start();
+        BatteryStateCache.start(this);
         startSocketServer();
         registerWifiSelfHealCallback();
         scanActiveNotifications();
@@ -146,6 +210,9 @@ public final class PushNotificationService extends NotificationListenerService {
 
     @Override
     public void onListenerDisconnected() {
+        if (callMonitor != null) callMonitor.stop();
+        BatteryStateCache.stop();
+        PushStore.get(this).recordListenerGap();
         if (instance == this) {
             instance = null;
         }
@@ -156,6 +223,9 @@ public final class PushNotificationService extends NotificationListenerService {
 
     @Override
     public void onDestroy() {
+        if (callMonitor != null) callMonitor.stop();
+        BatteryStateCache.stop();
+        PushStore.get(this).recordListenerGap();
         running = false;
         if (instance == this) {
             instance = null;
@@ -169,18 +239,24 @@ public final class PushNotificationService extends NotificationListenerService {
     public void scanActiveNotifications() {
         try {
             StatusBarNotification[] active = getActiveNotifications();
-            if (active == null || active.length == 0) return;
+            if (active == null) return;
             PushStore store = PushStore.get(this);
+            java.util.Set<String> activeKeys = new java.util.HashSet<String>();
             store.beginBatch();
             try {
                 for (StatusBarNotification sbn : active) {
                     if (sbn != null) {
+                        if (sbn.getKey() != null && !sbn.getKey().isEmpty()) {
+                            activeKeys.add(sbn.getKey());
+                        }
                         ingestStatusBarNotification(sbn, false);
                     }
                 }
+                store.reconcileActiveNotifications(activeKeys, System.currentTimeMillis());
             } finally {
                 store.endBatch();
             }
+            SmartBackScreenController.get(this).onNotificationsUpdated(this, store);
         } catch (Exception ignored) {
         }
     }
@@ -188,6 +264,7 @@ public final class PushNotificationService extends NotificationListenerService {
     @Override
     public void onNotificationPosted(StatusBarNotification sbn) {
         if (sbn == null) return;
+        if ("com.stepx.companion.app".equals(sbn.getPackageName())) return;
         acquireShortWakeLock();
         ingestStatusBarNotification(sbn, true);
     }
@@ -196,12 +273,14 @@ public final class PushNotificationService extends NotificationListenerService {
     public void onNotificationRemoved(StatusBarNotification sbn, RankingMap rankingMap, int reason) {
         if (sbn == null) return;
         try {
-            JSONObject delta = PushStore.get(this).onNotificationRemoved(
+            PushStore store = PushStore.get(this);
+            JSONObject delta = store.onNotificationRemoved(
                 sbn.getKey(), reason, System.currentTimeMillis()
             );
             if (delta != null) {
                 broadcastDelta(delta);
             }
+            SmartBackScreenController.get(this).onNotificationsUpdated(this, store);
         } catch (Exception ignored) {
         }
     }
@@ -229,6 +308,7 @@ public final class PushNotificationService extends NotificationListenerService {
         try {
             Notification n = sbn.getNotification();
             if (n == null) return;
+            if (callMonitor != null) callMonitor.notification(sbn.getPackageName(), n);
 
             String pkg = sbn.getPackageName() == null ? "" : sbn.getPackageName();
             if ("com.stepx.companion.app".equals(pkg)) return;
@@ -245,6 +325,9 @@ public final class PushNotificationService extends NotificationListenerService {
             String subText = "";
             boolean isGroup = false;
             boolean hasProgress = false;
+            int progressCurrent = 0;
+            int progressMax = 0;
+            boolean progressIndeterminate = false;
             List<PushStore.StyleMessage> styleMessages = new ArrayList<PushStore.StyleMessage>();
 
             if (extras != null) {
@@ -258,11 +341,13 @@ public final class PushNotificationService extends NotificationListenerService {
                 }
                 isGroup = extras.getBoolean(Notification.EXTRA_IS_GROUP_CONVERSATION, false)
                     || !conversationTitle.isEmpty();
-                int progressMax = extras.getInt(Notification.EXTRA_PROGRESS_MAX, 0);
-                boolean progressIndeterminate = extras.getBoolean(Notification.EXTRA_PROGRESS_INDETERMINATE, false);
+                progressCurrent = extras.getInt(Notification.EXTRA_PROGRESS, 0);
+                progressMax = extras.getInt(Notification.EXTRA_PROGRESS_MAX, 0);
+                progressIndeterminate = extras.getBoolean(Notification.EXTRA_PROGRESS_INDETERMINATE, false);
                 hasProgress = progressMax > 0 || progressIndeterminate;
 
                 // Extract MessagingStyle messages (EXTRA_MESSAGES)
+                String selfDisplayName = charSeqToString(extras.getCharSequence("android.selfDisplayName"));
                 Parcelable[] rawMsgs = extras.getParcelableArray(Notification.EXTRA_MESSAGES);
                 if (rawMsgs != null && rawMsgs.length > 0) {
                     for (Parcelable p : rawMsgs) {
@@ -270,15 +355,21 @@ public final class PushNotificationService extends NotificationListenerService {
                             Bundle mb = (Bundle) p;
                             String mText = charSeqToString(mb.getCharSequence("text"));
                             String mSender = charSeqToString(mb.getCharSequence("sender"));
-                            if (mSender.isEmpty()) {
-                                Parcelable personObj = mb.getParcelable("sender_person");
-                                if (personObj instanceof Person) {
-                                    mSender = charSeqToString(((Person) personObj).getName());
-                                }
+                            Parcelable personObj = mb.getParcelable("sender_person");
+                            if (mSender.isEmpty() && personObj instanceof Person) {
+                                mSender = charSeqToString(((Person) personObj).getName());
+                            }
+                            boolean isSelfReply = (mSender.isEmpty() && personObj == null)
+                                || "我".equals(mSender)
+                                || "Me".equalsIgnoreCase(mSender)
+                                || "自己".equals(mSender)
+                                || (!selfDisplayName.isEmpty() && selfDisplayName.equals(mSender));
+                            if (isSelfReply) {
+                                mSender = "我";
                             }
                             long mTime = mb.getLong("time", postTimeMs);
                             if (!mText.isEmpty()) {
-                                styleMessages.add(new PushStore.StyleMessage(mSender, mText, mTime));
+                                styleMessages.add(new PushStore.StyleMessage(mSender, mText, mTime, isSelfReply));
                             }
                         }
                     }
@@ -320,8 +411,11 @@ public final class PushNotificationService extends NotificationListenerService {
                 n, sbnKey, pkg, !conversationTitle.isEmpty() ? conversationTitle : title, postTimeMs
             );
 
+            String avatarB64 = extractNotificationAvatarBase64(n, extras);
+
             String appName = ImAppCatalog.appDisplayName(this, pkg);
-            JSONObject delta = PushStore.get(this).ingestNotification(
+            PushStore store = PushStore.get(this);
+            JSONObject delta = store.ingestNotification(
                 sbnKey,
                 pkg,
                 appName,
@@ -336,13 +430,110 @@ public final class PushNotificationService extends NotificationListenerService {
                 hasProgress,
                 styleMessages,
                 replyHandle,
-                n.contentIntent
+                n.contentIntent,
+                avatarB64,
+                progressCurrent,
+                progressMax,
+                progressIndeterminate
             );
 
-            if (broadcast && delta != null) {
-                broadcastDelta(delta);
+            if (broadcast) {
+                if (delta != null) {
+                    broadcastDelta(delta);
+                }
+                SmartBackScreenController.get(this).onNotificationsUpdated(this, store);
             }
         } catch (Exception ignored) {
+        }
+    }
+
+    private String extractNotificationAvatarBase64(Notification n, Bundle extras) {
+        if (n == null) return "";
+        try {
+            // 1. Latest MessagingStyle.Message sender Person.getIcon()
+            if (extras != null) {
+                Parcelable[] rawMsgs = extras.getParcelableArray(Notification.EXTRA_MESSAGES);
+                if (rawMsgs != null && rawMsgs.length > 0) {
+                    for (int i = rawMsgs.length - 1; i >= 0; i--) {
+                        Parcelable p = rawMsgs[i];
+                        if (p instanceof Bundle) {
+                            Parcelable personObj = ((Bundle) p).getParcelable("sender_person");
+                            if (personObj instanceof Person) {
+                                Icon personIcon = ((Person) personObj).getIcon();
+                                if (personIcon != null) {
+                                    String b64 = iconToBase64Png(personIcon, null);
+                                    if (!b64.isEmpty()) return b64;
+                                }
+                            }
+                        }
+                    }
+                }
+                // 2. android.conversationIcon or EXTRA_LARGE_ICON_BIG
+                Parcelable convIcon = extras.getParcelable("android.conversationIcon");
+                if (convIcon instanceof Icon) {
+                    String b64 = iconToBase64Png((Icon) convIcon, null);
+                    if (!b64.isEmpty()) return b64;
+                } else if (convIcon instanceof Bitmap) {
+                    String b64 = iconToBase64Png(null, new BitmapDrawable(getResources(), (Bitmap) convIcon));
+                    if (!b64.isEmpty()) return b64;
+                }
+                Parcelable bigIcon = extras.getParcelable(Notification.EXTRA_LARGE_ICON_BIG);
+                if (bigIcon instanceof Icon) {
+                    String b64 = iconToBase64Png((Icon) bigIcon, null);
+                    if (!b64.isEmpty()) return b64;
+                } else if (bigIcon instanceof Bitmap) {
+                    String b64 = iconToBase64Png(null, new BitmapDrawable(getResources(), (Bitmap) bigIcon));
+                    if (!b64.isEmpty()) return b64;
+                }
+            }
+            // 3. Notification.getLargeIcon()
+            Icon largeIcon = n.getLargeIcon();
+            if (largeIcon != null) {
+                String b64 = iconToBase64Png(largeIcon, null);
+                if (!b64.isEmpty()) return b64;
+            }
+            // 4. EXTRA_LARGE_ICON (Icon or Bitmap)
+            if (extras != null) {
+                Parcelable extraLarge = extras.getParcelable(Notification.EXTRA_LARGE_ICON);
+                if (extraLarge instanceof Icon) {
+                    String b64 = iconToBase64Png((Icon) extraLarge, null);
+                    if (!b64.isEmpty()) return b64;
+                } else if (extraLarge instanceof Bitmap) {
+                    String b64 = iconToBase64Png(null, new BitmapDrawable(getResources(), (Bitmap) extraLarge));
+                    if (!b64.isEmpty()) return b64;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return "";
+    }
+
+    private String iconToBase64Png(Icon icon, Drawable fallbackDrawable) {
+        try {
+            Drawable d = null;
+            if (icon != null) {
+                d = icon.loadDrawable(this);
+            }
+            if (d == null) {
+                d = fallbackDrawable;
+            }
+            if (d == null) return "";
+            Bitmap bmp = Bitmap.createBitmap(64, 64, Bitmap.Config.ARGB_8888);
+            try {
+                Canvas canvas = new Canvas(bmp);
+                Path clip = new Path();
+                clip.addRoundRect(new RectF(0f, 0f, 64f, 64f), 12f, 12f, Path.Direction.CW);
+                canvas.clipPath(clip);
+                d.setBounds(0, 0, 64, 64);
+                d.draw(canvas);
+                ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                bmp.compress(Bitmap.CompressFormat.PNG, 100, baos);
+                return Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP);
+            } finally {
+                bmp.recycle();
+            }
+        } catch (Throwable ignored) {
+            return "";
         }
     }
 
@@ -352,16 +543,40 @@ public final class PushNotificationService extends NotificationListenerService {
             String pkg,
             String rawTitle,
             long postTimeMs) {
-        if (n.actions == null) return null;
-        for (Notification.Action action : n.actions) {
-            if (action == null || action.actionIntent == null) continue;
-            RemoteInput[] inputs = action.getRemoteInputs();
-            if (inputs != null && inputs.length > 0) {
-                String cleanTitle = ImAppCatalog.cleanConversationTitle(pkg, rawTitle);
-                String threadId = ImAppCatalog.buildThreadId(pkg, cleanTitle);
+        if (n == null) return null;
+        String cleanTitle = ImAppCatalog.cleanConversationTitle(pkg, rawTitle);
+        String threadId = ImAppCatalog.buildThreadId(pkg, cleanTitle);
+
+        Notification.Action fallbackAction = null;
+        RemoteInput[] fallbackInputs = null;
+
+        if (n.actions != null) {
+            for (Notification.Action action : n.actions) {
+                if (action == null || action.actionIntent == null) continue;
+                RemoteInput[] inputs = action.getRemoteInputs();
+                if (inputs != null && inputs.length > 0) {
+                    if (isPreferredReplyAction(action, inputs)) {
+                        return new PushStore.RemoteReplyHandle(
+                            action.actionIntent,
+                            inputs,
+                            n.contentIntent,
+                            sbnKey,
+                            pkg,
+                            cleanTitle,
+                            threadId,
+                            postTimeMs
+                        );
+                    }
+                    if (fallbackAction == null) {
+                        fallbackAction = action;
+                        fallbackInputs = inputs;
+                    }
+                }
+            }
+            if (fallbackAction != null && fallbackInputs != null) {
                 return new PushStore.RemoteReplyHandle(
-                    action.actionIntent,
-                    inputs,
+                    fallbackAction.actionIntent,
+                    fallbackInputs,
                     n.contentIntent,
                     sbnKey,
                     pkg,
@@ -371,7 +586,117 @@ public final class PushNotificationService extends NotificationListenerService {
                 );
             }
         }
+
+        try {
+            List<Notification.Action> wearableActions = new Notification.WearableExtender(n).getActions();
+            if (wearableActions != null) {
+                Notification.Action wearableFallbackAction = null;
+                RemoteInput[] wearableFallbackInputs = null;
+                for (Notification.Action action : wearableActions) {
+                    if (action == null || action.actionIntent == null) continue;
+                    RemoteInput[] inputs = action.getRemoteInputs();
+                    if (inputs != null && inputs.length > 0) {
+                        if (isPreferredReplyAction(action, inputs)) {
+                            return new PushStore.RemoteReplyHandle(
+                                action.actionIntent,
+                                inputs,
+                                n.contentIntent,
+                                sbnKey,
+                                pkg,
+                                cleanTitle,
+                                threadId,
+                                postTimeMs
+                            );
+                        }
+                        if (wearableFallbackAction == null) {
+                            wearableFallbackAction = action;
+                            wearableFallbackInputs = inputs;
+                        }
+                    }
+                }
+                if (wearableFallbackAction != null && wearableFallbackInputs != null) {
+                    return new PushStore.RemoteReplyHandle(
+                        wearableFallbackAction.actionIntent,
+                        wearableFallbackInputs,
+                        n.contentIntent,
+                        sbnKey,
+                        pkg,
+                        cleanTitle,
+                        threadId,
+                        postTimeMs
+                    );
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+
+        try {
+            Notification.CarExtender.UnreadConversation unread =
+                new Notification.CarExtender(n).getUnreadConversation();
+            if (unread != null && unread.getReplyPendingIntent() != null && unread.getRemoteInput() != null) {
+                return new PushStore.RemoteReplyHandle(
+                    unread.getReplyPendingIntent(),
+                    new RemoteInput[] { unread.getRemoteInput() },
+                    n.contentIntent,
+                    sbnKey,
+                    pkg,
+                    cleanTitle,
+                    threadId,
+                    postTimeMs
+                );
+            }
+        } catch (Throwable ignored) {
+        }
+
+        if (n.extras != null) {
+            try {
+                Bundle carExt = n.extras.getBundle("android.car.EXTENSIONS");
+                if (carExt == null) {
+                    carExt = n.extras.getBundle("app_extensions");
+                }
+                if (carExt != null) {
+                    Bundle carConv = carExt.getBundle("car_conversation");
+                    if (carConv == null) {
+                        carConv = carExt;
+                    }
+                    Parcelable replyPi = carConv.getParcelable("on_reply");
+                    if (replyPi == null) {
+                        replyPi = carConv.getParcelable("reply");
+                    }
+                    Parcelable remoteIn = carConv.getParcelable("remote_input");
+                    if (replyPi instanceof PendingIntent && remoteIn instanceof RemoteInput) {
+                        return new PushStore.RemoteReplyHandle(
+                            (PendingIntent) replyPi,
+                            new RemoteInput[] { (RemoteInput) remoteIn },
+                            n.contentIntent,
+                            sbnKey,
+                            pkg,
+                            cleanTitle,
+                            threadId,
+                            postTimeMs
+                        );
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+        }
         return null;
+    }
+
+    private static boolean isPreferredReplyAction(Notification.Action action, RemoteInput[] inputs) {
+        if (action == null || inputs == null) return false;
+        try {
+            if (action.getSemanticAction() == Notification.Action.SEMANTIC_ACTION_REPLY) {
+                return true;
+            }
+        } catch (Throwable ignored) {
+        }
+        for (RemoteInput input : inputs) {
+            if (input != null && input.getAllowFreeFormInput()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static String charSeqToString(CharSequence cs) {

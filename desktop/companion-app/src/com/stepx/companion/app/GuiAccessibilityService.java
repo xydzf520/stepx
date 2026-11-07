@@ -57,6 +57,37 @@ public final class GuiAccessibilityService extends AccessibilityService {
         long last = lastUserTouchRealtimeMs;
         return last > 0L && nowRealtimeMs >= last && (nowRealtimeMs - last) < windowMs;
     }
+    public static Bitmap captureScreenBitmapSync(long timeoutMs) {
+        GuiAccessibilityService svc = instance;
+        if (svc == null) return null;
+        final CompletableFuture<Bitmap> fut = new CompletableFuture<Bitmap>();
+        try {
+            svc.takeScreenshot(0, svc.screenshotExecutor, new TakeScreenshotCallback() {
+                @Override
+                public void onSuccess(ScreenshotResult result) {
+                    try (android.hardware.HardwareBuffer buffer = result.getHardwareBuffer()) {
+                        Bitmap hw = Bitmap.wrapHardwareBuffer(buffer, result.getColorSpace());
+                        if (hw == null) {
+                            fut.complete(null);
+                            return;
+                        }
+                        Bitmap sw = hw.copy(Bitmap.Config.ARGB_8888, false);
+                        hw.recycle();
+                        fut.complete(sw);
+                    } catch (Throwable t) {
+                        fut.complete(null);
+                    }
+                }
+                @Override
+                public void onFailure(int errorCode) {
+                    fut.complete(null);
+                }
+            });
+            return fut.get(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
     @Override public void onInterrupt() { if(task.active()) task.stop(task.id,"系统中断了操作服务"); }
     @Override public void onDestroy() { if(instance==this)instance=null; main.removeCallbacksAndMessages(null); screenshotExecutor.shutdownNow(); super.onDestroy(); }
     JSONObject status() throws JSONException {

@@ -64,6 +64,19 @@ public final class Bridge {
             Object thread = at.getMethod("systemMain").invoke(null);
             Context system = (Context) at.getMethod("getSystemContext").invoke(thread);
             context = system.createPackageContext("com.android.shell", 0);
+            if (args != null && args.length == 2 && "--call-audio".equals(args[0])) {
+                // stdout is binary PCM in this mode. Diagnostics must never enter it.
+                try { CallAudioTools.run(args[1]); }
+                catch (Throwable error) {
+                    while (error.getCause() != null) error = error.getCause();
+                    System.err.println("STEPX_CALL_AUDIO_ERROR:" + error.getMessage());
+                }
+                return;
+            }
+            if (args != null && args.length > 0 && "--backscreen-loop".equals(args[0])) {
+                BackScreenMcpTools.runLoop(args);
+                return;
+            }
             String line = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8)).readLine();
             if (line == null || line.length() > 32768) throw new IllegalArgumentException("请求为空或过长");
             JSONObject request = new JSONObject(line);
@@ -90,12 +103,21 @@ public final class Bridge {
             case "phone_accounts": return DialTools.inspectAccounts();
             case "phone_prepare": return DialTools.prepare(request);
             case "phone_call": return DialTools.call(request);
+            case "phone_control": return DialTools.control(request);
+            case "phone_audio_capabilities": return CallAudioTools.inspect();
             case "storage_scan": return StorageTools.scan();
             case "storage_file_operation": return FileTools.run(request);
             case "storage_clear_cache": return FileTools.clearCache();
-            case "read_sms": return queryRows("content://sms", new String[]{"address", "body", "date", "type", "read", "sub_id"}, "date DESC, _id DESC");
+            case "read_sms": return readSms(request);
+            case "read_calendar": return readCalendarPage(request);
+            // Exact, bounded readback for MCP-created alarms; does not truncate
+            // silently to the 20-row home overview and never writes a provider.
+            case "read_alarms": return queryRows("content://com.android.alarmclock/alarms",
+                new String[]{"_id", "hour", "minutes", "daysofweek", "enabled", "vibrate", "label"},
+                "_id ASC", null, null, 1000);
             case "read_calls": return queryRows("content://call_log/calls", new String[]{"number", "name", "type", "date", "duration"}, "date DESC, _id DESC");
-            case "read_contacts": return queryRows("content://com.android.contacts/data/phones", new String[]{"display_name", "data1"}, "display_name ASC");
+            case "read_contacts": return readContacts();
+            case "create_contact": return createContact(request);
             case "capabilities": return capabilities();
             case "amoo_context": return amooContext();
             case "amoo_snapshot": return snapshot(request.optBoolean("debug", false));
@@ -108,12 +130,16 @@ public final class Bridge {
             case "sms_status": return readStatus(request.getString("id"));
             case "clipboard_get": return clipboardGet();
             case "clipboard_set": return clipboardSet(request.optString("text", ""));
-            case "stepos_usage": return steposUsage();
+            case "stepos_usage":
+            case "ai_suite": return steposUsage();
+            case "read_recordings": return new JSONObject().put("rows", queryRecentRecordings(new JSONArray()));
             case "calendar_create": return calendarCreate(request);
             case "calendar_delete": return calendarDelete(request);
             case "alarm_create": return alarmCreate(request);
             case "alarm_toggle": return alarmToggle(request);
             case "alarm_delete": return alarmDelete(request);
+            case "backscreen_mcp_status": return BackScreenMcpTools.status();
+            case "backscreen_mcp_stop": return BackScreenMcpTools.stop();
             default: throw new IllegalArgumentException("未知操作");
         }
     }
@@ -157,6 +183,10 @@ public final class Bridge {
     }
 
     static JSONObject queryRows(String uri, String[] columns, String order, String selection, String[] args) throws Exception {
+        return queryRows(uri, columns, order, selection, args, 0);
+    }
+
+    static JSONObject queryRows(String uri, String[] columns, String order, String selection, String[] args, int limit) throws Exception {
         // app_process has no registered ApplicationThread. Use the external provider
         // handle, as Android's `content` shell command does, with shell attribution.
         Uri target = Uri.parse(uri);
@@ -179,6 +209,7 @@ public final class Bridge {
             if (selection != null && !selection.isEmpty()) extras.putString(android.content.ContentResolver.QUERY_ARG_SQL_SELECTION, selection);
             if (args != null) extras.putStringArray(android.content.ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS, args);
             JSONArray rows = new JSONArray();
+            boolean hasMore = false;
             try (Cursor cursor = (Cursor) ipc.getMethod("query", android.content.AttributionSource.class,
                 Uri.class, String[].class, Bundle.class, signal).invoke(provider, attribution, target, columns, extras, null)) {
                 if (cursor == null) throw new IOException("手机数据提供程序未返回结果");
@@ -187,6 +218,10 @@ public final class Bridge {
                     colIndices[i] = cursor.getColumnIndexOrThrow(columns[i]);
                 }
                 while (cursor.moveToNext()) {
+                    if (limit > 0 && rows.length() >= limit) {
+                        hasMore = true;
+                        break;
+                    }
                     JSONObject row = new JSONObject();
                     for (int i = 0; i < columns.length; i++) {
                         int index = colIndices[i];
@@ -195,11 +230,219 @@ public final class Bridge {
                     rows.put(row);
                 }
             }
-            return new JSONObject().put("rows", rows);
+            return new JSONObject().put("rows", rows).put("has_more", hasMore);
         } finally {
             iam.getMethod("removeContentProviderExternalAsUser", String.class, android.os.IBinder.class, int.class)
                 .invoke(service, target.getAuthority(), token, user);
         }
+    }
+
+    static JSONObject readContacts() throws Exception {
+        JSONArray merged = new JSONArray();
+        Set<String> seen = new HashSet<>();
+        try {
+            JSONArray phoneRows = queryRows(
+                "content://com.android.contacts/data/phones",
+                new String[]{"display_name", "data1"},
+                "display_name ASC"
+            ).optJSONArray("rows");
+            if (phoneRows != null) {
+                for (int i = 0; i < phoneRows.length(); i++) {
+                    JSONObject r = phoneRows.optJSONObject(i);
+                    if (r == null) continue;
+                    String name = r.optString("display_name", "").trim();
+                    String num = r.optString("data1", "").trim();
+                    if (num.isEmpty() || "null".equalsIgnoreCase(num)) continue;
+                    if ("null".equalsIgnoreCase(name)) name = "";
+                    String key = num.replaceAll("[^0-9+]", "");
+                    if (key.isEmpty()) key = num;
+                    if (seen.add(key)) {
+                        merged.put(new JSONObject()
+                            .put("display_name", name.isEmpty() ? num : name)
+                            .put("data1", num));
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        String[] simUris = new String[]{
+            "content://icc/adn",
+            "content://icc/adn/subId/1",
+            "content://icc/adn/subId/2",
+            "content://icc/sdn"
+        };
+        for (String simUri : simUris) {
+            try {
+                JSONArray simRows = queryRows(
+                    simUri,
+                    new String[]{"name", "number"},
+                    null
+                ).optJSONArray("rows");
+                if (simRows == null) continue;
+                for (int i = 0; i < simRows.length(); i++) {
+                    JSONObject r = simRows.optJSONObject(i);
+                    if (r == null) continue;
+                    String name = r.optString("name", "").trim();
+                    String num = r.optString("number", "").trim();
+                    if (num.isEmpty() || "null".equalsIgnoreCase(num)) continue;
+                    if ("null".equalsIgnoreCase(name)) name = "";
+                    String key = num.replaceAll("[^0-9+]", "");
+                    if (key.isEmpty()) key = num;
+                    if (seen.add(key)) {
+                        merged.put(new JSONObject()
+                            .put("display_name", name.isEmpty() ? num : name)
+                            .put("data1", num));
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        return new JSONObject().put("rows", merged).put("has_more", false);
+    }
+
+    static JSONObject createContact(JSONObject req) throws Exception {
+        String name = req.optString("name", "").trim();
+        String number = req.optString("number", "").trim();
+        if (name.isEmpty() || number.isEmpty()) {
+            throw new IllegalArgumentException("请填写联系人姓名与电话号码");
+        }
+        String normTarget = number.replaceAll("[^0-9+]", "");
+        if (normTarget.isEmpty()) normTarget = number;
+
+        // 1. Check if a phone_v2 row with this number already exists on a non-deleted raw_contact
+        long existingRawContactId = 0L;
+        try {
+            JSONArray phoneRows = queryRows(
+                "content://com.android.contacts/data/phones",
+                new String[]{"raw_contact_id", "data1"},
+                "_id DESC"
+            ).optJSONArray("rows");
+            if (phoneRows != null) {
+                for (int i = 0; i < phoneRows.length(); i++) {
+                    JSONObject r = phoneRows.optJSONObject(i);
+                    if (r == null) continue;
+                    String num = r.optString("data1", "").trim();
+                    String norm = num.replaceAll("[^0-9+]", "");
+                    if (norm.isEmpty()) norm = num;
+                    if (norm.equals(normTarget)) {
+                        existingRawContactId = r.optLong("raw_contact_id", 0L);
+                        if (existingRawContactId > 0L) break;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+
+        if (existingRawContactId > 0L) {
+            ContentValues nameValues = new ContentValues();
+            nameValues.put("data1", name);
+            nameValues.put("data2", name);
+            int updated = updateRow(
+                "content://com.android.contacts/data",
+                nameValues,
+                "raw_contact_id=" + existingRawContactId + " AND mimetype='vnd.android.cursor.item/name'"
+            );
+            if (updated <= 0) {
+                ContentValues insertName = new ContentValues();
+                insertName.put("raw_contact_id", existingRawContactId);
+                insertName.put("mimetype", "vnd.android.cursor.item/name");
+                insertName.put("data1", name);
+                insertName.put("data2", name);
+                insertRow("content://com.android.contacts/data", insertName);
+            }
+            ContentValues phoneValues = new ContentValues();
+            phoneValues.put("data1", number);
+            updateRow(
+                "content://com.android.contacts/data",
+                phoneValues,
+                "raw_contact_id=" + existingRawContactId + " AND mimetype='vnd.android.cursor.item/phone_v2'"
+            );
+            return new JSONObject()
+                .put("saved", true)
+                .put("updated", true)
+                .put("raw_contact_id", existingRawContactId)
+                .put("contacts", readContacts().optJSONArray("rows"));
+        }
+
+        // 2. Insert a brand new raw_contact + StructuredName + Phone row
+        ContentValues rawValues = new ContentValues();
+        rawValues.putNull("account_type");
+        rawValues.putNull("account_name");
+        Uri rawUri = insertRow("content://com.android.contacts/raw_contacts", rawValues);
+        long rawContactId = 0L;
+        if (rawUri != null && rawUri.getLastPathSegment() != null) {
+            try {
+                rawContactId = Long.parseLong(rawUri.getLastPathSegment());
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        if (rawContactId <= 0L) {
+            JSONArray rawRows = queryRows(
+                "content://com.android.contacts/raw_contacts",
+                new String[]{"_id"},
+                "_id DESC",
+                "deleted=0",
+                null,
+                1
+            ).optJSONArray("rows");
+            if (rawRows != null && rawRows.length() > 0) {
+                rawContactId = rawRows.getJSONObject(0).optLong("_id", 0L);
+            }
+        }
+        if (rawContactId <= 0L) {
+            throw new IOException("无法创建手机通讯录记录");
+        }
+
+        ContentValues nameValues = new ContentValues();
+        nameValues.put("raw_contact_id", rawContactId);
+        nameValues.put("mimetype", "vnd.android.cursor.item/name");
+        nameValues.put("data1", name);
+        nameValues.put("data2", name);
+        insertRow("content://com.android.contacts/data", nameValues);
+
+        ContentValues phoneValues = new ContentValues();
+        phoneValues.put("raw_contact_id", rawContactId);
+        phoneValues.put("mimetype", "vnd.android.cursor.item/phone_v2");
+        phoneValues.put("data1", number);
+        phoneValues.put("data2", 2);
+        insertRow("content://com.android.contacts/data", phoneValues);
+
+        return new JSONObject()
+            .put("saved", true)
+            .put("raw_contact_id", rawContactId)
+            .put("contacts", readContacts().optJSONArray("rows"));
+    }
+
+    static JSONObject readSms(JSONObject request) throws Exception {
+        String[] columns = new String[]{"_id", "address", "body", "date", "type", "read", "sub_id"};
+        if (!request.has("after_date_ms") && !request.has("limit")) {
+            return queryRows("content://sms", columns, "date DESC, _id DESC");
+        }
+        long date = Math.max(0L, request.optLong("after_date_ms", 0L));
+        long id = Math.max(0L, request.optLong("after_id", 0L));
+        int limit = ContextReadPolicy.pageLimit(request.optInt("limit", 500));
+        JSONObject result = queryRows("content://sms", columns, "date ASC, _id ASC",
+            "date > ? OR (date = ? AND _id > ?)",
+            new String[]{String.valueOf(date), String.valueOf(date), String.valueOf(id)}, limit);
+        return result.put("incremental", true).put("capture_ms", System.currentTimeMillis());
+    }
+
+    static JSONObject readCalendarPage(JSONObject request) throws Exception {
+        long now = System.currentTimeMillis();
+        long start = request.optLong("start_ms", ContextReadPolicy.calendarStart(now));
+        long end = request.optLong("end_ms", ContextReadPolicy.calendarEnd(now));
+        ContextReadPolicy.checkCalendarWindow(start, end);
+        long after = Math.max(0L, request.optLong("after_begin_ms", 0L));
+        long afterId = Math.max(0L, request.optLong("after_id", 0L));
+        String uri = "content://com.android.calendar/instances/when/" + start + "/" + end;
+        JSONObject result = queryRows(uri,
+            new String[]{"_id", "event_id", "title", "description", "eventLocation", "begin", "end", "allDay", "rrule", "rdate"},
+            // CalendarProvider joins Instances and Events, both with an _id column.
+            // Qualify the paging key in SQL; the projected result remains named _id.
+            "begin ASC, Instances._id ASC", "begin > ? OR (begin = ? AND Instances._id > ?)",
+            new String[]{String.valueOf(after), String.valueOf(after), String.valueOf(afterId)},
+            ContextReadPolicy.pageLimit(request.optInt("limit", 500)));
+        return result.put("start_ms", start).put("end_ms", end).put("incremental", true);
     }
 
     // Same public OpenId provider used by Amoo. No account token or private DB.
@@ -616,6 +859,7 @@ public final class Bridge {
     }
 
     static JSONObject steposUsage() throws Exception {
+        JSONArray readErrors = new JSONArray();
         UsageStatsManager usm = (UsageStatsManager) context.getSystemService(Context.USAGE_STATS_SERVICE);
         PackageManager pm = context.getPackageManager();
         String tzId = "Asia/Shanghai";
@@ -653,9 +897,11 @@ public final class Bridge {
 
         Map<String, Long> eventMsByPkg = new HashMap<>();
         int unlockCount = 0;
+        if (usm == null) readErrors.put("用机统计服务不可用");
         if (usm != null) {
             try {
                 UsageEvents events = usm.queryEvents(startOfDay, now);
+                if (events == null) readErrors.put("用机事件暂不可读取");
                 UsageEvents.Event ev = new UsageEvents.Event();
                 String activePkg = null;
                 String activeClass = null;
@@ -709,7 +955,7 @@ public final class Bridge {
                         eventMsByPkg.put(activePkg, eventMsByPkg.getOrDefault(activePkg, 0L) + delta);
                     }
                 }
-            } catch (Throwable ignored) {}
+            } catch (Throwable failure) { readErrors.put("用机事件读取失败"); }
         }
 
         Map<String, Long> bucketMsByPkg = new HashMap<>();
@@ -718,6 +964,7 @@ public final class Bridge {
         if (usm != null) {
             try {
                 List<UsageStats> daily = usm.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, startOfDay, now);
+                if (daily == null) readErrors.put("用机统计暂不可读取");
                 if (daily != null) {
                     for (UsageStats st : daily) {
                         if (st == null) continue;
@@ -735,7 +982,7 @@ public final class Bridge {
                         }
                     }
                 }
-            } catch (Throwable ignored) {}
+            } catch (Throwable failure) { readErrors.put("用机统计读取失败"); }
         }
 
         Set<String> allPkgs = new HashSet<>();
@@ -803,16 +1050,164 @@ public final class Bridge {
         String clipText = "";
         try {
             clipText = clipboardGet().optString("text", "");
-        } catch (Throwable ignored) {}
+        } catch (Throwable failure) { readErrors.put("剪贴板读取失败"); }
+
+        JSONArray recentCalls = queryRecentCalls(readErrors);
+        JSONArray recentRecordings = queryRecentRecordings(readErrors);
 
         return new JSONObject()
             .put("screen_time_minutes", totalMinutes)
             .put("unlock_count", unlockCount)
             .put("clipboard", clipText)
             .put("top_apps", topApps)
-            .put("calendar_events", queryCalendarEvents())
-            .put("alarms", queryAlarms())
-            .put("controls", querySystemControls());
+            .put("calendar_events", queryCalendarEvents(readErrors))
+            .put("alarms", queryAlarms(readErrors))
+            .put("controls", querySystemControls(readErrors))
+            .put("recent_calls", recentCalls)
+            .put("recent_recordings", recentRecordings)
+            .put("voice_recordings", recentRecordings)
+            .put("read_errors", readErrors);
+    }
+
+    static JSONObject aiSuite() throws Exception {
+        return steposUsage();
+    }
+
+    static JSONArray queryRecentCalls() { return queryRecentCalls(null); }
+
+    static JSONArray queryRecentCalls(JSONArray readErrors) {
+        JSONArray out = new JSONArray();
+        try {
+            if (context != null && context.checkSelfPermission(Manifest.permission.READ_CALL_LOG) != PackageManager.PERMISSION_GRANTED) {
+                return out;
+            }
+            JSONArray rows = queryRows(
+                android.provider.CallLog.Calls.CONTENT_URI.toString(),
+                new String[]{"number", "name", "type", "date", "duration"},
+                "date DESC, _id DESC",
+                null,
+                null,
+                ContextReadPolicy.RECENT_CALLS_LIMIT
+            ).optJSONArray("rows");
+            if (rows == null) return out;
+            for (int i = 0; i < rows.length() && out.length() < ContextReadPolicy.RECENT_CALLS_LIMIT; i++) {
+                JSONObject r = rows.getJSONObject(i);
+                String number = r.optString("number", "").trim();
+                String name = r.optString("name", "").trim();
+                if ("null".equalsIgnoreCase(name)) name = "";
+                out.put(new JSONObject()
+                    .put("number", number)
+                    .put("name", name)
+                    .put("type", r.optInt("type", 0))
+                    .put("date", r.optLong("date", 0L))
+                    .put("duration", r.optLong("duration", 0L)));
+            }
+        } catch (SecurityException se) {
+            if (readErrors != null) readErrors.put("通话记录读取权限不足");
+        } catch (Throwable failure) {
+            Throwable cause = failure;
+            while (cause.getCause() != null) cause = cause.getCause();
+            if (cause instanceof SecurityException) {
+                if (readErrors != null) readErrors.put("通话记录读取权限不足");
+            }
+        }
+        return out;
+    }
+
+    static JSONArray queryRecentRecordings() { return queryRecentRecordings(null); }
+
+    static JSONArray queryRecentRecordings(JSONArray readErrors) {
+        JSONArray out = new JSONArray();
+        Set<String> seenPaths = new HashSet<>();
+        try {
+            List<File> files = new ArrayList<>();
+            for (String rel : new String[]{"/sdcard/Recordings", "/sdcard/SoundRecorder", "/sdcard/Sounds", "/sdcard/Music/Recordings"}) {
+                File dir = new File(rel);
+                if (!dir.isDirectory() || Files.isSymbolicLink(dir.toPath())) continue;
+                collectRecordingFiles(dir, 0, files);
+            }
+            files.sort((a, b) -> Long.compare(b.lastModified(), a.lastModified()));
+            for (File f : files) {
+                if (out.length() >= ContextReadPolicy.RECENT_RECORDINGS_LIMIT) break;
+                String path = f.getAbsolutePath();
+                if (!seenPaths.add(path)) continue;
+                out.put(new JSONObject()
+                    .put("name", f.getName())
+                    .put("path", path)
+                    .put("size", f.length())
+                    .put("bytes", f.length())
+                    .put("date", f.lastModified())
+                    .put("modified_ms", f.lastModified())
+                    .put("duration", 0L));
+            }
+        } catch (SecurityException se) {
+            if (readErrors != null) readErrors.put("录音文件目录读取权限不足");
+        } catch (Throwable ignored) {}
+
+        if (out.length() < ContextReadPolicy.RECENT_RECORDINGS_LIMIT) {
+            try {
+                boolean hasAudioPerm = context == null
+                    || context.checkSelfPermission("android.permission.READ_MEDIA_AUDIO") == PackageManager.PERMISSION_GRANTED
+                    || context.checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED;
+                if (hasAudioPerm) {
+                    JSONArray rows = queryRows(
+                        android.provider.MediaStore.Audio.Media.EXTERNAL_CONTENT_URI.toString(),
+                        new String[]{"_display_name", "_data", "_size", "date_modified", "duration"},
+                        "date_modified DESC",
+                        "_data LIKE ? OR _data LIKE ? OR _data LIKE ?",
+                        new String[]{"%/Recordings/%", "%/SoundRecorder/%", "%/Sounds/%"},
+                        ContextReadPolicy.RECENT_RECORDINGS_LIMIT
+                    ).optJSONArray("rows");
+                    if (rows != null) {
+                        for (int i = 0; i < rows.length() && out.length() < ContextReadPolicy.RECENT_RECORDINGS_LIMIT; i++) {
+                            JSONObject r = rows.getJSONObject(i);
+                            String path = r.optString("_data", "").trim();
+                            if (path.isEmpty() || !seenPaths.add(path)) continue;
+                            String name = r.optString("_display_name", "").trim();
+                            if (name.isEmpty()) name = new File(path).getName();
+                            long size = r.optLong("_size", 0L);
+                            long modSec = r.optLong("date_modified", 0L);
+                            long modMs = modSec > 10_000_000_000L ? modSec : modSec * 1000L;
+                            long duration = r.optLong("duration", 0L);
+                            out.put(new JSONObject()
+                                .put("name", name)
+                                .put("path", path)
+                                .put("size", size)
+                                .put("bytes", size)
+                                .put("date", modMs)
+                                .put("modified_ms", modMs)
+                                .put("duration", duration));
+                        }
+                    }
+                }
+            } catch (SecurityException se) {
+                if (readErrors != null) readErrors.put("媒体库录音读取权限不足");
+            } catch (Throwable failure) {
+                Throwable cause = failure;
+                while (cause.getCause() != null) cause = cause.getCause();
+                if (cause instanceof SecurityException && readErrors != null) {
+                    readErrors.put("媒体库录音读取权限不足");
+                }
+            }
+        }
+        return out;
+    }
+
+    private static void collectRecordingFiles(File dir, int depth, List<File> out) {
+        if (depth > 2 || out.size() >= 60) return;
+        File[] children = dir.listFiles();
+        if (children == null) return;
+        for (File child : children) {
+            if (out.size() >= 60) break;
+            try {
+                if (Files.isSymbolicLink(child.toPath()) || child.getName().startsWith(".")) continue;
+                if (child.isDirectory()) {
+                    collectRecordingFiles(child, depth + 1, out);
+                } else if (child.isFile() && child.length() > 0 && ContextReadPolicy.isAudioRecordingName(child.getName())) {
+                    out.add(child);
+                }
+            } catch (Throwable ignored) {}
+        }
     }
 
     static Uri insertRow(String uri, ContentValues values) throws Exception {
@@ -893,43 +1288,56 @@ public final class Bridge {
         }
     }
 
-    static JSONArray queryCalendarEvents() {
+    static JSONArray queryCalendarEvents() { return queryCalendarEvents(null); }
+
+    static JSONArray queryCalendarEvents(JSONArray readErrors) {
         JSONArray out = new JSONArray();
         try {
-            long minStart = System.currentTimeMillis() - 7L * 86400_000L;
-            String selection = "deleted=0 AND (dtend>=" + minStart + " OR (dtend IS NULL AND dtstart>=" + minStart + "))";
-            JSONArray rows = queryRows(
-                "content://com.android.calendar/events",
-                new String[]{"_id", "calendar_id", "title", "description", "eventLocation", "dtstart", "dtend", "allDay", "deleted"},
-                "dtstart ASC",
-                selection
-            ).optJSONArray("rows");
-            if (rows == null) return out;
+            // Instances expands recurring events in the requested range. Querying
+            // Events then taking the first 20 rows dropped today's occurrences.
+            JSONObject page = readCalendarPage(new JSONObject().put("limit", 1000));
+            JSONArray rows = page.optJSONArray("rows");
+            if (rows == null) {
+                if (readErrors != null) readErrors.put("手机日历未返回有效数据");
+                return out;
+            }
+            if (page.optBoolean("has_more", false) && readErrors != null) {
+                readErrors.put("日历范围内超过 1000 条，需分页读取；当前日程不完整");
+            }
             for (int i = 0; i < rows.length(); i++) {
                 JSONObject r = rows.getJSONObject(i);
-                if ("1".equals(r.optString("deleted", "0"))) continue;
-                long id = r.optLong("_id", 0L);
+                long id = r.optLong("event_id", 0L);
                 if (id <= 0L) continue;
-                long startMs = r.optLong("dtstart", 0L);
-                long endMs = r.optLong("dtend", startMs + 3600_000L);
-                if (endMs > 0L && endMs < minStart) continue;
+                long startMs = r.optLong("begin", 0L);
+                long endMs = r.optLong("end", startMs + 3600_000L);
                 String title = r.optString("title", "").trim();
                 if (title.isEmpty()) title = "未命名日程";
                 out.put(new JSONObject()
                     .put("id", id)
+                    .put("instance_id", r.optLong("_id", 0L))
                     .put("title", title)
                     .put("description", r.optString("description", "").trim())
                     .put("location", r.optString("eventLocation", "").trim())
                     .put("start_ms", startMs)
                     .put("end_ms", endMs)
+                    .put("recurring", !nullableCalendarText(r.optString("rrule", "")).isEmpty()
+                        || !nullableCalendarText(r.optString("rdate", "")).isEmpty())
                     .put("all_day", "1".equals(r.optString("allDay", "0"))));
-                if (out.length() >= 20) break;
             }
-        } catch (Throwable ignored) {}
+        } catch (Throwable failure) {
+            if (readErrors != null) readErrors.put("手机日历读取失败");
+        }
         return out;
     }
 
-    static JSONArray queryAlarms() {
+    private static String nullableCalendarText(String value) {
+        String text = value == null ? "" : value.trim();
+        return "null".equalsIgnoreCase(text) ? "" : text;
+    }
+
+    static JSONArray queryAlarms() { return queryAlarms(null); }
+
+    static JSONArray queryAlarms(JSONArray readErrors) {
         JSONArray out = new JSONArray();
         try {
             JSONArray rows = queryRows(
@@ -937,7 +1345,10 @@ public final class Bridge {
                 new String[]{"_id", "hour", "minutes", "daysofweek", "enabled", "vibrate", "label"},
                 "hour ASC, minutes ASC"
             ).optJSONArray("rows");
-            if (rows == null) return out;
+            if (rows == null) {
+                if (readErrors != null) readErrors.put("手机闹钟未返回有效数据");
+                return out;
+            }
             for (int i = 0; i < rows.length(); i++) {
                 JSONObject r = rows.getJSONObject(i);
                 long id = r.optLong("_id", 0L);
@@ -959,7 +1370,9 @@ public final class Bridge {
                     .put("label", label));
                 if (out.length() >= 20) break;
             }
-        } catch (Throwable ignored) {}
+        } catch (Throwable failure) {
+            if (readErrors != null) readErrors.put("手机闹钟读取失败");
+        }
         return out;
     }
 
@@ -994,12 +1407,23 @@ public final class Bridge {
         return def;
     }
 
-    static JSONObject querySystemControls() throws Exception {
-        boolean dndOn = settingInt("global", "zen_mode", 0) != 0;
-        boolean wifiOn = settingInt("global", "wifi_on", 1) != 0;
-        boolean bluetoothOn = settingInt("global", "bluetooth_on", 0) == 1;
-        int raw = settingInt("system", "screen_brightness", 1600);
-        int max = raw > 255 ? 4095 : 255;
+    static int checkedSettingInt(String table, String key, int fallback, JSONArray readErrors) {
+        int value = settingInt(table, key, Integer.MIN_VALUE);
+        if (value == Integer.MIN_VALUE) {
+            if (readErrors != null) readErrors.put("系统设置读取失败：" + key);
+            return fallback;
+        }
+        return value;
+    }
+
+    static JSONObject querySystemControls() throws Exception { return querySystemControls(null); }
+
+    static JSONObject querySystemControls(JSONArray readErrors) throws Exception {
+        boolean dndOn = checkedSettingInt("global", "zen_mode", 0, readErrors) != 0;
+        boolean wifiOn = checkedSettingInt("global", "wifi_on", 1, readErrors) != 0;
+        boolean bluetoothOn = checkedSettingInt("global", "bluetooth_on", 0, readErrors) == 1;
+        int raw = checkedSettingInt("system", "screen_brightness", 1600, readErrors);
+        int max = raw > 4095 ? 32767 : (raw > 255 ? 4095 : 255);
         int brightnessPercent = Math.max(5, Math.min(100, Math.round(raw * 100.0f / max)));
         return new JSONObject()
             .put("dnd_on", dndOn)
@@ -1051,6 +1475,12 @@ public final class Bridge {
         int minutes = Math.max(0, Math.min(59, req.optInt("minutes", 0)));
         int daysOfWeek = req.optInt("days_of_week", 0);
         String label = req.optString("label", "").trim();
+        Object rawSkipHolidays = (req != null && req.has("skip_holidays") && !req.isNull("skip_holidays")) ? req.opt("skip_holidays") : null;
+        Object rawStatutoryHolidays = (req != null && req.has("statutory_holidays") && !req.isNull("statutory_holidays")) ? req.opt("statutory_holidays") : null;
+        Object rawDailyEnabled = (req != null && req.has("daily_enabled") && !req.isNull("daily_enabled")) ? req.opt("daily_enabled") : null;
+        int skipHolidays = ContextReadPolicy.resolveSkipHolidays(rawSkipHolidays, rawStatutoryHolidays);
+        int statutoryHolidays = ContextReadPolicy.resolveStatutoryHolidays(rawSkipHolidays, rawStatutoryHolidays);
+        int dailyEnabled = ContextReadPolicy.resolveDailyEnabled(rawDailyEnabled);
         ContentValues values = new ContentValues();
         values.put("hour", hour);
         values.put("minutes", minutes);
@@ -1063,13 +1493,13 @@ public final class Bridge {
         values.put("snooze", 1);
         values.put("festival", 0);
         values.put("snooze_times", 8);
-        values.put("daily_enabled", 0);
+        values.put("daily_enabled", dailyEnabled);
         values.put("daily_play_type", 0);
         values.put("daily_skip_time", 0);
         values.put("upcoming", 0);
         values.put("shifts", 0);
-        values.put("skip_holidays", 0);
-        values.put("statutory_holidays", 0);
+        values.put("skip_holidays", skipHolidays);
+        values.put("statutory_holidays", statutoryHolidays);
         values.put("ring_duration", 3);
         values.put("creation_method", 0);
         Uri created = insertRow("content://com.android.alarmclock/alarms", values);
@@ -1079,6 +1509,9 @@ public final class Bridge {
         }
         return new JSONObject()
             .put("created_id", id)
+            .put("skip_holidays", skipHolidays)
+            .put("statutory_holidays", statutoryHolidays)
+            .put("daily_enabled", dailyEnabled)
             .put("alarms", queryAlarms());
     }
 

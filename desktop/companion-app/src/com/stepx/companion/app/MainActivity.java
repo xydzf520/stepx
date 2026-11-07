@@ -25,7 +25,7 @@ public final class MainActivity extends Activity {
     private CompanionUi design;
     private ProgressBar loadingLine; private Runnable loadingReveal;
     private void endLoading(){if(loadingReveal!=null)ui.removeCallbacks(loadingReveal);if(loadingLine!=null)loadingLine.setVisibility(View.INVISIBLE);}
-    private EditText taskInput; private TextView taskReadiness,taskBadge,taskMetrics,taskGoal,homeStatus,homeComputer,homeHint,homeTask;
+    private EditText taskInput; private TextView taskReadiness,taskBadge,taskMetrics,taskGoal,homeStatus,homeComputer,homeHint,homeTask,homeWork;
     private LinearLayout taskSteps,taskHistory,taskDock,composeCard,liveCard; private ScrollView pageScroll; private Button taskDetails;
     private String taskDraft="",lastTaskRender="",lastHistoryRender="";
     private JSONObject lastAgent=new JSONObject(); private boolean refreshPending;
@@ -59,7 +59,7 @@ public final class MainActivity extends Activity {
         AutoConnectService.resume(this);showTab(tab);
     }
     private void showTab(int next){
-        endLoading();CompanionMotion.stop(content);rememberDraft();hostSurface(false);if(next==8&&tab<4)historyOrigin=tab;if(next==4&&tab<4)connectionOrigin=tab;tab=next;pageGeneration++;content.removeAllViews();navigation.removeAllViews();linkTitle=linkHint=connectionFoot=transferHint=amooState=gameState=notice=null;guiState=taskReadiness=taskBadge=taskMetrics=taskGoal=homeStatus=homeComputer=homeHint=homeTask=null;guiStart=guiPause=guiResume=guiStop=taskDetails=homeScan=connScan=null;taskInput=null;taskSteps=taskHistory=taskDock=composeCard=liveCard=null;pageScroll=null;send=null;amooSwitch=null;transferList=null;historyTitle=null;permissionLabels.clear();lastListing=lastTaskRender=lastHistoryRender="";
+        endLoading();CompanionMotion.stop(content);rememberDraft();hostSurface(false);if(next==8&&tab<4)historyOrigin=tab;if(next==4&&tab<4)connectionOrigin=tab;tab=next;pageGeneration++;content.removeAllViews();navigation.removeAllViews();linkTitle=linkHint=connectionFoot=transferHint=amooState=gameState=notice=null;guiState=taskReadiness=taskBadge=taskMetrics=taskGoal=homeStatus=homeComputer=homeHint=homeTask=homeWork=null;guiStart=guiPause=guiResume=guiStop=taskDetails=homeScan=connScan=null;taskInput=null;taskSteps=taskHistory=taskDock=composeCard=liveCard=null;pageScroll=null;send=null;amooSwitch=null;transferList=null;historyTitle=null;permissionLabels.clear();lastListing=lastTaskRender=lastHistoryRender="";
         updateHeader();
         String[] labels={"首页","文件","设置","任务"};int[] icons={UiGlyph.HOME,UiGlyph.FOLDER,UiGlyph.SETTINGS,UiGlyph.TASK};
         for(int i:new int[]{0,3,1,2}){final int index=i;boolean active=tab==i||parentTab(tab)==i;TextView item=new TextView(this);item.setText(labels[i]);item.setContentDescription(labels[i]);item.setTextSize(11);item.setGravity(Gravity.CENTER);item.setTextColor(active?ink:secondary);item.setCompoundDrawablePadding(dp(4));UiGlyph glyph=new UiGlyph(icons[i],active?ink:secondary);glyph.setBounds(0,0,dp(22),dp(22));item.setCompoundDrawables(null,glyph,null,null);item.setBackground(design.touch(active?0xfff1f1f4:Color.WHITE,0,8));LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(0,-1,1);lp.leftMargin=dp(4);lp.rightMargin=dp(4);navigation.addView(item,lp);item.setOnClickListener(v->{if(tab!=index)showTab(index);});}
@@ -84,6 +84,7 @@ public final class MainActivity extends Activity {
         homeHint=text(hero,"连接后，在电脑使用 Amoo、文件与手机工具。",13,secondary,8);
         homeScan=button(hero,"扫码连接",true,()->startActivity(new Intent(this,PairingActivity.class)));UiGlyph.attach(homeScan,UiGlyph.SCAN,Color.WHITE,dp(18));
         row(hero,UiGlyph.COMPUTER,"连接管理","自动重连、USB 与无线配对",()->showTab(4));
+        LinearLayout work=card(p,16);heading(work,"接着处理",0);homeWork=text(work,"正在读取任务与成果…",14,secondary,8);homeWork.setMaxLines(4);homeWork.setEllipsize(android.text.TextUtils.TruncateAt.END);button(work,"任务与成果",true,()->startActivity(new Intent(this,DesktopWorkActivity.class)));text(work,"手机选资料，电脑处理；回到手机查看进度和已送达成果。",12,secondary,8);
         LinearLayout agent=group(p,"手机独立执行");row(agent,UiGlyph.TASK,"手机任务","输入目标，由 GUI Agent 看屏操作",()->showTab(3));homeTask=text(agent,"正在检查任务状态…",12,secondary,0);homeTask.setPadding(dp(40),0,0,dp(12));homeTask.setMaxLines(2);homeTask.setEllipsize(android.text.TextUtils.TruncateAt.END);
         LinearLayout tools=group(p,"更多工具");row(tools,UiGlyph.FOLDER,"存储扩容","原件存电脑 · 手机保留文件入口",()->startActivity(new Intent(this,ExpansionActivity.class)));row(tools,UiGlyph.STUDIO,"Studio 作品","打开电脑推送的作品与官网项目",()->startActivity(new Intent(this,StudioActivity.class)));row(tools,UiGlyph.SCREEN,"背屏与游戏","三敲启动，倾斜手机游玩",()->showTab(5));
     }
@@ -94,6 +95,14 @@ public final class MainActivity extends Activity {
         taskInput=new EditText(this);taskInput.setTextSize(14);taskInput.setTextColor(ink);taskInput.setHintTextColor(secondary);taskInput.setHint("例如：打开设置，查看 Android 版本");taskInput.setGravity(Gravity.TOP);taskInput.setMinLines(3);taskInput.setMaxLines(6);taskInput.setInputType(android.text.InputType.TYPE_CLASS_TEXT|android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE|android.text.InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);taskInput.setPadding(dp(12),dp(12),dp(12),dp(12));taskInput.setBackground(surface(CompanionUi.SURFACE,line,8));LinearLayout.LayoutParams ip=new LinearLayout.LayoutParams(-1,-2);ip.topMargin=dp(12);compose.addView(taskInput,ip);taskInput.setText(taskDraft);
         taskInput.addTextChangedListener(new android.text.TextWatcher(){public void beforeTextChanged(CharSequence v,int a,int c,int f){}public void onTextChanged(CharSequence v,int a,int b,int c){taskDraft=v.toString();updateGuiControls();}public void afterTextChanged(android.text.Editable e){}});
         TextView examples=text(compose,"试试一个示例",13,secondary,4);examples.setMinHeight(dp(44));examples.setGravity(Gravity.CENTER_VERTICAL);UiGlyph.attach(examples,UiGlyph.PLAY,secondary,dp(16));examples.setOnClickListener(v->new AlertDialog.Builder(this).setTitle("选择任务示例").setItems(new String[]{"查看 Android 版本","搜索电池设置"},(d,w)->fillTask(w==0?"打开设置，查看 Android 版本":"打开设置，在搜索框中输入“电池”，查看搜索结果，不修改设置")).show());
+        if(NeoAgent.installed(this)){
+            boolean background="background".equals(getSharedPreferences("gui_backend",0).getString("executionMode","foreground"));
+            row(compose,UiGlyph.SCREEN,background?"后台虚拟屏 · MDI":"手机前台",background?"应用在独立屏幕执行，可暂停和停止":"点击选择执行位置",()->new AlertDialog.Builder(this).setTitle("在哪里执行任务？")
+                .setSingleChoiceItems(new String[]{"手机前台 · 可直接看到操作","后台虚拟屏 · 系统 MDI（测试）"},background?1:0,(dialog,which)->{
+                    dialog.dismiss();new AlertDialog.Builder(this).setTitle(which==1?"使用后台虚拟屏":"使用手机前台")
+                    .setMessage(which==1?"应用会在系统虚拟屏中运行；同一应用可能被迁入虚拟屏。手机需要保持解锁，截图仍发送到你配置的模型。需要系统 MDI 服务，结束后自动回收。此选择也用于电脑和 Amoo 委派的任务。":"后续任务会操作手机当前屏幕。")
+                    .setNegativeButton("取消",null).setPositiveButton("确认使用",(d,w)->statusWorker.execute(()->{try{NeoAgent.executionMode(this,which==1?"background":"foreground");ui.post(()->{if(!destroyed)showTab(3);});}catch(Exception e){ui.post(()->toast(e.getMessage()));}})).show();}).setNegativeButton("取消",null).show());
+        }
         guiStart=button(compose,"开始任务",true,this::startTask);UiGlyph.attach(guiStart,UiGlyph.PLAY,Color.WHITE,dp(18));
         taskReadiness=text(compose,"正在检查执行器…",12,secondary,10);
         LinearLayout live=card(p,12);liveCard=live;live.setVisibility(View.GONE);taskBadge=text(live,"正在检查执行器…",13,secondary,0);taskBadge.setTypeface(CompanionUi.MEDIUM);taskGoal=heading(live,"当前任务",12);guiState=text(live,"正在读取任务状态",14,secondary,8);guiState.setTextIsSelectable(true);taskMetrics=text(live,"",12,secondary,12);taskSteps=column();live.addView(taskSteps);
@@ -118,7 +127,7 @@ public final class MainActivity extends Activity {
         rememberDraft();guiCommandPending=true;updateGuiControls();guiStart.setText("正在提交…");
         statusWorker.execute(()->{try{JSONObject request=new JSONObject().put("op","agent").put("agentOp","start").put("goal",goal);
             JSONObject value=GuiDelegation.desktop(this,request);if(!value.optBoolean("ok",true))throw new IOException(value.optString("error","任务未被接受"));
-            ui.post(()->{guiCommandPending=false;if(destroyed)return;lastAgent=value;guiPhase=value.optString("phase");updateGuiControls();if("running".equals(guiPhase)||"queued".equals(guiPhase)||"planning".equals(guiPhase)){hideTaskKeyboard();taskDraft="";if(taskInput!=null)taskInput.setText("");rememberDraft();moveTaskToBack(true);}else{toast("任务未进入执行，请查看状态");refresh();}});
+            ui.post(()->{guiCommandPending=false;if(destroyed)return;lastAgent=value;guiPhase=value.optString("phase");updateGuiControls();if("running".equals(guiPhase)||"queued".equals(guiPhase)||"planning".equals(guiPhase)){hideTaskKeyboard();taskDraft="";if(taskInput!=null)taskInput.setText("");rememberDraft();if(!"background".equals(value.optString("executionMode")))moveTaskToBack(true);}else{toast("任务未进入执行，请查看状态");refresh();}});
         }catch(Exception e){ui.post(()->{guiCommandPending=false;if(destroyed)return;if(guiStart!=null)guiStart.setText("开始任务");if(guiState!=null)guiState.setText("未能开始："+e.getMessage());updateGuiControls();toast(e.getMessage());});}});
     }
     private void officialSkill(boolean install,TextView target){
@@ -142,7 +151,7 @@ public final class MainActivity extends Activity {
         LinearLayout guide=card(p,18);heading(guide,"首次连接",0);text(guide,"无线连接",15,ink,16);text(guide,"1. 手机和电脑连接同一 Wi-Fi。\n2. desktop 打开“连接设备”并显示二维码。\n3. 在此扫码，确认要连接的电脑。",14,secondary,8);text(guide,"USB 连接",15,ink,18);text(guide,"使用 USB 数据线连接，在手机上确认这台电脑。desktop 连接成功后，此处会显示电脑名称。",14,secondary,8);
         
     }
-    private void filesPage(){LinearLayout p=page("文件","与已连接的电脑互传文件。");LinearLayout expGroup=group(p,"");row(expGroup,UiGlyph.FOLDER,"存储扩容","自动迁移 · 文件分类 · 查看与恢复",()->startActivity(new Intent(this,ExpansionActivity.class)));LinearLayout c=card(p,22);transferHint=text(c,"正在读取电脑连接…",14,secondary,0);send=button(c,busy?"正在准备文件…":"选择文件，发送到电脑",true,this::chooseFiles);text(c,"单个文件最多 256 MB，一次可选择 10 个。",12,secondary,10);notice=text(c,"",13,secondary,8);
+    private void filesPage(){LinearLayout p=page("文件","与已连接的电脑互传文件。");LinearLayout expGroup=group(p,"");row(expGroup,UiGlyph.FOLDER,"存储扩容","自动迁移 · 文件分类 · 查看与恢复",()->startActivity(new Intent(this,ExpansionActivity.class)));row(expGroup,UiGlyph.COMPUTER,"交给 Amoo 处理","选手机资料 → 电脑处理 → 成果回手机",()->startActivity(new Intent(this,DesktopWorkActivity.class)));LinearLayout c=card(p,22);transferHint=text(c,"正在读取电脑连接…",14,secondary,0);send=button(c,busy?"正在准备文件…":"选择文件，发送到电脑",true,this::chooseFiles);text(c,"单个文件最多 256 MB，一次可选择 10 个。",12,secondary,10);notice=text(c,"",13,secondary,8);
         LinearLayout tabs=new LinearLayout(this);LinearLayout.LayoutParams tp=new LinearLayout.LayoutParams(-1,dp(46));tp.topMargin=dp(22);p.addView(tabs,tp);String[] labels={"收到的文件","发出的文件"};for(int i=0;i<2;i++){final int d=i;TextView t=new TextView(this);t.setText(labels[i]);t.setGravity(Gravity.CENTER);t.setTextSize(15);t.setTextColor(transferDirection==i?Color.WHITE:secondary);t.setBackground(surface(transferDirection==i?ink:Color.TRANSPARENT,0,8));tabs.addView(t,new LinearLayout.LayoutParams(0,-1,1));t.setOnClickListener(v->{transferDirection=d;showTab(1);});}
         transferList=column();p.addView(transferList);loadTransfers();
     }
@@ -204,19 +213,21 @@ public final class MainActivity extends Activity {
     private void refresh(){
         if(destroyed||refreshPending)return;refreshPending=true;final int generation=pageGeneration,viewTab=tab;
         statusWorker.execute(()->{
-            TransferStore.Link link=store.link();JSONObject agent=null;String error="";JSONArray history=new JSONArray();JSONObject amoo=new JSONObject(),pairing=new JSONObject(),game=new JSONObject();
+            TransferStore.Link link=store.link();JSONObject agent=null;String error="";JSONArray history=new JSONArray(),desktopTasks=null;JSONObject amoo=new JSONObject(),pairing=new JSONObject(),game=new JSONObject();
+            if(viewTab==0)try{desktopTasks=new DesktopWorkStore(this).tasks();}catch(Exception ignored){/* Keep the continuation entry available during a storage outage. */}
             if(viewTab==0||viewTab==3)try{agent=NeoAgent.selected(this)?NeoAgent.status(this):PhoneGuiAgent.status(this);}catch(Exception e){error=e.getMessage()==null?"任务服务未返回状态，请稍后重试。":e.getMessage();}
             if(viewTab==3)try{history=AgentHistory.list(this);}catch(Exception ignored){/* A service outage must not hide readable task history. */}
             if(viewTab==0||viewTab==4||viewTab==6||viewTab==7)amoo=state("amoo-connection.json");
             if(viewTab==6||viewTab==7)pairing=state("pairing.json");if(viewTab==5)game=state("status.json");
             if(viewTab==8)try{history=AgentHistory.list(this);}catch(Exception e){history=null;error="记录读取失败，请返回后重试。";}
-            final JSONObject a=agent,as=amoo,ps=pairing,gs=game;final JSONArray hs=history;final String failure=error;
+            final JSONObject a=agent,as=amoo,ps=pairing,gs=game;final JSONArray hs=history,ds=desktopTasks;final String failure=error;
             ui.post(()->{refreshPending=false;if(destroyed)return;cachedLink=link;if(generation!=pageGeneration){refresh();return;}if(viewTab!=1)endLoading();
                 if(a!=null){lastAgent=a;guiReady=a.optBoolean("ready");guiPhase=a.optString("phase");}else if(viewTab==0||viewTab==3){guiReady=false;guiPhase="";}
                 AutoConnectService.rememberFirstConnection(this,link.online);
                 long nowElapsed=SystemClock.elapsedRealtime();
                 boolean amooActive=as.optBoolean("active")&&as.optLong("leaseExpiresElapsedMs")>nowElapsed&&as.optLong("uptimeMs")<=nowElapsed&&nowElapsed-as.optLong("uptimeMs")<30000;
-                if(homeStatus!=null){homeStatus.setText(link.online?(amooActive?"● 已连接 · 电脑正在使用 Amoo 协作":"● 已连接 · Amoo 与工具就绪"):AutoConnectService.enabled(this)?"尚未连接 · 自动连接待命中":"尚未连接");homeStatus.setTextColor(link.online?green:secondary);homeComputer.setText(link.online?link.name:"连接你的电脑");if(homeScan!=null)homeScan.setText(link.online?"扫码配对其他电脑":"扫码连接");if(homeHint!=null)homeHint.setText(link.online?(amooActive?"电脑正在执行 Amoo 协作（"+as.optString("message","保持唤醒")+"），文件互传与手机工具已就绪。":"已与电脑建立连接，可在电脑使用 Amoo 对话、Amoo Work、文件互传与手机工具。"):AutoConnectService.enabled(this)?"自动连接已开启 · 同一 Wi-Fi 下打开电脑端即可自动重连，也可扫码或 USB 连接。":"连接后，在电脑使用 Amoo、文件与手机工具。");homeTask.setText(a==null?(failure.isEmpty()?"暂时无法读取任务状态":failure):NeoPolicy.active(guiPhase)?phaseLabel(guiPhase)+" · "+a.optString("goal"):guiReady?"已就绪 · 无需连接电脑即可运行":readiness(a));}
+                if(homeWork!=null)homeWork.setText(desktopWorkSummary(ds));
+                if(homeStatus!=null){homeStatus.setText(link.online?(amooActive?"● 已连接 · 电脑正在使用 Amoo 协作":"● 已连接 · 可继续跨端协作"):AutoConnectService.enabled(this)?"尚未连接 · 自动连接待命中":"尚未连接");homeStatus.setTextColor(link.online?green:secondary);homeComputer.setText(link.online?link.name:"连接你的电脑");if(homeScan!=null)homeScan.setText(link.online?"扫码配对其他电脑":"扫码连接");if(homeHint!=null)homeHint.setText(link.online?(amooActive?"电脑正在执行 Amoo 协作（"+as.optString("message","保持唤醒")+"），文件互传与手机工具已就绪。":"已与电脑建立连接，可在电脑使用 Amoo 对话、Amoo Work、文件互传与手机工具。"):AutoConnectService.enabled(this)?"自动连接已开启 · 同一 Wi-Fi 下打开电脑端即可自动重连，也可扫码或 USB 连接。":"连接后，在电脑使用 Amoo、文件与手机工具。");homeTask.setText(a==null?(failure.isEmpty()?"暂时无法读取任务状态":failure):NeoPolicy.active(guiPhase)?phaseLabel(guiPhase)+" · "+a.optString("goal"):guiReady?"已就绪 · 无需连接电脑即可运行":readiness(a));}
                 if(guiState!=null){if(a!=null)renderAgent(a,hs);else{liveCard.setVisibility(View.VISIBLE);taskBadge.setText("任务服务未就绪");taskGoal.setText("请先恢复任务服务");taskReadiness.setText("暂时无法开始任务 · 草稿已保留");taskReadiness.setTextColor(CompanionUi.AMBER);guiState.setText(failure.isEmpty()?"请稍后重试":failure);taskMetrics.setText("");taskSteps.removeAllViews();taskDetails.setVisibility(View.GONE);lastTaskRender="";renderHistory(hs,5);}updateGuiControls();}
                 if(linkTitle!=null){linkTitle.setText(link.online?"已连接 · "+link.name:"尚未连接电脑");linkTitle.setTextColor(link.online?green:ink);if(connScan!=null)connScan.setText(link.online?"扫码配对其他电脑":"扫码连接");linkHint.setText(link.online?(amooActive?"电脑正在执行 Amoo 协作任务，可互传文件与调用手机工具。":"可以互传文件，在电脑使用 Amoo 与 Amoo Work。"):AutoConnectService.enabled(this)?"等待已配对电脑，请确认电脑已打开 StepX Companion。":"首次使用请扫码或通过 USB 配对。");connectionFoot.setText(link.online?(amooActive?"电脑已连接 · Amoo 后台协作进行中（"+as.optString("message","保持唤醒")+"）":"连接状态由电脑实时确认 · 支持 USB 与无线热备切换"):AutoConnectService.state(this));}
                 if(send!=null){send.setEnabled(!busy);send.setAlpha(!busy?1f:0.45f);send.setText(busy?"正在准备文件…":link.online?"选择文件，发送到电脑":"连接电脑");transferHint.setText(link.online?"发送给 "+link.name:"请先连接电脑，再选择文件。");loadTransfers();}
@@ -226,8 +237,18 @@ public final class MainActivity extends Activity {
             });
         });
     }
+    private String desktopWorkSummary(JSONArray tasks){
+        if(tasks==null)return "暂时无法读取任务；可打开任务与成果重试。";
+        if(tasks.length()==0)return "还没有电脑任务。选择手机资料，交给 Amoo 分析或制作。";
+        JSONObject current=tasks.optJSONObject(0);int active=0;
+        for(int i=0;i<tasks.length();i++){JSONObject item=tasks.optJSONObject(i);if(item!=null&&DesktopWorkPolicy.active(item.optString("phase"))){if(active==0)current=item;active++;}}
+        if(current==null)return "打开任务与成果，继续查看。";
+        String phase=current.optString("phase");
+        String connection=DesktopWorkPolicy.connectionHint(phase,current.optBoolean("desktopOnline"),current.optBoolean("differentDesktop"));
+        return (active>0?active+" 个任务进行中 · ":"最近任务 · ")+DesktopWorkPolicy.phaseLabel(phase)+"\n"+current.optString("goal")+(connection.isEmpty()?"":"\n"+connection);
+    }
     private boolean screenPermissionEnabled(){String services=Settings.Secure.getString(getContentResolver(),Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);if(services==null)return false;String target=NeoAgent.selected(this)?"com.stepx.companion.neo.ControlService":getPackageName()+".GuiAccessibilityService";for(String service:services.split(":")){ComponentName c=ComponentName.unflattenFromString(service);if(c!=null&&getPackageName().equals(c.getPackageName())&&target.equals(c.getClassName()))return true;}return false;}
-    private String readiness(JSONObject value){if(value.optBoolean("ready"))return "保持手机解锁 · 使用你配置的模型服务";if(!value.optBoolean("executorConnected"))return screenPermissionEnabled()?"看屏服务正在重新连接…":"请在设置 → 权限与服务中启用看屏操作。";if(!value.optBoolean("modelConfigured"))return "请先配置支持图片输入的模型。";return "请在模型设置中确认允许操作的应用。";}
+    private String readiness(JSONObject value){if(!value.optString("backendError").isEmpty())return value.optString("backendError");if(value.optBoolean("ready"))return "保持手机解锁 · 使用你配置的模型服务";if(!value.optBoolean("executorConnected"))return screenPermissionEnabled()?"看屏服务正在重新连接…":"请在设置 → 权限与服务中启用看屏操作。";if(!value.optBoolean("modelConfigured"))return "请先配置支持图片输入的模型。";return "请在模型设置中确认允许操作的应用。";}
     private String phaseLabel(String phase){return NeoPolicy.phaseLabel(phase);}
     private void renderAgent(JSONObject value,JSONArray history){
         JSONObject result=value.optJSONObject("result");boolean verified=result!=null&&result.optBoolean("verified")&&result.optBoolean("phoneStopped");
@@ -301,7 +322,7 @@ public final class MainActivity extends Activity {
             });
         }catch(Exception ex){ui.post(()->toast("预览失败："+ex.getMessage()));}});
     }
-    private void open(TransferStore.Entry e){if(busy)return;busy=true;refresh();if(notice!=null)notice.setText("正在校验文件…");files.execute(()->{try{store.verifiedFile(e.direction,e.id);ui.post(()->{busy=false;refresh();if(destroyed)return;try{Intent i=new Intent(Intent.ACTION_VIEW).setDataAndType(e.uri(),TransferStore.mime(e.name)).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);i.setClipData(ClipData.newRawUri(e.name,e.uri()));startActivity(Intent.createChooser(i,"打开文件"));if(notice!=null)notice.setText("文件校验通过。");}catch(ActivityNotFoundException ex){toast("没有可以打开此格式的应用，请先保存到手机。");}});}catch(Exception ex){finishFiles("打开失败："+ex.getMessage());}});}
+    private void open(TransferStore.Entry e){if(busy)return;if(TransferPreviewActivity.supports(e.name)){TransferPreviewActivity.open(this,e.direction,e.id);return;}busy=true;refresh();if(notice!=null)notice.setText("正在校验文件…");files.execute(()->{try{store.verifiedFile(e.direction,e.id);ui.post(()->{busy=false;refresh();if(destroyed)return;try{Intent i=new Intent(Intent.ACTION_VIEW).setDataAndType(e.uri(),TransferStore.mime(e.name)).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);i.setClipData(ClipData.newRawUri(e.name,e.uri()));startActivity(Intent.createChooser(i,"打开文件"));if(notice!=null)notice.setText("文件校验通过。");}catch(ActivityNotFoundException ex){toast("没有可以打开此格式的应用，请先保存到手机。");}});}catch(Exception ex){finishFiles("打开失败："+ex.getMessage());}});}
     private void save(TransferStore.Entry e){saving=e;Intent i=new Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType(TransferStore.mime(e.name)).putExtra(Intent.EXTRA_TITLE,e.name);startActivityForResult(i,SAVE_FILE);}
     private void confirmDelete(TransferStore.Entry e){new AlertDialog.Builder(this).setTitle("移除这条传输？").setMessage("将删除伴侣中的传输记录和缓存文件。已经保存到手机或电脑的文件不受影响。").setNegativeButton("保留",null).setPositiveButton("移除",(d,w)->files.execute(()->{try{store.delete(e);ui.post(()->{lastListing="";loadTransfers();});}catch(Exception ex){ui.post(()->toast("未能移除："+ex.getMessage()));}})).show();}
     @Override protected void onActivityResult(int request,int result,Intent data){super.onActivityResult(request,result,data);if(result!=RESULT_OK||data==null)return;

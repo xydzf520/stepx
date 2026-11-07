@@ -43,6 +43,7 @@ public final class CompanionService extends Service implements SensorEventListen
     private String mode="stopped",requestId="",jobId="",error="",pause="",title="";
     private long lastTick,started,lastStatus,lastStatusWrite,lastFrame,accelCount,gravityCount,gyroCount,frameCount,tapTriggers;
     private String lastStatusKey="";
+    private String lastNotificationText="等待指令";
     private float gx,gy,gz=9.8f,gyroMagnitude;
     private double tilt,neutral;
     private boolean registered=false,motionRegistered=false,standby=false,synthetic=false,calling=false,restored=true,pausedOutput=false,commandReady=false;
@@ -76,10 +77,16 @@ public final class CompanionService extends Service implements SensorEventListen
         Intent stop=new Intent(this,CompanionService.class).putExtra("op","stop");
         PendingIntent pi=PendingIntent.getService(this,1,stop,PendingIntent.FLAG_UPDATE_CURRENT|PendingIntent.FLAG_IMMUTABLE);
         PendingIntent open=PendingIntent.getActivity(this,2,new Intent(this,MainActivity.class),PendingIntent.FLAG_UPDATE_CURRENT|PendingIntent.FLAG_IMMUTABLE);
-        return new Notification.Builder(this,"backscreen").setSmallIcon(android.R.drawable.ic_media_play).setContentTitle("StepX伴侣").setContentText(text).setContentIntent(open).setOngoing(true).addAction(new Notification.Action.Builder(null,"停止",pi).build()).build();
+        return new Notification.Builder(this,"backscreen").setSmallIcon(android.R.drawable.ic_media_play).setContentTitle("StepX伴侣").setContentText(text).setContentIntent(open).setOngoing(true)
+            .setCategory(Notification.CATEGORY_SERVICE).setOnlyAlertOnce(true).setGroup("stepx-runtime-silent").setGroupAlertBehavior(Notification.GROUP_ALERT_SUMMARY).setVisibility(Notification.VISIBILITY_SECRET)
+            .addAction(new Notification.Action.Builder(null,"停止",pi).build()).build();
     }
     private String notificationText(){return mode.equals("standby")?"三敲背面开始游戏 · 待机不持唤醒锁":mode.equals("game")?"重力对齐 · 翻到手机正面结束":mode.equals("animation")?"背屏："+title:"已停止";}
-    private void notifyState(){getSystemService(NotificationManager.class).notify(17,notification(notificationText()));}
+    private void notifyState(){
+        String text=notificationText();
+        if(mode.equals("stopped")||text.equals(lastNotificationText))return;
+        getSystemService(NotificationManager.class).notify(17,notification(text));lastNotificationText=text;
+    }
     @Override public int onStartCommand(Intent intent,int flags,int startId){
         serviceStartCount++;lastStartId=startId;
         android.util.Log.i("StepXCompanion","start instance="+serviceCreatedUptimeMs+" startId="+startId+" mode="+mode);
@@ -113,7 +120,9 @@ public final class CompanionService extends Service implements SensorEventListen
             // stopSelf(oldStartId) need not destroy this instance if another command
             // was already queued. Reassert FGS after an idle status/stop removed it.
             // This retains the manifest's specialUse type; it is not a freezer bypass.
-            if(!mode.equals("stopped"))startForeground(17,notification(notificationText()));
+            if(!mode.equals("stopped")&&(!notificationText().equals(lastNotificationText)||getForegroundServiceType()==0)){
+                startForeground(17,notification(notificationText()));lastNotificationText=notificationText();
+            }
             commandReady=true;
         }catch(Throwable e){error=message(e);if(!preserveOutputOnFailure){stopOutput(true);mode="stopped";standby=false;unregister();}}
         android.util.Log.i("StepXCompanion","ack instance="+serviceCreatedUptimeMs+" startId="+startId+" mode="+mode+" fgsType="+getForegroundServiceType());
@@ -159,7 +168,7 @@ public final class CompanionService extends Service implements SensorEventListen
             if(game!=null&&!synthetic&&!game.phase.equals("countdown")&&faceExit.sample(now,gz,backNormal)){pause="本局已结束，已恢复背屏";finishGame(false);}
             if(mode.equals("standby"))pause=gravityCount==0?"等待姿态传感器":gz>=7.5?"请拿起手机，将背屏朝向自己后敲三下":"";
             if(mode.equals("game")||mode.equals("animation")){
-                String gate=calling?"来电或通话中":isPowerSave(now)?"系统省电模式":cachedThermalStatus>=PowerManager.THERMAL_STATUS_SEVERE?"手机温度较高":gravityCount==0?"等待姿态传感器":gz>=7.5?"请将背屏朝向自己":"";
+                String gate=calling?"来电或通话中":isPowerSave(now)?"系统省电模式":cachedThermalStatus>=PowerManager.THERMAL_STATUS_SEVERE?"手机温度较高":mode.equals("game")?(gravityCount==0?"等待姿态传感器":gz>=7.5?"请将背屏朝向自己":""):"";
                 if(!gate.isEmpty()){
                     pause=gate;if(!pausedOutput){screen.restore(false);pausedOutput=true;restored=true;if(lock.isHeld())lock.release();}
                 }else{
@@ -198,7 +207,7 @@ public final class CompanionService extends Service implements SensorEventListen
         if(!force&&stateKey.equals(lastStatusKey)&&now-lastStatusWrite<2000)return;
         lastStatusKey=stateKey;lastStatusWrite=now;
         try{
-            JSONObject j=new JSONObject().put("protocol",1).put("app","StepX伴侣").put("version","0.1.2").put("uid",android.os.Process.myUid()).put("requestId",requestId).put("jobId",jobId).put("commandReady",commandReady).put("running",!mode.equals("stopped")).put("mode",mode).put("phase",game!=null?game.phase:mode).put("appliedTitle",title).put("frameCount",frameCount).put("lastFrameUptimeMs",lastSubmitted).put("lastError",error).put("pausedReason",pause).put("settingsRestored",restored).put("synthetic",synthetic).put("standbyEnabled",standby).put("wakeLockHeld",lock!=null&&lock.isHeld()).put("timestampMs",System.currentTimeMillis()).put("uptimeMs",now).put("tiltDegrees",tilt-neutral).put("gravityZ",gz).put("tapCount",taps.count).put("tapTriggers",tapTriggers).put("outputAccepted",frameCount>0&&!pausedOutput&&(mode.equals("game")||mode.equals("animation"))).put("outputVerified",false);
+            JSONObject j=new JSONObject().put("protocol",1).put("app","StepX伴侣").put("version",getPackageManager().getPackageInfo(getPackageName(),0).versionName).put("uid",android.os.Process.myUid()).put("requestId",requestId).put("jobId",jobId).put("commandReady",commandReady).put("running",!mode.equals("stopped")).put("mode",mode).put("phase",game!=null?game.phase:mode).put("appliedTitle",title).put("frameCount",frameCount).put("lastFrameUptimeMs",lastSubmitted).put("lastError",error).put("pausedReason",pause).put("settingsRestored",restored).put("synthetic",synthetic).put("standbyEnabled",standby).put("wakeLockHeld",lock!=null&&lock.isHeld()).put("timestampMs",System.currentTimeMillis()).put("uptimeMs",now).put("tiltDegrees",tilt-neutral).put("gravityZ",gz).put("tapCount",taps.count).put("tapTriggers",tapTriggers).put("outputAccepted",frameCount>0&&!pausedOutput&&(mode.equals("game")||mode.equals("animation"))).put("outputVerified",false);
             j.put("serviceCreatedUptimeMs",serviceCreatedUptimeMs).put("serviceStartCount",serviceStartCount).put("lastStartId",lastStartId).put("foregroundServiceType",getForegroundServiceType());
             j.put("sensors",new JSONObject().put("accelerometer",accel!=null).put("gravity",gravity!=null).put("gyroscope",gyro!=null).put("accelEvents",accelCount).put("gravityEvents",gravityCount).put("gyroEvents",gyroCount).put("gameRotationVector",rotation!=null).put("rotationEvents",rotationCount).put("registered",registered).put("motionRegistered",motionRegistered));
             if(lastTest==null){String raw=getSharedPreferences("test_result",0).getString("last","");if(!raw.isEmpty())lastTest=new JSONObject(raw);}if(lastTest!=null)j.put("lastTest",lastTest);

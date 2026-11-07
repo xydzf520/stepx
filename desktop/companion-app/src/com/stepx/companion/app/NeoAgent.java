@@ -51,6 +51,24 @@ final class NeoAgent {
         if(!c.getSharedPreferences("gui_backend",0).edit().putBoolean("neo",false).commit())throw new IllegalStateException("未能保存执行器选择，请重试");
         return new JSONObject().put("ok",true).put("selected",false).put("installed",present);
     }
+    static synchronized JSONObject executionMode(Context c,String mode)throws Exception {
+        if(!mode.equals("background")&&!mode.equals("foreground"))throw new IllegalArgumentException("执行模式无效");
+        JSONObject state=call(c,new JSONObject().put("op","status"));
+        if(NeoPolicy.active(state.optString("state"))||state.optBoolean("executorBusy"))throw new IllegalStateException("请先结束当前任务，再切换执行方式");
+        if(mode.equals("background"))call(c,new JSONObject().put("op","mdi_probe"));
+        if(!c.getSharedPreferences("gui_backend",0).edit().putString("executionMode",mode).commit())throw new IllegalStateException("未能保存执行方式");
+        return status(c);
+    }
+    static synchronized JSONObject statusReadonly(Context c)throws Exception {
+        JSONObject raw=call(c,new JSONObject().put("op","status"));
+        String preferred=c.getSharedPreferences("gui_backend",0).getString("executionMode","foreground");
+        raw.put("preferredExecutionMode",preferred);
+        JSONObject value=normalize(raw).put("installed",true).put("selected",selected(c));
+        // Background readiness normally requires an active MDI probe. A passive
+        // observer must leave that fact unknown rather than starting a probe.
+        value.put("readinessKnown",!preferred.equals("background")||NeoPolicy.active(raw.optString("state")));
+        return value;
+    }
     static synchronized JSONObject status(Context c)throws Exception {
         JSONObject raw=call(c,new JSONObject().put("op","status")),config=raw.optJSONObject("config");
         // Adopt the companion's all-app default once for an already-ready legacy setup.
@@ -59,6 +77,12 @@ final class NeoAgent {
             call(c,new JSONObject().put("op","apps").put("mode","all").put("userConfirmed",true));
             raw=call(c,new JSONObject().put("op","status"));
         }
+        String preferred=c.getSharedPreferences("gui_backend",0).getString("executionMode","foreground");
+        if(preferred.equals("background")&&config!=null&&config.optBoolean("hasKey")&&!NeoPolicy.active(raw.optString("state"))){
+            try{JSONObject probe=call(c,new JSONObject().put("op","mdi_probe"));raw.put("ready",probe.optBoolean("transportReady")).put("accessibilityConnected",probe.optBoolean("transportReady"));}
+            catch(Exception e){raw.put("ready",false).put("accessibilityConnected",false).put("backendError","后台虚拟屏系统服务未就绪，请安装或修复伴侣服务");}
+        }
+        raw.put("preferredExecutionMode",preferred);
         JSONObject value=normalize(raw).put("installed",true).put("selected",selected(c));AgentHistory.observe(c,value);return value;
     }
     static JSONObject stepPlanKeyTarget(Context c)throws Exception {
@@ -105,6 +129,9 @@ final class NeoAgent {
             String goal=q.getString("goal");if(goal.trim().isEmpty()||goal.length()>4000)throw new IllegalArgumentException("任务目标无效");
             JSONObject current=status(c);
             if(NeoPolicy.active(current.optString("phase"))||current.optBoolean("executorBusy"))throw new IllegalStateException("手机已有任务，请先停止或等待完成");
+            String mode=q.optString("executionMode",c.getSharedPreferences("gui_backend",0).getString("executionMode","foreground"));
+            if(!mode.equals("foreground")&&!mode.equals("background"))throw new IllegalArgumentException("执行模式无效");
+            request.put("executionMode",mode);
             task=UUID.randomUUID().toString().replace("-","");request.put("requestId",task).put("goal",goal).put("session","companion-"+uid);
             // Native MCP cannot supply its own success assertion. Known exact
             // tasks use the same companion-owned acceptance recipe on all routes.

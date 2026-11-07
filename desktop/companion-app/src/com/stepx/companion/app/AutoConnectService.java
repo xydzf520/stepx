@@ -7,6 +7,7 @@ import android.net.*;
 import android.os.*;
 import android.provider.Settings;
 import java.util.HashSet;
+import java.util.Objects;
 
 /** Rejoins Android's authenticated wireless transport. Never trusts a Wi-Fi network or an ADB key. */
 public final class AutoConnectService extends Service {
@@ -15,6 +16,9 @@ public final class AutoConnectService extends Service {
     private final HashSet<Network> networks=new HashSet<>();
     private ConnectivityManager manager;
     private boolean registered;
+    private boolean foregroundStarted=false;
+    private String lastTitle=null;
+    private String lastText=null;
     private long permissionDeadline;
     private final Runnable retryPermission=()->{for(Network network:new HashSet<>(networks))enableOnNetwork(network);};
     private FileObserver linkObserver;
@@ -49,15 +53,27 @@ public final class AutoConnectService extends Service {
     private void status(String value){if(!value.equals(state(this)))prefs(this).edit().putString("state",value).apply();showStatus(value);}
     private void showStatus(String value){
         TransferStore.Link link=new TransferStore(this).link();
-        getSystemService(NotificationManager.class).notify(104,notification(link.online?"已连接 · "+link.name:value));
+        String title="电脑自动连接";
+        String text=link.online?"已连接 · "+link.name:value;
+        if(!foregroundStarted){
+            startForeground(104,statusNotification(title,text));
+            foregroundStarted=true;
+            lastTitle=title;
+            lastText=text;
+        }else if(!Objects.equals(title,lastTitle)||!Objects.equals(text,lastText)){
+            getSystemService(NotificationManager.class).notify(104,statusNotification(title,text));
+            lastTitle=title;
+            lastText=text;
+        }
         main.removeCallbacks(refreshLink);
         if(link.online)main.postDelayed(refreshLink,31000);
     }
-    private Notification notification(String value){
+    private Notification statusNotification(String title,String value){
         PendingIntent open=PendingIntent.getActivity(this,0,new Intent(this,MainActivity.class),PendingIntent.FLAG_UPDATE_CURRENT|PendingIntent.FLAG_IMMUTABLE);
         PendingIntent pause=PendingIntent.getService(this,1,new Intent(this,AutoConnectService.class).setAction("pause"),PendingIntent.FLAG_UPDATE_CURRENT|PendingIntent.FLAG_IMMUTABLE);
-        return new Notification.Builder(this,CHANNEL).setSmallIcon(getApplicationInfo().icon).setContentTitle("电脑自动连接").setContentText(value).setContentIntent(open).setOngoing(true).setOnlyAlertOnce(true).addAction(new Notification.Action.Builder(null,"暂停",pause).build()).build();
+        return new Notification.Builder(this,CHANNEL).setSmallIcon(getApplicationInfo().icon).setContentTitle(title).setContentText(value).setContentIntent(open).setOngoing(true).setOnlyAlertOnce(true).addAction(new Notification.Action.Builder(null,"暂停",pause).build()).build();
     }
+    private Notification notification(String value){return statusNotification("电脑自动连接",value);}
     @Override public void onCreate(){super.onCreate();getSystemService(NotificationManager.class).createNotificationChannel(new NotificationChannel(CHANNEL,"电脑自动连接",NotificationManager.IMPORTANCE_LOW));}
     private final ConnectivityManager.NetworkCallback callback=new ConnectivityManager.NetworkCallback(){
         @Override public void onAvailable(Network network){main.post(()->{if(networks.add(network))main.postDelayed(()->enableOnNetwork(network),1500);});}
@@ -73,7 +89,7 @@ public final class AutoConnectService extends Service {
         }catch(Exception e){status("无线连接未就绪 · 请查看连接管理");}
     }
     @Override public int onStartCommand(Intent intent,int flags,int id){
-        startForeground(104,notification(state(this)));
+        showStatus(state(this));
         if(intent!=null&&"pause".equals(intent.getAction())){setEnabled(this,false);return START_NOT_STICKY;}
         if(!enabled(this)){stopSelf();return START_NOT_STICKY;}
         if(!registered){permissionDeadline=SystemClock.elapsedRealtime()+180000;manager=getSystemService(ConnectivityManager.class);try{manager.registerNetworkCallback(new NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build(),callback);registered=true;}catch(Exception e){status("网络监听未启动 · 请重新开启自动连接");stopSelf();return START_NOT_STICKY;}}
@@ -81,6 +97,6 @@ public final class AutoConnectService extends Service {
         showStatus(state(this));
         return START_STICKY;
     }
-    @Override public void onDestroy(){if(linkObserver!=null)linkObserver.stopWatching();main.removeCallbacksAndMessages(null);if(registered)try{manager.unregisterNetworkCallback(callback);}catch(Exception ignored){}super.onDestroy();}
+    @Override public void onDestroy(){foregroundStarted=false;lastTitle=null;lastText=null;if(linkObserver!=null)linkObserver.stopWatching();main.removeCallbacksAndMessages(null);if(registered)try{manager.unregisterNetworkCallback(callback);}catch(Exception ignored){}super.onDestroy();}
     @Override public IBinder onBind(Intent intent){return null;}
 }

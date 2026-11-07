@@ -17,7 +17,10 @@ impl Companion {
     /// Returns `Some(El)` when there are active interactive desktop toast cards to display
     /// as a floating bottom-right overlay on top of the current shell.
     pub(super) fn push_toast_overlay(&self) -> Option<El> {
-        if self.push.active_toasts.is_empty() {
+        if self.push.active_toasts.is_empty()
+            || (self.page == super::Page::Home
+                && (self.context_home_is_focused() || self.home_module_edit_mode))
+        {
             return None;
         }
 

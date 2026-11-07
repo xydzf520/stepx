@@ -29,6 +29,8 @@ public final class AgentBusLease {
     private final Object gateway;
     private final String certificate;
     private final int uid;
+    private final String wakeMethod;
+    private final String jobActiveMethod;
     private final LocalServerSocket server;
     private final Map<String, Long> leases = new HashMap<>();
     private volatile boolean running = true;
@@ -40,19 +42,53 @@ public final class AgentBusLease {
     private AgentBusLease(Application app, Object gateway, String certificate, int uid) throws Exception {
         this.app = app; this.gateway = gateway; this.certificate = certificate; this.uid = uid;
         verifyCompanion();
-        if (!gateway.getClass().getName().equals("o4.t1")) throw new SecurityException("Unsupported gateway");
+        String[] methods = validateGatewayAbi(gateway);
+        this.wakeMethod = methods[0];
+        this.jobActiveMethod = methods[1];
+        this.server = new LocalServerSocket(SOCKET);
+    }
+
+    static String[] validateGatewayAbi(Object gateway) throws Exception {
+        String gatewayType = gateway.getClass().getName();
+        boolean v12 = gatewayType.equals("jb.r1");
+        if (!gatewayType.equals("o4.t1") && !v12) throw new SecurityException("Unsupported gateway: " + gatewayType);
+        String wake = v12 ? "v" : "w";
+        String jobActive = v12 ? "c" : "b";
         for (String name : new String[]{"F", "G", "I"}) {
             if (field(gateway, name).getType() != boolean.class) throw new SecurityException("Gateway ABI mismatch");
         }
         // Verify every native method before creating a server or changing any state.
-        gateway.getClass().getMethod("f");
+        if (gateway.getClass().getMethod("f").getReturnType() != boolean.class)
+            throw new SecurityException("Gateway pending ABI mismatch");
+        if (field(gateway, "J").getType().getMethod(jobActive).getReturnType() != boolean.class)
+            throw new SecurityException("Gateway job ABI mismatch");
         for (String name : new String[]{"x", "y"}) {
             Object connection = field(gateway, name).get(gateway);
-            connection.getClass().getMethod("w", boolean.class);
+            connection.getClass().getMethod(wake, boolean.class);
             connection.getClass().getMethod("f");
             connectionState(connection);
         }
-        this.server = new LocalServerSocket(SOCKET);
+        return new String[]{wake, jobActive};
+    }
+
+    static Object resolveGateway(Object service) throws Exception {
+        for (String containerFieldName : new String[]{"c", "h"}) {
+            Field containerField;
+            try {
+                containerField = field(service, containerFieldName);
+            } catch (NoSuchFieldException ignored) {
+                continue;
+            }
+            if (java.lang.reflect.Modifier.isStatic(containerField.getModifiers())) continue;
+            Object container = containerField.get(service);
+            if (container == null) continue;
+            try {
+                Object candidate = field(container, "f0").get(container);
+                if (candidate != null) return candidate;
+            } catch (NoSuchFieldException ignored) {
+            }
+        }
+        return null;
     }
 
     public static String run(String certificate, int uid) {
@@ -68,8 +104,7 @@ public final class AgentBusLease {
             Object gateway = null;
             for (Object value : services.values()) {
                 if (value instanceof Service && value.getClass().getName().equals("com.stepos.agentbus.platform.AgentBusService")) {
-                    Object container = field(value, "h").get(value);
-                    if (container != null) gateway = field(container, "f0").get(container);
+                    gateway = resolveGateway(value);
                 }
             }
             if (gateway == null) throw new IllegalStateException("AgentBus gateway not ready");
@@ -113,7 +148,7 @@ public final class AgentBusLease {
     private boolean pending() throws Exception { return (Boolean) gateway.getClass().getMethod("f").invoke(gateway); }
     private boolean nativeWakeActive() throws Exception {
         Object job = field(gateway, "J").get(gateway);
-        return job != null && (Boolean) job.getClass().getMethod("b").invoke(job);
+        return job != null && (Boolean) job.getClass().getMethod(jobActiveMethod).invoke(job);
     }
     private static String connectionState(Object connection) throws Exception {
         Object flow = field(connection, "b").get(connection);
@@ -137,7 +172,7 @@ public final class AgentBusLease {
                     Object connection = field(gateway, name).get(gateway);
                     String state = connectionState(connection);
                     if (!state.equals("ONLINE") && !state.equals("CONNECTING") && !state.equals("AUTHENTICATING"))
-                        connection.getClass().getMethod("w", boolean.class).invoke(connection, true);
+                        connection.getClass().getMethod(wakeMethod, boolean.class).invoke(connection, true);
                 }
             }
         } else {

@@ -4,10 +4,10 @@
 
 在真实使用场景中，**绝大多数用户不会一直插着 USB 数据线，而是让手机与电脑处于同一个 Wi-Fi 局域网下（手机常处于锁屏/熄屏放置在桌面或口袋中）**。
 
-基于对 `JiayuStudio/stepx-neo-lab`（`guides/neo-agent-touch` `v0.1.16-beta.1`）的深度拆解，以及我们现有的 [StepX伴侣 (`com.stepx.companion.app`)](file:///home/zhengfa/work/stepx/desktop/companion-app/AndroidManifest.xml) 与 [StepX 桌面端 (`desktop/src/`)](file:///home/zhengfa/work/stepx/desktop/src/main.rs) 架构底座，本方案旨在实现四大核心能力，并针对 **同 Wi-Fi 无线使用场景** 进行专项架构设计与评估：
+基于对 `JiayuStudio/stepx-neo-lab`（`guides/neo-agent-touch` `v0.1.16-beta.1`）的深度拆解，以及我们现有的 [StepX伴侣 (`com.stepx.companion.app`)](file:///home/stepx-user/work/stepx/desktop/companion-app/AndroidManifest.xml) 与 [StepX 桌面端 (`desktop/src/`)](file:///home/stepx-user/work/stepx/desktop/src/main.rs) 架构底座，本方案旨在实现四大核心能力，并针对 **同 Wi-Fi 无线使用场景** 进行专项架构设计与评估：
 
 1. **主流聊天软件在 StepX 内显示原生对话框并直接回复（IM Chat Hub）**
-   - 像现有的短信页面（[`desktop/src/ui/pages/sms.rs`](file:///home/zhengfa/work/stepx/desktop/src/ui/pages/sms.rs)）一样，**直接在 StepX 客户端内展示微信、企业微信、钉钉、飞书、QQ、Telegram、WhatsApp、Slack 等主流聊天软件的会话列表与聊天气泡对话框**。
+   - 像现有的短信页面（[`desktop/src/ui/pages/sms.rs`](file:///home/stepx-user/work/stepx/desktop/src/ui/pages/sms.rs)）一样，**直接在 StepX 客户端内展示微信、企业微信、钉钉、飞书、QQ、Telegram、WhatsApp、Slack 等主流聊天软件的会话列表与聊天气泡对话框**。
    - 用户（或 AI 助手）直接在 StepX 对话框底部输入框打字并点击发送，即可将消息直接回复至对应聊天软件。
 2. **显示来自手机全部推送的消息查看中心（Phone Push Notification Center）**
    - 在 StepX 客户端新增独立的 **「手机推送」** 页面，实时捕获并展示来自手机上**全部应用**的推送通知（涵盖即时通讯、社交互动、交易账单、物流出行、系统安全、资讯等）。
@@ -38,15 +38,15 @@
 为保证同 Wi-Fi 下 **“最快速度 + 最高可靠度 + 零配置”**，设计双栈传输通道（桌面端自动择优）：
 
 1. **首选栈 A：Wireless ADB `forward` 本地流套接字（零防火墙阻碍）**
-   - 当同 Wi-Fi 下的无线调试已连接（由 [`discovery.rs`](file:///home/zhengfa/work/stepx/desktop/src/discovery.rs) mDNS `_adb-tls-connect._tcp` 自动发现连接）时：
+   - 当同 Wi-Fi 下的无线调试已连接（由 [`discovery.rs`](file:///home/stepx-user/work/stepx/desktop/src/discovery.rs) mDNS `_adb-tls-connect._tcp` 自动发现连接）时：
    - 手机端 `PushNotificationService` 创建 `LocalServerSocket("stepx_push_v1")`（校验 `PeerCredentials.uid == 2000 || myUid()`）；
    - 桌面端执行一次 `adb -s <wifi_serial> forward tcp:0 localabstract:stepx_push_v1`，直接通过本地 TCP 长连接收发双向 JSON Lines 事件流。
    - **效果**：复用 ADB TLS 加密，绕过路由器端口限制，彻底消灭 `adb shell` 进程启动开销，实测往返延迟 **5~15ms**。
 
 2. **并列栈 B：同 Wi-Fi 局域网直连（LAN TLS/HMAC Socket + mDNS 广播）**
-   - 在首次配对（USB 或扫码配对 [`pairing.rs`](file:///home/zhengfa/work/stepx/desktop/src/pairing.rs)）时，桌面端与手机端通过 [`companion_link.rs`](file:///home/zhengfa/work/stepx/desktop/src/companion_link.rs) 协商并持久化 256-bit 共享密钥 `lan_push_secret`（保存在手机 `Vault` Keystore 与电脑 `~/.config/stepx-companion/`）。
+   - 在首次配对（USB 或扫码配对 [`pairing.rs`](file:///home/stepx-user/work/stepx/desktop/src/pairing.rs)）时，桌面端与手机端通过 [`companion_link.rs`](file:///home/stepx-user/work/stepx/desktop/src/companion_link.rs) 协商并持久化 256-bit 共享密钥 `lan_push_secret`（保存在手机 `Vault` Keystore 与电脑 `~/.config/stepx-companion/`）。
    - 手机端 `PushNotificationService` 在检测到 Wi-Fi 连接时，在局域网端口（并通过 Android `NsdManager` 注册 `_stepx-push._tcp.`）提供带 HMAC-SHA256 双向认证与 AES-GCM 加密的推送流接口。
-   - **效果**：即使手机重启导致无线 ADB 失效，只要手机和电脑连在同一个 Wi-Fi 下，桌面端通过 [`discovery.rs`](file:///home/zhengfa/work/stepx/desktop/src/discovery.rs) 发现 `_stepx-push._tcp.` 即可立即恢复全部推送查看与聊天直接回复！
+   - **效果**：即使手机重启导致无线 ADB 失效，只要手机和电脑连在同一个 Wi-Fi 下，桌面端通过 [`discovery.rs`](file:///home/stepx-user/work/stepx/desktop/src/discovery.rs) 发现 `_stepx-push._tcp.` 即可立即恢复全部推送查看与聊天直接回复！
 
 3. **兼容栈 C：`PushControlProvider`（`content://com.stepx.companion.app.push`）**
    - 作为标准 ContentProvider 兜底，供一次性查询、脚本诊断与测试调用。
@@ -75,9 +75,9 @@
 
 | 序号 | 长期同 Wi-Fi 稳定性隐患 | 根因分析 | StepX 工程自愈与优化方案 |
 | :--- | :--- | :--- | :--- |
-| **1** | **无线调试被系统自动关闭或端口随机漂移** | 手机重启、走出工位断开 Wi-Fi、或闲置超时后，Android 会自动把 `adb_wifi_enabled` 置 `0`，或重连时分配全新随机端口（如 `38129 -> 44910`） | **① 权限自愈重开**：复用伴侣已持有的 `WRITE_SECURE_SETTINGS` 权限（见 [`AndroidManifest.xml`](file:///home/zhengfa/work/stepx/desktop/companion-app/AndroidManifest.xml#L14-L15)），当 `ConnectivityManager.NetworkCallback` 监听到手机连回已信任 Wi-Fi 时，自动检测并恢复 `Settings.Global("adb_wifi_enabled") = 1`；<br/>**② 端口实时跟随**：伴侣原生 LAN 通道与 [`discovery.rs`](file:///home/zhengfa/work/stepx/desktop/src/discovery.rs) mDNS 实时通告新端口，桌面端秒级自动切换重连。 |
+| **1** | **无线调试被系统自动关闭或端口随机漂移** | 手机重启、走出工位断开 Wi-Fi、或闲置超时后，Android 会自动把 `adb_wifi_enabled` 置 `0`，或重连时分配全新随机端口（如 `38129 -> 44910`） | **① 权限自愈重开**：复用伴侣已持有的 `WRITE_SECURE_SETTINGS` 权限（见 [`AndroidManifest.xml`](file:///home/stepx-user/work/stepx/desktop/companion-app/AndroidManifest.xml#L14-L15)），当 `ConnectivityManager.NetworkCallback` 监听到手机连回已信任 Wi-Fi 时，自动检测并恢复 `Settings.Global("adb_wifi_enabled") = 1`；<br/>**② 端口实时跟随**：伴侣原生 LAN 通道与 [`discovery.rs`](file:///home/stepx-user/work/stepx/desktop/src/discovery.rs) mDNS 实时通告新端口，桌面端秒级自动切换重连。 |
 | **2** | **办公网屏蔽 mDNS 组播 & 跨天 DHCP IP 变化** | 企业路由器常过滤 UDP `5353` 组播包导致 mDNS 失效；次日上班手机 DHCP IP 发生变更 | **① 手机反向单播信标（Reverse Unicast Beacon）**：手机持久化记住上次配对电脑的局域网 IP，连上 Wi-Fi 或收到新微信时主动向电脑发送加密单播包，无视路由器组播屏蔽；<br/>**② 桌面端 `/24` 子网并发快扫兜底**：当缓存 IP 失联且 mDNS 无响应时，1.5 秒非阻塞并发探测同网段找回手机新 IP。 |
-| **3** | **手机长时间熄屏进入 Deep Doze 导致电脑发消息超时** | 熄屏 30 分钟后手机进入深度休眠，Wi-Fi 处于 PS-Poll 省电态，电脑主动请求延迟高达数秒甚至半开死连接 | **① 手机事件驱动上推 + 60 秒热态窗口**：微信来通知由系统内核唤醒手机，`PushNotificationService` 顺势持 3 秒 `WakeLock` 上推电脑，并在随后 **60 秒（高概率回复期）** 保持 `WIFI_MODE_FULL_LOW_LATENCY`，确保用户看到弹窗立即打字秒回 0 延迟；<br/>**② 原生 `CloudWake` 协同唤醒**：电脑主动发任务时联动 [`AmooConnectionService.java`](file:///home/zhengfa/work/stepx/desktop/companion-app/src/com/stepx/companion/app/AmooConnectionService.java) 唤醒手机。 |
+| **3** | **手机长时间熄屏进入 Deep Doze 导致电脑发消息超时** | 熄屏 30 分钟后手机进入深度休眠，Wi-Fi 处于 PS-Poll 省电态，电脑主动请求延迟高达数秒甚至半开死连接 | **① 手机事件驱动上推 + 60 秒热态窗口**：微信来通知由系统内核唤醒手机，`PushNotificationService` 顺势持 3 秒 `WakeLock` 上推电脑，并在随后 **60 秒（高概率回复期）** 保持 `WIFI_MODE_FULL_LOW_LATENCY`，确保用户看到弹窗立即打字秒回 0 延迟；<br/>**② 原生 `CloudWake` 协同唤醒**：电脑主动发任务时联动 [`AmooConnectionService.java`](file:///home/stepx-user/work/stepx/desktop/companion-app/src/com/stepx/companion/app/AmooConnectionService.java) 唤醒手机。 |
 | **4** | **`NotificationListenerService` 长期运行假死断连** | Android 系统级偶发通病：运行数天或伴侣热更新后，通知监听开关虽开着但 Binder 断连不再回调 | **看门狗自愈重绑 (`requestRebind`)**：伴侣每次心跳自检 `isConnected` 标志，若未连接但 `enabled_notification_listeners` 已授权，立即自动调用 `NotificationListenerService.requestRebind()`，必要时通过 `WRITE_SECURE_SETTINGS` 自动刷新重绑，无需用户干预。 |
 | **5** | **Wi-Fi 漫游/闪断瞬间的消息漏收与回复丢失** | 用户走进会议室切换 AP 或网络抖动的 2 秒内，新推送漏掉或小窗点“发送”失败 | **① 单调 `seq_id` 差量追平**：每条通知带自增 `seq_id`，重连后桌面端发送 `sync_since(last_seq)` 毫秒级补齐断网期间漏收的消息；<br/>**② 发送队列幂等重传（Outbox + `client_msg_id`）**：小窗/对话框回复先入本地发送队列（显示 `⏳发送中`），2 秒未收到手机 ACK 自动重传，手机端按 `client_msg_id` 幂等去重，绝不漏发或重发两遍。 |
 | **6** | **用户在手机上点开过微信导致 `RemoteInput` 句柄状态不一致** | 用户在手机上点开微信后通知栏消失，或旧 `PendingIntent` 被系统回收抛出 `CanceledException` | **① 句柄缓存池软保留**：即使通知栏因用户在手机查看而被移除（`REASON_APP_CANCEL`），内存仍保留该会话最近有效的 `RemoteReplyHandle`（实测多数 IM 仍可继续静默回复）；<br/>**② 异常捕获无缝降级**：一旦 `PendingIntent.send()` 抛出 `CanceledException`，立即将该会话标记为需更新，并在手机解锁态自动降级至 `ChatUiBridge` 看屏发送。 |
@@ -92,7 +92,7 @@
 
 | 领域 | 优化项 | 现有痛点 / 潜在短板 | 深度优化方案 |
 | :--- | :--- | :--- | :--- |
-| **架构并发** | **1. 快慢通道彻底隔离（独立 `push_worker`）** | 现有 [`actions.rs`](file:///home/zhengfa/work/stepx/desktop/src/ui/actions.rs#L1-L2) 中所有设备操作共用单线程 `adb_tx` 并受全局 `self.busy` 互斥锁限制；若后台正在传大文件、扫描应用或跑 Amoo 任务，收发消息会被阻塞数秒甚至报“设备忙” | 为「手机推送流 & 聊天秒回」建立**独立于 `adb_tx` 和 `self.busy` 的高优实时通道 (`push_tx`)**，即使主窗口正在传几个 GB 的文件，通知小窗依然 0 阻塞秒收秒回微信。 |
+| **架构并发** | **1. 快慢通道彻底隔离（独立 `push_worker`）** | 现有 [`actions.rs`](file:///home/stepx-user/work/stepx/desktop/src/ui/actions.rs#L1-L2) 中所有设备操作共用单线程 `adb_tx` 并受全局 `self.busy` 互斥锁限制；若后台正在传大文件、扫描应用或跑 Amoo 任务，收发消息会被阻塞数秒甚至报“设备忙” | 为「手机推送流 & 聊天秒回」建立**独立于 `adb_tx` 和 `self.busy` 的高优实时通道 (`push_tx`)**，即使主窗口正在传几个 GB 的文件，通知小窗依然 0 阻塞秒收秒回微信。 |
 | **带宽与性能** | **2. 图标/头像磁盘缓存 + 增量帧传输** | 每次同步若重复传输应用图标与联系人头像 Base64，会导致 JSON 暴涨至数百 KB，加剧 Wi-Fi 功耗与反序列化延迟 | 桌面端建立 `IconDiskCache`（按 `<pkg, versionCode>` 与 `<avatar_sha1>` 落盘缓存），网络流平时仅传 `< 500B` 的纯文本 `PushDelta` 增量帧。 |
 | **聊天还原度** | **3. 通知富媒体提取（图片缩略图 + 真实头像）** | 仅提取 `EXTRA_TEXT` 会导致对方发截图/照片时只显示冷冰冰的 `[图片]`，用户仍需掏手机查看 | 解析通知 `EXTRA_PICTURE`（大图预览）、`MessagingStyle` 消息图片 URI 及 `SenderPerson` 头像，压缩为 `< 30KB` WebP 随流同步，**在对话框和小窗内直接显示真实头像与聊天图片缩略图**。 |
 | **多端一致性** | **4. 手机端已读自动消红点 & 消息撤回识别** | 用户拿起手机看完了微信，手机通知栏已消，但电脑小窗和弹窗还挂着未读红点；或者对方撤回了消息但电脑未更新 | 监听 `onNotificationRemoved(REASON_CLICK / REASON_APP_CANCEL)`，手机端阅读后**电脑实时自动清零对应未读数并收起悬浮弹窗**；识别 `“xxx”撤回了一条消息` 自动在气泡流打上撤回标记。 |
@@ -121,7 +121,7 @@
 | **国际主流通讯** | **WhatsApp / Business** | `com.whatsapp`<br/>`com.whatsapp.w4b` | ✅ 极佳（完整 `MessagingStyle` + `RemoteInput`） | ✅ 支持 | 群组通知包含 `conversationTitle` 与发送者分离字段 |
 | **国际办公/社区** | **Slack / Discord / Teams / Signal / Messenger** | `com.Slack`<br/>`com.discord`<br/>`com.microsoft.teams`<br/>`org.thoughtcrime.securesms`<br/>`com.facebook.orca` | ✅ 原生支持 | ✅ 支持 | 按频道（Channel）/ 私信（DM）自动聚合为独立会话 ID |
 | **社媒与电商私信** | **小红书 / 抖音 / 闲鱼 / 淘宝旺旺 / 京东 / 拼多多** | `com.xingin.xhs`<br/>`com.ss.android.ugc.aweme`<br/>`com.taobao.idlefish`<br/>`com.taobao.taobao`<br/>`com.jingdong.app.mall`<br/>`com.xunmeng.pinduoduo` | ⚡ 部分版本支持通知栏快捷回复 | ✅ 支持触发通知 `contentIntent` 直达私信页后由无障碍写入并发送 | 当无 `RemoteInput` 时，优先执行通知自带 `contentIntent` 直接跳进该买家/博主聊天窗口，再由无障碍填入文字并点发送 |
-| **系统通信** | **系统短信 (SMS/MMS)** | Telephony Provider + `com.google.android.apps.messaging` | ✅ 走现有 [`sms.rs`](file:///home/zhengfa/work/stepx/desktop/src/sms.rs) 原生收发通道 | ✅ 原生 API 直接发送 | 与 IM 会话列表无缝并列或按渠道筛选 |
+| **系统通信** | **系统短信 (SMS/MMS)** | Telephony Provider + `com.google.android.apps.messaging` | ✅ 走现有 [`sms.rs`](file:///home/stepx-user/work/stepx/desktop/src/sms.rs) 原生收发通道 | ✅ 原生 API 直接发送 | 与 IM 会话列表无缝并列或按渠道筛选 |
 
 ### 3.2 动态通用识别机制（未列举聊天软件自动兼容）
 除上述固定包名列表外，`PushNotificationService` 对任意第三方应用通知执行以下判定，满足任一条件即自动提升为 **「可对话/可回复消息」**：
@@ -149,11 +149,11 @@ $$\text{threadId} = \text{packageName} + \text{"::"} + \text{normalizeTitle}(\te
 
 ### 4.2 融合 `neo-agent-touch` 的无障碍聊天桥接（`ChatUiBridge`）
 
-当用户在 StepX 中主动点击 **「同步当前屏上聊天记录」** 或在无 `RemoteInput` 句柄时使用 **「看屏通道发送」**，调用合入 [`GuiAccessibilityService`](file:///home/zhengfa/work/stepx/desktop/companion-app/src/com/stepx/companion/app/GuiAccessibilityService.java) 的 `ChatUiBridge`：
+当用户在 StepX 中主动点击 **「同步当前屏上聊天记录」** 或在无 `RemoteInput` 句柄时使用 **「看屏通道发送」**，调用合入 [`GuiAccessibilityService`](file:///home/stepx-user/work/stepx/desktop/companion-app/src/com/stepx/companion/app/GuiAccessibilityService.java) 的 `ChatUiBridge`：
 
 1. **解除 `neo-agent-touch` 原版对聊天发送的 3 处限制**：
    - **放行受控“发送”按钮**：原版 `ActionGuard.java` 拦截所有含 `"发送"` 的节点。新设计仅在 `ChatReplyContext` 激活且已校验屏幕顶部标题等于目标 `targetTitle` 时，允许点击 `"发送"` / `"Send"` 按钮。
-   - **支持聊天输入框写入**：在 [`gui_accessibility.xml`](file:///home/zhengfa/work/stepx/desktop/companion-app/res/xml/gui_accessibility.xml) 开启 `flagInputMethodEditor|flagViewFocused`，支持通过 `ACTION_SET_TEXT` 或 Android 33+ `AccessibilityInputMethod.getCurrentInputConnection().commitText()` 向微信/钉钉/飞书底部输入框写入文字并读回校验。
+   - **支持聊天输入框写入**：在 [`gui_accessibility.xml`](file:///home/stepx-user/work/stepx/desktop/companion-app/res/xml/gui_accessibility.xml) 开启 `flagInputMethodEditor|flagViewFocused`，支持通过 `ACTION_SET_TEXT` 或 Android 33+ `AccessibilityInputMethod.getCurrentInputConnection().commitText()` 向微信/钉钉/飞书底部输入框写入文字并读回校验。
    - **安全微偏移点击（`TouchPointPicker`）**：移植 `neo-agent-touch` 的 `TouchPointPicker.java`，在发送按钮可见边界内随机微偏移像素点击，避免每次点击固定中心点。
 2. **屏上聊天气泡抓取（`captureActiveChatWindow`）**：
    - 当手机前台正打开微信/钉钉/飞书聊天页时，扫描可见文本节点：
@@ -249,7 +249,7 @@ flowchart LR
 
 ### 6.1 第一层：StepX 跨平台交互式置顶悬浮弹窗（`desktop/src/ui/push_toast.rs`）
 
-复用我们已在投屏控制栏验证成熟的 [`facloud_ui::AddWindowOptions { window_style: WindowStyle::Pin, window_bounds: WindowBounds::ExactPosition(...) }`](file:///home/zhengfa/work/stepx/desktop/src/ui/mirror_controls.rs#L250-L260) 能力，在 **Windows、macOS、Linux** 上提供 100% 视觉一致、支持直接输入交互的桌面弹窗卡片：
+复用我们已在投屏控制栏验证成熟的 [`facloud_ui::AddWindowOptions { window_style: WindowStyle::Pin, window_bounds: WindowBounds::ExactPosition(...) }`](file:///home/stepx-user/work/stepx/desktop/src/ui/mirror_controls.rs#L250-L260) 能力，在 **Windows、macOS、Linux** 上提供 100% 视觉一致、支持直接输入交互的桌面弹窗卡片：
 
 1. **屏幕停靠位置自适应**：
    - **macOS / Linux (GNOME)**：默认停靠在主显示器 **右上角**（距离顶部菜单栏 `36px`，距离右边缘 `16px`）；
@@ -276,8 +276,8 @@ flowchart LR
 
 | 操作系统 | 原生实现机制 | 视觉与系统级特性 | 点击唤起与单实例联动 |
 | :--- | :--- | :--- | :--- |
-| **Windows (Win 10 / 11)** | 通过 WinRT `Windows.UI.Notifications.ToastNotificationManager` + XML 模板（`ToastGeneric`），绑定 StepX 应用标识 `AUMID = "StepX.Companion"`（在 `build.rs` / 注册表 `HKCU\Software\Classes\AppUserModelId\StepX.Companion` 自动注册） | - 进入 Windows 右下角「操作中心 / 通知中心」持久归档<br/>- 触发系统标准通知音效 (`ms-winsoundevent:Notification.Default`)<br/>- 自动遵循 Windows「专注助手（Focus Assist）」全屏游戏/演示免打扰状态 | 点击系统通知触发 `stepx-companion.exe --activate-push <id>`，通过 [`single_instance.rs`](file:///home/zhengfa/work/stepx/desktop/src/single_instance.rs#L118-L143) 的 `AllowSetForegroundWindow` + Loopback Token 唤醒已有主窗口并跳到对应会话 |
-| **macOS (macOS 12+)** | 利用工程已引入的 `objc` / `core-foundation` 依赖（见 [`Cargo.toml`](file:///home/zhengfa/work/stepx/desktop/Cargo.toml#L44-L48)）直接调用 `NSUserNotificationCenter` / `UNUserNotificationCenter`（并提供 `osascript` `display notification` 无签名开发环境兜底） | - 原生 macOS 右上角毛玻璃横幅滑入<br/>- 自动进入 macOS 右侧「通知中心」列表<br/>- 自动遵循 macOS「专注模式（Focus / Do Not Disturb）」 | 点击横幅触发应用 `applicationShouldHandleReopen` 或 Loopback 激活通道，将主窗口拉至前台并定位到目标聊天/推送 |
+| **Windows (Win 10 / 11)** | 通过 WinRT `Windows.UI.Notifications.ToastNotificationManager` + XML 模板（`ToastGeneric`），绑定 StepX 应用标识 `AUMID = "StepX.Companion"`（在 `build.rs` / 注册表 `HKCU\Software\Classes\AppUserModelId\StepX.Companion` 自动注册） | - 进入 Windows 右下角「操作中心 / 通知中心」持久归档<br/>- 触发系统标准通知音效 (`ms-winsoundevent:Notification.Default`)<br/>- 自动遵循 Windows「专注助手（Focus Assist）」全屏游戏/演示免打扰状态 | 点击系统通知触发 `stepx-companion.exe --activate-push <id>`，通过 [`single_instance.rs`](file:///home/stepx-user/work/stepx/desktop/src/single_instance.rs#L118-L143) 的 `AllowSetForegroundWindow` + Loopback Token 唤醒已有主窗口并跳到对应会话 |
+| **macOS (macOS 12+)** | 利用工程已引入的 `objc` / `core-foundation` 依赖（见 [`Cargo.toml`](file:///home/stepx-user/work/stepx/desktop/Cargo.toml#L44-L48)）直接调用 `NSUserNotificationCenter` / `UNUserNotificationCenter`（并提供 `osascript` `display notification` 无签名开发环境兜底） | - 原生 macOS 右上角毛玻璃横幅滑入<br/>- 自动进入 macOS 右侧「通知中心」列表<br/>- 自动遵循 macOS「专注模式（Focus / Do Not Disturb）」 | 点击横幅触发应用 `applicationShouldHandleReopen` 或 Loopback 激活通道，将主窗口拉至前台并定位到目标聊天/推送 |
 | **Linux (Ubuntu / GNOME / KDE / Wayland / X11)** | 优先通过 Freedesktop 标准 D-Bus 接口 `org.freedesktop.Notifications.Notify`（使用 `gdbus call --session` 或 `notify-send`），携带 `--app-name="StepX伴侣"`、`category` 与 `urgency` | - 完美兼容 X11 与 Wayland（GNOME 顶部横幅、KDE Plasma 右下角弹窗、Sway/Mako/Dunst）<br/>- 保留在 Linux 桌面顶部日历/通知抽屉中<br/>- 验证码与 `@我` 的消息使用 `urgency=normal`，后台日志用 `urgency=low` | 注入 D-Bus `actions: ["default", "打开对话"]`，点击后唤醒 StepX 主窗口 |
 
 ### 6.3 桌面提醒偏好与隐私保护开关（可持久化配置）
@@ -305,7 +305,7 @@ flowchart LR
 1. **随时跟 AI 简单对话提问或交代任务**（AI 简洁模式）；
 2. **随时瞟一眼手机新消息并在小窗里顺手直接回复**（通知小窗模式）。
 
-我们在 [`desktop/src/ui/mini_modes.rs`](file:///home/zhengfa/work/stepx/desktop/src/ui/mini_modes.rs) 中设计两种专门的极简模式，既支持从主窗口顶部工具栏一键弹出/切换，也支持通过命令行参数（`--mini-ai`、`--mini-notify`）独立启动。
+我们在 [`desktop/src/ui/mini_modes.rs`](file:///home/stepx-user/work/stepx/desktop/src/ui/mini_modes.rs) 中设计两种专门的极简模式，既支持从主窗口顶部工具栏一键弹出/切换，也支持通过命令行参数（`--mini-ai`、`--mini-notify`）独立启动。
 
 ---
 
@@ -417,19 +417,19 @@ flowchart LR
 | :--- | :--- |
 | **窗口模式架构** | 支持 **「独立置顶悬浮小窗 (`cx.add_window` + `WindowStyle::Pin`)」** 与 **「主窗口内切换极简视图 (`ShellMode::Full` / `ShellMode::MiniAi` / `ShellMode::MiniNotify`)」** 两种形态，兼容 Windows / macOS / Linux 全桌面环境。 |
 | **状态实时共享** | 小窗视图通过 `WeakViewHandle<Companion>` 与 `mpsc::Sender<Action>` 共享主进程的 `PushSnapshot`（IM 会话、全量推送、OTP 验证码）及 AI 会话状态，小窗内发送回复或清除通知后，主窗口与手机端毫秒级同步更新。 |
-| **入口设计** | 1. **主窗口顶部栏入口**：在 [`desktop/src/ui/shell.rs`](file:///home/zhengfa/work/stepx/desktop/src/ui/shell.rs) 顶部 Header 右侧提供 `[🤖 AI 简洁模式]` 与 `[🔔 通知小窗]` 两个快捷按钮；<br/>2. **桌面弹窗联动**：点击右下角推送弹窗上的「在小窗打开」，直接唤起通知小窗并聚焦到该会话输入框；<br/>3. **CLI 独立直达参数**：支持 `stepx-companion-desktop --mini-ai` 直接以 AI 简洁模式启动，或 `--mini-notify` 直接以通知小窗模式启动。 |
+| **入口设计** | 1. **主窗口顶部栏入口**：在 [`desktop/src/ui/shell.rs`](file:///home/stepx-user/work/stepx/desktop/src/ui/shell.rs) 顶部 Header 右侧提供 `[🤖 AI 简洁模式]` 与 `[🔔 通知小窗]` 两个快捷按钮；<br/>2. **桌面弹窗联动**：点击右下角推送弹窗上的「在小窗打开」，直接唤起通知小窗并聚焦到该会话输入框；<br/>3. **CLI 独立直达参数**：支持 `stepx-companion-desktop --mini-ai` 直接以 AI 简洁模式启动，或 `--mini-notify` 直接以通知小窗模式启动。 |
 
 ---
 
 ## 8. 代码文件落地规划
 
-### 8.1 手机端 `StepX伴侣` ([`desktop/companion-app`](file:///home/zhengfa/work/stepx/desktop/companion-app))
+### 8.1 手机端 `StepX伴侣` ([`desktop/companion-app`](file:///home/stepx-user/work/stepx/desktop/companion-app))
 
-1. **修改 [`desktop/companion-app/AndroidManifest.xml`](file:///home/zhengfa/work/stepx/desktop/companion-app/AndroidManifest.xml)**：
+1. **修改 [`desktop/companion-app/AndroidManifest.xml`](file:///home/stepx-user/work/stepx/desktop/companion-app/AndroidManifest.xml)**：
    - 新增 `PushNotificationService`（声明 `android.permission.BIND_NOTIFICATION_LISTENER_SERVICE`）；
    - 新增 `PushControlProvider`（`authorities="com.stepx.companion.app.push"`, `android:permission="android.permission.DUMP"`）；
    - 在 `<queries>` 中声明主流 IM 包名以支持 `PackageManager` 读取图标与名称。
-2. **修改 [`desktop/companion-app/res/xml/gui_accessibility.xml`](file:///home/zhengfa/work/stepx/desktop/companion-app/res/xml/gui_accessibility.xml)**：
+2. **修改 [`desktop/companion-app/res/xml/gui_accessibility.xml`](file:///home/stepx-user/work/stepx/desktop/companion-app/res/xml/gui_accessibility.xml)**：
    - 增加 `flagInputMethodEditor|flagViewFocused`。
 3. **新增 `ImAppCatalog.java`**：
    - 维护主流聊天软件（微信、企微、钉钉、飞书、QQ、TIM、TG、WhatsApp、Slack、Discord、小红书、抖音、闲鱼等）包名、分类与会话标题清洗规则；
@@ -448,7 +448,7 @@ flowchart LR
 7. **新增 `PushControlProvider.java`**：
    - 提供 `status`、`snapshot`、`thread_detail`、`reply_im`、`sync_window`、`dismiss_push`、`dismiss_all_push`、`open_push` 等 RPC 接口。
 
-### 8.2 桌面端 Rust 客户端 ([`desktop/src/`](file:///home/zhengfa/work/stepx/desktop/src/lib.rs))
+### 8.2 桌面端 Rust 客户端 ([`desktop/src/`](file:///home/stepx-user/work/stepx/desktop/src/lib.rs))
 
 1. **新增 `desktop/src/push.rs`**：
    - 定义 `ImThread`、`ImMessage`、`PushNotification`、`OtpBanner`、`PushSnapshot`、`PushCategory`、`ReplyMode` 等数据结构；
@@ -463,14 +463,14 @@ flowchart LR
 4. **新增 `desktop/src/ui/mini_modes.rs`**：
    - 实现 **「AI 简洁模式 (`AiMiniWindow` / `ShellMode::MiniAi`)」**：极简对话窗口、快捷提问胶囊、手机未读消息总结与一句话操控回复；
    - 实现 **「通知小窗模式 (`NotifyMiniWindow` / `ShellMode::MiniNotify`)」**：紧凑型通知与聊天流、四维快速过滤、小窗内原地展开对话气泡与直接打字回复、快捷回复短语胶囊、验证码一键复制与同步清除。
-5. **升级 [`desktop/src/ui/pages/sms.rs`](file:///home/zhengfa/work/stepx/desktop/src/ui/pages/sms.rs)**：
+5. **升级 [`desktop/src/ui/pages/sms.rs`](file:///home/stepx-user/work/stepx/desktop/src/ui/pages/sms.rs)**：
    - 升级为 **「消息与聊天（微信 / 钉钉 / 飞书 / 全渠道 IM + 短信）」** 双栏对话框；
    - 左侧列表支持按 `全部`、`微信`、`企微`、`钉钉`、`飞书`、`QQ/国际`、`短信` 筛选，显示 `⚡可秒回` 状态徽章；
    - 右侧对话框显示聊天气泡流，底部输入框直接打字发送（优先走 `RemoteInput` 静默秒回，无句柄时自动或按用户确认走看屏发送），并支持一键 `同步手机屏上聊天记录`。
 6. **新增 `desktop/src/ui/pages/notifications.rs`**：
    - 实现独立的 **「手机推送（来自手机全部推送的消息查看）」** 页面；
    - 支持 6 大分类筛选、应用过滤、关键词搜索、常驻通知折叠、桌面弹窗策略设置、验证码一键复制、内联直接回复、在手机打开通知详情、同步清除手机通知栏消息。
-7. **修改 [`desktop/src/ui/mod.rs`](file:///home/zhengfa/work/stepx/desktop/src/ui/mod.rs)、[`desktop/src/ui/shell.rs`](file:///home/zhengfa/work/stepx/desktop/src/ui/shell.rs)、[`desktop/src/ui/actions.rs`](file:///home/zhengfa/work/stepx/desktop/src/ui/actions.rs)**：
+7. **修改 [`desktop/src/ui/mod.rs`](file:///home/stepx-user/work/stepx/desktop/src/ui/mod.rs)、[`desktop/src/ui/shell.rs`](file:///home/stepx-user/work/stepx/desktop/src/ui/shell.rs)、[`desktop/src/ui/actions.rs`](file:///home/stepx-user/work/stepx/desktop/src/ui/actions.rs)**：
    - 在左侧导航栏挂载「手机推送」入口，在顶部 Header 挂载「🤖 AI 简洁模式」与「🔔 通知小窗」一键切换/弹出按钮，并支持 `--mini-ai` / `--mini-notify` 启动参数。
 
 ---

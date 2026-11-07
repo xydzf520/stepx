@@ -14,4 +14,11 @@ final class ExpansionRules {
         return "";
     }
     static long readyAt(long modified,int days){return modified+Math.max(120000L,days*86400000L);}
+    static int normalizeLimit(int limit){return Math.max(1,Math.min(100,limit<=0?20:limit));}
+    static boolean matchesQuery(String query,String id,String name,String path,String kind,String state){
+        if(query==null||query.trim().isEmpty())return true;
+        String q=query.trim().toLowerCase(Locale.ROOT);
+        String hay=((name==null?"":name)+" "+(path==null?"":path)+" "+(kind==null?"":kind)+" "+(id==null?"":id)+" "+(state==null?"":state)).toLowerCase(Locale.ROOT);
+        return hay.contains(q);
+    }
 }

@@ -10,6 +10,12 @@ public final class ExpansionRulesTest {
         check(ExpansionRules.readyAt(1000,0)==121000);
         check(ExpansionRules.readyAt(1000,7)==604801000L);
         check(ExpansionRules.readyAt(1000,30)==2592001000L);
+        check(ExpansionRules.normalizeLimit(0)==20);
+        check(ExpansionRules.normalizeLimit(-5)==20);
+        check(ExpansionRules.normalizeLimit(50)==50);
+        check(ExpansionRules.normalizeLimit(500)==100);
+        check(ExpansionRules.matchesQuery("report","0123456789abcdef0123456789abcdef","report.pdf","Download/report.pdf","documents","archived"));
+        check(!ExpansionRules.matchesQuery("invoice","0123456789abcdef0123456789abcdef","report.pdf","Download/report.pdf","documents","archived"));
         System.out.println("Expansion camera roots, exclusions and retention rules passed");
     }
 }

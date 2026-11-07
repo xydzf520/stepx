@@ -93,16 +93,46 @@ public final class NativeMcpService extends Service {
             case "tools/call":
                 if(!c.initialized)throw new IllegalStateException("Initialize first");
                 JSONObject p=q.getJSONObject("params");String tool=p.getString("name");
-                if(!java.util.Arrays.asList("stepx_gui_control","stepx_gui_agent").contains(tool))throw new IllegalArgumentException("Unknown tool");
-                try{
-                    if(tool.equals("stepx_gui_agent"))result=new JSONObject().put("isError",false).put("content",new JSONArray().put(new JSONObject().put("type","text").put("text",GuiDelegation.mcp(this,c.uid,p.getJSONObject("arguments")).toString())));
-                    else result=execute(c,p.getJSONObject("arguments"));
-                }catch(Exception e){result=new JSONObject().put("isError",true).put("content",new JSONArray().put(new JSONObject().put("type","text").put("text",String.valueOf(e.getMessage()))));}
-                Log.i("StepXNativeMcp","tools/call completed uid="+c.uid+" error="+((JSONObject)result).optBoolean("isError"));break;
+                JSONObject callArgs=p.optJSONObject("arguments");if(callArgs==null)callArgs=new JSONObject();
+                result=callTool(c,tool,callArgs);
+                Log.i("StepXNativeMcp","tools/call tool="+tool+" op="+callArgs.optString("op")+" uid="+c.uid+" error="+((JSONObject)result).optBoolean("isError"));break;
             default:throw new IllegalArgumentException("Unknown method");
         }
         if(id!=null)send(c,new JSONObject().put("jsonrpc","2.0").put("id",id).put("result",result).toString());
     }catch(Exception e){try{send(c,new JSONObject().put("jsonrpc","2.0").put("id",id==null?JSONObject.NULL:id).put("error",new JSONObject().put("code",-32602).put("message",String.valueOf(e.getMessage()))).toString());}catch(Exception ignored){}}}
+    private JSONObject callTool(Client c,String tool,JSONObject args)throws Exception{
+        if(!McpRoutePolicy.isSupportedTool(tool))throw new IllegalArgumentException("Unknown tool");
+        try{
+            if(tool.equals("stepx_desktop_work"))return new JSONObject().put("isError",false).put("content",new JSONArray().put(new JSONObject().put("type","text").put("text",new DesktopWorkStore(this).call(c.uid,args).toString())));
+            if(tool.equals("stepx_gui_agent"))return new JSONObject().put("isError",false).put("content",new JSONArray().put(new JSONObject().put("type","text").put("text",GuiDelegation.mcp(this,c.uid,args).toString())));
+            if(tool.equals("stepx_expansion"))return new JSONObject().put("isError",false).put("content",new JSONArray().put(new JSONObject().put("type","text").put("text",callExpansion(args).toString())));
+            return execute(c,args);
+        }catch(Exception e){
+            return new JSONObject().put("isError",true).put("content",new JSONArray().put(new JSONObject().put("type","text").put("text",String.valueOf(e.getMessage()))));
+        }
+    }
+    private JSONObject callExpansion(JSONObject args)throws Exception{
+        String op=args.optString("op","").trim();
+        if(!McpRoutePolicy.isExpansionOperation(op))throw new IllegalArgumentException("Unknown expansion operation");
+        switch(op){
+            case "status":return ExpansionStore.status(this);
+            case "list":{
+                int limit=ExpansionRules.normalizeLimit(args.optInt("limit",20));
+                String query=args.optString("query","").trim();
+                JSONArray items=ExpansionStore.list(this,query,limit);
+                return new JSONObject().put("ok",true).put("count",items.length()).put("items",items);
+            }
+            case "get":{
+                String itemId=args.optString("item_id",args.optString("id","")).trim();
+                return new JSONObject().put("ok",true).put("file",ExpansionStore.get(this,itemId));
+            }
+            case "request":{
+                String itemId=args.optString("item_id",args.optString("id","")).trim();
+                return ExpansionStore.requestRestore(this,itemId);
+            }
+            default:throw new IllegalArgumentException("Unknown expansion operation");
+        }
+    }
     private void requireLegacyOperation(String op){
         if(!McpRoutePolicy.legacyOperation(op,NeoAgent.selected(this)))
             throw new IllegalStateException("已启用内置 GUI Agent，请使用 stepx_gui_agent；旧逐步控制仅允许查询或停止既有任务");

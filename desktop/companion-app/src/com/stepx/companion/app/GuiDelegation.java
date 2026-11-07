@@ -8,7 +8,11 @@ import java.nio.file.*;
 final class GuiDelegation {
     static synchronized JSONObject desktop(Context c,JSONObject q)throws Exception {
         String op=q.getString("agentOp");
+        // Home observes the phone queue without adopting scopes, probing MDI,
+        // installing keys, renewing leases or writing execution history.
+        if(op.equals("status_readonly"))return NeoAgent.selected(c)?NeoAgent.statusReadonly(c):PhoneGuiAgent.status(c);
         if(op.equals("neo_enable"))return NeoAgent.enable(c);
+        if(op.equals("neo_execution_mode"))return NeoAgent.executionMode(c,q.getString("executionMode"));
         if(op.equals("neo_status"))return NeoAgent.info(c);
         if(op.equals("neo_disable"))return NeoAgent.disable(c);
         if(op.equals("neo_settings")){NeoAgent.openSettings(c);return new JSONObject().put("ok",true);}

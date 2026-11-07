@@ -6,7 +6,7 @@ import android.os.*;
 import org.json.JSONObject;
 import java.security.MessageDigest;
 
-/** ADB-installed shell process with exactly five pairing operations, no network listener. */
+/** Signed-companion-only pairing and MDI service. No public network listener. */
 public final class PairingDaemon extends Binder {
     private static final String PACKAGE="com.stepx.companion.app";
     private static final String DESCRIPTOR="com.stepx.companion.Pairing.v1";
@@ -31,22 +31,23 @@ public final class PairingDaemon extends Binder {
     }
     @Override protected boolean onTransact(int code,Parcel data,Parcel reply,int flags)throws RemoteException{
         if(code==INTERFACE_TRANSACTION){reply.writeString(DESCRIPTOR);return true;}
-        if(code!=FIRST_CALL_TRANSACTION||reply==null)return false;
+        if((code!=FIRST_CALL_TRANSACTION&&code!=FIRST_CALL_TRANSACTION+1)||reply==null)return false;
         data.enforceInterface(DESCRIPTOR);
         int caller=Binder.getCallingUid();
         if(caller!=companionUid)throw new SecurityException("Untrusted pairing caller");
         String raw=data.readString();
-        if(raw==null||raw.length()>2048||data.dataAvail()!=0)throw new SecurityException("Invalid pairing request");
+        if(raw==null||raw.length()>(code==FIRST_CALL_TRANSACTION?2048:16384)||data.dataAvail()!=0)throw new SecurityException("Invalid pairing request");
         // In system_server, IAdbManager is a local Binder. Preserve the verified
         // companion caller so its granted MANAGE_DEBUGGING is checked by Android.
         // The shell fallback uses its own shell identity as before.
-        boolean shellIdentity=android.os.Process.myUid()==2000;
+        boolean shellIdentity=android.os.Process.myUid()==2000 || code==FIRST_CALL_TRANSACTION+1;
         JSONObject result;long identity=shellIdentity?Binder.clearCallingIdentity():0;
         try{
             verifyCompanion();
-            result=ScopedPairing.handle(context,new JSONObject(raw)).put("ok",true);
+            result=(code==FIRST_CALL_TRANSACTION?ScopedPairing.handle(context,new JSONObject(raw)):MdiBroker.handle(context,new JSONObject(raw))).put("ok",true);
         }catch(Exception e){
-            result=new JSONObject();try{result.put("ok",false).put("error",e.getMessage()==null?"安全配对未完成":e.getMessage());}catch(Exception ignored){}
+            Throwable cause=e;while(cause instanceof java.lang.reflect.InvocationTargetException&&cause.getCause()!=null)cause=cause.getCause();
+            result=new JSONObject();try{result.put("ok",false).put("error",cause.getMessage()==null?(code==FIRST_CALL_TRANSACTION?"安全配对未完成":"MDI 调用未完成："+cause.getClass().getSimpleName()):cause.getMessage());}catch(Exception ignored){}
         }finally{if(shellIdentity)Binder.restoreCallingIdentity(identity);}
         try{result.put("version",1).put("service",SERVICE).put("pid",android.os.Process.myPid()).put("processUid",android.os.Process.myUid()).put("uid",companionUid);}catch(Exception ignored){}
         reply.writeNoException();reply.writeString(result.toString());return true;
@@ -75,18 +76,22 @@ public final class PairingDaemon extends Binder {
         Object thread=threadType.getMethod("currentActivityThread").invoke(null);
         Context context=(Context)threadType.getMethod("getSystemContext").invoke(thread);
         PairingDaemon daemon=new PairingDaemon(context,certificate,uid);
+        Object previous=System.getProperties().put("stepx.mdi.shutdown",(Runnable)MdiBroker::shutdown);
         // A deliberate repair can replace our old boot instance without restarting Android.
         for(java.util.Map.Entry<Thread,StackTraceElement[]> entry:Thread.getAllStackTraces().entrySet()){
             if(!"StepXBootPairing".equals(entry.getKey().getName()))continue;
             for(StackTraceElement frame:entry.getValue())if(frame.getClassName().startsWith("stepx.PairingDaemon")){entry.getKey().interrupt();break;}
         }
         Thread registration=new Thread(()->{
+            // Service retirement may wait for a pending native request. Never hold
+            // the short-lived installation/JNI caller while doing Binder I/O.
+            if(previous instanceof Runnable)((Runnable)previous).run();
             // User 0's encrypted app data may be locked at startup. Register after unlock,
             // without opening its activity or modifying the user's lockscreen.
-            while(true){try{
-                if(context.getSystemService(UserManager.class).isUserUnlocked())daemon.attach();
+            while(true){boolean ok=false;try{
+                if(context.getSystemService(UserManager.class).isUserUnlocked()){daemon.attach();ok=true;}
             }catch(SecurityException revoked){daemon.diagnostic(revoked);return;}catch(Exception unavailable){daemon.diagnostic(unavailable);}
-                try{Thread.sleep(10000);}catch(InterruptedException stopped){return;}}
+                try{Thread.sleep(ok?60000L:10000L);}catch(InterruptedException stopped){return;}}
         },"StepXBootPairing");registration.setDaemon(true);registration.start();
     }
     public static void main(String[] args)throws Exception{
@@ -100,8 +105,8 @@ public final class PairingDaemon extends Binder {
         PairingDaemon daemon=new PairingDaemon(context,args[0],uid);
         Runtime.getRuntime().addShutdownHook(new Thread(ScopedPairing::shutdown,"StepXPairingStop"));
         Thread registration=new Thread(()->{
-            while(true){try{daemon.attach();}catch(SecurityException revoked){daemon.diagnostic(revoked);ScopedPairing.shutdown();System.exit(1);}catch(Exception unavailable){daemon.diagnostic(unavailable);}
-                try{Thread.sleep(10000);}catch(InterruptedException stopped){return;}}
+            while(true){boolean ok=false;try{daemon.attach();ok=true;}catch(SecurityException revoked){daemon.diagnostic(revoked);ScopedPairing.shutdown();System.exit(1);}catch(Exception unavailable){daemon.diagnostic(unavailable);}
+                try{Thread.sleep(ok?60000L:10000L);}catch(InterruptedException stopped){return;}}
         },"StepXPairingAttach");registration.setDaemon(true);registration.start();
         Looper.loop();
     }
