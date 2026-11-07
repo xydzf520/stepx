@@ -1,0 +1,19 @@
+{
+  "file": "StepX-0.2.60-to-0.2.177.mp4",
+  "bytes": 3243961,
+  "duration_seconds": 135.333,
+  "width": 1280,
+  "height": 720,
+  "fps": 15,
+  "format": "H.264 High / AAC mono 24 kHz",
+  "faststart": true,
+  "black_intervals": 0,
+  "decode": "full A/V decode passed",
+  "volume": [
+    "[Parsed_volumedetect_0 @ 0x74a048002cc0] mean_volume: -20.1 dB",
+    "[Parsed_volumedetect_0 @ 0x74a048002cc0] max_volume: -1.8 dB"
+  ],
+  "sha256": "fe9e32d810d0d333e23ee0718039c1b475104e720b3fa9ba17765f57181b4efc",
+  "subtitle_check": "ordered non-overlapping timestamps within video duration; contact details and software/hardware experience retained",
+  "subtitle_entries": 25
+}

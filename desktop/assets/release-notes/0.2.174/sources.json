@@ -1,0 +1,133 @@
+{
+  "capture_version": "0.2.167–0.2.170",
+  "captured_on": "2026-11-07",
+  "mode": "ui-capture --demo; isolated configuration and demonstration files",
+  "images": {
+    "home.png": {
+      "capture": "home.png",
+      "crop": [
+        0.158,
+        0.195,
+        0.975,
+        0.65
+      ]
+    },
+    "search.png": {
+      "capture": "search-focused.png",
+      "capture_version": "0.2.170",
+      "crop": [
+        0.16678805535324107,
+        0.008389261744966443,
+        0.40568099053168244,
+        0.3579418344519016
+      ],
+      "mode": "Actual native quick search results in isolated demo; cached phone-file metadata, no device fetch"
+    },
+    "messages.png": {
+      "capture": "red-packet-light.png",
+      "crop": [
+        0,
+        0,
+        1,
+        1
+      ]
+    },
+    "files.png": {
+      "capture": "files-mixed.png",
+      "capture_version": "0.2.170",
+      "crop": [
+        0.15625,
+        0.16493055555555555,
+        0.9765625,
+        0.8159722222222222
+      ],
+      "mode": "Actual native UI in isolated demo; no device operation",
+      "data": "For files: four real local demo files and four phone-metadata demo rows; no transfer or phone reading is claimed"
+    },
+    "agent.png": {
+      "capture": "agent.png",
+      "crop": [
+        0.274,
+        0.186,
+        0.796,
+        0.46
+      ]
+    },
+    "phone.png": {
+      "capture": "phone.png",
+      "crop": [
+        0.157,
+        0.304,
+        0.97,
+        0.77
+      ]
+    },
+    "capsule.png": {
+      "capture": "capsule-real.png",
+      "capture_version": "0.2.170",
+      "mode": "Actual native ui-capture --demo, top capsule and open hub",
+      "crop_pixels": [
+        898,
+        20,
+        1740,
+        1080
+      ],
+      "data": "Isolated demo data; no real messages or device operation",
+      "crop": [
+        0.2923177083333333,
+        0.011574074074074073,
+        0.56640625,
+        0.625
+      ]
+    },
+    "connection.png": {
+      "capture": "connection-real.png",
+      "capture_version": "0.2.170",
+      "crop": [
+        0.15625,
+        0.09259259259259259,
+        0.9765625,
+        0.8622685185185185
+      ],
+      "mode": "Actual native UI in isolated demo; no device operation",
+      "data": "Demo device with Android official screenshot connection tutorial"
+    },
+    "tools.png": {
+      "capture": "tools-native.png",
+      "capture_version": "0.2.170",
+      "crop": [
+        0.16,
+        0.16,
+        0.98,
+        0.49
+      ],
+      "mode": "Actual native tools UI in demo; no native tool called"
+    }
+  },
+  "notes": [
+    "Images are captures of implemented UI, not concepts or end-to-end verification evidence.",
+    "Messages uses the independent notification window captured during 0.2.167 verification.",
+    "Raw captures remain in the private local verification directory; bundled exports omit desktop chrome and version footer."
+  ],
+  "video": {
+    "file": "tour.mp4",
+    "recorded_on": "2026-11-07",
+    "captured_from": "0.2.170",
+    "mode": "Actual native UI in isolated demo: 170 captures across 39.082 seconds plus a 30-capture recent-files retake; phone file rows are metadata fixtures, no transfers or phone reads",
+    "actions": [
+      "Open the independent desktop popup reminder menu and return",
+      "Open capsule hub and mark a demo pickup as handled",
+      "Select a date on the home month calendar",
+      "Enter and exit home layout editing",
+      "Open recent files, filter phone and desktop demo rows",
+      "Search a keyword and view all results"
+    ],
+    "audio": false,
+    "annotations": "Chinese chapter titles outside the unchanged native window capture; proportional scaling and padding only",
+    "native_file": "tour.h264",
+    "native_encoding": "H.264 Annex B from the same MP4, constrained baseline, 960×628, 12fps, 468 frames, no audio"
+  },
+  "default_image_capture_version": "0.2.167",
+  "reused_in": "0.2.173",
+  "reuse_note": "0.2.174 改善消息中心入口；累计功能图文与操作录屏沿用已核验的 0.2.170 素材，未重新拍摄。"
+}

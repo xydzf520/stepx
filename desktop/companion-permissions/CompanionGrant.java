@@ -59,6 +59,7 @@ public final class CompanionGrant {
             if (!"android".equals(permission.packageName) ||
                 (permission.protectionLevel & PermissionInfo.PROTECTION_MASK_BASE) != PermissionInfo.PROTECTION_SIGNATURE)
                 throw new SecurityException("Unexpected backscreen permission owner/protection");
+            if (!grant) CompanionUpdateRuntime.stopInstalled();
             Class<?> access = Class.forName("com.android.server.permission.access.AccessState", false, loader);
             Class<?> mutable = Class.forName("com.android.server.permission.access.MutableAccessState", false, loader);
             Class<?> getScope = Class.forName("com.android.server.permission.access.GetStateScope", false, loader);
@@ -112,7 +113,7 @@ public final class CompanionGrant {
 
     /** Boot restoration is confined to the same four permissions and pinned companion identity. */
     public static String runBoot(String expectedSigner, String operation, String baselineJson, int expectedUid) {
-        if(!"StepX/pandora/pandora:16/BQ2A.260122.002-BP2A.250705.008/172:user/release-keys".equals(android.os.Build.FINGERPRINT)||android.os.Build.VERSION.SDK_INT!=36)
+        if((!"StepX/pandora/pandora:16/BQ2A.260122.002-BP2A.250705.008/172:user/release-keys".equals(android.os.Build.FINGERPRINT)&&!"StepX/pandora/pandora:16/BQ2A.260122.002-BP2A.250705.008/12:user/release-keys".equals(android.os.Build.FINGERPRINT))||android.os.Build.VERSION.SDK_INT!=36)
             return "{\"status\":\"failed\",\"error\":\"Unsupported boot firmware\"}";
         String raw=runFixed(expectedSigner, operation, baselineJson, expectedUid, 2);
         try {
@@ -121,7 +122,9 @@ public final class CompanionGrant {
                 result.put("runtime",CompanionRuntime.ensure(expectedSigner,expectedUid));
                 PairingDaemon.installSystem(expectedSigner,expectedUid);
                 result.put("boot_pairing_started",true);
-                result.put("google_login",GoogleLoginRuntime.install());
+                result.put("companion_update",CompanionUpdateRuntime.install(expectedSigner,expectedUid,baselineJson));
+                try { result.put("google_login",GoogleLoginRuntime.install()); }
+                catch(Exception optional) { result.put("google_login",new JSONObject().put("status","needs_google_repair").put("error",optional.getClass().getSimpleName())); }
             }
             if("revoke".equals(operation)&&"success".equals(result.optString("status"))) {
                 GoogleLoginRuntime.stopInstalled();
@@ -129,6 +132,12 @@ public final class CompanionGrant {
             }
             return result.toString();
         } catch(Exception error){try{return new JSONObject(raw).put("status","failed").put("error","Boot pairing: "+error.toString()).toString();}catch(Exception ignored){return raw;}}
+    }
+
+    // Called only by the system package-update observer installed after runBoot.
+    // No boot hook, power exemption, Google action, or app preference is changed.
+    static String restoreAfterUpdate(String signer,String baseline,int uid) {
+        return runFixed(signer,"grant",baseline,uid,2);
     }
 
     // Permission names/owners are never supplied by the caller.
@@ -176,6 +185,9 @@ public final class CompanionGrant {
                     if (!(value instanceof Integer)) throw new SecurityException("Invalid permission baseline flags");
                 }
             }
+            // Retire the observer before revocation, including one-group rollbacks.
+            // A queued package update must not undo an explicit revoke operation.
+            if (operation.equals("revoke")) CompanionUpdateRuntime.stopInstalled();
             Class<?> access = Class.forName("com.android.server.permission.access.AccessState", false, loader);
             Class<?> mutable = Class.forName("com.android.server.permission.access.MutableAccessState", false, loader);
             Class<?> getScope = Class.forName("com.android.server.permission.access.GetStateScope", false, loader);

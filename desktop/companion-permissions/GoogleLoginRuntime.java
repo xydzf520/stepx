@@ -46,7 +46,7 @@ public final class GoogleLoginRuntime {
         return p;
     }
     public static synchronized JSONObject install() throws Exception {
-        if(!"StepX/pandora/pandora:16/BQ2A.260122.002-BP2A.250705.008/172:user/release-keys".equals(Build.FINGERPRINT))
+        if(!"StepX/pandora/pandora:16/BQ2A.260122.002-BP2A.250705.008/172:user/release-keys".equals(Build.FINGERPRINT)&&!"StepX/pandora/pandora:16/BQ2A.260122.002-BP2A.250705.008/12:user/release-keys".equals(Build.FINGERPRINT))
             throw new SecurityException("Unsupported Google login firmware");
         Class<?> at=Class.forName("android.app.ActivityThread");
         context=(Context)at.getMethod("getSystemContext").invoke(at.getMethod("currentActivityThread").invoke(null));

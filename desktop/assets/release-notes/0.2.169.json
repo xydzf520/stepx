@@ -1,0 +1,118 @@
+{
+  "version": "0.2.169",
+  "baseline": "0.2.60",
+  "baseline_url": "https://github.com/xydzf520/stepx/releases/tag/v0.2.60",
+  "date": "2026-11-07",
+  "title": "从手机到电脑，把事情接着做",
+  "summary": "消息、文件和安排汇到一个工作台。少找一次资料，少切一次设备，把讨论接着整理成能用的东西。",
+  "captured_from": "0.2.167",
+  "highlights": [
+    {
+      "id": "home",
+      "title": "把今天，放回整个月里",
+      "summary": "首页先看全月安排，再处理今天的事。原有模块都保留，按你的工作习惯重新摆放。",
+      "steps": [
+        "蓝点看工作、青绿点看生活，选中一天查看详情。"
+      ],
+      "image": "release-notes/home.png",
+      "image_alt": "新版首页月历，工作和生活双色日期标记与当天安排",
+      "caption": "首页月历 · 脱敏演示数据",
+      "action_label": "看看新版首页",
+      "destination": "home",
+      "availability": null
+    },
+    {
+      "id": "search",
+      "title": "想到什么，就从这里找",
+      "summary": "消息、Amoo 对话、日历、文件和功能入口，一次检索。默认综合，也可以只看手机或电脑。",
+      "steps": [
+        "按 Ctrl K 搜索人名、关键词、文件名或功能。"
+      ],
+      "image": "release-notes/search.png",
+      "image_alt": "顶部全局搜索的来源筛选、结果分类与匹配结果",
+      "caption": "全局搜索 · 脱敏演示数据",
+      "action_label": "试试全局搜索",
+      "destination": "search",
+      "availability": "消息搜索覆盖已同步的文字；手机文件需保持连接并允许读取。"
+    },
+    {
+      "id": "messages",
+      "title": "电脑上的消息，轻一点",
+      "summary": "会话与推送分开看。新提醒及时置前，验证码可复制，红包有专属红色样式，正在打字时保持原会话。",
+      "steps": [
+        "按应用设置显示内容、隐藏内容或静默提醒。"
+      ],
+      "image": "release-notes/messages.png",
+      "image_alt": "电脑右下角的红包提醒，显示应用来源、菜单和关闭入口",
+      "caption": "独立桌面提醒 · 脱敏演示数据",
+      "action_label": "打开消息",
+      "destination": "messages",
+      "availability": "后台回复取决于手机应用是否提供有效入口；通知记录不等于完整聊天历史。"
+    },
+    {
+      "id": "files",
+      "title": "新文件，不用再找一遍",
+      "summary": "不论由哪个应用生成，保存到已选择文件夹里的图片、文档等新内容，都能在最近文件里找到。",
+      "steps": [
+        "首页快速取用；文件与扩容默认也显示最近文件。"
+      ],
+      "image": "release-notes/files.png",
+      "image_alt": "最近文件列表，文件类型图标和传到手机操作",
+      "caption": "最近文件 · 仅使用本机演示文件",
+      "action_label": "查看最近文件",
+      "destination": "files",
+      "availability": null
+    },
+    {
+      "id": "agent",
+      "title": "从讨论，走到下一步",
+      "summary": "找资料、拟回复、讨论变待办、整理方案与复盘。常用场景有明确策略，也能调整自己的 Agent 提示词。",
+      "steps": [
+        "已有规则先处理明确任务，需要理解的内容再交给 Agent。"
+      ],
+      "image": "release-notes/agent.png",
+      "image_alt": "设置中的独立 Agent 模块，常用场景与提示词策略",
+      "caption": "Agent 场景与策略 · 演示界面",
+      "action_label": "看看 Agent 场景",
+      "destination": "agent",
+      "availability": "沿用已选择的手机账号或独立 API；需要相应服务可用，不把未知内容当成已确认事实。"
+    },
+    {
+      "id": "phone",
+      "title": "电话响了，电脑也能处理",
+      "summary": "来电提醒显示联系人与号码，明确选择手机接听或电脑接听；未接记录可以回拨。",
+      "steps": [
+        "来电时在右下角选择接听设备，也可挂断。"
+      ],
+      "image": "release-notes/phone.png",
+      "image_alt": "电话页的通话记录、联系人与回拨入口",
+      "caption": "电话记录 · 脱敏演示数据",
+      "action_label": "打开电话",
+      "destination": "phone",
+      "availability": "电脑音频接听目前要求 Linux 与支持原厂通话音频接口的手机；其他环境保留手机接听。"
+    }
+  ],
+  "improvements": [
+    "首次连接引导改为真实截图加中文操作提示，USB 授权与无线配对分别说明。",
+    "无线设备在线与数据真的读到分开判断，读取停滞时恢复会话，保留已收到的内容。",
+    "消息同步独立于页面操作和方案、总结生成，普通锁屏后继续使用已授权的数据。",
+    "提醒保存已展示事件，重启、重连减少旧消息重复弹出；菜单、回复和输入法不串到其他会话。",
+    "SQLite 事务、增量写入、读取上限与缩略图回收保护本地数据；不以更换数据库宣称所有操作全面提速。",
+    "胶囊区分寄件与收件、跟随送达和完成状态，模糊情形保留核对入口。",
+    "优先使用可用的原厂 MCP 结构化能力，操作失败显示原因与重试，更新和安装继续校验包名、签名。"
+  ],
+  "boundaries": [
+    "本页回顾 GitHub 公开版 0.2.60 之后的主要改进；0.2.168 是当前开发版，不代表公开下载页已发布相同安装包。",
+    "图片使用脱敏演示数据说明界面；连接、权限、固件和账号能力以当前设备检查结果为准。",
+    "原厂端侧语音的能力检查不等于已开放通用转写、合成；不能把云端调用称为端侧模型。"
+  ],
+  "video": {
+    "title": "看一遍：日历、搜索和最近文件",
+    "summary": "选日期、找资料、取用新文件，跟着画面看就明白。",
+    "duration_seconds": 23,
+    "captured_from": "0.2.168",
+    "poster": "release-notes/search.png",
+    "caption": "桌面真实操作录屏 · 演示数据 · 无声音",
+    "file": "release-notes/tour.mp4"
+  }
+}

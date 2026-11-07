@@ -1,0 +1,81 @@
+{
+  "capture_version": "0.2.167",
+  "captured_on": "2026-11-07",
+  "mode": "ui-capture --demo; isolated configuration and demonstration files",
+  "images": {
+    "home.png": {
+      "capture": "home.png",
+      "crop": [
+        0.158,
+        0.195,
+        0.975,
+        0.65
+      ]
+    },
+    "search.png": {
+      "capture": "search-results.png",
+      "crop": [
+        0.28,
+        0.095,
+        0.855,
+        0.72
+      ]
+    },
+    "messages.png": {
+      "capture": "red-packet-light.png",
+      "crop": [
+        0,
+        0,
+        1,
+        1
+      ]
+    },
+    "files.png": {
+      "capture": "files.png",
+      "crop": [
+        0.158,
+        0.167,
+        0.975,
+        0.765
+      ]
+    },
+    "agent.png": {
+      "capture": "agent.png",
+      "crop": [
+        0.274,
+        0.186,
+        0.796,
+        0.46
+      ]
+    },
+    "phone.png": {
+      "capture": "phone.png",
+      "crop": [
+        0.157,
+        0.304,
+        0.97,
+        0.77
+      ]
+    }
+  },
+  "notes": [
+    "Images are captures of implemented UI, not concepts or end-to-end verification evidence.",
+    "Messages uses the independent notification window captured during 0.2.167 verification.",
+    "Raw captures remain in the private local verification directory; bundled exports omit desktop chrome and version footer."
+  ],
+  "video": {
+    "file": "tour.mp4",
+    "recorded_on": "2026-11-07",
+    "captured_from": "0.2.168",
+    "mode": "Native ui-capture recording; 128 actual window frames over 22.17 seconds; isolated demo configuration",
+    "actions": [
+      "select a calendar day",
+      "type a search query",
+      "show all results",
+      "filter phone and desktop",
+      "open recent files"
+    ],
+    "audio": false,
+    "annotations": "Chinese chapter captions; no generated UI"
+  }
+}

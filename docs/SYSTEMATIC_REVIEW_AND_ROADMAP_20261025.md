@@ -2,13 +2,13 @@
 
 > **评审时间**：2026-10-25
 > **基线版本**：`v0.2.29`（已完成首轮 9 项体验重构 + 次轮 5 项底层流式/快慢通道/缩略图墙/小窗胶囊/大文件拆分）
-> **真机实测基线**：StepX `PZ261A` (`pandora`, `ZYPZ261A01M692000LP`) 实机进程、端口、Binder 服务、ContentProvider 与 MCP 注册表全量扫描
+> **真机实测基线**：StepX `PZ261A` (`pandora`, `STEPXTEST8DB89E4B8927`) 实机进程、端口、Binder 服务、ContentProvider 与 MCP 注册表全量扫描
 
 ---
 
 ## 一、 真机深度扫描发现：手机端已具备但桌面端尚未打通/未充分释放的「宝藏能力」
 
-通过对真机 `ZYPZ261A01M692000LP` 的系统包（65 个 `com.stepos.*` 组件）、监听端口（`18789` / `18790` / `18791` / `18800` / `8900` / `8765`）、Binder 服务（471 项）及权限表的实机探查，发现手机端存在 **6 大核心能力群** 尚未在桌面端暴露或仅处于“半接通”状态：
+通过对真机 `STEPXTEST8DB89E4B8927` 的系统包（65 个 `com.stepos.*` 组件）、监听端口（`18789` / `18790` / `18791` / `18800` / `8900` / `8765`）、Binder 服务（471 项）及权限表的实机探查，发现手机端存在 **6 大核心能力群** 尚未在桌面端暴露或仅处于“半接通”状态：
 
 ### 1. 代码库内部「被遮蔽的完整工作台模块」（高优修复）
 在统一 `workspace.rs` 极简对话视图时，`desktop/src/ui/pages/mod.rs`（第 287–291 行）将 `Page::Amoo`、`Page::Work`、`Page::Studio` 全部硬编码路由到了同一个 `self.workspace_page(false)`：
@@ -63,7 +63,7 @@ Page::Studio => self.workspace_page(false),
    - 根因：通过 `ubuntu_zygote` 拉起的后台辅助任务退出后，父进程或包装脚本未正确 detach / 收割子进程，长期运行会占用 PID 槽位。
    - 修复方案：在 `companion_loader.py` / `GoogleLoginRuntime` 派生的 worker 外层统一采用双 fork（daemonize）或 `waitpid` 回收机制，彻底消除 `[stepx-gms-worke]` 僵尸进程。
 2. **多台 Android 设备同时连接时的脚本/命令冲突（已在本次实测复现）**：
-   - 现象：当前电脑同时连接了 `ZYPZ261A01M692000LP`（USB）、`10.0.1.177:34883`（同台手机的无线 ADB）、`adb-ZYPZ261A01M692000LP-...`（mDNS TLS）以及另一台手机 `ASGXVB1806001948`。
+   - 现象：当前电脑同时连接了 `STEPXTEST8DB89E4B8927`（USB）、`10.0.0.42:34883`（同台手机的无线 ADB）、`adb-STEPXTEST8DB89E4B8927-...`（mDNS TLS）以及另一台手机 `ASGXVB1806001948`。
    - 风险：1）同一台手机同时出现 3 个 ADB transport（USB + IP:Port + mDNS TLS），设备切换列表容易出现重复项或端口抢占；2）辅助脚本若未强制绑定 `-s <serial>` 会直接因 `adb: more than one device/emulator` 失败。
    - 修复方案：在 `device.rs::parse_devices` 中按真实硬件序列号（`serial`）对同一台手机的多个 transport（USB 优先、无线次之、mDNS 折叠）进行**多通道智能归并（Multi-Transport Deduplication & Failover）**——当拔掉 USB 时无缝零感知秒切到该手机已在线的无线 transport，不在 UI 上显示 3 台重复设备！
 3. **ADB Forward 端口泄漏与失效重连**：
@@ -148,7 +148,7 @@ flowchart TD
 ### 阶段四（Workstream 4）：工业级稳定性、多通道去重容灾与视觉收口
 **目标**：解决多手机/多通道同时在线的冲突、真机僵尸进程以及 UI 细节一致性。
 1. **同一台手机的多通道归并与无感故障转移（Multi-Transport Deduplication & Auto-Failover）**：
-   - 在 `device.rs` 中识别同一硬件序列号（如 `ZYPZ261A01M692000LP` 同时存在 USB、`10.0.1.177:34883`、`adb-ZYPZ261A01M692000LP-...`）的多个通道，在设备列表中合并展示为主设备（标记 `USB + 无线双通道就绪`），当 USB 断开时毫秒级自动切换到无线通道，不断连、不丢会话。
+   - 在 `device.rs` 中识别同一硬件序列号（如 `STEPXTEST8DB89E4B8927` 同时存在 USB、`10.0.0.42:34883`、`adb-STEPXTEST8DB89E4B8927-...`）的多个通道，在设备列表中合并展示为主设备（标记 `USB + 无线双通道就绪`），当 USB 断开时毫秒级自动切换到无线通道，不断连、不丢会话。
 2. **真机 `[stepx-gms-worke]` 僵尸进程根治**：
    - 优化 `companion_loader.py` / 后台 worker 启动方式，确保子进程脱离或被 init 收养，并在修复脚本中清理存量僵尸状态。
 3. **概览页（`overview.rs`）矢量图标统一与编译零警告清理**：
