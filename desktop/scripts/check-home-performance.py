@@ -5,7 +5,10 @@ CI: python3 desktop/scripts/check-home-performance.py --output artifacts/home-pe
 Same-host comparison: add --baseline artifacts/previous-home-performance.json
 Quick validator regression checks: --self-test
 
-Compilation ends before measurement. Three fresh, single-test processes collect
+Compilation ends before measurement. One app is reused per process. Linux startup
+work must settle; idle workers stay alive, and /proc CPU ticks/state are checked
+before and after sampling (kernel accounting resolution, not proof of zero work).
+Three fresh, single-test processes collect
 80 warm samples for each of 30 cases. The median across process medians and P95s
 must BOTH remain below the original 15 ms budget. A supplied compatible baseline
 also gates regressions >25% AND >250 us, avoiding timer noise on very short cases.
@@ -23,6 +26,7 @@ import platform
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 
 TEST = "ui::pages::home::tests::home_release_frame_budget_regression"
@@ -33,6 +37,8 @@ FIXTURES = {"empty-v1", "populated-v1"}
 BUDGET_US = 15_000.0
 REGRESSION_RATIO = 1.25
 REGRESSION_FLOOR_US = 250.0
+ISOLATION_PROTOCOL = "one-companion-idle-workers-v1"
+FIXTURE_ENVIRONMENT = "temporary-state-offline-helpers-v1"
 
 
 def key(row):
@@ -40,8 +46,20 @@ def key(row):
 
 
 def validate_probe(probe):
-    if probe.get("schema") != 1 or probe.get("debug_assertions") is not False:
-        raise ValueError("Expected schema 1 and a release probe; a debug/zero-test run cannot pass")
+    if probe.get("schema") != 2 or probe.get("debug_assertions") is not False:
+        raise ValueError("Expected schema 2 and a release probe; a debug/zero-test run cannot pass")
+    if probe.get("background_quiesced") is not True:
+        raise ValueError("Benchmark startup/background work has not been verified quiescent")
+    isolation = probe.get("isolation", {})
+    if (isolation.get("protocol") != ISOLATION_PROTOCOL
+            or isolation.get("settle_ms", 0) < 2600
+            or not isinstance(isolation.get("workers_before"), dict)
+            or isolation["workers_before"] != isolation.get("workers_after")):
+        raise ValueError("Missing or invalid idle-worker isolation evidence")
+    for worker in isolation["workers_before"].values():
+        if (worker.get("state") != "S" or worker.get("wait") != "futex_do_wait"
+                or not isinstance(worker.get("cpu_ticks"), int) or worker["cpu_ticks"] < 0):
+            raise ValueError("A background worker was active during the measurement window")
     if probe.get("metric") != "home_view_tree_build_and_drop_us":
         raise ValueError("Incompatible metric")
     cases = probe.get("cases", [])
@@ -140,8 +158,20 @@ def build_probe(repo, log):
 
 
 def run_probe(binary, repo, log):
-    result = subprocess.run([str(binary), TEST, "--exact", "--test-threads=1", "--nocapture"],
-                            cwd=repo, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    # SearchState opens its SQLite worker during construction. Keep it off the
+    # user's live database. App-store icon prefetch uses Python; that unrelated
+    # network helper must not turn a View-only fixture into a download benchmark.
+    # No normal worker or production thread pool is terminated for measurement.
+    with tempfile.TemporaryDirectory(prefix="stepx-home-perf-") as scratch:
+        env = os.environ.copy()
+        env["STEPX_STATE_DIR"] = str(Path(scratch) / "state")
+        env["STEPX_PYTHON"] = str(Path(scratch) / "disabled-external-helper")
+        for name in ("STEPX_STORE_QUERY", "STEPX_STORE_SUB_TAG", "STEPX_STORE_DETAIL",
+                     "STEPX_STORE_CATEGORY", "STEPX_PAGE", "STEPX_TOOL"):
+            env.pop(name, None)
+        result = subprocess.run([str(binary), TEST, "--exact", "--test-threads=1", "--nocapture"],
+                                cwd=repo, env=env, text=True, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT)
     log.write_text(result.stdout)
     if result.returncode:
         raise RuntimeError(f"Probe failed; see {log}\n{result.stdout[-3000:]}")
@@ -159,7 +189,9 @@ def self_test():
               "warmup": 20, "samples": 80, "first_us": 3000., "median_us": 1000.,
               "p95_us": 1100., "mean_us": 1050., "min_us": 950., "max_us": 1150.}
              for f in FIXTURES for w, h in VIEWPORTS for p in PRESETS]
-    probe = {"schema": 1, "debug_assertions": False,
+    probe = {"schema": 2, "debug_assertions": False, "background_quiesced": True,
+             "isolation": {"protocol": ISOLATION_PROTOCOL, "settle_ms": 2600,
+                           "workers_before": {}, "workers_after": {}},
              "metric": "home_view_tree_build_and_drop_us", "cases": cases}
     rows = aggregate([probe] * 3)
     assert not gate(rows)[0]
@@ -172,7 +204,11 @@ def self_test():
     noisy = copy.deepcopy(rows)
     noisy[0]["median_us"] = 1100.
     assert not gate(noisy, {"cases": rows})[0]
-    for invalid in ({**probe, "debug_assertions": True}, {**probe, "cases": []},
+    active = copy.deepcopy(probe)
+    active["isolation"]["workers_after"] = {"1": {"cpu_ticks": 1, "state": "R", "wait": "0"}}
+    for invalid in ({**probe, "debug_assertions": True}, {**probe, "background_quiesced": False},
+                    {**probe, "isolation": {}}, active,
+                    {**probe, "cases": []},
                     {**probe, "cases": cases + [cases[0]]}):
         try:
             validate_probe(invalid)
@@ -196,13 +232,17 @@ def main():
         return
     if args.runs < 3:
         parser.error("--runs must be at least 3")
+    if platform.system() != "Linux":
+        parser.error("This isolated timing gate runs on Linux; use normal interaction tests on other platforms")
     repo = Path(__file__).resolve().parents[2]
     output = args.output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     host = host_signature(repo)
     baseline = json.loads(args.baseline.read_text()) if args.baseline else None
-    if baseline and (baseline.get("schema") != 1 or baseline.get("host") != host
+    if baseline and (baseline.get("schema") != 2 or baseline.get("host") != host
                      or baseline.get("profile") != "release"
+                     or baseline.get("isolation_protocol") != ISOLATION_PROTOCOL
+                     or baseline.get("fixture_environment") != FIXTURE_ENVIRONMENT
                      or baseline.get("metric") != "home_view_tree_build_and_drop_us"):
         raise ValueError("Baseline must use the same host, compiler, release profile and metric")
     binary = args.binary.resolve() if args.binary else build_probe(repo, output.with_suffix(".build.log"))
@@ -212,7 +252,9 @@ def main():
         probes.append(run_probe(binary, repo, output.with_suffix(f".run-{index + 1}.log")))
     rows = aggregate(probes)
     failures, comparisons = gate(rows, baseline)
-    report = {"schema": 1, "profile": "release", "metric": "home_view_tree_build_and_drop_us",
+    report = {"schema": 2, "profile": "release", "metric": "home_view_tree_build_and_drop_us",
+              "isolation_protocol": ISOLATION_PROTOCOL,
+              "fixture_environment": FIXTURE_ENVIRONMENT,
               "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": host,
               "commit": command_text(["git", "rev-parse", "HEAD"], repo),
               "dirty": bool(command_text(["git", "status", "--porcelain"], repo)),

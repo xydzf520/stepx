@@ -4130,39 +4130,85 @@ fn home_tools_normal_view_can_expand_and_collapse_at_every_card_height() {
 // the original 15 ms budget on warm median/P95 and can compare same-host results.
 // This measures View-tree construction and destruction, not layout/GPU painting,
 // network synchronization, real-device latency, or a claim of 60 fps rendering.
-#[cfg(not(debug_assertions))]
+#[cfg(all(not(debug_assertions), target_os = "linux"))]
 #[test]
 fn home_release_frame_budget_regression() {
     const WARMUP: usize = 20;
     const SAMPLES: usize = 80;
+    // Use one long-lived app, as in production. In particular, do not accumulate
+    // 30 startup reapers or terminate normal global workers to improve timings.
+    // The Linux reaper sleeps for 150 + 500 + 1500 ms. Wait beyond that interval,
+    // then verify that additional workers are parked and their CPU counters
+    // have not changed for 300 ms. A live idle worker is not contamination.
+    let initial_threads: std::collections::BTreeSet<_> = std::fs::read_dir("/proc/self/task")
+        .expect("Linux benchmark needs /proc/self/task to verify isolation")
+        .map(|entry| entry.expect("thread entry").file_name())
+        .collect();
+    #[derive(Debug, PartialEq, Eq, serde::Serialize)]
+    struct WorkerSample {
+        cpu_ticks: u64,
+        state: String,
+        wait: String,
+    }
+    let worker_samples = || {
+        let mut workers = std::collections::BTreeMap::new();
+        for entry in std::fs::read_dir("/proc/self/task").expect("thread inventory") {
+            let entry = entry.expect("thread entry");
+            if initial_threads.contains(&entry.file_name()) { continue; }
+            // A startup worker may exit between inventory and reading stat.
+            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else { continue; };
+            let fields: Vec<_> = stat.rsplit_once(") ").expect("proc stat format").1
+                .split_whitespace().collect();
+            let Ok(wait) = std::fs::read_to_string(entry.path().join("wchan")) else { continue; };
+            workers.insert(entry.file_name().to_string_lossy().into_owned(), WorkerSample {
+                cpu_ticks: fields[11].parse::<u64>().expect("utime")
+                    + fields[12].parse::<u64>().expect("stime"),
+                state: fields[0].to_owned(),
+                wait: wait.trim().to_owned(),
+            });
+        }
+        workers
+    };
+    let parked = |workers: &std::collections::BTreeMap<String, WorkerSample>| {
+        workers.values().all(|w| w.state == "S" && w.wait == "futex_do_wait")
+    };
+    let mut app = Companion::new_for_test();
+    app.demo_mode = false;
+    app.page = Page::Home;
+    let settling = std::time::Instant::now();
+    std::thread::sleep(std::time::Duration::from_millis(2300));
+    let workers_before = loop {
+        let before = worker_samples();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let after = worker_samples();
+        if before == after && parked(&after) { break after; }
+        assert!(settling.elapsed() < std::time::Duration::from_secs(8),
+            "Startup workers are active; refusing contaminated measurements: {after:?}");
+    };
+    let settle_ms = settling.elapsed().as_millis();
     let mut rows = Vec::new();
     for populated in [false, true] {
+        if populated {
+            app.push.snapshot = stepx_companion::push::demo_push_snapshot();
+            app.express_parcels = stepx_companion::device::default_express_parcels();
+            app.back_screen.stepos_suite =
+                stepx_companion::toolbox::default_stepos_ai_suite_report();
+            // Exercise synchronized lists with local fixtures and no device job.
+            let source = app.push.snapshot.threads.clone();
+            for i in 0..120 {
+                let mut thread = source[i % source.len()].clone();
+                thread.thread_id = format!("home-perf-{i}");
+                thread.title = format!("项目沟通 {i}");
+                app.push.snapshot.threads.push(thread);
+            }
+        }
         for (width, height) in [(1000, 650), (1440, 900), (1920, 1080)] {
             for preset in HomeModulePreset::ALL {
-                // Reset mutable UI state for every case. Global icon/report
-                // caches may already be warm: first_us is the first build of
-                // this case, not application cold-start time. Synthetic data
-                // remain local; no action or device job is dispatched.
-                let mut app = Companion::new_for_test();
-                app.demo_mode = false;
-                app.page = Page::Home;
+                // Match real resizing/preset selection on one long-lived app.
+                // first_us is the first build after switching this case; global
+                // caches may be warm, so it is not application cold-start time.
                 app.workspace.viewport = vec2f(width as f32, height as f32);
                 app.home_modules = HomeModuleLayoutConfig::from_preset(preset);
-                if populated {
-                    app.push.snapshot = stepx_companion::push::demo_push_snapshot();
-                    app.express_parcels = stepx_companion::device::default_express_parcels();
-                    app.back_screen.stepos_suite =
-                        stepx_companion::toolbox::default_stepos_ai_suite_report();
-                    // Exercise long synchronized lists without a phone, worker
-                    // job, action dispatch, filesystem fixture or cloud model.
-                    let source = app.push.snapshot.threads.clone();
-                    for i in 0..120 {
-                        let mut thread = source[i % source.len()].clone();
-                        thread.thread_id = format!("home-perf-{i}");
-                        thread.title = format!("项目沟通 {i}");
-                        app.push.snapshot.threads.push(thread);
-                    }
-                }
                 let first = std::time::Instant::now();
                 drop(std::hint::black_box(app.home_page()));
                 let first_us = first.elapsed().as_secs_f64() * 1_000_000.;
@@ -4190,8 +4236,16 @@ fn home_release_frame_budget_regression() {
         }
     }
     assert_eq!(rows.len(), 30, "both fixtures, three viewports, all five presets");
+    let workers_after = worker_samples();
+    assert_eq!(workers_before, workers_after,
+        "Background worker CPU/state changed during sampling; retry on an idle host");
     println!("STEPX_HOME_PERF_JSON {}", serde_json::json!({
-        "schema": 1, "debug_assertions": cfg!(debug_assertions),
+        "schema": 2, "debug_assertions": cfg!(debug_assertions),
+        "background_quiesced": true,
+        "isolation": {
+            "protocol": "one-companion-idle-workers-v1", "settle_ms": settle_ms,
+            "workers_before": workers_before, "workers_after": workers_after,
+        },
         "metric": "home_view_tree_build_and_drop_us", "cases": rows,
     }));
 }
