@@ -4,6 +4,8 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 
 #[derive(Clone, Debug)]
 pub struct Message {
+    /// Provider identity is absent on bridge versions predating incremental reads.
+    pub provider_id: Option<i64>,
     pub address: String,
     pub body: String,
     pub date_ms: i64,
@@ -11,6 +13,57 @@ pub struct Message {
     pub kind: u8,
     pub read: bool,
     pub subscription: Option<i32>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Cursor {
+    pub date_ms: i64,
+    pub id: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct Page {
+    pub messages: Vec<Message>,
+    pub next_cursor: Option<Cursor>,
+    pub has_more: bool,
+    pub supports_incremental: bool,
+}
+
+/// Append-only paging: deleted messages and read-status changes are not a change feed.
+/// Older bridges are reported explicitly; callers must not poll them as incremental.
+pub fn read_page(adb: &Adb, device: &Device, after: Option<Cursor>, limit: usize) -> Result<Page> {
+    let cursor = after.unwrap_or_default();
+    let value = crate::bridge::call_bridge(
+        adb,
+        device,
+        &serde_json::json!({
+            "op": "read_sms", "after_date_ms": cursor.date_ms.max(0),
+            "after_id": cursor.id.max(0), "limit": limit.clamp(1, 1000),
+        }),
+        std::time::Duration::from_secs(30),
+    )?;
+    parse_page(&value)
+}
+
+pub fn parse_page(value: &serde_json::Value) -> Result<Page> {
+    let messages = parse_messages(value)?;
+    let supported = value["incremental"].as_bool() == Some(true);
+    if supported {
+        anyhow::ensure!(messages.iter().all(|m| m.provider_id.is_some_and(|id| id > 0)), "短信增量读取缺少稳定记录 ID");
+        anyhow::ensure!(messages.windows(2).all(|pair| {
+            (pair[0].date_ms, pair[0].provider_id) < (pair[1].date_ms, pair[1].provider_id)
+        }), "短信增量读取顺序无效");
+        anyhow::ensure!(!messages.is_empty() || value["has_more"].as_bool() != Some(true), "短信分页未返回可继续的记录");
+    }
+    let next_cursor = if supported {
+        messages.last().and_then(|m| m.provider_id.map(|id| Cursor { date_ms: m.date_ms, id }))
+    } else { None };
+    Ok(Page {
+        messages,
+        next_cursor,
+        has_more: supported && value["has_more"].as_bool().unwrap_or(false),
+        supports_incremental: supported,
+    })
 }
 
 /// Read structured records without parsing unescaped `content query` output.
@@ -34,6 +87,7 @@ pub fn parse_messages(value: &serde_json::Value) -> Result<Vec<Message>> {
         .map(|row| {
             let kind = crate::device::provider_number(row, "type")?;
             Ok(Message {
+                provider_id: row["_id"].as_i64().or_else(|| row["_id"].as_str().and_then(|s| s.parse().ok())),
                 address: row["address"].as_str().unwrap_or("").to_owned(),
                 body: row["body"].as_str().unwrap_or("").to_owned(),
                 date_ms: crate::device::provider_number(row, "date")?,
@@ -102,6 +156,37 @@ pub fn normalize_address(address: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(id: Option<i64>, date: i64) -> serde_json::Value {
+        let mut row = serde_json::json!({"address":"10086","body":"提醒","date":date.to_string(),"type":"1","read":"0","sub_id":"1"});
+        if let Some(id) = id { row["_id"] = id.to_string().into(); }
+        row
+    }
+
+    #[test]
+    fn same_millisecond_messages_keep_distinct_ids_and_page_cursor() {
+        let page = parse_page(&serde_json::json!({"incremental":true,"has_more":true,"rows":[row(Some(7),100),row(Some(8),100)]})).unwrap();
+        assert_eq!(page.messages.len(), 2);
+        assert_eq!(page.next_cursor, Some(Cursor { date_ms:100,id:8 }));
+        assert!(page.has_more && page.supports_incremental);
+    }
+
+    #[test]
+    fn legacy_bridge_is_explicitly_not_incremental() {
+        let page = parse_page(&serde_json::json!({"rows":[row(None,100)]})).unwrap();
+        assert!(!page.supports_incremental);
+        assert_eq!(page.next_cursor, None);
+        assert_eq!(page.messages[0].provider_id, None);
+    }
+
+    #[test]
+    fn malformed_incremental_page_cannot_silently_advance_or_loop() {
+        for value in [
+            serde_json::json!({"incremental":true,"rows":[row(None,100)]}),
+            serde_json::json!({"incremental":true,"rows":[row(Some(9),100),row(Some(8),100)]}),
+            serde_json::json!({"incremental":true,"has_more":true,"rows":[]}),
+        ] { assert!(parse_page(&value).is_err()); }
+    }
 
     #[test]
     fn normalizes_mainland_mobile_prefixes_to_same_key() {

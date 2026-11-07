@@ -26,6 +26,11 @@ pub enum MirrorAudioRoute {
 }
 
 impl MirrorAudioRoute {
+    #[allow(non_upper_case_globals)]
+    pub const DesktopOnly: Self = Self::Pc;
+    #[allow(non_upper_case_globals)]
+    pub const PhoneOnly: Self = Self::Phone;
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Pc => "电脑端播放",
@@ -55,6 +60,62 @@ impl MirrorAudioRoute {
             Self::Pc => Self::Phone,
             Self::Phone => Self::Both,
             Self::Both => Self::Pc,
+        }
+    }
+}
+
+pub fn resolve_effective_audio_route(
+    requested: MirrorAudioRoute,
+    force_no_audio: bool,
+    has_audio_dup: bool,
+) -> (MirrorAudioRoute, bool) {
+    if force_no_audio {
+        (
+            MirrorAudioRoute::PhoneOnly,
+            requested != MirrorAudioRoute::PhoneOnly,
+        )
+    } else if requested == MirrorAudioRoute::Both && !has_audio_dup {
+        (MirrorAudioRoute::DesktopOnly, true)
+    } else {
+        (requested, false)
+    }
+}
+
+pub fn format_started_message(
+    frame_received: bool,
+    audio_route: MirrorAudioRoute,
+    audio_downgraded: bool,
+) -> &'static str {
+    match (frame_received, audio_route, audio_downgraded) {
+        (true, MirrorAudioRoute::Pc, false) => {
+            "独立投屏已启动（声音：电脑端播放）· 手机画面已就绪；投屏期间保持手机屏幕活跃"
+        }
+        (true, MirrorAudioRoute::Pc, true) => {
+            "独立投屏已启动（声音：电脑端播放 · 当前组件不支持双端同播）· 手机画面已就绪；投屏期间保持手机屏幕活跃"
+        }
+        (true, MirrorAudioRoute::Phone, false) => {
+            "独立投屏已启动（声音：手机端播放）· 手机画面已就绪；投屏期间保持手机屏幕活跃"
+        }
+        (true, MirrorAudioRoute::Phone, true) => {
+            "独立投屏已启动（声音：手机端播放 · 音频转发受限已自动降级）· 手机画面已就绪；投屏期间保持手机屏幕活跃"
+        }
+        (true, MirrorAudioRoute::Both, _) => {
+            "独立投屏已启动（声音：电脑+手机双端同播）· 手机画面已就绪；投屏期间保持手机屏幕活跃"
+        }
+        (false, MirrorAudioRoute::Pc, false) => {
+            "独立投屏已启动（声音：电脑端播放）· 请在独立窗口确认画面；投屏期间保持手机屏幕活跃"
+        }
+        (false, MirrorAudioRoute::Pc, true) => {
+            "独立投屏已启动（声音：电脑端播放 · 当前组件不支持双端同播）· 请在独立窗口确认画面；投屏期间保持手机屏幕活跃"
+        }
+        (false, MirrorAudioRoute::Phone, false) => {
+            "独立投屏已启动（声音：手机端播放）· 请在独立窗口确认画面；投屏期间保持手机屏幕活跃"
+        }
+        (false, MirrorAudioRoute::Phone, true) => {
+            "独立投屏已启动（声音：手机端播放 · 音频转发受限已自动降级）· 请在独立窗口确认画面；投屏期间保持手机屏幕活跃"
+        }
+        (false, MirrorAudioRoute::Both, _) => {
+            "独立投屏已启动（声音：电脑+手机双端同播）· 请在独立窗口确认画面；投屏期间保持手机屏幕活跃"
         }
     }
 }
@@ -98,7 +159,7 @@ impl MirrorOptions {
     ) -> (&'static str, &'static str, &'static str) {
         if is_wireless {
             match self.quality {
-                0 => ("1280", "60", "4M"),
+                0 => ("1280", "30", "3M"),
                 1 => ("1440", "60", "6M"),
                 _ => ("1920", "90", "10M"),
             }
@@ -148,6 +209,7 @@ pub struct MirrorSession {
     exited: bool,
     frame_received: bool,
     audio_route: MirrorAudioRoute,
+    audio_downgraded: bool,
     window: crate::mirror_window::Watcher,
 }
 
@@ -158,6 +220,10 @@ impl MirrorSession {
 
     pub fn audio_route(&self) -> MirrorAudioRoute {
         self.audio_route
+    }
+
+    pub fn audio_downgraded(&self) -> bool {
+        self.audio_downgraded
     }
 
     pub fn start_with_options(adb: &Adb, serial: &str, options: MirrorOptions) -> Result<Self> {
@@ -171,6 +237,7 @@ impl MirrorSession {
         if !has_keep_active {
             bail!("投屏组件版本不兼容，无法在投屏时保持手机亮屏。请更新 scrcpy（当前验证版本 5.0.1）或重新安装完整版 desktop。");
         }
+        let has_audio_dup = help_text.contains("--audio-dup");
         let resolved = crate::device::resolve_online_transport(adb, serial, "", "", &[])
             .unwrap_or_else(|_| serial.to_string());
         // Wake phone display if it went to sleep on wireless standby so SurfaceFlinger emits the initial frame immediately.
@@ -207,10 +274,16 @@ impl MirrorSession {
                     }
                     MirrorAudioRoute::Pc => {}
                     MirrorAudioRoute::Both => {
-                        if help_text.contains("--audio-dup") {
+                        if has_audio_dup {
                             command.arg("--audio-dup");
                         }
                     }
+                }
+            }
+            if is_wireless {
+                command.arg("--video-codec-options=i-frame-interval=2");
+                if !force_no_audio && options.audio_route != MirrorAudioRoute::Phone {
+                    command.arg("--audio-buffer=80");
                 }
             }
             if options.stay_awake || has_keep_active {
@@ -247,33 +320,50 @@ impl MirrorSession {
         };
 
         let first_try = Self::spawn(build_cmd(&resolved, false), Duration::from_secs(20));
-        let mut session = match first_try {
-            Ok(s) => s,
+        let can_retry_no_audio = options.audio_route != MirrorAudioRoute::Phone;
+        let (mut session, used_no_audio_fallback) = match first_try {
+            Ok(s) => (s, false),
             Err(first_err) => {
-                // If wireless audio forwarding or an mDNS transport caused startup failure,
-                // try alternate online transport or fallback with `--no-audio`.
+                // If wireless audio forwarding, an audio encoder failure, or an mDNS transport
+                // caused startup failure, try alternate online transport or fallback with `--no-audio`.
                 let alt = crate::device::resolve_online_transport(adb, "", "", "PZ261A", &[])
                     .ok()
                     .filter(|t| t != &resolved);
+                let is_wireless_or_audio_err = resolved.contains(':')
+                    || resolved.starts_with("adb-")
+                    || first_err.to_string().to_ascii_lowercase().contains("audio");
                 if let Some(alt_serial) = alt {
                     let _ = adb.run_timeout(
                         &["-s", &alt_serial, "shell", "input", "keyevent", "224"],
                         Duration::from_secs(2),
                     );
-                    Self::spawn(build_cmd(&alt_serial, false), Duration::from_secs(16))
-                        .or_else(|_| {
+                    match Self::spawn(build_cmd(&alt_serial, false), Duration::from_secs(16)) {
+                        Ok(s) => (s, false),
+                        Err(_) if can_retry_no_audio => (
                             Self::spawn(build_cmd(&alt_serial, true), Duration::from_secs(14))
-                        })
-                        .map_err(|_| first_err)?
-                } else if resolved.contains(':') || resolved.starts_with("adb-") {
-                    Self::spawn(build_cmd(&resolved, true), Duration::from_secs(14))
-                        .map_err(|_| first_err)?
+                                .map_err(|_| first_err)?,
+                            true,
+                        ),
+                        Err(_) => return Err(first_err),
+                    }
+                } else if can_retry_no_audio && is_wireless_or_audio_err {
+                    (
+                        Self::spawn(build_cmd(&resolved, true), Duration::from_secs(14))
+                            .map_err(|_| first_err)?,
+                        true,
+                    )
                 } else {
                     return Err(first_err);
                 }
             }
         };
-        session.audio_route = options.audio_route;
+        let (effective_route, audio_downgraded) = resolve_effective_audio_route(
+            options.audio_route,
+            used_no_audio_fallback,
+            has_audio_dup,
+        );
+        session.audio_route = effective_route;
+        session.audio_downgraded = audio_downgraded;
         Ok(session)
     }
 
@@ -326,6 +416,7 @@ impl MirrorSession {
             exited: false,
             frame_received: false,
             audio_route: MirrorAudioRoute::default(),
+            audio_downgraded: false,
         };
         #[cfg(unix)]
         collect_log(output, session.log.clone());
@@ -364,26 +455,7 @@ impl MirrorSession {
     }
 
     pub fn started_message(&self) -> &'static str {
-        match (self.frame_received, self.audio_route) {
-            (true, MirrorAudioRoute::Pc) => {
-                "独立投屏已启动（声音：电脑端播放）· 手机画面已就绪；投屏期间保持手机屏幕活跃"
-            }
-            (true, MirrorAudioRoute::Phone) => {
-                "独立投屏已启动（声音：手机端播放）· 手机画面已就绪；投屏期间保持手机屏幕活跃"
-            }
-            (true, MirrorAudioRoute::Both) => {
-                "独立投屏已启动（声音：电脑+手机双端同播）· 手机画面已就绪；投屏期间保持手机屏幕活跃"
-            }
-            (false, MirrorAudioRoute::Pc) => {
-                "独立投屏已启动（声音：电脑端播放）· 请在独立窗口确认画面；投屏期间保持手机屏幕活跃"
-            }
-            (false, MirrorAudioRoute::Phone) => {
-                "独立投屏已启动（声音：手机端播放）· 请在独立窗口确认画面；投屏期间保持手机屏幕活跃"
-            }
-            (false, MirrorAudioRoute::Both) => {
-                "独立投屏已启动（声音：电脑+手机双端同播）· 请在独立窗口确认画面；投屏期间保持手机屏幕活跃"
-            }
-        }
+        format_started_message(self.frame_received, self.audio_route, self.audio_downgraded)
     }
 
     pub fn window_bounds(&self) -> Option<crate::mirror_window::MirrorWindow> {
@@ -571,10 +643,14 @@ mod tests {
         assert!(!def.turn_screen_off);
         assert!(!def.show_touches);
         assert_eq!(def.quality_params(), ("1600", "60", "8M"));
+        assert_eq!(def.quality_params_for_transport(false), ("1600", "60", "8M"));
+        assert_eq!(def.quality_params_for_transport(true), ("1440", "60", "6M"));
         let smooth = MirrorOptions { quality: 0, ..def };
         assert_eq!(smooth.quality_params(), ("1280", "30", "4M"));
+        assert_eq!(smooth.quality_params_for_transport(true), ("1280", "30", "3M"));
         let ultra = MirrorOptions { quality: 2, ..def };
         assert_eq!(ultra.quality_params(), ("2400", "120", "16M"));
+        assert_eq!(ultra.quality_params_for_transport(true), ("1920", "90", "10M"));
     }
 
     #[test]
@@ -598,5 +674,71 @@ mod tests {
         assert_eq!(both.detail_label(), "电脑与手机同时播放声音");
 
         assert_eq!(both.next(), MirrorAudioRoute::Pc);
+    }
+
+    #[test]
+    fn audio_downgrade_updates_effective_route_and_started_message() {
+        let (route, downgraded) =
+            resolve_effective_audio_route(MirrorAudioRoute::Pc, true, true);
+        assert_eq!(route, MirrorAudioRoute::PhoneOnly);
+        assert!(downgraded);
+        let msg = format_started_message(true, route, downgraded);
+        assert!(msg.contains("手机端播放"), "{msg}");
+        assert!(!msg.contains("电脑端播放"), "{msg}");
+
+        let (route2, downgraded2) =
+            resolve_effective_audio_route(MirrorAudioRoute::Both, false, false);
+        assert_eq!(route2, MirrorAudioRoute::DesktopOnly);
+        assert!(downgraded2);
+        let msg2 = format_started_message(true, route2, downgraded2);
+        assert!(msg2.contains("电脑端播放"), "{msg2}");
+        assert!(msg2.contains("不支持双端同播"), "{msg2}");
+
+        let (route3, downgraded3) =
+            resolve_effective_audio_route(MirrorAudioRoute::Phone, true, true);
+        assert_eq!(route3, MirrorAudioRoute::Phone);
+        assert!(!downgraded3);
+
+        // End-to-end test of MirrorSession::start_with_options with a fake scrcpy binary
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fake_adb = dir.path().join("adb");
+        std::fs::write(&fake_adb, "#!/usr/bin/env bash\nexit 0\n").unwrap();
+        std::fs::set_permissions(&fake_adb, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let fake_scrcpy = dir.path().join("scrcpy");
+        let scrcpy_script = r#"#!/usr/bin/env bash
+if [[ "$*" == *"--help"* ]]; then
+  echo "scrcpy 5.0.1 --keep-active --max-fps --video-bit-rate"
+  exit 0
+fi
+if [[ "$*" != *"--no-audio"* ]]; then
+  echo "ERROR: Audio capture failed on wireless transport" >&2
+  exit 1
+fi
+echo "INFO: Texture: 1080x2400"
+sleep 5
+"#;
+        std::fs::write(&fake_scrcpy, scrcpy_script).unwrap();
+        std::fs::set_permissions(&fake_scrcpy, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        std::env::set_var("STEPX_SCRCPY", &fake_scrcpy);
+        let adb = Adb { path: fake_adb };
+        let session = MirrorSession::start_with_options(
+            &adb,
+            "192.168.1.88:5555",
+            MirrorOptions {
+                audio_route: MirrorAudioRoute::Pc,
+                ..MirrorOptions::default()
+            },
+        )
+        .expect("start_with_options should succeed via --no-audio fallback");
+        std::env::remove_var("STEPX_SCRCPY");
+
+        assert_eq!(session.audio_route(), MirrorAudioRoute::PhoneOnly);
+        assert!(session.audio_downgraded());
+        let started_msg = session.started_message();
+        assert!(started_msg.contains("手机端播放"), "{started_msg}");
+        assert!(!started_msg.contains("声音：电脑端播放"), "{started_msg}");
     }
 }

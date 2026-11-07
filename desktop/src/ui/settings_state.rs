@@ -1,3 +1,4 @@
+use stepx_companion::file_dialog::DialogKind;
 use super::*;
 use facloud_ui::TypedActionView;
 use stepx_companion::settings::{self, Appearance, Settings};
@@ -5,6 +6,7 @@ use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
     Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
+pub(super) const AGENT_SETTINGS_TAB: u8 = 5;
 
 #[derive(Clone, Debug)]
 pub(super) enum SettingsAction {
@@ -15,6 +17,10 @@ pub(super) enum SettingsAction {
     Tray,
     CloseToTray,
     Motion,
+    CapsuleAgent,
+    ResetCapsulePrompt,
+    HomeAgent,
+    ResetHomeAgentPrompt,
     Downloads,
     WorkDirectory,
     OpenDownloads,
@@ -60,7 +66,7 @@ impl Default for SettingsUi {
                 .and_then(|i| std::env::args().nth(i + 1))
                 .and_then(|s| s.parse::<u8>().ok())
                 .unwrap_or(0)
-                .min(4),
+                .min(AGENT_SETTINGS_TAB),
             feedback: String::new(),
             tray: None,
             tray_initialized: false,
@@ -191,33 +197,66 @@ impl Companion {
             SettingsAction::Motion => {
                 self.settings.draft.reduced_motion = !self.settings.draft.reduced_motion
             }
+            SettingsAction::CapsuleAgent => {
+                self.settings.draft.capsule_agent_enabled = !self.settings.draft.capsule_agent_enabled;
+            }
+            SettingsAction::ResetCapsulePrompt => {
+                let prompt = stepx_companion::capsule_fulfillment::DEFAULT_AGENT_PROMPT;
+                self.settings.draft.capsule_agent_prompt = prompt.into();
+                self.fields[F_CAPSULE_PROMPT].set(prompt);
+            }
+            SettingsAction::HomeAgent => {
+                self.settings.draft.home_agent_enabled = !self.settings.draft.home_agent_enabled;
+            }
+            SettingsAction::ResetHomeAgentPrompt => {
+                let prompt = stepx_companion::agent_workflows::DEFAULT_PROMPT;
+                self.settings.draft.home_agent_prompt = prompt.into();
+                self.fields[F_HOME_AGENT_PROMPT].set(prompt);
+            }
             SettingsAction::SyncOutputs => {
                 self.settings.draft.sync_work_outputs = !self.settings.draft.sync_work_outputs
             }
             SettingsAction::Downloads => {
-                if let Some(path) = native_dialog::FileDialog::new()
-                    .set_title("选择下载与接收文件夹")
-                    .show_open_single_dir()?
-                {
-                    self.settings.draft.download_directory =
-                        Some(settings::choose_directory(&path)?);
-                } else {
-                    return Ok(());
-                }
+                let expected_draft = self.settings.draft.clone();
+                self.choose_path(
+                    stepx_companion::file_dialog::FileDialog::new().set_title("选择下载与接收文件夹"),
+                    DialogKind::OpenFolder,
+                    move |app, path, _| {
+                        anyhow::ensure!(
+                            app.page == Page::Settings && app.settings.draft == expected_draft,
+                            "设置已变化，请重新选择下载文件夹；现有设置保留"
+                        );
+                        app.settings.draft.download_directory = Some(settings::choose_directory(&path)?);
+                        app.settings.feedback = "有未保存的更改，确认保存后才会生效".into();
+                        Ok(())
+                    },
+                );
+                return Ok(());
             }
             SettingsAction::WorkDirectory => {
                 anyhow::ensure!(
                     !self.work.running && !self.busy && self.work.attachments.is_empty(),
                     "请先完成当前任务，并发送或移除附件，再更换工作文件夹；草稿会保留"
                 );
-                if let Some(path) = native_dialog::FileDialog::new()
-                    .set_title("选择 Amoo Work 项目文件夹")
-                    .show_open_single_dir()?
-                {
-                    self.settings.draft.work_directory = Some(settings::choose_directory(&path)?);
-                } else {
-                    return Ok(());
-                }
+                let expected_draft = self.settings.draft.clone();
+                self.choose_path(
+                    stepx_companion::file_dialog::FileDialog::new().set_title("选择 Amoo Work 项目文件夹"),
+                    DialogKind::OpenFolder,
+                    move |app, path, _| {
+                        anyhow::ensure!(
+                            app.page == Page::Settings && app.settings.draft == expected_draft,
+                            "设置已变化，请重新选择工作文件夹；现有设置保留"
+                        );
+                        anyhow::ensure!(
+                            !app.work.running && !app.busy && app.work.attachments.is_empty(),
+                            "当前任务已变化，请完成任务后重新选择文件夹；草稿会保留"
+                        );
+                        app.settings.draft.work_directory = Some(settings::choose_directory(&path)?);
+                        app.settings.feedback = "有未保存的更改，确认保存后才会生效".into();
+                        Ok(())
+                    },
+                );
+                return Ok(());
             }
             SettingsAction::OpenDownloads => {
                 let p = if let Some(p) = &self.settings.draft.download_directory {
@@ -255,12 +294,15 @@ impl Companion {
         Ok(())
     }
     pub(super) fn settings_dirty(&self) -> bool {
-        self.settings.value != self.settings.draft || self.push.prefs != self.settings.notify_draft
+        self.settings.value != self.settings.draft
+            || !self.push.prefs.settings_eq(&self.settings.notify_draft)
     }
     pub(super) fn discard_settings(&mut self) {
         let _ = self.shortcuts.resume();
         self.shortcuts.recording = false;
         self.settings.draft = self.settings.value.clone();
+        self.fields[F_CAPSULE_PROMPT].set(&self.settings.draft.capsule_agent_prompt);
+        self.fields[F_HOME_AGENT_PROMPT].set(&self.settings.draft.home_agent_prompt);
         self.settings.notify_draft = self.push.prefs.clone();
     }
     pub(super) fn settings_changes(&self) -> Vec<String> {
@@ -289,6 +331,8 @@ impl Companion {
             ("托盘图标", a.tray_icon, b.tray_icon),
             ("关闭后留在后台", a.close_to_tray, b.close_to_tray),
             ("减少动态效果", a.reduced_motion, b.reduced_motion),
+            ("胶囊 Agent 复核", a.capsule_agent_enabled, b.capsule_agent_enabled),
+            ("首页 Agent 自动接手", a.home_agent_enabled, b.home_agent_enabled),
             (
                 "工作成果自动发送到手机",
                 a.sync_work_outputs,
@@ -298,6 +342,12 @@ impl Companion {
             if x != y {
                 rows.push(format!("{name}：{} → {}", flag(x), flag(y)));
             }
+        }
+        if a.capsule_agent_prompt != b.capsule_agent_prompt {
+            rows.push("更新胶囊 Agent 提示词".into());
+        }
+        if a.home_agent_prompt != b.home_agent_prompt {
+            rows.push("更新工作台 Agent 提示词".into());
         }
         if a.download_directory != b.download_directory {
             rows.push(format!(
@@ -324,6 +374,12 @@ impl Companion {
         }
         if a.popup_mode != b.popup_mode {
             rows.push(format!("电脑提醒方式：{}", b.popup_mode.label()));
+        }
+        if a.app_popup_modes != b.app_popup_modes {
+            rows.push(format!(
+                "各应用独立弹窗规则：{} 项配置",
+                b.app_popup_modes.len()
+            ));
         }
         if a.privacy_mask != b.privacy_mask {
             rows.push(format!("隐藏通知正文：{}", flag(b.privacy_mask)));
@@ -365,9 +421,11 @@ impl Companion {
             }
             return Err(error);
         }
-        if let Err(e) =
-            stepx_companion::desktop_notify::save_preferences(&self.settings.notify_draft)
-        {
+        let next_notify = self
+            .push
+            .prefs
+            .with_settings_from(&self.settings.notify_draft);
+        if let Err(e) = stepx_companion::desktop_notify::save_preferences(&next_notify) {
             if shortcut_changed {
                 let _ = self.shortcuts.replace(&old.compact_shortcut);
             }
@@ -382,7 +440,34 @@ impl Companion {
             );
         }
         self.settings.value = next;
-        self.push.prefs = self.settings.notify_draft.clone();
+        let explicitly_enabling_notifications = self.settings.notify_draft.scope
+            != stepx_companion::desktop_notify::AlertScope::Muted
+            && (self.push.prefs.popup_mode != self.settings.notify_draft.popup_mode
+                || self.push.prefs.scope != self.settings.notify_draft.scope
+                || self.push.prefs.app_popup_modes != self.settings.notify_draft.app_popup_modes);
+        self.push.prefs = next_notify;
+        self.settings.notify_draft = self.push.prefs.clone();
+        let any_popup_enabled = self.push.prefs.popup_mode
+            != stepx_companion::desktop_notify::PopupMode::Silent
+            || self
+                .push
+                .prefs
+                .app_popup_modes
+                .values()
+                .any(|m| *m != stepx_companion::desktop_notify::PopupMode::Silent);
+        if self.notification_center.alert_mode
+            != crate::ui::notification_center_state::NotificationAlertMode::Muted
+            || (explicitly_enabling_notifications && any_popup_enabled)
+        {
+            self.notification_center.alert_mode = if any_popup_enabled {
+                crate::ui::notification_center_state::NotificationAlertMode::PopupAndBadge
+            } else {
+                crate::ui::notification_center_state::NotificationAlertMode::BadgeOnly
+            };
+            self.notification_center.save();
+        }
+        self.sync_notification_center();
+        self.sync_desktop_popup_window(ctx);
         self.theme_mode = match self.settings.value.appearance {
             Appearance::System => ThemeMode::System,
             Appearance::Light => ThemeMode::Light,
@@ -539,5 +624,30 @@ impl Companion {
         self.settings.value.work_directory = self.work.workspace.clone();
         self.settings.draft.work_directory = self.work.workspace.clone();
         settings::save(&self.settings.value)
+    }
+}
+
+#[cfg(test)]
+mod notification_draft_tests {
+    use super::*;
+
+    #[test]
+    fn message_state_changes_do_not_trigger_leave_confirmation() {
+        let mut app = Companion::new_for_test();
+        assert!(!app.settings_dirty());
+        app.push.prefs.pinned_targets.insert("im:one".into());
+        app.push.prefs.manual_unread_targets.insert("im:two".into());
+        app.push
+            .prefs
+            .deleted_threads
+            .insert("local-test".into(), 123);
+        assert!(!app.settings_dirty());
+        assert!(app.settings_changes().is_empty());
+        app.settings.notify_draft.privacy_mask = !app.push.prefs.privacy_mask;
+        assert!(app.settings_dirty());
+        assert!(!app.settings_changes().is_empty());
+        app.discard_settings();
+        assert!(!app.settings_dirty());
+        assert!(app.push.prefs.pinned_targets.contains("im:one"));
     }
 }

@@ -1,7 +1,7 @@
 //! Shared outline icon family. Assets use a 24 px grid and rounded 1.75 px strokes.
 //! White SVG masks are required: the renderer uses the red channel as icon alpha.
-use super::{widgets::El, Companion};
 pub(super) use super::widgets::icon_label;
+use super::{widgets::El, Companion};
 use facloud_ui::{color::ColorU, elements::*};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -22,14 +22,28 @@ pub(super) enum UiIcon {
     GithubStar,
     Bolt,
     Connect,
+    Usb,
+    MoreHorizontal,
     Folder,
     File,
+    FilePdf,
+    Spreadsheet,
+    Presentation,
+    Code,
+
     Music,
     Video,
     Image,
     Download,
     Upload,
     Battery,
+    BatteryEmpty,
+    BatteryLow,
+    BatteryHalf,
+    BatteryFull,
+    BatteryCharging,
+    BatteryPlugged,
+
     Storage,
     Temperature,
     Copy,
@@ -56,12 +70,16 @@ pub(super) enum UiIcon {
     Backspace,
     Camera,
     Lock,
+    Unlock,
+    Square,
     Shield,
     Monitor,
     Wifi,
     Clock,
     Bell,
+    BellOff,
     Sun,
+    CloudRain,
     Smile,
     Lightbulb,
     Chat,
@@ -96,6 +114,10 @@ pub(super) enum UiIcon {
     Key,
     Activity,
     Gift,
+    Users,
+    MessageCircle,
+    Reply,
+    CheckAll,
 }
 #[allow(non_upper_case_globals, dead_code)]
 impl UiIcon {
@@ -103,6 +125,14 @@ impl UiIcon {
     pub(super) const SpeakerOff: Self = Self::Mute;
     pub(super) const Wallet: Self = Self::CreditCard;
     pub(super) const Sos: Self = Self::AlertTriangle;
+    pub(super) const FolderOpen: Self = Self::Folder;
+    pub(super) const Link: Self = Self::Connect;
+    pub(super) const Alert: Self = Self::AlertTriangle;
+    pub(super) const ArrowUpRight: Self = Self::ExternalLink;
+    pub(super) const Grid: Self = Self::Apps;
+    pub(super) const Layers: Self = Self::Archive;
+    pub(super) const Database: Self = Self::Storage;
+    pub(super) const Quote: Self = Self::Reply;
 
     pub(super) fn path(self) -> &'static str {
         match self {
@@ -122,14 +152,28 @@ impl UiIcon {
             Self::GithubStar => "icons/GithubStar.svg",
             Self::Bolt => "icons/Bolt.svg",
             Self::Connect => "icons/Connect.svg",
+            Self::Usb => "icons/Usb.svg",
+            Self::MoreHorizontal => "icons/MoreHorizontal.svg",
             Self::Folder => "icons/Folder.svg",
             Self::File => "icons/File.svg",
+            Self::FilePdf => "icons/FilePdf.svg",
+            Self::Spreadsheet => "icons/Spreadsheet.svg",
+            Self::Presentation => "icons/Presentation.svg",
+            Self::Code => "icons/Code.svg",
+
             Self::Music => "icons/Music.svg",
             Self::Video => "icons/Video.svg",
             Self::Image => "icons/Image.svg",
             Self::Download => "icons/Download.svg",
             Self::Upload => "icons/Upload.svg",
             Self::Battery => "icons/Battery.svg",
+            Self::BatteryEmpty => "icons/BatteryEmpty.svg",
+            Self::BatteryLow => "icons/BatteryLow.svg",
+            Self::BatteryHalf => "icons/BatteryHalf.svg",
+            Self::BatteryFull => "icons/BatteryFull.svg",
+            Self::BatteryCharging => "icons/BatteryCharging.svg",
+            Self::BatteryPlugged => "icons/BatteryPlugged.svg",
+
             Self::Storage => "icons/Storage.svg",
             Self::Temperature => "icons/Temperature.svg",
             Self::Copy => "icons/Copy.svg",
@@ -156,12 +200,16 @@ impl UiIcon {
             Self::Backspace => "icons/Backspace.svg",
             Self::Camera => "icons/Camera.svg",
             Self::Lock => "icons/Lock.svg",
+            Self::Unlock => "icons/Unlock.svg",
+            Self::Square => "icons/Square.svg",
             Self::Shield => "icons/Shield.svg",
             Self::Monitor => "icons/Monitor.svg",
             Self::Wifi => "icons/Wifi.svg",
             Self::Clock => "icons/Clock.svg",
             Self::Bell => "icons/Bell.svg",
+            Self::BellOff => "icons/BellOff.svg",
             Self::Sun => "icons/Sun.svg",
+            Self::CloudRain => "icons/CloudRain.svg",
             Self::Smile => "icons/Smile.svg",
             Self::Lightbulb => "icons/Lightbulb.svg",
             Self::Chat => "icons/Chat.svg",
@@ -196,6 +244,10 @@ impl UiIcon {
             Self::Key => "icons/Key.svg",
             Self::Activity => "icons/Activity.svg",
             Self::Gift => "icons/Gift.svg",
+            Self::Users => "icons/Users.svg",
+            Self::MessageCircle => "icons/MessageCircle.svg",
+            Self::Reply => "icons/Reply.svg",
+            Self::CheckAll => "icons/CheckAll.svg",
         }
     }
 }
@@ -217,14 +269,28 @@ pub(super) fn asset(path: &str) -> Option<&'static [u8]> {
         "icons/GithubStar.svg" => include_bytes!("../../assets/icons/GithubStar.svg"),
         "icons/Bolt.svg" => include_bytes!("../../assets/icons/Bolt.svg"),
         "icons/Connect.svg" => include_bytes!("../../assets/icons/Connect.svg"),
+        "icons/Usb.svg" => include_bytes!("../../assets/icons/Usb.svg"),
+        "icons/MoreHorizontal.svg" => include_bytes!("../../assets/icons/MoreHorizontal.svg"),
         "icons/Folder.svg" => include_bytes!("../../assets/icons/Folder.svg"),
         "icons/File.svg" => include_bytes!("../../assets/icons/File.svg"),
+        "icons/FilePdf.svg" => include_bytes!("../../assets/icons/FilePdf.svg"),
+        "icons/Spreadsheet.svg" => include_bytes!("../../assets/icons/Spreadsheet.svg"),
+        "icons/Presentation.svg" => include_bytes!("../../assets/icons/Presentation.svg"),
+        "icons/Code.svg" => include_bytes!("../../assets/icons/Code.svg"),
+
         "icons/Music.svg" => include_bytes!("../../assets/icons/Music.svg"),
         "icons/Video.svg" => include_bytes!("../../assets/icons/Video.svg"),
         "icons/Image.svg" => include_bytes!("../../assets/icons/Image.svg"),
         "icons/Download.svg" => include_bytes!("../../assets/icons/Download.svg"),
         "icons/Upload.svg" => include_bytes!("../../assets/icons/Upload.svg"),
         "icons/Battery.svg" => include_bytes!("../../assets/icons/Battery.svg"),
+        "icons/BatteryEmpty.svg" => include_bytes!("../../assets/icons/BatteryEmpty.svg"),
+        "icons/BatteryLow.svg" => include_bytes!("../../assets/icons/BatteryLow.svg"),
+        "icons/BatteryHalf.svg" => include_bytes!("../../assets/icons/BatteryHalf.svg"),
+        "icons/BatteryFull.svg" => include_bytes!("../../assets/icons/BatteryFull.svg"),
+        "icons/BatteryCharging.svg" => include_bytes!("../../assets/icons/BatteryCharging.svg"),
+        "icons/BatteryPlugged.svg" => include_bytes!("../../assets/icons/BatteryPlugged.svg"),
+
         "icons/Storage.svg" => include_bytes!("../../assets/icons/Storage.svg"),
         "icons/Temperature.svg" => include_bytes!("../../assets/icons/Temperature.svg"),
         "icons/Copy.svg" => include_bytes!("../../assets/icons/Copy.svg"),
@@ -251,12 +317,16 @@ pub(super) fn asset(path: &str) -> Option<&'static [u8]> {
         "icons/Backspace.svg" => include_bytes!("../../assets/icons/Backspace.svg"),
         "icons/Camera.svg" => include_bytes!("../../assets/icons/Camera.svg"),
         "icons/Lock.svg" => include_bytes!("../../assets/icons/Lock.svg"),
+        "icons/Unlock.svg" => include_bytes!("../../assets/icons/Unlock.svg"),
+        "icons/Square.svg" => include_bytes!("../../assets/icons/Square.svg"),
         "icons/Shield.svg" => include_bytes!("../../assets/icons/Shield.svg"),
         "icons/Monitor.svg" => include_bytes!("../../assets/icons/Monitor.svg"),
         "icons/Wifi.svg" => include_bytes!("../../assets/icons/Wifi.svg"),
         "icons/Clock.svg" => include_bytes!("../../assets/icons/Clock.svg"),
         "icons/Bell.svg" => include_bytes!("../../assets/icons/Bell.svg"),
+        "icons/BellOff.svg" => include_bytes!("../../assets/icons/BellOff.svg"),
         "icons/Sun.svg" => include_bytes!("../../assets/icons/Sun.svg"),
+        "icons/CloudRain.svg" => include_bytes!("../../assets/icons/CloudRain.svg"),
         "icons/Smile.svg" => include_bytes!("../../assets/icons/Smile.svg"),
         "icons/Lightbulb.svg" => include_bytes!("../../assets/icons/Lightbulb.svg"),
         "icons/Chat.svg" => include_bytes!("../../assets/icons/Chat.svg"),
@@ -291,6 +361,10 @@ pub(super) fn asset(path: &str) -> Option<&'static [u8]> {
         "icons/Key.svg" => include_bytes!("../../assets/icons/Key.svg"),
         "icons/Activity.svg" => include_bytes!("../../assets/icons/Activity.svg"),
         "icons/Gift.svg" => include_bytes!("../../assets/icons/Gift.svg"),
+        "icons/Users.svg" => include_bytes!("../../assets/icons/Users.svg"),
+        "icons/MessageCircle.svg" => include_bytes!("../../assets/icons/MessageCircle.svg"),
+        "icons/Reply.svg" => include_bytes!("../../assets/icons/Reply.svg"),
+        "icons/CheckAll.svg" => include_bytes!("../../assets/icons/CheckAll.svg"),
         _ => return None,
     })
 }
@@ -298,11 +372,13 @@ pub(super) fn draw_icon(icon: UiIcon, size: f32, color: ColorU) -> El {
     ConstrainedBox::new(Icon::new(icon.path(), color).finish())
         .with_width(size)
         .with_height(size)
+        .with_min_width(size)
+        .with_min_height(size)
         .finish()
 }
 impl Companion {
     pub(super) fn ui_icon(&self, icon: UiIcon, size: f32, color: ColorU) -> El {
-        draw_icon(icon, size, color)
+        draw_icon(icon, size, self.p().icon_foreground(color))
     }
 }
 pub(super) fn symbol(value: &str) -> Option<UiIcon> {
@@ -310,7 +386,8 @@ pub(super) fn symbol(value: &str) -> Option<UiIcon> {
     Some(match trimmed {
         "◈" | "⌂" | "🏠" => UiIcon::Home,
         "❖" => UiIcon::Matrix,
-        "✦" => UiIcon::Star,
+        "✦" => UiIcon::Sparkles,
+        "⭐" => UiIcon::Star,
         "✨" => UiIcon::Sparkles,
         "⚡" => UiIcon::Bolt,
         "✉" => UiIcon::Sms,
@@ -355,29 +432,35 @@ pub(super) fn symbol(value: &str) -> Option<UiIcon> {
         "+" | "＋" | "⊕" | "➕" => UiIcon::Plus,
         "−" | "–" | "—" => UiIcon::Minus,
         "✕" | "×" => UiIcon::Close,
-        "✓" => UiIcon::Check,
+        "✓" | "✅" | "☑" => UiIcon::Check,
+        "☐" => UiIcon::Square,
         "🗑" => UiIcon::Trash,
         "ⓘ" | "◉" => UiIcon::Info,
-        "⚠" | "🆘" => UiIcon::AlertTriangle,
+        "⚠" | "🆘" | "🚨" => UiIcon::AlertTriangle,
         "⚙" => UiIcon::Settings,
         "🔍" | "🔎" => UiIcon::Search,
-        "📦" => UiIcon::Package,
+        "📦" | "🛍" => UiIcon::Package,
         "🗜" | "🗂" => UiIcon::Archive,
         "⌫" => UiIcon::Backspace,
         "📷" | "📸" => UiIcon::Camera,
-        "🔒" | "🔑" | "🔓" => UiIcon::Lock,
+        "🔒" | "🔐" => UiIcon::Lock,
+        "🔓" => UiIcon::Unlock,
+        "🔑" => UiIcon::Key,
         "🛡" => UiIcon::Shield,
         "💻" | "🖥" => UiIcon::Monitor,
-        "📡" | "🌐" | "📶" => UiIcon::Wifi,
+        "📡" | "🌐" | "📶" | "G" => UiIcon::Wifi,
+        "🔌" => UiIcon::Usb,
         "🔵" => UiIcon::Bluetooth,
         "📅" => UiIcon::Calendar,
-        "🕒" | "◷" | "⏰" | "⏳" | "🍅" => UiIcon::Clock,
+        "🕒" | "◷" | "⏰" | "⏳" | "🍅" | "⏱" => UiIcon::Clock,
         "☀" => UiIcon::Sun,
+        "🌧" => UiIcon::CloudRain,
         "🌓" => UiIcon::Contrast,
         "😊" => UiIcon::Smile,
         "💡" => UiIcon::Lightbulb,
         "💬" => UiIcon::Chat,
-        "🔔" | "🔕" => UiIcon::Bell,
+        "🔔" => UiIcon::Bell,
+        "🔕" => UiIcon::BellOff,
         "🤖" | "⌘" => UiIcon::Cpu,
         "⤢" | "⛶" => UiIcon::Maximize,
         "📎" => UiIcon::Attach,
@@ -393,6 +476,7 @@ pub(super) fn symbol(value: &str) -> Option<UiIcon> {
         "🐱" => UiIcon::Cat,
         "↔" => UiIcon::Flip,
         "👤" => UiIcon::User,
+        "👥" => UiIcon::Users,
         "💳" => UiIcon::CreditCard,
         "🏃" => UiIcon::Activity,
         "🎂" => UiIcon::Gift,
@@ -442,6 +526,108 @@ mod tests {
     use super::*;
 
     #[test]
+    fn entire_functional_svg_family_obeys_the_mask_contract() {
+        use facloud_ui::{assets::asset_cache::Asset, image_cache::ImageType};
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/icons");
+        let mut count = 0;
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|x| x.to_str()) != Some("svg") {
+                continue;
+            }
+            let key = format!("icons/{}", path.file_name().unwrap().to_str().unwrap());
+            let bytes = asset(&key).unwrap_or_else(|| panic!("SVG not bundled: {key}"));
+            assert!(
+                ImageType::try_from_bytes(bytes).is_ok(),
+                "cannot render {key}"
+            );
+            let svg = std::str::from_utf8(bytes).unwrap();
+            for attr in [
+                "viewBox=\"0 0 24 24\"",
+                "stroke-width=\"1.75\"",
+                "stroke-linecap=\"round\"",
+                "stroke-linejoin=\"round\"",
+            ] {
+                assert!(svg.contains(attr), "{key}: missing {attr}");
+            }
+            assert!(
+                svg.contains("stroke=\"white\"") || svg.contains("stroke=\"#FFFFFF\""),
+                "{key}: non-mask stroke"
+            );
+            count += 1;
+        }
+        assert!(count >= 100);
+    }
+
+    #[test]
+    fn state_glyphs_remain_distinct_and_embedded_user_symbols_stay_text() {
+        for (glyph, expected) in [
+            ("🌧️", UiIcon::CloudRain),
+            ("☀️", UiIcon::Sun),
+            ("🔕", UiIcon::BellOff),
+            ("🔔", UiIcon::Bell),
+            ("🔓", UiIcon::Unlock),
+            ("🔒", UiIcon::Lock),
+            ("🔑", UiIcon::Key),
+            ("☐", UiIcon::Square),
+            ("☑", UiIcon::Check),
+            ("✦", UiIcon::Sparkles),
+            ("⭐", UiIcon::Star),
+        ] {
+            assert_eq!(symbol(glyph), Some(expected));
+        }
+        assert_eq!(label_icon("☐ 未完成"), Some((UiIcon::Square, "未完成")));
+        assert_eq!(label_icon("☑ 已完成"), Some((UiIcon::Check, "已完成")));
+        assert_eq!(label_icon("🔓已解锁"), Some((UiIcon::Unlock, "已解锁")));
+        assert_eq!(label_icon("⭐ 收藏"), Some((UiIcon::Star, "收藏")));
+        for text in ["天气 🌧️", "解锁状态🔓", "我的备注：☐ 未完成", "收藏 ⭐"]
+        {
+            assert_eq!(label_icon(text), None, "embedded user symbols: {text}");
+        }
+        for (left, right) in [
+            (UiIcon::CloudRain, UiIcon::Sun),
+            (UiIcon::BellOff, UiIcon::Bell),
+            (UiIcon::Unlock, UiIcon::Lock),
+            (UiIcon::Square, UiIcon::Check),
+            (UiIcon::Star, UiIcon::Sparkles),
+        ] {
+            assert_ne!(asset(left.path()), asset(right.path()));
+        }
+    }
+
+    #[test]
+    fn new_state_assets_parse_and_keep_the_shared_white_outline_mask() {
+        use facloud_ui::{assets::asset_cache::Asset, image_cache::ImageType};
+        for icon in [
+            UiIcon::CloudRain,
+            UiIcon::BellOff,
+            UiIcon::Unlock,
+            UiIcon::Square,
+            UiIcon::Star,
+        ] {
+            let bytes = asset(icon.path()).expect("state icon asset must exist");
+            assert!(
+                ImageType::try_from_bytes(bytes).is_ok(),
+                "invalid SVG: {icon:?}"
+            );
+            let svg = std::str::from_utf8(bytes).unwrap();
+            for attribute in [
+                "viewBox=\"0 0 24 24\"",
+                "fill=\"none\"",
+                "stroke=\"white\"",
+                "stroke-width=\"1.75\"",
+                "stroke-linecap=\"round\"",
+                "stroke-linejoin=\"round\"",
+            ] {
+                assert!(
+                    svg.contains(attribute),
+                    "outline contract {attribute}: {icon:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn symbol_and_label_icon_mappings() {
         assert_eq!(symbol("📂"), Some(UiIcon::Folder));
         assert_eq!(
@@ -467,10 +653,10 @@ mod tests {
         assert_eq!(symbol("⏰"), Some(UiIcon::Clock));
         assert_eq!(label_icon("⏰"), Some((UiIcon::Clock, "")));
 
-        assert_eq!(symbol("🔑"), Some(UiIcon::Lock));
+        assert_eq!(symbol("🔑"), Some(UiIcon::Key));
         assert_eq!(
             label_icon("🔑 复制验证码"),
-            Some((UiIcon::Lock, "复制验证码"))
+            Some((UiIcon::Key, "复制验证码"))
         );
 
         assert_eq!(label_icon("🔍-"), Some((UiIcon::Minus, "")));

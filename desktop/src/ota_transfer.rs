@@ -68,12 +68,80 @@ impl Drop for Job {
         self.cancel();
     }
 }
+fn resolve_cache_dir_from(
+    xdg_cache_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+    local_app_data: Option<PathBuf>,
+    app_data: Option<PathBuf>,
+    user_profile: Option<PathBuf>,
+    is_macos: bool,
+) -> Result<PathBuf> {
+    let non_empty = |p: Option<PathBuf>| p.filter(|v| !v.as_os_str().is_empty());
+    let base = if let Some(xdg) = non_empty(xdg_cache_home) {
+        Some(xdg)
+    } else if let Some(h) = non_empty(home) {
+        if is_macos {
+            Some(h.join("Library/Application Support"))
+        } else {
+            Some(h.join(".cache"))
+        }
+    } else if let Some(local) = non_empty(local_app_data) {
+        Some(local)
+    } else if let Some(roaming) = non_empty(app_data) {
+        Some(roaming)
+    } else if let Some(profile) = non_empty(user_profile) {
+        if is_macos {
+            Some(profile.join("Library/Application Support"))
+        } else {
+            Some(profile.join("AppData/Local"))
+        }
+    } else {
+        None
+    }
+    .context("无法定位固件缓存目录")?;
+    Ok(base.join("stepx-companion/phone-ota"))
+}
+
+fn fallback_unix_home(is_macos: bool) -> Option<PathBuf> {
+    #[cfg(unix)]
+    unsafe {
+        let pw = libc::getpwuid(libc::getuid());
+        if !pw.is_null() && !(*pw).pw_dir.is_null() {
+            if let Ok(s) = std::ffi::CStr::from_ptr((*pw).pw_dir).to_str() {
+                if !s.trim().is_empty() {
+                    return Some(PathBuf::from(s));
+                }
+            }
+        }
+    }
+    std::env::var_os("USER")
+        .or_else(|| std::env::var_os("LOGNAME"))
+        .filter(|u| !u.is_empty())
+        .map(|u| {
+            PathBuf::from(if is_macos { "/Users" } else { "/home" }).join(u)
+        })
+}
+
 fn cache_dir() -> Result<PathBuf> {
-    let home = std::env::var_os("XDG_CACHE_HOME")
+    let is_macos = cfg!(target_os = "macos");
+    let home = std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|v| PathBuf::from(v).join(".cache")))
-        .context("无法定位固件缓存目录")?;
-    Ok(home.join("stepx-companion/phone-ota"))
+        .or_else(|| {
+            if cfg!(unix) {
+                fallback_unix_home(is_macos)
+            } else {
+                None
+            }
+        });
+    resolve_cache_dir_from(
+        std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from),
+        home,
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
+        std::env::var_os("APPDATA").map(PathBuf::from),
+        std::env::var_os("USERPROFILE").map(PathBuf::from),
+        is_macos,
+    )
 }
 fn request(firmware: &Firmware) -> Result<Value> {
     ensure!(
@@ -506,6 +574,70 @@ mod tests {
         let mut m = meta();
         m.insert("pre-build".into(), "other-fingerprint".into());
         assert!(validate_device(&m, "pandora\n172\nfingerprint\n100").is_err());
+    }
+    #[test]
+    fn cache_dir_cross_platform_fallbacks() {
+        assert_eq!(
+            resolve_cache_dir_from(
+                Some(PathBuf::from("/custom/xdg")),
+                Some(PathBuf::from("/home/stepx-user")),
+                None,
+                None,
+                None,
+                false
+            )
+            .unwrap(),
+            PathBuf::from("/custom/xdg/stepx-companion/phone-ota")
+        );
+        assert_eq!(
+            resolve_cache_dir_from(
+                None,
+                Some(PathBuf::from("/Users/macuser")),
+                None,
+                None,
+                None,
+                true
+            )
+            .unwrap(),
+            PathBuf::from("/Users/macuser/Library/Application Support/stepx-companion/phone-ota")
+        );
+        assert_eq!(
+            resolve_cache_dir_from(
+                None,
+                None,
+                Some(PathBuf::from("C:\\Users\\Alice\\AppData\\Local")),
+                None,
+                None,
+                false
+            )
+            .unwrap(),
+            PathBuf::from("C:\\Users\\Alice\\AppData\\Local").join("stepx-companion/phone-ota")
+        );
+        assert_eq!(
+            resolve_cache_dir_from(
+                None,
+                None,
+                None,
+                Some(PathBuf::from("C:\\Users\\Alice\\AppData\\Roaming")),
+                None,
+                false
+            )
+            .unwrap(),
+            PathBuf::from("C:\\Users\\Alice\\AppData\\Roaming").join("stepx-companion/phone-ota")
+        );
+        assert_eq!(
+            resolve_cache_dir_from(
+                None,
+                None,
+                None,
+                None,
+                Some(PathBuf::from("C:\\Users\\Alice")),
+                false
+            )
+            .unwrap(),
+            PathBuf::from("C:\\Users\\Alice").join("AppData/Local/stepx-companion/phone-ota")
+        );
+        assert!(resolve_cache_dir_from(None, None, None, None, None, false).is_err());
     }
 }
 

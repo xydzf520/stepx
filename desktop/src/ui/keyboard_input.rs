@@ -89,6 +89,18 @@ impl Companion {
         if index == F_AMOO {
             Self::scroll_to_end(&self.amoo_ui.composer_scroll);
         }
+        if index == F_TOAST_REPLY && self.push.active_toasts.is_empty() {
+            if let Some(popup) = self.notification_active_popup().cloned() {
+                self.push
+                    .active_toasts
+                    .push(stepx_companion::desktop_notify::DesktopToastItem {
+                        id: popup.id,
+                        timestamp_ms: chrono::Local::now().timestamp_millis(),
+                        can_reply: true,
+                        ..Default::default()
+                    });
+            }
+        }
         ctx.focus_self();
     }
 
@@ -96,6 +108,12 @@ impl Companion {
         let Some(i) = self.focus else {
             return;
         };
+        self.edit_field(i, action, ctx);
+    }
+
+    // A native popup has its own focus owner. Editing it must never change the
+    // main window's editor, composition, selection or native focus.
+    pub(super) fn edit_field(&mut self, i: usize, action: &Action, ctx: &mut ViewContext<Self>) {
         let input = &mut self.fields[i];
         if matches!(
             action,
@@ -206,6 +224,15 @@ impl Companion {
                 });
             }
         }
+        if i == F_GLOBAL_SEARCH {
+            self.search_edited();
+        }
+        if i == F_CAPSULE_PROMPT {
+            self.settings.draft.capsule_agent_prompt = self.fields[i].text.clone();
+        }
+        if i == F_HOME_AGENT_PROMPT {
+            self.settings.draft.home_agent_prompt = self.fields[i].text.clone();
+        }
         if i == F_PHONE_DIAL {
             self.pending_call = None;
         }
@@ -215,14 +242,28 @@ impl Companion {
         if i == F_STORE_SEARCH {
             self.on_store_search_edited();
         }
+        if i == F_TOAST_REPLY && self.push.active_toasts.is_empty() {
+            if let Some(popup) = self.notification_active_popup().cloned() {
+                self.push
+                    .active_toasts
+                    .push(stepx_companion::desktop_notify::DesktopToastItem {
+                        id: popup.id,
+                        timestamp_ms: chrono::Local::now().timestamp_millis(),
+                        can_reply: true,
+                        ..Default::default()
+                    });
+            }
+        }
     }
 }
 
 /// Handles committed IME text separately from key presses so Chinese input is neither lost
 /// nor inserted twice, and maps Cmd (macOS) / Ctrl (Windows, Linux) shortcuts.
 pub(super) struct Keyboard {
+    pub(super) search: bool,
     pub(super) accept_attachments: bool,
     pub(super) context_menu: bool,
+    pub(super) interaction: bool,
     pub(super) shortcut: stepx_companion::settings::CompactShortcut,
     pub(super) recording_shortcut: bool,
     pub(super) child: Box<dyn Element>,
@@ -289,6 +330,19 @@ impl Element for Keyboard {
                     "down" => Some(Action::ContextNavigate(1)),
                     "enter" | "return" => Some(Action::ContextActivate),
                     "escape" | "tab" => Some(Action::ContextClose),
+                    _ => None,
+                };
+                if let Some(a) = a {
+                    ctx.dispatch_typed_action(a);
+                    return true;
+                }
+            }
+        }
+        if self.interaction {
+            if let Event::KeyDown { keystroke, .. } = event.raw_event() {
+                let a = match keystroke.key.as_str() {
+                    "escape" => Some(Action::ReviewCancel),
+                    "enter" | "return" => Some(Action::ReviewConfirm),
                     _ => None,
                 };
                 if let Some(a) = a {
@@ -372,20 +426,29 @@ impl Keyboard {
                     "7" if cmd => Some(Action::Page(Page::Tools)),
                     "8" if cmd => Some(Action::Page(Page::BackScreen)),
                     "," if cmd => Some(Action::Page(Page::Settings)),
-                    "k" if cmd => Some(Action::FocusSearch),
+                    "k" if cmd => Some(Action::GlobalSearch(SearchAction::Open)),
                     "r" if cmd => Some(Action::ContextRefresh),
                     "f5" => Some(Action::ContextRefresh),
                     "m" if cmd => Some(Action::Mirror),
                     "t" if cmd => Some(Action::CycleTheme),
                     "f" if cmd => Some(Action::FocusSearch),
-                    "n" if cmd && !typing => Some(Action::OpenNewFolder),
+                    "n" if cmd => Some(Action::OpenNewFolder),
                     "escape" => Some(Action::Escape),
                     "tab" => Some(Action::NextField(k.shift)),
+                    "enter" | "return" if self.search && cmd => {
+                        Some(Action::GlobalSearch(SearchAction::AllResults))
+                    }
                     "enter" | "return" if typing && k.shift && self.multiline => {
                         Some(Action::Insert("\n".into()))
                     }
                     "enter" | "return" if typing => Some(Action::SubmitFocused),
                     "enter" | "return" => Some(Action::ActivateSelectedFile),
+                    "up" if self.search && !self.composing => {
+                        Some(Action::GlobalSearch(SearchAction::Move(-1)))
+                    }
+                    "down" if self.search && !self.composing => {
+                        Some(Action::GlobalSearch(SearchAction::Move(1)))
+                    }
                     "up" if !typing => Some(Action::MoveFileSelection(-1)),
                     "down" if !typing => Some(Action::MoveFileSelection(1)),
                     "left" if !typing => Some(Action::MoveHorizontalSelection(-1)),
@@ -432,8 +495,10 @@ mod input_tests {
 
     fn keyboard(composing: bool) -> Keyboard {
         Keyboard {
+            search: false,
             accept_attachments: false,
             context_menu: false,
+            interaction: false,
             child: Empty::new().finish(),
             shortcut: Default::default(),
             recording_shortcut: false,
@@ -491,6 +556,26 @@ mod input_tests {
             );
             assert!(keyboard(true).action_for_event(&event).is_none());
         }
+    }
+
+    #[test]
+    fn global_search_shortcuts_respect_input_and_ime() {
+        let mut input = keyboard(false);
+        input.search = true;
+        assert!(matches!(
+            input.action_for_event(&key("down", false)),
+            Some(Action::GlobalSearch(SearchAction::Move(1)))
+        ));
+        let mut shortcut = key("k", false);
+        if let Event::KeyDown { keystroke, .. } = &mut shortcut {
+            keystroke.ctrl = true;
+        }
+        assert!(matches!(
+            input.action_for_event(&shortcut),
+            Some(Action::GlobalSearch(SearchAction::Open))
+        ));
+        input.composing = true;
+        assert!(input.action_for_event(&key("down", false)).is_none());
     }
 
     #[test]

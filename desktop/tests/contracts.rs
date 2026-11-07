@@ -504,7 +504,7 @@ fn low_level_protocols_batch_updates_ota_companion_and_sms_prepare() {
 printf '%s\n' "$*" >> {}
 case "$*" in
 *ro.serialno*)
-    printf 'phone-e2e\n'
+    printf 'CONTRACTBATCHUNIT001\n'
     ;;
 *resolve-activity*stepos.settings.SYSTEM_UPDATE_SETTINGS*)
     printf 'Step AOS 1.2.0\n2026-10-01\npriority=0\ncom.stepos.update/.SystemUpgradeListActivity\n'
@@ -555,8 +555,8 @@ esac
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
     let adb = Adb { path };
     let device = Device {
-        transport: "phone-e2e".into(),
-        serial: "phone-e2e".into(),
+        transport: "CONTRACTBATCHUNIT001".into(),
+        serial: "CONTRACTBATCHUNIT001".into(),
         model: "PZ261A".into(),
         android: "16".into(),
         product: "pandora".into(),
@@ -570,18 +570,26 @@ esac
     let calls_after_pv = std::fs::read_to_string(&log).unwrap().lines().count();
     assert_eq!(calls_after_pv, 2);
 
-    // 2. ota::install_status caches stepx-ota.jar on first call (3 calls: verify + stat + OtaProbe)
-    // and reuses cache on second call (2 calls: verify + OtaProbe, zero push/stat)
+    // 2. OTA performs one stat + probe, optionally rechecking an expired
+    // hardware-identity cache. A warm jar must not be pushed or stat-ed again.
     let st1 = ota::install_status(&adb, &device).unwrap();
     assert_eq!(st1.internal_permission, Some(true));
     assert_eq!(st1.shop_demo, Some(false));
     let calls_after_ota1 = std::fs::read_to_string(&log).unwrap().lines().count();
-    assert_eq!(calls_after_ota1 - calls_after_pv, 3);
+    assert!((2..=3).contains(&(calls_after_ota1 - calls_after_pv)));
+    let first_ota_log = std::fs::read_to_string(&log).unwrap();
+    let first_ota_calls: Vec<_> = first_ota_log.lines().skip(calls_after_pv).collect();
+    assert_eq!(first_ota_calls.iter().filter(|line| line.contains("OtaProbe")).count(), 1);
+    assert_eq!(first_ota_calls.iter().filter(|line| line.contains("stat -c %s")).count(), 1);
 
     let report = ota::check(&adb, &device).unwrap();
     assert_eq!(report.current_version, "Step AOS 1.2.0_20261001_120000");
     let calls_after_ota2 = std::fs::read_to_string(&log).unwrap().lines().count();
-    assert_eq!(calls_after_ota2 - calls_after_ota1, 2);
+    assert!((1..=2).contains(&(calls_after_ota2 - calls_after_ota1)));
+    let warm_log = std::fs::read_to_string(&log).unwrap();
+    let warm_calls: Vec<_> = warm_log.lines().skip(calls_after_ota1).collect();
+    assert_eq!(warm_calls.iter().filter(|line| line.contains("OtaProbe")).count(), 1);
+    assert!(warm_calls.iter().all(|line| !line.contains("stat -c %s") && !line.contains(" push ")));
 
     // 3. companion_app::inspect runs in 2 ADB calls (verify + 1 unified script) instead of 18
     let comp = companion_app::inspect(&adb, &device).unwrap();
@@ -593,7 +601,7 @@ esac
     assert_eq!(comp.doze_exempt, Some(true));
     assert_eq!(comp.oem_freezer_exempt, Some(true));
     let calls_after_comp = std::fs::read_to_string(&log).unwrap().lines().count();
-    assert_eq!(calls_after_comp - calls_after_ota2, 2);
+    assert!((1..=2).contains(&(calls_after_comp - calls_after_ota2)));
 
     // 4. bridge::sms_prepare resolves subscription_label in a single JVM call (no separate capabilities call)
     bridge::mark_bridge_jar_cached(&device.transport);
@@ -601,5 +609,5 @@ esac
     assert_eq!(plan.subscription, 3);
     assert_eq!(plan.subscription_label, "中国移动 SIM 1");
     let calls_after_sms = std::fs::read_to_string(&log).unwrap().lines().count();
-    assert_eq!(calls_after_sms - calls_after_comp, 2); // verify + 1 single app_process call
+    assert!((1..=2).contains(&(calls_after_sms - calls_after_comp))); // optional identity refresh + one JVM request
 }

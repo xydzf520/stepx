@@ -1,5 +1,6 @@
 //! Device, file, SMS, phone, apps, toolbox, and connection action handlers for `Companion`.
 
+use stepx_companion::file_dialog::DialogKind;
 use super::*;
 
 impl Companion {
@@ -124,10 +125,50 @@ impl Companion {
             self.refresh_amoo_background();
             return;
         }
+        if !self.demo_mode
+            && matches!(self.page, Page::Home | Page::Overview)
+            && !self.amoo_ui.usage_attempted
+        {
+            self.start_account_usage_sync();
+        }
         if self.busy {
             return;
         }
         match self.page {
+            Page::Home
+                if !self.demo_mode
+                    && (self.summary.is_empty()
+                        || (!self.sms_loaded && self.sms_error.is_none())
+                        || (!self.phone_loaded && self.call_logs_error.is_none())) =>
+            {
+                self.with_device(
+                    "正在刷新首页消息、日程与手机状态…",
+                    |adb, d| {
+                        let (summary_res, caps, sms, call_logs, contacts) =
+                            std::thread::scope(|s| {
+                                let h_sum = s.spawn(|| d.summary(adb));
+                                let h_cap = s.spawn(|| bridge::capabilities(adb, &d).ok());
+                                let h_sms = s.spawn(|| read_result(d.messages(adb)));
+                                let h_log = s.spawn(|| read_result(d.call_logs(adb)));
+                                let h_con = s.spawn(|| read_result(d.contacts(adb)));
+                                (
+                                    h_sum.join().unwrap(),
+                                    h_cap.join().unwrap(),
+                                    h_sms.join().unwrap(),
+                                    h_log.join().unwrap(),
+                                    h_con.join().unwrap(),
+                                )
+                            });
+                        Ok(Outcome::HomeRefreshed(
+                            summary_res?,
+                            caps,
+                            sms,
+                            call_logs,
+                            contacts,
+                        ))
+                    },
+                );
+            }
             Page::Overview if !self.demo_mode => {
                 self.with_device("正在刷新设备状态…", |adb, d| {
                     Ok(Outcome::Summary(
@@ -143,7 +184,9 @@ impl Companion {
             Page::Amoo if !self.demo_mode => {
                 self.refresh_amoo_background();
             }
-            Page::Files if self.files.is_empty() => self.browse(self.directory.clone()),
+            Page::Files if !self.recent_files_view && self.files.is_empty() => {
+                self.browse(self.directory.clone())
+            }
             Page::Gallery
                 if !self.demo_mode
                     && !self.back_screen.gallery_checked
@@ -162,6 +205,30 @@ impl Companion {
                     Ok(Outcome::Sms(read_result(d.messages(adb)), caps))
                 });
             }
+            Page::Notifications if !self.demo_mode => {
+                if !self.push.loaded && !self.push.syncing && self.push.error.is_none() {
+                    self.trigger_immediate_push_sync();
+                }
+                if !self.back_screen.stepos_suite.checked
+                    && !self.back_screen.stepos_suite_loading
+                    && self.selected.is_some()
+                {
+                    self.back_screen.stepos_suite_loading = true;
+                    self.with_device_bulk(
+                        "正在读取 StepOS 原生服务、日程与双端剪贴板…",
+                        |adb, d| {
+                            Ok(Outcome::StepOsSuite(
+                                stepx_companion::toolbox::inspect_stepos_ai_suite(adb, &d)?,
+                            ))
+                        },
+                    );
+                }
+                if (!self.sms_loaded && self.sms_error.is_none())
+                    || (!self.phone_loaded && self.call_logs_error.is_none())
+                {
+                    self.spawn_message_sync();
+                }
+            }
             Page::Phone if !self.demo_mode => {
                 self.with_device("正在读取通话记录与通讯录…", |adb, d| {
                     let logs = read_result(d.call_logs(adb));
@@ -175,6 +242,12 @@ impl Companion {
     }
 
     pub(super) fn clear_device_state(&mut self) {
+        self.doctor_report = None;
+        self.doctor_running = false;
+        self.auto_sync.on_device_disconnected();
+        self.home_ai = Default::default();
+        self.bg_receivers.clear();
+        self.context.device_cleared();
         self.clear_text_interaction();
         self.speech = Default::default();
         self.bulk_rx = None;
@@ -184,9 +257,11 @@ impl Companion {
         self.bulk_started_at = None;
         let mode = self.push.shell_mode;
         let pin = self.push.pin_window;
+        let prev_seen_toasts = std::mem::take(&mut self.push.seen_toast_keys);
         self.push = PushUiState::default();
         self.push.shell_mode = mode;
         self.push.pin_window = pin;
+        self.push.seen_toast_keys = prev_seen_toasts;
         for index in [F_IM_REPLY, F_PUSH_REPLY, F_TOAST_REPLY] {
             self.fields[index].clear();
         }
@@ -230,20 +305,26 @@ impl Companion {
         self.amoo_cron_jobs.clear();
         self.amoo_gateway_online = false;
         self.work.disconnect();
+        let prev_clip = self.back_screen.last_synced_phone_clip.clone();
+        let prev_dismissed = std::mem::take(&mut self.back_screen.dismissed_capsule_ids);
         self.back_screen = BackScreenUiState::default();
+        self.back_screen.last_synced_phone_clip = prev_clip;
+        self.back_screen.dismissed_capsule_ids = prev_dismissed;
         self.updates = UpdateState::default();
         if !self.demo_mode {
             self.amoo_sessions.clear();
             self.amoo_skills.clear();
-            self.amoo_memories.clear();
             self.amoo_cron_count = 0;
+            self.amoo_total_skills = 0;
             self.amoo_bm25_entries = 0;
+            self.express_parcels.clear();
         }
         self.pending_sms_plan = None;
         self.last_sms_status = None;
         self.selected_thread = None;
         self.content.clear();
         self.sms.clear();
+        self.local_sent_sms.clear();
         self.sms_loaded = false;
         self.phone_loaded = false;
         self.pending_call = None;
@@ -278,12 +359,29 @@ impl Companion {
         self.selected_file = None;
         self.file_modal = None;
         self.trash_confirm = false;
+        let prev_seen_updatable_apps = self.notification_center.seen_updatable_apps.clone();
+        let prev_app_update_read_ids: Vec<String> = self
+            .notification_center
+            .read_ids
+            .iter()
+            .filter(|id| id.starts_with("app-update:") || *id == "app-updates-summary")
+            .cloned()
+            .collect();
+        self.sync_notification_center();
+        self.notification_center.seen_updatable_apps = prev_seen_updatable_apps;
+        self.notification_center
+            .read_ids
+            .retain(|id| !id.starts_with("app-update:") && id != "app-updates-summary");
+        self.notification_center
+            .read_ids
+            .extend(prev_app_update_read_ids);
         if native_gui_unconfirmed {
             self.status = "已停止桌面等待，手机原生操作可能仍继续，请在手机上核对".into();
         }
     }
 
     pub(super) fn browse(&mut self, path: String) {
+        self.recent_files_view = false;
         if self.busy {
             return;
         }
@@ -297,8 +395,24 @@ impl Companion {
     }
 
     pub(super) fn stop_mirror(&mut self) {
+        self.mirror_interrupted_at = None;
         if let Some(child) = self.mirror.take() {
             child.stop_in_background();
+        }
+    }
+
+    pub(super) fn start_mirror(&mut self) {
+        self.demote_busy_if_background();
+        if !self.busy && self.mirror.is_none() {
+            let options = self.mirror_options;
+            self.with_device("正在开启投屏…", move |adb, d| {
+                let active_transport = d
+                    .resolve_active_transport(adb)
+                    .unwrap_or_else(|_| d.transport.clone());
+                let session =
+                    stepx_companion::mirror::start_with_options(adb, &active_transport, options)?;
+                Ok(Outcome::Mirror(d.serial, active_transport, session))
+            });
         }
     }
 
@@ -314,8 +428,11 @@ impl Companion {
                     let active_transport = d
                         .resolve_active_transport(adb)
                         .unwrap_or_else(|_| d.transport.clone());
-                    let session =
-                        stepx_companion::mirror::start_with_options(adb, &active_transport, options)?;
+                    let session = stepx_companion::mirror::start_with_options(
+                        adb,
+                        &active_transport,
+                        options,
+                    )?;
                     Ok(Outcome::Mirror(d.serial, active_transport, session))
                 },
             );
@@ -392,17 +509,16 @@ impl Companion {
                     .or_insert(name_lower);
             }
         }
+        let selected_norm = self
+            .selected_thread
+            .as_deref()
+            .filter(|s| !s.is_empty() && *s != "__new__")
+            .map(stepx_companion::sms::normalize_address)
+            .unwrap_or_default();
         let mut threads: Vec<SmsThread> = Vec::new();
+        let mut thread_flags: Vec<(bool, bool)> = Vec::new();
         let mut thread_indices: HashMap<String, usize> = HashMap::new();
         for m in &self.sms {
-            let matches_filter = match self.sms_filter {
-                SmsFilter::All => true,
-                SmsFilter::Incoming => m.kind == 1,
-                SmsFilter::Outgoing => m.kind == 2,
-            };
-            if !matches_filter {
-                continue;
-            }
             let addr = m.address.trim();
             let norm_addr = stepx_companion::sms::normalize_address(addr);
             if !query.is_empty()
@@ -414,27 +530,46 @@ impl Companion {
             {
                 continue;
             }
+            let is_in = m.kind == 1 && !m.outgoing;
+            let is_out = m.kind == 2 || m.outgoing;
             if let Some(&idx) = thread_indices.get(&norm_addr) {
                 let t = &mut threads[idx];
                 t.count += 1;
-                t.unread |= m.kind == 1 && !m.read;
+                t.unread |= is_in && !m.read;
+                thread_flags[idx].0 |= is_in;
+                thread_flags[idx].1 |= is_out;
                 if m.date_ms >= t.last_ms {
                     t.last_ms = m.date_ms;
                     t.last_body = m.body.clone();
                 }
             } else {
                 thread_indices.insert(norm_addr, threads.len());
+                thread_flags.push((is_in, is_out));
                 threads.push(SmsThread {
                     address: addr.to_string(),
                     count: 1,
                     last_ms: m.date_ms,
                     last_body: m.body.clone(),
-                    unread: m.kind == 1 && !m.read,
+                    unread: is_in && !m.read,
                 });
             }
         }
-        threads.sort_by(|a, b| b.last_ms.cmp(&a.last_ms));
-        threads
+        let mut filtered: Vec<SmsThread> = threads
+            .into_iter()
+            .zip(thread_flags)
+            .filter_map(|(t, (has_in, has_out))| {
+                let norm = stepx_companion::sms::normalize_address(&t.address);
+                let is_selected = !selected_norm.is_empty() && norm == selected_norm;
+                let matches_filter = match self.sms_filter {
+                    SmsFilter::All => true,
+                    SmsFilter::Incoming => has_in || is_selected,
+                    SmsFilter::Outgoing => has_out || is_selected,
+                };
+                matches_filter.then_some(t)
+            })
+            .collect();
+        filtered.sort_by(|a, b| b.last_ms.cmp(&a.last_ms));
+        filtered
     }
 
     pub(super) fn is_stepos_or_system_app(app: &AppInfo) -> bool {
@@ -482,25 +617,18 @@ impl Companion {
         };
         let src = src.clone();
         let name = format!("StepX-{}.png", chrono::Local::now().format("%Y%m%d-%H%M%S"));
-        match native_dialog::FileDialog::new()
-            .set_title("保存截图")
-            .set_filename(&name)
-            .set_location(&stepx_companion::settings::downloads())
-            .show_save_single_file()
-        {
-            Ok(Some(dest)) => match std::fs::copy(&src, &dest) {
-                Ok(_) => self.status = format!("截图已保存到 {}", dest.display()),
-                Err(e) => {
-                    self.status = format!("保存失败：{e}");
-                    self.error = true;
-                }
+        self.choose_path(
+            stepx_companion::file_dialog::FileDialog::new()
+                .set_title("保存截图")
+                .set_filename(&name)
+                .set_location(&stepx_companion::settings::downloads()),
+            DialogKind::SaveFile,
+            move |app, dest, _| {
+                std::fs::copy(&src, &dest)?;
+                app.status = format!("截图已保存到 {}", dest.display());
+                Ok(())
             },
-            Ok(None) => {}
-            Err(e) => {
-                self.status = format!("无法打开保存窗口：{e}");
-                self.error = true;
-            }
-        }
+        );
     }
 
     pub(super) fn activate_file(&mut self, i: usize) -> Option<Action> {
@@ -517,6 +645,17 @@ impl Companion {
     }
 
     pub(super) fn handle_device_action(&mut self, action: &Action) {
+        let origin = interaction::OperationFailure::for_action(
+            action,
+            self.page,
+            self.selected.as_ref().map(|d| d.serial.clone()),
+        );
+        let previous = self.interaction.active_operation.replace(origin);
+        self.handle_device_action_inner(action);
+        self.interaction.active_operation = previous;
+    }
+
+    fn handle_device_action_inner(&mut self, action: &Action) {
         let is_bulk_action = matches!(
             action,
             Action::ScanStorage
@@ -530,6 +669,8 @@ impl Companion {
                 | Action::ExportApp(_)
                 | Action::Mirror
                 | Action::OpenAppInMirror(_)
+                | Action::RunDoctorHarness { .. }
+                | Action::ExecuteDoctorQuickAction(_)
         );
         if !is_bulk_action && self.busy && self.page == Page::Tools {
             return;
@@ -597,27 +738,16 @@ impl Companion {
             Action::Refresh => self.refresh(),
             Action::Select(id) => self.select(id.clone()),
             Action::Forget => {
+                // Disconnect pauses this client, it does not revoke trust or erase pairing.
                 self.allow_first_connect = false;
-                self.preferences.first_connect_done = true;
-                self.pairing_hosts.clear();
-                let serial = self
-                    .selected
-                    .take()
-                    .map(|d| d.serial)
-                    .or_else(|| self.preferences.selected_serial.clone());
+                self.connection_watch.user_paused = true;
+                self.qr = None;
                 self.connection_watch.detached_serial = None;
-                if let Some(serial) = serial {
-                    self.preferences.devices.retain(|p| p.serial != serial);
-                    self.preferences.wireless.remove(&serial);
-                    self.preferences.selected_serial = None;
-                    if let Err(e) = self.preferences.save() {
-                        self.status = e.to_string();
-                        self.error = true;
-                        return;
-                    }
+                if let Some(device) = self.selected.take() {
+                    self.last_connected_serial = Some(device.serial);
                 }
                 self.clear_device_state();
-                self.status = "已断开。拔下数据线或在手机上撤销调试授权可彻底停止连接".into();
+                self.status = "已断开并暂停自动连接；已信任手机保留，点击连接可恢复".into();
             }
             Action::PairCode => {
                 let endpoint = self.fields[F_PAIR_ADDR].text.trim().to_string();
@@ -627,6 +757,7 @@ impl Companion {
                     self.error = true;
                     return;
                 }
+                self.connection_watch.user_paused = false;
                 self.submit("正在配对…", move |adb| {
                     let endpoint = if endpoint.is_empty() {
                         pairing::unique_code_endpoint(
@@ -644,6 +775,12 @@ impl Companion {
                     Action::ConnectEndpoint(e) => e.trim().to_string(),
                     _ => self.fields[F_CONNECT].text.trim().to_string(),
                 };
+                if let Err(error) = pairing::validate_endpoint(&endpoint) {
+                    self.status = error.to_string();
+                    self.error = true;
+                    return;
+                }
+                self.connection_watch.user_paused = false;
                 self.submit("正在连接…", move |adb| {
                     pairing::validate_endpoint(&endpoint)?;
                     adb.run(&["connect", &endpoint])?;
@@ -652,6 +789,7 @@ impl Companion {
             }
             Action::Qr => match QrSession::new() {
                 Ok(qr) => {
+                    self.connection_watch.user_paused = false;
                     self.qr = Some(Arc::new(qr));
                     self.pair_tab = PairTab::Qr;
                     self.status = "已生成新的二维码".into();
@@ -872,14 +1010,12 @@ impl Companion {
                     self.send_amoo_draft();
                 }
             }
-            Action::ReadVisible => self.with_device(
-                "正在唤醒圈选感知并读取屏幕文字…",
-                |adb, d| {
+            Action::ReadVisible => {
+                self.with_device("正在读取当前手机画面文字…", |adb, d| {
                     let _ = adb.shell(&d.transport, &["input", "keyevent", "224"]);
-                    let _ = d.open_amoo_screen_perception(adb);
                     Ok(Outcome::Text(d.visible_text(adb)?))
-                },
-            ),
+                })
+            }
             Action::ReadSms => self.with_device("正在读取短信…", |adb, d| {
                 let msgs = read_result(d.messages(adb));
                 let caps = bridge::capabilities(adb, &d).ok();
@@ -897,28 +1033,79 @@ impl Companion {
                 });
             }
             Action::PrepareDirectSms => {
-                let number = if self.fields[F_SMS_TO].text.trim().is_empty() {
+                let to = if self.fields[F_SMS_TO].text.trim().is_empty() {
                     self.selected_thread
                         .as_deref()
-                        .filter(|s| *s != "__new__")
-                        .unwrap_or("")
-                        .to_string()
+                        .filter(|s| *s != "__new__" && !s.trim().is_empty())
+                        .map(str::to_string)
+                        .or_else(|| self.sms_threads().first().map(|t| t.address.clone()))
+                        .or_else(|| self.demo_mode.then(|| "10086".to_string()))
+                        .unwrap_or_default()
                 } else {
                     self.fields[F_SMS_TO].text.trim().to_string()
                 };
-                let body = self.fields[F_SMS_BODY].text.clone();
-                if number.is_empty() || body.trim().is_empty() {
+                let raw_body = self.fields[F_SMS_BODY].text.trim().to_string();
+                if to.is_empty() || raw_body.is_empty() {
                     self.status = "请填写收件人号码和短信内容".into();
                     self.error = true;
                     return;
                 }
-                self.fields[F_SMS_TO].set(&number);
+                if !self.demo_mode && self.selected.is_none() {
+                    self.status = "手机已断开，短信未发送；收件人和正文已保留".into();
+                    self.error = true;
+                    return;
+                }
+                let body = if let Some((q_sender, q_text, true)) = self.push.reply_quote.take() {
+                    if q_sender.trim().is_empty() {
+                        format!("「{q_text}」\n{raw_body}")
+                    } else {
+                        format!("「{}: {q_text}」\n{raw_body}", q_sender.trim())
+                    }
+                } else {
+                    raw_body
+                };
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let optimistic_msg = stepx_companion::sms::Message {
+                    provider_id: Some(now_ms),
+                    address: to.clone(),
+                    body: body.clone(),
+                    date_ms: now_ms,
+                    outgoing: true,
+                    kind: 2,
+                    read: true,
+                    subscription: self.selected_sim,
+                };
+                self.fields[F_SMS_TO].set(&to);
+
+                self.pending_sms_plan = None;
+                self.selected_thread = Some(to.clone());
+                self.sms.insert(0, optimistic_msg.clone());
+                self.local_sent_sms.insert(0, optimistic_msg.clone());
+                self.fields[F_SMS_BODY].clear();
+                Self::scroll_to_end(&self.sms_messages_scroll);
+                if self.demo_mode {
+                    self.status = format!("已发送短信至 {to}（演示模式）");
+                    self.error = false;
+                    return;
+                }
+                self.status = format!("正在向 {to} 发送短信，等待手机确认…");
+                self.error = false;
                 let sim = self.selected_sim;
-                self.with_device("正在准备短信发送计划…", move |adb, d| {
-                    Ok(Outcome::SmsPrepared(bridge::sms_prepare(
-                        adb, &d, &number, &body, sim,
-                    )?))
-                });
+                if let Some(mut device) = self.selected.clone() {
+                    let (tx, rx) = mpsc::channel();
+                    self.bg_receivers.push((Page::Sms, None, rx));
+                    std::thread::spawn(move || {
+                        let outcome = Adb::discover().and_then(|adb| {
+                            device.transport = device.resolve_active_transport(&adb)?;
+                            let plan = bridge::sms_prepare(&adb, &device, &to, &body, sim)?;
+                            let status = bridge::sms_send(&adb, &device, &plan)?;
+                            let mut messages = read_result(device.messages(&adb));
+                            merge_confirmed_sms(&mut messages, &status, optimistic_msg);
+                            Ok(Outcome::SmsSent(status, messages))
+                        });
+                        let _ = tx.send(outcome);
+                    });
+                }
             }
             Action::ConfirmDirectSms => {
                 let Some(plan) = self.pending_sms_plan.take() else {
@@ -926,11 +1113,27 @@ impl Companion {
                     self.error = true;
                     return;
                 };
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let optimistic_msg = stepx_companion::sms::Message {
+                    provider_id: Some(now_ms),
+                    address: plan.number.clone(),
+                    body: plan.body.clone(),
+                    date_ms: now_ms,
+                    outgoing: true,
+                    kind: 2,
+                    read: true,
+                    subscription: self.selected_sim,
+                };
                 self.selected_thread = Some(plan.number.clone());
+                self.sms.insert(0, optimistic_msg.clone());
+                self.local_sent_sms.insert(0, optimistic_msg.clone());
+                self.fields[F_SMS_BODY].clear();
+                Self::scroll_to_end(&self.sms_messages_scroll);
                 // Consume the confirmation once; never fabricate a send plan or retry a timed-out send.
                 self.with_device("正在通过手机发送短信…", move |adb, d| {
                     let status = bridge::sms_send(adb, &d, &plan)?;
-                    let messages = read_result(d.messages(adb));
+                    let mut messages = read_result(d.messages(adb));
+                    merge_confirmed_sms(&mut messages, &status, optimistic_msg);
                     Ok(Outcome::SmsSent(status, messages))
                 });
             }
@@ -950,19 +1153,18 @@ impl Companion {
                 if self.busy {
                     return;
                 }
-                match native_dialog::FileDialog::new()
-                    .set_title("选择要上传到手机的文件")
-                    .show_open_single_file()
-                {
-                    Ok(Some(path)) => {
-                        self.prepare_file_transfer(vec![path], Some(self.directory.clone()))
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        self.status = format!("未选择文件：{e}");
-                        self.error = true;
-                    }
-                }
+                let directory = self.directory.clone();
+                let device = self.selected.as_ref().map(|d| d.serial.clone());
+                self.choose_path(
+                    stepx_companion::file_dialog::FileDialog::new().set_title("选择要上传到手机的文件"),
+                    DialogKind::OpenFile,
+                    move |app, path, _| {
+                        app.ensure_file_dialog_device(&device)?;
+                        anyhow::ensure!(!app.busy, "当前操作尚未完成，请重新选择要上传的文件");
+                        app.prepare_file_transfer(vec![path], Some(directory));
+                        Ok(())
+                    },
+                );
             }
             Action::TransferFiles(paths, directory) => {
                 let paths = paths.clone();
@@ -1042,7 +1244,7 @@ impl Companion {
                     return;
                 }
                 self.with_device("选择保存位置…", move |adb, d| {
-                    match native_dialog::FileDialog::new()
+                    match stepx_companion::file_dialog::FileDialog::new()
                         .set_title("下载到电脑")
                         .set_filename(&entry.name)
                         .set_location(&stepx_companion::settings::downloads())
@@ -1101,7 +1303,7 @@ impl Companion {
                 }
                 let pkg = pkg.clone();
                 self.with_device_bulk("选择 APK 导出目录…", move |adb, d| {
-                    match native_dialog::FileDialog::new()
+                    match stepx_companion::file_dialog::FileDialog::new()
                         .set_title("选择 APK 导出目录")
                         .show_open_single_dir()?
                     {
@@ -1117,7 +1319,222 @@ impl Companion {
                 let pkg = pkg.clone();
                 self.with_device("正在打开手机应用详情…", move |adb, d| {
                     apps::open_settings(adb, &d, &pkg)?;
-                    Ok(Outcome::Notice("已在手机打开应用详情".into()))
+                    Ok(Outcome::Notice("已在手机系统设置中打开应用详情".into()))
+                });
+            }
+            Action::InspectApp(pkg_opt) => {
+                if self.selected_app == *pkg_opt && self.selected_app_details.is_some() {
+                    return;
+                }
+                self.selected_app = pkg_opt.clone();
+                self.selected_app_details = None;
+                let Some(pkg) = pkg_opt.clone() else {
+                    self.selected_app_loading = false;
+                    return;
+                };
+                if self.demo_mode || self.selected.is_none() {
+                    self.selected_app_loading = false;
+                    self.selected_app_details = Some(apps::demo_details(&pkg));
+                    self.status = format!("已在桌面端展开应用详情与权限管理：{pkg}");
+                    return;
+                }
+                self.selected_app_loading = true;
+                self.demote_busy_if_background();
+                self.with_device(
+                    "正在读取应用详情与权限状态…",
+                    move |adb, d| {
+                        let details = apps::inspect_details(adb, &d, &pkg)
+                            .unwrap_or_else(|_| apps::demo_details(&pkg));
+                        Ok(Outcome::AppInspected(
+                            pkg.clone(),
+                            details,
+                            Some(format!("已加载 {pkg} 应用详情与权限")),
+                        ))
+                    },
+                );
+            }
+            Action::ToggleAppPermission {
+                package,
+                permission,
+                grant,
+            } => {
+                let pkg = package.clone();
+                let perm = permission.clone();
+                let grant = *grant;
+                if let Some(details) = self.selected_app_details.as_mut() {
+                    if details.package == pkg {
+                        for p in &mut details.permissions {
+                            if p.name == perm {
+                                p.granted = grant;
+                            }
+                        }
+                    }
+                }
+                if self.demo_mode || self.selected.is_none() {
+                    self.status = format!(
+                        "已在桌面端{}权限：{}",
+                        if grant { "授予" } else { "撤销" },
+                        perm
+                    );
+                    return;
+                }
+                self.with_device(
+                    if grant {
+                        "正在授予应用权限…"
+                    } else {
+                        "正在撤销应用权限…"
+                    },
+                    move |adb, d| {
+                        apps::set_permission(adb, &d, &pkg, &perm, grant)?;
+                        let details = apps::inspect_details(adb, &d, &pkg)
+                            .unwrap_or_else(|_| apps::demo_details(&pkg));
+                        Ok(Outcome::AppInspected(
+                            pkg,
+                            details,
+                            Some(format!(
+                                "已{}权限：{}",
+                                if grant { "授予" } else { "撤销" },
+                                perm
+                            )),
+                        ))
+                    },
+                );
+            }
+            Action::ToggleAppEnabled { package, enable } => {
+                let pkg = package.clone();
+                let enable = *enable;
+                for app in &mut self.apps {
+                    if app.package == pkg {
+                        app.enabled = enable;
+                    }
+                }
+                if self.demo_mode || self.selected.is_none() {
+                    self.status = format!("已{}应用：{pkg}", if enable { "启用" } else { "停用" });
+                    return;
+                }
+                self.with_device(
+                    if enable {
+                        "正在启用应用…"
+                    } else {
+                        "正在停用应用…"
+                    },
+                    move |adb, d| {
+                        apps::set_enabled(adb, &d, &pkg, enable)?;
+                        Ok(Outcome::ApkInstalled(
+                            format!("已{}应用：{pkg}", if enable { "启用" } else { "停用" }),
+                            apps::catalog(adb, &d)?,
+                        ))
+                    },
+                );
+            }
+            Action::ClearAppStorage {
+                package,
+                clear_data,
+            } => {
+                let pkg = package.clone();
+                let clear_data = *clear_data;
+                if self.demo_mode || self.selected.is_none() {
+                    self.status = format!(
+                        "已清理 {} 的{}",
+                        pkg,
+                        if clear_data {
+                            "应用数据与缓存"
+                        } else {
+                            "应用缓存"
+                        }
+                    );
+                    return;
+                }
+                self.with_device(
+                    if clear_data {
+                        "正在清除应用数据…"
+                    } else {
+                        "正在清理应用缓存…"
+                    },
+                    move |adb, d| {
+                        apps::clear_storage(adb, &d, &pkg, clear_data)?;
+                        let details = apps::inspect_details(adb, &d, &pkg)
+                            .unwrap_or_else(|_| apps::demo_details(&pkg));
+                        Ok(Outcome::AppInspected(
+                            pkg.clone(),
+                            details,
+                            Some(format!(
+                                "已清理 {} 的{}",
+                                pkg,
+                                if clear_data {
+                                    "应用数据与缓存"
+                                } else {
+                                    "应用缓存"
+                                }
+                            )),
+                        ))
+                    },
+                );
+            }
+            Action::PreviewSelectedFile(index) => {
+                let Some(entry) = self.files.get(*index).cloned() else {
+                    return;
+                };
+                if entry.directory {
+                    return;
+                }
+                if self.demo_mode || self.selected.is_none() {
+                    self.selected_file_preview_path = Some(entry.path.clone());
+                    self.selected_file_preview_text = Some(format!(
+                        "# {}\n路径: {}\n大小: {}\n\n[桌面端内联预览] 无需在手机端打开，可直接在电脑查看内容、复制文本或打开编辑。",
+                        entry.name,
+                        entry.path,
+                        storage::format_bytes(entry.bytes)
+                    ));
+                    self.selected_file_preview_image = None;
+                    return;
+                }
+                let lower = entry.name.to_ascii_lowercase();
+                let is_img = [".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"]
+                    .iter()
+                    .any(|ext| lower.ends_with(ext));
+                self.demote_busy_if_background();
+                self.with_device("正在加载文件桌面预览…", move |adb, d| {
+                    let folder = stepx_companion::resources::user_state().join("file-previews");
+                    std::fs::create_dir_all(&folder)?;
+                    let safe_name = std::path::Path::new(&entry.name)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("preview.bin");
+                    let dest = folder.join(format!("inline-{}", safe_name));
+                    storage::pull(adb, &d, &entry.path, &dest)?;
+                    if is_img {
+                        Ok(Outcome::FilePreviewLoaded {
+                            path: entry.path,
+                            text: None,
+                            image_path: Some(dest),
+                        })
+                    } else {
+                        let bytes = std::fs::read(&dest).unwrap_or_default();
+                        let slice = &bytes[..bytes.len().min(6144)];
+                        let text = String::from_utf8_lossy(slice).into_owned();
+                        Ok(Outcome::FilePreviewLoaded {
+                            path: entry.path,
+                            text: Some(text),
+                            image_path: None,
+                        })
+                    }
+                });
+            }
+            Action::InstallRemoteApk(remote_path) => {
+                let remote_path = remote_path.clone();
+                if self.demo_mode || self.selected.is_none() {
+                    self.status = format!("已在桌面端发起 APK 安装：{remote_path}");
+                    return;
+                }
+                self.with_device("正在从手机文件直接安装 APK…", move |adb, d| {
+                    let folder = stepx_companion::resources::user_state().join("apk-staging");
+                    std::fs::create_dir_all(&folder)?;
+                    let local_apk = folder.join("staged_remote.apk");
+                    storage::pull(adb, &d, &remote_path, &local_apk)?;
+                    let msg = d.install_apk(adb, &local_apk)?;
+                    let apps = apps::catalog(adb, &d)?;
+                    Ok(Outcome::ApkInstalled(msg, apps))
                 });
             }
             Action::ConfirmUninstallApp(pkg) => {
@@ -1143,7 +1560,7 @@ impl Companion {
             }
             Action::InstallApk => {
                 self.with_device("选择 APK…", move |adb, d| {
-                    match native_dialog::FileDialog::new()
+                    match stepx_companion::file_dialog::FileDialog::new()
                         .set_title("安装 APK")
                         .add_filter("Android APK", &["apk"])
                         .show_open_single_file()?
@@ -1190,38 +1607,102 @@ impl Companion {
                 );
             }
             Action::EnableUsbWirelessBridge => {
-                let usb_target = self
+                let selected = self.selected.clone();
+                let usb_targets: Vec<_> = self
                     .devices
                     .iter()
-                    .find(|d| {
-                        d.state == "device" && !d.id.contains(':') && !d.id.starts_with("adb-")
-                    })
+                    .filter(|d| d.state == "device" && !is_wireless(&d.id))
                     .map(|d| d.id.clone())
-                    .or_else(|| self.selected.as_ref().map(|d| d.transport.clone()));
-                let Some(transport_id) = usb_target else {
-                    self.status = "请先通过 USB 数据线连接手机并开启 USB 调试".into();
+                    .collect();
+                if selected.is_none() && usb_targets.len() != 1 {
+                    self.status = "请先选择要连接的手机；USB 设置需要已授权的数据线连接".into();
                     self.error = true;
                     return;
-                };
+                }
+                self.demote_busy_if_background();
                 self.submit(
-                    "正在通过 USB 激活同局域网无线连接…",
+                    "正在核验并连接手机当前无线通道…",
                     move |adb| {
-                        let _ = adb.run(&["-s", &transport_id, "tcpip", "5555"]);
-                        std::thread::sleep(Duration::from_millis(700));
-                        let raw = adb
-                            .run(&["-s", &transport_id, "shell", "ip -o -4 addr show dev wlan0"])
-                            .unwrap_or_default();
-                        let Some(ip) = raw.split_whitespace().find_map(|s| {
-                            s.split_once('/')
-                                .and_then(|(ip, _)| ip.parse::<std::net::IpAddr>().ok())
-                        }) else {
-                            anyhow::bail!(
-                                "未能读取手机局域网 Wi-Fi 地址，请确认手机与电脑连接在同一 Wi-Fi"
-                            );
+                        let device = match selected {
+                            Some(device) => device,
+                            None => Device::inspect(adb, &usb_targets[0])?,
                         };
-                        let endpoint = format!("{ip}:5555");
-                        adb.run(&["connect", &endpoint])?;
-                        Ok(Outcome::Paired(endpoint))
+                        let id =
+                            stepx_companion::reconnect::enable_usb_wireless_bridge(adb, &device)?;
+                        Ok(Outcome::Paired(id.endpoint))
+                    },
+                );
+            }
+            Action::SwitchPreferredTransport(target) => {
+                let target = target.trim().to_string();
+                if target.is_empty() {
+                    return;
+                }
+                if !self
+                    .selected
+                    .as_ref()
+                    .is_some_and(|device| self.online_device_transports(device).contains(&target))
+                {
+                    self.status = "备用通道已离线或尚未核验，请先检查连接".into();
+                    self.error = true;
+                    return;
+                }
+                let mut switched = false;
+                if let Some(selected) = self.selected.as_mut() {
+                    if selected.transport != target {
+                        let old_t = selected.transport.clone();
+                        let mut backups = selected.backup_transports();
+                        backups.retain(|b| b != &target);
+                        if !old_t.is_empty() && !backups.contains(&old_t) {
+                            backups.push(old_t);
+                        }
+                        selected.transport = target.clone();
+                        selected.set_backup_transports(backups);
+                        stepx_companion::device::promote_active_transport(
+                            &selected.serial,
+                            &target,
+                        );
+                        switched = true;
+                    }
+                }
+                if switched {
+                    if let Some(srv) = &self.lan_cast.server {
+                        srv.set_serial(target.clone());
+                    }
+                    self.amoo_poll_remaining = self.amoo_poll_remaining.max(15);
+                    self.trigger_immediate_push_sync();
+                    let msg = if is_wireless(&target) {
+                        format!("已切换至无线通道 {target} · USB 通道转为热备待命")
+                    } else {
+                        format!("已切换至 USB 通道 {target} · 无线通道转为热备待命")
+                    };
+                    self.record_notice("通道切换", msg.clone());
+                    self.error = false;
+                    if self.mirror.is_some() {
+                        self.restart_active_mirror(msg);
+                    } else {
+                        self.status = msg;
+                    }
+                }
+            }
+            Action::HealConnection => {
+                self.demote_busy_if_background();
+                let prefs = self.preferences.clone();
+                let pairing_hosts = self.pairing_hosts.clone();
+                let selected = self.selected.clone();
+                self.submit(
+                    "正在检查连接，必要时恢复已验证通道…",
+                    move |adb| {
+                        let (devices, services) = stepx_companion::reconnect::check_and_recover(
+                            adb,
+                            selected.as_ref(),
+                            &prefs,
+                            &pairing_hosts,
+                        )?;
+                        Ok(Outcome::Transports(
+                            stepx_companion::device::deduplicate_transports(devices),
+                            services,
+                        ))
                     },
                 );
             }
@@ -1326,57 +1807,48 @@ impl Companion {
                 }
             }
             Action::AmooOpenMemory => {
-                if self.selected.is_some() {
-                    self.with_device("正在打开 Amoo 记忆库…", |adb, d| {
-                        Ok(Outcome::Notice(d.open_amoo_memory(adb)?))
-                    });
-                } else {
-                    self.page = Page::Amoo;
-                    self.workspace.sub_view = 1;
-                    self.error = false;
-                    self.status = "已打开桌面端「记忆与自我」偏好工作台".into();
-                }
+                self.page = Page::Amoo;
+                self.workspace.panel = 7;
+                self.workspace.sub_view = 1;
+                self.amoo_show_details = true;
+                self.error = false;
+                self.status = "已在桌面端打开「记忆与自我」偏好工作台".into();
             }
             Action::AmooOpenPersona => {
-                if self.selected.is_some() {
-                    self.with_device("正在打开个人偏好设置…", |adb, d| {
-                        Ok(Outcome::Notice(d.open_amoo_persona(adb)?))
-                    });
-                } else {
-                    self.page = Page::Amoo;
-                    self.workspace.sub_view = 1;
-                    self.error = false;
-                    self.status = "已打开桌面端个人画像与偏好设置".into();
-                }
+                self.page = Page::Amoo;
+                self.workspace.panel = 7;
+                self.workspace.sub_view = 1;
+                self.amoo_show_details = true;
+                self.error = false;
+                self.status = "已在桌面端打开个人画像与偏好设置".into();
             }
             Action::AmooOpenSafety => {
-                if self.selected.is_some() {
-                    self.with_device("正在打开敏感操作安全守护中心…", |adb, d| {
-                        Ok(Outcome::Notice(d.open_amoo_safety_center(adb)?))
-                    });
-                } else {
-                    self.page = Page::Amoo;
-                    self.amoo_show_details = true;
-                    self.error = false;
-                    self.status = "已展开桌面端敏感操作安全守护面板".into();
-                }
+                self.page = Page::Amoo;
+                self.workspace.panel = 7;
+                self.amoo_show_details = true;
+                self.error = false;
+                self.status = "已在桌面端展开敏感操作安全守护面板".into();
             }
             Action::AmooOpenModels => {
-                if self.selected.is_some() {
-                    self.with_device("正在打开端侧大模型管理…", |adb, d| {
-                        Ok(Outcome::Notice(d.open_amoo_model_manager(adb)?))
-                    });
-                } else {
-                    self.page = Page::Amoo;
-                    self.workspace.panel = 3;
-                    self.error = false;
-                    self.status = "已打开桌面端模型与路由配置面板".into();
-                }
+                self.page = Page::Amoo;
+                self.workspace.panel = 3;
+                self.error = false;
+                self.status = "已在桌面端打开模型与路由配置面板".into();
             }
             Action::AmooOpenVoiceSettings => {
-                self.with_device("正在打开语音唤醒设置…", |adb, d| {
-                    Ok(Outcome::Notice(d.open_amoo_voice_settings(adb)?))
-                });
+                self.page = Page::Amoo;
+                self.workspace.panel = 7;
+                self.amoo_show_details = true;
+                self.amoo_tts_on = !self.amoo_tts_on;
+                self.error = false;
+                self.status = format!(
+                    "已在桌面端切换语音播报与唤醒偏好（当前：{}）",
+                    if self.amoo_tts_on {
+                        "已开启"
+                    } else {
+                        "已关闭"
+                    }
+                );
             }
             Action::ReadPhone => {
                 self.with_device("正在读取通话记录与通讯录…", |adb, d| {
@@ -1440,10 +1912,38 @@ impl Companion {
                     return;
                 }
                 self.fields[F_PHONE_CONTACT_NAME].clear();
-                self.with_device(
-                    "正在向手机通讯录写入新联系人…",
-                    move |adb, d| Ok(Outcome::Notice(d.create_contact(adb, &name, &number)?)),
-                );
+                let norm = stepx_companion::sms::normalize_address(&number);
+                if let Some(pos) = self.contacts.iter().position(|c| {
+                    stepx_companion::sms::normalize_address(&c.number) == norm && !norm.is_empty()
+                }) {
+                    self.contacts[pos].name = name.clone();
+                    self.contacts[pos].number = number.clone();
+                    self.selected_contact = pos;
+                } else {
+                    self.contacts.insert(
+                        0,
+                        ContactEntry {
+                            name: name.clone(),
+                            number: number.clone(),
+                        },
+                    );
+                    self.selected_contact = 0;
+                }
+                self.contacts_error = None;
+                self.error = false;
+                self.status = format!("已保存联系人并正在同步至手机：{name} ({number})");
+                if self.selected.is_some() && !self.demo_mode {
+                    self.demote_busy_if_background();
+                    self.with_device(
+                        "正在自动同步新联系人到手机通讯录…",
+                        move |adb, d| {
+                            let _ = d.create_contact(adb, &name, &number)?;
+                            let logs = read_result(d.call_logs(adb));
+                            let contacts = read_result(d.contacts(adb));
+                            Ok(Outcome::PhoneData(logs, contacts))
+                        },
+                    );
+                }
             }
             Action::ForceStopApp(pkg) => {
                 let pkg = pkg.clone();
@@ -1534,12 +2034,9 @@ impl Companion {
             }
             Action::InspectInputMethod | Action::SwitchInputMethodFcitx5(_) => {}
             Action::GoogleSuiteInspect => {
-                if self.bulk_busy {
-                    return;
-                }
                 self.google_suite = GoogleSuiteStatus::default();
                 *self.google_progress.lock().unwrap() = String::new();
-                self.with_device_bulk("正在检测 Google 服务…", |adb, d| {
+                self.with_device("正在检测 Google 服务…", |adb, d| {
                     let suite = d.inspect_google_suite(adb)?;
                     let companion = companion_app::inspect(adb, &d)?;
                     let msg = suite.verification_note.clone();
@@ -1598,6 +2095,24 @@ impl Companion {
                     },
                 );
             }
+            Action::NeoExecutionMode(background) => {
+                let background = *background;
+                self.with_device("正在切换 GUI Agent 执行位置…", move |adb, d| {
+                    stepx_companion::companion_gui::call(adb, &d, serde_json::json!({"op":"agent","agentOp":"neo_execution_mode","executionMode":if background {"background"} else {"foreground"}}))?;
+                    Ok(Outcome::NeoStatus(stepx_companion::neo_agent::inspect(adb, &d)?))
+                });
+            }
+            Action::NeoConnectAmoo => {
+                self.with_device("正在向 Amoo 提交技能安装请求…", |adb, d| {
+                    let mut bus = amoo::AgentBus::connect(adb, &d)?;
+                    let key = bus.create_session()?;
+                    let receipt = bus.send(
+                        &key,
+                        &stepx_companion::neo_agent::amoo_skill_install_prompt(),
+                    )?;
+                    Ok(Outcome::AmooSkillRequested(receipt))
+                });
+            }
             Action::NeoInspect => {
                 if self.bulk_busy {
                     return;
@@ -1613,25 +2128,26 @@ impl Companion {
             }
             Action::NeoInstall => {
                 let ime = self.neo_enable_ime;
-                match native_dialog::FileDialog::new()
-                    .set_title("选择内置 GUI Agent 的 StepX伴侣 APK")
-                    .add_filter("Android 应用", &["apk"])
-                    .show_open_single_file()
-                {
-                    Ok(Some(path)) => self.with_device(
-                        "正在更新 StepX伴侣内置 GUI Agent，请保持连接…",
-                        move |adb, d| {
-                            Ok(Outcome::NeoStatus(stepx_companion::neo_agent::install(
-                                adb, &d, &path, ime,
-                            )?))
-                        },
-                    ),
-                    Ok(None) => {}
-                    Err(error) => {
-                        self.status = format!("选择 APK 失败：{error}");
-                        self.error = true;
-                    }
-                }
+                let device = self.selected.as_ref().map(|d| d.serial.clone());
+                self.choose_path(
+                    stepx_companion::file_dialog::FileDialog::new()
+                        .set_title("选择内置 GUI Agent 的 StepX伴侣 APK")
+                        .add_filter("Android 应用", &["apk"]),
+                    DialogKind::OpenFile,
+                    move |app, path, _| {
+                        app.ensure_file_dialog_device(&device)?;
+                        anyhow::ensure!(!app.busy, "当前操作尚未完成，请重新选择 APK");
+                        app.with_device(
+                            "正在更新 StepX伴侣内置 GUI Agent，请保持连接…",
+                            move |adb, d| {
+                                Ok(Outcome::NeoStatus(stepx_companion::neo_agent::install(
+                                    adb, &d, &path, ime,
+                                )?))
+                            },
+                        );
+                        Ok(())
+                    },
+                );
             }
             Action::NeoActivate => {
                 self.with_device("正在启用手机 Neo 任务路由…", |adb, d| {
@@ -1690,17 +2206,17 @@ impl Companion {
                 if self.busy {
                     return;
                 }
-                match native_dialog::FileDialog::new()
-                    .set_title("发送文件到 StepX伴侣")
-                    .show_open_multiple_file()
-                {
-                    Ok(paths) if !paths.is_empty() => self.prepare_file_transfer(paths, None),
-                    Ok(_) => {}
-                    Err(error) => {
-                        self.status = format!("选择文件失败：{error}");
-                        self.error = true;
-                    }
-                }
+                let device = self.selected.as_ref().map(|d| d.serial.clone());
+                self.choose_paths(
+                    stepx_companion::file_dialog::FileDialog::new().set_title("发送文件到 StepX伴侣"),
+                    DialogKind::OpenFiles,
+                    move |app, paths, _| {
+                        app.ensure_file_dialog_device(&device)?;
+                        anyhow::ensure!(!app.busy, "当前操作尚未完成，请重新选择要发送的文件");
+                        app.prepare_file_transfer(paths, None);
+                        Ok(())
+                    },
+                );
             }
             Action::CompanionReceiveFolder => {
                 let opened = (|| -> anyhow::Result<std::path::PathBuf> {
@@ -1835,17 +2351,45 @@ impl Companion {
                 }
             }
             Action::AmooPushPickupCode(code) => {
-                let code = code.clone();
+                let code = code.trim().to_string();
+                if code.is_empty() {
+                    self.status = "暂无可推送至背屏的取件码或运单号".into();
+                    self.error = true;
+                    return;
+                }
                 self.fields[F_BACK_MARQUEE].set(&code);
                 self.matrix_marquee_on = true;
+                self.back_screen.active_phone_capsule = Some((
+                    "stepx_pickup".into(),
+                    format!("📦 {code}"),
+                    format!("取件码 {code}"),
+                    Instant::now(),
+                ));
                 let rev = self.back_screen.config.invert;
                 if self.selected.is_some() {
                     self.with_device(
-                        "正在将快递取件码推送至手机背屏跑马灯常显…",
+                        "正在将快递取件码推送至手机顶部实况胶囊与背屏跑马灯常显…",
                         move |adb, d| {
+                            let _ =
+                                stepx_companion::toolbox::push_clipboard_to_phone(adb, &d, &code);
+                            let capsule_req = stepx_companion::push::PhoneLiveCapsuleRequest {
+                                tag: "stepx_pickup".into(),
+                                pill_text: format!("📦 {code}"),
+                                title: format!("取件码 {code}"),
+                                subtitle: "已复制并同步至手机顶部实况胶囊与背屏".into(),
+                                badge_text: "取件助手".into(),
+                                live_type: 6,
+                                countdown_secs: None,
+                                ongoing: true,
+                            };
+                            let _ = stepx_companion::push::post_phone_live_capsule(
+                                adb,
+                                &d.serial,
+                                &capsule_req,
+                            );
                             d.set_backscreen_marquee(adb, &code, true, rev)?;
                             Ok(Outcome::Notice(format!(
-                                "手机已保存取件码「{code}」跑马灯，实际亮灯遵循手机背屏设置"
+                                "手机已同步取件码「{code}」顶部实况胶囊与背屏跑马灯，实际亮灯遵循手机背屏设置"
                             )))
                         },
                     );
@@ -1964,6 +2508,173 @@ impl Companion {
                     },
                 );
             }
+            Action::RunDoctorHarness { topic, query } => {
+                let topic = *topic;
+                let query = query.clone();
+                let initial_report = stepx_companion::doctor_harness::pending_report(topic, &query);
+                if self.doctor_report.is_none() || self.page == Page::Amoo {
+                    self.doctor_report = Some(initial_report.clone());
+                }
+                if self.page == Page::Amoo && !query.trim().is_empty() {
+                    self.workspace_ensure_task();
+                    if let Some(task) = self.workspace_task_mut() {
+                        let already_has_query = task
+                            .turns
+                            .iter()
+                            .any(|t| t.user && t.text.trim() == query.trim());
+                        if !already_has_query {
+                            if task.turns.is_empty() {
+                                task.title = query.trim().chars().take(28).collect();
+                            }
+                            let now_ms = chrono::Utc::now().timestamp_millis();
+                            task.turns.push(stepx_companion::amoo_workspace::Turn {
+                                at_ms: Some(now_ms),
+                                user: true,
+                                text: query.clone(),
+                            });
+                            task.turns.push(stepx_companion::amoo_workspace::Turn {
+                                at_ms: Some(now_ms),
+                                user: false,
+                                text: initial_report.ai_guidance_markdown.clone(),
+                            });
+                            task.steps = vec![stepx_companion::amoo_workspace::Step {
+                                executor: stepx_companion::amoo_workspace::Executor::Phone,
+                                phase: stepx_companion::amoo_workspace::Phase::Running,
+                                note: format!(
+                                    "{}：{}",
+                                    initial_report.model_label, initial_report.headline
+                                ),
+                            }];
+                            task.route_note = topic.label().to_string();
+                            task.updated = chrono::Utc::now().timestamp();
+                        }
+                    }
+                    self.reveal_latest_chat();
+                }
+                self.doctor_running = true;
+                if self.demo_mode {
+                    let report =
+                        stepx_companion::doctor_harness::default_demo_report(topic, &query);
+                    self.apply(Outcome::DoctorHarnessReport(report));
+                } else if self.selected.is_none() {
+                    let page = self.page;
+                    let tool = self.tool_page;
+                    self.spawn_bulk(
+                        "正在检查环境并请求手机账号 AI 诊断…",
+                        move || {
+                            let result = Adb::discover().and_then(|adb| {
+                                stepx_companion::doctor_harness::run_diagnosis(
+                                    &adb,
+                                    None,
+                                    topic,
+                                    &query,
+                                    |_| {},
+                                )
+                            });
+                            match result {
+                                Ok(report) => Outcome::DoctorHarnessReport(report),
+                                Err(err) => Outcome::BulkFailed(page, tool, format!("{err:#}")),
+                            }
+                        },
+                    );
+                } else {
+                    self.with_device_bulk(
+                        "正在检查环境并请求手机账号 AI 诊断…",
+                        move |adb, d| {
+                            let report = stepx_companion::doctor_harness::run_diagnosis(
+                                adb,
+                                Some(&d),
+                                topic,
+                                &query,
+                                |_| {},
+                            )?;
+                            Ok(Outcome::DoctorHarnessReport(report))
+                        },
+                    );
+                }
+            }
+            Action::ExecuteDoctorQuickAction(kind) => {
+                use stepx_companion::doctor_harness::DoctorActionKind;
+                match kind {
+                    DoctorActionKind::InstallGoogleSuite => {
+                        self.trigger_subtab_switch();
+                        self.page = Page::Tools;
+                        self.tool_page = Some(ToolPage::Google);
+                        self.tools_pending = None;
+                        self.tool_confirmation = None;
+                        self.focus = None;
+                        self.scroll = Default::default();
+                        self.auto_load_for_page();
+                        if !self.busy && self.selected.is_some() {
+                            self.tool_confirmation = Some(Box::new(Action::GoogleSuiteInstall));
+                            self.scroll.scroll_to(facloud_ui::units::Pixels::new(0.));
+                        } else if self.selected.is_none() {
+                            self.status =
+                                "已打开 Google Play 向导专页，连接手机后即可一键安装".into();
+                        }
+                    }
+                    DoctorActionKind::RepairGoogleCompatibility => {
+                        self.trigger_subtab_switch();
+                        self.page = Page::Tools;
+                        self.tool_page = Some(ToolPage::Google);
+                        self.tools_pending = None;
+                        self.tool_confirmation = None;
+                        self.focus = None;
+                        self.scroll = Default::default();
+                        self.auto_load_for_page();
+                        if !self.busy && self.selected.is_some() {
+                            self.tool_confirmation = Some(Box::new(Action::GoogleSuiteMaintain));
+                            self.scroll.scroll_to(facloud_ui::units::Pixels::new(0.));
+                        } else if self.selected.is_none() {
+                            self.status =
+                                "已打开 Google Play 向导专页，连接手机后即可一键修复权限与服务"
+                                    .into();
+                        }
+                    }
+                    DoctorActionKind::InspectGoogleSuite => {
+                        self.handle_device_action(&Action::GoogleSuiteInspect);
+                    }
+                    DoctorActionKind::OpenPlayStoreInMirror => {
+                        self.handle_device_action(&Action::OpenAppInMirror(
+                            "com.android.vending".into(),
+                        ));
+                    }
+                    DoctorActionKind::OpenPlayStoreOnPhone => {
+                        self.handle_device_action(&Action::OpenApp("com.android.vending".into()));
+                    }
+                    DoctorActionKind::OpenGoogleToolPage => {
+                        self.trigger_subtab_switch();
+                        self.page = Page::Tools;
+                        self.tool_page = Some(ToolPage::Google);
+                        self.tools_pending = None;
+                        self.tool_confirmation = None;
+                        self.focus = None;
+                        self.scroll = Default::default();
+                        self.auto_load_for_page();
+                        self.status = "已打开 Google Play 端到端安装与使用向导".into();
+                    }
+                    DoctorActionKind::RepairCompanionPermissions
+                    | DoctorActionKind::ReconnectWirelessAdb
+                    | DoctorActionKind::CleanPcTempCache => {
+                        let kind = *kind;
+                        let device = self.selected.clone();
+                        let page = self.page;
+                        let tool = self.tool_page;
+                        self.spawn_bulk("正在执行修复并核验结果…", move || {
+                            match Adb::discover().and_then(|adb| {
+                                stepx_companion::doctor_harness::execute_quick_repair(
+                                    &adb,
+                                    device.as_ref(),
+                                    kind,
+                                )
+                            }) {
+                                Ok(message) => Outcome::Notice(message),
+                                Err(error) => Outcome::BulkFailed(page, tool, format!("{error:#}")),
+                            }
+                        });
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -2024,13 +2735,11 @@ impl Companion {
         }
     }
 
-    pub(super) fn active_amoo_agent_name(&self) -> &'static str {
-        match self.amoo_agent_idx {
-            0 => "Amoo 助手",
-            1 => "桌面伙伴",
-            2 => "飞书 / 企微",
-            _ => "Claude 协同",
-        }
+    pub(super) fn active_amoo_agent_name(&self) -> &str {
+        self.amoo_agents
+            .get(self.amoo_agent_idx)
+            .map(String::as_str)
+            .unwrap_or("Amoo 全能助手")
     }
 
     pub(super) fn active_amoo_model_name(&self) -> &str {
@@ -2131,4 +2840,86 @@ pub(super) fn parent_dir(dir: &str) -> String {
         .filter(|p| p.starts_with("/sdcard"))
         .unwrap_or("/sdcard")
         .to_string()
+}
+
+/// Only a confirmed SENT receipt can fill a temporarily missing provider row.
+/// Pending/failed/unknown sends keep the draft and cannot create a success bubble.
+pub(super) fn merge_confirmed_sms(
+    messages: &mut std::result::Result<Vec<stepx_companion::sms::Message>, String>,
+    status: &stepx_companion::bridge::SmsSendStatus,
+    candidate: stepx_companion::sms::Message,
+) {
+    if status.state != "sent" {
+        return;
+    }
+    if let Ok(list) = messages {
+        let address = stepx_companion::sms::normalize_address(&candidate.address);
+        let present = list.iter().any(|message| {
+            message.outgoing
+                && stepx_companion::sms::normalize_address(&message.address) == address
+                && message.body.trim() == candidate.body.trim()
+                && message.date_ms.abs_diff(candidate.date_ms) < 60_000
+        });
+        if !present {
+            list.insert(0, candidate);
+        }
+    }
+}
+
+#[cfg(test)]
+mod messaging_receipt_tests {
+    use super::*;
+    #[test]
+    fn sms_success_rows_require_confirmed_sent_and_do_not_duplicate_provider_rows() {
+        let candidate = stepx_companion::sms::Message {
+            provider_id: Some(1),
+            address: "10086".into(),
+            body: "reply".into(),
+            date_ms: 1_000,
+            outgoing: true,
+            kind: 2,
+            read: true,
+            subscription: None,
+        };
+        for state in ["failed", "sending", "unknown", "sent"] {
+            let status = stepx_companion::bridge::SmsSendStatus {
+                id: "request".into(),
+                state: state.into(),
+                parts: 1,
+                completed: usize::from(state == "sent"),
+                error_code: None,
+                error: None,
+                updated_ms: None,
+            };
+            let mut messages = Ok(vec![]);
+            merge_confirmed_sms(&mut messages, &status, candidate.clone());
+            assert_eq!(
+                messages.as_ref().unwrap().len(),
+                usize::from(state == "sent")
+            );
+            merge_confirmed_sms(&mut messages, &status, candidate.clone());
+            assert_eq!(
+                messages.as_ref().unwrap().len(),
+                usize::from(state == "sent")
+            );
+            let mut failed_read = Err("provider unavailable".into());
+            merge_confirmed_sms(&mut failed_read, &status, candidate.clone());
+            assert!(failed_read.is_err());
+        }
+    }
+    #[test]
+    fn disconnected_direct_sms_keeps_the_draft_and_does_not_create_a_success_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = crate::ui::TestUiConfigDirGuard::set(dir.path());
+        let mut app = Companion::new_for_test();
+        app.demo_mode = false;
+        app.selected = None;
+        app.fields[F_SMS_TO].set("10086");
+        app.fields[F_SMS_BODY].set("keep this reply");
+        let before = app.sms.len();
+        app.handle_device_action(&Action::PrepareDirectSms);
+        assert!(app.error && app.status.contains("未发送"));
+        assert_eq!(app.fields[F_SMS_BODY].text, "keep this reply");
+        assert_eq!(app.sms.len(), before);
+    }
 }

@@ -6,7 +6,7 @@ use crate::{
     amoo::AgentBus,
     device::Device,
 };
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -974,6 +974,15 @@ pub fn import_file(workspace: &Path, source: &Path) -> Result<WorkFile> {
 }
 
 pub fn start(adb: Adb, device: Device, request: WorkRequest) -> WorkHandle {
+    start_routed(adb, device, request, crate::model_source::load().map(|p| p.source))
+}
+
+/// Native image processing is explicitly billed to the connected phone.
+pub fn start_phone(adb: Adb, device: Device, request: WorkRequest) -> WorkHandle {
+    start_routed(adb, device, request, Ok(crate::model_source::Source::PhoneAccount))
+}
+
+fn start_routed(adb: Adb, device: Device, request: WorkRequest, source: Result<crate::model_source::Source>) -> WorkHandle {
     let (tx, events) = mpsc::channel();
     let (work_tx, work_events) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -1001,7 +1010,7 @@ pub fn start(adb: Adb, device: Device, request: WorkRequest) -> WorkHandle {
         }
     });
     thread::spawn(move || {
-        let result = run_phone(&adb, &device, request, &work_tx, &token);
+        let result = source.and_then(|source|run_selected(&adb, &device, request, &work_tx, &token, source));
         if token.load(Ordering::SeqCst) {
             let _ = work_tx.send(WorkEvent::Cancelled);
         } else if let Err(error) = result {
@@ -1012,9 +1021,21 @@ pub fn start(adb: Adb, device: Device, request: WorkRequest) -> WorkHandle {
 }
 
 pub fn start_local(mut request: WorkRequest) -> WorkHandle {
+    // Lock the explicit source before any journal/workspace creation. A stale
+    // UI availability check is not permission to choose another model origin.
+    let startup = crate::model_source::load().and_then(|preferences| {
+        ensure!(preferences.source==crate::model_source::Source::IndependentApi,
+            "当前未明确选择独立 API，本地工作任务未启动，也未切换模型来源");
+        let config=crate::studio_lab::load_config()?;
+        validate_local_start(preferences.source,&config)
+    });
     let (tx, events) = mpsc::channel();
     let (work_tx, work_events) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
+    if let Err(error)=startup {
+        let _=tx.send(WorkEvent::Failed(format!("{error:#}")));
+        return WorkHandle {events,cancel};
+    }
     let token = cancel.clone();
     let journal_workspace = request.workspace.clone();
     thread::spawn(move || {
@@ -1286,16 +1307,18 @@ fn load_artifacts_for_session(root: &Path, session_key: Option<&str>) -> Result<
     Ok(found)
 }
 
-fn run_phone(
+fn run_selected(
     adb: &Adb,
     device: &Device,
     mut request: WorkRequest,
     tx: &Sender<WorkEvent>,
     cancel: &AtomicBool,
+    source: crate::model_source::Source,
 ) -> Result<()> {
     if request.prompt.trim().is_empty() {
         bail!("请描述需要完成的工作");
     }
+    if source==crate::model_source::Source::IndependentApi {ensure_api_configuration()?;}
     let _ = fs::create_dir_all(&request.workspace);
     let workspace = Workspace::open(&request.workspace)?;
     let root = request.workspace.canonicalize()?;
@@ -1324,7 +1347,14 @@ fn run_phone(
     if cancel.load(Ordering::SeqCst) {
         return Ok(());
     }
-    let _ = tx.send(WorkEvent::Status("正在连接手机 Amoo…".into()));
+    if source == crate::model_source::Source::IndependentApi {
+        let _=tx.send(WorkEvent::Status("正在使用明确选择的独立 API 生成办公交付物…".into()));
+        let key=request.session_key.as_deref().filter(|key|!key.is_empty()).unwrap_or("local-work-session").to_owned();
+        let _=tx.send(WorkEvent::SessionReady(key));
+        let mut backend=LocalApiBackend::new(tx.clone());
+        return run_loop(&workspace,&request.prompt,&attachments,&mut backend,tx,cancel);
+    }
+    let _ = tx.send(WorkEvent::Status("正在连接手机 Amoo，使用手机账号…".into()));
     let connected = if device.serial.trim().is_empty() {
         Err(anyhow!("未选择手机设备"))
     } else {
@@ -1332,6 +1362,8 @@ fn run_phone(
     };
     match connected {
         Ok(mut bus) => {
+            let account_scope = crate::amoo_usage::account_scope_fresh(adb, device)?
+                .context("请先登录手机 Amoo 账号，未改用独立 API")?;
             let key = match request.session_key.as_deref().filter(|key| !key.is_empty()) {
                 Some(key) => key.to_string(),
                 None => bus.create_session()?,
@@ -1342,6 +1374,7 @@ fn run_phone(
                 bus.set_session_model(&key, model)?;
             }
             let mut backend = PhoneBackend {
+                account_scope,
                 bus,
                 key,
                 events: tx.clone(),
@@ -1365,39 +1398,27 @@ fn run_phone(
                 cancel,
             )
         }
-        Err(phone_err) => {
-            if has_local_model_backend() {
-                let _ = tx.send(WorkEvent::Status(
-                    "正在通过本地配置的模型生成办公交付物…".into(),
-                ));
-                let key = request
-                    .session_key
-                    .as_deref()
-                    .filter(|key| !key.is_empty())
-                    .unwrap_or("local-work-session")
-                    .to_string();
-                let _ = tx.send(WorkEvent::SessionReady(key));
-                let mut backend = LocalApiBackend::new(tx.clone());
-                run_loop(
-                    &workspace,
-                    &request.prompt,
-                    &attachments,
-                    &mut backend,
-                    tx,
-                    cancel,
-                )
-            } else {
-                Err(phone_err)
-            }
-        }
+        Err(phone_err) => Err(phone_err.context("手机 AI 不可用；未切换到独立 API")),
     }
 }
 
 pub fn has_local_model_backend() -> bool {
-    crate::studio_lab::load_config().is_ok_and(|cfg| {
-        cfg.has_key && !cfg.endpoint.trim().is_empty() && !cfg.model.trim().is_empty()
-    })
+    crate::model_source::load().is_ok_and(|p|p.source==crate::model_source::Source::IndependentApi)
+        && api_configuration_available()
 }
+fn validate_work_api(config:&crate::studio_lab::PublicConfig)->Result<()> {
+    ensure!(config.protocol=="openai", "Amoo Work 的独立 API 目前仅支持 OpenAI 兼容协议；当前协议不会调用，也未改用手机账号");
+    ensure!(config.has_key && !config.endpoint.trim().is_empty() && !config.model.trim().is_empty(),
+        "请先配置所选独立 API 的地址、模型和密钥；未改用手机账号");
+    Ok(())
+}
+fn validate_local_start(source:crate::model_source::Source,config:&crate::studio_lab::PublicConfig)->Result<()> {
+    ensure!(source==crate::model_source::Source::IndependentApi,
+        "当前未明确选择独立 API，本地工作任务未启动，也未切换模型来源");
+    validate_work_api(config)
+}
+fn ensure_api_configuration()->Result<()> {validate_work_api(&crate::studio_lab::load_config()?)}
+fn api_configuration_available() -> bool {ensure_api_configuration().is_ok()}
 
 struct LocalApiBackend {
     config_path: PathBuf,
@@ -1436,6 +1457,8 @@ impl Backend for LocalApiBackend {
 cfg_path = sys.argv[1]
 with open(cfg_path, "r", encoding="utf-8") as f:
     cfg = json.load(f)
+if cfg.get("protocol", "openai") != "openai":
+    raise RuntimeError("Amoo Work 独立 API 仅支持 OpenAI 兼容协议；未调用其他协议，也未切换手机账号")
 endpoint = (cfg.get("endpoint") or "").strip().rstrip("/")
 model = (cfg.get("model") or "").strip()
 api_key = (cfg.get("key") or cfg.get("api_key") or "").strip()
@@ -1491,6 +1514,7 @@ trait Backend {
     fn reply(&mut self, message: &str, cancel: &AtomicBool) -> Result<String>;
 }
 pub(crate) struct PhoneBackend {
+    account_scope: String,
     bus: AgentBus,
     key: String,
     events: Sender<WorkEvent>,
@@ -1500,10 +1524,36 @@ pub(crate) struct PhoneBackend {
 }
 impl PhoneBackend {
     pub(crate) fn for_lab(adb: Adb, device: Device, events: Sender<WorkEvent>) -> Result<Self> {
+        Self::build_lab(adb, device, events, None)
+    }
+    pub(crate) fn account_scope(&self) -> &str {
+        &self.account_scope
+    }
+    pub(crate) fn for_lab_in_account(
+        adb: Adb,
+        device: Device,
+        events: Sender<WorkEvent>,
+        expected_account: &str,
+    ) -> Result<Self> {
+        Self::build_lab(adb, device, events, Some(expected_account))
+    }
+    fn build_lab(
+        adb: Adb,
+        device: Device,
+        events: Sender<WorkEvent>,
+        expected_account: Option<&str>,
+    ) -> Result<Self> {
+        let account_scope = crate::amoo_usage::account_scope_fresh(&adb, &device)?
+            .context("请先登录手机 Amoo 账号，未改用独立 API")?;
+        ensure!(
+            expected_account.is_none_or(|expected| expected == account_scope),
+            "手机账号已变化，未创建跨账号复核会话，未改用独立 API"
+        );
         let mut bus = AgentBus::connect(&adb, &device)?;
         let key = bus.create_session()?;
         let _ = events.send(WorkEvent::SessionReady(key.clone()));
         Ok(Self {
+            account_scope,
             bus,
             key,
             events,
@@ -1521,6 +1571,8 @@ impl Backend for PhoneBackend {
         if cancel.load(Ordering::SeqCst) {
             bail!("桌面任务已停止");
         }
+        ensure!(crate::amoo_usage::account_scope_fresh(&self.adb,&self.device)?.as_deref()==Some(self.account_scope.as_str()),
+            "手机账号已变化，工作请求未发送，未改用独立 API");
         let response_started = Instant::now();
         let pending = if self.image_attachments.is_empty() {
             self.bus.send(&self.key, message)?
@@ -1540,6 +1592,15 @@ impl Backend for PhoneBackend {
                     &["rm", "-rf", "--", &uploaded.directory],
                 );
                 bail!("桌面任务已停止，图片未提交给模型");
+            }
+            if crate::amoo_usage::account_scope_fresh(&self.adb, &self.device)?.as_deref()
+                != Some(self.account_scope.as_str())
+            {
+                let _ = self.adb.shell(
+                    &self.device.transport,
+                    &["rm", "-rf", "--", &uploaded.directory],
+                );
+                bail!("手机账号已变化，图片请求未发送，未改用独立 API");
             }
             let pending = self.bus.send_with_attachments(
                 &self.key,
@@ -1567,6 +1628,11 @@ impl Backend for PhoneBackend {
                     bail!("手机 Amoo 要求本人确认，但授权未完成。电脑文件和已有成果已保留；请在手机查看提示，确认后再继续，未自动重发任务。");
                 }
                 if pending.finished(session) {
+                    ensure!(
+                        crate::amoo_usage::account_scope_fresh(&self.adb, &self.device)?
+                            .as_deref() == Some(self.account_scope.as_str()),
+                        "手机账号已变化，未接收本次工作结果，未改用独立 API"
+                    );
                     let _ = self.events.send(model_response_event(
                         &data,
                         &self.key,
@@ -1729,8 +1795,10 @@ fn run_loop(
     let mut successful = 0;
     let mut artifacts = 0;
     let mut format_repairs = 0;
-    let mut nudge_sent = false;
     let mut completed_writes = std::collections::HashMap::<String, Value>::new();
+    let mut failed_writes = std::collections::BTreeSet::<String>::new();
+    let mut delivery_repairs = 0;
+    let slide_count = requested_slide_count(prompt);
     for round in 0..MAX_ROUNDS {
         if cancel.load(Ordering::SeqCst) {
             return Ok(());
@@ -1746,7 +1814,7 @@ fn run_loop(
                 let _ = tx.send(WorkEvent::Status(format!(
                     "正在修正文件操作格式（{format_repairs}/2），原文件未改动…"
                 )));
-                next = format!("<amoo_work_protocol>\nAmoo Work 桌面执行结果：上条回复格式无效，本条中的任何工具均未执行。错误：{error}。请修正后重发一个完整协议对象。需要工具时 done=false；只有收到成功执行回执后才能 done=true 且 tools=[]。不要宣称上条操作已成功。已执行的早期回执仍有效，不要重复创建。\n</amoo_work_protocol>");
+                next = format!("<amoo_work_protocol>\nAmoo Work 桌面执行结果：上条回复格式无效，本条中的任何工具均未执行。错误：{error}。请重新构造一个完整 JSON 对象，不要原样重发。若有 paragraphs，每项必须是完整的对象，例如 [{{\"text\":\"标题\",\"style\":\"heading1\"}},{{\"text\":\"正文\",\"style\":\"body\"}}]；tools 数组及每个对象必须闭合，字符串内部的英文双引号必须转义。需要工具时 done=false；只有收到成功执行回执后才能 done=true 且 tools=[]。不要宣称上条操作已成功。已执行的早期回执仍有效，不要重复创建。\n</amoo_work_protocol>");
                 continue;
             }
             Err(error) => return Err(error.context("模型连续未给出有效文件操作，已有文件保留")),
@@ -1754,40 +1822,41 @@ fn run_loop(
         let plan = match parsed {
             Some(p) => p,
             None => {
-                if round == 0
-                    && count == 0
-                    && completed_writes.is_empty()
-                    && !nudge_sent
-                    && prompt_expects_file_action(prompt)
-                {
-                    nudge_sent = true;
-                    let nudge = "<amoo_work_protocol>\n系统提示：你刚才仅回复了普通文字，未输出 <amoo_work_protocol> JSON 工具计划，电脑端尚未生成任何实际文件。请立即使用 <amoo_work_protocol>{\"amoo_work\":1,\"summary\":\"正在生成文件\",\"done\":false,\"tools\":[...]}</amoo_work_protocol> 调用 write_document、write_spreadsheet、write_presentation 或 write_file 实际写入文件。\n</amoo_work_protocol>";
-                    if let Ok(retry_response) = backend.reply(nudge, cancel) {
-                        if let Ok(Some(retry_plan)) = parse_plan(&retry_response) {
-                            retry_plan
-                        } else {
-                            let _ = tx.send(WorkEvent::Assistant(retry_response));
-                            let _ = tx.send(WorkEvent::Complete(completion_summary(
-                                count, successful, artifacts,
-                            )));
-                            return Ok(());
-                        }
-                    } else {
-                        let _ = tx.send(WorkEvent::Assistant(response));
-                        let _ = tx.send(WorkEvent::Complete(completion_summary(
-                            count, successful, artifacts,
-                        )));
-                        return Ok(());
-                    }
-                } else {
-                    let _ = tx.send(WorkEvent::Assistant(response));
-                    let _ = tx.send(WorkEvent::Complete(completion_summary(
-                        count, successful, artifacts,
-                    )));
-                    return Ok(());
+                if !failed_writes.is_empty() {
+                    bail!("还有文件未能生成，不能将普通回复当作完成。已有成果保留，请重试失败部分。");
                 }
+                if artifacts == 0 && prompt_expects_file_action(prompt) {
+                    if delivery_repairs >= 2 {
+                        bail!("模型尚未生成实际文件，不能标记完成。请重试或补充文件要求。");
+                    }
+                    delivery_repairs += 1;
+                    let _ = tx.send(WorkEvent::Status("正在补齐实际文件，尚未完成…".into()));
+                    next = "<amoo_work_protocol>用户要求交付文件，但尚未收到任何成功写入回执。请调用 write_document、write_spreadsheet、write_presentation 或 write_file 实际生成文件，不要只回复承诺。需要工具时 done=false；收到成功回执后才能 done=true。</amoo_work_protocol>".into();
+                    continue;
+                }
+                let _ = tx.send(WorkEvent::Assistant(response));
+                let _ = tx.send(WorkEvent::Complete(completion_summary(count, successful, artifacts)));
+                return Ok(());
             }
         };
+        if plan.done && !failed_writes.is_empty() {
+            if delivery_repairs >= 2 {
+                bail!("文件尚未全部生成：{}。已成功的文件保留，可重试失败部分。", failed_writes.iter().cloned().collect::<Vec<_>>().join("、"));
+            }
+            delivery_repairs += 1;
+            let _ = tx.send(WorkEvent::Status("正在修复未完成的文件，已有成果保留…".into()));
+            next = format!("<amoo_work_protocol>不能宣布全部完成，以下写入仍失败：{}。根据先前错误修正并重新调用工具；不要重复创建成功的文件。成功回执后再 done=true。</amoo_work_protocol>", failed_writes.iter().cloned().collect::<Vec<_>>().join("、"));
+            continue;
+        }
+        if plan.done && artifacts == 0 && prompt_expects_file_action(prompt) {
+            if delivery_repairs >= 2 {
+                bail!("模型报告完成，但没有生成实际文件。请重试，原文件未改动。");
+            }
+            delivery_repairs += 1;
+            let _ = tx.send(WorkEvent::Status("正在补齐实际文件，尚未完成…".into()));
+            next = "<amoo_work_protocol>不能宣布完成：电脑没有收到文件写入请求。即使你在手机或云端 exec 中生成了同名文件，也没有交付到电脑。接下来禁止调用任何原生工具，只回复一个文本 JSON 计划：{\"amoo_work\":1,\"done\":false,\"tools\":[{\"id\":\"deliver\",\"tool\":\"write_document\",\"path\":\"用户要求的文件名.docx\",\"title\":\"标题\",\"paragraphs\":[{\"text\":\"实际正文\",\"style\":\"body\"}]}]}。按用户要求替换为对应 write_spreadsheet/write_presentation/write_file 及其参数。由电脑收到并执行后再完成。</amoo_work_protocol>".into();
+            continue;
+        }
         if !plan.summary.trim().is_empty() {
             // Intermediate plans belong to the compact execution status. Only
             // the final human-readable answer becomes a result message.
@@ -1839,12 +1908,17 @@ fn run_loop(
             let reused = cached.is_some();
             let result = match cached {
                 Some(value) => Ok(value),
-                None => execute_tool(ws, &run, &call, tx),
+                None => validate_requested_slides(&call, slide_count)
+                    .and_then(|_| execute_tool(ws, &run, &call, tx)),
             };
             let (success, data) = match result {
                 Ok(value) => (true, value),
                 Err(error) => (false, json!({"error":format!("{error:#}")})),
             };
+            if write {
+                let path = call["path"].as_str().unwrap_or(&name).to_string();
+                if success { failed_writes.remove(&path); } else { failed_writes.insert(path); }
+            }
             if success {
                 successful += 1;
                 if write && !reused {
@@ -1869,51 +1943,52 @@ fn run_loop(
     }
     bail!("已达到 12 轮桌面协作上限，已有产物已保留；可检查后继续任务")
 }
-fn prompt_expects_file_action(prompt: &str) -> bool {
-    let lower = prompt.to_ascii_lowercase();
-    for kw in [
-        "生成",
-        "创建",
-        "制作",
-        "撰写",
-        "整理",
-        "写一",
-        "导出",
-        "保存",
-        "修订",
-        "修改",
-        "文件",
-        "文档",
-        "表格",
-        "报告",
-        "汇报",
-        "方案",
-        "看板",
-        "游戏",
-        "幻灯片",
-        "演示",
-        "docx",
-        "xlsx",
-        "pptx",
-        "word",
-        "excel",
-        "ppt",
-        "markdown",
-        ".md",
-        ".html",
-        ".csv",
-    ] {
-        if lower.contains(kw) {
-            return true;
+/// Enforce an unambiguous explicit total, not ordinal page references or ranges.
+fn requested_slide_count(prompt: &str) -> Option<usize> {
+    let text: String = prompt.chars().filter(|c| !c.is_whitespace()).collect();
+    let mut total = None;
+    for (end, _) in text.match_indices('页') {
+        let prefix = &text[..end];
+        let digits = prefix.trim_end_matches(|c: char| c.is_ascii_digit());
+        if digits.len() == prefix.len() { continue; }
+        let preceding = digits.chars().last();
+        if preceding.is_some_and(|c| c == '第' || c == '到' || c == '至' || c == '-' || c == '～') { continue; }
+        let lead: String = digits.chars().rev().take(12).collect::<Vec<_>>().into_iter().rev().collect();
+        if !["制作", "生成", "做", "改成", "改为", "总共", "共", "合计"].iter().any(|w| lead.contains(w)) { continue; }
+        if let Ok(n) = prefix[digits.len()..].parse::<usize>() {
+            if (1..=40).contains(&n) { total = Some(n); }
         }
     }
-    false
+    total
 }
+fn validate_requested_slides(call: &Value, expected: Option<usize>) -> Result<()> {
+    if call["tool"] == "write_presentation" {
+        if let (Some(expected), Some(slides)) = (expected, call["slides"].as_array()) {
+            anyhow::ensure!(slides.len() == expected,
+                "用户指定总共 {expected} 页（包含封面），当前计划 {} 页；文件未写入。请重新组织内容，严格保持 {expected} 页后重试。", slides.len());
+        }
+    }
+    Ok(())
+}
+fn prompt_expects_file_action(prompt: &str) -> bool {
+    let lower = prompt.to_ascii_lowercase();
+    if ["不要生成", "不生成文件", "不要创建", "无需生成", "只需分析", "只阅读", "不要保存", "do not create", "don't create"].iter().any(|v| lower.contains(v)) {
+        return false;
+    }
+    let action = ["生成", "创建", "制作", "导出", "保存为", "另存为", "写入", "修订", "修改", "交付", "create", "generate", "export", "save as", "write", "revise"].iter().any(|v| lower.contains(v));
+    let file = ["文件", "文档", "表格", "报告", "汇报", "演示", "幻灯片", "通知", "docx", "xlsx", "pptx", "word", "excel", "ppt", "markdown", ".md", ".html", ".csv", ".json", ".txt", "report", "document", "spreadsheet"].iter().any(|v| lower.contains(v));
+    action && file
+}
+
 fn completion_summary(attempted: usize, successful: usize, artifacts: usize) -> String {
     if attempted == 0 {
         "手机已回复；未执行桌面操作，未生成本地文件。".into()
     } else {
-        format!("桌面操作 {successful}/{attempted} 项成功；生成 {artifacts} 个本地文件。")
+        if artifacts > 0 {
+            format!("已保存 {artifacts} 个文件，可预览检查或继续修改。")
+        } else {
+            format!("已完成 {successful} 项资料处理，未生成新文件。")
+        }
     }
 }
 fn initial_prompt(prompt: &str, attachments: &[String]) -> String {
@@ -1933,10 +2008,10 @@ fn initial_prompt(prompt: &str, attachments: &[String]) -> String {
 - csv_summary: path，返回 CSV 的列名、行数、数值列合计/均值。
 - write_file: path、content，生成新的 txt/md/csv/tsv/json/html/css/svg/xml/yaml 文件。可玩网页游戏使用自包含 HTML，CSS/JavaScript 内嵌，不依赖 CDN；不能把伪代码当成游戏。
 - edit_text: source（已有文本/HTML 相对路径）、path（新文件名）、replacements 数组，每项 {{"find":"精确原文","replace":"新文字","expected_count":1}}；匹配数必须一致，生成修订副本。
-- write_document: path（.docx）、title、paragraphs 数组。段落可为字符串或 {{"text":"内容","style":"heading1"}}；style 支持 heading1/heading2/body/bullet/quote。
+- write_document: path（.docx）、title、paragraphs 数组。paragraphs 内每个段落统一使用对象 {{"text":"内容","style":"body"}}，标题用 heading1 或 heading2，列表用 bullet，引用用 quote。不要将 style 键写在对象外；不要混用未闭合的字符串和对象。
 - edit_document: source（原 .docx 相对路径）、path（新 .docx 文件名）、replacements（同 edit_text）。在原文档上精确替换，保留其余排版/图片；不能跨段落，默认每项只允许匹配一次。修改原文档时优先使用此工具，不要重写整个文档。
-- write_spreadsheet: path（.xlsx）、sheet_name（可选）、column_widths（可选，每列 8–80）、rows 二维数组。单元格支持文字/数字/空值、{{"value":30,"format":"currency"}} 或 {{"formula":"ROUND(B2*C2,2)","format":"number"}}。format 支持 number/currency/percent。公式支持本表 A1 引用、范围、算术比较及 SUM/AVERAGE/MIN/MAX/COUNT/ROUND/ABS/IF，并真实计算缓存结果；普通的 "=SUM(...)" 字符串仅作为文字。金额/合计用公式，不要凭空填计算结果。
-- write_presentation: path（.pptx）、slides 数组（1–40 页）。每页 {{"title":"标题","subtitle":"可选副标题","bullets":["要点"],"layout":"content"}}；layout 支持 cover/section/content，封面只用标题和副标题，内容页最多 6 点，长内容拆页。生成真正可编辑的 16:9 PowerPoint。
+- write_spreadsheet: path（.xlsx）、sheet_name（可选）；多工作表使用 sheets 数组，每项含 sheet_name、rows 和可选 column_widths。column_widths（可选，每列 8–80）、rows 二维数组。单元格支持文字/数字/空值、{{"value":30,"format":"currency"}} 或 {{"formula":"ROUND(B2*C2,2)","format":"number"}}。format 支持 number/currency/percent。公式支持本表 A1 引用、范围、算术比较及 SUM/AVERAGE/MIN/MAX/COUNT/ROUND/ABS/IF，并真实计算缓存结果；禁止裸字符串 "=SUM(...)"，它不会计算且会被要求修正；公式必须用 formula 对象，明确需要原样文字才用 {{"value":"=SUM(...)"}}。金额/合计用公式，不要凭空填计算结果。
+- write_presentation: path（.pptx）、slides 数组（1–40 页）。每页 {{"title":"标题","subtitle":"可选副标题","bullets":["要点"],"layout":"content"}}；layout 支持 cover/section/content，封面只用标题和副标题，内容页最多 6 点。用户指定的总页数包含封面，必须严格遵守；长内容先精简，不擅自加封面、目录或结尾页。生成真正可编辑的 16:9 PowerPoint。
 所有输出自动写入独立的 Amoo Work Outputs/任务目录，不覆盖原文件。后续读取应使用写入结果返回的完整相对路径。
 每份要求的输出都必须实际写入。写入成功后不要重复创建；修订请使用新文件名。写入后至少 read_file 核对关键内容、表格合计或演示页数，再给简短交付说明。进展 summary 用一句话；长代码/JSON 只放工具参数，不在正文再次贴出。最终答复优先说明成果、主要结果与尚未验证的限制，不重复原始 Markdown/协议/代码。没有运行浏览器就不能声称已实测游戏交互。
 任何需要读取、写入或修改文件的回复必须 done=false；done=true 时 tools 必须为空。等待写入成功回执后才能宣布完成。最终完成使用 {{"amoo_work":1,"summary":"交付说明，注明真实输出文件","done":true,"tools":[]}}。
@@ -1949,9 +2024,13 @@ fn initial_prompt(prompt: &str, attachments: &[String]) -> String {
 fn execute_tool(ws: &Workspace, run: &str, call: &Value, tx: &Sender<WorkEvent>) -> Result<Value> {
     let name = call["tool"].as_str().context("缺少工具名")?;
     let path = call["path"].as_str().unwrap_or("");
+    if name == "write_spreadsheet" { validate_model_spreadsheet_cells(call)?; }
     match name {
         "list_files" => Ok(json!({"files":ws.list_files(path)?})),
-        "read_file" => Ok(json!({"path":path,"text":ws.read_text(path)?})),
+        "read_file" => {
+            let resolved = resolve_read_path(ws, run, path)?;
+            Ok(json!({"path":resolved,"text":ws.read_text(&resolved)?}))
+        },
         "search_files" => {
             let query = call["query"]
                 .as_str()
@@ -1960,7 +2039,7 @@ fn execute_tool(ws: &Workspace, run: &str, call: &Value, tx: &Sender<WorkEvent>)
             let matches = ws.search_files(path, query)?;
             Ok(json!({"matches":matches,"scope":"当前目录，最多检索 100 个文件"}))
         }
-        "csv_summary" => csv_summary(&ws.read_text(path)?),
+        "csv_summary" => csv_summary(&ws.read_text(&resolve_read_path(ws, run, path)?)?),
         "write_file" => {
             if !matches!(
                 extension(Path::new(path)).as_str(),
@@ -2035,6 +2114,30 @@ fn execute_tool(ws: &Workspace, run: &str, call: &Value, tx: &Sender<WorkEvent>)
         }
         _ => bail!("桌面没有名为 {name} 的工具；未执行此操作"),
     }
+}
+fn resolve_read_path(ws: &Workspace, run: &str, path: &str) -> Result<String> {
+    // Models sometimes reuse the write path instead of its returned output path.
+    // Resolve only within this run, after checking the workspace path normally.
+    let requested = ws.path(path, false)?;
+    if requested.exists() || path.starts_with("Amoo Work Outputs/") {
+        return Ok(path.to_string());
+    }
+    let output = format!("Amoo Work Outputs/{run}/{path}");
+    if ws.path(&output, false)?.is_file() { Ok(output) } else { Ok(path.to_string()) }
+}
+fn validate_model_spreadsheet_cells(call: &Value) -> Result<()> {
+    let mut sheets = vec![call];
+    if let Some(multiple) = call["sheets"].as_array() { sheets.extend(multiple); }
+    for sheet in sheets {
+        for row in sheet["rows"].as_array().into_iter().flatten() {
+            for cell in row.as_array().into_iter().flatten() {
+                if cell.as_str().is_some_and(|s| s.trim_start().starts_with('=')) {
+                    bail!("发现以 = 开头的裸字符串，不能把它当作已计算结果交付。计算公式请改为 {{\"formula\":\"SUM(B2:B4)\"}}，将真实计算缓存值；若用户明确要保留公式原文，请用 {{\"value\":\"=SUM(B2:B4)\"}}。本次文件未写入，请修正后重试。");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 fn emit_artifact(artifact: WorkArtifact, tx: &Sender<WorkEvent>) -> Result<Value> {
     let value = json!({"path":artifact.relative_path,"bytes":artifact.bytes,"kind":artifact.kind});
@@ -2379,6 +2482,17 @@ fn csv_summary(text: &str) -> Result<Value> {
 mod tests {
     use super::*;
     #[test]
+    fn local_work_requires_explicit_api_source_and_supported_protocol_before_start() {
+        let config=crate::studio_lab::PublicConfig {protocol:"openai".into(),endpoint:"https://example.invalid/v1".into(),model:"fixture".into(),has_key:true};
+        assert!(validate_local_start(crate::model_source::Source::PhoneAccount,&config).is_err());
+        assert!(validate_local_start(crate::model_source::Source::IndependentApi,&config).is_ok());
+        let mut other=config.clone();other.protocol="anthropic".into();
+        assert!(validate_local_start(crate::model_source::Source::IndependentApi,&other).unwrap_err().to_string().contains("仅支持 OpenAI"));
+        other=config.clone();other.has_key=false;
+        assert!(validate_local_start(crate::model_source::Source::IndependentApi,&other).is_err());
+    }
+
+    #[test]
     fn response_metrics_keep_canonical_usage_ids_and_do_not_journal_phone_history() {
         use crate::openclaw::{RealAmooData, RealChatMessage, RealSessionInfo};
         let message = RealChatMessage {
@@ -2577,6 +2691,30 @@ mod tests {
         assert!(events.iter().any(|e| matches!(e, WorkEvent::Complete(_))));
     }
     #[test]
+    fn failed_write_cannot_be_reported_as_complete() {
+        let temp = tempfile::tempdir().unwrap();
+        let ws = Workspace::open(temp.path()).unwrap();
+        let done = json!({"amoo_work":1,"done":true,"summary":"全部完成"}).to_string();
+        let mut model = FakeBackend { requests:vec![], replies:[
+            json!({"amoo_work":1,"tools":[{"tool":"write_presentation","path":"bad.pptx","slides":[{},{},{},{}]}]}).to_string(),
+            done.clone(), done.clone(), done,
+        ].into() };
+        let (tx, rx) = mpsc::channel();
+        assert!(run_loop(&ws,"制作3页PPT",&[],&mut model,&tx,&AtomicBool::new(false)).is_err());
+        assert!(!rx.try_iter().any(|e|matches!(e,WorkEvent::Complete(_)|WorkEvent::Artifact(_))));
+    }
+    #[test]
+    fn reads_can_use_this_runs_write_path_without_shadowing_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let ws = Workspace::open(temp.path()).unwrap();
+        ws.write_new("current","result.txt",b"generated").unwrap();
+        assert_eq!(resolve_read_path(&ws,"current","result.txt").unwrap(),"Amoo Work Outputs/current/result.txt");
+        assert_eq!(resolve_read_path(&ws,"other","result.txt").unwrap(),"result.txt");
+        fs::write(temp.path().join("result.txt"),"original").unwrap();
+        assert_eq!(resolve_read_path(&ws,"current","result.txt").unwrap(),"result.txt");
+        assert!(resolve_read_path(&ws,"current","../outside").is_err());
+    }
+    #[test]
     fn cancellation_prevents_all_model_and_file_operations() {
         let temp = tempfile::tempdir().unwrap();
         let ws = Workspace::open(temp.path()).unwrap();
@@ -2598,7 +2736,7 @@ mod tests {
             replies: ["文件已经生成了".into()].into(),
         };
         let (tx, rx) = mpsc::channel();
-        run_loop(
+        assert!(run_loop(
             &ws,
             "生成文件",
             &[],
@@ -2606,14 +2744,10 @@ mod tests {
             &tx,
             &AtomicBool::new(false),
         )
-        .unwrap();
+        .is_err());
         let events: Vec<_> = rx.try_iter().collect();
-        assert!(events
-            .iter()
-            .any(|e| matches!(e,WorkEvent::Assistant(text) if text=="文件已经生成了")));
-        assert!(events
-            .iter()
-            .any(|e| matches!(e,WorkEvent::Complete(text) if text.contains("未生成本地文件"))));
+        assert_eq!(model.requests.len(), 2, "attempt to obtain the missing file");
+        assert!(!events.iter().any(|e| matches!(e, WorkEvent::Complete(_))));
         assert!(!events.iter().any(|e| matches!(e, WorkEvent::Artifact(_))));
     }
     #[test]
@@ -2700,7 +2834,7 @@ mod tests {
             &AtomicBool::new(false),
         )
         .unwrap();
-        assert!(rx.try_iter().any(|e|matches!(e,WorkEvent::Complete(text) if text.contains("1/1") && text.contains("0 个本地文件"))));
+        assert!(rx.try_iter().any(|e|matches!(e,WorkEvent::Complete(text) if text.contains("1 项资料处理") && text.contains("未生成新文件"))));
     }
     #[test]
     fn invalid_tool_is_reported_not_executed() {
@@ -2715,6 +2849,13 @@ mod tests {
         )
         .is_err());
         assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn model_spreadsheet_requires_explicit_formula_or_literal_intent() {
+        assert!(validate_model_spreadsheet_cells(&json!({"rows":[["=SUM(B2:B4)"]]})).is_err());
+        assert!(validate_model_spreadsheet_cells(&json!({"sheets":[{"rows":[[" =COUNT(B2:B4)"]]}]})).is_err());
+        assert!(validate_model_spreadsheet_cells(&json!({"rows":[[{"formula":"SUM(B2:B4)"},{"value":"=SUM(B2:B4)"},"ordinary text",80]]})).is_ok());
     }
 
     #[test]
@@ -2887,6 +3028,14 @@ mod tests {
     }
 
     #[test]
+    fn explicit_slide_count_includes_cover_without_matching_ordinals() {
+        assert_eq!(requested_slide_count("制作3页周报PPT，风险单独一页"), Some(3));
+        assert_eq!(requested_slide_count("改成 4 页 PPT，第二页是结果"), Some(4));
+        assert_eq!(requested_slide_count("生成PPT，第三页介绍功能"), None);
+        assert_eq!(requested_slide_count("生成 3 到 5 页 PPT"), None);
+        assert!(validate_requested_slides(&json!({"tool":"write_presentation","slides":[{}, {}, {}, {}]}), Some(3)).is_err());
+    }
+    #[test]
     fn presentation_and_word_revision_produce_verified_workspace_artifacts() {
         if adb::find_executable("python3").is_none() {
             return;
@@ -2968,7 +3117,7 @@ mod tests {
         assert!(model.requests[2].contains("\"ok\":true"));
         assert!(events
             .iter()
-            .any(|e| matches!(e,WorkEvent::Complete(s) if s.contains("生成 1 个"))));
+            .any(|e| matches!(e,WorkEvent::Complete(s) if s.contains("已保存 1 个文件"))));
     }
 
     #[test]
@@ -2996,6 +3145,22 @@ mod tests {
         assert!(docx_text.contains("> 立项愿景"));
         let md_text = ws.read_text("AI终端与移动生产力深度调研报告.md").unwrap();
         assert!(md_text.contains("| 评估维度 |"));
+    }
+
+    #[test]
+    fn promised_deliverable_requires_a_written_artifact() {
+        for response in ["已经完成文件。".to_string(), json!({"amoo_work":1,"done":true,"summary":"已生成"}).to_string()] {
+            let root = tempfile::tempdir().unwrap();
+            let ws = Workspace::open(root.path()).unwrap();
+            let mut model = FakeBackend {requests: vec![], replies: vec![response;3].into()};
+            let (tx,rx) = mpsc::channel();
+            let error = run_loop(&ws,"生成报告 report.docx",&[],&mut model,&tx,&AtomicBool::new(false)).unwrap_err();
+            assert!(error.to_string().contains("实际文件"));
+            assert!(!rx.try_iter().any(|e|matches!(e,WorkEvent::Complete(_))));
+        }
+        assert!(!prompt_expects_file_action("阅读文件"));
+        assert!(!prompt_expects_file_action("不要生成报告文件，只分析数据"));
+        assert!(prompt_expects_file_action("Generate a report.docx"));
     }
 
     #[test]

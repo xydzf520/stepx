@@ -135,7 +135,7 @@ impl Companion {
                 0=>{
                     self.set_compact_mode(mode,ctx);resize(ctx,width,height);self.page=Page::Amoo;self.amoo_sessions.clear();run(self,W::New,ctx);self.error=false;self.status="正在验证窗口布局".into();
                     let mut task=Task::new(None,None);task.title="多场景测试：保留当前对话中的草稿与全部附件".into();task.workspace=Some(fixtures.clone());
-                    task.turns=vec![Turn{user:true,text:"请核对资料，说明下一步。".into()},Turn{user:false,text:"## 核对结果\n\n资料已准备好。**仍在编辑的文字和附件应保持原样**。\n\n1. 查看图片。\n2. 阅读表格与文档。\n3. 在另一条会话中讨论，再返回继续。\n\n| 项目 | 数量 |\n|---|---:|\n| 甲 | 3 |\n| 乙 | 4 |\n\n这是用于检查文字选择、长段落换行和窗口缩放的内容。".repeat(3)}];
+                    task.turns=vec![Turn{at_ms:None,user:true,text:"请核对资料，说明下一步。".into()},Turn{at_ms:None,user:false,text:"## 核对结果\n\n资料已准备好。**仍在编辑的文字和附件应保持原样**。\n\n1. 查看图片。\n2. 阅读表格与文档。\n3. 在另一条会话中讨论，再返回继续。\n\n| 项目 | 数量 |\n|---|---:|\n| 甲 | 3 |\n| 乙 | 4 |\n\n这是用于检查文字选择、长段落换行和窗口缩放的内容。".repeat(3)}];
                     for (file,kind) in [("图像识别与附件预览_红方块绿圆形蓝三角.png","图片"),("项目资料_中文名称与空格 单价数量.csv","表格")] {task.add_output(Output{path:fixtures.join(file),name:file.into(),kind:kind.into(),lab_id:None});}
                     c.first=task.id.clone();self.workspace.journal.tasks.push(task);run(self,W::Select(c.first.clone()),ctx);self.focus_field(F_AMOO,ctx);
                 },

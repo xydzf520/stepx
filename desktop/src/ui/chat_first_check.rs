@@ -127,7 +127,7 @@ impl Companion {
                     // Filled conversation pins the composer at the bottom, forcing the menu upward.
                     self.amoo_attachments.clear();self.fields[F_AMOO].clear();
                     let task=self.workspace.journal.tasks.iter_mut().find(|t|t.id==c.task).unwrap();
-                    task.turns=vec![stepx_companion::amoo_workspace::Turn{user:true,text:"这份表格合计多少？".into()},stepx_companion::amoo_workspace::Turn{user:false,text:"合计 **30**。两项分别为 12 和 18。".into()}];
+                    task.turns=vec![stepx_companion::amoo_workspace::Turn{at_ms:None,user:true,text:"这份表格合计多少？".into()},stepx_companion::amoo_workspace::Turn{at_ms:None,user:false,text:"合计 **30**。两项分别为 12 和 18。".into()}];
                     task.steps=vec![stepx_companion::amoo_workspace::Step{executor:Executor::Phone,phase:stepx_companion::amoo_workspace::Phase::Done,note:String::new()}];
                     task.session=None;self.reveal_latest_chat();
                 },

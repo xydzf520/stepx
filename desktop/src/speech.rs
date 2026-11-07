@@ -114,51 +114,72 @@ pub fn helper() -> Result<()> {
         .take(128 * 1024)
         .read_to_string(&mut text)?;
     ensure!(!text.is_empty(), "empty speech");
-    let text = CString::new(text)?;
+    let c_text = CString::new(text.as_str())?;
     // Run the optional system engine in a child process: stopping it cannot affect
     // screen readers or other applications, and engine crashes cannot freeze the UI.
     unsafe {
-        let lib = libloading::Library::new("libespeak-ng.so.1").context("Install espeak-ng")?;
-        let init: libloading::Symbol<unsafe extern "C" fn(i32, i32, *const c_char, i32) -> i32> =
-            lib.get(b"espeak_Initialize")?;
-        let voice: libloading::Symbol<unsafe extern "C" fn(*const c_char) -> i32> =
-            lib.get(b"espeak_SetVoiceByName")?;
-        let synth: libloading::Symbol<
-            unsafe extern "C" fn(
-                *const c_void,
-                usize,
-                u32,
-                i32,
-                u32,
-                u32,
-                *mut u32,
-                *mut c_void,
-            ) -> i32,
-        > = lib.get(b"espeak_Synth")?;
-        let sync: libloading::Symbol<unsafe extern "C" fn() -> i32> =
-            lib.get(b"espeak_Synchronize")?;
-        let terminate: libloading::Symbol<unsafe extern "C" fn() -> i32> =
-            lib.get(b"espeak_Terminate")?;
-        ensure!(
-            init(3, 0, std::ptr::null(), 0x8000) > 0,
-            "speech initialization failed"
-        );
-        ensure!(voice(c"cmn".as_ptr()) == 0, "Chinese voice unavailable");
-        let result = synth(
-            text.as_ptr().cast(),
-            text.as_bytes_with_nul().len(),
-            0,
-            1,
-            0,
-            1,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        );
-        let completed = sync();
-        terminate();
-        ensure!(result == 0 && completed == 0, "speech playback failed");
+        if let Ok(lib) = libloading::Library::new("libespeak-ng.so.1")
+            .or_else(|_| libloading::Library::new("libespeak-ng.so"))
+        {
+            let init: libloading::Symbol<
+                unsafe extern "C" fn(i32, i32, *const c_char, i32) -> i32,
+            > = lib.get(b"espeak_Initialize")?;
+            let voice: libloading::Symbol<unsafe extern "C" fn(*const c_char) -> i32> =
+                lib.get(b"espeak_SetVoiceByName")?;
+            let synth: libloading::Symbol<
+                unsafe extern "C" fn(
+                    *const c_void,
+                    usize,
+                    u32,
+                    i32,
+                    u32,
+                    u32,
+                    *mut u32,
+                    *mut c_void,
+                ) -> i32,
+            > = lib.get(b"espeak_Synth")?;
+            let sync: libloading::Symbol<unsafe extern "C" fn() -> i32> =
+                lib.get(b"espeak_Synchronize")?;
+            let terminate: libloading::Symbol<unsafe extern "C" fn() -> i32> =
+                lib.get(b"espeak_Terminate")?;
+            ensure!(
+                init(3, 0, std::ptr::null(), 0x8000) > 0,
+                "speech initialization failed"
+            );
+            ensure!(voice(c"cmn".as_ptr()) == 0, "Chinese voice unavailable");
+            let result = synth(
+                c_text.as_ptr().cast(),
+                c_text.as_bytes_with_nul().len(),
+                0,
+                1,
+                0,
+                1,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            let completed = sync();
+            terminate();
+            ensure!(result == 0 && completed == 0, "speech playback failed");
+            return Ok(());
+        }
     }
-    Ok(())
+    for (program, args) in [
+        ("spd-say", &["-w", "-l", "cmn", text.as_str()][..]),
+        ("espeak-ng", &["-v", "cmn", text.as_str()][..]),
+    ] {
+        if let Ok(status) = Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
+            if status.success() {
+                return Ok(());
+            }
+        }
+    }
+    anyhow::bail!("Install espeak-ng")
 }
 #[cfg(test)]
 mod tests {

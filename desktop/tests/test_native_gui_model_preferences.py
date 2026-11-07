@@ -1,25 +1,58 @@
 """Offline filtering contracts; Android source/MMKV I/O requires device proof."""
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
-JAVA = Path('/home/zhengfa/.local/opt/android-studio/jbr/bin')
-ANDROID = Path('/home/zhengfa/Android/Sdk/platforms/android-36/android.jar')
-GSON = ROOT / 'research/jadx/lib/jadx-1.5.6-all.jar'
+
+
+def _java_bin() -> Path:
+    for candidate in (
+        os.environ.get('JAVA_HOME'),
+        str(Path.home() / '.local/opt/android-studio/jbr'),
+    ):
+        if candidate and (Path(candidate) / 'bin/javac').is_file():
+            return Path(candidate) / 'bin'
+    javac = shutil.which('javac')
+    if javac:
+        return Path(javac).resolve().parent
+    return Path.home() / '.local/opt/android-studio/jbr/bin'
+
+
+def _android_jar() -> Path | None:
+    for sdk in (
+        os.environ.get('ANDROID_SDK_ROOT'),
+        os.environ.get('ANDROID_HOME'),
+        str(Path.home() / 'Android/Sdk'),
+    ):
+        if not sdk:
+            continue
+        preferred = Path(sdk) / 'platforms/android-36/android.jar'
+        if preferred.is_file():
+            return preferred
+        jars = sorted((Path(sdk) / 'platforms').glob('android-*/android.jar'), reverse=True)
+        if jars:
+            return jars[0]
+    return None
 
 
 class ModelPreferencesTest(unittest.TestCase):
     def test_only_valid_registered_model_selection_is_returned(self):
+        java_bin = _java_bin()
+        android_jar = _android_jar()
         with tempfile.TemporaryDirectory(prefix='stepx-model-preferences-') as tmp:
             work = Path(tmp)
             json_source = work / 'org/json/JSONObject.java'
             json_source.parent.mkdir(parents=True)
             json_source.write_text('''package org.json;
-import java.util.*; public class JSONObject {
+import java.util.*;import java.util.regex.*; public class JSONObject {
 private Map<String,Object> values=new LinkedHashMap<>();
-public JSONObject(){} public JSONObject(String value){values=new com.google.gson.Gson().fromJson(value,Map.class);}
+public JSONObject(){} public JSONObject(String value){
+if(value!=null){Matcher m=Pattern.compile("\\"([^\\"]+)\\"\\\\s*:\\\\s*(\\"([^\\"]*)\\"|(-?\\\\d+))").matcher(value);
+while(m.find()){values.put(m.group(1),m.group(3)!=null?m.group(3):Integer.valueOf(m.group(4)));}}}
 public JSONObject put(String key,Object value){values.put(key,value);return this;}
 public Object opt(String key){return values.get(key);}
 public String toString(){return values.toString();}
@@ -55,12 +88,19 @@ catch(InvocationTargetException expected){check(expected.getCause() instanceof S
 System.out.println("model selection filtering contracts passed");
 }}
 ''')
-            cp = f'{ANDROID}:{GSON}'
-            subprocess.run([str(JAVA / 'javac'), '--release', '11', '-cp', cp,
-                            '-d', str(work / 'classes'), str(json_source), str(harness),
-                            str(ROOT / 'desktop/gui-native/NativeGuiModelPreferences.java')],
-                           check=True, capture_output=True, text=True)
-            result = subprocess.run([str(JAVA / 'java'), '-cp', f'{work / "classes"}:{cp}',
+            cp = str(android_jar) if android_jar else ''
+            javac_cmd = [str(java_bin / 'javac'), '--release', '11']
+            if cp:
+                javac_cmd.extend(['-cp', cp])
+            javac_cmd.extend([
+                '-d', str(work / 'classes'),
+                str(json_source),
+                str(harness),
+                str(ROOT / 'desktop/gui-native/NativeGuiModelPreferences.java'),
+            ])
+            subprocess.run(javac_cmd, check=True, capture_output=True, text=True)
+            run_cp = f'{work / "classes"}:{cp}' if cp else str(work / 'classes')
+            result = subprocess.run([str(java_bin / 'java'), '-cp', run_cp,
                                      'ModelPreferencesContract'], check=True, capture_output=True, text=True)
             self.assertIn('contracts passed', result.stdout)
 

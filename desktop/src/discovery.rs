@@ -20,6 +20,7 @@ struct Discovery {
     daemon: ServiceDaemon,
     receivers: Vec<Receiver<ServiceEvent>>,
     services: HashMap<String, Vec<Service>>,
+    primed: bool,
 }
 
 impl Discovery {
@@ -39,6 +40,7 @@ impl Discovery {
             daemon,
             receivers,
             services: HashMap::new(),
+            primed: false,
         })
     }
 
@@ -48,20 +50,32 @@ impl Discovery {
                 match event {
                     ServiceEvent::ServiceResolved(info) => {
                         let entries = info
-                            .get_addresses_v4()
-                            .into_iter()
+                            .get_addresses()
+                            .iter()
+                            .map(|scoped| scoped.to_ip_addr())
+                            .filter(|ip| {
+                                !matches!(ip, std::net::IpAddr::V6(v6) if v6.is_unicast_link_local())
+                            })
                             .filter_map(|ip| {
                                 service_from_dns(
                                     &info.fullname,
                                     &info.ty_domain,
-                                    &format!("{ip}:{}", info.port),
+                                    &std::net::SocketAddr::new(ip, info.port).to_string(),
                                 )
                             })
                             .collect();
                         self.services.insert(info.fullname.to_lowercase(), entries);
                     }
-                    ServiceEvent::ServiceRemoved(_, name) => {
-                        self.services.remove(&name.to_lowercase());
+                    ServiceEvent::ServiceRemoved(ty, fullname) => {
+                        let full_lower = fullname.to_lowercase();
+                        let trimmed_name = fullname
+                            .trim_end_matches(&format!(".{ty}"))
+                            .trim_end_matches('.');
+                        self.services.retain(|key, list| {
+                            !full_lower.starts_with(key)
+                                && !key.starts_with(&full_lower)
+                                && !list.iter().any(|s| s.name == trimmed_name)
+                        });
                     }
                     _ => {}
                 }
@@ -117,12 +131,13 @@ pub fn discover_services(adb: &Adb) -> Result<Vec<Service>> {
         .map(|s| parse_services(s))
         .unwrap_or_default();
     if let Some(discovery) = native.as_mut() {
-        let deadline = Instant::now()
-            + if first {
-                Duration::from_secs(2)
-            } else {
-                Duration::ZERO
-            };
+        let wait = if !discovery.primed {
+            discovery.primed = true;
+            Duration::from_millis(2000)
+        } else {
+            Duration::from_millis(80)
+        };
+        let deadline = Instant::now() + wait;
         loop {
             discovery.drain();
             if Instant::now() >= deadline {

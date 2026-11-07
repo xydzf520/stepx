@@ -1,0 +1,763 @@
+{
+  "profile": "pandora-12",
+  "observed": "2026-11-05",
+  "schemas": {
+    "speak_text": {
+      "properties": {
+        "text": {
+          "items": "",
+          "properties": "",
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "type": "object"
+    },
+    "start_back_screen_countdown": {
+      "properties": {
+        "seconds": {
+          "items": "",
+          "properties": "",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "seconds"
+      ],
+      "type": "object"
+    },
+    "cancel_back_screen_countdown": {
+      "properties": "",
+      "required": [],
+      "type": "object"
+    },
+    "security_permissioncontroller_global_location": {
+      "type": "object",
+      "required": [
+        "enable"
+      ],
+      "properties": {
+        "enable": {
+          "type": "boolean"
+        }
+      }
+    },
+    "security_permissioncontroller_global_microphone": {
+      "type": "object",
+      "required": [
+        "enable"
+      ],
+      "properties": {
+        "enable": {
+          "type": "boolean"
+        }
+      }
+    },
+    "security_permissioncontroller_global_camera": {
+      "type": "object",
+      "required": [
+        "enable"
+      ],
+      "properties": {
+        "enable": {
+          "type": "boolean"
+        }
+      }
+    },
+    "security_permissioncontroller_delete_file_and_image_protect": {
+      "type": "object",
+      "required": [
+        "enable"
+      ],
+      "properties": {
+        "enable": {
+          "type": "boolean"
+        }
+      }
+    },
+    "search_open": {
+      "type": "object",
+      "required": []
+    },
+    "connectivitysettings_open_settings_wifi_settings_activity": {
+      "type": "object",
+      "required": []
+    },
+    "connectivitysettings_open_settings_bluetooth_settings_activity": {
+      "type": "object",
+      "required": []
+    },
+    "dialer_contacts_add": {
+      "type": "object",
+      "required": [
+        "number"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "note": {
+          "type": "string"
+        },
+        "email": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "number": {
+          "type": "string"
+        },
+        "address": {
+          "type": "string"
+        },
+        "company": {
+          "type": "string"
+        }
+      }
+    },
+    "dialer_show_dialpad": {
+      "type": "object",
+      "required": [],
+      "properties": {
+        "number": {
+          "type": "string"
+        }
+      }
+    },
+    "settings_open_settings_homepage_activity": {
+      "type": "object",
+      "required": []
+    },
+    "settings_open_settings_sound_settings_activity": {
+      "type": "object",
+      "required": []
+    },
+    "settings_wifi_switch": {
+      "type": "object",
+      "required": [
+        "openState"
+      ],
+      "properties": {
+        "openState": {
+          "type": "boolean"
+        }
+      }
+    },
+    "settings_bluetooth_switch": {
+      "type": "object",
+      "required": [
+        "openState"
+      ],
+      "properties": {
+        "openState": {
+          "type": "boolean"
+        }
+      }
+    },
+    "settings_disturb_mode_switch": {
+      "type": "object",
+      "required": [
+        "openState"
+      ],
+      "properties": {
+        "openState": {
+          "type": "boolean"
+        }
+      }
+    },
+    "settings_adjust_sound": {
+      "type": "object",
+      "required": [
+        "openState"
+      ],
+      "properties": {
+        "openState": {
+          "type": "boolean"
+        },
+        "soundType": {
+          "type": "string"
+        }
+      }
+    },
+    "settings_adjust_brightness": {
+      "type": "object",
+      "required": [],
+      "properties": {
+        "newValue": {
+          "type": "string"
+        },
+        "openState": {
+          "type": "boolean"
+        }
+      }
+    },
+    "settings_set_media_sound": {
+      "type": "object",
+      "required": [
+        "newValue"
+      ],
+      "properties": {
+        "newValue": {
+          "type": "string"
+        }
+      }
+    },
+    "settings_open_language": {
+      "required": [],
+      "type": "object"
+    },
+    "alarm_clock_add": {
+      "type": "object",
+      "required": [
+        "hour",
+        "minute"
+      ],
+      "properties": {
+        "hour": {
+          "type": "integer"
+        },
+        "label": {
+          "type": "string"
+        },
+        "minute": {
+          "type": "integer"
+        },
+        "vibrate": {
+          "type": "boolean"
+        },
+        "weekdays": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "repeatDays": {
+          "type": "integer"
+        }
+      }
+    },
+    "screen_capture_screenshot": {
+      "type": "object",
+      "required": []
+    },
+    "filemanager_create_folder": {
+      "type": "object",
+      "required": [
+        "folderName"
+      ],
+      "properties": {
+        "folderName": {
+          "type": "string"
+        }
+      }
+    },
+    "filemanager_search_file": {
+      "type": "object",
+      "required": [
+        "keywords"
+      ],
+      "properties": {
+        "keywords": {
+          "type": "string"
+        }
+      }
+    },
+    "filemanager_edit_folder_name": {
+      "type": "object",
+      "required": [
+        "file_uri",
+        "newName"
+      ],
+      "properties": {
+        "newName": {
+          "type": "string"
+        },
+        "file_uri": {
+          "type": "string"
+        }
+      }
+    },
+    "filemanager_edit_file_name": {
+      "type": "object",
+      "required": [
+        "file_uri",
+        "newName"
+      ],
+      "properties": {
+        "newName": {
+          "type": "string"
+        },
+        "file_uri": {
+          "type": "string"
+        }
+      }
+    },
+    "calendar_add_event": {
+      "type": "object",
+      "required": [
+        "title",
+        "start_time",
+        "end_time"
+      ],
+      "properties": {
+        "title": {
+          "type": "string"
+        },
+        "end_time": {
+          "type": "string"
+        },
+        "location": {
+          "type": "string"
+        },
+        "is_all_day": {
+          "type": "boolean"
+        },
+        "start_time": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "recurrence_type": {
+          "type": "number"
+        },
+        "reminder_offset": {
+          "type": "number"
+        },
+        "recurrence_sub_type": {
+          "type": "number"
+        },
+        "recurrence_until_time": {
+          "type": "string"
+        },
+        "recurrence_until_count": {
+          "type": "number"
+        }
+      }
+    },
+    "open_app_by_package": {
+      "type": "object",
+      "required": [
+        "packageName"
+      ],
+      "properties": {
+        "className": {
+          "type": "string"
+        },
+        "packageName": {
+          "type": "string"
+        }
+      }
+    },
+    "common_ability_clipboard_text": {
+      "type": "object",
+      "required": []
+    },
+    "open_url_with_browser": {
+      "type": "object",
+      "required": [
+        "url"
+      ],
+      "properties": {
+        "url": {
+          "type": "string"
+        }
+      }
+    },
+    "set_back_screen_auto_brightness": {
+      "type": "object",
+      "required": [
+        "enabled"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        }
+      }
+    },
+    "set_back_screen_brightness": {
+      "type": "object",
+      "required": [
+        "brightness"
+      ],
+      "properties": {
+        "brightness": {
+          "type": "integer"
+        }
+      }
+    },
+    "set_back_screen_camera_link": {
+      "type": "object",
+      "required": [
+        "enabled"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        }
+      }
+    },
+    "set_back_screen_display_mode": {
+      "type": "object",
+      "required": [
+        "mode"
+      ],
+      "properties": {
+        "mode": {
+          "type": "string"
+        },
+        "customEnd": {
+          "type": "integer"
+        },
+        "customStart": {
+          "type": "integer"
+        }
+      }
+    },
+    "set_back_screen_basic_type": {
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string"
+        }
+      }
+    },
+    "set_back_screen_frame": {
+      "type": "object",
+      "required": [
+        "frame"
+      ],
+      "properties": {
+        "frame": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        }
+      }
+    },
+    "clear_back_screen_frame": {
+      "type": "object",
+      "required": []
+    },
+    "wake_up_back_screen": {
+      "type": "object",
+      "required": []
+    },
+    "sleep_back_screen": {
+      "type": "object",
+      "required": []
+    },
+    "security_permissioncontroller_enter_file_recycle_bin_page": {
+      "type": "object",
+      "required": []
+    },
+    "security_safebox_open": {
+      "type": "object",
+      "required": []
+    },
+    "dialer_hangup_call": {
+      "type": "object",
+      "required": []
+    },
+    "settings_open_manage_applications": {
+      "type": "object",
+      "required": []
+    },
+    "settings_open_feedback": {
+      "type": "object",
+      "required": []
+    },
+    "security_center_open_main": {
+      "type": "object",
+      "required": []
+    },
+    "security_manager_into_virus_page": {
+      "type": "object",
+      "required": []
+    },
+    "sms_send": {
+      "type": "object",
+      "required": [
+        "phone",
+        "message"
+      ],
+      "properties": {
+        "phone": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "sim_slot": {
+          "type": "integer"
+        },
+        "send_directly": {
+          "type": "boolean"
+        }
+      }
+    },
+    "gallery_open_trash_bin": {
+      "type": "object",
+      "required": []
+    },
+    "lite_recorder_open_home": {
+      "type": "object"
+    },
+    "file_safe_delete": {
+      "properties": {
+        "path": {
+          "default": "",
+          "description": "要安全删除的外部存储原始路径，例如 /storage/emulated/0/Download/a.txt 或 /sdcard/Download/a.txt。与 paths 二选一。",
+          "items": "",
+          "properties": "",
+          "type": "string"
+        },
+        "paths": {
+          "default": "",
+          "description": "要安全删除的外部存储原始路径列表。与 path 二选一，用于批量删除多个文件或目录。",
+          "items": {
+            "properties": "",
+            "required": "",
+            "type": "string"
+          },
+          "properties": "",
+          "type": "array"
+        },
+        "recursive": {
+          "default": "",
+          "description": "目录删除是否递归，默认 true；false 时目录删除会失败，对普通文件无影响。",
+          "items": "",
+          "properties": "",
+          "type": "boolean"
+        },
+        "truth_id": {
+          "default": "",
+          "description": "与本次工具调用对应的 tool_call_id，用于本机删除较真与云端可撤 step 关联；缺省时跳过较真记录。",
+          "items": "",
+          "properties": "",
+          "type": "string"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "file_restore": {
+      "properties": {
+        "path": {
+          "description": "要恢复的文件或目录在删除前的外部存储原始路径，例如 /storage/emulated/0/Download/a.txt 或 /sdcard/Download/a.txt。与 paths 二选一。",
+          "type": "string"
+        },
+        "paths": {
+          "description": "要恢复的外部存储原始路径列表。与 path 二选一，用于批量恢复多个文件或目录。",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "recursive": {
+          "description": "目录恢复是否包含原路径前缀下的项目，默认 true；false 时只恢复精确匹配路径。",
+          "type": "boolean"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "stepx_gui_control": {
+      "properties": {
+        "action": {
+          "default": "",
+          "description": "",
+          "items": "",
+          "properties": {
+            "package": {
+              "default": "",
+              "description": "当 action.type=launch 时要启动的应用包名。",
+              "items": "",
+              "properties": "",
+              "type": "string"
+            },
+            "text": {
+              "default": "",
+              "description": "",
+              "items": "",
+              "properties": "",
+              "type": "string"
+            },
+            "type": {
+              "default": "",
+              "description": "",
+              "items": "",
+              "properties": "",
+              "type": "string"
+            },
+            "x": {
+              "default": "",
+              "description": "",
+              "items": "",
+              "properties": "",
+              "type": "number"
+            },
+            "x1": {
+              "default": "",
+              "description": "",
+              "items": "",
+              "properties": "",
+              "type": "number"
+            },
+            "x2": {
+              "default": "",
+              "description": "",
+              "items": "",
+              "properties": "",
+              "type": "number"
+            },
+            "y": {
+              "default": "",
+              "description": "",
+              "items": "",
+              "properties": "",
+              "type": "number"
+            },
+            "y1": {
+              "default": "",
+              "description": "",
+              "items": "",
+              "properties": "",
+              "type": "number"
+            },
+            "y2": {
+              "default": "",
+              "description": "",
+              "items": "",
+              "properties": "",
+              "type": "number"
+            }
+          },
+          "type": "object"
+        },
+        "epoch": {
+          "default": "",
+          "description": "",
+          "items": "",
+          "properties": "",
+          "type": "integer"
+        },
+        "goal": {
+          "default": "",
+          "description": "",
+          "items": "",
+          "properties": "",
+          "type": "string"
+        },
+        "op": {
+          "default": "",
+          "description": "",
+          "items": "",
+          "properties": "",
+          "type": "string"
+        },
+        "task": {
+          "default": "",
+          "description": "",
+          "items": "",
+          "properties": "",
+          "type": "string"
+        },
+        "treeHash": {
+          "default": "",
+          "description": "",
+          "items": "",
+          "properties": "",
+          "type": "string"
+        }
+      },
+      "required": [
+        "op"
+      ],
+      "type": "object"
+    },
+    "open_flash_light": {
+      "properties": {
+        "openState": {
+          "description": "open or close flash light,true:open, false:close",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "openState"
+      ],
+      "type": "object"
+    },
+    "settings_open_settings_device_info_settings_activity": {
+      "required": [],
+      "type": "object"
+    },
+    "settings_open_settings_storage_dashboard_activity": {
+      "required": [],
+      "type": "object"
+    },
+    "settings_open_step_os_settings_activity_step_os_battery_settings_activity": {
+      "properties": "",
+      "required": [],
+      "type": "object"
+    },
+    "settings_open_step_os_settings_activity_step_os_screen_zoom_and_font_size_activity": {
+      "properties": "",
+      "required": [],
+      "type": "object"
+    },
+    "settings_open_step_os_settings_activity_step_os_configure_notification_settings_activity": {
+      "properties": "",
+      "required": [],
+      "type": "object"
+    },
+    "settings_open_step_os_settings_activity_step_os_wallpaper_type_settings_activity": {
+      "properties": "",
+      "required": [],
+      "type": "object"
+    },
+    "connectivitysettings_open_settings_tether_settings_activity": {
+      "required": [],
+      "type": "object"
+    },
+    "connectivitysettings_open_settings_vpn_settings_activity": {
+      "required": [],
+      "type": "object"
+    },
+    "connectivitysettings_open_settings_nfc_settings_activity": {
+      "required": [],
+      "type": "object"
+    },
+    "connectivitysettings_open_settings_mobile_network_settings_activity": {
+      "required": [],
+      "type": "object"
+    },
+    "alarm_clock_timer_add": {
+      "properties": {
+        "label": {
+          "description": "作用: 倒计时计时器的可选标签，用于标记该计时器。",
+          "type": "string"
+        },
+        "seconds": {
+          "description": "作用: 倒计时计时器的时长，单位为秒。格式约束: 整数，取值范围为 1 - 86400。",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "seconds"
+      ],
+      "type": "object"
+    },
+    "connectivitysettings_open_settings_wifi_display_settings_activity": {
+      "required": [],
+      "type": "object"
+    }
+  }
+}

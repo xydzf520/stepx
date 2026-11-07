@@ -4,6 +4,22 @@ use super::super::{
 };
 use facloud_ui::{assets::asset_cache::AssetSource, elements::*, platform::Cursor};
 
+fn remembered_device_is_online(
+    serial: &str,
+    selected: Option<&stepx_companion::device::Device>,
+    transports: &[stepx_companion::device::Transport],
+) -> bool {
+    transports
+        .iter()
+        .any(|t| t.state == "device" && t.id == serial)
+        || selected.is_some_and(|d| {
+            d.serial == serial
+                && transports
+                    .iter()
+                    .any(|t| t.state == "device" && t.id == d.transport)
+        })
+}
+
 fn guide_can_continue(
     step: u8,
     connected: bool,
@@ -13,8 +29,11 @@ fn guide_can_continue(
     match step {
         0 => true,
         1 => connected,
-        2 => connected && companion.installed && companion.pairing_permission_granted,
-        3 => connected && companion.pairing_ready && companion.wireless_enabled == Some(true),
+        2 => connected && companion.installed,
+        // This only opens pairing controls. Some firmware cannot report the
+        // switch state; do not trap a user who enabled it on the phone. Step 4
+        // still requires an actual wireless transport before completion.
+        3 => connected,
         4 => connected && wireless,
         _ => false,
     }
@@ -67,7 +86,7 @@ impl Companion {
             "安装 StepX伴侣",
             "开启无线调试",
             "手机扫码配对",
-            "连接成功",
+            "确认连接",
         ];
         let mut body = vec![
             self.between(
@@ -114,11 +133,12 @@ impl Companion {
         );
         match step {
             0 => {
-                body.push(self.text("在手机「设置 → 关于手机 → 版本信息」连续点击「版本号」7 次，按系统提示完成验证。返回设置，搜索「开发者选项」，开启「USB 调试」。不同系统的入口名称可能略有不同。", BODY, p.text));
-                body.push(self.text("首次安装伴侣需要已授权的 USB 连接。也可先用下方系统配对码建立无线连接使用现有功能，但安装与权限适配仍需 USB。未安装的伴侣无法直接扫码取得权限。", CAPTION, p.text2));
+                body.push(self.connection_reference(1));
+                body.push(self.button("guide-find-developer", "找不到开发者选项？看前一步", Action::AdbGuide(Some(0)), Btn::Secondary));
+                body.push(self.text("第一次使用建议先连数据线；电脑已包含连接工具。", CAPTION, p.text2));
             }
             1 => {
-                body.push(self.text("用支持数据传输的 USB 线连接手机和电脑，保持手机解锁。在「允许 USB 调试」弹窗核对这台电脑并允许。", BODY, p.text));
+                body.push(self.connection_reference(2));
                 let hint = if connected {
                     "已通过 ADB 验证当前手机，可继续安装。"
                 } else if self.devices.iter().any(|d| d.state == "unauthorized") {
@@ -131,7 +151,7 @@ impl Companion {
                 body.push(self.text(hint, CAPTION, if connected { p.success } else { p.text2 }));
             }
             2 => {
-                body.push(self.text("安装手机界面与当前会话的扫码系统服务，并配置文件收发、背屏所需权限。安装会核验签名、权限和手机的服务接收结果；熄屏任务另以真实连接回执确认。", BODY, p.text));
+                body.push(self.text("在电脑点下面的安装按钮，再到手机确认安装。", BODY, p.text));
                 body.push(self.text(
                     if companion.checked {
                         &companion.message
@@ -155,7 +175,7 @@ impl Companion {
                         Btn::Primary,
                     )
                 });
-                body.push(self.text("安装时配置相机、通知、通话状态和电池优化豁免。已适配的 StepX 172 固件支持开机恢复：重启后首次手动解锁，已配对电脑在同一局域网自动连接。新电脑、新 Wi-Fi 仍需首次授权；安装结果会说明未完成的能力。", CAPTION, p.text3));
+                body.push(self.text("手机询问安装、通知或扫码权限时，按当前功能确认。若签名不一致会保留数据并停止覆盖；具体结果会显示在这里。", CAPTION, p.text3));
             }
             3 => {
                 let wireless = self
@@ -163,15 +183,8 @@ impl Companion {
                     .as_ref()
                     .is_some_and(|d| is_wireless(&d.transport));
                 let wireless_ready = wireless || companion.wireless_enabled == Some(true);
-                body.push(self.text(
-                    if companion.pairing_ready {
-                        "手机和电脑连接同一局域网。在手机 StepX伴侣「连接」页开启无线调试，确认 Android 的当前 Wi-Fi 信任提示。不要使用访客网络或阻止设备互访的网络。"
-                    } else {
-                        "手机和电脑连接同一局域网。在手机「设置 → 开发者选项 → 无线调试」手动开启，确认系统的 Wi-Fi 信任提示。"
-                    },
-                    BODY,
-                    p.text,
-                ));
+                body.push(self.connection_reference(3));
+                body.push(self.text("手机若询问是否允许当前 Wi-Fi，请在手机上确认。", CAPTION, p.text2));
                 if wireless_ready {
                     body.push(self.text(
                         if wireless {
@@ -196,7 +209,9 @@ impl Companion {
                         match companion.wireless_enabled {
                             Some(true) => "已检测到手机无线调试开启，可继续下一步完成配对。",
                             Some(false) => "无线调试尚未开启；在手机确认后点击「检测伴侣状态」。",
-                            None => "请在手机开启「无线调试」，或直接点击「下一步」使用配对码连接。",
+                            None => {
+                                "请在手机开启「无线调试」，或直接点击「下一步」使用配对码连接。"
+                            }
                         },
                         CAPTION,
                         p.text2,
@@ -226,8 +241,9 @@ impl Companion {
                 ]));
             }
             4 => {
-                body.push(self.text(if companion.pairing_ready { "在手机 StepX伴侣「连接」页点「扫码连接电脑」扫描下方二维码。也可以使用系统开发者选项中的「使用二维码配对设备」。" } else { "伴侣扫码服务尚未通过核验。请使用手机系统「开发者选项 → 无线调试 → 使用二维码配对设备」，或切换下方的 6 位配对码。" }, BODY, p.text));
-                body.push(self.text("首次配对后会记住这台手机，同一局域网内自动重连。手机开启「连接管理 → 自动连接」，电脑保持 StepX Companion 运行即可。新 Wi-Fi 的系统信任授权仍需首次确认。", CAPTION, p.text2));
+                body.push(self.connection_reference(3));
+                body.push(self.text(if companion.pairing_ready { "在手机伴侣点“扫码连接电脑”，扫描电脑下方的二维码。" } else { "在手机选“使用配对码配对设备”，把弹窗中的地址和六位码填到电脑下方。" }, BODY, p.text));
+                body.push(self.text("填配对弹窗里的地址，不是上一页的连接地址；配对成功后会记住这台手机。", CAPTION, p.text2));
             }
             _ => {
                 let wireless = self
@@ -239,7 +255,7 @@ impl Companion {
                     self.button(
                         "guide-home",
                         "返回首页",
-                        Action::Page(Page::Overview),
+                        Action::Page(Page::Home),
                         Btn::Primary,
                     ),
                     self.button(
@@ -276,7 +292,9 @@ impl Companion {
             navigation.push(if can_continue && !self.busy {
                 self.button(
                     "guide-next",
-                    if step == 0 {
+                    if step == 3 {
+                        "去配对"
+                    } else if step == 0 {
                         "已开启，下一步"
                     } else {
                         "下一步"
@@ -294,34 +312,24 @@ impl Companion {
         self.sub_enter(self.panel(body))
     }
 
-    fn detected_phone_ip(&self) -> Option<String> {
-        let wifi_ip = self.cached_device_metrics().wifi_ipv4;
-        if !wifi_ip.is_empty() && wifi_ip != "未知" && wifi_ip != "未检测" {
-            return Some(wifi_ip);
-        }
-        if let Some(ip) = self.pairing_hosts.first() {
-            return Some(ip.to_string());
-        }
-        if let Some(svc) = self.mdns_services.first() {
-            if let Some(host) = svc.endpoint.split(':').next() {
-                if !host.is_empty() {
-                    return Some(host.to_string());
-                }
-            }
-        }
-        None
+    fn detected_connection_endpoint(&self) -> Option<String> {
+        let selected = self.selected.as_ref()?;
+        // Only current, identity-associated endpoints. An IP alone tells us no port.
+        self.online_device_transports(selected)
+            .into_iter()
+            .find(|endpoint| stepx_companion::pairing::validate_endpoint(endpoint).is_ok())
     }
 
     fn connection_pairing_panel(&self) -> El {
         let p = self.p();
-        let detected_ip = self.detected_phone_ip();
+        let detected_endpoint = self.detected_connection_endpoint();
         let connected = self.selected.is_some();
         let wireless = self
             .selected
             .as_ref()
             .is_some_and(|d| is_wireless(&d.transport));
         let mut rows = vec![
-            self.heading("无线配对"),
+            self.section_heading(UiIcon::Smartphone, "无线配对"),
             self.text(
                 "Android 11 及以上支持系统无线调试。手机与电脑需要能在同一局域网互相访问。",
                 CAPTION,
@@ -337,13 +345,13 @@ impl Companion {
                 Btn::Secondary,
             ));
         }
-        if let Some(ip) = &detected_ip {
+        if let Some(endpoint) = &detected_endpoint {
             if !wireless {
                 rows.push(self.button_icon(
                     "conn-fill-detected-ip",
-                    format!("填入检测到的手机 IP ({ip}:5555)"),
-                    UiIcon::Bolt,
-                    Action::FillDetectedPhoneIp(ip.clone()),
+                    format!("使用已验证的连接地址 {endpoint}"),
+                    UiIcon::Wifi,
+                    Action::FillDetectedConnectionEndpoint(endpoint.clone()),
                     Btn::Ghost,
                 ));
             }
@@ -351,7 +359,7 @@ impl Companion {
         if wireless {
             rows.push(
                 Container::new(self.text(
-                    "当前手机已通过局域网无线连接，无需数据线即可使用全部功能。如需配对其他手机，可使用下方方式。",
+                    "当前手机已连接。以下入口用于添加另一台手机；可用功能取决于手机权限与固件支持。",
                     CAPTION,
                     p.success_text,
                 ))
@@ -364,7 +372,7 @@ impl Companion {
         } else if connected {
             rows.push(
                 Container::new(self.text(
-                    "当前手机已通过 USB 连接，系统会自动预热并维护同局域网无线备用通道，无需手动扫码配对；如需手动绑定新设备可使用下方配对方式。",
+                    "当前手机已通过 USB 连接。无线备用需要手机开启无线调试并通过身份核验；下方可配对其他手机。",
                     CAPTION,
                     p.success_text,
                 ))
@@ -412,7 +420,12 @@ impl Companion {
                         p.text2,
                     ));
                     rows.push(self.text(format!("配对服务：{}", qr.service), MICRO, p.text3));
-                    rows.push(self.button("qr-refresh", "生成新二维码", Action::Qr, Btn::Secondary));
+                    rows.push(self.button(
+                        "qr-refresh",
+                        "生成新二维码",
+                        Action::Qr,
+                        Btn::Secondary,
+                    ));
                     rows.push(self.text(
                         "可使用 StepX伴侣「扫码连接电脑」或 Android 系统「无线调试 → 使用二维码配对设备」扫描。",
                         CAPTION,
@@ -473,6 +486,16 @@ impl Companion {
     pub(in super::super) fn connect_page(&self) -> El {
         let p = self.p();
         let mut sections = vec![];
+        if self.connection_watch.user_paused {
+            sections.push(self.panel(vec![
+                self.heading("自动连接已暂停"),
+                self.text(
+                    "已保留信任信息。选择下方手机并点击连接，即可恢复本次桌面会话。",
+                    CAPTION,
+                    p.text2,
+                ),
+            ]));
+        }
         if let Some(step) = self.connect_guide_step {
             sections.push(self.connection_guide(step));
         } else if self.selected.is_none() && self.preferences.devices.is_empty() {
@@ -496,6 +519,96 @@ impl Companion {
                 ),
             )]));
         }
+        if let Some(sel) = &self.selected {
+            let backups = self.online_device_backups(sel);
+            let has_dual = self.device_has_online_usb_and_wireless(sel);
+            let active_transport = self.online_device_active_transport(sel);
+            let active_wireless = is_wireless(&active_transport);
+            let primary_desc = format!(
+                "{} · {}",
+                if active_wireless {
+                    "无线 Wi-Fi"
+                } else {
+                    "USB 有线"
+                },
+                active_transport
+            );
+            let standby_desc = if !backups.is_empty() {
+                format!(
+                    "已验证备用：{} · 当前通道断开后尝试切换",
+                    backups.join(" / ")
+                )
+            } else if !active_wireless {
+                "USB 正在使用；无线备用尚未验证，请完成无线连接后再拔线。".into()
+            } else {
+                "已通过无线连接；手机与电脑保持同一网络即可继续同步。".into()
+            };
+            let mut dual_actions = Vec::new();
+            if let Some(standby) = backups.first() {
+                let switch_label = if is_wireless(standby) {
+                    "切换至无线通道"
+                } else {
+                    "切换至 USB 通道"
+                };
+                dual_actions.push(self.button(
+                    "conn-switch-preferred-transport",
+                    switch_label,
+                    Action::SwitchPreferredTransport(standby.clone()),
+                    Btn::Secondary,
+                ));
+            } else if !active_wireless {
+                dual_actions.push(self.button(
+                    "conn-enable-usb-wireless-standby",
+                    "启用无线备用",
+                    Action::EnableUsbWirelessBridge,
+                    Btn::Primary,
+                ));
+            }
+            dual_actions.push(self.button(
+                "conn-heal-connection",
+                "检查连接",
+                Action::HealConnection,
+                Btn::Secondary,
+            ));
+            dual_actions.push(self.button_icon(
+                "conn-ai-diagnosis",
+                "AI 诊断",
+                UiIcon::Sparkles,
+                Action::RunDoctorHarness {
+                    topic: stepx_companion::doctor_harness::DoctorTopic::CompanionSelfHeal,
+                    query: "检查当前手机连接、伴侣后台与权限，给出依据和可执行修复建议".into(),
+                },
+                Btn::Secondary,
+            ));
+            sections.push(self.panel(vec![
+                self.between(
+                    self.hstack(
+                        S2,
+                        vec![
+                            self.content_icon(UiIcon::Smartphone, 22., p.text2),
+                            self.heading(&sel.model),
+                            self.device_connection_icons("connection-primary", sel),
+                            self.pill_badge(
+                                if has_dual {
+                                    "双通道已连接"
+                                } else if !backups.is_empty() {
+                                    "备用地址已连接"
+                                } else if active_wireless {
+                                    "已连接"
+                                } else {
+                                    "已连接"
+                                },
+                                p.success_text,
+                                p.success_soft,
+                            ),
+                        ],
+                    ),
+                    self.wrap(dual_actions),
+                ),
+                self.text(primary_desc, BODY, p.text),
+                self.text(standby_desc, CAPTION, p.text2),
+            ]));
+        }
         let mut channels = vec![self.heading(format!("检测到的设备 · {}", self.devices.len()))];
         if self.devices.is_empty() {
             channels.push(self.text(
@@ -504,11 +617,14 @@ impl Companion {
                 p.text2,
             ));
         }
-        for (i, device) in self.devices.iter().enumerate() {
-            let selected = self
-                .selected
-                .as_ref()
-                .is_some_and(|d| d.transport == device.id);
+        let range = self.list_page_range("connected-device-transports",self.devices.len(),30);
+        channels.push(self.list_page_controls("connected-device-transports",self.devices.len(),30));
+        for (i, device) in self.devices.iter().enumerate().skip(range.start).take(range.len()) {
+            let selected = self.selected.as_ref().is_some_and(|d| {
+                self.online_device_transports(d)
+                    .iter()
+                    .any(|id| id == &device.id || device.backup_transports().contains(id))
+            });
             let online = device.state == "device";
             let wireless_ch = is_wireless(&device.id);
             let note = match device.state.as_str() {
@@ -526,24 +642,25 @@ impl Companion {
                         self.hstack(
                             S2,
                             vec![
-                                self.ui_icon(
-                                    if wireless_ch {
-                                        UiIcon::Wifi
-                                    } else {
-                                        UiIcon::Smartphone
-                                    },
-                                    20.,
-                                    p.text2,
-                                ),
+                                self.content_icon(UiIcon::Smartphone, 20., p.text2),
                                 self.heading(if device.model.is_empty() {
                                     "Android 设备"
                                 } else {
                                     &device.model
                                 }),
-                                self.pill_badge(
-                                    if wireless_ch { "无线" } else { "USB" },
+                                self.status_icon(
+                                    format!("conn-transport-{i}"),
+                                    if wireless_ch {
+                                        "无线连接"
+                                    } else {
+                                        "USB 有线连接"
+                                    },
+                                    if wireless_ch {
+                                        UiIcon::Wifi
+                                    } else {
+                                        UiIcon::Usb
+                                    },
                                     p.text2,
-                                    p.surface,
                                 ),
                             ],
                         ),
@@ -552,7 +669,12 @@ impl Companion {
                     ],
                 ),
                 if selected {
-                    self.pill_badge("已连接", p.success_text, p.success_soft)
+                    self.status_icon(
+                        format!("conn-online-{i}"),
+                        "当前设备已连接",
+                        UiIcon::Check,
+                        p.success_text,
+                    )
                 } else if online && !self.busy {
                     self.button(
                         format!("conn-select-{i}"),
@@ -614,7 +736,7 @@ impl Companion {
                 .finish(),
             );
         }
-        let mut remembered = vec![self.heading("已信任的手机")];
+        let mut remembered = vec![self.section_heading(UiIcon::Shield, "已信任的手机")];
         if self.preferences.devices.is_empty() {
             remembered.push(self.text(
                 "成功验证设备后，会在此保存型号和序列号。",
@@ -623,23 +745,29 @@ impl Companion {
             ));
         }
         let multi_remembered = self.preferences.devices.len() > 1;
-        for (idx, device) in self.preferences.devices.iter().enumerate() {
+        let range = self.list_page_range("remembered-devices",self.preferences.devices.len(),30);
+        remembered.push(self.list_page_controls("remembered-devices",self.preferences.devices.len(),30));
+        for (idx, device) in self.preferences.devices.iter().enumerate().skip(range.start).take(range.len()) {
             let is_preferred =
                 self.preferences.selected_serial.as_deref() == Some(device.serial.as_str());
-            let is_online = self.selected.as_ref().is_some_and(|sel| {
-                sel.serial == device.serial
-                    || (!device.model.is_empty() && sel.model == device.model)
-            }) || self.devices.iter().any(|d| {
-                d.state == "device"
-                    && (d.id == device.serial
-                        || (!device.model.is_empty() && d.model == device.model))
-            });
+            let is_online =
+                remembered_device_is_online(&device.serial, self.selected.as_ref(), &self.devices);
             let mut left = vec![self.text(&device.model, BODY, p.text)];
             if is_online {
-                left.push(self.pill_badge("当前在线", p.success_text, p.success_soft));
+                left.push(self.status_icon(
+                    format!("conn-trusted-online-{idx}"),
+                    "当前在线",
+                    UiIcon::Check,
+                    p.success_text,
+                ));
             }
             if is_preferred {
-                left.push(self.pill_badge("默认", p.accent, p.accent_soft));
+                left.push(self.status_icon(
+                    format!("conn-trusted-default-{idx}"),
+                    "默认连接设备",
+                    UiIcon::Pin,
+                    p.accent,
+                ));
             }
             let mut right_actions = vec![];
             if multi_remembered && !is_preferred {
@@ -715,20 +843,96 @@ impl Companion {
         if self.error && self.connect_guide_step.is_none() {
             sections.push(self.panel(vec![self.text(&self.status, BODY, p.danger)]));
         }
-        sections.push(
-            Flex::row()
-                .with_spacing(S4)
-                .with_cross_axis_alignment(CrossAxisAlignment::Start)
-                .with_child(
-                    Expanded::new(
-                        1.,
-                        self.vstack(S4, vec![self.panel(channels), self.panel(remembered)]),
-                    )
-                    .finish(),
-                )
-                .with_child(Expanded::new(1., self.connection_pairing_panel()).finish())
-                .finish(),
-        );
+        if self.doctor_running {
+            sections.push(self.panel(vec![self.lead(
+                S2,
+                self.content_icon(UiIcon::Activity, 16., p.text2),
+                self.text("正在检查手机与电脑；资料同步继续运行", CAPTION, p.text2),
+            )]));
+        } else if let Some(report) = self.doctor_report.as_ref().filter(|r| {
+            self.selected.is_some()
+                && r.topic == stepx_companion::doctor_harness::DoctorTopic::CompanionSelfHeal
+        }) {
+            sections.push(self.panel(vec![
+                self.between(
+                    self.section_heading(UiIcon::Activity, "连接诊断"),
+                    self.line(&report.model_label, MICRO, p.text2),
+                ),
+                self.text(&report.headline, BODY, p.text),
+                self.text(
+                    report.ai_conclusion.as_deref().unwrap_or(&report.summary),
+                    CAPTION,
+                    p.text2,
+                ),
+                self.text(
+                    if report.phone_token_used {
+                        "手机账号已返回诊断建议，修复仍按实测结果核验。"
+                    } else {
+                        "当前显示本地实测结果；未取得手机 AI 的有效答复。"
+                    },
+                    MICRO,
+                    p.text3,
+                ),
+            ]));
+        }
+        if self.selected.is_some() {
+            sections.push(self.render_device_sync_panel());
+        }
+        sections.push(self.panel(vec![self.between(
+            self.vstack(
+                S1,
+                vec![
+                    self.heading("设备管理"),
+                    self.text(
+                        format!(
+                            "{} 台已信任手机 · 可添加手机或管理已保存的连接",
+                            self.preferences.devices.len()
+                        ),
+                        CAPTION,
+                        p.text2,
+                    ),
+                ],
+            ),
+            self.wrap(vec![
+                self.button_icon(
+                    "conn-manage-toggle",
+                    if self.connection_manage_open {
+                        "收起设备"
+                    } else {
+                        "管理设备"
+                    },
+                    UiIcon::Settings,
+                    Action::ConnectionManage(!self.connection_manage_open),
+                    Btn::Secondary,
+                ),
+                self.button_icon(
+                    "conn-pairing-toggle",
+                    if self.connection_pairing_open {
+                        "收起配对"
+                    } else {
+                        "添加手机"
+                    },
+                    UiIcon::Plus,
+                    Action::ConnectionPairing(!self.connection_pairing_open),
+                    Btn::Secondary,
+                ),
+            ]),
+        )]));
+        if self.selected.is_none() || self.connection_manage_open {
+            sections.push(self.responsive_columns(
+                900.,
+                S4,
+                S4,
+                CrossAxisAlignment::Start,
+                vec![(1., self.panel(channels)), (1., self.panel(remembered))],
+            ));
+        }
+        if self.selected.is_none()
+            || self.connection_pairing_open
+            || self.connect_guide_step.is_some()
+        {
+            sections.push(self.connection_pairing_panel());
+        }
         self.vstack(S4, sections)
     }
 }
@@ -738,6 +942,90 @@ mod tests {
     use super::*;
     use stepx_companion::companion_app::CompanionStatus;
     #[test]
+    fn connection_address_uses_real_port_and_keeps_ipv6_brackets() {
+        let mut app = Companion::new_for_test();
+        let mut phone = stepx_companion::device::Device {
+            serial: "ENDPOINT_NO_GUESS".into(),
+            transport: "10.0.1.2".into(),
+            ..Default::default()
+        };
+        app.selected = Some(phone.clone());
+        assert!(
+            app.detected_connection_endpoint().is_none(),
+            "bare IP must not become port 5555"
+        );
+        phone.transport = "[fd00::3]:45281".into();
+        app.selected = Some(phone);
+        assert_eq!(
+            app.detected_connection_endpoint().as_deref(),
+            Some("[fd00::3]:45281")
+        );
+    }
+
+    #[test]
+    fn disconnect_preserves_trust_and_blocks_automatic_reselection() {
+        let mut app = Companion::new_for_test();
+        let serial = "PAUSED_CONNECTION_TEST".to_string();
+        app.preferences.remember(serial.clone(), "PZ261A".into());
+        app.preferences.selected_serial = Some(serial.clone());
+        app.selected = Some(stepx_companion::device::Device {
+            serial: serial.clone(),
+            transport: serial.clone(),
+            ..Default::default()
+        });
+        app.handle_device_action(&Action::Forget);
+        assert!(app.selected.is_none());
+        assert!(app.connection_watch.user_paused);
+        assert!(app.preferences.devices.iter().any(|d| d.serial == serial));
+        assert_eq!(
+            app.preferences.selected_serial.as_deref(),
+            Some(serial.as_str())
+        );
+        app.auto_select();
+        assert!(app.selected.is_none());
+        // Results from work started before disconnect must not resume this client.
+        app.apply(super::super::super::Outcome::Paired(
+            "192.0.2.1:45281".into(),
+        ));
+        app.apply(super::super::super::Outcome::Qr(Some(
+            "192.0.2.1:45281".into(),
+        )));
+        assert!(app.connection_watch.user_paused);
+        assert!(app.pairing_hosts.is_empty());
+        app.handle_device_action(&Action::PairCode);
+        app.handle_device_action(&Action::ConnectEndpoint("invalid-address".into()));
+        assert!(
+            app.connection_watch.user_paused,
+            "invalid input must not resume auto-connect"
+        );
+    }
+
+    #[test]
+    fn replacement_phone_does_not_mark_same_model_history_online() {
+        use stepx_companion::device::{parse_devices, Device};
+        let phone = Device {
+            serial: "NEW_PHONE".into(),
+            transport: "192.0.2.44:43111".into(),
+            model: "PZ261A".into(),
+            android: "16".into(),
+            product: "pandora".into(),
+        };
+        let online = parse_devices(
+            "List of devices attached\n192.0.2.44:43111 device model:PZ261A product:pandora\n",
+        );
+        assert!(remembered_device_is_online(
+            "NEW_PHONE",
+            Some(&phone),
+            &online
+        ));
+        assert!(!remembered_device_is_online(
+            "OLD_PHONE",
+            Some(&phone),
+            &online
+        ));
+        assert!(!remembered_device_is_online("NEW_PHONE", Some(&phone), &[]));
+    }
+    #[test]
     fn onboarding_requires_actual_install_permissions_and_wireless_connection() {
         let mut phone = CompanionStatus::default();
         assert!(guide_can_continue(0, false, false, &phone));
@@ -745,15 +1033,16 @@ mod tests {
         assert!(guide_can_continue(1, true, false, &phone));
         assert!(!guide_can_continue(2, true, false, &phone));
         phone.installed = true;
-        assert!(!guide_can_continue(2, true, false, &phone));
+        assert!(guide_can_continue(2, true, false, &phone));
         phone.pairing_permission_granted = true;
         assert!(guide_can_continue(2, true, false, &phone));
         assert!(!guide_can_continue(2, false, false, &phone));
-        assert!(!guide_can_continue(3, true, false, &phone));
+        assert!(guide_can_continue(3, true, false, &phone));
         phone.wireless_enabled = Some(false);
-        assert!(!guide_can_continue(3, true, false, &phone));
+        assert!(guide_can_continue(3, true, false, &phone));
+        assert!(!guide_can_continue(3, false, false, &phone));
         phone.wireless_enabled = Some(true);
-        assert!(!guide_can_continue(3, true, false, &phone));
+        assert!(guide_can_continue(3, true, false, &phone));
         phone.pairing_ready = true;
         assert!(guide_can_continue(3, true, false, &phone));
         assert!(!guide_can_continue(4, true, false, &phone));

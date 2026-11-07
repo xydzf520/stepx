@@ -13,8 +13,9 @@ use super::super::{
     Action, Companion, F_STORE_SEARCH,
 };
 use crate::app_store::{
-    category_sub_tags, check_store_install_state, compare_android_versions, HistoricalVersion,
-    RelatedAppItem, StoreApp, StoreCategory, StoreInstallState, StoreSource, StoreSourceOffer,
+    category_sub_tags, check_store_install_state, compare_android_versions,
+    is_blacklisted_store_item, HistoricalVersion, RelatedAppItem, StoreApp, StoreCategory,
+    StoreInstallState, StoreSource, StoreSourceOffer,
 };
 use facloud_ui::{
     assets::asset_cache::AssetSource, color::ColorU, elements::*, fonts::Weight, platform::Cursor,
@@ -39,10 +40,7 @@ fn clean_version_display(raw: &str) -> Option<String> {
         .trim()
         .trim_start_matches(|c| c == 'v' || c == 'V')
         .trim();
-    if trimmed.is_empty()
-        || trimmed == "最新版"
-        || trimmed == "开源最新版"
-        || trimmed == "未知"
+    if trimmed.is_empty() || trimmed == "最新版" || trimmed == "开源最新版" || trimmed == "未知"
     {
         return None;
     }
@@ -56,6 +54,7 @@ fn clean_version_display(raw: &str) -> Option<String> {
 fn source_badge_colors(source: StoreSource, p: &Palette) -> (ColorU, ColorU) {
     match source {
         StoreSource::Tencent => (p.blue, blue_soft(p)),
+        StoreSource::Huawei => (p.blue, blue_soft(p)),
         StoreSource::Global => (p.indigo, indigo_soft(p)),
         StoreSource::Official => (p.success_text, p.success_soft),
         StoreSource::GitHub => (p.indigo, indigo_soft(p)),
@@ -68,11 +67,35 @@ fn source_verify_badge(source: StoreSource, p: &Palette) -> (&'static str, Color
     match source {
         StoreSource::Official => ("安装前校验", p.success_text, p.success_soft),
         StoreSource::Tencent => ("安装前校验", p.blue, blue_soft(p)),
+        StoreSource::Huawei => ("安装前校验", p.blue, blue_soft(p)),
         StoreSource::Global => ("第三方来源", p.indigo, indigo_soft(p)),
         StoreSource::GitHub => ("开源发布", p.indigo, indigo_soft(p)),
         StoreSource::FDroid => ("F-Droid 可复现构建", p.warning, p.warning_soft),
         StoreSource::StepOs => ("平台来源", p.text2, p.tag_bg),
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct StoreCountsKey {
+    catalog_ptr: usize,
+    catalog_len: usize,
+    apps_ptr: usize,
+    apps_len: usize,
+    apps_fp: u64,
+}
+
+#[derive(Clone, Copy)]
+struct StoreCountsValue {
+    key: StoreCountsKey,
+    matched_fp: u64,
+    matched_len: u8,
+    matched_indices: [u16; 64],
+    updatable: usize,
+    installed: usize,
+}
+
+std::thread_local! {
+    static STORE_COUNTS_CACHE: std::cell::Cell<Option<StoreCountsValue>> = const { std::cell::Cell::new(None) };
 }
 
 impl Companion {
@@ -82,38 +105,118 @@ impl Companion {
         self.pill_badge(source.short_label(), fg, bg)
     }
 
+    fn cached_store_counts(&self) -> (usize, usize) {
+        if self.apps.is_empty() || self.app_store.catalog.is_empty() {
+            return (0, 0);
+        }
+        #[inline]
+        fn str_sig(s: &str) -> u64 {
+            let b = s.as_bytes();
+            let edge = match (b.first(), b.last()) {
+                (Some(&f), Some(&l)) => ((f as u64) << 8) | (l as u64),
+                _ => 0,
+            };
+            (b.as_ptr() as u64) ^ ((b.len() as u64) << 32) ^ (edge << 48)
+        }
+        #[inline]
+        fn cat_item_sig(c: &StoreApp) -> u64 {
+            str_sig(c.version_name())
+                ^ (c.version_code() as u64).wrapping_mul(0x9E3779B97F4A7C15)
+                ^ ((c.selected_source_idx as u64) << 40)
+                ^ ((c.allow_system_update as u64) << 62)
+        }
+        let mut apps_fp: u64 = 0xcbf29ce484222325;
+        for a in &self.apps {
+            let sig = str_sig(&a.package)
+                ^ str_sig(&a.version_name).rotate_left(13)
+                ^ (a.version_code as u64).wrapping_mul(0x517cc1b727220a95)
+                ^ ((a.system as u64) << 61)
+                ^ ((a.updated_system as u64) << 62);
+            apps_fp = (apps_fp ^ sig).wrapping_mul(0x100000001b3);
+        }
+        if let Some(first) = self.app_store.catalog.first() {
+            apps_fp = (apps_fp ^ cat_item_sig(first)).wrapping_mul(0x100000001b3);
+        }
+        if let Some(last) = self.app_store.catalog.last() {
+            apps_fp = (apps_fp ^ cat_item_sig(last)).wrapping_mul(0x100000001b3);
+        }
+        let key = StoreCountsKey {
+            catalog_ptr: self.app_store.catalog.as_ptr() as usize,
+            catalog_len: self.app_store.catalog.len(),
+            apps_ptr: self.apps.as_ptr() as usize,
+            apps_len: self.apps.len(),
+            apps_fp,
+        };
+        if let Some(cached) = STORE_COUNTS_CACHE.with(|c| c.get()) {
+            if cached.key == key && (cached.matched_len as usize) == cached.installed {
+                let mut check_fp: u64 = 0xcbf29ce484222325;
+                let mut valid = true;
+                for i in 0..(cached.matched_len as usize) {
+                    let idx = cached.matched_indices[i] as usize;
+                    if let Some(c) = self.app_store.catalog.get(idx) {
+                        check_fp = (check_fp ^ cat_item_sig(c)).wrapping_mul(0x100000001b3);
+                    } else {
+                        valid = false;
+                        break;
+                    }
+                }
+                if valid && check_fp == cached.matched_fp {
+                    return (cached.updatable, cached.installed);
+                }
+            }
+        }
+        let app_map: std::collections::HashMap<&str, &stepx_companion::apps::AppInfo> =
+            self.apps.iter().map(|a| (a.package.as_str(), a)).collect();
+        let mut updatable = 0usize;
+        let mut installed = 0usize;
+        let mut matched_indices = [0u16; 64];
+        let mut matched_len = 0u8;
+        let mut matched_fp: u64 = 0xcbf29ce484222325;
+        for (idx, app) in self.app_store.catalog.iter().enumerate() {
+            if is_blacklisted_store_item(&app.package, &app.name) {
+                continue;
+            }
+            if let Some(&entry) = app_map.get(app.package.as_str()) {
+                if is_blacklisted_store_item(&entry.package, &entry.label)
+                    || (!entry.launchable && !app.allow_system_update)
+                {
+                    continue;
+                }
+                installed += 1;
+                if (matched_len as usize) < matched_indices.len() && idx <= u16::MAX as usize {
+                    matched_indices[matched_len as usize] = idx as u16;
+                    matched_len += 1;
+                    matched_fp = (matched_fp ^ cat_item_sig(app)).wrapping_mul(0x100000001b3);
+                }
+                if matches!(
+                    check_store_install_state(std::slice::from_ref(entry), app),
+                    StoreInstallState::Updatable { .. }
+                ) {
+                    updatable += 1;
+                }
+            }
+        }
+        STORE_COUNTS_CACHE.with(|c| {
+            c.set(Some(StoreCountsValue {
+                key,
+                matched_fp,
+                matched_len,
+                matched_indices,
+                updatable,
+                installed,
+            }))
+        });
+        (updatable, installed)
+    }
+
     /// Count how many apps in the current store catalog have an update available on the connected phone.
     pub(in super::super) fn store_updatable_count(&self) -> usize {
-        if self.apps.is_empty() {
-            return 0;
-        }
-        self.app_store
-            .catalog
-            .iter()
-            .filter(|app| {
-                matches!(
-                    check_store_install_state(&self.apps, app),
-                    StoreInstallState::Updatable { .. }
-                )
-            })
-            .count()
+        self.cached_store_counts().0
     }
 
     /// Count how many apps in the store catalog are currently installed on the connected phone.
     pub(in super::super) fn store_installed_count(&self) -> usize {
-        if self.apps.is_empty() {
-            return 0;
-        }
-        self.app_store
-            .catalog
-            .iter()
-            .filter(|app| {
-                !matches!(
-                    check_store_install_state(&self.apps, app),
-                    StoreInstallState::NotInstalled
-                )
-            })
-            .count()
+        self.cached_store_counts().1
     }
 
     /// Count how many apps in the catalog belong to a given `StoreCategory`.
@@ -138,40 +241,12 @@ impl Companion {
         if self.selected.is_some() {
             items.push(self.button_icon(
                 "store-hdr-install-local",
-                "安装本地 APK",
+                "安装 APK",
                 UiIcon::Plus,
                 Action::InstallApk,
                 Btn::Secondary,
             ));
         }
-
-        items.push(self.button_icon(
-            "store-hdr-refresh-catalog",
-            if self.app_store.syncing_catalog {
-                "正在同步应用库…"
-            } else {
-                "刷新应用库"
-            },
-            UiIcon::Refresh,
-            Action::AppStore(AppStoreAction::RefreshCatalog),
-            Btn::Secondary,
-        ));
-
-        items.push(self.button_icon(
-            "store-hdr-check-updates",
-            if self.app_store.checking_updates {
-                "正在检测更新…"
-            } else {
-                "检测更新"
-            },
-            UiIcon::Refresh,
-            Action::AppStore(AppStoreAction::CheckUpdates),
-            if updatable_count > 0 {
-                Btn::Ghost
-            } else {
-                Btn::Secondary
-            },
-        ));
 
         if updatable_count > 0 {
             items.push(self.button_icon(
@@ -180,6 +255,18 @@ impl Companion {
                 UiIcon::Download,
                 Action::AppStore(AppStoreAction::UpdateAll),
                 Btn::Primary,
+            ));
+        } else {
+            items.push(self.button_icon(
+                "store-hdr-check-updates",
+                if self.app_store.checking_updates || self.app_store.syncing_catalog {
+                    "检测中…"
+                } else {
+                    "检测更新"
+                },
+                UiIcon::Refresh,
+                Action::AppStore(AppStoreAction::CheckUpdates),
+                Btn::Secondary,
             ));
         }
 
@@ -206,16 +293,24 @@ impl Companion {
     }
 
     fn store_app_icon(&self, app: &StoreApp, size: f32) -> El {
+        let installed = self.apps.iter().find(|a| a.package == app.package);
+        self.store_app_icon_with_installed(app, installed, size)
+    }
+
+    fn store_app_icon_with_installed(
+        &self,
+        app: &StoreApp,
+        installed: Option<&stepx_companion::apps::AppInfo>,
+        size: f32,
+    ) -> El {
         let p = self.p();
         let cached_path = app
             .cached_icon
             .as_deref()
             .filter(|path| cached_is_file(path))
             .or_else(|| {
-                self.apps
-                    .iter()
-                    .find(|installed| installed.package == app.package)
-                    .and_then(|installed| installed.icon_path.as_deref())
+                installed
+                    .and_then(|inst| inst.icon_path.as_deref())
                     .filter(|path| cached_is_file(path))
             });
 
@@ -240,28 +335,11 @@ impl Companion {
             .with_height(size)
             .finish()
         } else {
-            let hash = app
-                .package
-                .bytes()
-                .fold(0usize, |acc, b| acc.wrapping_mul(31).wrapping_add(b as usize));
-            let palettes = [
-                (blue_soft(&p), p.blue),
-                (indigo_soft(&p), p.indigo),
-                (p.success_soft, p.success_text),
-                (p.warning_soft, p.warning),
-            ];
-            let (bg, fg) = palettes[hash % palettes.len()];
-            let first_char = app
-                .name
-                .chars()
-                .next()
-                .unwrap_or('A')
-                .to_uppercase()
-                .to_string();
-            let glyph = Align::new(self.line_w(first_char, TITLE, fg, Weight::Semibold)).finish();
+            let glyph = Align::new(self.content_icon(UiIcon::Apps, (size * 0.48).round(), p.text2))
+                .finish();
             ConstrainedBox::new(
                 Container::new(glyph)
-                    .with_background_color(bg)
+                    .with_background_color(p.card2)
                     .with_border(Border::all(1.).with_border_color(p.surface_border))
                     .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_PANEL)))
                     .finish(),
@@ -301,14 +379,17 @@ impl Companion {
             .contain()
             .finish()
         } else {
-            let ch = item.name.chars().next().unwrap_or('A').to_string();
-            Align::new(self.line_w(ch, BODY, p.blue, Weight::Semibold)).finish()
+            Align::new(self.content_icon(UiIcon::Apps, 18.0, p.text2)).finish()
         };
 
         ConstrainedBox::new(
             Container::new(inner)
                 .with_uniform_padding(3.)
-                .with_background_color(p.surface)
+                .with_background_color(if cached_path.is_some() {
+                    p.surface
+                } else {
+                    p.card2
+                })
                 .with_border(Border::all(1.).with_border_color(p.border))
                 .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
                 .finish(),
@@ -337,7 +418,7 @@ impl Companion {
                     self.hstack(
                         S2,
                         vec![
-                            self.ui_icon(
+                            self.content_icon(
                                 icon,
                                 16.,
                                 if *is_err { p.danger } else { p.success },
@@ -397,7 +478,7 @@ impl Companion {
                     self.hstack(
                         S2,
                         vec![
-                            self.ui_icon(UiIcon::AlertTriangle, 16., p.warning),
+                            self.content_icon(UiIcon::AlertTriangle, 16., p.warning),
                             self.text(
                                 format!(
                                     "Android 系统限制直接覆盖降级已安装的正式版「{name}」。安装 {ver_label} 可能需要清除数据。请先自行备份并在手机卸载，客户端不会自动卸载。"
@@ -419,7 +500,11 @@ impl Companion {
                             self.button(
                                 "store-downgrade-confirm",
                                 "已了解",
-                                    Action::AppStore(AppStoreAction::DismissBanner),
+                                Action::AppStore(AppStoreAction::InstallHistorical {
+                                    package: pkg.clone(),
+                                    version_idx: *ver_idx,
+                                    force_reinstall: true,
+                                }),
                                 Btn::Primary,
                             ),
                         ],
@@ -514,8 +599,7 @@ impl Companion {
         let mut left_pills: Vec<El> = Vec::with_capacity(9);
         for cat in standard_categories {
             let label = cat.label().to_string();
-            let active =
-                self.app_store.search_results.is_none() && self.app_store.category == cat;
+            let active = self.app_store.search_results.is_none() && self.app_store.category == cat;
             left_pills.push(self.chip(
                 format!("store-cat-{:?}", cat),
                 label,
@@ -531,8 +615,7 @@ impl Companion {
         for cat in status_categories {
             let count = self.store_category_count(cat);
             let label = format!("{} · {count}", cat.label());
-            let active =
-                self.app_store.search_results.is_none() && self.app_store.category == cat;
+            let active = self.app_store.search_results.is_none() && self.app_store.category == cat;
             left_pills.push(self.chip(
                 format!("store-cat-{:?}", cat),
                 label,
@@ -552,11 +635,7 @@ impl Companion {
             .finish();
 
         let mut search_bar = vec![
-            self.input(
-                F_STORE_SEARCH,
-                "搜索应用、包名或开发者…",
-                Some(172.),
-            ),
+            self.input(F_STORE_SEARCH, "搜索应用、包名或开发者…", Some(172.)),
             self.button_icon(
                 "store-search-btn",
                 if self.app_store.searching {
@@ -632,11 +711,7 @@ impl Companion {
                 .as_deref()
                 .filter(|s| !s.trim().is_empty())
             {
-                self.pill_badge(
-                    format!("多源实时在线 · {sync_str}"),
-                    p.text3,
-                    p.surface,
-                )
+                self.pill_badge(format!("多源实时在线 · {sync_str}"), p.text3, p.surface)
             } else {
                 self.pill_badge("多源实时在线", p.text3, p.surface)
             };
@@ -648,7 +723,7 @@ impl Companion {
             rows.push(self.hstack(
                 S1 + 2.,
                 vec![
-                    self.ui_icon(UiIcon::Refresh, 12., p.blue),
+                    self.content_icon(UiIcon::Refresh, 12., p.blue),
                     self.line(
                         "正在并发检索应用宝、国际源、官方直连、GitHub 与 F-Droid…",
                         MICRO,
@@ -837,7 +912,7 @@ impl Companion {
             Align::new(self.vstack(
                 S2,
                 vec![
-                    Align::new(self.ui_icon(UiIcon::Image, 28., p.text3)).finish(),
+                    Align::new(self.content_icon(UiIcon::Image, 28., p.text3)).finish(),
                     Align::new(self.line("正在缓存高清应用截图…", BODY, p.text2)).finish(),
                 ],
             ))
@@ -945,12 +1020,16 @@ impl Companion {
                 ),
                 controls,
             ),
-            Container::new(ConstrainedBox::new(main_image).with_height(canvas_h).finish())
-                .with_uniform_padding(S2)
-                .with_background_color(p.surface)
-                .with_border(Border::all(1.).with_border_color(p.border))
-                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
-                .finish(),
+            Container::new(
+                ConstrainedBox::new(main_image)
+                    .with_height(canvas_h)
+                    .finish(),
+            )
+            .with_uniform_padding(S2)
+            .with_background_color(p.surface)
+            .with_border(Border::all(1.).with_border_color(p.border))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
+            .finish(),
         ];
         if !thumbs.is_empty() {
             body.push(self.wrap(thumbs));
@@ -1053,10 +1132,17 @@ impl Companion {
     /// - Version / Size / Developer subtitle
     /// - Right: subtle `详情` button (`SelectApp`) + primary `安装` / `更新` / `打开` button
     /// - Clicking the card body dispatches `Action::AppStore(AppStoreAction::SelectApp(pkg.clone()))`
-    fn store_app_card(&self, app: &StoreApp) -> El {
+    fn store_app_card_with_installed(
+        &self,
+        app: &StoreApp,
+        installed: Option<&stepx_companion::apps::AppInfo>,
+    ) -> El {
         let p = self.p();
         let pkg = &app.package;
-        let install_state = check_store_install_state(&self.apps, app);
+        let install_state = match installed {
+            Some(entry) => check_store_install_state(std::slice::from_ref(entry), app),
+            None => StoreInstallState::NotInstalled,
+        };
         let primary_source = app.primary_source();
 
         // Line 1: App Name + Category badge + Source badge + Installed/Update badge
@@ -1067,13 +1153,18 @@ impl Companion {
         } else {
             app.category.label()
         };
+        let max_title_units = if matches!(install_state, StoreInstallState::NotInstalled) {
+            18usize
+        } else {
+            13usize
+        };
         let display_title = {
             let mut units = 0usize;
             let mut cut_idx = app.name.len();
             let mut truncated = false;
             for (idx, ch) in app.name.char_indices() {
                 let w = if ch.is_ascii() { 1 } else { 2 };
-                if units + w > 20 {
+                if units + w > max_title_units {
                     cut_idx = idx;
                     truncated = true;
                     break;
@@ -1144,15 +1235,17 @@ impl Companion {
         let center_lines = vec![line1, line2, line3];
 
         // Right: subtle `详情` button + primary `安装` / `更新` / `打开` button (or active task progress)
-        let active_task = self.app_store.tasks.get(pkg).filter(|t| t.stage.is_active());
+        let active_task = self
+            .app_store
+            .tasks
+            .get(pkg)
+            .filter(|t| t.stage.is_active());
         let right_action = if let Some(task) = active_task {
             let (label, pct, color) = match &task.stage {
                 StoreTaskStage::Queued => ("排队中…".to_string(), 8, p.text3),
-                StoreTaskStage::Downloading { percent, .. } => (
-                    format!("下载 {}%", percent),
-                    (*percent).max(6),
-                    p.blue,
-                ),
+                StoreTaskStage::Downloading { percent, .. } => {
+                    (format!("下载 {}%", percent), (*percent).max(6), p.blue)
+                }
                 StoreTaskStage::Verifying => ("校验中…".to_string(), 92, p.indigo),
                 StoreTaskStage::Installing => ("安装中…".to_string(), 96, p.indigo),
                 StoreTaskStage::Uninstalling => ("卸载中…".to_string(), 85, p.warning),
@@ -1175,40 +1268,50 @@ impl Companion {
                 Action::AppStore(AppStoreAction::SelectApp(pkg.clone())),
                 Btn::Ghost,
             );
-            let primary_btn = match &install_state {
-                StoreInstallState::Updatable { .. } => self.button_icon(
-                    format!("store-card-upd:{pkg}"),
-                    "更新",
-                    UiIcon::Download,
-                    Action::AppStore(AppStoreAction::InstallOrUpdate {
-                        package: pkg.clone(),
-                    }),
-                    Btn::Primary,
-                ),
-                StoreInstallState::Installed { .. } => self.button(
-                    format!("store-card-open:{pkg}"),
-                    "打开",
-                    Action::OpenApp(pkg.clone()),
-                    Btn::Secondary,
-                ),
-                StoreInstallState::NotInstalled => self.button(
-                    format!("store-card-inst:{pkg}"),
-                    "安装",
-                    Action::AppStore(AppStoreAction::InstallOrUpdate {
-                        package: pkg.clone(),
-                    }),
-                    Btn::Primary,
-                ),
-            };
-            self.hstack(S1 + 2., vec![detail_btn, primary_btn])
+            let mut action_btns = vec![detail_btn];
+            match &install_state {
+                StoreInstallState::Updatable { .. } => {
+                    action_btns.push(self.button_icon(
+                        format!("store-card-upd:{pkg}"),
+                        "更新",
+                        UiIcon::Download,
+                        Action::AppStore(AppStoreAction::InstallOrUpdate {
+                            package: pkg.clone(),
+                        }),
+                        Btn::Primary,
+                    ));
+                }
+                StoreInstallState::Installed { .. } => {
+                    action_btns.push(self.button_icon(
+                        format!("store-card-mirror:{pkg}"),
+                        "打开",
+                        UiIcon::Monitor,
+                        Action::OpenAppInMirror(app.package.clone()),
+                        Btn::Secondary,
+                    ));
+                }
+                StoreInstallState::NotInstalled => {
+                    action_btns.push(self.button(
+                        format!("store-card-inst:{pkg}"),
+                        "安装",
+                        Action::AppStore(AppStoreAction::InstallOrUpdate {
+                            package: pkg.clone(),
+                        }),
+                        Btn::Primary,
+                    ));
+                }
+            }
+            self.hstack(S1 + 2., action_btns)
         };
 
         let card_content = Flex::row()
             .with_main_axis_size(MainAxisSize::Max)
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_spacing(S3)
-            .with_child(self.store_app_icon(app, 48.))
-            .with_child(Expanded::new(1., self.vstack(3., center_lines)).finish())
+            .with_child(self.store_app_icon_with_installed(app, installed, 48.))
+            .with_child(
+                Expanded::new(1., Clipped::new(self.vstack(3., center_lines)).finish()).finish(),
+            )
             .with_child(right_action)
             .finish();
 
@@ -1247,8 +1350,7 @@ impl Companion {
         let p = self.p();
         let query = self.fields[F_STORE_SEARCH].text.trim();
 
-        let filtered = self.filtered_store_apps();
-        let active_list: Vec<&StoreApp> = filtered.iter().collect();
+        let active_list = self.filtered_store_apps();
 
         let total_apps = active_list.len();
         let page_size = self.app_store.page_size.max(1);
@@ -1338,10 +1440,17 @@ impl Companion {
             };
             catalog_rows.push(empty_el);
         } else {
+            let installed_by_pkg: std::collections::HashMap<&str, &stepx_companion::apps::AppInfo> =
+                self.apps.iter().map(|a| (a.package.as_str(), a)).collect();
             for pair in page_items.chunks(2) {
-                let left = Expanded::new(1., self.store_app_card(pair[0])).finish();
+                let left_inst = installed_by_pkg.get(pair[0].package.as_str()).copied();
+                let left =
+                    Expanded::new(1., self.store_app_card_with_installed(pair[0], left_inst))
+                        .finish();
                 let right = if pair.len() == 2 {
-                    Expanded::new(1., self.store_app_card(pair[1])).finish()
+                    let right_inst = installed_by_pkg.get(pair[1].package.as_str()).copied();
+                    Expanded::new(1., self.store_app_card_with_installed(pair[1], right_inst))
+                        .finish()
                 } else {
                     Expanded::new(1., Empty::new().finish()).finish()
                 };
@@ -1454,17 +1563,37 @@ impl Companion {
         );
 
         let pkg_btn = package.to_string();
-        let right = self.button_icon(
-            format!("store-src-install:{package}:{idx}"),
-            "立即安装",
-            UiIcon::Download,
-            Action::AppStore(AppStoreAction::InstallOrUpdate { package: pkg_btn }),
-            if selected {
-                Btn::Primary
-            } else {
-                Btn::Secondary
-            },
-        );
+        let active_task = self
+            .app_store
+            .tasks
+            .get(package)
+            .filter(|t| t.stage.is_active());
+        let right = if let Some(t) = active_task {
+            let lbl = match &t.stage {
+                StoreTaskStage::Downloading { percent, .. } => format!("下载中 {percent}%"),
+                StoreTaskStage::Verifying => "校验中…".to_string(),
+                StoreTaskStage::Installing => "正在安装…".to_string(),
+                StoreTaskStage::Uninstalling => "卸载中…".to_string(),
+                StoreTaskStage::Queued => "排队中…".to_string(),
+                _ => "处理中…".to_string(),
+            };
+            self.disabled_button(lbl)
+        } else {
+            self.button_icon(
+                format!("store-src-install:{package}:{idx}"),
+                "立即安装",
+                UiIcon::Download,
+                Action::AppStore(AppStoreAction::InstallFromSource {
+                    package: pkg_btn,
+                    source_idx: idx,
+                }),
+                if selected {
+                    Btn::Primary
+                } else {
+                    Btn::Secondary
+                },
+            )
+        };
 
         let row_inner = self.between(left, right);
         let pkg = package.to_string();
@@ -1553,17 +1682,34 @@ impl Companion {
             ],
         );
 
-        let right = self.button_icon(
-            format!("store-hist:{}:{idx}", app.package),
-            btn_label,
-            UiIcon::Download,
-            Action::AppStore(AppStoreAction::InstallHistorical {
-                package: app.package.clone(),
-                version_idx: idx,
-                force_reinstall: false,
-            }),
-            Btn::Secondary,
-        );
+        let active_task = self
+            .app_store
+            .tasks
+            .get(&app.package)
+            .filter(|t| t.stage.is_active());
+        let right = if let Some(t) = active_task {
+            let lbl = match &t.stage {
+                StoreTaskStage::Downloading { percent, .. } => format!("下载中 {percent}%"),
+                StoreTaskStage::Verifying => "校验中…".to_string(),
+                StoreTaskStage::Installing => "正在安装…".to_string(),
+                StoreTaskStage::Uninstalling => "卸载中…".to_string(),
+                StoreTaskStage::Queued => "排队中…".to_string(),
+                _ => "处理中…".to_string(),
+            };
+            self.disabled_button(lbl)
+        } else {
+            self.button_icon(
+                format!("store-hist:{}:{idx}", app.package),
+                btn_label,
+                UiIcon::Download,
+                Action::AppStore(AppStoreAction::InstallHistorical {
+                    package: app.package.clone(),
+                    version_idx: idx,
+                    force_reinstall: false,
+                }),
+                Btn::Secondary,
+            )
+        };
 
         Container::new(self.between(left, right))
             .with_horizontal_padding(S3)
@@ -1581,11 +1727,7 @@ impl Companion {
             let ver_suffix = clean_version_display(&inst.version_name)
                 .map(|v| format!(" {v}"))
                 .unwrap_or_default();
-            self.pill_badge(
-                format!("已装{ver_suffix}"),
-                p.success_text,
-                p.success_soft,
-            )
+            self.pill_badge(format!("已装{ver_suffix}"), p.success_text, p.success_soft)
         } else {
             let (fg, bg) = source_badge_colors(item.source, &p);
             self.pill_badge(item.source.short_label(), fg, bg)
@@ -1683,8 +1825,7 @@ impl Companion {
         let p = self.p();
         let pkg = &app.package;
         let install_state = check_store_install_state(&self.apps, app);
-        let loading_detail =
-            self.app_store.loading_detail_pkg.as_deref() == Some(pkg.as_str());
+        let loading_detail = self.app_store.loading_detail_pkg.as_deref() == Some(pkg.as_str());
 
         // 1. Top Navigation Bar
         let mut breadcrumb_items = vec![
@@ -1719,6 +1860,34 @@ impl Companion {
             ));
         }
 
+        let active_task = self
+            .app_store
+            .tasks
+            .get(pkg)
+            .filter(|t| t.stage.is_active());
+        let active_task_label = active_task.map(|t| match &t.stage {
+            StoreTaskStage::Downloading { percent, .. } => format!("下载中 {percent}%"),
+            StoreTaskStage::Verifying => "校验中…".to_string(),
+            StoreTaskStage::Installing => "正在安装…".to_string(),
+            StoreTaskStage::Uninstalling => "卸载中…".to_string(),
+            StoreTaskStage::Queued => "排队中…".to_string(),
+            _ => "处理中…".to_string(),
+        });
+
+        let dl_apk_btn = if let Some(ref lbl) = active_task_label {
+            self.disabled_button(lbl.clone())
+        } else {
+            self.button_icon(
+                format!("store-det-dl-apk:{pkg}"),
+                "仅下载 APK",
+                UiIcon::Folder,
+                Action::AppStore(AppStoreAction::DownloadApkOnly {
+                    package: pkg.clone(),
+                }),
+                Btn::Secondary,
+            )
+        };
+
         let nav_right = self.hstack(
             S2,
             vec![
@@ -1733,34 +1902,24 @@ impl Companion {
                     Action::AppStore(AppStoreAction::RefreshDetail(pkg.clone())),
                     Btn::Ghost,
                 ),
-                self.button_icon(
-                    format!("store-det-dl-apk:{pkg}"),
-                    "仅下载 APK",
-                    UiIcon::Folder,
-                    Action::AppStore(AppStoreAction::DownloadApkOnly {
-                        package: pkg.clone(),
-                    }),
-                    Btn::Secondary,
-                ),
+                dl_apk_btn,
             ],
         );
 
-        let top_nav_bar = Container::new(self.between(
-            self.hstack(S2, breadcrumb_items),
-            nav_right,
-        ))
-        .with_horizontal_padding(S3 + 2.)
-        .with_vertical_padding(S2 + 2.)
-        .with_background_color(p.bg)
-        .with_border(Border::all(1.).with_border_color(p.border))
-        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_PANEL)))
-        .finish();
+        let top_nav_bar =
+            Container::new(self.between(self.hstack(S2, breadcrumb_items), nav_right))
+                .with_horizontal_padding(S3 + 2.)
+                .with_vertical_padding(S2 + 2.)
+                .with_background_color(p.bg)
+                .with_border(Border::all(1.).with_border_color(p.border))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_PANEL)))
+                .finish();
 
         // 2. Hero Card
         let install_badge = match &install_state {
             StoreInstallState::Updatable { latest_version, .. } => {
-                let ver = clean_version_display(latest_version)
-                    .unwrap_or_else(|| latest_version.clone());
+                let ver =
+                    clean_version_display(latest_version).unwrap_or_else(|| latest_version.clone());
                 self.pill_badge(format!("可更新至 {ver}"), p.blue, blue_soft(&p))
             }
             StoreInstallState::Installed {
@@ -1796,8 +1955,8 @@ impl Companion {
             pkg.as_str()
         };
 
-        let ver_str = clean_version_display(app.version_name())
-            .unwrap_or_else(|| "最新正式版".to_string());
+        let ver_str =
+            clean_version_display(app.version_name()).unwrap_or_else(|| "最新正式版".to_string());
         let size_str = if app.size_bytes() > 0 {
             format_bytes(app.size_bytes())
         } else {
@@ -1811,15 +1970,19 @@ impl Companion {
         let mut hero_actions = Vec::new();
         match &install_state {
             StoreInstallState::Updatable { can_uninstall, .. } => {
-                hero_actions.push(self.button_icon(
-                    format!("store-det-upd:{pkg}"),
-                    "升级到最新版",
-                    UiIcon::Download,
-                    Action::AppStore(AppStoreAction::InstallOrUpdate {
-                        package: pkg.clone(),
-                    }),
-                    Btn::Primary,
-                ));
+                if let Some(ref lbl) = active_task_label {
+                    hero_actions.push(self.disabled_button(lbl.clone()));
+                } else {
+                    hero_actions.push(self.button_icon(
+                        format!("store-det-upd:{pkg}"),
+                        "升级到最新版",
+                        UiIcon::Download,
+                        Action::AppStore(AppStoreAction::InstallOrUpdate {
+                            package: pkg.clone(),
+                        }),
+                        Btn::Primary,
+                    ));
+                }
                 hero_actions.push(self.button(
                     format!("store-det-open:{pkg}"),
                     "在手机上打开",
@@ -1833,7 +1996,7 @@ impl Companion {
                     Action::OpenAppInMirror(pkg.clone()),
                     Btn::Secondary,
                 ));
-                if *can_uninstall {
+                if *can_uninstall && active_task_label.is_none() {
                     hero_actions.push(self.button_icon(
                         format!("store-det-uninst:{pkg}"),
                         "卸载",
@@ -1857,7 +2020,7 @@ impl Companion {
                     Action::OpenAppInMirror(pkg.clone()),
                     Btn::Secondary,
                 ));
-                if *can_uninstall {
+                if *can_uninstall && active_task_label.is_none() {
                     hero_actions.push(self.button_icon(
                         format!("store-det-uninst:{pkg}"),
                         "卸载",
@@ -1868,15 +2031,19 @@ impl Companion {
                 }
             }
             StoreInstallState::NotInstalled => {
-                hero_actions.push(self.button_icon(
-                    format!("store-det-inst:{pkg}"),
-                    "安装到手机",
-                    UiIcon::Download,
-                    Action::AppStore(AppStoreAction::InstallOrUpdate {
-                        package: pkg.clone(),
-                    }),
-                    Btn::Primary,
-                ));
+                if let Some(ref lbl) = active_task_label {
+                    hero_actions.push(self.disabled_button(lbl.clone()));
+                } else {
+                    hero_actions.push(self.button_icon(
+                        format!("store-det-inst:{pkg}"),
+                        "安装到手机",
+                        UiIcon::Download,
+                        Action::AppStore(AppStoreAction::InstallOrUpdate {
+                            package: pkg.clone(),
+                        }),
+                        Btn::Primary,
+                    ));
+                }
             }
         }
 
@@ -1918,7 +2085,7 @@ impl Companion {
         };
         let mut intro_children = vec![
             self.between(
-                self.heading("应用介绍与更新说明"),
+                self.section_heading(UiIcon::Apps, "应用介绍与更新说明"),
                 self.pill_badge(app.category.label(), p.text2, p.tag_bg),
             ),
             self.text(desc_text, BODY, p.text2),
@@ -1926,14 +2093,14 @@ impl Companion {
 
         if !app.changelog.trim().is_empty() {
             intro_children.push(self.divider());
-            intro_children.push(self.heading("本次更新说明"));
+            intro_children.push(self.section_heading(UiIcon::File, "本次更新说明"));
             intro_children.push(self.text(&app.changelog, BODY, p.text2));
         }
 
         if !app.cached_screenshots.is_empty() || !app.screenshots.is_empty() || loading_detail {
             intro_children.push(self.divider());
             intro_children.push(self.between(
-                self.heading("应用预览截图"),
+                self.section_heading(UiIcon::Image, "应用预览截图"),
                 self.line("点击任意截图可打开高清大图预览", MICRO, p.text3),
             ));
 
@@ -1976,12 +2143,10 @@ impl Companion {
                     )
                     .with_cursor(Cursor::PointingHand)
                     .on_click(move |ctx, _, _| {
-                        ctx.dispatch_typed_action(Action::AppStore(
-                            AppStoreAction::OpenLightbox {
-                                package: pkg_shot.clone(),
-                                idx,
-                            },
-                        ))
+                        ctx.dispatch_typed_action(Action::AppStore(AppStoreAction::OpenLightbox {
+                            package: pkg_shot.clone(),
+                            idx,
+                        }))
                     })
                     .finish();
                     shots.push(shot_card);
@@ -1995,7 +2160,7 @@ impl Companion {
                 Container::new(self.hstack(
                     S2,
                     vec![
-                        self.ui_icon(UiIcon::Image, 16., p.text3),
+                        self.content_icon(UiIcon::Image, 16., p.text3),
                         self.line("正在同步高清应用预览截图…", CAPTION, p.text2),
                     ],
                 ))
@@ -2023,8 +2188,12 @@ impl Companion {
                 self.hstack(
                     S2,
                     vec![
-                        self.heading("下载源切换与多源镜像"),
-                        self.line("支持一键切换官方直连、应用宝、国际源与开源镜像", MICRO, p.text3),
+                        self.section_heading(UiIcon::Storage, "下载源切换与多源镜像"),
+                        self.line(
+                            "支持一键切换官方直连、应用宝、国际源与开源镜像",
+                            MICRO,
+                            p.text3,
+                        ),
                     ],
                 ),
                 self.pill_badge(
@@ -2046,7 +2215,7 @@ impl Companion {
                 .collect();
             Some(self.panel(vec![
                 self.between(
-                    self.heading("历史版本与旧版安装"),
+                    self.section_heading(UiIcon::Archive, "历史版本与旧版安装"),
                     self.pill_badge(
                         format!("{} 个历史版", app.historical_versions.len()),
                         p.text2,
@@ -2065,9 +2234,7 @@ impl Companion {
         };
 
         let mut left_col_cards = Vec::with_capacity(3);
-        if cfg!(feature = "ui-capture")
-            && std::env::var_os("STEPX_STORE_DETAIL_BOTTOM").is_some()
-        {
+        if cfg!(feature = "ui-capture") && std::env::var_os("STEPX_STORE_DETAIL_BOTTOM").is_some() {
             if let Some(hc) = hist_card {
                 left_col_cards.push(hc);
             }
@@ -2096,8 +2263,8 @@ impl Companion {
             } => {
                 let iv = clean_version_display(installed_version)
                     .unwrap_or_else(|| installed_version.clone());
-                let lv = clean_version_display(latest_version)
-                    .unwrap_or_else(|| latest_version.clone());
+                let lv =
+                    clean_version_display(latest_version).unwrap_or_else(|| latest_version.clone());
                 self.pill_badge(format!("可更新 ({iv} → {lv})"), p.blue, blue_soft(&p))
             }
             StoreInstallState::Installed {
@@ -2107,9 +2274,7 @@ impl Companion {
                     .unwrap_or_else(|| installed_version.clone());
                 self.pill_badge(format!("已安装 ({iv})"), p.success_text, p.success_soft)
             }
-            StoreInstallState::NotInstalled => {
-                self.line("手机未安装", CAPTION, p.text2)
-            }
+            StoreInstallState::NotInstalled => self.line("手机未安装", CAPTION, p.text2),
         };
 
         let pkg_row_val = self.between(
@@ -2139,34 +2304,22 @@ impl Companion {
             self.divider(),
             self.store_spec_row("应用包名", pkg_row_val),
             self.divider(),
-            self.store_spec_row(
-                "安装包大小",
-                self.line(size_str, CAPTION, p.text),
-            ),
+            self.store_spec_row("安装包大小", self.line(size_str, CAPTION, p.text)),
             self.divider(),
-            self.store_spec_row(
-                "适用架构",
-                self.mono("arm64-v8a", MICRO, p.text2),
-            ),
+            self.store_spec_row("适用架构", self.mono("arm64-v8a", MICRO, p.text2)),
             self.divider(),
             self.store_spec_row(
                 "当前下载源",
                 self.line(app.primary_source().label(), CAPTION, p.text),
             ),
             self.divider(),
-            self.store_spec_row(
-                "开发者",
-                self.line(&app.developer, CAPTION, p.text),
-            ),
+            self.store_spec_row("开发者", self.line(&app.developer, CAPTION, p.text)),
             self.divider(),
-            self.store_spec_row(
-                "备案信息",
-                self.line(icp_or_sig, CAPTION, p.text2),
-            ),
+            self.store_spec_row("备案信息", self.line(icp_or_sig, CAPTION, p.text2)),
         ];
 
         let specs_card = self.panel(vec![
-            self.heading("版本与包体信息"),
+            self.section_heading(UiIcon::Package, "版本与包体信息"),
             Container::new(self.vstack(S2, spec_rows))
                 .with_horizontal_padding(S3)
                 .with_vertical_padding(S2 + 2.)
@@ -2217,7 +2370,7 @@ impl Companion {
         }
 
         let mut rec_children = vec![self.between(
-            self.heading("同分类与同开发者推荐"),
+            self.section_heading(UiIcon::Apps, "同分类与同开发者推荐"),
             self.button_icon(
                 format!("store-det-search-dev:{pkg}"),
                 "搜索同厂",

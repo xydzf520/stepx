@@ -24,6 +24,10 @@ pub struct Settings {
     pub close_to_tray: bool,
     pub reduced_motion: bool,
     pub sync_work_outputs: bool,
+    pub capsule_agent_enabled: bool,
+    pub capsule_agent_prompt: String,
+    pub home_agent_enabled: bool,
+    pub home_agent_prompt: String,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -36,6 +40,10 @@ impl Default for Settings {
             close_to_tray: false,
             reduced_motion: false,
             sync_work_outputs: false,
+            capsule_agent_enabled: false,
+            capsule_agent_prompt: crate::capsule_fulfillment::DEFAULT_AGENT_PROMPT.into(),
+            home_agent_enabled: false,
+            home_agent_prompt: crate::agent_workflows::DEFAULT_PROMPT.into(),
         }
     }
 }
@@ -130,12 +138,32 @@ fn load_from(path: &Path) -> Settings {
     if !s.compact_shortcut.valid() {
         s.compact_shortcut = CompactShortcut::default();
     }
+    if s.capsule_agent_prompt.trim().is_empty()
+        || s.capsule_agent_prompt.chars().count() > crate::capsule_fulfillment::MAX_PROMPT_CHARS
+    {
+        s.capsule_agent_prompt = crate::capsule_fulfillment::DEFAULT_AGENT_PROMPT.into();
+    }
+    if s.home_agent_prompt.trim().is_empty()
+        || s.home_agent_prompt.chars().count() > crate::agent_workflows::MAX_PROMPT_CHARS
+    {
+        s.home_agent_prompt = crate::agent_workflows::DEFAULT_PROMPT.into();
+    }
     s
 }
 pub fn save(s: &Settings) -> Result<()> {
     save_to(&path(), s)
 }
 fn save_to(path: &Path, s: &Settings) -> Result<()> {
+    ensure!(
+        !s.home_agent_prompt.trim().is_empty()
+            && s.home_agent_prompt.chars().count() <= crate::agent_workflows::MAX_PROMPT_CHARS,
+        "工作台 Agent 提示词需在 1–1200 字以内"
+    );
+    ensure!(
+        !s.capsule_agent_prompt.trim().is_empty()
+            && s.capsule_agent_prompt.chars().count() <= crate::capsule_fulfillment::MAX_PROMPT_CHARS,
+        "胶囊 Agent 提示词需在 1–800 字以内"
+    );
     ensure!(s.tray_icon || !s.close_to_tray, "请先开启托盘图标");
     ensure!(
         s.compact_shortcut.valid(),
@@ -215,5 +243,24 @@ mod tests {
             choose_directory(t.path()).unwrap(),
             t.path().canonicalize().unwrap()
         );
+    }
+    #[test]
+    fn agent_settings_preserve_existing_preferences_and_validate_prompt() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        fs::write(&path, r#"{"capsule_agent_enabled":true,"capsule_agent_prompt":"原有物流策略","reduced_motion":true}"#).unwrap();
+        let mut settings = load_from(&path);
+        assert!(!settings.home_agent_enabled);
+        assert_eq!(settings.home_agent_prompt, crate::agent_workflows::DEFAULT_PROMPT);
+        assert!(settings.capsule_agent_enabled && settings.reduced_motion);
+        settings.home_agent_enabled = true;
+        settings.home_agent_prompt = "先核对原文，再整理待办".into();
+        save_to(&path, &settings).unwrap();
+        assert_eq!(load_from(&path), settings);
+        settings.home_agent_prompt.clear();
+        assert!(save_to(&path, &settings).is_err());
+        assert_eq!(load_from(&path).home_agent_prompt, "先核对原文，再整理待办");
+        fs::write(&path, r#"{"home_agent_prompt":" "}"#).unwrap();
+        assert_eq!(load_from(&path).home_agent_prompt, crate::agent_workflows::DEFAULT_PROMPT);
     }
 }

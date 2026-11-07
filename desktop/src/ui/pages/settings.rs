@@ -1,6 +1,11 @@
 use super::super::{
-    icons::UiIcon, settings_state::SettingsAction as S, studio_state::StudioAction, theme::*,
-    widgets::*, Action, BackScreenAction, Companion, Page, PushAction,
+    icons::UiIcon,
+    notification_center_state::{NotificationAlertMode, NotificationCenterAction},
+    settings_state::{SettingsAction as S, AGENT_SETTINGS_TAB},
+    studio_state::StudioAction,
+    theme::*,
+    widgets::*,
+    Action, BackScreenAction, Companion, Page, PushAction, F_CAPSULE_PROMPT, F_HOME_AGENT_PROMPT,
 };
 use facloud_ui::{elements::*, fonts::Weight};
 use stepx_companion::{
@@ -14,7 +19,7 @@ impl Companion {
     fn setting_button_icon(&self, id: &str, label: &str, icon: UiIcon, a: S) -> El {
         self.button_icon(id, label, icon, Action::Settings(a), Btn::Secondary)
     }
-    fn setting_row(&self, title: &str, note: &str, control: El) -> El {
+    pub(in crate::ui) fn setting_row(&self, title: &str, note: &str, control: El) -> El {
         let p = self.p();
         self.hstack(
             S5,
@@ -122,7 +127,7 @@ impl Companion {
             .display()
             .to_string();
         self.panel(vec![
-            self.heading("配置与数据目录快捷操作"),
+            self.section_heading(UiIcon::Folder, "配置与数据目录快捷操作"),
             self.text(
                 "快速复制本机配置路径，或直接打开配置、数据与日志目录（用于备份、迁移或问题排查）。",
                 CAPTION,
@@ -173,26 +178,27 @@ impl Companion {
         let tab = if self.page == Page::About {
             4
         } else {
-            self.settings.tab.min(4)
+            self.settings.tab.min(AGENT_SETTINGS_TAB)
         };
         let s = &self.settings.draft;
-        let labels = ["通用", "文件与存储", "生成文件", "通知", "关于"];
+        let labels = ["通用", "文件与存储", "生成文件", "通知", "关于", "Agent"];
         let icons = [
             UiIcon::Settings,
             UiIcon::Folder,
             UiIcon::Briefcase,
             UiIcon::Bell,
             UiIcon::Info,
+            UiIcon::Sparkles,
         ];
         let nav = self.vstack(
             S2,
-            (0..5)
+            [0, 1, 2, 3, usize::from(AGENT_SETTINGS_TAB), 4].into_iter()
                 .map(|i| {
                     self.nav_item_icon(
                         &format!("settings-tab-{i}"),
                         icons[i],
                         labels[i],
-                        None,
+                        crate::ui::shell::SidebarBadge::None,
                         tab == i as u8,
                         Action::Settings(S::Tab(i as u8)),
                     )
@@ -200,15 +206,38 @@ impl Companion {
                 .collect(),
         );
         let mut cards = vec![];
+        if tab==1 {
+            cards.push(self.panel(vec![
+                self.section_heading(UiIcon::Folder,"本机数据与备份"),
+                self.text(self.interaction.storage_status.as_deref().unwrap_or("后台自动维护：每天校验备份，保留最近 7 份。日志保留 30 天，过期预览和无引用暂存自动回收。"),BODY,p.text2),
+                self.setting_row("维护与备份","原文件、成果、模型和待发送文件不会被缓存清理删除。手动备份会一直保留。",
+                    self.button_icon("storage-maintain",if self.interaction.storage_rx.is_some(){"维护中…"}else{"备份并维护"},UiIcon::Refresh,Action::StorageMaintain,Btn::Secondary)),
+            ]));
+        }
         match tab {
             0 => {
+                cards.push(self.voice_settings_card());
+                cards.push(self.panel(vec![
+                    self.section_heading(UiIcon::Tools, "排障日志"),
+                    self.setting_row(
+                        "操作结果与失败原因",
+                        "查看最近 30 天的本机日志，可重试读取失败的操作。",
+                        self.button_icon(
+                            "settings-diagnostics",
+                            "查看日志",
+                            UiIcon::Clock,
+                            Action::ReviewHistory,
+                            Btn::Secondary,
+                        ),
+                    ),
+                ]));
                 let modes = [
                     (Appearance::System, "跟随系统"),
                     (Appearance::Light, "浅色"),
                     (Appearance::Dark, "深色"),
                 ];
                 cards.push(self.panel(vec![
-                        self.heading("外观与动画"),
+                        self.section_heading(UiIcon::Image, "外观与动画"),
                         self.setting_row(
                             "界面颜色",
                             "选择你习惯的显示方式",
@@ -244,7 +273,7 @@ impl Companion {
                         ),
                     ]));
                 cards.push(self.panel(vec![
-                    self.heading("跨端同步与剪贴板互通"),
+                    self.section_heading(UiIcon::Clipboard, "跨端同步与剪贴板互通"),
                     self.setting_row(
                         "自动双向共享电脑与手机剪贴板",
                         "开启后，在电脑或手机复制文字时自动双向同步剪贴板，直接粘贴即可使用",
@@ -266,7 +295,7 @@ impl Companion {
                     ),
                 ]));
                 cards.push(self.panel(vec![
-                    self.heading("窗口与托盘"),
+                    self.section_heading(UiIcon::Monitor, "窗口与托盘"),
                     self.setting_row(
                         "显示托盘图标",
                         "收起窗口后，也能快速打开伴侣",
@@ -301,7 +330,7 @@ impl Companion {
                     ));
                 }
                 cards.push(self.panel(vec![
-                    self.heading("简洁对话快捷键"),
+                    self.section_heading(UiIcon::Keyboard, "简洁对话快捷键"),
                     self.setting_row(
                         "快速打开 Amoo 对话",
                         "呼出简洁窗口并定位输入框，会话和草稿保持不变。",
@@ -334,7 +363,7 @@ impl Companion {
                     ),
                 ]));
                 cards.push(self.panel(vec![
-                    self.heading("设备与模型入口"),
+                    self.section_heading(UiIcon::Cpu, "设备与模型入口"),
                     self.setting_row(
                         "连接手机",
                         "USB、无线连接和新手引导",
@@ -347,9 +376,9 @@ impl Companion {
                     ),
                     self.divider(),
                     self.setting_row(
-                        "Studio 模型服务",
-                        "用于本地创建应用、技能和智能体",
-                        self.setting_button("settings-model", "配置模型", S::Models),
+                        "AI 来源与用量",
+                        "首页成稿、工作任务与应用创作共用手机账号或所选独立 API",
+                        self.setting_button("settings-model", "管理 AI 来源", S::Models),
                     ),
                 ]));
                 cards.push(self.studio_lab_settings());
@@ -361,7 +390,7 @@ impl Companion {
                     .unwrap_or_else(stepx_companion::settings::downloads);
                 let path_str = path.display().to_string();
                 cards.push(self.panel(vec![
-                    self.heading("下载与接收"),
+                    self.section_heading(UiIcon::Folder, "下载与接收"),
                     self.setting_row(
                         "保存到",
                         "从手机接收的文件，以及另存为时的默认位置",
@@ -410,7 +439,7 @@ impl Companion {
                     exp_row
                 };
                 cards.push(self.panel(vec![
-                    self.heading("手机存储扩容"),
+                    self.section_heading(UiIcon::Storage, "手机存储扩容"),
                     self.text("将手机原文件保存到电脑，手机保留访问入口。", BODY, p.text2),
                     exp_row,
                     self.text(
@@ -433,7 +462,7 @@ impl Companion {
                     self.text("还没有选择，会使用默认工作文件夹", BODY, p.text)
                 };
                 let mut work_panel = vec![
-                    self.heading("项目文件"),
+                    self.section_heading(UiIcon::Folder, "项目文件"),
                     self.setting_row(
                         "工作文件夹",
                         "Amoo 生成文件时读取资料、保存结果的位置",
@@ -457,7 +486,7 @@ impl Companion {
                 }
                 cards.push(self.panel(work_panel));
                 let mut sync_panel = vec![
-                    self.heading("手机也能拿到成果"),
+                    self.section_heading(UiIcon::Package, "手机也能拿到成果"),
                     self.setting_row(
                         "桌面任务完成后自动发送到手机",
                         "仅发送生成的交付文件，项目源码和临时文件留在电脑",
@@ -487,8 +516,389 @@ impl Companion {
                 cards.push(self.studio_lab_settings());
             }
             3 => {
+                let nc_mode = self.notification_center.alert_mode;
+                let nc_unread = self.notification_raw_unread_count();
+                let global_mode = self.settings.notify_draft.popup_mode;
+                if self.notification_center.is_currently_snoozed() {
+                    let until = self.notification_center.snooze_until_ms.unwrap_or_default();
+                    let time = chrono::DateTime::from_timestamp_millis(until)
+                        .map(|t| {
+                            t.with_timezone(&chrono::Local)
+                                .format("%m-%d %H:%M")
+                                .to_string()
+                        })
+                        .unwrap_or_default();
+                    cards.push(self.panel(vec![self.setting_row(
+                        "弹窗已暂停",
+                        &format!("{time} 自动恢复，消息仍正常同步"),
+                        self.button(
+                            "settings-popup-resume",
+                            "立即恢复",
+                            Action::NotificationCenter(NotificationCenterAction::ClearSnooze),
+                            Btn::Secondary,
+                        ),
+                    )]));
+                }
+
                 cards.push(self.panel(vec![
-                        self.heading("哪些通知提醒我"),
+                    self.between(
+                        self.section_heading(UiIcon::Chat, "新消息弹窗模式 · 全局默认"),
+                        self.button_icon(
+                            "settings-popup-preview-latest",
+                            "预览已保存设置",
+                            UiIcon::Bell,
+                            Action::NotificationCenter(
+                                NotificationCenterAction::ReplayLatestPopups,
+                            ),
+                            Btn::Secondary,
+                        ),
+                    ),
+                    self.text(
+                        if self.settings.notify_draft.scope == AlertScope::Muted {
+                            "电脑消息提醒当前已静音。选择下方任一提醒模式即可恢复聊天与验证码提醒。"
+                        } else {
+                            "选择收到手机新消息时的电脑桌面提醒方式；提醒来源仍按下方范围设置过滤。"
+                        },
+                        CAPTION,
+                        p.text2,
+                    ),
+                    self.wrap(
+                        PopupMode::ALL
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, v)| {
+                                self.button(
+                                    format!("settings-popup-{i}"),
+                                    v.label(),
+                                    Action::Push(PushAction::SetPopupMode(v)),
+                                    if global_mode == v {
+                                        Btn::Primary
+                                    } else {
+                                        Btn::Secondary
+                                    },
+                                )
+                            })
+                            .collect(),
+                    ),
+                    self.text(
+                        format!(
+                            "所选全局模式：{} — {}",
+                            global_mode.label(),
+                            global_mode.description()
+                        ),
+                        CAPTION,
+                        p.accent,
+                    ),
+                    self.divider(),
+                    self.setting_row(
+                        "1. 不弹窗",
+                        "新消息仅在「消息」与通知中心内静默记录，不弹出桌面窗口",
+                        self.button(
+                            "settings-popup-row-silent",
+                            if global_mode == PopupMode::Silent {
+                                "已选择"
+                            } else {
+                                "设为默认"
+                            },
+                            Action::Push(PushAction::SetPopupMode(PopupMode::Silent)),
+                            if global_mode == PopupMode::Silent {
+                                Btn::Primary
+                            } else {
+                                Btn::Secondary
+                            },
+                        ),
+                    ),
+                    self.setting_row(
+                        "2. 隐藏内容",
+                        "电脑右下角的 StepX 弹窗，仅显示来源；隐藏正文和图片",
+                        self.button(
+                            "settings-popup-row-banner",
+                            if global_mode == PopupMode::Banner {
+                                "已选择"
+                            } else {
+                                "设为默认"
+                            },
+                            Action::Push(PushAction::SetPopupMode(PopupMode::Banner)),
+                            if global_mode == PopupMode::Banner {
+                                Btn::Primary
+                            } else {
+                                Btn::Secondary
+                            },
+                        ),
+                    ),
+                    self.setting_row(
+                        "3. 显示内容",
+                        "显示消息摘要和对应图片；支持后台回复时显示输入框",
+                        self.button(
+                            "settings-popup-row-full",
+                            if global_mode == PopupMode::FullReply {
+                                "已选择"
+                            } else {
+                                "设为默认"
+                            },
+                            Action::Push(PushAction::SetPopupMode(PopupMode::FullReply)),
+                            if global_mode == PopupMode::FullReply {
+                                Btn::Primary
+                            } else {
+                                Btn::Secondary
+                            },
+                        ),
+                    ),
+                ]));
+
+                let mut app_entries: Vec<(String, String)> = vec![
+                    ("com.tencent.mm".into(), "微信".into()),
+                    ("com.ss.android.lark".into(), "飞书".into()),
+                    ("com.alibaba.android.rimet".into(), "钉钉".into()),
+                    ("com.tencent.wework".into(), "企业微信".into()),
+                    ("com.android.mms".into(), "短信与验证码".into()),
+                    ("com.android.dialer".into(), "电话与未接来电".into()),
+                    ("com.android.calendar".into(), "日历日程提醒".into()),
+                    ("com.android.deskclock".into(), "闹钟与倒计时提醒".into()),
+                    ("com.cainiao.wireless".into(), "快递与外卖实况".into()),
+                    ("com.tencent.mobileqq".into(), "QQ".into()),
+                    ("com.xingin.xhs".into(), "小红书".into()),
+                    ("com.taobao.taobao".into(), "淘宝".into()),
+                    ("com.jingdong.app.mall".into(), "京东".into()),
+                    ("com.sankuai.meituan".into(), "美团".into()),
+                    ("com.ss.android.ugc.aweme".into(), "抖音".into()),
+                    ("tv.danmaku.bili".into(), "哔哩哔哩".into()),
+                    ("com.eg.android.AlipayGphone".into(), "支付宝".into()),
+                    ("com.whatsapp".into(), "WhatsApp".into()),
+                    ("org.telegram.messenger".into(), "Telegram".into()),
+                ];
+                let mut seen_pkgs: std::collections::HashSet<String> =
+                    app_entries.iter().map(|(pkg, _)| pkg.clone()).collect();
+                for t in &self.push.snapshot.threads {
+                    let pkg = stepx_companion::desktop_notify::NotifyPreferences::normalize_app_key(
+                        t.package_name.trim(),
+                    );
+                    if !pkg.is_empty() && seen_pkgs.insert(pkg.clone()) {
+                        let label = if !t.app_name.trim().is_empty() {
+                            t.app_name.trim().to_string()
+                        } else {
+                            pkg.clone()
+                        };
+                        app_entries.push((pkg, label));
+                    }
+                }
+                for n in &self.push.snapshot.notifications {
+                    let pkg = stepx_companion::desktop_notify::NotifyPreferences::normalize_app_key(
+                        n.package_name.trim(),
+                    );
+                    if !pkg.is_empty() && seen_pkgs.insert(pkg.clone()) {
+                        let label = if !n.app_name.trim().is_empty() {
+                            n.app_name.trim().to_string()
+                        } else {
+                            pkg.clone()
+                        };
+                        app_entries.push((pkg, label));
+                    }
+                }
+                for raw_pkg in self.settings.notify_draft.app_popup_modes.keys() {
+                    let pkg = stepx_companion::desktop_notify::NotifyPreferences::normalize_app_key(
+                        raw_pkg.trim(),
+                    );
+                    if !pkg.is_empty() && seen_pkgs.insert(pkg.clone()) {
+                        app_entries.push((pkg.clone(), pkg));
+                    }
+                }
+
+                let override_count = self.settings.notify_draft.app_popup_modes.len();
+                let mut per_app_children: Vec<El> = vec![
+                    self.between(
+                        self.section_heading(UiIcon::Apps, "各应用独立弹窗设置（支持全部应用）"),
+                        self.pill_badge(
+                            if override_count > 0 {
+                                format!("{override_count} 个独立配置")
+                            } else {
+                                "全部跟随全局".into()
+                            },
+                            if override_count > 0 { p.accent } else { p.text2 },
+                            if override_count > 0 {
+                                p.accent_soft
+                            } else {
+                                p.tag_bg
+                            },
+                        ),
+                    ),
+                    self.text(
+                        "可为各应用单独选择提醒方式；完整消息窗口仅在手机提供后台回复入口时显示发送框。隐藏正文设置优先于完整消息模式。",
+                        CAPTION,
+                        p.text2,
+                    ),
+                ];
+
+                let range = self.list_page_range("notification-app-settings",app_entries.len(),30);
+                per_app_children.push(self.list_page_controls("notification-app-settings",app_entries.len(),30));
+                for (idx, (pkg, app_label)) in app_entries.into_iter().enumerate().skip(range.start).take(range.len()) {
+                    if idx > 0 {
+                        per_app_children.push(self.divider());
+                    }
+                    let override_mode = self.settings.notify_draft.app_popup_mode_override(&pkg);
+                    let effective_mode = self.settings.notify_draft.effective_popup_mode(&pkg);
+                    let status_desc = match override_mode {
+                        Some(m) => format!("独立设置：{} · {}", m.short_label(), pkg),
+                        None => format!(
+                            "跟随全局（当前：{}） · {}",
+                            effective_mode.short_label(),
+                            pkg
+                        ),
+                    };
+                    let buttons = self.wrap(vec![
+                        self.button(
+                            format!("settings-app-popup-inherit-{idx}"),
+                            "跟随全局",
+                            Action::Push(PushAction::SetAppPopupMode {
+                                package_name: pkg.clone(),
+                                mode: None,
+                            }),
+                            if override_mode.is_none() {
+                                Btn::Primary
+                            } else {
+                                Btn::Secondary
+                            },
+                        ),
+                        self.button(
+                            format!("settings-app-popup-silent-{idx}"),
+                            PopupMode::Silent.short_label(),
+                            Action::Push(PushAction::SetAppPopupMode {
+                                package_name: pkg.clone(),
+                                mode: Some(PopupMode::Silent),
+                            }),
+                            if override_mode == Some(PopupMode::Silent) {
+                                Btn::Primary
+                            } else {
+                                Btn::Secondary
+                            },
+                        ),
+                        self.button(
+                            format!("settings-app-popup-banner-{idx}"),
+                            PopupMode::Banner.short_label(),
+                            Action::Push(PushAction::SetAppPopupMode {
+                                package_name: pkg.clone(),
+                                mode: Some(PopupMode::Banner),
+                            }),
+                            if override_mode == Some(PopupMode::Banner) {
+                                Btn::Primary
+                            } else {
+                                Btn::Secondary
+                            },
+                        ),
+                        self.button(
+                            format!("settings-app-popup-full-{idx}"),
+                            PopupMode::FullReply.short_label(),
+                            Action::Push(PushAction::SetAppPopupMode {
+                                package_name: pkg.clone(),
+                                mode: Some(PopupMode::FullReply),
+                            }),
+                            if override_mode == Some(PopupMode::FullReply) {
+                                Btn::Primary
+                            } else {
+                                Btn::Secondary
+                            },
+                        ),
+                    ]);
+                    per_app_children.push(self.setting_row(&app_label, &status_desc, buttons));
+                }
+                cards.push(self.panel(per_app_children));
+
+                cards.push(self.panel(vec![
+                    self.between(
+                        self.section_heading(UiIcon::Chat, "消息中心与桌面弹窗"),
+                        self.pill_badge(
+                            if nc_unread > 0 {
+                                format!("{nc_unread} 未读")
+                            } else {
+                                "0 未读".into()
+                            },
+                            if nc_unread > 0 && nc_mode.allows_badge() {
+                                p.danger
+                            } else {
+                                p.text2
+                            },
+                            if nc_unread > 0 && nc_mode.allows_badge() {
+                                p.danger_soft
+                            } else {
+                                p.tag_bg
+                            },
+                        ),
+                    ),
+                    self.text(
+                        "统一收纳手机应用推送、未接来电与短信验证码、应用更新、跨端协同任务及系统状态。",
+                        CAPTION,
+                        p.text2,
+                    ),
+                    self.wrap(vec![
+                        self.button_icon(
+                            "settings-nc-mode-popup",
+                            "弹窗与红点",
+                            UiIcon::Bell,
+                            Action::NotificationCenter(NotificationCenterAction::SetAlertMode(
+                                NotificationAlertMode::PopupAndBadge,
+                            )),
+                            if nc_mode == NotificationAlertMode::PopupAndBadge {
+                                Btn::Primary
+                            } else {
+                                Btn::Secondary
+                            },
+                        ),
+                        self.button(
+                            "settings-nc-mode-badge",
+                            "仅显示红点",
+                            Action::NotificationCenter(NotificationCenterAction::SetAlertMode(
+                                NotificationAlertMode::BadgeOnly,
+                            )),
+                            if nc_mode == NotificationAlertMode::BadgeOnly {
+                                Btn::Primary
+                            } else {
+                                Btn::Secondary
+                            },
+                        ),
+                        self.button_icon(
+                            "settings-nc-mode-muted",
+                            "关闭提醒",
+                            UiIcon::Mute,
+                            Action::NotificationCenter(NotificationCenterAction::SetAlertMode(
+                                NotificationAlertMode::Muted,
+                            )),
+                            if nc_mode == NotificationAlertMode::Muted {
+                                Btn::Primary
+                            } else {
+                                Btn::Secondary
+                            },
+                        ),
+                    ]),
+                    self.text(nc_mode.description(), CAPTION, p.text3),
+                    self.divider(),
+                    self.wrap(vec![
+                        self.button_icon(
+                            "settings-nc-open-drawer",
+                            "打开消息中心",
+                            UiIcon::Bell,
+                            Action::NotificationCenter(NotificationCenterAction::ToggleDrawer),
+                            Btn::Secondary,
+                        ),
+                        self.button_icon(
+                            "settings-nc-mark-all-read",
+                            "全部已读",
+                            UiIcon::Check,
+                            Action::NotificationCenter(NotificationCenterAction::MarkAllRead),
+                            Btn::Secondary,
+                        ),
+                        self.button_icon(
+                            "settings-nc-clear",
+                            "清理已读",
+                            UiIcon::Trash,
+                            Action::NotificationCenter(
+                                NotificationCenterAction::ClearReadAndDismissed,
+                            ),
+                            Btn::Ghost,
+                        ),
+                    ]),
+                ]));
+                cards.push(self.panel(vec![
+                        self.section_heading(UiIcon::Bell, "哪些通知提醒我"),
                         self.wrap(
                             AlertScope::ALL
                                 .into_iter()
@@ -510,30 +920,9 @@ impl Companion {
                         self.text("只影响电脑上的提醒，不会更改手机通知。", CAPTION, p.text3),
                     ]));
                 cards.push(self.panel(vec![
-                        self.heading("提醒方式"),
-                        self.wrap(
-                            PopupMode::ALL
-                                .into_iter()
-                                .enumerate()
-                                .map(|(i, v)| {
-                                    self.button(
-                                        format!("settings-popup-{i}"),
-                                        v.label(),
-                                        Action::Push(PushAction::SetPopupMode(v)),
-                                        if self.settings.notify_draft.popup_mode == v {
-                                            Btn::Primary
-                                        } else {
-                                            Btn::Secondary
-                                        },
-                                    )
-                                })
-                                .collect(),
-                        ),
-                    ]));
-                cards.push(self.panel(vec![
-                    self.heading("隐私与便捷操作"),
+                    self.section_heading(UiIcon::Shield, "隐私与便捷操作"),
                     self.setting_row(
-                        "隐藏通知正文",
+                        "弹窗防窥保护（仅在桌面弹窗中隐藏消息正文，进入消息页正常显示）",
                         "提醒中只显示来源，保护私人内容",
                         self.setting_toggle(
                             "settings-privacy",
@@ -553,6 +942,60 @@ impl Companion {
                     ),
                 ]));
             }
+            AGENT_SETTINGS_TAB => {
+                cards.push(self.render_agent_workbench());
+                cards.push(self.panel(vec![
+                    self.section_heading(UiIcon::Layers, "何时调用 Agent"),
+                    self.setting_row(
+                        "首页指令自动接手",
+                        "明确的搜索、复盘或设备指令走本地。其余请求用对应场景整理成草稿。",
+                        self.setting_toggle(
+                            "settings-home-agent",
+                            s.home_agent_enabled,
+                            Action::Settings(S::HomeAgent),
+                        ),
+                    ),
+                    self.text("本地直达示例\n搜索 项目评审 PDF → 打开真实搜索结果\n日程 2026-11-09 14:30 项目评审 → 预填日历，核对后添加\n打开日历、日总结、专注25分钟 → 使用现有入口", CAPTION, p.text2),
+                    self.text("找资料给搜索词，拟回复给可复制草稿，讨论提取结论与待办，日程保留已知时间，方案给建议和检查清单。缺资料时会提示补充。", CAPTION, p.text2),
+                    self.between(
+                        self.heading("工作台提示词"),
+                        self.setting_button("settings-home-agent-reset", "恢复默认", S::ResetHomeAgentPrompt),
+                    ),
+                    self.input(F_HOME_AGENT_PROMPT, "输入 Agent 的表达偏好与要求", None),
+                    self.setting_button_icon("agent-model-settings", "模型设置", UiIcon::Settings, S::Models),
+                ]));
+                cards.push(self.panel(vec![
+                    self.section_heading(UiIcon::Package, "实况胶囊"),
+                    self.setting_row(
+                        "Agent 复核物流方向",
+                        "本地规则先判断。开启后只发送提取的状态短语，沿用已选模型来源。",
+                        self.setting_toggle(
+                            "settings-capsule-agent",
+                            s.capsule_agent_enabled,
+                            Action::Settings(S::CapsuleAgent),
+                        ),
+                    ),
+                    self.between(
+                        self.heading("Agent 提示词"),
+                        self.button(
+                            "settings-capsule-prompt-reset",
+                            "恢复默认",
+                            Action::Settings(S::ResetCapsulePrompt),
+                            Btn::Ghost,
+                        ),
+                    ),
+                    self.input(F_CAPSULE_PROMPT, "输入物流方向判断规则", None),
+                    self.text(
+                        if self.settings.value.capsule_agent_enabled && !self.fulfillment.status.is_empty() {
+                            self.fulfillment.status.as_str()
+                        } else {
+                            "已送达的提醒在查看后收起，未查看时最多保留 10 分钟。"
+                        },
+                        CAPTION,
+                        p.text2,
+                    ),
+                ]));
+            }
             _ => {
                 if self.settings.changelog {
                     let mut lines = include_str!("../../../../CHANGELOG.md")
@@ -566,16 +1009,26 @@ impl Companion {
                         .filter(|l| !l.trim().is_empty())
                     {
                         items.push(self.text(
-                            format!("• {}", line.trim_start_matches("- ")),
+                            format!("• {}", line.trim_start_matches("- ").replace("**", "")),
                             BODY,
                             p.text2,
                         ));
                     }
-                    items.push(self.wrap(vec![self.setting_button(
-                        "settings-log-back",
-                        "返回关于",
-                        S::Changelog,
-                    )]));
+                    items.push(self.wrap(vec![
+                        self.button(
+                            "settings-log-open-whats-new",
+                            "弹出版本更新卡片",
+                            Action::DesktopUpdate(
+                                super::super::desktop_update_state::DesktopUpdateAction::OpenWhatsNew,
+                            ),
+                            Btn::Primary,
+                        ),
+                        self.setting_button(
+                            "settings-log-back",
+                            "返回关于",
+                            S::Changelog,
+                        ),
+                    ]));
                     cards.push(self.panel(items));
                 } else {
                     cards.push(self.about_page());
@@ -590,6 +1043,7 @@ impl Companion {
             "让工作资料与交付成果各归其位。",
             "选择电脑如何接收手机提醒。",
             "版本、项目信息与联系方式。",
+            "规则先判断，Agent 处理需要理解的内容。先看草稿，再决定下一步。",
         ];
         let mut content = vec![
             self.line_w(labels[tab as usize], 24., p.text, Weight::Bold),

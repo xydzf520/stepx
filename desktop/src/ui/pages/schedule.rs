@@ -4,11 +4,11 @@
 //! and a dedicated visual alarm clock page with desktop-to-phone alarm creation & toggles.
 
 use super::super::{
-    backscreen_state::BackScreenAction, icons::UiIcon, theme::*, widgets::*,
-    workspace_state::WorkspaceAction, Action, Companion, Page, PushAction, F_ALARM_LABEL,
-    F_ALARM_TIME, F_CALENDAR_TIME, F_PHONE_SCHEDULE_TITLE,
+    backscreen_state::BackScreenAction, icons::UiIcon, theme::*, widgets::*, Action, Companion,
+    PushAction, F_ALARM_LABEL, F_ALARM_TIME, F_CALENDAR_TIME, F_PHONE_SCHEDULE_TITLE,
 };
-use chrono::{Datelike, Local, NaiveDate};
+use super::{calendar_style::DayMarks, home::home_event_date_bounds};
+use chrono::{Datelike, Days, Local, NaiveDate, Timelike};
 use facloud_ui::{
     color::ColorU,
     elements::*,
@@ -16,6 +16,144 @@ use facloud_ui::{
     platform::Cursor,
     text_layout::ClipConfig,
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CalendarEventValidity {
+    OngoingToday,
+    UpcomingToday { mins_until: Option<i64> },
+    UpcomingFuture { days_until: i64 },
+    EndedToday,
+    ManuallyExpired,
+    Completed,
+    PastDate,
+}
+
+impl CalendarEventValidity {
+    #[inline]
+    fn is_valid_unexpired(self) -> bool {
+        matches!(
+            self,
+            Self::OngoingToday | Self::UpcomingToday { .. } | Self::UpcomingFuture { .. }
+        )
+    }
+
+    #[inline]
+    fn is_today_valid_unexpired(self) -> bool {
+        matches!(self, Self::OngoingToday | Self::UpcomingToday { .. })
+    }
+
+    #[inline]
+    fn sort_rank(self) -> u8 {
+        match self {
+            Self::OngoingToday => 0,
+            Self::UpcomingToday { .. } => 1,
+            Self::UpcomingFuture { .. } => 2,
+            Self::EndedToday => 3,
+            Self::Completed => 4,
+            Self::ManuallyExpired => 5,
+            Self::PastDate => 6,
+        }
+    }
+
+    fn badge(self, p: &Palette) -> (String, ColorU, ColorU) {
+        match self {
+            Self::OngoingToday => ("进行中".into(), p.success_text, p.success_soft),
+            Self::UpcomingToday { mins_until } => {
+                let label = match mins_until {
+                    Some(mins) if mins >= 60 => {
+                        if mins % 60 == 0 {
+                            format!("{} 小时后", mins / 60)
+                        } else {
+                            format!("{} 小时 {} 分后", mins / 60, mins % 60)
+                        }
+                    }
+                    Some(mins) => format!("{} 分钟后", mins.max(1)),
+                    None => "今天".into(),
+                };
+                (label, p.accent, p.accent_soft)
+            }
+            Self::UpcomingFuture { days_until } => {
+                let label = match days_until {
+                    1 => "明天".into(),
+                    2 => "后天".into(),
+                    d => format!("{d} 天后"),
+                };
+                (label, p.accent, p.accent_soft)
+            }
+            Self::EndedToday => ("已结束".into(), p.text3, p.card2),
+            Self::ManuallyExpired => ("已过期".into(), p.text3, p.card2),
+            Self::Completed => ("已完成".into(), p.success_text, p.success_soft),
+            Self::PastDate => ("已过期".into(), p.text3, p.card2),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AlarmValidity {
+    TodayValidUnexpired { diff_mins: u32 },
+    PassedTodayRepeating,
+    FutureDayRepeating,
+    ExpiredOneShot,
+    ManuallyExpired,
+    Disabled,
+}
+
+fn fmt_alarm_countdown(diff_mins: u32) -> String {
+    let mins = diff_mins.max(1);
+    if mins >= 60 {
+        if mins % 60 == 0 {
+            format!("{} 小时后", mins / 60)
+        } else {
+            format!("{} 小时 {} 分后", mins / 60, mins % 60)
+        }
+    } else {
+        format!("{mins} 分钟后")
+    }
+}
+
+impl AlarmValidity {
+    #[inline]
+    fn is_today_unexpired(self) -> bool {
+        matches!(self, Self::TodayValidUnexpired { .. })
+    }
+
+    #[inline]
+    fn is_valid_active(self) -> bool {
+        matches!(
+            self,
+            Self::TodayValidUnexpired { .. }
+                | Self::PassedTodayRepeating
+                | Self::FutureDayRepeating
+        )
+    }
+
+    #[inline]
+    fn sort_rank(self) -> u8 {
+        match self {
+            Self::TodayValidUnexpired { .. } => 0,
+            Self::PassedTodayRepeating => 1,
+            Self::FutureDayRepeating => 2,
+            Self::ExpiredOneShot => 3,
+            Self::ManuallyExpired => 4,
+            Self::Disabled => 5,
+        }
+    }
+
+    fn badge(self, p: &Palette) -> (String, ColorU, ColorU) {
+        match self {
+            Self::TodayValidUnexpired { diff_mins } => (
+                fmt_alarm_countdown(diff_mins),
+                p.success_text,
+                p.success_soft,
+            ),
+            Self::PassedTodayRepeating => ("明天再响".into(), p.warning, p.warning_soft),
+            Self::FutureDayRepeating => ("今天不响".into(), p.accent, p.accent_soft),
+            Self::ExpiredOneShot => ("已过".into(), p.text3, p.card2),
+            Self::ManuallyExpired => ("已过期".into(), p.text3, p.card2),
+            Self::Disabled => ("未开启".into(), p.text3, p.card2),
+        }
+    }
+}
 
 fn relative_day_badge(
     year: i32,
@@ -52,48 +190,120 @@ fn days_in_year_month(year: i32, month: u32) -> u32 {
     (first_of_next - first_of_this).num_days().clamp(28, 31) as u32
 }
 
+#[inline]
 fn truncate_chars(s: &str, max_chars: usize) -> String {
-    let mut chars = s.chars();
-    let head: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{head}…")
-    } else {
-        head
-    }
+    stepx_companion::home_hub::truncate_chars(s, max_chars)
 }
 
 impl Companion {
-    #[allow(dead_code)]
-    pub(super) fn schedule_actions(&self) -> Vec<El> {
-        self.calendar_actions()
-    }
-
     #[allow(dead_code)]
     pub(in super::super) fn schedule_page(&self) -> El {
         self.calendar_page()
     }
 
+    fn calendar_event_validity(
+        &self,
+        ev: &stepx_companion::toolbox::PhoneCalendarEvent,
+        today: NaiveDate,
+        now_ms: i64,
+    ) -> CalendarEventValidity {
+        if self.calendar_event_is_completed(ev) {
+            return CalendarEventValidity::Completed;
+        }
+        if self.calendar_event_is_suppressed(ev, now_ms) {
+            return CalendarEventValidity::ManuallyExpired;
+        }
+        let (ey, em, ed) = ev.date_ymd();
+        let Some(target_date) = NaiveDate::from_ymd_opt(ey, em, ed) else {
+            return CalendarEventValidity::PastDate;
+        };
+        let effective_end_ms = if ev.dtend > ev.dtstart {
+            ev.dtend
+        } else {
+            ev.dtstart + 3_600_000
+        };
+        let day_diff = (target_date - today).num_days();
+        if day_diff < 0 {
+            if !ev.all_day && ev.dtstart <= now_ms && effective_end_ms > now_ms {
+                CalendarEventValidity::OngoingToday
+            } else {
+                CalendarEventValidity::PastDate
+            }
+        } else if day_diff == 0 {
+            if ev.all_day {
+                CalendarEventValidity::UpcomingToday { mins_until: None }
+            } else if ev.dtstart <= now_ms && effective_end_ms > now_ms {
+                CalendarEventValidity::OngoingToday
+            } else if ev.dtstart > now_ms {
+                let mins = ((ev.dtstart - now_ms) / 60_000).max(1);
+                CalendarEventValidity::UpcomingToday {
+                    mins_until: Some(mins),
+                }
+            } else {
+                CalendarEventValidity::EndedToday
+            }
+        } else {
+            CalendarEventValidity::UpcomingFuture {
+                days_until: day_diff,
+            }
+        }
+    }
+
+    fn alarm_validity(
+        &self,
+        a: &stepx_companion::toolbox::PhoneAlarmItem,
+        now_ms: i64,
+        now_min: u32,
+        weekday_idx: u32,
+    ) -> AlarmValidity {
+        let is_suppressed = self.reminder_governance.is_any_key_suppressed(
+            &[format!("alarm:{}", a.id), format!("capsule:alarm-{}", a.id)],
+            None,
+            None,
+            None,
+            now_ms,
+        );
+        if is_suppressed {
+            return AlarmValidity::ManuallyExpired;
+        }
+        if !a.enabled {
+            return AlarmValidity::Disabled;
+        }
+        let matches_today =
+            a.days_of_week == 0 || (a.days_of_week & (1u32 << weekday_idx.min(6))) != 0;
+        let alarm_min = (a.hour as u32) * 60 + (a.minutes as u32);
+        if matches_today && alarm_min > now_min {
+            AlarmValidity::TodayValidUnexpired {
+                diff_mins: alarm_min - now_min,
+            }
+        } else if matches_today && a.days_of_week != 0 {
+            AlarmValidity::PassedTodayRepeating
+        } else if !matches_today && a.days_of_week != 0 {
+            AlarmValidity::FutureDayRepeating
+        } else {
+            AlarmValidity::ExpiredOneShot
+        }
+    }
+
     pub(super) fn calendar_actions(&self) -> Vec<El> {
         vec![
-            self.button(
-                "cal-hdr-today",
-                "回到今天",
-                Action::BackScreen(BackScreenAction::CalendarToday),
-                Btn::Secondary,
-            ),
             self.button_icon(
-                "cal-hdr-open-phone",
-                "在手机打开日历",
-                UiIcon::Calendar,
-                Action::BackScreen(BackScreenAction::McpQuickOpenCalendar),
+                "cal-banner-autosync-toggle",
+                "自动同步",
+                if self.prefs.auto_sync_calendar {
+                    UiIcon::Check
+                } else {
+                    UiIcon::Pause
+                },
+                Action::BackScreen(BackScreenAction::ToggleAutoSyncCalendar),
                 Btn::Ghost,
             ),
             if self.back_screen.stepos_suite_loading {
-                self.disabled_button("正在同步日历…")
+                self.disabled_button("同步中…")
             } else {
                 self.button_icon(
                     "cal-hdr-refresh",
-                    "同步系统与手机日历",
+                    "同步",
                     UiIcon::Refresh,
                     Action::BackScreen(BackScreenAction::InspectStepOsSuite),
                     Btn::Primary,
@@ -105,7 +315,9 @@ impl Companion {
     pub(super) fn calendar_page(&self) -> El {
         let p = self.p();
         let suite = &self.back_screen.stepos_suite;
-        let today = Local::now().date_naive();
+        let now_local = Local::now();
+        let today = now_local.date_naive();
+        let now_ms = now_local.timestamp_millis();
 
         let year = if self.back_screen.calendar_year >= 1970 {
             self.back_screen.calendar_year
@@ -123,88 +335,51 @@ impl Companion {
             .selected_calendar_day
             .clamp(1, days_in_month);
 
-        let visible_calendar_events: Vec<&stepx_companion::toolbox::PhoneCalendarEvent> = suite
+        let visible_calendar_events: Vec<_> = suite
             .calendar_events
             .iter()
-            .filter(|ev| {
-                !ev.title.contains("StepX 日历网格验证") && !ev.title.contains("StepX E2E")
-            })
+            .filter(|event| !event.is_e2e_probe())
             .collect();
+        let month_days = self.home_month_days();
+        let mut marks = [DayMarks::default(); 32];
+        for day in month_days.iter().filter(|d| (d.date.year(), d.date.month()) == (year, month)) {
+            marks[day.date.day() as usize] = day.marks;
+        }
+        let first_day = NaiveDate::from_ymd_opt(year, month, 1).unwrap_or(today);
+        let last_day = NaiveDate::from_ymd_opt(year, month, days_in_month).unwrap_or(first_day);
 
         let mut by_day: [Vec<&stepx_companion::toolbox::PhoneCalendarEvent>; 32] =
             std::array::from_fn(|_| Vec::new());
-        let mut month_event_count = 0usize;
+        let mut today_valid_unexpired_count = 0usize;
         for ev in &visible_calendar_events {
-            let (ey, em, ed) = ev.date_ymd();
-            if ey == year && em == month && (1..=31).contains(&ed) {
-                month_event_count += 1;
-                by_day[ed as usize].push(*ev);
+            let Some((start, end)) = home_event_date_bounds(ev) else {
+                continue;
+            };
+            if today >= start && today <= end
+                && self.calendar_event_validity(ev, today, now_ms).is_today_valid_unexpired()
+            {
+                today_valid_unexpired_count += 1;
+            }
+            if start <= last_day && end >= first_day {
+                for day in start.max(first_day).day()..=end.min(last_day).day() {
+                    by_day[day as usize].push(*ev);
+                }
             }
         }
+        for day_vec in &mut by_day {
+            day_vec.sort_by_key(|ev| {
+                let v = self.calendar_event_validity(ev, today, now_ms);
+                (v.sort_rank(), ev.dtstart, ev.id)
+            });
+        }
         let selected_day_events = &by_day[selected_day as usize];
-
-        // 1. Top Sync & Status Banner
-        let cal_note = if !suite.last_action_note.is_empty()
-            && (suite.last_action_note.contains("日历") || suite.last_action_note.contains("日程"))
-            && !suite.last_action_note.contains("屏幕使用")
-            && !suite.last_action_note.contains("闹钟")
-        {
-            suite.last_action_note.clone()
-        } else {
-            format!(
-                "当前选中 {year}-{month:02}-{selected_day:02} · 当日 {} 项日程，本月共 {} 项日程",
-                selected_day_events.len(),
-                month_event_count
-            )
-        };
-        let banner_left = vec![
-            self.hstack(
-                S2,
-                vec![
-                    self.heading("双端日历工作台（电脑系统日历与手机日历双向同步）"),
-                    self.pill_badge(
-                        format!("共 {} 项双端日程", visible_calendar_events.len()),
-                        p.accent,
-                        p.accent_soft,
-                    ),
-                ],
-            ),
-            self.text(
-                "默认自动读取当前电脑系统日历（Linux Evolution/GNOME/KDE · macOS Calendar · Windows Outlook/系统日历）并与手机日历双向同步，也可在右侧或设置中随时关闭。",
-                CAPTION,
-                p.text2,
-            ),
-            self.line(cal_note, MICRO, p.text3),
-        ];
-
-        let top_banner = self.panel(vec![self.between(
-            self.vstack(S1, banner_left),
-            self.hstack(
-                S2,
-                vec![
-                    self.button(
-                        "cal-banner-autosync-toggle",
-                        if self.prefs.auto_sync_calendar {
-                            "自动同步系统日历：已开启"
-                        } else {
-                            "自动同步系统日历：已关闭"
-                        },
-                        Action::BackScreen(BackScreenAction::ToggleAutoSyncCalendar),
-                        if self.prefs.auto_sync_calendar {
-                            Btn::Primary
-                        } else {
-                            Btn::Secondary
-                        },
-                    ),
-                    self.button(
-                        "cal-banner-goto-settings",
-                        "前往设置",
-                        Action::Page(Page::Settings),
-                        Btn::Ghost,
-                    ),
-                ],
-            ),
-        )]);
+        let selected_day_valid_count = selected_day_events
+            .iter()
+            .filter(|ev| {
+                self.calendar_event_validity(ev, today, now_ms)
+                    .is_valid_unexpired()
+            })
+            .count();
 
         // 2. Left Column: Visual 7×6 Month Calendar Grid
         let month_nav_bar = self.between(
@@ -213,7 +388,7 @@ impl Companion {
                 vec![
                     self.heading(format!("{year} 年 {month:02} 月")),
                     self.pill_badge(
-                        format!("本月 {month_event_count} 项日程"),
+                        format!("今日 {today_valid_unexpired_count} 项"),
                         p.accent,
                         p.accent_soft,
                     ),
@@ -261,13 +436,10 @@ impl Companion {
                 .finish(),
             )
             .with_vertical_padding(6.)
-            .with_background_color(p.surface)
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
             .finish();
             weekday_header_row = weekday_header_row.with_child(Expanded::new(1., cell).finish());
         }
 
-        let first_day = NaiveDate::from_ymd_opt(year, month, 1).unwrap_or(today);
         let leading_empty = first_day.weekday().num_days_from_monday() as i32;
 
         let mut week_rows: Vec<El> = Vec::with_capacity(6);
@@ -281,14 +453,31 @@ impl Companion {
                 let day_num = cell_idx - leading_empty + 1;
 
                 let cell_el: El = if day_num < 1 || day_num > days_in_month as i32 {
+                    let adjacent = if day_num < 1 {
+                        first_day.checked_sub_days(Days::new((1 - day_num) as u64))
+                    } else {
+                        first_day.checked_add_days(Days::new((day_num - 1) as u64))
+                    };
+                    let content = adjacent.map_or_else(
+                        || Empty::new().finish(),
+                        |date| {
+                            let marks = month_days.iter().find(|day| day.date == date)
+                                .map_or(DayMarks::default(), |day| day.marks);
+                            self.hstack(
+                                5.,
+                                vec![
+                                    self.calendar_day_number(date.day(), date == today, false, false),
+                                    self.calendar_day_marks(marks),
+                                ],
+                            )
+                        },
+                    );
                     ConstrainedBox::new(
-                        Container::new(Empty::new().finish())
-                            .with_background_color(p.workspace)
-                            .with_border(Border::all(1.).with_border_color(p.border))
-                            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
+                        Container::new(Align::new(content).top_left().finish())
+                            .with_uniform_padding(6.)
                             .finish(),
                     )
-                    .with_height(92.)
+                    .with_height(80.)
                     .finish()
                 } else {
                     let d = day_num as u32;
@@ -297,19 +486,29 @@ impl Companion {
                     let is_selected = d == selected_day;
 
                     let day_events = &by_day[d as usize];
-                    let event_count = day_events.len();
-                    let previews: Vec<(i64, String, bool)> = day_events
+                    let day_marks = marks[d as usize];
+                    let previews: Vec<(i64, String, bool, bool)> = day_events
                         .iter()
                         .take(2)
                         .map(|ev| {
-                            let label =
-                                truncate_chars(&format!("{} {}", ev.hm_label(), ev.title), 7);
+                            let validity = self.calendar_event_validity(ev, today, now_ms);
+                            let is_valid = validity.is_valid_unexpired();
+                            let raw_label = match validity {
+                                CalendarEventValidity::Completed => {
+                                    format!("✓ {} {}", ev.hm_label(), ev.title)
+                                }
+                                _ if !is_valid => {
+                                    format!("[已过] {} {}", ev.hm_label(), ev.title)
+                                }
+                                _ => format!("{} {}", ev.hm_label(), ev.title),
+                            };
+                            let label = truncate_chars(&raw_label, 8);
                             let is_sys = ev.source.contains("system")
                                 || ev.source.contains("desktop")
                                 || ev.source.contains("local")
                                 || ev.source.contains("电脑")
                                 || ev.source.contains("双端");
-                            (ev.id, label, is_sys)
+                            (ev.id, label, is_sys, is_valid)
                         })
                         .collect();
 
@@ -317,88 +516,33 @@ impl Companion {
                     let font = self.font;
 
                     Hoverable::new(state, move |mouse| {
-                        let hovered = mouse.is_mouse_over_element();
-                        let t = if self.settings.value.reduced_motion {
-                            if hovered {
-                                1.
-                            } else {
-                                0.
-                            }
-                        } else {
-                            mouse.hover_progress().clamp(0., 1.)
-                        };
-                        let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t) as u8;
-                        let blend = |c1: ColorU, c2: ColorU| {
-                            ColorU::new(
-                                mix(c1.r, c2.r),
-                                mix(c1.g, c2.g),
-                                mix(c1.b, c2.b),
-                                mix(c1.a, c2.a),
-                            )
-                        };
-                        let bg = if mouse.is_clicked() || is_selected {
+                        let t = self.hover_t(mouse);
+                        let bg = if is_selected {
                             p.accent_soft
+                        } else if mouse.is_clicked() {
+                            p.press_color(p.hover)
                         } else {
-                            blend(p.surface, p.hover)
+                            lerp_color(p.bg, p.hover, t)
                         };
-                        let border_color = if mouse.is_clicked() || is_selected {
+                        let border_color = if is_selected {
                             p.accent
-                        } else if is_today {
-                            p.blue
                         } else {
-                            blend(p.border, p.border_strong)
+                            lerp_color(p.border, p.border_strong, t)
                         };
-                        let border_w = if mouse.is_clicked() || is_selected || is_today {
-                            1.5
-                        } else {
-                            1.0
-                        };
-
-                        let day_num_el = Text::new(format!("{d}"), font, BODY)
-                            .with_color(if is_selected {
-                                p.accent
-                            } else if is_today {
-                                p.blue
+                        let date = self.calendar_day_number(d, is_today, is_selected, true);
+                        let top_row = self.hstack(5., vec![date, self.calendar_day_marks(day_marks)]);
+                        #[cfg(feature = "ui-capture")]
+                        let top_row = crate::ui::scenario_check::control(
+                            if is_today {
+                                "cal-cell-today".to_string()
                             } else {
-                                p.text
-                            })
-                            .with_style(Properties::default().weight(if is_selected || is_today {
-                                Weight::Bold
-                            } else {
-                                Weight::Semibold
-                            }))
-                            .soft_wrap(false)
-                            .finish();
-
-                        let badge_el: El = if is_today {
-                            Container::new(
-                                Text::new("今".to_string(), font, MICRO)
-                                    .with_color(p.on_accent)
-                                    .with_style(Properties::default().weight(Weight::Semibold))
-                                    .soft_wrap(false)
-                                    .finish(),
-                            )
-                            .with_horizontal_padding(5.)
-                            .with_vertical_padding(1.)
-                            .with_background_color(p.blue)
-                            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
-                            .finish()
-                        } else if event_count > 0 {
-                            self.line(format!("{event_count}项"), MICRO, p.text3)
-                        } else {
-                            Empty::new().finish()
-                        };
-
-                        let top_row = Flex::row()
-                            .with_main_axis_size(MainAxisSize::Max)
-                            .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
-                            .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                            .with_child(day_num_el)
-                            .with_child(badge_el)
-                            .finish();
+                                format!("cal-cell-{year}-{month}-{d}")
+                            },
+                            top_row,
+                        );
 
                         let mut cell_items: Vec<El> = vec![top_row];
-                        for &(ev_id, ref preview_text, is_sys) in &previews {
+                        for &(ev_id, ref preview_text, is_sys, is_valid) in &previews {
                             let pill_state =
                                 self.mouse_state(format!("cal-cell-ev:{year}:{month}:{d}:{ev_id}"));
                             let pill_text = preview_text.clone();
@@ -406,14 +550,23 @@ impl Companion {
                                 let pill_hovered = pill_mouse.is_mouse_over_element();
                                 let pill_bg = if pill_mouse.is_clicked() || pill_hovered {
                                     p.hover
+                                } else if !is_valid {
+                                    p.card2
                                 } else if is_selected {
                                     p.bg
                                 } else {
                                     p.accent_soft
                                 };
+                                let pill_fg = if !is_valid {
+                                    p.text3
+                                } else if is_sys {
+                                    p.blue
+                                } else {
+                                    p.text
+                                };
                                 Container::new(
                                     Text::new(pill_text.clone(), font, MICRO)
-                                        .with_color(if is_sys { p.blue } else { p.text })
+                                        .with_color(pill_fg)
                                         .soft_wrap(false)
                                         .with_clip(ClipConfig::ellipsis())
                                         .finish(),
@@ -459,13 +612,13 @@ impl Companion {
                             Container::new(inner)
                                 .with_uniform_padding(6.)
                                 .with_background_color(bg)
-                                .with_border(Border::all(border_w).with_border_color(border_color))
+                                .with_border(Border::all(1.).with_border_color(border_color))
                                 .with_corner_radius(CornerRadius::with_all(Radius::Pixels(
                                     R_CONTROL,
                                 )))
                                 .finish(),
                         )
-                        .with_height(92.)
+                        .with_height(80.)
                         .finish()
                     })
                     .with_defer_events_to_children()
@@ -502,30 +655,11 @@ impl Companion {
             week_rows.push(row.finish());
         }
 
-        let grid_footer = self.between(
-            self.hstack(
-                S2,
-                vec![
-                    self.pill_badge("今 · 今日日期", p.blue, p.surface),
-                    self.pill_badge(
-                        format!("当前选中：{year}-{month:02}-{selected_day:02}"),
-                        p.accent,
-                        p.accent_soft,
-                    ),
-                ],
-            ),
-            self.line(
-                "左键选日期 · 双击新建 · 右键日期或日程直接添加/修改/删除",
-                CAPTION,
-                p.text3,
-            ),
-        );
-
         let left_calendar_card = self.panel(vec![
             month_nav_bar,
             weekday_header_row.finish(),
-            self.vstack(6., week_rows),
-            grid_footer,
+            self.calendar_content_enter(self.vstack(6., week_rows), true),
+            self.bounded_wrap(self.calendar_mark_legend()),
         ]);
 
         // 3. Right Column: Selected Day Inspector & Event Creator
@@ -534,15 +668,13 @@ impl Companion {
             relative_day_badge(year, month, selected_day, today, &p);
         let is_editing = self.back_screen.editing_calendar_event_id.is_some();
         let current_cal_time = self.fields[F_CALENDAR_TIME].text.trim();
-        let cal_time_presets: [(&'static str, &'static str); 6] = [
-            ("09:00 晨会", "09:00-09:30"),
-            ("10:00 评审", "10:00-11:00"),
-            ("14:00 下午", "14:00-15:00"),
-            ("16:00 沟通", "16:00-17:00"),
-            ("19:30 晚间", "19:30-20:30"),
-            ("全天日程", "09:00-18:00"),
+        let cal_time_presets: [(&'static str, &'static str); 4] = [
+            ("09:00", "09:00-09:30"),
+            ("14:00", "14:00-15:00"),
+            ("16:00", "16:00-17:00"),
+            ("全天", "09:00-18:00"),
         ];
-        let mut cal_time_preset_chips: Vec<El> = vec![self.line("快捷时段：", MICRO, p.text2)];
+        let mut cal_time_preset_chips: Vec<El> = Vec::new();
         for (idx, (chip_label, time_val)) in cal_time_presets.into_iter().enumerate() {
             let active_chip = current_cal_time == time_val;
             cal_time_preset_chips.push(self.button(
@@ -557,139 +689,22 @@ impl Companion {
             ));
         }
 
-        let scenario_templates: [(UiIcon, &'static str, &'static str, &'static str); 5] = [
-            (
-                UiIcon::Calendar,
-                "15分钟后开会",
-                "临时会议讨论",
-                "10:00-10:30",
-            ),
-            (
-                UiIcon::Package,
-                "下班取快递",
-                "下班驿站取快递",
-                "18:30-19:00",
-            ),
-            (
-                UiIcon::Activity,
-                "今晚 20:00 运动",
-                "晚间运动健身",
-                "20:00-21:00",
-            ),
-            (
-                UiIcon::Heart,
-                "每日吃药提醒",
-                "按时服药与饮水提醒",
-                "21:30-21:45",
-            ),
-            (
-                UiIcon::Gift,
-                "纪念日/生日",
-                "亲友生日与纪念日祝福",
-                "09:00-18:00",
-            ),
-        ];
-        let mut scenario_chips: Vec<El> = vec![self.line("场景模板：", MICRO, p.text2)];
-        for (idx, (icon, btn_label, tpl_title, tpl_time)) in
-            scenario_templates.into_iter().enumerate()
-        {
-            let is_active_tpl = self.fields[F_PHONE_SCHEDULE_TITLE].text.trim() == tpl_title;
-            let state = self.mouse_state(format!("cal-scen-tpl:{idx}"));
-            let font = self.font;
-            let title_str = tpl_title.to_string();
-            let time_str = tpl_time.to_string();
-            let label_str = btn_label.to_string();
-            scenario_chips.push(
-                Hoverable::new(state, move |mouse| {
-                    let hovered = mouse.is_mouse_over_element();
-                    let bg = if mouse.is_clicked() || is_active_tpl {
-                        p.accent_soft
-                    } else if hovered {
-                        p.hover
-                    } else {
-                        p.surface
-                    };
-                    let border = if is_active_tpl {
-                        p.accent
-                    } else if hovered {
-                        p.border_strong
-                    } else {
-                        p.border
-                    };
-                    Container::new(self.hstack(
-                        5.,
-                        vec![
-                            self.ui_icon(
-                                icon,
-                                13.,
-                                if is_active_tpl { p.accent } else { p.text2 },
-                            ),
-                            Text::new(label_str.clone(), font, MICRO)
-                                .with_color(p.text)
-                                .with_style(Properties::default().weight(if is_active_tpl {
-                                    Weight::Semibold
-                                } else {
-                                    Weight::Medium
-                                }))
-                                .soft_wrap(false)
-                                .finish(),
-                        ],
-                    ))
-                    .with_horizontal_padding(10.)
-                    .with_vertical_padding(4.)
-                    .with_background_color(bg)
-                    .with_border(Border::all(1.).with_border_color(border))
-                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
-                    .finish()
-                })
-                .with_cursor(Cursor::PointingHand)
-                .on_click(move |ctx, _, _| {
-                    ctx.dispatch_typed_action(Action::Focus(F_PHONE_SCHEDULE_TITLE));
-                    ctx.dispatch_typed_action(Action::ClearField(F_PHONE_SCHEDULE_TITLE));
-                    ctx.dispatch_typed_action(Action::Insert(title_str.clone()));
-                    ctx.dispatch_typed_action(Action::Push(PushAction::SelectCalendarQuickTime(
-                        time_str.clone(),
-                    )));
-                })
-                .finish(),
-            );
-        }
-
-        let mut create_card_items: Vec<El> = vec![
-            self.between(
-                self.hstack(
-                    S2,
-                    vec![
-                        self.heading(format!("{year}年{month:02}月{selected_day:02}日 日程安排")),
-                        self.pill_badge(sel_rel_label, sel_rel_fg, sel_rel_bg),
-                    ],
-                ),
-                self.pill_badge(
-                    format!("当日 {} 项", selected_day_events.len()),
-                    p.accent,
-                    p.accent_soft,
-                ),
-            ),
-            self.text(
-                "点击左侧日历任意日期即可切换选中日；在下方输入日程标题与时间（或点击场景模板/快捷时段），一键写入手机日历并与桌面同步。",
-                CAPTION,
-                p.text2,
-            ),
-        ];
+        let mut create_card_items: Vec<El> = vec![self.hstack(
+            S2,
+            vec![
+                self.heading(format!("{month}月{selected_day}日")),
+                self.pill_badge(sel_rel_label, sel_rel_fg, sel_rel_bg),
+            ],
+        )];
 
         if is_editing {
-            create_card_items.push(
-                Container::new(self.between(
+            create_card_items.push(self.status_banner_box(
+                self.between(
                     self.hstack(
                         8.,
                         vec![
-                            self.ui_icon(UiIcon::Edit, 14., p.warning),
-                            self.line_w(
-                                "正在修改日程（保存后将直接更新原日程）",
-                                CAPTION,
-                                p.text,
-                                Weight::Semibold,
-                            ),
+                            self.content_icon(UiIcon::Edit, 14., p.warning),
+                            self.line_w("正在修改日程", CAPTION, p.text, Weight::Semibold),
                         ],
                     ),
                     self.button(
@@ -698,36 +713,19 @@ impl Companion {
                         Action::BackScreen(BackScreenAction::CalendarCancelEdit),
                         Btn::Secondary,
                     ),
-                ))
-                .with_horizontal_padding(12.)
-                .with_vertical_padding(8.)
-                .with_background_color(p.warning_soft)
-                .with_border(Border::all(1.).with_border_color(p.warning))
-                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
-                .finish(),
-            );
+                ),
+                p.warning_soft,
+                p.warning,
+            ));
         }
 
-        create_card_items.push(self.input(
-            F_PHONE_SCHEDULE_TITLE,
-            "输入日程标题（如：项目评审会 / 航班出行）…",
-            None,
-        ));
-        create_card_items.push(self.input(
-            F_CALENDAR_TIME,
-            "输入日程时间（如 09:30 或 14:00-15:30，留空默认 09:30）…",
-            None,
-        ));
-        create_card_items.push(self.wrap(scenario_chips));
+        create_card_items.push(self.input(F_PHONE_SCHEDULE_TITLE, "日程标题", None));
+        create_card_items.push(self.input(F_CALENDAR_TIME, "时间，如 09:30", None));
         create_card_items.push(self.wrap(cal_time_preset_chips));
 
         let mut submit_btns = vec![self.button_icon(
             "cal-create-selected-custom",
-            if is_editing {
-                "保存日程修改"
-            } else {
-                "在选中日期添加日程"
-            },
+            if is_editing { "保存" } else { "添加" },
             if is_editing {
                 UiIcon::Check
             } else {
@@ -743,28 +741,6 @@ impl Companion {
                 Action::BackScreen(BackScreenAction::CalendarCancelEdit),
                 Btn::Secondary,
             ));
-        } else {
-            submit_btns.push(self.button_icon(
-                "cal-create-preset-1h",
-                "1 小时后快速日程",
-                UiIcon::Plus,
-                Action::BackScreen(BackScreenAction::CalendarCreatePreset(0)),
-                Btn::Secondary,
-            ));
-            submit_btns.push(self.button_icon(
-                "cal-create-preset-18",
-                "今晚 18:00 复盘",
-                UiIcon::Plus,
-                Action::BackScreen(BackScreenAction::CalendarCreatePreset(1)),
-                Btn::Secondary,
-            ));
-            submit_btns.push(self.button_icon(
-                "cal-create-preset-tmr",
-                "明早 09:30 晨会",
-                UiIcon::Plus,
-                Action::BackScreen(BackScreenAction::CalendarCreatePreset(2)),
-                Btn::Secondary,
-            ));
         }
         create_card_items.push(self.wrap(submit_btns));
 
@@ -772,8 +748,12 @@ impl Companion {
 
         // Card 2: Selected Date Events & Upcoming Agenda
         let mut selected_day_hdr_right = vec![self.pill_badge(
-            format!("{} 项", selected_day_events.len()),
-            p.accent,
+            format!("{selected_day_valid_count}/{}", selected_day_events.len()),
+            if selected_day_valid_count > 0 {
+                p.success_text
+            } else {
+                p.accent
+            },
             p.surface,
         )];
         if !selected_day_events.is_empty() {
@@ -789,59 +769,72 @@ impl Companion {
             ));
         }
         let mut agenda_rows: Vec<El> = vec![self.between(
-            self.heading(format!("{month:02}月{selected_day:02}日 当日日程明细")),
+            self.section_heading(UiIcon::Calendar, "当日日程"),
             self.hstack(S2, selected_day_hdr_right),
         )];
 
         if selected_day_events.is_empty() {
-            agenda_rows.push(
-                Container::new(self.text(
-                    "选中日期暂无日程安排。可在上方填写标题后点击「在选中日期添加日程」或快捷时间按钮创建。",
-                    BODY,
-                    p.text2,
-                ))
-                .with_uniform_padding(S3)
-                .with_background_color(p.surface)
-                .with_border(Border::all(1.).with_border_color(p.border))
-                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
-                .finish(),
-            );
+            agenda_rows.push(self.surface_note_box("暂无日程", p.text2));
         } else {
-            for event in selected_day_events {
-                agenda_rows.push(self.render_calendar_event_row(event, "sel"));
+            let page_key = format!("calendar-day:{year}:{month}:{selected_day}");
+            let range = self.list_page_range(&page_key,selected_day_events.len(),20);
+            agenda_rows.push(self.list_page_controls(&page_key,selected_day_events.len(),20));
+            for (_i, event) in selected_day_events.iter().enumerate().skip(range.start).take(range.len()) {
+                let row_el = self.render_calendar_event_row(event, "sel", today, now_ms);
+                #[cfg(feature = "ui-capture")]
+                let row_el =
+                    crate::ui::scenario_check::control(format!("cal-agenda-row-{_i}"), row_el);
+                agenda_rows.push(row_el);
             }
         }
 
-        agenda_rows.push(self.divider());
-        agenda_rows.push(self.between(
-            self.heading("近期全部日程"),
-            self.pill_badge(
-                format!("共 {} 项", visible_calendar_events.len()),
-                p.text2,
-                p.surface,
-            ),
-        ));
+        if let Some(day) = month_days.iter().find(|day| day.date.day() == selected_day
+            && (day.date.year(), day.date.month()) == (year, month))
+        {
+            let rows = self.calendar_day_context_rows(day);
+            if !rows.is_empty() {
+                agenda_rows.push(self.divider());
+                agenda_rows.extend(rows);
+            }
+        }
+        let selected_agenda = self.calendar_content_enter(self.vstack(S2, agenda_rows), false);
+        let mut agenda_rows = vec![selected_agenda];
 
-        if visible_calendar_events.is_empty() {
-            agenda_rows.push(
-                Container::new(self.text(
-                    if suite.checked {
-                        "当前暂无近期日程。系统日历（Evolution / GNOME / KDE / macOS / Windows）与手机日历中的新日程会自动汇总于此。"
-                    } else {
-                        "正在读取电脑系统日历与手机日历日程…"
-                    },
-                    BODY,
-                    p.text2,
-                ))
-                .with_uniform_padding(S3)
-                .with_background_color(p.surface)
-                .with_border(Border::all(1.).with_border_color(p.border))
-                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
-                .finish(),
-            );
+        let mut upcoming_valid_events: Vec<&stepx_companion::toolbox::PhoneCalendarEvent> =
+            visible_calendar_events
+                .iter()
+                .copied()
+                .filter(|ev| {
+                    self.calendar_event_validity(ev, today, now_ms)
+                        .is_valid_unexpired()
+                })
+                .collect();
+        upcoming_valid_events.sort_by_key(|ev| (ev.dtstart, ev.id));
+
+        agenda_rows.push(self.divider());
+        agenda_rows.push(self.section_heading(UiIcon::Calendar, "近期日程"));
+
+        if upcoming_valid_events.is_empty() {
+            agenda_rows.push(self.surface_note_box(
+                if suite.checked {
+                    "暂无近期日程"
+                } else {
+                    "正在读取…"
+                },
+                p.text2,
+            ));
         } else {
-            for event in visible_calendar_events.iter().take(8) {
-                agenda_rows.push(self.render_calendar_event_row(event, "all"));
+            let range = self.list_page_range("calendar-upcoming",upcoming_valid_events.len(),8);
+            agenda_rows.push(self.list_page_controls("calendar-upcoming",upcoming_valid_events.len(),8));
+            for (_i, event) in upcoming_valid_events.iter().enumerate().skip(range.start).take(range.len()) {
+                let row_el = self.render_calendar_event_row(event, "all", today, now_ms);
+                #[cfg(feature = "ui-capture")]
+                let row_el = if selected_day_events.is_empty() {
+                    crate::ui::scenario_check::control(format!("cal-agenda-row-{_i}"), row_el)
+                } else {
+                    crate::ui::scenario_check::control(format!("cal-all-row-{_i}"), row_el)
+                };
+                agenda_rows.push(row_el);
             }
         }
 
@@ -853,42 +846,41 @@ impl Companion {
             !self.settings.value.reduced_motion && !self.settings.hidden,
         );
 
-        let main_split = Flex::row()
-            .with_main_axis_size(MainAxisSize::Max)
-            .with_cross_axis_alignment(CrossAxisAlignment::Start)
-            .with_spacing(S4)
-            .with_child(Expanded::new(1.35, left_calendar_card).finish())
-            .with_child(Expanded::new(1.0, right_col).finish())
-            .finish();
+        let main_split = self.responsive_columns(
+            860.,
+            S4,
+            S3,
+            CrossAxisAlignment::Start,
+            vec![(1.35, left_calendar_card), (1., right_col)],
+        );
 
-        Container::new(self.vstack(S4, vec![top_banner, main_split]))
-            .with_padding_bottom(S2)
-            .finish()
+        Container::new(main_split).with_padding_bottom(S2).finish()
     }
 
     fn render_calendar_event_row(
         &self,
         event: &stepx_companion::toolbox::PhoneCalendarEvent,
         prefix: &str,
+        today: NaiveDate,
+        now_ms: i64,
     ) -> El {
         let p = self.p();
         let time_badge = event.time_range_label();
         let src_label = event.source_label();
         let (ey, em, ed) = event.date_ymd();
-        let today = Local::now().date_naive();
-        let (rel_label, rel_fg, rel_bg) = relative_day_badge(ey, em, ed, today, &p);
-        let is_done = self
-            .back_screen
-            .completed_calendar_events
-            .contains(&event.id);
+        let validity = self.calendar_event_validity(event, today, now_ms);
+        let (val_label, val_fg, val_bg) = validity.badge(&p);
+        let is_done = self.calendar_event_is_completed(event);
+        let is_valid = validity.is_valid_unexpired();
+        let title_color = if is_valid { p.text } else { p.text3 };
 
         let mut header_badges = vec![
-            self.line_w(&event.title, BODY, p.text, Weight::Semibold),
-            self.pill_badge(rel_label, rel_fg, rel_bg),
+            self.line_w(&event.title, BODY, title_color, Weight::Semibold),
+            self.pill_badge(val_label, val_fg, val_bg),
             self.pill_badge(&time_badge, p.accent, p.accent_soft),
             self.pill_badge(src_label, p.blue, p.surface),
         ];
-        if is_done {
+        if is_done && !matches!(validity, CalendarEventValidity::Completed) {
             header_badges.push(self.pill_badge_icon(
                 "已完成",
                 UiIcon::Check,
@@ -910,113 +902,101 @@ impl Companion {
             detail_col.push(self.text(sub, CAPTION, p.text2));
         }
 
-        let summary_text = if !event.location.is_empty() && !event.description.is_empty() {
-            format!(
-                "【日程】{} ({}) · 地点：{} · 备注：{}",
-                event.title, time_badge, event.location, event.description
-            )
-        } else if !event.location.is_empty() {
-            format!(
-                "【日程】{} ({}) · 地点：{}",
-                event.title, time_badge, event.location
-            )
-        } else if !event.description.is_empty() {
-            format!(
-                "【日程】{} ({}) · {}",
-                event.title, time_badge, event.description
-            )
-        } else {
-            format!("【日程】{} ({})", event.title, time_badge)
-        };
-
         let is_editing_this = self.back_screen.editing_calendar_event_id == Some(event.id);
-        let mut actions = vec![
-            self.button_icon(
-                format!("cal-{prefix}-done-{}", event.id),
-                if is_done { "设为未完" } else { "完成" },
-                if is_done {
-                    UiIcon::Retry
-                } else {
-                    UiIcon::Check
-                },
-                Action::BackScreen(BackScreenAction::CalendarToggleDone(event.id)),
-                if is_done {
-                    Btn::Secondary
-                } else {
-                    Btn::Primary
-                },
-            ),
-            self.button_icon(
-                format!("cal-{prefix}-edit-{}", event.id),
-                if is_editing_this {
-                    "编辑中"
-                } else {
-                    "编辑"
-                },
-                UiIcon::Edit,
-                Action::BackScreen(BackScreenAction::CalendarEditEvent(event.id)),
-                if is_editing_this {
-                    Btn::Primary
-                } else {
-                    Btn::Secondary
-                },
-            ),
-            self.button(
-                format!("cal-{prefix}-postpone-{}", event.id),
-                "顺延1天",
-                Action::BackScreen(BackScreenAction::CalendarPostponeOneDay(event.id)),
-                Btn::Secondary,
-            ),
-            self.button_icon(
-                format!("cal-{prefix}-copy-{}", event.id),
-                "复制日程摘要",
-                UiIcon::Clipboard,
-                Action::CopyText(summary_text, format!("已复制日程摘要：{}", event.title)),
-                Btn::Secondary,
-            ),
-            self.button(
-                format!("cal-{prefix}-amoo-{}", event.id),
-                "交给 Amoo",
-                Action::Workspace(WorkspaceAction::SendScheduleToAmoo(format!(
-                    "{}（{}）",
-                    event.title, time_badge
-                ))),
-                Btn::Secondary,
-            ),
-            self.button(
-                format!("cal-{prefix}-del-{}", event.id),
-                "删除",
-                Action::BackScreen(BackScreenAction::CalendarDelete(event.id)),
-                Btn::Ghost,
-            ),
-        ];
-        if prefix == "all" {
-            actions.insert(
-                0,
+        let row_key = format!("cal-ev-row:{prefix}:{}:{}", event.id, event.dtstart);
+        let done_id = format!("cal-{prefix}-done-{}:{}", event.id, event.dtstart);
+        let edit_id = format!("cal-{prefix}-edit-{}:{}", event.id, event.dtstart);
+        let del_id = format!("cal-{prefix}-del-{}:{}", event.id, event.dtstart);
+        let jump_id = format!("cal-{prefix}-jump-{}:{}", event.id, event.dtstart);
+        let phone_only = self.calendar_event_action_limit(event.id).is_some();
+        let done_btn = if phone_only {
+            self.button_icon(done_id, "手机处理", UiIcon::Smartphone,
+                Action::OpenAppInMirror("com.android.calendar".into()), Btn::Secondary)
+        } else { self.button_icon(
+            done_id,
+            if is_done { "设为未完" } else { "完成" },
+            if is_done {
+                UiIcon::Retry
+            } else {
+                UiIcon::Check
+            },
+            Action::BackScreen(BackScreenAction::CalendarToggleDone(event.id)),
+            if is_done {
+                Btn::Secondary
+            } else {
+                Btn::Primary
+            },
+        ) };
+
+        let top_row = self.between(self.vstack(S1, detail_col), done_btn);
+        let mut row_children = vec![top_row];
+
+        if !phone_only {
+            let mut secondary_actions = vec![
+                self.button_icon(
+                    edit_id,
+                    if is_editing_this {
+                        "编辑中"
+                    } else {
+                        "编辑"
+                    },
+                    UiIcon::Edit,
+                    Action::BackScreen(BackScreenAction::CalendarEditEvent(event.id)),
+                    if is_editing_this {
+                        Btn::Primary
+                    } else {
+                        Btn::Secondary
+                    },
+                ),
                 self.button(
-                    format!("cal-{prefix}-jump-{}", event.id),
-                    "定位",
-                    Action::BackScreen(BackScreenAction::CalendarSelectDate(ey, em, ed)),
+                    del_id,
+                    "删除",
+                    Action::BackScreen(BackScreenAction::CalendarDelete(event.id)),
                     Btn::Ghost,
                 ),
-            );
+            ];
+            if prefix == "all" {
+                secondary_actions.insert(
+                    0,
+                    self.button(
+                        jump_id,
+                        "定位",
+                        Action::BackScreen(BackScreenAction::CalendarSelectDate(ey, em, ed)),
+                        Btn::Ghost,
+                    ),
+                );
+            }
+            row_children.push(self.wrap(secondary_actions));
+        } else {
+            row_children.push(self.text("需在手机日历中选择处理本次或整个系列", MICRO, p.text2));
         }
 
-        let row_body = self.vstack(S2, vec![self.vstack(S1, detail_col), self.wrap(actions)]);
-        let state = self.mouse_state(format!("cal-ev-row:{prefix}:{}", event.id));
+        let row_body = self.vstack(S2, row_children);
+        let state = self.mouse_state(row_key);
         let event_id = event.id;
         Hoverable::new(state, move |mouse| {
             let hovered = mouse.is_mouse_over_element();
-            let border_col = if mouse.is_clicked() {
+            let hover_t = self.hover_t(&mouse);
+            let row_bg = if is_editing_this {
+                p.accent_soft
+            } else {
+                p.surface
+            };
+            let bg_col = if mouse.is_clicked() {
+                p.press_color(p.hover)
+            } else {
+                lerp_color(row_bg, p.hover, hover_t)
+            };
+            let border_col = if mouse.is_clicked() || is_editing_this {
                 p.accent
             } else if hovered {
                 p.border_strong
             } else {
-                p.border
+                lerp_color(p.border, p.border_strong, hover_t)
             };
             Container::new(row_body)
                 .with_uniform_padding(S3)
-                .with_background_color(p.surface)
+                .with_background_color(bg_col)
                 .with_border(Border::all(1.).with_border_color(border_col))
                 .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
                 .finish()
@@ -1029,7 +1009,7 @@ impl Companion {
             )));
         })
         .on_double_click(move |ctx, _, _| {
-            ctx.dispatch_typed_action(Action::BackScreen(BackScreenAction::CalendarToggleDone(
+            ctx.dispatch_typed_action(Action::BackScreen(BackScreenAction::CalendarEditEvent(
                 event_id,
             )));
         })
@@ -1043,36 +1023,29 @@ impl Companion {
     }
 
     pub(super) fn alarms_actions(&self) -> Vec<El> {
-        vec![
+        vec![if self.back_screen.stepos_suite_loading {
+            self.disabled_button("同步中…")
+        } else {
             self.button_icon(
-                "alarms-hdr-open-phone",
-                "在手机打开时钟",
-                UiIcon::Clock,
-                Action::BackScreen(BackScreenAction::McpQuickOpenAlarm),
-                Btn::Ghost,
-            ),
-            if self.back_screen.stepos_suite_loading {
-                self.disabled_button("正在同步闹钟…")
-            } else {
-                self.button_icon(
-                    "alarms-hdr-refresh",
-                    "刷新手机闹钟",
-                    UiIcon::Refresh,
-                    Action::BackScreen(BackScreenAction::InspectStepOsSuite),
-                    Btn::Primary,
-                )
-            },
-        ]
+                "alarms-hdr-refresh",
+                "刷新",
+                UiIcon::Refresh,
+                Action::BackScreen(BackScreenAction::InspectStepOsSuite),
+                Btn::Primary,
+            )
+        }]
     }
 
     pub(super) fn alarms_page(&self) -> El {
         let p = self.p();
         let suite = &self.back_screen.stepos_suite;
-        let enabled_alarms = suite.alarms.iter().filter(|a| a.enabled).count();
 
         let now = Local::now();
+        let now_ms = now.timestamp_millis();
+        let now_min = now.hour() * 60 + now.minute();
+        let weekday_idx = now.weekday().num_days_from_monday();
         let now_hm = now.format("%H:%M").to_string();
-        let weekday_cn = match now.weekday().num_days_from_monday() {
+        let weekday_cn = match weekday_idx {
             0 => "星期一",
             1 => "星期二",
             2 => "星期三",
@@ -1083,6 +1056,34 @@ impl Companion {
         };
         let now_date = format!("{} · {}", now.format("%Y年%m月%d日"), weekday_cn);
 
+        let mut visible_alarms: Vec<&stepx_companion::toolbox::PhoneAlarmItem> = suite
+            .alarms
+            .iter()
+            .filter(|a| !stepx_companion::home_hub::is_synthetic_e2e_probe_text(&a.message))
+            .collect();
+        visible_alarms.sort_by_key(|a| {
+            let v = self.alarm_validity(a, now_ms, now_min, weekday_idx);
+            let alarm_min = a.hour.saturating_mul(60).saturating_add(a.minutes);
+            (v.sort_rank(), alarm_min, a.id)
+        });
+
+        let mut today_unexpired_count = 0usize;
+        let mut valid_active_count = 0usize;
+        let mut next_today_alarm: Option<(&stepx_companion::toolbox::PhoneAlarmItem, u32)> = None;
+
+        for &a in &visible_alarms {
+            let v = self.alarm_validity(a, now_ms, now_min, weekday_idx);
+            if let AlarmValidity::TodayValidUnexpired { diff_mins } = v {
+                today_unexpired_count += 1;
+                if next_today_alarm.is_none_or(|(_, best)| diff_mins < best) {
+                    next_today_alarm = Some((a, diff_mins));
+                }
+            }
+            if v.is_valid_active() {
+                valid_active_count += 1;
+            }
+        }
+
         // 1. Top Digital Clock & Alarm Summary Banner
         let clock_display = Container::new(self.mono(now_hm, 26., p.text))
             .with_horizontal_padding(S4)
@@ -1092,60 +1093,28 @@ impl Companion {
             .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_PANEL)))
             .finish();
 
-        let alarm_note = if !suite.last_action_note.is_empty()
-            && suite.last_action_note.contains("闹钟")
-            && !suite.last_action_note.contains("屏幕使用")
-            && !suite.last_action_note.contains("手机日历")
-            && !suite.last_action_note.contains("双端日历")
-        {
-            suite.last_action_note.clone()
-        } else {
-            format!(
-                "桌面与手机系统时钟实时同步 · 当前已开启 {} 个闹钟",
-                enabled_alarms
-            )
-        };
-        let banner_info = vec![
-            self.heading("手机与桌面闹钟中心"),
-            self.line(now_date, BODY, p.text2),
-            self.line(alarm_note, CAPTION, p.text3),
-        ];
+        let banner_info = vec![self.line(now_date, BODY, p.text2)];
+        let mut banner_pills: Vec<El> = Vec::new();
+        if let Some((next_alarm, diff_mins)) = next_today_alarm {
+            banner_pills.push(self.pill_badge(
+                format!(
+                    "下一个 {:02}:{:02} · {}",
+                    next_alarm.hour,
+                    next_alarm.minutes,
+                    fmt_alarm_countdown(diff_mins)
+                ),
+                p.accent,
+                p.accent_soft,
+            ));
+        }
 
         let top_banner = self.panel(vec![self.between(
             self.hstack(S4, vec![clock_display, self.vstack(S1, banner_info)]),
-            self.hstack(
-                S2,
-                vec![
-                    self.pill_badge(
-                        format!("{enabled_alarms}/{} 个闹钟已开启", suite.alarms.len()),
-                        if enabled_alarms > 0 {
-                            p.success
-                        } else {
-                            p.text2
-                        },
-                        p.surface,
-                    ),
-                    self.pill_badge(
-                        if suite.controls.dnd_on {
-                            "手机勿扰：已开启"
-                        } else {
-                            "手机铃声：正常"
-                        },
-                        if suite.controls.dnd_on {
-                            p.warning
-                        } else {
-                            p.success
-                        },
-                        p.surface,
-                    ),
-                ],
-            ),
+            self.hstack(S2, banner_pills),
         )]);
 
         // 2. Left Column: Visual Alarm Creator & Pomodoro Focus
-        let quick_times: [&'static str; 8] = [
-            "06:30", "07:00", "07:30", "08:00", "08:30", "09:00", "12:30", "22:00",
-        ];
+        let quick_times: [&'static str; 6] = ["06:30", "07:00", "07:30", "08:00", "08:30", "09:00"];
         let current_alarm_time = self.fields[F_ALARM_TIME].text.trim();
         let quick_time_chips: Vec<El> = quick_times
             .iter()
@@ -1164,34 +1133,18 @@ impl Companion {
             })
             .collect();
 
-        let alarm_scenario_presets: [(UiIcon, &'static str, &'static str, &'static str); 5] = [
-            (UiIcon::Coffee, "15分钟小憩", "+15m", "15分钟午休小憩提醒"),
-            (
-                UiIcon::Clock,
-                "25分钟番茄钟",
-                "+25m",
-                "25分钟专注番茄钟提醒",
-            ),
-            (UiIcon::Coffee, "5分钟泡面", "+5m", "5分钟泡面/倒计时提醒"),
-            (
-                UiIcon::Clock,
-                "明早 07:30 起床",
-                "07:30",
-                "早间起床与日程提醒",
-            ),
-            (
-                UiIcon::Clock,
-                "明早 08:00 早会",
-                "08:00",
-                "晨会与重点任务提醒",
-            ),
+        let alarm_scenario_presets: [(UiIcon, &'static str, &'static str, &'static str); 4] = [
+            (UiIcon::Clock, "5 分钟后", "+5m", "倒计时"),
+            (UiIcon::Coffee, "15 分钟小憩", "+15m", "小憩"),
+            (UiIcon::Clock, "25 分钟专注", "+25m", "专注"),
+            (UiIcon::Clock, "1 小时后", "+60m", "提醒"),
         ];
-        let mut alarm_scenario_chips: Vec<El> = vec![self.line("场景速设：", MICRO, p.text2)];
+        let mut alarm_scenario_chips: Vec<El> = Vec::new();
         for (idx, (icon, btn_label, qt_str, tpl_label)) in
             alarm_scenario_presets.into_iter().enumerate()
         {
-            let active_scen = current_alarm_time == qt_str
-                && self.fields[F_ALARM_LABEL].text.trim() == tpl_label;
+            let active_scen =
+                current_alarm_time == qt_str && self.fields[F_ALARM_LABEL].text.trim() == tpl_label;
             let state = self.mouse_state(format!("alarm-scen-chip:{idx}"));
             let font = self.font;
             let label_str = btn_label.to_string();
@@ -1216,7 +1169,7 @@ impl Companion {
                     Container::new(self.hstack(
                         5.,
                         vec![
-                            self.ui_icon(
+                            self.content_icon(
                                 icon,
                                 13.,
                                 if active_scen { p.accent } else { p.text2 },
@@ -1253,30 +1206,15 @@ impl Companion {
         }
 
         let is_editing_alarm = self.back_screen.editing_alarm_id.is_some();
-        let mut create_alarm_items: Vec<El> = vec![
-            self.between(
-                self.heading("新建闹钟（实时同步至手机系统时钟）"),
-                self.pill_badge("桌面添加 · 手机响铃", p.accent, p.accent_soft),
-            ),
-            self.text(
-                "直接点选下方场景速设、常用时间或输入 24 小时制时间与倒计时（如 07:30 或 +15m），点击「添加并开启闹钟」即可同步到手机闹钟。",
-                CAPTION,
-                p.text2,
-            ),
-        ];
+        let mut create_alarm_items: Vec<El> = vec![self.section_heading(UiIcon::Clock, "新建闹钟")];
         if is_editing_alarm {
-            create_alarm_items.push(
-                Container::new(self.between(
+            create_alarm_items.push(self.status_banner_box(
+                self.between(
                     self.hstack(
                         8.,
                         vec![
-                            self.ui_icon(UiIcon::Edit, 14., p.warning),
-                            self.line_w(
-                                "正在修改闹钟（保存后将直接更新原闹钟时间与标签）",
-                                CAPTION,
-                                p.text,
-                                Weight::Semibold,
-                            ),
+                            self.content_icon(UiIcon::Edit, 14., p.warning),
+                            self.line_w("正在修改闹钟", CAPTION, p.text, Weight::Semibold),
                         ],
                     ),
                     self.button(
@@ -1285,34 +1223,17 @@ impl Companion {
                         Action::BackScreen(BackScreenAction::AlarmCancelEdit),
                         Btn::Secondary,
                     ),
-                ))
-                .with_horizontal_padding(12.)
-                .with_vertical_padding(8.)
-                .with_background_color(p.warning_soft)
-                .with_border(Border::all(1.).with_border_color(p.warning))
-                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
-                .finish(),
-            );
+                ),
+                p.warning_soft,
+                p.warning,
+            ));
         }
-        create_alarm_items.push(self.input(
-            F_ALARM_TIME,
-            "输入闹钟时间（24小时制如 07:30，或倒计时如 +15m）…",
-            None,
-        ));
-        create_alarm_items.push(self.wrap(alarm_scenario_chips));
+        create_alarm_items.push(self.input(F_ALARM_TIME, "07:30 或 +15m", None));
         create_alarm_items.push(self.wrap(quick_time_chips));
-        create_alarm_items.push(self.input(
-            F_ALARM_LABEL,
-            "输入闹钟标签备注（如：早起打卡 / 会议提醒）…",
-            None,
-        ));
+        create_alarm_items.push(self.input(F_ALARM_LABEL, "标签（可选）", None));
         let mut alarm_submit_btns = vec![self.button_icon(
             "alarm-create-custom",
-            if is_editing_alarm {
-                "保存闹钟修改"
-            } else {
-                "添加并开启闹钟"
-            },
+            if is_editing_alarm { "保存" } else { "添加" },
             if is_editing_alarm {
                 UiIcon::Check
             } else {
@@ -1328,71 +1249,43 @@ impl Companion {
                 Action::BackScreen(BackScreenAction::AlarmCancelEdit),
                 Btn::Secondary,
             ));
-        } else {
-            alarm_submit_btns.push(self.button_icon(
-                "alarm-create-preset-15m",
-                "15 分钟小憩闹钟",
-                UiIcon::Coffee,
-                Action::BackScreen(BackScreenAction::AlarmCreatePreset(0)),
-                Btn::Secondary,
-            ));
-            alarm_submit_btns.push(self.button_icon(
-                "alarm-create-preset-30m",
-                "30 分钟后响铃",
-                UiIcon::Plus,
-                Action::BackScreen(BackScreenAction::AlarmCreatePreset(1)),
-                Btn::Secondary,
-            ));
-            alarm_submit_btns.push(self.button_icon(
-                "alarm-create-preset-0730",
-                "明早 07:30 起床",
-                UiIcon::Clock,
-                Action::BackScreen(BackScreenAction::AlarmCreatePreset(2)),
-                Btn::Secondary,
-            ));
-            alarm_submit_btns.push(self.button_icon(
-                "alarm-create-preset-0800",
-                "明早 08:00 早会",
-                UiIcon::Clock,
-                Action::BackScreen(BackScreenAction::AlarmCreatePreset(3)),
-                Btn::Secondary,
-            ));
         }
         create_alarm_items.push(self.wrap(alarm_submit_btns));
+        if !is_editing_alarm {
+            create_alarm_items.push(self.wrap(alarm_scenario_chips));
+        }
         let create_alarm_card = self.panel(create_alarm_items);
 
         let focus_card = self.panel(vec![
-            self.between(
-                self.heading("专注番茄钟与手机免打扰"),
-                self.pill_badge(
-                    if self.back_screen.pomodoro_active {
+            if self.back_screen.pomodoro_active {
+                self.between(
+                    self.section_heading(UiIcon::Coffee, "专注"),
+                    self.pill_badge(
                         format!(
-                            "专注剩余 {} 分钟",
-                            self.back_screen.pomodoro_remaining_secs().div_ceil(60).max(1)
-                        )
-                    } else {
-                        "背屏像素倒计时联动".to_string()
-                    },
-                    p.accent,
-                    p.accent_soft,
-                ),
-            ),
-            self.text(
-                "开启桌面专注番茄钟时，手机背屏将同步点亮像素倒计时；同时可一键切换手机勿扰模式，避免专注期间受到打扰。",
-                BODY,
-                p.text2,
-            ),
+                            "剩余 {} 分钟",
+                            self.back_screen
+                                .pomodoro_remaining_secs()
+                                .div_ceil(60)
+                                .max(1)
+                        ),
+                        p.accent,
+                        p.accent_soft,
+                    ),
+                )
+            } else {
+                self.section_heading(UiIcon::Coffee, "专注")
+            },
             self.wrap({
                 let mut focus_btns = vec![
                     self.button(
                         "alarm-pomo-start-15",
-                        "开启 15 分钟专注",
+                        "15 分钟",
                         Action::BackScreen(BackScreenAction::StartPomodoro(15)),
                         Btn::Secondary,
                     ),
                     self.button(
                         "alarm-pomo-start",
-                        "开启 25 分钟专注",
+                        "25 分钟",
                         Action::BackScreen(BackScreenAction::StartPomodoro(25)),
                         if self.back_screen.pomodoro_active {
                             Btn::Secondary
@@ -1402,7 +1295,7 @@ impl Companion {
                     ),
                     self.button(
                         "alarm-pomo-start-45",
-                        "开启 45 分钟深度专注",
+                        "45 分钟",
                         Action::BackScreen(BackScreenAction::StartPomodoro(45)),
                         Btn::Secondary,
                     ),
@@ -1410,7 +1303,7 @@ impl Companion {
                 if self.back_screen.pomodoro_active {
                     focus_btns.push(self.button(
                         "alarm-pomo-stop",
-                        "停止专注番茄钟",
+                        "停止",
                         Action::BackScreen(BackScreenAction::StopPomodoro),
                         Btn::Danger,
                     ));
@@ -1418,9 +1311,9 @@ impl Companion {
                 focus_btns.push(self.button(
                     "alarm-dnd-toggle",
                     if suite.controls.dnd_on {
-                        "勿扰模式：已开启（点击恢复响铃）"
+                        "勿扰：开"
                     } else {
-                        "勿扰模式：正常响铃（点击开启勿扰）"
+                        "勿扰：关"
                     },
                     Action::BackScreen(BackScreenAction::McpToggleDnd),
                     if suite.controls.dnd_on {
@@ -1437,15 +1330,26 @@ impl Companion {
 
         // 3. Right Column: Visual Alarm Cards List
         let mut alarm_hdr_right = vec![self.pill_badge(
-            format!("已开启 {} 个", enabled_alarms),
-            if enabled_alarms > 0 {
-                p.success
+            format!(
+                "今日 {today_unexpired_count} · 有效 {valid_active_count}/{}",
+                visible_alarms.len()
+            ),
+            if today_unexpired_count > 0 {
+                p.success_text
+            } else if valid_active_count > 0 {
+                p.accent
             } else {
                 p.text2
             },
-            p.surface,
+            if today_unexpired_count > 0 {
+                p.success_soft
+            } else if valid_active_count > 0 {
+                p.accent_soft
+            } else {
+                p.surface
+            },
         )];
-        if !suite.alarms.is_empty() {
+        if !visible_alarms.is_empty() {
             alarm_hdr_right.push(self.button(
                 "alarms-batch-enable-all",
                 "全部开启",
@@ -1459,45 +1363,30 @@ impl Companion {
                 Btn::Ghost,
             ));
         }
-        let mut alarm_list_rows: Vec<El> = vec![
-            self.between(
-                self.hstack(
-                    S2,
-                    vec![
-                        self.heading("全部闹钟"),
-                        self.pill_badge(
-                            format!("共 {} 个", suite.alarms.len()),
-                            p.accent,
-                            p.accent_soft,
-                        ),
-                    ],
-                ),
-                self.hstack(S2, alarm_hdr_right),
-            ),
-            self.text(
-                "直观展示手机与桌面端添加的全部闹钟卡片，支持在桌面端直接开启/关闭、编辑、顺延或右键快捷操作。",
-                CAPTION,
-                p.text2,
-            ),
-        ];
+        let mut alarm_list_rows: Vec<El> = vec![self.between(
+            self.section_heading(UiIcon::Clock, "全部闹钟"),
+            self.hstack(S2, alarm_hdr_right),
+        )];
 
-        if suite.alarms.is_empty() {
-            alarm_list_rows.push(
-                Container::new(self.text(
-                    "当前暂无闹钟。可在左侧输入时间或点选快捷时间后点击「添加并开启闹钟」，添加后将立即显示在此处。",
-                    BODY,
-                    p.text2,
-                ))
-                .with_uniform_padding(S3)
-                .with_background_color(p.surface)
-                .with_border(Border::all(1.).with_border_color(p.border))
-                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
-                .finish(),
-            );
+        if visible_alarms.is_empty() {
+            alarm_list_rows.push(self.surface_note_box("暂无闹钟", p.text2));
         } else {
-            for alarm in &suite.alarms {
-                let border_color = if alarm.enabled { p.accent } else { p.border };
-                let border_w = if alarm.enabled { 1.5 } else { 1.0 };
+            let range = self.list_page_range("phone-alarms",visible_alarms.len(),20);
+            alarm_list_rows.push(self.list_page_controls("phone-alarms",visible_alarms.len(),20));
+            for (_i, &alarm) in visible_alarms.iter().enumerate().skip(range.start).take(range.len()) {
+                let validity = self.alarm_validity(alarm, now_ms, now_min, weekday_idx);
+                let is_valid_active = validity.is_valid_active();
+                let is_today_unexpired = validity.is_today_unexpired();
+                let (v_label, v_fg, v_bg) = validity.badge(&p);
+
+                let border_color = if is_today_unexpired {
+                    p.accent
+                } else if is_valid_active {
+                    p.border_strong
+                } else {
+                    p.border
+                };
+                let border_w = if is_today_unexpired { 1.5 } else { 1.0 };
                 let is_editing_this_alarm = self.back_screen.editing_alarm_id == Some(alarm.id);
 
                 let left_info = self.hstack(
@@ -1506,7 +1395,7 @@ impl Companion {
                         self.mono(
                             alarm.time_label(),
                             22.,
-                            if alarm.enabled { p.text } else { p.text3 },
+                            if is_valid_active { p.text } else { p.text3 },
                         ),
                         self.hstack(
                             S2,
@@ -1514,116 +1403,135 @@ impl Companion {
                                 self.line_w(
                                     alarm.display_title(),
                                     BODY,
-                                    if alarm.enabled { p.text } else { p.text2 },
-                                    Weight::Semibold,
-                                ),
-                                self.pill_badge(
-                                    if alarm.enabled {
-                                        "已开启"
+                                    if is_valid_active { p.text } else { p.text3 },
+                                    if is_valid_active {
+                                        Weight::Semibold
                                     } else {
-                                        "已关闭"
+                                        Weight::Medium
                                     },
-                                    if alarm.enabled { p.success } else { p.text3 },
-                                    if alarm.enabled { p.accent_soft } else { p.bg },
                                 ),
+                                self.pill_badge(v_label, v_fg, v_bg),
                             ],
                         ),
                     ],
                 );
 
-                let toggle_btn = self.button(
-                    format!("alarm-card-toggle-{}", alarm.id),
-                    if alarm.enabled {
-                        "关闭闹钟"
-                    } else {
-                        "开启闹钟"
-                    },
-                    Action::BackScreen(BackScreenAction::AlarmToggle(alarm.id, !alarm.enabled)),
-                    if alarm.enabled {
-                        Btn::Primary
-                    } else {
-                        Btn::Secondary
-                    },
-                );
-
-                let secondary_controls = self.hstack(
-                    S2,
-                    vec![
-                        self.button_icon(
-                            format!("alarm-card-edit-{}", alarm.id),
-                            if is_editing_this_alarm {
-                                "编辑中"
-                            } else {
-                                "编辑"
-                            },
-                            UiIcon::Edit,
-                            Action::BackScreen(BackScreenAction::AlarmEdit(alarm.id)),
-                            if is_editing_this_alarm {
-                                Btn::Primary
-                            } else {
-                                Btn::Secondary
-                            },
-                        ),
-                        self.button(
-                            format!("alarm-card-shift10-{}", alarm.id),
-                            "+10分",
-                            Action::BackScreen(BackScreenAction::AlarmShiftMinutes(alarm.id, 10)),
-                            Btn::Secondary,
-                        ),
-                        self.button(
-                            format!("alarm-card-del-{}", alarm.id),
-                            "删除",
-                            Action::BackScreen(BackScreenAction::AlarmDelete(alarm.id)),
-                            Btn::Ghost,
-                        ),
-                    ],
-                );
-
                 let alarm_id = alarm.id;
-                let alarm_enabled = alarm.enabled;
-                let state = self.mouse_state(format!("alarm-card-row:{alarm_id}"));
-                let row_inner = self.vstack(
-                    S2,
-                    vec![
-                        self.between(left_info, toggle_btn),
-                        self.between(
-                            self.line(alarm.repeat_label(), CAPTION, p.text2),
-                            secondary_controls,
-                        ),
-                    ],
+                let row_key = format!("alarm-card-row:{alarm_id}");
+                let toggle_id = format!("alarm-card-toggle-{alarm_id}");
+                let edit_id = format!("alarm-card-edit-{alarm_id}");
+                let shift_id = format!("alarm-card-shift10-{alarm_id}");
+                let del_id = format!("alarm-card-del-{alarm_id}");
+                let hover_keys = [
+                    row_key.clone(),
+                    toggle_id.clone(),
+                    format!("btn:{edit_id}"),
+                    format!("btn:{shift_id}"),
+                    format!("btn:{del_id}"),
+                ];
+                let is_card_hovered = {
+                    let map = self.hover_states.borrow();
+                    hover_keys.iter().any(|k| {
+                        map.get(k.as_str())
+                            .is_some_and(|(_, h)| h.lock().unwrap().is_mouse_over_element())
+                    })
+                };
+
+                let toggle_sw = self.toggle_switch(
+                    toggle_id,
+                    alarm.enabled,
+                    Action::BackScreen(BackScreenAction::AlarmToggle(alarm.id, !alarm.enabled)),
                 );
-                alarm_list_rows.push(
-                    Hoverable::new(state, move |mouse| {
-                        let hovered = mouse.is_mouse_over_element();
-                        let bc = if mouse.is_clicked() {
-                            p.accent
-                        } else if hovered && !alarm_enabled {
-                            p.border_strong
-                        } else {
-                            border_color
-                        };
-                        Container::new(row_inner)
-                            .with_uniform_padding(S3)
-                            .with_background_color(p.surface)
-                            .with_border(Border::all(border_w).with_border_color(bc))
-                            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_PANEL)))
-                            .finish()
-                    })
-                    .with_defer_events_to_children()
-                    .with_cursor(Cursor::PointingHand)
-                    .on_double_click(move |ctx, _, _| {
-                        ctx.dispatch_typed_action(Action::BackScreen(
-                            BackScreenAction::AlarmToggle(alarm_id, !alarm_enabled),
-                        ));
-                    })
-                    .on_right_click(move |ctx, _, at| {
-                        ctx.dispatch_typed_action(Action::ContextOpen(
-                            crate::ui::context_menu::Target::AlarmItem(alarm_id),
-                            at,
-                        ));
-                    })
-                    .finish(),
-                );
+
+                let repeat_fg = if is_valid_active { p.text2 } else { p.text3 };
+                let bottom_row = if is_card_hovered || is_editing_this_alarm {
+                    let secondary_controls = self.hstack(
+                        S2,
+                        vec![
+                            self.button_icon(
+                                edit_id,
+                                if is_editing_this_alarm {
+                                    "编辑中"
+                                } else {
+                                    "编辑"
+                                },
+                                UiIcon::Edit,
+                                Action::BackScreen(BackScreenAction::AlarmEdit(alarm.id)),
+                                if is_editing_this_alarm {
+                                    Btn::Primary
+                                } else {
+                                    Btn::Secondary
+                                },
+                            ),
+                            self.button(
+                                shift_id,
+                                "+10分",
+                                Action::BackScreen(BackScreenAction::AlarmShiftMinutes(
+                                    alarm.id, 10,
+                                )),
+                                Btn::Secondary,
+                            ),
+                            self.button(
+                                del_id,
+                                "删除",
+                                Action::BackScreen(BackScreenAction::AlarmDelete(alarm.id)),
+                                Btn::Ghost,
+                            ),
+                        ],
+                    );
+                    self.between(
+                        self.line(alarm.repeat_label(), CAPTION, repeat_fg),
+                        secondary_controls,
+                    )
+                } else {
+                    self.line(alarm.repeat_label(), CAPTION, repeat_fg)
+                };
+
+                let state = self.mouse_state(row_key);
+                let row_inner =
+                    self.vstack(S2, vec![self.between(left_info, toggle_sw), bottom_row]);
+                let card_el = Hoverable::new(state, move |mouse| {
+                    let hovered = mouse.is_mouse_over_element();
+                    let hover_t = self.hover_t(&mouse);
+                    let bg = if mouse.is_clicked() {
+                        p.press_color(p.hover)
+                    } else {
+                        lerp_color(p.surface, p.hover, hover_t)
+                    };
+                    let bc = if mouse.is_clicked() {
+                        p.accent
+                    } else if hovered && !is_today_unexpired {
+                        p.border_strong
+                    } else {
+                        border_color
+                    };
+                    Container::new(row_inner)
+                        .with_uniform_padding(S3)
+                        .with_background_color(bg)
+                        .with_border(Border::all(border_w).with_border_color(bc))
+                        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_PANEL)))
+                        .finish()
+                })
+                .with_defer_events_to_children()
+                .with_cursor(Cursor::PointingHand)
+                .on_double_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(Action::BackScreen(BackScreenAction::AlarmEdit(
+                        alarm_id,
+                    )));
+                })
+                .on_right_click(move |ctx, _, at| {
+                    ctx.dispatch_typed_action(Action::ContextOpen(
+                        crate::ui::context_menu::Target::AlarmItem(alarm_id),
+                        at,
+                    ));
+                })
+                .finish();
+                let card_el =
+                    SavePosition::new(card_el, &format!("search-alarm-{alarm_id}")).finish();
+                #[cfg(feature = "ui-capture")]
+                let card_el =
+                    crate::ui::scenario_check::control(format!("alarm-card-{_i}"), card_el);
+                alarm_list_rows.push(card_el);
             }
         }
 
@@ -1640,5 +1548,73 @@ impl Companion {
         Container::new(self.vstack(S4, vec![top_banner, main_split]))
             .with_padding_bottom(S2)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod calendar_layout_review_tests {
+    use super::*;
+    use pathfinder_geometry::vector::vec2f;
+
+    struct CalendarRowOnly {
+        view: Companion,
+        event: stepx_companion::toolbox::PhoneCalendarEvent,
+    }
+    impl facloud_ui::Entity for CalendarRowOnly { type Event = (); }
+    impl facloud_ui::TypedActionView for CalendarRowOnly { type Action = (); }
+    impl facloud_ui::View for CalendarRowOnly {
+        fn ui_name() -> &'static str { "calendar_hover_layout_review" }
+        fn render(&self, _: &facloud_ui::AppContext) -> El {
+            let now = Local::now();
+            Stack::new().with_child(SavePosition::new(self.view.render_calendar_event_row(
+                &self.event, "all", now.date_naive(), now.timestamp_millis()), "calendar-row-probe").finish()).finish()
+        }
+    }
+
+    #[test]
+    fn calendar_hover_keeps_row_height_and_actions_inside_the_safe_margin() {
+        facloud_ui::App::test((), |mut app| async move {
+            for width in [440., 760.] {
+                let start = Local::now().timestamp_millis() + 3_600_000;
+                let event = stepx_companion::toolbox::PhoneCalendarEvent {
+                    id: 71, title: "项目评审会议".into(), dtstart: start,
+                    dtend: start + 3_600_000, recurring: Some(false), ..Default::default()
+                };
+                let mut companion = Companion::new_for_test();
+                companion.back_screen.stepos_suite.calendar_events = vec![event.clone()];
+                let (window, _) = app.add_window(facloud_ui::platform::WindowStyle::NotStealFocus,
+                    |_| CalendarRowOnly { view: companion, event });
+                let root = app.root_view_id(window).unwrap();
+                app.update(move |ctx| {
+                    let mut presenter = facloud_ui::Presenter::new(window);
+                    let invalidate = || facloud_ui::WindowInvalidation {
+                        updated: std::collections::HashSet::from([root]), ..Default::default()
+                    };
+                    presenter.invalidate(invalidate(), ctx);
+                    presenter.build_scene(vec2f(width, 1200.), 1., None, ctx);
+                    let before = presenter.position_cache().get_position("calendar-row-probe").unwrap();
+                    let pointer = before.origin() + vec2f(20., 12.);
+                    presenter.dispatch_event(facloud_ui::Event::MouseMoved {
+                        position: pointer, cmd: false, shift: false, is_synthetic: false,
+                    }, ctx);
+                    presenter.invalidate(invalidate(), ctx);
+                    presenter.build_scene(vec2f(width, 1200.), 1., None, ctx);
+                    let positions = presenter.position_cache();
+                    let after = positions.get_position("calendar-row-probe").unwrap();
+                    assert!((before.height() - after.height()).abs() < 0.5,
+                        "hover must not insert a row of actions: {before:?} -> {after:?}");
+                    assert!(after.max_x() <= width + 0.5);
+                    #[cfg(feature = "ui-capture")]
+                    if std::env::var_os("STEPX_SCENARIO_DIR").is_some() {
+                    for control in [format!("cal-all-edit-71:{start}"), format!("cal-all-del-71:{start}")] {
+                        let rect = positions.get_position(&control).unwrap_or_else(|| panic!("missing {control}"));
+                        assert!(rect.origin().x() >= after.origin().x() && rect.max_x() <= after.max_x());
+                        assert!(rect.max_y() <= after.max_y() - S3 + 0.5,
+                            "controls need bottom safe padding: {rect:?}/{after:?}");
+                    }
+                    }
+                });
+            }
+        });
     }
 }

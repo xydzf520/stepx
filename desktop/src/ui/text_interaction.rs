@@ -5,6 +5,44 @@ use pathfinder_geometry::rect::RectF;
 use std::ops::Range;
 
 impl Input {
+    pub(super) fn place_pointer(&mut self, position: usize, extend: bool, clicks: u32) -> bool {
+        if !self.preedit.is_empty() {
+            return false;
+        }
+        let mut pos = position.min(self.text.len());
+        while !self.text.is_char_boundary(pos) {
+            pos -= 1;
+        }
+        if extend {
+            self.anchor.get_or_insert(self.cursor);
+        } else {
+            self.anchor = Some(pos);
+        }
+        self.cursor = pos;
+        self.last_edit = None;
+        self.all = false;
+        self.dragging = true;
+        if clicks >= 3 {
+            self.all = true;
+            self.anchor = Some(0);
+            self.cursor = self.text.len();
+        } else if clicks == 2 {
+            let start = self.text[..pos]
+                .char_indices()
+                .rev()
+                .find(|(_, c)| c.is_whitespace())
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(0);
+            let end = self.text[pos..]
+                .char_indices()
+                .find(|(_, c)| c.is_whitespace())
+                .map(|(i, _)| pos + i)
+                .unwrap_or(self.text.len());
+            self.anchor = Some(start);
+            self.cursor = end;
+        }
+        true
+    }
     pub(super) fn checkpoint(&mut self, group: bool) {
         if !group
             || self
@@ -58,7 +96,7 @@ impl Input {
         self.anchor = None;
         true
     }
-    fn extend(&mut self, direction: i8) {
+    pub(super) fn extend(&mut self, direction: i8) {
         self.anchor.get_or_insert(self.cursor);
         self.cursor = match direction {
             -2 => 0,
@@ -118,41 +156,12 @@ impl Companion {
                 }
             }
             Action::InputPointer(index, position, extend, clicks) => {
+                if *index == F_GLOBAL_SEARCH && !self.search.open && self.page != Page::Search {
+                    self.handle_search(&SearchAction::Open, ctx);
+                }
                 let input = &mut self.fields[*index];
-                if !input.preedit.is_empty() {
+                if !input.place_pointer(*position, *extend, *clicks) {
                     return true;
-                }
-                let mut pos = (*position).min(input.text.len());
-                while !input.text.is_char_boundary(pos) {
-                    pos -= 1;
-                }
-                if *extend {
-                    input.anchor.get_or_insert(input.cursor);
-                } else {
-                    input.anchor = Some(pos);
-                }
-                input.cursor = pos;
-                input.last_edit = None;
-                input.all = false;
-                input.dragging = true;
-                if *clicks >= 3 {
-                    input.all = true;
-                    input.anchor = Some(0);
-                    input.cursor = input.text.len();
-                } else if *clicks == 2 {
-                    let start = input.text[..pos]
-                        .char_indices()
-                        .rev()
-                        .find(|(_, c)| c.is_whitespace())
-                        .map(|(i, c)| i + c.len_utf8())
-                        .unwrap_or(0);
-                    let end = input.text[pos..]
-                        .char_indices()
-                        .find(|(_, c)| c.is_whitespace())
-                        .map(|(i, _)| pos + i)
-                        .unwrap_or(input.text.len());
-                    input.anchor = Some(start);
-                    input.cursor = end;
                 }
                 self.focus = Some(*index);
                 self.selected_text = None;
@@ -183,7 +192,7 @@ impl Companion {
         caret: Option<usize>,
     ) -> widgets::El {
         let f = &self.fields[index];
-        let focused = self.focus == Some(index);
+        let focused = self.input_has_focus(index);
         let insertion = if focused { f.preedit.len() } else { 0 };
         let masked = (index == F_PAIR_CODE && !self.show_secret) || index == F_LAB_KEY;
         let mask_map = masked.then(|| {

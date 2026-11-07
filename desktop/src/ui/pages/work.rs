@@ -116,7 +116,7 @@ impl Companion {
                 mix_color(p.text2, p.text, t)
             };
             let button = ConstrainedBox::new(
-                Container::new(Align::new(self.ui_icon(icon, 16., fg)).finish())
+                Container::new(Align::new(self.content_icon(icon, 16., fg)).finish())
                     .with_background_color(bg)
                     .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
                     .finish(),
@@ -177,7 +177,7 @@ impl Companion {
         self.hstack(
             S2,
             vec![
-                self.ui_icon(icon, 16., p.text2),
+                self.content_icon(icon, 16., p.text2),
                 Expanded::new(1., self.line_w(title, HEADING, p.text, Weight::Semibold)).finish(),
             ],
         )
@@ -187,15 +187,11 @@ impl Companion {
         let p = self.p();
         let query = self.fields[F_WORK_SEARCH].text.trim().to_lowercase();
         let mut rows = Vec::new();
-        for (index, session) in self.amoo_sessions.iter().enumerate() {
-            if !query.is_empty()
-                && !session_title(&session.title)
-                    .to_lowercase()
-                    .contains(&query)
-                && !session.agent.to_lowercase().contains(&query)
-            {
-                continue;
-            }
+        let matching_sessions: Vec<_> = self.amoo_sessions.iter().enumerate().filter(|(_,session)|
+            query.is_empty() || session_title(&session.title).to_lowercase().contains(&query) || session.agent.to_lowercase().contains(&query)).collect();
+        let page_key = format!("work-sessions:{query}");
+        let range = self.list_page_range(&page_key, matching_sessions.len(), 30);
+        for &(index, session) in &matching_sessions[range] {
             let active = self.work_session_index() == Some(index);
             let pending = self.amoo_pending_reply.contains_key(&session.session_key);
             let title = session_title(&session.title);
@@ -204,47 +200,73 @@ impl Companion {
             } else {
                 session.meta.clone()
             };
-            let row = self.vstack(
-                S1,
-                vec![
-                    self.line_w(title, BODY, p.text, Weight::Medium),
-                    self.line(subtitle, MICRO, if pending { p.success } else { p.text3 }),
-                ],
-            );
+            let row_key = format!("work-session-{index}");
+            let del_key = format!("iconact:work-sess-del-{index}");
+            let show_actions = self.is_hovered_any(&[&row_key, &del_key]);
+            let pinned = self
+                .workspace
+                .journal
+                .pinned_sessions
+                .contains(&session.session_key);
+            let mut row_children = vec![Expanded::new(
+                1.,
+                self.vstack(
+                    S1,
+                    vec![
+                        self.line_w(title, BODY, p.text, Weight::Medium),
+                        self.line(subtitle, MICRO, if pending { p.success } else { p.text3 }),
+                    ],
+                ),
+            )
+            .finish()];
+            if show_actions {
+                row_children.push(self.icon_action(
+                    format!("work-sess-del-{index}"),
+                    "删除对话",
+                    UiIcon::Trash,
+                    vec![Action::Workspace(
+                        super::super::workspace_state::WorkspaceAction::Delete(format!(
+                            "phone:{}",
+                            session.session_key
+                        )),
+                    )],
+                    false,
+                ));
+            } else if pinned {
+                row_children.push(self.content_icon(UiIcon::Pin, 12., p.accent));
+            }
+            let row = self.hstack(S2, row_children);
             rows.push(
-                Hoverable::new(
-                    self.mouse_state(format!("work-session-{index}")),
-                    move |mouse| {
-                        let hovered = mouse.is_mouse_over_element();
-                        let t = if self.settings.value.reduced_motion {
-                            if hovered {
-                                1.0
-                            } else {
-                                0.0
-                            }
+                Hoverable::new(self.mouse_state(row_key), move |mouse| {
+                    let hovered = mouse.is_mouse_over_element();
+                    let t = if self.settings.value.reduced_motion {
+                        if hovered {
+                            1.0
                         } else {
-                            mouse.hover_progress().clamp(0.0, 1.0)
-                        };
-                        let bg = if mouse.is_clicked() {
-                            p.accent_soft
-                        } else if active {
-                            mix_color(p.selected, p.hover, t * 0.5)
-                        } else {
-                            mix_color(p.bg, p.hover, t)
-                        };
-                        let border = if active || mouse.is_clicked() {
-                            p.border_strong
-                        } else {
-                            mix_color(p.border, p.border_strong, t)
-                        };
-                        Container::new(row)
-                            .with_uniform_padding(S3)
-                            .with_background_color(bg)
-                            .with_border(Border::all(1.).with_border_color(border))
-                            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
-                            .finish()
-                    },
-                )
+                            0.0
+                        }
+                    } else {
+                        mouse.hover_progress().clamp(0.0, 1.0)
+                    };
+                    let bg = if mouse.is_clicked() {
+                        p.accent_soft
+                    } else if active {
+                        mix_color(p.selected, p.hover, t * 0.5)
+                    } else {
+                        mix_color(p.bg, p.hover, t)
+                    };
+                    let border = if active || mouse.is_clicked() {
+                        p.border_strong
+                    } else {
+                        mix_color(p.border, p.border_strong, t)
+                    };
+                    Container::new(row)
+                        .with_uniform_padding(S3)
+                        .with_background_color(bg)
+                        .with_border(Border::all(1.).with_border_color(border))
+                        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
+                        .finish()
+                })
                 .with_cursor(Cursor::PointingHand)
                 .on_click(move |ctx, _, _| {
                     ctx.dispatch_typed_action(Action::Work(WorkAction::Session(index)))
@@ -270,6 +292,7 @@ impl Companion {
                 .with_spacing(S3)
                 .with_child(self.work_title(UiIcon::Tools, "处理记录"))
                 .with_child(self.input(F_WORK_SEARCH, "搜索工作与会话…", None))
+                .with_child(self.list_page_controls(&page_key, matching_sessions.len(), 30))
                 .with_child(
                     Expanded::new(
                         1.,
@@ -308,7 +331,7 @@ impl Companion {
                     self.hstack(
                         S2,
                         vec![
-                            self.ui_icon(
+                            self.content_icon(
                                 if kind == "image" {
                                     UiIcon::Image
                                 } else {
@@ -388,7 +411,10 @@ impl Companion {
                 .finish(),
             )];
             if expanded {
-                for (record_index, record) in records.iter().enumerate() {
+                let page_key = format!("work-tool-records:{key}");
+                let range = self.list_page_range(&page_key, records.len(), 30);
+                children.push(self.list_page_controls(&page_key, records.len(), 30));
+                for (record_index, record) in records.iter().enumerate().skip(range.start).take(range.len()) {
                     let mut details = vec![self.between(
                         self.line(
                             format!("{:02}  {}", record_index + 1, work_step_name(&record.name)),
@@ -481,8 +507,8 @@ impl Companion {
             self.hstack(
                 S2,
                 vec![
-                    self.ui_icon(
-                        if user { UiIcon::Chat } else { UiIcon::Star },
+                    self.content_icon(
+                        if user { UiIcon::Chat } else { UiIcon::Sparkles },
                         14.,
                         if user { p.text2 } else { p.accent },
                     ),
@@ -500,7 +526,7 @@ impl Companion {
             children.push(self.hstack(
                 S2,
                 vec![
-                    self.ui_icon(UiIcon::Attach, 14., p.text3),
+                    self.content_icon(UiIcon::Attach, 14., p.text3),
                     Expanded::new(1., self.line(attachment, CAPTION, p.text2)).finish(),
                 ],
             ));
@@ -546,15 +572,16 @@ impl Companion {
         }
         Hoverable::new(self.mouse_state("work-prompt"), move |_| {
             ConstrainedBox::new(
-                Container::new(self.pane_scroll(
-                    self.work.prompt_scroll.clone(),
-                    self.multiline_field_text(
-                        &value,
-                        caret,
-                        F_WORK_PROMPT,
-                        if is_empty { p.text3 } else { p.text },
-                    ),
-                ))
+                Container::new(self.hstack(S2, vec![
+                    Expanded::new(1., self.pane_scroll(
+                        self.work.prompt_scroll.clone(),
+                        self.multiline_field_text(
+                            &value, caret, F_WORK_PROMPT,
+                            if is_empty { p.text3 } else { p.text },
+                        ),
+                    )).finish(),
+                    self.voice_input_button(F_WORK_PROMPT),
+                ]))
                 .with_horizontal_padding(S1)
                 .with_vertical_padding(S2)
                 .with_background_color(p.bg)
@@ -590,7 +617,7 @@ impl Companion {
                 self.hstack(
                     S2,
                     vec![
-                        self.ui_icon(UiIcon::Bolt, 15., p.accent),
+                        self.content_icon(UiIcon::Bolt, 15., p.accent),
                         self.line_w("生成示例文件", CAPTION, p.text, Weight::Semibold),
                     ],
                 ),
@@ -612,7 +639,7 @@ impl Companion {
             self.hstack(
                 S2,
                 vec![
-                    self.ui_icon(UiIcon::Star, 14., p.text2),
+                    self.content_icon(UiIcon::Sparkles, 14., p.text2),
                     self.line("或者让 Amoo 按你的资料来做：", MICRO, p.text2),
                 ],
             ),
@@ -639,13 +666,11 @@ impl Companion {
         let session = self.work_session();
         let mut stream = vec![self.work_office_quick_bar()];
         if let Some(session) = session.filter(|s| !s.items.is_empty()) {
-            stream.extend(
-                session
-                    .items
-                    .iter()
-                    .enumerate()
-                    .map(|(i, item)| self.work_chat_bubble(i, item)),
-            );
+            let page_key = format!("work-transcript:{}",session.session_key);
+            let newest = self.list_page_range(&page_key,session.items.len(),60);
+            let visible = session.items.len()-newest.end..session.items.len()-newest.start;
+            stream.push(self.list_page_controls(&page_key,session.items.len(),60));
+            stream.extend(session.items.iter().enumerate().skip(visible.start).take(visible.len()).map(|(i,item)|self.work_chat_bubble(i,item)));
         } else {
             stream.push(self.panel(vec![
                 self.work_title(UiIcon::Tools, "要处理哪些文件？"),
@@ -671,7 +696,10 @@ impl Companion {
                 Btn::Ghost,
             )];
             if expanded {
-                events.extend(self.work.events.iter().enumerate().map(|(index, event)| {
+                let page_key = "work-desktop-events";
+                let range = self.list_page_range(page_key,self.work.events.len(),40);
+                events.push(self.list_page_controls(page_key,self.work.events.len(),40));
+                events.extend(self.work.events.iter().enumerate().skip(range.start).take(range.len()).map(|(index, event)| {
                     let detail_key = format!("work-event-detail-{index}");
                     let full = self.amoo_expanded_tool_records.contains(&detail_key);
                     let mut details = vec![self.text(
@@ -791,7 +819,7 @@ impl Companion {
                             Container::new(self.hstack(
                                 S2,
                                 vec![
-                                        self.ui_icon(
+                                        self.content_icon(
                                             if image { UiIcon::Image } else { UiIcon::File },
                                             15.,
                                             if image { p.success } else { p.text2 },
@@ -1257,7 +1285,7 @@ impl Companion {
                 );
             } else {
                 items.push(self.panel(vec![
-                    self.ui_icon(UiIcon::Image, 30., p.text3),
+                    self.content_icon(UiIcon::Image, 30., p.text3),
                     self.line_w("把成果放在眼前", HEADING, p.text, Weight::Medium),
                     self.text(
                         "选中交付文件即可预览。图片、Markdown、表格和文档内容会显示在这里。",
@@ -1285,7 +1313,11 @@ impl Companion {
         if self.work.artifacts.is_empty() && remote_files.is_empty() {
             items.push(self.text("任务产生的图片、文档和表格会归集到这里。", MICRO, p.text3));
         }
-        for (index, item) in remote_files {
+        let result_total = remote_files.len()+self.work.artifacts.len();
+        let result_range = self.list_page_range("work-artifacts",result_total,30);
+        let remote_count = remote_files.len();
+        items.push(self.list_page_controls("work-artifacts",result_total,30));
+        for (index, item) in remote_files.into_iter().skip(result_range.start).take(result_range.len()) {
             if let AmooChatItem::Attachment {
                 name,
                 kind,
@@ -1308,7 +1340,7 @@ impl Companion {
                     self.hstack(
                         S2,
                         vec![
-                                self.ui_icon(
+                                self.content_icon(
                                     if kind == "image" {
                                         UiIcon::Image
                                     } else {
@@ -1345,7 +1377,7 @@ impl Companion {
                                     ),
                                 )
                                 .finish(),
-                                self.ui_icon(UiIcon::ChevronRight, 14., p.text3),
+                                self.content_icon(UiIcon::ChevronRight, 14., p.text3),
                             ],
                     ),
                     selected,
@@ -1365,7 +1397,7 @@ impl Companion {
                 ));
             }
         }
-        for (index, artifact) in self.work.artifacts.iter().enumerate() {
+        for (index, artifact) in self.work.artifacts.iter().enumerate().skip(result_range.start.saturating_sub(remote_count)).take(result_range.end.saturating_sub(remote_count)) {
             let selected = self
                 .work
                 .local_preview
@@ -1376,7 +1408,7 @@ impl Companion {
                 self.hstack(
                     S2,
                     vec![
-                            self.ui_icon(UiIcon::File, 16., p.text2),
+                            self.content_icon(UiIcon::File, 16., p.text2),
                             Expanded::new(
                                 1.,
                                 self.vstack(
@@ -1401,7 +1433,7 @@ impl Companion {
                                 ),
                             )
                             .finish(),
-                            self.ui_icon(UiIcon::ChevronRight, 14., p.text3),
+                            self.content_icon(UiIcon::ChevronRight, 14., p.text3),
                         ],
                 ),
                 selected,
@@ -1448,7 +1480,9 @@ impl Companion {
             if expanded && self.work.files.is_empty() {
                 items.push(self.text("文件夹为空，可以添加资料开始工作。", MICRO, p.text3));
             }
-            for (index, file) in self.work.files.iter().enumerate().filter(|_| expanded) {
+            let range = self.list_page_range("work-input-files",self.work.files.len(),40);
+            if expanded { items.push(self.list_page_controls("work-input-files",self.work.files.len(),40)); }
+            for (index, file) in self.work.files.iter().enumerate().skip(range.start).take(range.len()).filter(|_| expanded) {
                 let selected = self
                     .work
                     .local_preview
@@ -1459,7 +1493,7 @@ impl Companion {
                     self.hstack(
                         S2,
                         vec![
-                            self.ui_icon(
+                            self.content_icon(
                                 if file.is_dir {
                                     UiIcon::Folder
                                 } else {
@@ -1541,10 +1575,11 @@ impl Companion {
                 p.text2,
             ),
         ];
-        for skill in &self.work.desktop_skills {
-            if !matches(&format!("{} {}", skill.name, skill.description)) {
-                continue;
-            }
+        let skills: Vec<_> = self.work.desktop_skills.iter().filter(|skill|matches(&format!("{} {}",skill.name,skill.description))).collect();
+        let page_key = format!("work-desktop-skills:{query}");
+        let range = self.list_page_range(&page_key,skills.len(),30);
+        desktop_workflows.push(self.list_page_controls(&page_key,skills.len(),30));
+        for skill in skills.into_iter().skip(range.start).take(range.len()) {
             desktop_workflows.push(self.vstack(
                 S1,
                 vec![
@@ -1810,15 +1845,11 @@ impl Companion {
                     } else {
                         rows.push(self.work_title(UiIcon::Smartphone, "已安装手机技能"));
                     }
-                    for skill in skills {
-                        if !market
-                            && !matches(&format!(
-                                "{} {} {}",
-                                skill.name, skill.id, skill.description
-                            ))
-                        {
-                            continue;
-                        }
+                    let matching_skills: Vec<_> = skills.iter().filter(|skill|market || matches(&format!("{} {} {}",skill.name,skill.id,skill.description))).collect();
+                    let page_key = format!("work-phone-skills:{market}:{query}");
+                    let range = self.list_page_range(&page_key,matching_skills.len(),30);
+                    rows.push(self.list_page_controls(&page_key,matching_skills.len(),30));
+                    for skill in matching_skills.into_iter().skip(range.start).take(range.len()) {
                         count += 1;
                         let mut actions = Vec::new();
                         if skill.installed {
@@ -1962,7 +1993,10 @@ impl Companion {
                     self.text(&catalog.tools_status.message, CAPTION, p.text3),
                 ];
                 if expanded {
-                    for tool in tools {
+                    let page_key = format!("work-phone-tools:{query}");
+                    let range = self.list_page_range(&page_key,tools.len(),40);
+                    tool_rows.push(self.list_page_controls(&page_key,tools.len(),40));
+                    for tool in tools.into_iter().skip(range.start).take(range.len()) {
                         tool_rows.push(self.vstack(
                             S1,
                             vec![
@@ -2001,17 +2035,15 @@ impl Companion {
                         },
                     ),
                 ]));
-                for agent in &catalog.agents {
-                    if !matches(&format!(
-                        "{} {} {}",
-                        agent.name, agent.id, agent.description
-                    )) {
-                        continue;
-                    }
+                let agents: Vec<_> = catalog.agents.iter().filter(|agent|matches(&format!("{} {} {}",agent.name,agent.id,agent.description))).collect();
+                let page_key = format!("work-agents:{query}");
+                let range = self.list_page_range(&page_key,agents.len(),30);
+                rows.push(self.list_page_controls(&page_key,agents.len(),30));
+                for agent in agents.into_iter().skip(range.start).take(range.len()) {
                     count += 1;
                     rows.push(self.panel(vec![
                         self.between(
-                            self.work_title(UiIcon::Star, &agent.name),
+                            self.work_title(UiIcon::Sparkles, &agent.name),
                             self.work_button(
                                 &format!("agent-{}", agent.id),
                                 "查看信息",
@@ -2062,10 +2094,11 @@ impl Companion {
                         ),
                     ]),
                 ]));
-                for app in &catalog.ai_apps {
-                    if !matches(&format!("{} {} {}", app.name, app.id, app.description)) {
-                        continue;
-                    }
+                let apps: Vec<_> = catalog.ai_apps.iter().filter(|app|matches(&format!("{} {} {}",app.name,app.id,app.description))).collect();
+                let page_key = format!("work-ai-apps:{query}");
+                let range = self.list_page_range(&page_key,apps.len(),30);
+                rows.push(self.list_page_controls(&page_key,apps.len(),30));
+                for app in apps.into_iter().skip(range.start).take(range.len()) {
                     count += 1;
                     rows.push(self.panel(vec![
                         self.between(

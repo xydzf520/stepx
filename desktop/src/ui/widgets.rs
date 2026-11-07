@@ -24,10 +24,53 @@ pub enum Btn {
 
 pub type El = Box<dyn Element>;
 
+/// A single rounded surface, with paint-only elevation outside its layout bounds.
+/// Clip scrolling content inside it, never the complete surface and its shadow.
+pub(super) fn popover_surface(inner: El, palette: Palette) -> El {
+    Container::new(inner)
+        .with_background_color(palette.bg)
+        .with_border(Border::all(1.).with_border_color(palette.border_strong))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_PANEL)))
+        .with_drop_shadow(popover_shadow(palette.dark))
+        .finish()
+}
+
+/// Only auxiliary controls use this vocabulary. Titles, body text, navigation
+/// labels, form decisions and destructive actions keep their original wording.
+fn auxiliary_action_icon(label: &str) -> Option<UiIcon> {
+    Some(match label {
+        "刷新" | "刷新状态" | "重新扫描" | "刷新用量" | "重新读取" => {
+            UiIcon::Refresh
+        }
+        "重试" => UiIcon::Retry,
+        "复制"
+        | "复制路径"
+        | "复制链接"
+        | "复制内容"
+        | "复制结果"
+        | "复制地址"
+        | "复制当前目录路径" => UiIcon::Copy,
+        "详情" | "查看详情" => UiIcon::Info,
+        "查看内容" => UiIcon::ChevronRight,
+        "更多" => UiIcon::MoreHorizontal,
+        "关闭" | "关闭预览" => UiIcon::Close,
+        "收起" | "收起详情" => UiIcon::ChevronUp,
+        "展开详情" => UiIcon::Info,
+        "上一页" => UiIcon::ChevronLeft,
+        "下一页" => UiIcon::ChevronRight,
+        "上一级" => UiIcon::ArrowUp,
+        "搜索" => UiIcon::Search,
+        "查看大图" | "放大" => UiIcon::Maximize,
+        "缩小" => UiIcon::Minus,
+        _ => return None,
+    })
+}
+
 struct FileProbeEntry {
     at: std::time::Instant,
     is_file: bool,
     len: u64,
+    modified_ms: Option<i64>,
     dims: Option<(u32, u32)>,
     is_black: Option<bool>,
 }
@@ -36,7 +79,10 @@ static FILE_PROBE_CACHE: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, FileProbeEntry>>,
 > = std::sync::OnceLock::new();
 
-fn probe_file_cached(path: &std::path::Path, need_dims: bool) -> (bool, u64, Option<(u32, u32)>) {
+fn probe_file_cached(
+    path: &std::path::Path,
+    need_dims: bool,
+) -> (bool, u64, Option<i64>, Option<(u32, u32)>) {
     const TTL: std::time::Duration = std::time::Duration::from_secs(2);
     let cache =
         FILE_PROBE_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -47,6 +93,7 @@ fn probe_file_cached(path: &std::path::Path, need_dims: bool) -> (bool, u64, Opt
                     return (
                         entry.is_file,
                         entry.len,
+                        entry.modified_ms,
                         entry.dims.filter(|&(w, h)| w > 0 && h > 0),
                     );
                 }
@@ -55,6 +102,7 @@ fn probe_file_cached(path: &std::path::Path, need_dims: bool) -> (bool, u64, Opt
                 return (
                     entry.is_file,
                     entry.len,
+                    entry.modified_ms,
                     (probed.0 > 0 && probed.1 > 0).then_some(probed),
                 );
             }
@@ -63,6 +111,12 @@ fn probe_file_cached(path: &std::path::Path, need_dims: bool) -> (bool, u64, Opt
     let meta = std::fs::metadata(path).ok();
     let is_file = meta.as_ref().is_some_and(|m| m.is_file());
     let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+    let modified_ms = meta
+        .as_ref()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .filter(|&ms| ms > 0);
     let dims_raw = if need_dims && is_file {
         Some(image::image_dimensions(path).ok().unwrap_or((0, 0)))
     } else {
@@ -89,12 +143,18 @@ fn probe_file_cached(path: &std::path::Path, need_dims: bool) -> (bool, u64, Opt
                 at: std::time::Instant::now(),
                 is_file,
                 len,
+                modified_ms,
                 dims: dims_raw.or(prev_dims),
                 is_black: prev_is_black,
             },
         );
     }
-    (is_file, len, dims_raw.filter(|&(w, h)| w > 0 && h > 0))
+    (
+        is_file,
+        len,
+        modified_ms,
+        dims_raw.filter(|&(w, h)| w > 0 && h > 0),
+    )
 }
 
 fn probe_image_is_black(path: &std::path::Path) -> bool {
@@ -106,21 +166,24 @@ fn probe_image_is_black(path: &std::path::Path) -> bool {
     if w == 0 || h == 0 {
         return false;
     }
+    let mut dark_samples = 0u32;
+    let mut total_samples = 0u32;
     for gy in 1..9u32 {
         let y = ((h as u64 * gy as u64) / 9).min(h.saturating_sub(1) as u64) as u32;
         for gx in 1..9u32 {
             let x = ((w as u64 * gx as u64) / 9).min(w.saturating_sub(1) as u64) as u32;
             let px = rgba.get_pixel(x, y).0;
-            if px[0] > 10 || px[1] > 10 || px[2] > 10 {
-                return false;
+            total_samples += 1;
+            if px[0] <= 18 && px[1] <= 18 && px[2] <= 18 {
+                dark_samples += 1;
             }
         }
     }
-    true
+    dark_samples * 100 >= total_samples * 84
 }
 
 pub(super) fn cached_image_is_black(path: &std::path::Path) -> bool {
-    let (is_file, _, _) = probe_file_cached(path, false);
+    let (is_file, _, _, _) = probe_file_cached(path, false);
     if !is_file {
         return false;
     }
@@ -145,12 +208,16 @@ pub(super) fn cached_is_file(path: &std::path::Path) -> bool {
 }
 
 pub(super) fn cached_file_len(path: &std::path::Path) -> Option<u64> {
-    let (is_file, len, _) = probe_file_cached(path, false);
+    let (is_file, len, _, _) = probe_file_cached(path, false);
     is_file.then_some(len)
 }
 
+pub(super) fn cached_file_modified_ms(path: &std::path::Path) -> Option<i64> {
+    probe_file_cached(path, false).2
+}
+
 pub(super) fn cached_image_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
-    probe_file_cached(path, true).2
+    probe_file_cached(path, true).3
 }
 
 pub(super) fn invalidate_cached_file(path: &std::path::Path) {
@@ -161,6 +228,26 @@ pub(super) fn invalidate_cached_file(path: &std::path::Path) {
     }
 }
 
+#[inline]
+pub(super) fn is_bright_on_dark(color: ColorU) -> bool {
+    let luma =
+        (0.2126 * color.r as f32 + 0.7152 * color.g as f32 + 0.0722 * color.b as f32) / 255.0;
+    luma > 0.65
+}
+
+#[inline]
+pub(super) fn compensate_optical_weight(weight: Weight, color: ColorU) -> Weight {
+    if is_bright_on_dark(color) {
+        match weight {
+            Weight::Medium => Weight::MediumOpticalDark,
+            Weight::Semibold => Weight::SemiboldOpticalDark,
+            other => other,
+        }
+    } else {
+        weight
+    }
+}
+
 pub(super) fn ui_label(
     text: String,
     font: facloud_ui::fonts::FamilyId,
@@ -168,6 +255,7 @@ pub(super) fn ui_label(
     color: ColorU,
     weight: Weight,
 ) -> El {
+    let weight = compensate_optical_weight(weight, color);
     let Some((icon, rest)) = icons::label_icon(&text) else {
         return Text::new(text, font, size)
             .with_color(color)
@@ -187,6 +275,7 @@ pub(super) fn icon_label(
     color: ColorU,
     weight: Weight,
 ) -> El {
+    let weight = compensate_optical_weight(weight, color);
     let rest = match icons::label_icon(rest) {
         Some((_, stripped)) => stripped,
         None => rest,
@@ -240,9 +329,20 @@ impl Companion {
                 0.0
             }
         } else {
-            let p = mouse.hover_progress().clamp(0.0, 1.0);
-            1.0 - (1.0 - p).powi(2)
+            super::motion::hover_progress(mouse.hover_progress(), false)
         }
+    }
+
+    pub(super) fn is_hovered_any(&self, keys: &[&str]) -> bool {
+        let map = self.hover_states.borrow();
+        keys.iter().any(|k| {
+            map.get(*k).is_some_and(|(_, handle)| {
+                handle
+                    .lock()
+                    .ok()
+                    .is_some_and(|st| st.is_mouse_over_element() || st.hover_progress() > 0.05)
+            })
+        })
     }
 
     pub fn toggle_switch(&self, id: impl Into<String>, on: bool, action: Action) -> El {
@@ -272,7 +372,9 @@ impl Companion {
                         ConstrainedBox::new(
                             Container::new(Empty::new().finish())
                                 .with_background_color(rgb(255, 255, 255))
-                                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(9.)))
+                                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(
+                                    concentric_radius(R_LG, 3.0),
+                                )))
                                 .finish(),
                         )
                         .with_width(thumb_w)
@@ -283,7 +385,7 @@ impl Companion {
             )
             .with_uniform_padding(3.)
             .with_background_color(track_bg)
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(12.)))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_LG)))
             .finish()
         })
         .with_cursor(Cursor::PointingHand)
@@ -308,6 +410,7 @@ impl Companion {
     }
 
     pub fn text_w(&self, text: impl Into<String>, size: f32, color: ColorU, weight: Weight) -> El {
+        let weight = self.p().optical_weight_for_color(weight, color);
         Text::new(text.into(), self.font, size)
             .with_color(color)
             .with_style(Properties::default().weight(weight))
@@ -366,6 +469,19 @@ impl Companion {
     pub fn wrap(&self, children: Vec<El>) -> El {
         Wrap::row()
             .with_main_axis_size(MainAxisSize::Min)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(S2)
+            .with_run_spacing(S2)
+            .with_children(children)
+            .finish()
+    }
+
+    /// Use in a finite-width card row. Wrap's Min measurement includes gaps
+    /// twice in the current UI runtime; Max keeps card bounds stable while
+    /// preserving the same child wrapping and spacing.
+    pub fn bounded_wrap(&self, children: Vec<El>) -> El {
+        Wrap::row()
+            .with_main_axis_size(MainAxisSize::Max)
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_spacing(S2)
             .with_run_spacing(S2)
@@ -577,7 +693,9 @@ impl Companion {
                 .with_vertical_padding(S2 + 2.)
                 .with_background_color(bg)
                 .with_border(border)
-                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(concentric_radius(
+                    R_LG, 4.0,
+                ))))
                 .finish()
         })
         .with_defer_events_to_children();
@@ -691,7 +809,13 @@ impl Companion {
         action: Action,
         kind: Btn,
     ) -> El {
-        self.button_control(id.into(), label.into(), None, action, kind)
+        let label = label.into();
+        if matches!(kind, Btn::Secondary | Btn::Ghost) {
+            if let Some(icon) = auxiliary_action_icon(&label) {
+                return self.icon_action(id, label, icon, vec![action], false);
+            }
+        }
+        self.button_control(id.into(), label, None, action, kind)
     }
 
     pub fn button_icon(
@@ -702,7 +826,13 @@ impl Companion {
         action: Action,
         kind: Btn,
     ) -> El {
-        self.button_control(id.into(), label.into(), Some(icon), action, kind)
+        let label = label.into();
+        if matches!(kind, Btn::Secondary | Btn::Ghost) {
+            if let Some(auxiliary) = auxiliary_action_icon(&label) {
+                return self.icon_action(id, label, auxiliary, vec![action], false);
+            }
+        }
+        self.button_control(id.into(), label, Some(icon), action, kind)
     }
 
     fn button_control(
@@ -828,9 +958,12 @@ impl Companion {
 
     /// Text-style link button (used inside rows and breadcrumbs).
     pub fn link(&self, id: impl Into<String>, label: impl Into<String>, action: Action) -> El {
+        let label = label.into();
+        if let Some(icon) = auxiliary_action_icon(&label) {
+            return self.icon_action(id, label, icon, vec![action], false);
+        }
         let p = self.p();
         let state = self.mouse_state(format!("link:{}", id.into()));
-        let label = label.into();
         let font = self.font;
         Hoverable::new(state, move |mouse| {
             let t = self.hover_t(&mouse);
@@ -853,9 +986,12 @@ impl Companion {
         label: impl Into<String>,
         action: Action,
     ) -> El {
+        let label = label.into();
+        if let Some(icon) = auxiliary_action_icon(&label) {
+            return self.icon_action(id, label, icon, vec![action], false);
+        }
         let p = self.p();
         let state = self.mouse_state(format!("mlink:{}", id.into()));
-        let label = label.into();
         let font = self.font;
         Hoverable::new(state, move |mouse| {
             let t = self.hover_t(&mouse);
@@ -872,6 +1008,21 @@ impl Companion {
     }
 
     pub fn disabled_button(&self, label: impl Into<String>) -> El {
+        let label = label.into();
+        if let Some(icon) = auxiliary_action_icon(&label) {
+            return ConstrainedBox::new(
+                Align::new(self.status_icon(
+                    format!("disabled-{label}"),
+                    format!("{label} · 当前不可用"),
+                    icon,
+                    self.p().text3,
+                ))
+                .finish(),
+            )
+            .with_width(30.)
+            .with_height(30.)
+            .finish();
+        }
         let p = self.p();
         Container::new(
             ConstrainedBox::new(Align::new(self.line(label, BODY, p.text3)).finish())
@@ -893,7 +1044,7 @@ impl Companion {
             .enumerate()
             .map(|(i, (label, active, action))| {
                 let state = self.mouse_state(format!("seg:{id}:{i}"));
-                Hoverable::new(state, move |mouse| {
+                let seg = Hoverable::new(state, move |mouse| {
                     let t = self.hover_t(&mouse);
                     let clicked = mouse.is_clicked();
                     let bg = if active {
@@ -934,12 +1085,18 @@ impl Companion {
                     .with_vertical_padding(4.)
                     .with_background_color(bg)
                     .with_border(Border::all(1.).with_border_color(border_col))
-                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL - 1.)))
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(concentric_radius(
+                        R_CONTROL + 1.,
+                        2.0,
+                    ))))
                     .finish()
                 })
                 .with_cursor(Cursor::PointingHand)
                 .on_click(move |ctx, _, _| ctx.dispatch_typed_action(action.clone()))
-                .finish()
+                .finish();
+                #[cfg(feature = "ui-capture")]
+                let seg = super::scenario_check::control(format!("seg:{id}:{i}"), seg);
+                seg
             })
             .collect();
         Container::new(self.hstack(2., children))
@@ -983,11 +1140,16 @@ impl Companion {
         self.vstack(0., paragraphs)
     }
 
+    pub(super) fn input_has_focus(&self, index: usize) -> bool {
+        self.focus == Some(index)
+            || (index == super::F_TOAST_REPLY && self.desktop_popup.reply_focused)
+    }
+
     /// Text field bound to `self.fields[index]`. Without a width it fills the parent.
     pub fn input(&self, index: usize, placeholder: &str, width: Option<f32>) -> El {
         let p = self.p();
         let field = &self.fields[index];
-        let focused = self.focus == Some(index);
+        let focused = self.input_has_focus(index);
         let masked =
             (index == super::F_PAIR_CODE && !self.show_secret) || index == super::F_LAB_KEY;
         let mut value = if masked {
@@ -1035,7 +1197,37 @@ impl Companion {
                     .with_color(text_color)
                     .soft_wrap(false)
                     .with_clip(ClipConfig::ellipsis());
-                self.editable_line(text, &value, 0, index, Some(caret_index))
+                let editor = if matches!(index, super::F_CAPSULE_PROMPT | super::F_HOME_AGENT_PROMPT | super::F_AGENT_REQUEST) {
+                    self.multiline_field_text(&value, caret_index, index, text_color)
+                } else {
+                    self.editable_line(text, &value, 0, index, Some(caret_index))
+                };
+                if index == super::F_GLOBAL_SEARCH {
+                    self.hstack(
+                        S2,
+                        vec![
+                            self.ui_icon(UiIcon::Search, 15., p.text2),
+                            Expanded::new(1., editor).finish(),
+                            self.voice_input_button(index),
+                            self.text(
+                                if cfg!(target_os = "macos") {
+                                    "⌘ K"
+                                } else {
+                                    "Ctrl K"
+                                },
+                                MICRO,
+                                p.text3,
+                            ),
+                        ],
+                    )
+                } else if super::voice_input_state::accepts_dictation(index) {
+                    self.hstack(
+                        S1,
+                        vec![Expanded::new(1., editor).finish(), self.voice_input_button(index)],
+                    )
+                } else {
+                    editor
+                }
             })
             .with_horizontal_padding(10.)
             .with_vertical_padding(6.)
@@ -1052,6 +1244,7 @@ impl Companion {
         .with_defer_events_to_children()
         .on_mouse_down(move |ctx, _, _| ctx.dispatch_typed_action(Action::Focus(index)))
         .on_right_click(move |ctx, _, at| {
+            if index == super::F_TOAST_REPLY { return; }
             ctx.dispatch_typed_action(Action::ContextOpen(
                 crate::ui::context_menu::Target::Input(index),
                 at,
@@ -1059,10 +1252,13 @@ impl Companion {
         })
         .finish();
 
-        match width {
+        let out = match width {
             Some(w) => self.fixed_w(w, field_box),
             None => field_box,
-        }
+        };
+        #[cfg(feature = "ui-capture")]
+        let out = super::scenario_check::control(format!("input:{index}"), out);
+        out
     }
 
     pub fn checkbox_row(
@@ -1175,17 +1371,15 @@ impl Companion {
             } else {
                 lerp_color(p.border, p.border_strong, t)
             };
+            let title_fg = if active { p.accent } else { p.text };
             let mut col = vec![
-                ui_label(
-                    icon.clone(),
-                    font,
-                    HEADING + 1.,
-                    if active { p.accent } else { p.text },
-                    Weight::Normal,
-                ),
+                ui_label(icon.clone(), font, HEADING + 1., title_fg, Weight::Normal),
                 Text::new(title.clone(), font, CAPTION)
-                    .with_color(if active { p.accent } else { p.text })
-                    .with_style(Properties::default().weight(Weight::Medium))
+                    .with_color(title_fg)
+                    .with_style(
+                        Properties::default()
+                            .weight(p.optical_weight_for_color(Weight::Medium, title_fg)),
+                    )
                     .soft_wrap(false)
                     .finish(),
             ];
@@ -1202,6 +1396,86 @@ impl Companion {
                     .with_main_axis_size(MainAxisSize::Min)
                     .with_cross_axis_alignment(CrossAxisAlignment::Center)
                     .with_spacing(3.)
+                    .with_children(col)
+                    .finish(),
+            )
+            .with_horizontal_padding(S2)
+            .with_vertical_padding(S2 + 2.)
+            .with_background_color(bg)
+            .with_border(Border::all(1.).with_border_color(border))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_PANEL)))
+            .finish()
+        })
+        .with_cursor(Cursor::PointingHand)
+        .on_click(move |ctx, _, _| ctx.dispatch_typed_action(action.clone()))
+        .finish()
+    }
+
+    pub fn ui_icon_tile_btn(
+        &self,
+        id: impl Into<String>,
+        icon: UiIcon,
+        title: &str,
+        subtitle: Option<&str>,
+        active: bool,
+        action: Action,
+    ) -> El {
+        let p = self.p();
+        let state = self.mouse_state(format!("tile:{}", id.into()));
+        let title = title.to_string();
+        let subtitle = subtitle.map(str::to_string);
+        let font = self.font;
+        Hoverable::new(state, move |mouse| {
+            let t = self.hover_t(&mouse);
+            let clicked = mouse.is_clicked();
+            let bg = if active {
+                if clicked {
+                    lerp_color(p.accent_soft, p.hover, 0.6)
+                } else {
+                    p.accent_soft
+                }
+            } else if clicked {
+                p.accent_soft
+            } else {
+                lerp_color(p.surface, p.hover, t)
+            };
+            let border = if active {
+                p.accent
+            } else if clicked {
+                p.border_strong
+            } else {
+                lerp_color(p.border, p.border_strong, t)
+            };
+            let title_fg = if active { p.accent } else { p.text };
+            let icon_bg = if active {
+                lerp_color(p.accent_soft, p.accent, 0.14)
+            } else {
+                p.card2
+            };
+            let mut col = vec![
+                self.icon_badge(icon, 14., title_fg, icon_bg, 26.),
+                Text::new(title.clone(), font, CAPTION)
+                    .with_color(title_fg)
+                    .with_style(
+                        Properties::default()
+                            .weight(p.optical_weight_for_color(Weight::Medium, title_fg)),
+                    )
+                    .soft_wrap(false)
+                    .finish(),
+            ];
+            if let Some(sub) = &subtitle {
+                col.push(
+                    Text::new(sub.clone(), font, MICRO)
+                        .with_color(p.text3)
+                        .soft_wrap(false)
+                        .finish(),
+                );
+            }
+            Container::new(
+                Flex::column()
+                    .with_main_axis_size(MainAxisSize::Min)
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_spacing(4.)
                     .with_children(col)
                     .finish(),
             )
@@ -1265,9 +1539,12 @@ impl Companion {
         icon: UiIcon,
         action: Action,
     ) -> El {
+        let label = label.into();
+        if let Some(auxiliary) = auxiliary_action_icon(&label) {
+            return self.icon_action(id, label, auxiliary, vec![action], false);
+        }
         let p = self.p();
         let state = self.mouse_state(format!("link:{}", id.into()));
-        let label = label.into();
         let font = self.font;
         Hoverable::new(state, move |mouse| {
             let t = self.hover_t(&mouse);
@@ -1351,7 +1628,7 @@ impl Companion {
     }
 
     /// Orthographic device artwork. Screen/LED content is composited separately.
-    fn phone_art(&self, name: &'static str, width: f32, height: f32) -> El {
+    pub(super) fn phone_art(&self, name: &'static str, width: f32, height: f32) -> El {
         ConstrainedBox::new(
             Image::new(
                 facloud_ui::assets::asset_cache::AssetSource::Bundled { path: name },
@@ -1392,17 +1669,27 @@ impl Companion {
     }
 
     pub fn phone_front_housing(&self, width: f32, height: f32) -> El {
+        self.phone_front_artwork(width, height, true)
+    }
+
+    /// Stable sidebar artwork: never replace the icon with private screen content.
+    pub fn phone_front_icon(&self, width: f32, height: f32) -> El {
+        self.phone_front_artwork(width, height, false)
+    }
+
+    fn phone_front_artwork(&self, width: f32, height: f32, screen_preview: bool) -> El {
         let scale = (width / 866.).min(height / 1817.);
         let w = 866. * scale;
         let h = 1817. * scale;
-        let source = if let Some((_, path)) = &self.screenshot {
-            facloud_ui::assets::asset_cache::AssetSource::LocalFile {
-                path: path.to_string_lossy().into_owned(),
+        let source = match &self.screenshot {
+            Some((_, path)) if screen_preview && !cached_image_is_black(path) => {
+                facloud_ui::assets::asset_cache::AssetSource::LocalFile {
+                    path: path.to_string_lossy().into_owned(),
+                }
             }
-        } else {
-            facloud_ui::assets::asset_cache::AssetSource::Bundled {
+            _ => facloud_ui::assets::asset_cache::AssetSource::Bundled {
                 path: "stepx_home_screen.png",
-            }
+            },
         };
         // Fit under the generated bezel, preserving screenshot aspect ratio.
         let screen = ConstrainedBox::new(
@@ -1598,7 +1885,15 @@ impl Companion {
             let (icon_sz, title_txt, title_sz, sub_txt, sub_sz, h_pad, v_pad) = if compact_bezel {
                 (18., "手机当前已息屏", 11., "点击画面点亮解锁", 9.5, 8., 8.)
             } else {
-                (22., "手机当前处于息屏", 12.5, "点击画面点亮并解锁", 10.5, 12., 10.)
+                (
+                    22.,
+                    "手机当前处于息屏",
+                    12.5,
+                    "点击画面点亮并解锁",
+                    10.5,
+                    12.,
+                    10.,
+                )
             };
             let screen_off_overlay = ConstrainedBox::new(
                 Align::new(
@@ -1615,7 +1910,12 @@ impl Companion {
                             .with_child(
                                 Text::new(title_txt, font, title_sz)
                                     .with_color(rgb(0xF4, 0xF4, 0xF5))
-                                    .with_style(Properties::default().weight(Weight::Semibold))
+                                    .with_style(Properties::default().weight(
+                                        compensate_optical_weight(
+                                            Weight::Semibold,
+                                            rgb(0xF4, 0xF4, 0xF5),
+                                        ),
+                                    ))
                                     .soft_wrap(false)
                                     .finish(),
                             )
@@ -1630,9 +1930,9 @@ impl Companion {
                     .with_horizontal_padding(h_pad)
                     .with_vertical_padding(v_pad)
                     .with_background_color(ColorU::new(0x18, 0x18, 0x1B, 215))
-                    .with_border(Border::all(1.).with_border_color(ColorU::new(
-                        0x3F, 0x3F, 0x46, 180,
-                    )))
+                    .with_border(
+                        Border::all(1.).with_border_color(ColorU::new(0x3F, 0x3F, 0x46, 180)),
+                    )
                     .with_corner_radius(CornerRadius::with_all(Radius::Pixels(10.)))
                     .finish(),
                 )
@@ -1733,7 +2033,10 @@ impl Companion {
                             .with_child(
                                 Text::new(lbl.clone(), font, 10.5)
                                     .with_color(fg)
-                                    .with_style(Properties::default().weight(Weight::Medium))
+                                    .with_style(
+                                        Properties::default()
+                                            .weight(p.optical_weight_for_color(Weight::Medium, fg)),
+                                    )
                                     .soft_wrap(false)
                                     .finish(),
                             )
@@ -1743,7 +2046,9 @@ impl Companion {
                     .with_vertical_padding(4.)
                     .with_background_color(bg)
                     .with_border(Border::all(1.).with_border_color(border))
-                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(concentric_radius(
+                        R_CARD, 4.0,
+                    ))))
                     .finish(),
                 )
                 .with_width(58.)
@@ -1769,7 +2074,7 @@ impl Companion {
             .with_uniform_padding(4.)
             .with_background_color(p.surface)
             .with_border(Border::all(1.).with_border_color(p.border))
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(10.)))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CARD)))
             .finish(),
         )
         .with_width(66.)
@@ -1814,7 +2119,10 @@ impl Companion {
                             .with_child(
                                 Text::new(lbl.clone(), font, 11.)
                                     .with_color(fg)
-                                    .with_style(Properties::default().weight(Weight::Medium))
+                                    .with_style(
+                                        Properties::default()
+                                            .weight(p.optical_weight_for_color(Weight::Medium, fg)),
+                                    )
                                     .soft_wrap(false)
                                     .finish(),
                             )
@@ -1826,7 +2134,9 @@ impl Companion {
                 .with_vertical_padding(5.)
                 .with_background_color(bg)
                 .with_border(Border::all(1.).with_border_color(border))
-                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(concentric_radius(
+                    R_SHELL, 3.0,
+                ))))
                 .finish()
             })
             .with_cursor(Cursor::PointingHand)
@@ -1846,10 +2156,10 @@ impl Companion {
                     .with_children(nav_buttons)
                     .finish(),
             )
-            .with_uniform_padding(4.)
+            .with_uniform_padding(3.)
             .with_background_color(p.surface)
             .with_border(Border::all(1.).with_border_color(p.border))
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(10.)))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_SHELL)))
             .finish(),
         )
         .with_width(total_unit_width)
@@ -1946,7 +2256,83 @@ impl Companion {
         control
     }
 
-    /// Icon-only button with a hover tooltip. Runs every action in order.
+    /// Compact status glyph with its original meaning available on hover.
+    pub fn status_icon(
+        &self,
+        id: impl Into<String>,
+        tooltip: impl Into<String>,
+        icon: UiIcon,
+        color: ColorU,
+    ) -> El {
+        let id = id.into();
+        let tooltip = tooltip.into();
+        let p = self.p();
+        let el = Hoverable::new(
+            self.mouse_state(format!("status-icon:{id}")),
+            move |mouse| {
+                let glyph =
+                    ConstrainedBox::new(Align::new(self.ui_icon(icon, 14., color)).finish())
+                        .with_width(20.)
+                        .with_height(20.)
+                        .finish();
+                if !mouse.is_mouse_over_element() {
+                    return glyph;
+                }
+                let tip = Container::new(self.line(tooltip.clone(), MICRO, p.text))
+                    .with_horizontal_padding(S2)
+                    .with_vertical_padding(S1)
+                    .with_background_color(p.bg)
+                    .with_border(Border::all(1.).with_border_color(p.border))
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
+                    .finish();
+                Stack::new()
+                    .with_child(glyph)
+                    .with_positioned_child(
+                        tip,
+                        OffsetPositioning::offset_from_parent(
+                            pathfinder_geometry::vector::vec2f(0., -S1),
+                            ParentOffsetBounds::WindowByPosition,
+                            ParentAnchor::TopMiddle,
+                            ChildAnchor::BottomMiddle,
+                        ),
+                    )
+                    .finish()
+            },
+        )
+        .finish();
+        #[cfg(feature = "ui-capture")]
+        let el = super::scenario_check::control(id, el);
+        el
+    }
+
+    pub fn device_connection_icons(&self, id: &str, device: &super::Device) -> El {
+        let wireless = super::is_wireless(&self.online_device_active_transport(device));
+        let mut icons = vec![self.status_icon(
+            format!("{id}-active"),
+            if wireless {
+                "无线连接 · 当前通道"
+            } else {
+                "USB 有线连接 · 当前通道"
+            },
+            if wireless { UiIcon::Wifi } else { UiIcon::Usb },
+            self.p().text2,
+        )];
+        if self.device_has_online_usb_and_wireless(device) {
+            icons.push(self.status_icon(
+                format!("{id}-standby"),
+                if wireless {
+                    "USB 有线备用 · 断线后自动切换"
+                } else {
+                    "无线备用 · 拔线后自动切换"
+                },
+                if wireless { UiIcon::Usb } else { UiIcon::Wifi },
+                self.p().text3,
+            ));
+        }
+        self.hstack(2., icons)
+    }
+
+    /// 16 px glyph, 30 px pointer target, and the original label on hover.
     pub fn icon_action(
         &self,
         id: impl Into<String>,
@@ -2076,6 +2462,230 @@ impl Companion {
             ));
         }
         self.wrap(items)
+    }
+
+    pub fn stepper_index(&self, labels: &[&str], active_idx: usize) -> El {
+        let steps = labels
+            .iter()
+            .enumerate()
+            .map(|(idx, &label)| {
+                let mark = if idx < active_idx {
+                    StepMark::Done
+                } else if idx == active_idx {
+                    StepMark::Active
+                } else {
+                    StepMark::Pending
+                };
+                (label.to_string(), mark)
+            })
+            .collect();
+        self.stepper(steps)
+    }
+
+    pub fn grid_cols(&self, items: Vec<El>, cols: usize, spacing: f32) -> El {
+        let cols = cols.max(1);
+        let mut rows = Vec::new();
+        let mut chunk = Vec::with_capacity(cols);
+        for item in items {
+            chunk.push(Expanded::new(1., item).finish());
+            if chunk.len() == cols {
+                rows.push(
+                    Flex::row()
+                        .with_main_axis_size(MainAxisSize::Max)
+                        .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                        .with_spacing(spacing)
+                        .with_children(std::mem::take(&mut chunk))
+                        .finish(),
+                );
+            }
+        }
+        if !chunk.is_empty() {
+            while chunk.len() < cols {
+                chunk.push(Expanded::new(1., Empty::new().finish()).finish());
+            }
+            rows.push(
+                Flex::row()
+                    .with_main_axis_size(MainAxisSize::Max)
+                    .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                    .with_spacing(spacing)
+                    .with_children(chunk)
+                    .finish(),
+            );
+        }
+        self.vstack(spacing, rows)
+    }
+
+    pub fn card_box(
+        &self,
+        child: El,
+        bg: ColorU,
+        border_color: ColorU,
+        radius: f32,
+        pad_h: f32,
+        pad_v: f32,
+    ) -> El {
+        Container::new(child)
+            .with_background_color(bg)
+            .with_border(Border::all(1.).with_border_color(border_color))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(radius)))
+            .with_horizontal_padding(pad_h)
+            .with_vertical_padding(pad_v)
+            .finish()
+    }
+
+    pub fn surface_note_box(&self, text: impl Into<String>, color: ColorU) -> El {
+        let p = self.p();
+        self.card_box(
+            self.text(text, BODY, color),
+            p.surface,
+            p.border,
+            concentric_radius(R_LG, 2.0),
+            S4,
+            S3,
+        )
+    }
+
+    pub fn status_banner_box(&self, child: El, bg: ColorU, border_color: ColorU) -> El {
+        self.card_box(
+            child,
+            bg,
+            border_color,
+            concentric_radius(R_LG, 2.0),
+            S4,
+            S2,
+        )
+    }
+
+    /// Content only. Main/sidebar and header actions keep their existing palette.
+    pub fn content_icon(&self, icon: UiIcon, size: f32, fallback: ColorU) -> El {
+        let p = self.p();
+        let color = if fallback == p.text2 || fallback == p.text {
+            super::icon_style::content_style(icon, &p).foreground
+        } else {
+            fallback
+        }; // explicit status/disabled/brand colour stays intact
+        self.ui_icon(icon, size, color)
+    }
+
+    pub fn section_heading(&self, icon: UiIcon, text: impl Into<String>) -> El {
+        self.hstack(
+            S2,
+            vec![
+                self.content_icon(icon, 16., self.p().text2),
+                self.heading(text),
+            ],
+        )
+    }
+
+    pub fn section_icon_badge(&self, icon: UiIcon, icon_size: f32, box_size: f32) -> El {
+        let style = super::icon_style::content_style(icon, &self.p());
+        self.icon_badge(
+            icon,
+            icon_size,
+            style.foreground,
+            style.background,
+            box_size,
+        )
+    }
+
+    pub fn icon_badge(
+        &self,
+        icon: UiIcon,
+        icon_size: f32,
+        fg: ColorU,
+        bg: ColorU,
+        box_size: f32,
+    ) -> El {
+        ConstrainedBox::new(
+            Container::new(
+                Flex::row()
+                    .with_main_axis_size(MainAxisSize::Max)
+                    .with_main_axis_alignment(MainAxisAlignment::Center)
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_child(self.ui_icon(icon, icon_size, fg))
+                    .finish(),
+            )
+            .with_background_color(bg)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
+            .finish(),
+        )
+        .with_width(box_size)
+        .with_height(box_size)
+        .finish()
+    }
+
+    /// Build each column once, and share it between two lightweight layout
+    /// branches. The native switch re-evaluates every new constraint, including
+    /// measurement followed by a tighter layout and resizing the same element.
+    pub fn responsive_columns(
+        &self,
+        min_wide_width: f32,
+        row_spacing: f32,
+        stack_spacing: f32,
+        row_alignment: CrossAxisAlignment,
+        columns: Vec<(f32, El)>,
+    ) -> El {
+        let mut row = Flex::row()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_cross_axis_alignment(row_alignment)
+            .with_spacing(row_spacing);
+        let mut stack = Flex::column()
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_spacing(stack_spacing);
+        for (weight, child) in columns {
+            let shared = std::rc::Rc::new(std::cell::RefCell::new(child));
+            row = row
+                .with_child(Expanded::new(weight, Box::new(SharedColumn(shared.clone()))).finish());
+            stack = stack.with_child(Box::new(SharedColumn(shared)));
+        }
+        SizeConstraintSwitch::new(
+            row.finish(),
+            [(
+                SizeConstraintCondition::WidthLessThan(min_wide_width),
+                stack.finish(),
+            )],
+        )
+        .finish()
+    }
+}
+
+/// The two responsive branches share content, never duplicated SVG work or
+/// independent control state. Only the active branch lays out and paints it.
+struct SharedColumn(std::rc::Rc<std::cell::RefCell<El>>);
+
+impl facloud_ui::Element for SharedColumn {
+    fn layout(
+        &mut self,
+        c: SizeConstraint,
+        ctx: &mut LayoutContext,
+        app: &facloud_ui::AppContext,
+    ) -> pathfinder_geometry::vector::Vector2F {
+        self.0.borrow_mut().layout(c, ctx, app)
+    }
+    fn after_layout(&mut self, ctx: &mut AfterLayoutContext, app: &facloud_ui::AppContext) {
+        self.0.borrow_mut().after_layout(ctx, app);
+    }
+    fn paint(
+        &mut self,
+        origin: pathfinder_geometry::vector::Vector2F,
+        ctx: &mut PaintContext,
+        app: &facloud_ui::AppContext,
+    ) {
+        self.0.borrow_mut().paint(origin, ctx, app);
+    }
+    fn size(&self) -> Option<pathfinder_geometry::vector::Vector2F> {
+        self.0.borrow().size()
+    }
+    fn origin(&self) -> Option<Point> {
+        self.0.borrow().origin()
+    }
+    fn dispatch_event(
+        &mut self,
+        event: &facloud_ui::event::DispatchedEvent,
+        ctx: &mut EventContext,
+        app: &facloud_ui::AppContext,
+    ) -> bool {
+        self.0.borrow_mut().dispatch_event(event, ctx, app)
     }
 }
 

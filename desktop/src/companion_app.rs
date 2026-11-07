@@ -18,10 +18,11 @@ const SERVICE: &str = "com.stepx.companion.app/.CompanionService";
 const FILES: &str = "/sdcard/Android/data/com.stepx.companion.app/files";
 const STATUS: &str = "/sdcard/Android/data/com.stepx.companion.app/files/status.json";
 const PERMISSION: &str = "com.stepos.permission.MANAGE_BACK_SCREEN";
-const RUNTIME_PERMISSIONS: [&str; 3] = [
+const RUNTIME_PERMISSIONS: [&str; 4] = [
     "android.permission.CAMERA",
     "android.permission.POST_NOTIFICATIONS",
     "android.permission.READ_PHONE_STATE",
+    "android.permission.READ_CALL_LOG",
 ];
 const APK: &[u8] = include_bytes!("../assets/stepx-companion.apk");
 static REQUEST: AtomicU64 = AtomicU64::new(0);
@@ -503,7 +504,38 @@ pub fn inspect(adb: &Adb, device: &Device) -> Result<CompanionStatus> {
          dumpsys activity freeze whitelist 2>/dev/null || printf 'STEPX_OEM_ERR\\n'"
     );
     let raw = adb.script(&device.transport, &script)?;
-    Ok(parse_inspect_output(&raw, device))
+    let mut status = parse_inspect_output(&raw, device);
+    if !status.running {
+        if let Ok(mcp_raw) = adb.shell(
+            &device.transport,
+            &[
+                "cat",
+                "/data/local/tmp/stepx-companion/backscreen-mcp-status.json",
+            ],
+        ) {
+            if let Ok(mcp) = serde_json::from_str::<Value>(mcp_raw.trim()) {
+                if mcp["running"].as_bool() == Some(true) {
+                    let title = mcp["appliedTitle"]
+                        .as_str()
+                        .unwrap_or("已应用效果")
+                        .trim()
+                        .to_string();
+                    status.running = true;
+                    status.mode = mcp["mode"].as_str().unwrap_or("animation").to_string();
+                    status.applied_title = title.clone();
+                    status.message = format!(
+                        "手机背屏任务：{} · 请确认实际显示",
+                        if title.is_empty() {
+                            "已应用效果"
+                        } else {
+                            &title
+                        }
+                    );
+                }
+            }
+        }
+    }
+    Ok(status)
 }
 
 fn parse_inspect_output(raw: &str, device: &Device) -> CompanionStatus {
@@ -633,7 +665,14 @@ fn parse_inspect_output(raw: &str, device: &Device) -> CompanionStatus {
         String::new()
     };
     let last_error = state["lastError"].as_str().unwrap_or("");
-    let paused = state["pausedReason"].as_str().unwrap_or("");
+    let raw_paused = state["pausedReason"].as_str().unwrap_or("");
+    let paused = if mode == "animation"
+        && (raw_paused == "请将背屏朝向自己" || raw_paused == "等待姿态传感器")
+    {
+        ""
+    } else {
+        raw_paused
+    };
     let stalled = running
         && uptime_secs
             .zip(state["uptimeMs"].as_u64())
@@ -746,56 +785,60 @@ pub fn install(
 ) -> Result<CompanionStatus> {
     device.verify(adb)?;
     let script = permission_script()?;
-    let apk = installation_apk(&crate::resources::root())?;
-    let path = apk.path().to_str().context("安装包路径无效")?;
-
-    let pre_dump = adb
-        .script(
-            &device.transport,
-            &format!("dumpsys package {PACKAGE} 2>/dev/null || true"),
-        )
-        .unwrap_or_default();
-    let already_installed_and_granted = pre_dump.contains(&format!("Package [{PACKAGE}]"))
-        && granted(&pre_dump, PERMISSION)
-        && granted(&pre_dump, "android.permission.WRITE_SECURE_SETTINGS");
-
-    if !already_installed_and_granted {
-        progress("正在检查设备、应用签名与内置功能保留条件…");
-        run_adapter(adb, device, &script, apk.path(), "preflight")?;
-        // Only this package's USB-install gate is temporarily opened. Restore it on
-        // every normal error path, including a partially completed prepare step.
+    progress("正在核对安装版本、保留内置能力并备份原安装包…");
+    let candidate = installation_apk(&crate::resources::root())?;
+    let trusted = compiled_apk_snapshot()?;
+    let apk = tempfile::Builder::new().suffix(".apk").tempfile()?;
+    let mut command = crate::resources::python_command();
+    command.arg(crate::resources::root().join("scripts/companion-install-plan.py"))
+        .arg("--apk").arg(candidate.path()).arg("--trusted-apk").arg(trusted.path())
+        .arg("--selected-apk").arg(apk.path())
+        .env("STEPX_SERIAL", &device.transport).env("STEPX_DEVICE_SERIAL", &device.serial)
+        .env("STEPX_ADB", &adb.path).env_remove("PYTHONOPTIMIZE");
+    let output = run_process(command, None, Duration::from_secs(120))?;
+    let plan: Value = serde_json::from_slice(&output.stdout).context("安装检查未返回有效结果，未修改手机")?;
+    ensure!(output.status.success() && plan["ok"] == true, "{}", plan["error"].as_str().unwrap_or("安装包检查失败，未修改手机"));
+    let needs_install = plan["needs_install"].as_bool().context("安装检查缺少版本结论")?;
+    let retained = plan["message"].as_str().unwrap_or("").to_owned();
+    let adapted = plan["system_adaptation_supported"].as_bool()
+        .context("安装检查缺少固件适配结论，请使用完整的新版客户端")?;
+    if !adapted {
+        // A new/after-sales firmware can install a normal signed APK without
+        // running old root, native-loader, freezer or boot-hook adapters.
+        if needs_install {
+            progress("正在安装基础伴侣，请在手机确认系统安装提示…");
+            device.verify(adb)?;
+            let result = adb.run_timeout(
+                &["-s", &device.transport, "install", "-r", "--user", "0",
+                  apk.path().to_str().context("安装包路径无效")?],
+                Duration::from_secs(120),
+            ).context("基础安装未完成，请在手机允许 USB 安装并确认系统提示；现有应用数据保留")?;
+            ensure!(result.lines().any(|line| line.trim() == "Success"),
+                "手机未确认基础安装成功：{}。请检查手机 USB 安装许可与系统提示", result.trim());
+        }
+        let mut result = inspect(adb, device)?;
+        ensure!(result.installed, "手机未确认 StepX伴侣已安装");
+        if !result.pairing_ready {
+            result.pairing_message = "当前固件的伴侣扫码服务尚未适配，可使用手机系统的无线调试配对码。".into();
+        }
+        result.message = format!(
+            "StepX伴侣已安装（基础模式）。当前固件尚未完成系统适配，本次未配置背屏特权、系统扫码与开机恢复。请打开手机伴侣按功能授权；无线连接可使用手机开发者选项中的无线调试配对码。{retained}"
+        );
+        return Ok(result);
+    }
+    run_adapter(adb, device, &script, apk.path(), "preflight")?;
+    if needs_install {
         let installation = (|| -> Result<()> {
             run_adapter(adb, device, &script, apk.path(), "prepare-install")?;
-            progress("正在安装 StepX伴侣…");
-            let result = adb.run_timeout(
-                &[
-                    "-s",
-                    &device.transport,
-                    "install",
-                    "-r",
-                    "--user",
-                    "0",
-                    path,
-                ],
-                Duration::from_secs(120),
-            )?;
-            ensure!(
-                result.lines().any(|l| l.trim() == "Success"),
-                "手机未确认 StepX伴侣安装成功：{}",
-                result.trim()
-            );
+            progress("正在安装 StepX伴侣，保留手机现有数据…");
+            let result = adb.run_timeout(&["-s", &device.transport, "install", "-r", "--user", "0",
+                apk.path().to_str().context("安装包路径无效")?], Duration::from_secs(120))?;
+            ensure!(result.lines().any(|l|l.trim()=="Success"), "手机未确认安装成功：{}", result.trim());
             Ok(())
         })();
         let restored = run_adapter(adb, device, &script, apk.path(), "finish-install");
         if let Err(error) = restored {
-            bail!(
-                "安装流程结束，但恢复 USB 安装许可失败：{error}；安装结果：{}",
-                installation
-                    .as_ref()
-                    .err()
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| "APK 已安装".into())
-            );
+            bail!("恢复 USB 安装许可失败：{error}；安装结果：{}", installation.as_ref().err().map(ToString::to_string).unwrap_or_else(||"APK 已安装".into()));
         }
         installation?;
     }
@@ -804,50 +847,13 @@ pub fn install(
     progress("正在授予相机、服务通知与通话状态权限，并逐项回读…");
     grant_runtime_permissions(adb, device)?;
 
-    let post_dump = adb
-        .script(
-            &device.transport,
-            &format!("dumpsys package {PACKAGE} 2>/dev/null || true"),
-        )
-        .unwrap_or_default();
-    let core_permissions_already_granted = granted(&post_dump, PERMISSION)
-        && granted(&post_dump, "android.permission.WRITE_SECURE_SETTINGS");
-
-    if core_permissions_already_granted {
-        progress("已检测到背屏与无线调试权限就绪，正在快速配置后台豁免…");
-        let _ = adb.script(
-            &device.transport,
-            &format!(
-                "cmd deviceidle whitelist +{PACKAGE} 2>/dev/null || true; \
-                 dumpsys activity freeze whiteAdd {PACKAGE} 2>/dev/null || true; \
-                 appops set {PACKAGE} RUN_IN_BACKGROUND allow 2>/dev/null || true; \
-                 appops set {PACKAGE} RUN_ANY_IN_BACKGROUND allow 2>/dev/null || true"
-            ),
-        );
-        progress("正在启用并验证伴侣看屏操作服务…");
-        if let Err(error) = crate::companion_gui::enable(adb, device) {
-            warnings.push(format!("看屏操作服务未完成：{error}"));
-        }
-        progress("正在回读权限、电池豁免与各项实际能力…");
-        let checked = inspect(adb, device)?;
-        ensure!(checked.installed, "手机未确认 StepX伴侣已安装");
-        progress("正在安装并验证当前手机会话的系统扫码服务…");
-        let service = start_pairing_service(adb, device, apk.path());
-        if !granted(&post_dump, "com.stepos.cloud.push.permission.MESSAGE") {
-            let _ = run_adapter(adb, device, &script, apk.path(), "grant-wake");
-        }
-        let mut result = inspect(adb, device).unwrap_or(checked);
-        finish_installation_status(&mut result, service);
-        return Ok(result);
-    }
-
-    // Runtime grants go first: PackageManager can recalculate nonstandard permission flags.
-    progress("正在适配背屏、扫码连接权限，并核验应用签名…");
-    for (operation, label) in [("grant", "背屏权限"), ("grant-connection", "无线配对权限")]
-    {
-        if let Err(error) = run_adapter(adb, device, &script, apk.path(), operation) {
-            warnings.push(format!("{label}未完成：{error}"));
-        }
+    // Do not skip updates or boot restoration merely because a previous grant remains.
+    progress("正在启用受限系统服务并回读背屏、扫码与熄屏权限…");
+    if let Err(error) = activate_system_service(adb, device, apk.path()) {
+        warnings.push(format!("系统服务配置未完成：{error}"));
+        let _ = run_adapter(adb, device, &script, apk.path(), "grant");
+        let _ = run_adapter(adb, device, &script, apk.path(), "grant-connection");
+        let _ = run_adapter(adb, device, &script, apk.path(), "grant-wake");
     }
     progress("正在配置 StepX伴侣电池优化豁免并保存原状态…");
     if let Err(error) = apply_power_exemption(adb, device, apk.path()) {
@@ -857,26 +863,23 @@ pub fn install(
     if let Err(error) = crate::companion_gui::enable(adb, device) {
         warnings.push(format!("看屏操作服务未完成：{error}"));
     }
+    // Package replacement can leave a saved missing-permission error. Refresh
+    // after restoring grants without changing the user's enabled preference.
+    progress("正在刷新后台协作状态，保留手机当前开关…");
+    if let Err(error) = crate::amoo_background::refresh_status(adb, device) {
+        warnings.push(format!("后台协作状态未确认：{error}"));
+    }
     progress("正在回读权限、电池豁免与各项实际能力…");
     let checked = inspect(adb, device)?;
     ensure!(checked.installed, "手机未确认 StepX伴侣已安装");
     progress("正在安装并验证当前手机会话的系统扫码服务…");
     let service = start_pairing_service(adb, device, apk.path());
-    // A CloudWake adapter failure must not prevent installing the independent scanner.
-    progress("正在核验熄屏任务唤醒能力…");
-    if let Err(error) = run_adapter(adb, device, &script, apk.path(), "grant-wake") {
-        warnings.push(format!("熄屏任务唤醒权限未完成：{error}"));
-    }
-    progress("正在安装开机恢复并保存原启动文件与权限记录…");
-    if let Err(error) = install_boot_adapter(adb, device, apk.path()) {
-        warnings.push(format!("开机自动恢复未完成：{error}"));
-    }
     let mut result = inspect(adb, device).unwrap_or(checked);
     finish_installation_status(&mut result, service);
     if let Err(error) = verify_installation(&result) {
         warnings.push(error.to_string());
     }
-    if !warnings.is_empty() && !result.permission_granted {
+    if !warnings.is_empty() {
         result.message = format!(
             "伴侣已安装。扫码服务：{}。部分功能需要修复：{}",
             if result.pairing_ready {
@@ -891,6 +894,7 @@ pub fn install(
                 .join("；")
         );
     }
+    if !retained.is_empty() { result.message.push_str(&format!(" {retained}")); }
     Ok(result)
 }
 
@@ -1002,30 +1006,47 @@ fn configure_pairing_service(
     confirm_phone()
 }
 
-fn install_boot_adapter(adb: &Adb, device: &Device, apk: &Path) -> Result<()> {
+fn activate_system_service(adb: &Adb, device: &Device, apk: &Path) -> Result<()> {
     let script = crate::resources::root().join("scripts/companion-boot.py");
-    ensure!(script.is_file(), "缺少伴侣开机恢复组件");
+    ensure!(script.is_file(), "缺少伴侣系统服务组件");
     let mut command = crate::resources::python_command();
-    command
-        .arg(script)
-        .arg("install")
-        .arg("--apk")
-        .arg(apk)
-        .env("STEPX_SERIAL", &device.transport)
-        .env("STEPX_DEVICE_SERIAL", &device.serial)
-        .env("STEPX_ADB", &adb.path)
-        .env_remove("PYTHONOPTIMIZE");
-    let output = run_process(command, None, Duration::from_secs(100))?;
-    let result: Value = serde_json::from_slice(&output.stdout).context("开机恢复未返回有效回执")?;
-    ensure!(
-        output.status.success()
-            && result["status"] == "installed"
-            && result["config"]["package"] == PACKAGE
-            && result["config"]["version"] == 1,
-        "开机恢复未完成：{}",
-        result["error"].as_str().unwrap_or("回读校验失败")
-    );
+    command.arg(script).arg("activate").arg("--apk").arg(apk)
+        .env("STEPX_SERIAL", &device.transport).env("STEPX_DEVICE_SERIAL", &device.serial)
+        .env("STEPX_ADB", &adb.path).env_remove("PYTHONOPTIMIZE");
+    let output = run_process(command, None, Duration::from_secs(180))?;
+    let result: Value = serde_json::from_slice(&output.stdout).context("系统服务未返回有效回执")?;
+    ensure!(output.status.success() && result["status"]=="activated" && result["package"]==PACKAGE
+        && result["service_uid"]==1000 && result["signature_verified"]==true && result["system_server_unchanged"]==true,
+        "{}",result["error"].as_str().unwrap_or("系统服务回读未通过"));
+    ensure!(result["boot_installed"]==true,"当前会话服务已就绪，但独立开机恢复未通过校验；请查看安装诊断后重试");
+    ensure!(result["package_update_recovery"]==true,"当前会话权限已恢复，但伴侣更新后的自动恢复未通过校验");
     Ok(())
+}
+
+/// Verify companion boot restoration after any installation changes the shared factory entry.
+pub fn complete_boot_setup(adb: &Adb, device: &Device) -> Result<CompanionStatus> {
+    let apk = installed_apk_snapshot(adb, device)?;
+    activate_system_service(adb, device, apk.path())?;
+    crate::amoo_background::refresh_status(adb, device)?;
+    let status = inspect(adb, device)?;
+    verify_installation(&status)?;
+    ensure!(status.pairing_ready, "系统服务已启用，扫码服务尚未确认就绪");
+    Ok(status)
+}
+
+fn installed_apk_snapshot(adb: &Adb, device: &Device) -> Result<tempfile::NamedTempFile> {
+    let raw = adb.shell(&device.transport, &["pm", "path", "--user", "0", PACKAGE])?;
+    let paths: Vec<_> = raw.lines().filter_map(|l| l.strip_prefix("package:")).collect();
+    ensure!(paths.len()==1 && paths[0].starts_with("/data/app/"), "无法核对已安装伴侣的位置");
+    let apk = tempfile::Builder::new().suffix(".apk").tempfile()?;
+    adb.run_timeout(&["-s", &device.transport,"pull",paths[0],apk.path().to_str().context("路径无效")?],Duration::from_secs(60))?;
+    let trusted=compiled_apk_snapshot()?;
+    let mut command=crate::resources::python_command();
+    command.arg(permission_script()?).arg("preflight").arg("--apk").arg(apk.path()).arg("--trusted-apk").arg(trusted.path())
+        .env("STEPX_SERIAL",&device.transport).env("STEPX_DEVICE_SERIAL",&device.serial).env("STEPX_ADB",&adb.path).env_remove("PYTHONOPTIMIZE");
+    let output=run_process(command,None,Duration::from_secs(90))?;
+    ensure!(output.status.success(),"已安装伴侣的签名与状态核对未通过");
+    Ok(apk)
 }
 
 fn start_pairing_service(adb: &Adb, device: &Device, apk: &Path) -> Result<()> {
@@ -1229,6 +1250,15 @@ pub fn ensure_background_execution(adb: &Adb, device: &Device) -> Result<String>
 
 fn require_ready(adb: &Adb, device: &Device) -> Result<()> {
     let mut state = inspect(adb, device)?;
+    if state.installed && !state.permission_granted {
+        if let (Ok(script), Ok(apk)) = (
+            permission_script(),
+            installation_apk(&crate::resources::root()),
+        ) {
+            let _ = run_adapter(adb, device, &script, apk.path(), "grant");
+            state = inspect(adb, device)?;
+        }
+    }
     if !state.installed || !state.permission_granted {
         let _ = install(adb, device, |_| {});
         state = inspect(adb, device)?;
@@ -1343,7 +1373,11 @@ fn confirm_output(adb: &Adb, device: &Device, acknowledged: &Value) -> Result<St
         }
         if let Some(reason) = state["pausedReason"]
             .as_str()
-            .filter(|s| !s.is_empty() && *s != "等待姿态传感器")
+            .filter(|s| {
+                !s.is_empty()
+                    && *s != "等待姿态传感器"
+                    && !(state["mode"].as_str() == Some("animation") && *s == "请将背屏朝向自己")
+            })
         {
             return Ok(format!("当前暂停：{reason}"));
         }
@@ -1629,7 +1663,7 @@ local freeze white apps:
         );
         let wireless_device = Device {
             transport: "192.168.1.88:39123".into(),
-            serial: "ZYPZ261A01M692000LP".into(),
+            serial: "STEPXTEST8DB89E4B8927".into(),
             model: "StepX".into(),
             android: "16".into(),
             product: "pandora".into(),
@@ -1651,6 +1685,14 @@ local freeze white apps:
         finish_installation_status(&mut status, Err(anyhow::anyhow!("已有服务运行中。")));
         assert!(!status.message.contains("。。"));
         assert!(!status.pairing_message.contains("。。"));
+
+        let raw_12 = raw_crlf.replace(
+            "StepX/pandora/pandora:16/BQ2A.260122.002-BP2A.250705.008/172:user/release-keys\r\n36\r\n\r\n",
+            "StepX/pandora/pandora:16/BQ2A.260122.002-BP2A.250705.008/12:user/release-keys\r\n36\r\ne89a65e1a153e87fdec850caffe9a19db4ed70244754e847e0c512c540a902f8  /system/priv-app/AgentBus/AgentBus.apk\r\n",
+        );
+        let status_12 = parse_inspect_output(&raw_12, &wireless_device);
+        assert!(status_12.installed);
+        assert_eq!(status_12.background_supported, Some(true));
     }
     #[test]
     fn pairing_service_replaces_only_outdated_record_and_checks_phone_even_if_running() {

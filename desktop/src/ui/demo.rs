@@ -150,6 +150,7 @@ impl Companion {
             prepared: false,
         });
         let msg = |address: &str, body: &str, ago: i64, outgoing: bool| Message {
+            provider_id: None,
             address: address.into(),
             body: body.into(),
             date_ms: now - ago * min,
@@ -202,7 +203,7 @@ impl Companion {
             entry("Download", 0, true),
             entry("Music", 0, true),
             entry("Pictures", 0, true),
-            entry("会议纪要-1020.pdf", 1_482_000, false),
+            entry("会议纪要-1020.md", 14_820, false),
             entry("IMG_20261019_183205.jpg", 4_215_000, false),
             entry("stepx-release.apk", 58_330_000, false),
             entry("录音 2026-10-18.m4a", 7_820_000, false),
@@ -343,7 +344,7 @@ impl Companion {
         if std::env::var_os("STEPX_CONNECT_WIRELESS").is_some() {
             self.selected = Some(Device {
                 transport: "192.168.1.5:46315".into(),
-                serial: "ZYPZ261A01M69200105".into(),
+                serial: "STEPXTEST430C671785A1".into(),
                 model: "StepX PZ261A".into(),
                 android: "16".into(),
                 product: "pandora".into(),
@@ -374,6 +375,7 @@ impl Companion {
         ];
         self.back_screen.stepos_suite.calendar_events = vec![
             stepx_companion::toolbox::PhoneCalendarEvent {
+                recurring: Some(false),
                 id: 101,
                 title: "第四季度产品与桌面协同评审会".into(),
                 dtstart: now + 60 * min,
@@ -384,6 +386,7 @@ impl Companion {
                 source: "双端已同步".into(),
             },
             stepx_companion::toolbox::PhoneCalendarEvent {
+                recurring: Some(false),
                 id: 102,
                 title: "晚间重点待办复盘与周报归档".into(),
                 dtstart: now + 240 * min,
@@ -394,6 +397,7 @@ impl Companion {
                 source: "双端已同步".into(),
             },
             stepx_companion::toolbox::PhoneCalendarEvent {
+                recurring: Some(false),
                 id: 900_001,
                 title: "StepX 跨端日历与相册架构同步".into(),
                 dtstart: now + 1440 * min,
@@ -484,7 +488,11 @@ impl Companion {
         self.back_screen.stepos_suite.thermal_summary =
             "多温区实时温控：机身 31.4°C · 电池 29.5°C · NPU 43.2°C".into();
         self.back_screen.stepos_suite.last_action_note = "已同步手机日程与闹钟状态".into();
+        self.back_screen.stepos_suite_loading = false;
+        self.back_screen.stepos_suite_error = None;
+        self.back_screen.stepos_suite_synced_at = Some(Instant::now());
         self.init_demo_push();
+        self.seed_demo_context_overview();
         // Alternate state set: confirmations, transient panels.
         if std::env::var_os("STEPX_DEMO_ALT").is_some() {
             self.trash_confirm = true;

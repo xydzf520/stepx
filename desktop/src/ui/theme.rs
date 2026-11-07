@@ -2,9 +2,12 @@
 
 use facloud_ui::{
     color::ColorU,
-    fonts::{Cache as FontCache, FamilyId},
+    elements::DropShadow,
+    fonts::{Cache as FontCache, FamilyId, Weight},
     platform::SystemTheme,
 };
+
+pub type Color = ColorU;
 
 // Spacing scale (multiples of 4).
 pub const S1: f32 = 4.;
@@ -27,6 +30,43 @@ pub const METRIC: f32 = 24.;
 pub const R_CONTROL: f32 = 8.;
 pub const R_PANEL: f32 = 12.;
 pub const R_TAG: f32 = 6.;
+pub const R_SM: f32 = R_TAG;
+pub const R_MD: f32 = R_CONTROL;
+pub const R_LG: f32 = R_PANEL;
+pub const R_SHELL: f32 = 14.0;
+pub const R_CARD: f32 = 10.0;
+
+/// Red packets have a warm semantic surface, distinct from error alerts.
+pub fn red_packet_colors(dark: bool) -> (ColorU, ColorU, ColorU) {
+    if dark {
+        (rgb(255, 162, 151), rgb(49, 30, 33), rgb(123, 63, 65))
+    } else {
+        (rgb(180, 42, 39), rgb(255, 247, 244), rgb(236, 180, 169))
+    }
+}
+
+/// Shared elevation for anchored popovers (search, notifications, live capsule).
+/// `spread_radius` is the renderer's sampling margin, not a solid spread.
+/// Keep three sigma of space so the blur fades instead of ending at a hard edge.
+pub fn popover_shadow(dark: bool) -> DropShadow {
+    DropShadow {
+        color: if dark {
+            rgba(0, 0, 0, 96)
+        } else {
+            rgba(15, 23, 42, 30)
+        },
+        offset: pathfinder_geometry::vector::vec2f(0., 4.),
+        blur_radius: 8.,
+        spread_radius: 24.,
+    }
+}
+
+/// Concentric corner interlocking (同心圆角咬合): R_inner = max(R_outer - inset_px, 4.0)
+#[inline]
+pub const fn concentric_radius(outer_r: f32, inset_px: f32) -> f32 {
+    let r = outer_r - inset_px;
+    if r > 4.0 { r } else { 4.0 }
+}
 
 // Fixed layout sizes.
 pub const SIDEBAR_W: f32 = 216.;
@@ -83,6 +123,12 @@ pub fn lerp_color(a: ColorU, b: ColorU, t: f32) -> ColorU {
         return b;
     }
     let ch = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    if a == ColorU::transparent_black() {
+        return ColorU::new(b.r, b.g, b.b, ch(0, b.a));
+    }
+    if b == ColorU::transparent_black() {
+        return ColorU::new(a.r, a.g, a.b, ch(a.a, 0));
+    }
     ColorU {
         r: ch(a.r, b.r),
         g: ch(a.g, b.g),
@@ -103,11 +149,14 @@ const fn hex(rgb: u32) -> ColorU {
 #[derive(Clone, Copy)]
 pub struct Palette {
     pub dark: bool,
+    pub is_dark: bool,
     pub bg: ColorU,
     pub workspace: ColorU,
     pub sidebar: ColorU,
     pub surface: ColorU,
     pub surface_border: ColorU,
+    pub card: ColorU,
+    pub card2: ColorU,
     pub hover: ColorU,
     pub selected: ColorU,
     pub border: ColorU,
@@ -122,11 +171,15 @@ pub struct Palette {
     pub on_accent: ColorU,
     pub blue: ColorU,
     pub indigo: ColorU,
+    pub indigo_soft: ColorU,
+    pub teal: ColorU,
+    pub teal_soft: ColorU,
     pub pink: ColorU,
     pub success: ColorU,
     pub success_text: ColorU,
     pub success_soft: ColorU,
     pub warning: ColorU,
+    pub warning_text: ColorU,
     pub warning_soft: ColorU,
     pub warning_border: ColorU,
     pub danger: ColorU,
@@ -139,11 +192,14 @@ impl Palette {
         if dark {
             Self {
                 dark: true,
+                is_dark: true,
                 bg: hex(0x18181C),
                 workspace: hex(0x0F0F12),
                 sidebar: hex(0x141417),
                 surface: hex(0x222227),
                 surface_border: hex(0x2E2E36),
+                card: hex(0x222227),
+                card2: hex(0x27272D),
                 hover: hex(0x27272D),
                 selected: hex(0x27272A),
                 border: hex(0x27272A),
@@ -158,6 +214,9 @@ impl Palette {
                 on_accent: hex(0x18181B),
                 blue: hex(0x3B82F6),
                 indigo: hex(0x6366F1),
+                indigo_soft: rgba(99, 102, 241, 36),
+                teal: hex(0x14B8A6),
+                teal_soft: rgba(20, 184, 166, 36),
                 pink: hex(0xEC4899),
                 success: hex(0x10B981),
                 success_text: hex(0x10B981),
@@ -168,6 +227,7 @@ impl Palette {
                     a: 36,
                 },
                 warning: hex(0xF59E0B),
+                warning_text: hex(0xFBBF24),
                 warning_soft: ColorU {
                     r: 245,
                     g: 158,
@@ -192,11 +252,14 @@ impl Palette {
         } else {
             Self {
                 dark: false,
+                is_dark: false,
                 bg: hex(0xFFFFFF),
                 workspace: hex(0xFAFAFB),
                 sidebar: hex(0xF4F4F6),
                 surface: hex(0xF8F8FA),
                 surface_border: hex(0xEBEBEF),
+                card: hex(0xFFFFFF),
+                card2: hex(0xF8F8FA),
                 hover: hex(0xF1F1F4),
                 selected: hex(0xFFFFFF),
                 border: hex(0xE5E5EA),
@@ -211,6 +274,9 @@ impl Palette {
                 on_accent: hex(0xFFFFFF),
                 blue: hex(0x3B82F6),
                 indigo: hex(0x6366F1),
+                indigo_soft: rgba(99, 102, 241, 28),
+                teal: hex(0x0D9488),
+                teal_soft: rgba(13, 148, 136, 28),
                 pink: hex(0xEC4899),
                 success: hex(0x10B981),
                 success_text: hex(0x059669),
@@ -221,6 +287,7 @@ impl Palette {
                     a: 28,
                 },
                 warning: hex(0xF59E0B),
+                warning_text: hex(0xB45309),
                 warning_soft: hex(0xFFFBEB),
                 warning_border: ColorU {
                     r: 245,
@@ -235,12 +302,62 @@ impl Palette {
         }
     }
 
+    /// Semantic icon foregrounds need enough contrast on neutral and soft
+    /// status surfaces. Keep the brighter plot palette and original image
+    /// colors unchanged; only exact, opaque status tokens are promoted here.
+    #[inline]
+    pub fn icon_foreground(&self, foreground: ColorU) -> ColorU {
+        if foreground == self.warning {
+            self.warning_text
+        } else if foreground == self.success {
+            self.success_text
+        } else {
+            foreground
+        }
+    }
+
     pub fn press_color(&self, base: ColorU) -> ColorU {
         lerp_color(
             base,
             self.border_strong,
             if self.dark { 0.35 } else { 0.42 },
         )
+    }
+
+    #[inline]
+    pub const fn optical_weight(&self, weight: Weight) -> Weight {
+        if self.is_dark {
+            match weight {
+                Weight::Medium => Weight::MediumOpticalDark,
+                Weight::Semibold => Weight::SemiboldOpticalDark,
+                other => other,
+            }
+        } else {
+            weight
+        }
+    }
+
+    #[inline]
+    pub fn optical_weight_for_color(&self, weight: Weight, fg: Color) -> Weight {
+        let luma = (0.2126 * fg.r as f32 + 0.7152 * fg.g as f32 + 0.0722 * fg.b as f32) / 255.0;
+        if self.is_dark || luma > 0.72 {
+            match weight {
+                Weight::Medium => Weight::MediumOpticalDark,
+                Weight::Semibold => Weight::SemiboldOpticalDark,
+                other => other,
+            }
+        } else {
+            weight
+        }
+    }
+}
+
+pub fn with_alpha_f(c: ColorU, alpha: f32) -> ColorU {
+    ColorU {
+        r: c.r,
+        g: c.g,
+        b: c.b,
+        a: (alpha.clamp(0.0, 1.0) * 255.0).round() as u8,
     }
 }
 
@@ -335,4 +452,74 @@ pub fn load_fonts(cache: &mut FontCache) -> (FamilyId, FamilyId) {
     };
     let mono_font = load_first(cache, &installed, mono).unwrap_or(ui_font);
     (ui_font, mono_font)
+}
+
+#[cfg(test)]
+mod icon_color_tests {
+    use super::*;
+
+    fn composite(foreground: ColorU, background: ColorU) -> ColorU {
+        let alpha = foreground.a as f64 / 255.;
+        let channel = |front: u8, back: u8| {
+            (front as f64 * alpha + back as f64 * (1. - alpha)).round() as u8
+        };
+        rgb(
+            channel(foreground.r, background.r),
+            channel(foreground.g, background.g),
+            channel(foreground.b, background.b),
+        )
+    }
+
+    fn contrast(foreground: ColorU, background: ColorU) -> f64 {
+        let luminance = |color: ColorU| {
+            let linear = |channel: u8| {
+                let value = channel as f64 / 255.;
+                if value <= 0.04045 {
+                    value / 12.92
+                } else {
+                    ((value + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * linear(color.r) + 0.7152 * linear(color.g) + 0.0722 * linear(color.b)
+        };
+        let a = luminance(composite(foreground, background));
+        let b = luminance(background);
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    #[test]
+    fn semantic_icon_foregrounds_are_legible_on_neutral_and_soft_surfaces() {
+        for dark in [false, true] {
+            let p = Palette::for_theme(dark);
+            for base in [p.bg, p.card, p.surface, p.sidebar, p.card2] {
+                for (name, color, soft) in [
+                    ("warning", p.warning, p.warning_soft),
+                    ("success", p.success, p.success_soft),
+                ] {
+                    let foreground = p.icon_foreground(color);
+                    for background in [base, composite(soft, base)] {
+                        let ratio = contrast(foreground, background);
+                        assert!(ratio >= 3., "{name} icon contrast {ratio:.2} in dark={dark}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn icon_foregrounds_preserve_brand_neutral_and_dimmed_colors() {
+        for dark in [false, true] {
+            let p = Palette::for_theme(dark);
+            for color in [
+                p.text, p.text2, p.text3, p.blue, p.indigo, p.danger, p.on_accent,
+                rgb(0x07, 0xC1, 0x60), rgb(0x22, 0x9E, 0xD9), rgb(0xFF, 0x5A, 0x00),
+                with_alpha_f(p.warning, 0.4), with_alpha_f(p.success, 0.4),
+            ] {
+                assert_eq!(p.icon_foreground(color), color);
+            }
+            // Data visualizations still receive the original bright palette.
+            assert_eq!(p.warning, hex(0xF59E0B));
+            assert_eq!(p.success, hex(0x10B981));
+        }
+    }
 }

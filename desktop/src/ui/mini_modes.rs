@@ -355,7 +355,9 @@ impl Companion {
 
     fn compact_clipboard_row(&self) -> El {
         let p = self.p();
-        let snippet = if self.push.clipboard_preview.trim().is_empty() {
+        let snippet = if self.workspace.viewport.x() < 560. {
+            "剪贴板".to_string()
+        } else if self.push.clipboard_preview.trim().is_empty() {
             "剪贴板提问".to_string()
         } else {
             format!(
@@ -408,12 +410,12 @@ impl Companion {
         let mut pills = vec![
             self.compact_clip_pill(
                 "compact-clip-explain",
-                "解释剪贴板",
+                "解释",
                 Action::Push(PushAction::AskClipboard(0)),
             ),
             self.compact_clip_pill(
                 "compact-clip-translate",
-                "翻译剪贴板",
+                "翻译",
                 Action::Push(PushAction::AskClipboard(1)),
             ),
             self.compact_clip_pill(
@@ -437,7 +439,9 @@ impl Companion {
         if is_verify
             || self.push.shell_mode != ShellMode::MiniAi
             || self.compact.history
-            || self.workspace.viewport.y() < 480.
+            || self.workspace.history
+            || self.workspace.panel != 0
+            || self.workspace.viewport.y() < 600.
         {
             return None;
         }
@@ -634,12 +638,17 @@ impl Companion {
         let content = if self.compact.history {
             let mut sessions = vec![];
             for (i, s) in self.amoo_sessions.iter().enumerate() {
-                sessions.push(self.list_row(
+                sessions.push(self.list_row_with_menu(
                     format!("compact-session-{i}"),
                     self.text(amoo_display::session_title(&s.title), BODY, p.text),
                     i == self.amoo_session_idx,
                     Some(Action::AmooSelectSession(i)),
                     None,
+                    Some(crate::ui::context_menu::Target::ChatSession {
+                        workspace_task_id: None,
+                        phone_session_idx: Some(i),
+                        title: s.title.clone(),
+                    }),
                 ));
             }
             if sessions.is_empty() {
@@ -715,9 +724,9 @@ impl Companion {
                     self.button_icon(
                         "compact-privacy",
                         if self.push.prefs.privacy_mask {
-                            "显示正文"
+                            "弹窗防窥: 开"
                         } else {
-                            "隐藏正文"
+                            "弹窗防窥"
                         },
                         UiIcon::Lock,
                         Action::Push(PushAction::TogglePrivacyMask),
@@ -766,11 +775,10 @@ impl Companion {
                 self.line_w(title, BODY, p.text, Weight::Medium),
                 self.line(pages::format_time(thread.last_timestamp_ms), MICRO, p.text3),
             );
-            let preview = if self.push.prefs.privacy_mask {
-                "消息正文已隐藏".into()
-            } else {
-                Self::truncate_chars(&thread.last_message, 66)
-            };
+            let preview = Self::truncate_chars(
+                &pages::sms::sanitize_ui_display_text(&thread.last_message),
+                66,
+            );
             let label = if thread.unread_count > 0 {
                 format!("{} 条未读", thread.unread_count)
             } else if self
@@ -955,11 +963,7 @@ impl Companion {
                 self.line(pages::format_time(n.post_time_ms), MICRO, p.text3),
             ),
             self.text(
-                if self.push.prefs.privacy_mask {
-                    "通知正文已隐藏".into()
-                } else {
-                    Self::truncate_chars(&n.text, 100)
-                },
+                Self::truncate_chars(&pages::sms::sanitize_ui_display_text(&n.text), 100),
                 CAPTION,
                 p.text2,
             ),
@@ -1024,11 +1028,7 @@ impl Companion {
         );
         let mut messages = vec![self.line("来自手机通知的消息记录", MICRO, p.text3)];
         for m in &t.messages {
-            let text = if self.push.prefs.privacy_mask && !m.outgoing {
-                "消息正文已隐藏".into()
-            } else {
-                m.text.clone()
-            };
+            let text = pages::sms::sanitize_ui_display_text(&m.text);
             let (state, color) = match m.delivery_status.as_str() {
                 "sending" => ("发送中", p.text3),
                 "failed" => ("未发送 · 草稿已保留", p.danger),
@@ -1180,13 +1180,8 @@ impl Companion {
     }
 
     pub(super) fn im_package_colors(package_name: &str, p: &Palette) -> (ColorU, ColorU) {
-        match ImChannel::from_package(package_name) {
-            ImChannel::WeChat | ImChannel::Sms => (p.success_text, p.success_soft),
-            ImChannel::Feishu | ImChannel::DingTalk | ImChannel::WeCom => (p.blue, p.accent_soft),
-            ImChannel::QqTim | ImChannel::GlobalIm => (p.indigo, p.accent_soft),
-            ImChannel::SocialDm => (p.pink, p.danger_soft),
-            ImChannel::All => (p.text2, p.tag_bg),
-        }
+        let style = super::icon_style::channel_source_style(ImChannel::from_package(package_name), p);
+        (style.foreground, style.background)
     }
 
     pub(super) fn format_rel_time(timestamp_ms: i64) -> String {
@@ -1208,14 +1203,9 @@ impl Companion {
         }
     }
 
+    #[inline]
     pub(super) fn truncate_chars(text: &str, max_chars: usize) -> String {
-        let mut chars = text.chars();
-        let head: String = chars.by_ref().take(max_chars).collect();
-        if chars.next().is_some() {
-            format!("{head}…")
-        } else {
-            head
-        }
+        stepx_companion::home_hub::truncate_chars(text, max_chars)
     }
 }
 

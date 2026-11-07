@@ -13,6 +13,18 @@ spec.loader.exec_module(adapter)
 
 
 class Guards(unittest.TestCase):
+    def setUp(self):
+        # Permission baselines require an explicitly selected device. Keep these
+        # mocked tests independent of the developer's connected phone and env.
+        serial = 'STEPX_TEST_DEVICE'
+        for mock in (
+            patch.object(adapter, 'ADB', ['adb', '-s', serial]),
+            patch.object(adapter, 'AUTHORIZED_SERIAL', serial),
+            patch.dict(adapter.os.environ, {'STEPX_DEVICE_SERIAL': serial}),
+        ):
+            mock.start()
+            self.addCleanup(mock.stop)
+
     def test_android_tools_receive_explicit_java_runtime(self):
         with tempfile.TemporaryDirectory() as directory:
             jdk = Path(directory); (jdk / 'bin').mkdir(); (jdk / 'bin/java').touch()
@@ -31,8 +43,8 @@ class Guards(unittest.TestCase):
     def test_other_user_selected_stepx_serial_is_accepted(self):
         dump = '  Package [com.stepx.companion.app] (abcd):\n    appId=10234\n    com.stepos.permission.MANAGE_BACK_SCREEN: granted=true\n'
         for transport, physical in [
-            ('ZYPZ261A01M692888AB', 'ZYPZ261A01M692888AB'),
-            ('192.168.1.88:5555', 'ZYPZ261A01M692888AB'),
+            ('STEPXTESTE44707A7194A', 'STEPXTESTE44707A7194A'),
+            ('192.168.1.88:5555', 'STEPXTESTE44707A7194A'),
         ]:
             with self.subTest(transport=transport), patch.dict(
                 adapter.os.environ,

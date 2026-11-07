@@ -9,7 +9,13 @@ pub(super) fn read_result<T>(result: Result<Vec<T>>) -> ReadResult<T> {
 }
 
 pub(super) enum Outcome {
+    AutoSyncMessages {
+        device_serial: String,
+        request_id: u64,
+        result: std::result::Result<Box<Outcome>, String>,
+    },
     BulkFailed(Page, Option<ToolPage>, String),
+    JobFailed(Page, Option<ToolPage>, anyhow::Error),
     InputMethod(stepx_companion::input_method::Status, String),
     AmooUi(AmooUiOutcome),
     Work(WorkOutcome),
@@ -33,6 +39,7 @@ pub(super) enum Outcome {
     AmooObservationUnavailable,
     AmooCreated(String),
     AmooSent(amoo::PendingReply),
+    AmooSkillRequested(amoo::PendingReply),
     WorkspaceDelivered(String, PathBuf, String, std::result::Result<String, String>),
     Transports(Vec<Transport>, Vec<Service>),
     Reattached(Device),
@@ -50,8 +57,25 @@ pub(super) enum Outcome {
     /// Result that only needs a line in the status bar.
     Notice(String),
     Summary(String, Option<Capabilities>),
+    HomeRefreshed(
+        String,
+        Option<Capabilities>,
+        ReadResult<Message>,
+        ReadResult<CallRecord>,
+        ReadResult<ContactEntry>,
+    ),
     Files(String, Vec<Entry>, Option<String>),
+    FilePreviewLoaded {
+        path: String,
+        text: Option<String>,
+        image_path: Option<PathBuf>,
+    },
     Apps(Vec<AppInfo>),
+    AppInspected(
+        String,
+        stepx_companion::apps::AppRuntimeDetails,
+        Option<String>,
+    ),
     ApkInstalled(String, Vec<AppInfo>),
     Mirror(String, String, MirrorSession),
     Screenshot(tempfile::TempDir, PathBuf),
@@ -74,22 +98,60 @@ pub(super) enum Outcome {
     StepOsCalendarUpdated(Vec<stepx_companion::toolbox::PhoneCalendarEvent>, String),
     StepOsAlarmsUpdated(Vec<stepx_companion::toolbox::PhoneAlarmItem>, String),
     StepOsSuite(stepx_companion::toolbox::StepOsAiSuiteReport),
+    DoctorHarnessReport(stepx_companion::doctor_harness::DoctorReport),
 }
 
 impl Companion {
     pub(super) fn apply(&mut self, outcome: Outcome) {
+        let sync_results = self.auto_sync_outcome_results(&outcome);
         match outcome {
+            Outcome::AutoSyncMessages {
+                device_serial,
+                request_id,
+                result,
+            } => {
+                self.apply_message_sync_result(&device_serial, request_id, result);
+                return;
+            }
+            Outcome::JobFailed(page, tool, error) => {
+                let context = error
+                    .downcast_ref::<interaction::OperationFailure>()
+                    .cloned();
+                self.apply(Outcome::BulkFailed(page, tool, format!("{error:#}")));
+                self.attach_operation_failure(context);
+                return;
+            }
             Outcome::BulkFailed(page, _tool, err) => {
                 self.record_notice("操作未完成", err.clone());
                 if matches!(page, Page::Apps | Page::AppStore) {
                     self.apps_loaded = true;
                     self.apps_error = Some(err.clone());
+                    self.selected_app_loading = false;
                 }
                 if page == Page::Tools {
                     self.back_screen.stepos_suite_loading = false;
                 }
+                self.doctor_running = false;
                 self.error = true;
-                self.status = err;
+                self.status = self.connection_failure_status(&err);
+            }
+            Outcome::FilePreviewLoaded {
+                path,
+                text,
+                image_path,
+            } => {
+                self.selected_file_preview_path = Some(path);
+                self.selected_file_preview_text = text;
+                self.selected_file_preview_image = image_path;
+            }
+            Outcome::AppInspected(pkg, details, notice) => {
+                self.selected_app_loading = false;
+                if self.selected_app.as_deref() == Some(pkg.as_str()) {
+                    self.selected_app_details = Some(details);
+                }
+                if let Some(msg) = notice {
+                    self.status = msg;
+                }
             }
             Outcome::Work(result) => self.apply_work(result),
             Outcome::AmooUi(result) => self.apply_amoo_ui(result),
@@ -145,10 +207,15 @@ impl Companion {
                 let devices = stepx_companion::device::deduplicate_transports(devices);
                 let mut failed_over_to: Option<String> = None;
                 let mut disconnected = false;
+                let mut transient_miss = false;
                 if let Some(selected) = self.selected.as_mut() {
-                    let primary_online = devices
-                        .iter()
-                        .any(|t| t.id == selected.transport && t.state == "device");
+                    let primary_online = devices.iter().any(|t| {
+                        t.state == "device"
+                            && (t.id == selected.transport
+                                || t.backup_transports()
+                                    .iter()
+                                    .any(|b| b == &selected.transport))
+                    });
                     if !primary_online {
                         let known_backups = selected.backup_transports();
                         let fallback = known_backups
@@ -162,9 +229,7 @@ impl Companion {
                                         t.state == "device"
                                             && (stepx_companion::device::canonical_serial_from_transport(&t.id)
                                                 .as_deref()
-                                                == Some(selected.serial.as_str())
-                                                || (!t.model.is_empty()
-                                                    && t.model == selected.model))
+                                                == Some(selected.serial.as_str()))
                                     })
                                     .map(|t| t.id.clone())
                             });
@@ -175,36 +240,67 @@ impl Companion {
                                 .collect();
                             selected.transport = next_transport.clone();
                             selected.set_backup_transports(remaining_backups);
+                            stepx_companion::device::promote_active_transport(
+                                &selected.serial,
+                                &next_transport,
+                            );
                             failed_over_to = Some(next_transport);
                         } else {
-                            disconnected = true;
+                            self.connection_watch.misses =
+                                self.connection_watch.misses.saturating_add(1);
+                            if self.connection_watch.misses >= 2 {
+                                disconnected = true;
+                            } else {
+                                transient_miss = true;
+                            }
                         }
-                    } else if let Some(active) = devices
-                        .iter()
-                        .find(|t| t.id == selected.transport && t.state == "device")
-                    {
-                        let active_backups = active.backup_transports();
-                        if !active_backups.is_empty() {
-                            selected.set_backup_transports(active_backups);
+                    } else {
+                        self.connection_watch.misses = 0;
+                        self.connection_watch.disconnected_at = None;
+                        if let Some(active) = devices.iter().find(|t| {
+                            t.state == "device"
+                                && (t.id == selected.transport
+                                    || t.backup_transports()
+                                        .iter()
+                                        .any(|b| b == &selected.transport))
+                        }) {
+                            let mut active_backups: Vec<String> =
+                                std::iter::once(active.id.clone())
+                                    .chain(active.backup_transports())
+                                    .filter(|b| b != &selected.transport)
+                                    .collect();
+                            active_backups.dedup();
+                            if !active_backups.is_empty() {
+                                selected.set_backup_transports(active_backups);
+                            }
                         }
                     }
                 }
+                if transient_miss {
+                    self.begin_connection_watch();
+                }
                 if let Some(next_transport) = failed_over_to {
+                    self.connection_watch.misses = 0;
                     self.connection_watch.disconnected_at = None;
                     if let Some(srv) = &self.lan_cast.server {
                         srv.set_serial(next_transport.clone());
                     }
                     let msg = if is_wireless(&next_transport) {
-                        format!(
-                            "USB 已断开，已无感切换至无线通道 {next_transport} · 对话与任务不中断"
-                        )
+                        format!("已切换至可用无线通道 {next_transport}，正在继续同步")
                     } else {
-                        format!("已无感切换至 USB 通道 {next_transport} · 对话与任务不中断")
+                        format!("已切换至 USB 通道 {next_transport}，正在继续同步")
                     };
                     self.record_notice("多通道热备切换", msg.clone());
                     self.error = false;
                     if self.mirror.is_some() {
                         self.restart_active_mirror(msg);
+                    } else if self
+                        .mirror_interrupted_at
+                        .is_some_and(|t| t.elapsed() < Duration::from_secs(10))
+                    {
+                        self.mirror_interrupted_at = None;
+                        self.start_mirror();
+                        self.status = format!("{msg} · 正在无感恢复无线投屏");
                     } else {
                         self.status = msg;
                     }
@@ -214,7 +310,11 @@ impl Companion {
                     self.connection_watch.disconnected_at = Some(Instant::now());
                     self.selected = None;
                     self.amoo_gateway_online = false;
+                    let had_mirror = self.mirror.is_some();
                     self.stop_mirror();
+                    if had_mirror {
+                        self.mirror_interrupted_at = Some(Instant::now());
+                    }
                     self.status = "连接暂时断开，正在自动重连；草稿与附件已保留".into();
                 }
                 self.devices = devices;
@@ -226,25 +326,49 @@ impl Companion {
             Outcome::Reattached(device) => {
                 if self.connection_watch.detached_serial.as_deref() == Some(device.serial.as_str())
                 {
+                    self.connection_watch.misses = 0;
                     self.connection_watch.detached_serial = None;
                     self.connection_watch.disconnected_at = None;
                     self.connection_watch.identity_at = None;
+                    stepx_companion::device::promote_active_transport(
+                        &device.serial,
+                        &device.transport,
+                    );
                     if let Some(srv) = &self.lan_cast.server {
                         srv.set_serial(device.transport.clone());
                     }
+                    self.last_connected_serial = Some(device.serial.clone());
                     self.selected = Some(device);
                     self.connect_guide_step = None;
                     self.initializing = false;
                     self.error = false;
                     self.workspace.reconciled_sessions.clear();
                     self.amoo_poll_remaining = self.amoo_poll_remaining.max(25);
+                    self.auto_load_for_page();
+                    if self
+                        .mirror_interrupted_at
+                        .is_some_and(|t| t.elapsed() < Duration::from_secs(10))
+                    {
+                        self.mirror_interrupted_at = None;
+                        self.start_mirror();
+                    }
                     self.status = "已自动恢复连接 · 正在同步核对会话与任务".into();
                 }
             }
             Outcome::Selected(device, summary, caps, real_amoo, sms, call_logs, contacts) => {
+                if self.connection_watch.user_paused {
+                    return;
+                }
                 self.allow_first_connect = false;
+                let same_selected = self
+                    .selected
+                    .as_ref()
+                    .is_some_and(|d| d.serial == device.serial);
                 let resumed = self.connection_watch.detached_serial.take().as_deref()
-                    == Some(device.serial.as_str());
+                    == Some(device.serial.as_str())
+                    || same_selected;
+                self.last_connected_serial = Some(device.serial.clone());
+                self.connection_watch.misses = 0;
                 self.connection_watch.disconnected_at = None;
                 self.workspace.reconciled_sessions.clear();
                 self.amoo_poll_remaining = self.amoo_poll_remaining.max(20);
@@ -252,19 +376,30 @@ impl Companion {
                     self.clear_device_state();
                 }
                 self.connection_watch.identity_at = None;
+                stepx_companion::device::promote_active_transport(
+                    &device.serial,
+                    &device.transport,
+                );
                 self.apply_capabilities(caps);
                 self.apply_sms_data(sms);
                 self.apply_phone_data(call_logs, contacts);
-                if !self.demo_mode && self.selected_thread.is_none() {
+                if !self.demo_mode
+                    && self.selected_thread.is_none()
+                    && self.push.selected_im_thread.is_none()
+                    && self.push.snapshot.threads.is_empty()
+                {
                     if let Some(first) = self.sms_threads().first() {
                         let addr = first.address.clone();
                         self.fields[F_SMS_TO].set(&addr);
                         self.selected_thread = Some(addr);
                     }
                 }
+                self.sync_live_express_parcels();
+                self.sync_notification_center();
                 if let Some(real) = real_amoo {
                     self.apply_real_amoo_data(real);
                 }
+                self.preferences.adb_guide_seen = true;
                 self.preferences
                     .remember(device.serial.clone(), device.model.clone());
                 if let Err(e) = self.preferences.save() {
@@ -278,14 +413,22 @@ impl Companion {
                     srv.set_serial(device.transport.clone());
                 }
                 self.selected = Some(device);
-                self.summary = summary;
+                if !summary.is_empty() || self.summary.is_empty() {
+                    self.summary = summary;
+                }
                 // Collapse the newbie wizard once a device is connected; the user can
                 // still open it manually via "连接引导" in the Connect page header.
                 self.connect_guide_step = None;
+                self.adb_guide_step = None;
                 if self.page == Page::Overview {
                     self.with_device_bulk("正在读取应用数量与图标…", |adb, d| {
                         Ok(Outcome::Apps(apps::catalog(adb, &d)?))
                     });
+                    self.auto_load_for_page();
+                } else if self.page == Page::Home && self.auto_sync.enabled {
+                    if !self.amoo_ui.usage_attempted {
+                        self.start_account_usage_sync();
+                    }
                 } else {
                     self.auto_load_for_page();
                 }
@@ -305,56 +448,77 @@ impl Companion {
                 self.summary = text;
                 self.apply_capabilities(caps);
             }
-            Outcome::Sms(messages, caps) => {
+            Outcome::HomeRefreshed(summary, caps, sms, call_logs, contacts) => {
+                if !summary.is_empty() {
+                    self.summary = summary;
+                }
                 self.apply_capabilities(caps);
-                self.apply_sms_data(messages);
-                if !self.demo_mode && self.selected_thread.is_none() {
+                self.apply_sms_data(sms);
+                self.apply_phone_data(call_logs, contacts);
+                if !self.demo_mode
+                    && self.selected_thread.is_none()
+                    && self.push.selected_im_thread.is_none()
+                    && self.push.snapshot.threads.is_empty()
+                {
                     if let Some(first) = self.sms_threads().first() {
                         let addr = first.address.clone();
                         self.fields[F_SMS_TO].set(&addr);
                         self.selected_thread = Some(addr);
                     }
                 }
+                self.sync_live_express_parcels();
+                self.sync_notification_center();
+            }
+            Outcome::Sms(messages, caps) => {
+                self.apply_capabilities(caps);
+                self.apply_sms_data(messages);
+                if !self.demo_mode
+                    && self.selected_thread.is_none()
+                    && self.push.selected_im_thread.is_none()
+                    && self.push.snapshot.threads.is_empty()
+                {
+                    if let Some(first) = self.sms_threads().first() {
+                        let addr = first.address.clone();
+                        self.fields[F_SMS_TO].set(&addr);
+                        self.selected_thread = Some(addr);
+                    }
+                }
+                self.sync_live_express_parcels();
+                self.trigger_auto_context_refresh();
+                self.sync_notification_center();
             }
             Outcome::SmsPrepared(plan) => {
                 self.status = format!(
                     "已就绪：将通过 {} 发送至 {}，请点击「确认发送」",
                     plan.subscription_label, plan.number
                 );
-                let target = self
-                    .selected
-                    .as_ref()
-                    .map(|d| format!("手机：{} · {}", d.model, d.serial))
-                    .unwrap_or_default();
-                self.review_action(
-                    &Action::ConfirmDirectSms,
-                    "确认发送这条短信？",
-                    target,
-                    vec![
-                        format!("收件人：{} · 使用 {}", plan.number, plan.subscription_label),
-                        plan.body.clone(),
-                        format!(
-                            "共 {} 段短信，运营商可能按套餐计费。确认后实际从手机发出。",
-                            plan.parts
-                        ),
-                    ],
-                    "确认发送",
-                    true,
-                    false,
-                );
                 self.pending_sms_plan = Some(plan);
+                self.focus = Some(F_SMS_BODY);
             }
             Outcome::SmsSent(send_status, messages) => {
                 self.pending_sms_plan = None;
                 if send_status.state == "sent" {
                     self.fields[F_SMS_BODY].clear();
+                } else if send_status.state == "failed" {
+                    if let Some(failed_msg) = self.local_sent_sms.first().cloned() {
+                        self.local_sent_sms.remove(0);
+                        self.sms.retain(|m| {
+                            !(m.outgoing
+                                && m.date_ms == failed_msg.date_ms
+                                && m.body == failed_msg.body)
+                        });
+                        if self.fields[F_SMS_BODY].text.trim().is_empty() {
+                            self.fields[F_SMS_BODY].set(&failed_msg.body);
+                        }
+                    }
                 }
                 self.status = send_status.summary_label();
                 self.error = send_status.state == "failed";
                 self.last_sms_status = Some(send_status);
                 let send_notice = self.status.clone();
+                let sms_refresh_failed = messages.is_err();
                 self.apply_sms_data(messages);
-                self.status = if self.sms_error.is_some() {
+                self.status = if sms_refresh_failed {
                     format!("{send_notice}；短信列表读取失败，请刷新")
                 } else {
                     send_notice
@@ -433,6 +597,22 @@ impl Companion {
                     msg
                 };
             }
+            Outcome::AmooSkillRequested(receipt) => {
+                // Preserve the user's current conversation, attachments and draft.
+                if let Err(error) = self.workspace_switch_new() {
+                    self.status =
+                        format!("请求已发给 Amoo，但切换会话失败：{error}；请在会话记录查看");
+                    self.error = true;
+                    return;
+                }
+                self.apply(Outcome::AmooCreated(receipt.key.clone()));
+                if let Some(session) = self.amoo_sessions.first_mut() {
+                    session.title = "连接伴侣后台操作".into();
+                }
+                self.apply(Outcome::AmooSent(receipt));
+                self.page = Page::Amoo;
+                self.status="安装请求已发出，请查看 Amoo 的读回结果。成功后新建对话即可使用；如手机要求授权，请本人确认。".into();
+            }
             Outcome::AmooCreated(key) => {
                 self.amoo_sessions.insert(
                     0,
@@ -504,7 +684,10 @@ impl Companion {
                 // draft and attachments while marking the connection unconfirmed.
                 self.amoo_gateway_online = false;
                 self.amoo_poll_remaining = 0;
-                self.status = "手机 Amoo 暂未连接，已保留上次内容；发送任务时会重新连接".into();
+                self.mark_auto_sync_domain_synced(AutoSyncDomain::AmooAndTasks);
+                if self.page == Page::Amoo {
+                    self.status = "手机 Amoo 暂未连接，已保留上次内容；发送任务时会重新连接".into();
+                }
             }
             Outcome::AmooRealData(real, mut msg) => {
                 // Measure completion before removing the matching pending run.
@@ -683,9 +866,11 @@ impl Companion {
             Outcome::ApkInstalled(msg, apps) => {
                 self.apps_loaded = true;
                 self.apps_error = None;
+                self.record_notice("应用安装", msg.clone());
                 self.status = msg;
                 self.apps = apps;
                 self.sync_app_store_with_installed();
+                self.sync_notification_center();
             }
             Outcome::Mirror(serial, transport, child) => {
                 if let Some(selected) = self.selected.as_mut().filter(|d| d.serial == serial) {
@@ -706,27 +891,38 @@ impl Companion {
                 if self.amoo_ui.screen_mode || self.amoo_ui.gui_running || self.amoo_ui.gui_paused {
                     self.amoo_ui.gui_screenshot = Some(path.clone());
                 }
+                self.record_notice("手机截图", format!("已获取手机截图 {}", path.display()));
                 self.screenshot = Some((directory, path));
                 self.status = "已截图".into();
+                self.sync_notification_center();
             }
             Outcome::ScreenshotWithNotice(directory, path, notice) => {
                 if self.amoo_ui.screen_mode || self.amoo_ui.gui_running || self.amoo_ui.gui_paused {
                     self.amoo_ui.gui_screenshot = Some(path.clone());
                 }
+                self.record_notice("手机截图", notice.clone());
                 self.screenshot = Some((directory, path));
                 self.status = notice;
+                self.sync_notification_center();
             }
             Outcome::Trash(record) => {
+                self.record_notice("文件管理", format!("已移到回收站：{}", record.original));
                 self.trashed = Some(record);
                 self.status = "已移到回收站".into();
                 self.browse(self.directory.clone());
+                self.sync_notification_center();
             }
             Outcome::Restored => {
+                self.record_notice("文件管理", "已从回收站恢复文件".to_string());
                 self.trashed = None;
                 self.status = "已恢复".into();
                 self.browse(self.directory.clone());
+                self.sync_notification_center();
             }
             Outcome::Qr(endpoint) => {
+                if self.connection_watch.user_paused {
+                    return;
+                }
                 if let Some(endpoint) = endpoint {
                     self.remember_pairing_host(&endpoint);
                     self.qr = None;
@@ -738,6 +934,9 @@ impl Companion {
                 }
             }
             Outcome::Paired(endpoint) => {
+                if self.connection_watch.user_paused {
+                    return;
+                }
                 self.remember_pairing_host(&endpoint);
                 self.fields[F_PAIR_CODE].clear();
                 self.status = format!("已连接 {endpoint}，正在验证…");
@@ -843,10 +1042,11 @@ impl Companion {
             Outcome::DeepAmooGranted(msg) => {
                 self.deep_amoo_granted = true;
                 self.amoo_bg_keepalive = true;
-                self.back_screen.stepos_suite.gui_accessibility_enabled = true;
-                self.back_screen.stepos_suite.notification_listener_enabled = true;
-                self.back_screen.stepos_suite.mcp_permission_granted = true;
-                self.back_screen.stepos_suite.screen_perception_ready = true;
+                // A successful grant script is not a fresh observation of four
+                // independent capabilities. The following inspection supplies
+                // each permission's actual/unknown state.
+                self.back_screen.stepos_suite.capability_evidence = Default::default();
+                self.back_screen.stepos_suite.checked = false;
                 self.back_screen.stepos_suite.last_action_note = msg.clone();
                 self.tools_feedback = Some((self.tool_page, msg.clone(), false));
                 self.status = msg;
@@ -869,6 +1069,9 @@ impl Companion {
             Outcome::StepOsCalendarUpdated(events, msg) => {
                 self.fields[F_PHONE_SCHEDULE_TITLE].clear();
                 self.back_screen.stepos_suite.checked = true;
+                if self.back_screen.stepos_suite_synced_at.is_none() {
+                    self.back_screen.stepos_suite_synced_at = Some(Instant::now());
+                }
                 self.back_screen.stepos_suite.calendar_events = events;
                 self.back_screen.stepos_suite.last_action_note = msg.clone();
                 self.error = false;
@@ -877,6 +1080,9 @@ impl Companion {
             Outcome::StepOsAlarmsUpdated(alarms, msg) => {
                 self.fields[F_PHONE_SCHEDULE_TITLE].clear();
                 self.back_screen.stepos_suite.checked = true;
+                if self.back_screen.stepos_suite_synced_at.is_none() {
+                    self.back_screen.stepos_suite_synced_at = Some(Instant::now());
+                }
                 self.back_screen.stepos_suite.alarms = alarms;
                 self.back_screen.stepos_suite.last_action_note = msg.clone();
                 self.error = false;
@@ -884,18 +1090,167 @@ impl Companion {
             }
             Outcome::StepOsSuite(report) => {
                 self.back_screen.stepos_suite_loading = false;
+                if self.reject_incomplete_stepos_snapshot(&report) {
+                    self.apply_auto_sync_results(sync_results);
+                    self.reconcile_auto_sync_domains_from_state();
+                    return;
+                }
+                self.back_screen.stepos_suite_synced_at = Some(Instant::now());
+                let sync_error = report
+                    .read_error
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|error| !error.is_empty())
+                    .map(str::to_string);
+                self.back_screen.stepos_suite_error = sync_error.clone();
                 let phone_clip = report.phone_clipboard.trim().to_string();
                 if !phone_clip.is_empty() {
                     self.back_screen.record_clipboard_history(&phone_clip);
                 }
+                let sig_text = report.backscreen_signature.trim().to_string();
+                if !sig_text.is_empty() {
+                    self.back_screen.frame =
+                        stepx_companion::backscreen::synthesize_chinese_signature_frame(
+                            &sig_text,
+                            self.back_screen.config.invert,
+                        );
+                }
                 let note = report.last_action_note.clone();
                 self.back_screen.stepos_suite = report;
+                self.sync_live_express_parcels();
                 if !self.busy {
                     self.status = note.clone();
+                    self.error = sync_error.is_some();
                 }
-                self.tools_feedback = Some((self.tool_page, note, false));
+                if sync_error.is_some() && self.tool_page.is_none() {
+                    self.tools_feedback = Some((None, note, true));
+                }
+            }
+            Outcome::DoctorHarnessReport(report) => {
+                self.doctor_running = false;
+                if let Some(ref gs) = report.google_status {
+                    self.google_suite = gs.clone();
+                }
+                if let Some(ref cs) = report.companion_status {
+                    self.companion_status = cs.clone();
+                }
+                self.error = false;
+                self.status = format!("{}：{}", report.model_label, report.headline);
+                if self.page == Page::Amoo {
+                    if let Some(task) = self.workspace_task_mut() {
+                        let matches_task = task.title.contains(&report.query)
+                            || report.query.contains(&task.title)
+                            || task.turns.iter().any(|t| {
+                                t.user
+                                    && (t.text.contains(&report.query)
+                                        || stepx_companion::amoo_route::detect_doctor_or_google_guide_query(&t.text).is_some())
+                            })
+                            || stepx_companion::amoo_route::detect_doctor_or_google_guide_query(&task.title).is_some();
+                        if matches_task && !report.ai_guidance_markdown.trim().is_empty() {
+                            if let Some(last_turn) = task.turns.last_mut() {
+                                if last_turn.user {
+                                    task.turns.push(stepx_companion::amoo_workspace::Turn {
+                                        at_ms: Some(
+                                            std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_millis()
+                                                as i64,
+                                        ),
+                                        user: false,
+                                        text: report.ai_guidance_markdown.clone(),
+                                    });
+                                } else {
+                                    last_turn.text = report.ai_guidance_markdown.clone();
+                                }
+                            } else {
+                                task.turns.push(stepx_companion::amoo_workspace::Turn {
+                                    at_ms: Some(
+                                        std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_millis()
+                                            as i64,
+                                    ),
+                                    user: false,
+                                    text: report.ai_guidance_markdown.clone(),
+                                });
+                            }
+                            for step in &mut task.steps {
+                                if matches!(
+                                    step.phase,
+                                    stepx_companion::amoo_workspace::Phase::Ready
+                                        | stepx_companion::amoo_workspace::Phase::Running
+                                ) {
+                                    step.phase = stepx_companion::amoo_workspace::Phase::Done;
+                                    step.note =
+                                        format!("{}：{}", report.model_label, report.headline);
+                                }
+                            }
+                        }
+                    }
+                    self.reveal_latest_chat();
+                }
+                self.doctor_report = Some(report);
             }
         }
+        self.apply_auto_sync_results(sync_results);
+        self.reconcile_auto_sync_domains_from_state();
+        self.sync_notification_center();
+    }
+
+    pub(super) fn sync_live_express_parcels(&mut self) {
+        if self.demo_mode {
+            return;
+        }
+        let previous = self
+            .selected
+            .as_ref()
+            .and_then(|device| self.push.prefs.parcel_receipts.get(&device.serial))
+            .cloned()
+            .unwrap_or_default();
+        let mut receipts = stepx_companion::parcel_state::CompletionIndex::reconcile(
+            &previous,
+            &self.sms,
+            &self.push.snapshot.notifications,
+            &self.push.snapshot.threads,
+        );
+        let now = chrono::Local::now().timestamp_millis();
+        receipts.merge(&Default::default(), now);
+        receipts.record_capsule_signals(&self.fulfillment_signals(now), now);
+        if let Some(serial) = self
+            .selected
+            .as_ref()
+            .map(|d| d.serial.clone())
+            .filter(|s| !s.is_empty() && !s.contains(':') && !s.contains('.'))
+        {
+            if self.push.prefs.parcel_receipts.get(&serial) != Some(&receipts) {
+                self.push
+                    .prefs
+                    .parcel_receipts
+                    .insert(serial, receipts.clone());
+                if let Err(error) = self.push.prefs.save() {
+                    eprintln!("Could not persist parcel receipts: {error}");
+                }
+            }
+        }
+        self.push.parcel_receipts = receipts;
+        let mut parcels = stepx_companion::home_hub::extract_live_express_parcels_with_receipts(
+            &self.sms,
+            &self.push.snapshot.notifications,
+            &self.push.snapshot.threads,
+            &self.back_screen.stepos_suite.phone_clipboard,
+            &self.push.parcel_receipts,
+        );
+        if !self.push.prefs.dismissed_pickup_codes.is_empty() {
+            parcels.retain(|p| {
+                let pk = p.pickup_code.trim().to_uppercase();
+                let trk = p.tracking_no.trim().to_uppercase();
+                (pk.is_empty() || !self.push.prefs.dismissed_pickup_codes.contains(&pk))
+                    && (trk.is_empty() || !self.push.prefs.dismissed_pickup_codes.contains(&trk))
+            });
+        }
+        self.express_parcels = parcels;
     }
 
     pub(super) fn apply_capabilities(&mut self, caps: Option<Capabilities>) {
@@ -918,12 +1273,219 @@ impl Companion {
     }
 
     pub(super) fn apply_sms_data(&mut self, result: ReadResult<Message>) {
-        self.sms_loaded = result.is_ok();
         match result {
-            Ok(messages) => {
+            Ok(mut messages) => {
+                for local_msg in &self.local_sent_sms {
+                    let norm_local = stepx_companion::sms::normalize_address(&local_msg.address);
+                    let present = messages.iter().any(|m| {
+                        m.outgoing
+                            && stepx_companion::sms::normalize_address(&m.address) == norm_local
+                            && m.body.trim() == local_msg.body.trim()
+                            && m.date_ms.abs_diff(local_msg.date_ms) < 120_000
+                    });
+                    if !present {
+                        messages.insert(0, local_msg.clone());
+                    }
+                }
+
+                let mut prefs_dirty = false;
+                for m in &messages {
+                    let norm_addr = stepx_companion::sms::normalize_address(&m.address);
+                    let key1 = stepx_companion::desktop_notify::NotifyPreferences::sms_target_key(
+                        &m.address,
+                    );
+                    let key2 = stepx_companion::desktop_notify::NotifyPreferences::sms_target_key(
+                        &norm_addr,
+                    );
+                    let del_ts = self
+                        .push
+                        .prefs
+                        .deleted_threads
+                        .get(&key1)
+                        .copied()
+                        .or_else(|| self.push.prefs.deleted_threads.get(&key2).copied());
+                    if let Some(ts) = del_ts {
+                        if m.date_ms > ts {
+                            self.push.prefs.deleted_threads.remove(&key1);
+                            self.push.prefs.deleted_threads.remove(&key2);
+                            prefs_dirty = true;
+                        }
+                    }
+                }
+
+                messages.retain(|m| {
+                    let norm_addr = stepx_companion::sms::normalize_address(&m.address);
+                    let key1 = stepx_companion::desktop_notify::NotifyPreferences::sms_target_key(
+                        &m.address,
+                    );
+                    let key2 = stepx_companion::desktop_notify::NotifyPreferences::sms_target_key(
+                        &norm_addr,
+                    );
+                    if self.push.prefs.deleted_threads.contains_key(&key1)
+                        || self.push.prefs.deleted_threads.contains_key(&key2)
+                    {
+                        return false;
+                    }
+                    if let Some(clr_ts) = self
+                        .push
+                        .prefs
+                        .cleared_threads
+                        .get(&key1)
+                        .copied()
+                        .or_else(|| self.push.prefs.cleared_threads.get(&key2).copied())
+                    {
+                        if m.date_ms <= clr_ts {
+                            return false;
+                        }
+                    }
+                    let msg_key = format!("sms_msg:{norm_addr}::{}::{}", m.date_ms, m.body.trim());
+                    !self.push.prefs.deleted_messages.contains(&msg_key)
+                });
+
+                messages.sort_by(|a, b| b.date_ms.cmp(&a.date_ms));
+
+                let mut seen_manual_unread_addrs = std::collections::HashSet::new();
+                for m in &mut messages {
+                    let norm_addr = stepx_companion::sms::normalize_address(&m.address);
+                    let key1 = stepx_companion::desktop_notify::NotifyPreferences::sms_target_key(
+                        &m.address,
+                    );
+                    let key2 = stepx_companion::desktop_notify::NotifyPreferences::sms_target_key(
+                        &norm_addr,
+                    );
+                    if (self.push.prefs.manual_unread_targets.contains(&key1)
+                        || self.push.prefs.manual_unread_targets.contains(&key2))
+                        && seen_manual_unread_addrs.insert(norm_addr)
+                    {
+                        m.read = false;
+                    }
+                }
+                if prefs_dirty {
+                    let _ = stepx_companion::desktop_notify::save_preferences(&self.push.prefs);
+                }
+
+                let is_initial_sms_load = !self.sms_loaded;
+                self.sms_loaded = true;
+                if is_initial_sms_load
+                    && self.notification_center.connect_baseline_enabled
+                    && self.selected.is_some()
+                {
+                    for m in &messages {
+                        let raw_addr = m.address.trim();
+                        let norm_addr = stepx_companion::sms::normalize_address(&m.address);
+                        let key1 =
+                            stepx_companion::desktop_notify::NotifyPreferences::sms_target_key(
+                                &m.address,
+                            );
+                        let key2 =
+                            stepx_companion::desktop_notify::NotifyPreferences::sms_target_key(
+                                &norm_addr,
+                            );
+                        if !self.push.prefs.manual_unread_targets.contains(&key1)
+                            && !self.push.prefs.manual_unread_targets.contains(&key2)
+                        {
+                            if !norm_addr.is_empty() {
+                                self.read_sms_addresses.insert(norm_addr.clone());
+                            }
+                            if !raw_addr.is_empty() {
+                                self.read_sms_addresses.insert(raw_addr.to_string());
+                            }
+                        }
+                        if let Some(code) = stepx_companion::push::extract_otp_code(&m.body) {
+                            for otp_id in [
+                                format!("otp:{code}"),
+                                format!("sms-otp:{}:{code}", m.date_ms),
+                            ] {
+                                self.notification_center.read_ids.insert(otp_id.clone());
+                                self.notification_center.popup_shown_ids.insert(otp_id);
+                            }
+                        }
+                        let sender = if raw_addr.is_empty() {
+                            "短信"
+                        } else {
+                            raw_addr
+                        };
+                        for sms_id in [
+                            format!("sms:{sender}:{}", m.date_ms),
+                            format!("sms:{norm_addr}:{}", m.date_ms),
+                            format!("sms-delivery:{}:{norm_addr}", m.date_ms),
+                            format!("sms-delivery:{}:{raw_addr}", m.date_ms),
+                            format!("sms-bill:{}:{norm_addr}", m.date_ms),
+                            format!("sms-bill:{}:{raw_addr}", m.date_ms),
+                            format!("sms-unread:{norm_addr}"),
+                            format!("sms-unread:{raw_addr}"),
+                        ] {
+                            self.notification_center.read_ids.insert(sms_id.clone());
+                            self.notification_center.popup_shown_ids.insert(sms_id);
+                        }
+                    }
+                    self.notification_center.save();
+                } else if !is_initial_sms_load {
+                    let prev_keys: std::collections::HashSet<(String, i64, String)> = self
+                        .sms
+                        .iter()
+                        .map(|m| {
+                            (
+                                stepx_companion::sms::normalize_address(&m.address),
+                                m.date_ms,
+                                m.body.trim().to_string(),
+                            )
+                        })
+                        .collect();
+                    let active_sms_norm = (self.push.shell_mode
+                        == crate::ui::push_state::ShellMode::Full
+                        && self.page == Page::Sms
+                        && (self.push.im_channel == stepx_companion::push::ImChannel::Sms
+                            || self.push.selected_im_thread.as_deref() == Some("")))
+                    .then(|| {
+                        self.selected_thread
+                            .as_deref()
+                            .map(stepx_companion::sms::normalize_address)
+                    })
+                    .flatten();
+                    for m in &messages {
+                        if !m.outgoing && !m.read {
+                            let raw_addr = m.address.trim();
+                            let norm_addr = stepx_companion::sms::normalize_address(&m.address);
+                            let is_new = !prev_keys.contains(&(
+                                norm_addr.clone(),
+                                m.date_ms,
+                                m.body.trim().to_string(),
+                            ));
+                            if is_new && active_sms_norm.as_deref() != Some(norm_addr.as_str()) {
+                                self.read_sms_addresses.remove(&norm_addr);
+                                self.read_sms_addresses.remove(raw_addr);
+                            }
+                        }
+                    }
+                }
                 self.status = format!("已从手机读取 {} 条短信", messages.len());
                 self.sms = messages;
+                self.sync_read_sms_state();
                 self.sms_error = None;
+                self.sync_live_express_parcels();
+                if self.push.prefs.auto_copy_otp && !is_initial_sms_load {
+                    let now_ms = chrono::Local::now().timestamp_millis();
+                    if let Some(code) = self
+                        .sms
+                        .iter()
+                        .filter(|m| {
+                            !m.outgoing
+                                && !m.read
+                                && (m.date_ms <= 0
+                                    || now_ms <= 1_700_000_000_000
+                                    || now_ms.saturating_sub(m.date_ms) <= 15 * 60_000)
+                        })
+                        .find_map(|m| stepx_companion::push::extract_otp_code(&m.body))
+                    {
+                        if self.notification_center.last_copied_text.as_deref()
+                            != Some(code.as_str())
+                        {
+                            self.notification_center.last_copied_text = Some(code.clone());
+                            self.notification_center.pending_clipboard_otp = Some(code);
+                        }
+                    }
+                }
                 // Never leave a deleted thread selected or a previous recipient in the composer.
                 if self.selected_thread.as_deref().is_some_and(|addr| {
                     addr != "__new__"
@@ -938,10 +1500,17 @@ impl Companion {
                 }
             }
             Err(error) => {
-                self.sms.clear();
-                self.status = format!("短信读取失败：{error}");
-                self.sms_error = Some(error);
-                self.error = true;
+                if self.sms.is_empty() {
+                    self.sms_loaded = false;
+                    self.status = format!("短信读取失败：{error}");
+                    self.sms_error = Some(error);
+                    self.error = true;
+                } else {
+                    self.sms_loaded = true;
+                    self.sms_error = None;
+                    self.status =
+                        format!("短信增量刷新受阻（已保留 {} 条本地缓存）", self.sms.len());
+                }
             }
         }
     }
@@ -951,15 +1520,21 @@ impl Companion {
         logs: ReadResult<CallRecord>,
         contacts: ReadResult<ContactEntry>,
     ) {
+        let is_initial_phone_load = !self.phone_loaded;
         self.phone_loaded = true;
+        let mut partial_err = false;
         match logs {
             Ok(logs) => {
                 self.call_logs = logs;
                 self.call_logs_error = None;
             }
             Err(error) => {
-                self.call_logs.clear();
-                self.call_logs_error = Some(error);
+                if self.call_logs.is_empty() {
+                    self.call_logs_error = Some(error);
+                } else {
+                    self.call_logs_error = None;
+                    partial_err = true;
+                }
             }
         }
         match contacts {
@@ -968,13 +1543,54 @@ impl Companion {
                 self.contacts_error = None;
             }
             Err(error) => {
-                self.contacts.clear();
-                self.contacts_error = Some(error);
+                if self.contacts.is_empty() {
+                    self.contacts_error = Some(error);
+                } else {
+                    self.contacts_error = None;
+                    partial_err = true;
+                }
+            }
+        }
+        if (is_initial_phone_load
+            && self.notification_center.connect_baseline_enabled
+            && self.selected.is_some())
+            || self.page == Page::Phone
+        {
+            let mut changed = false;
+            for r in &self.call_logs {
+                if r.call_type == 3 {
+                    let raw_num = r.number.trim();
+                    let num = if raw_num.is_empty() {
+                        "unknown"
+                    } else {
+                        raw_num
+                    };
+                    for id in [
+                        format!("missed-call:{num}:{}", r.date_ms),
+                        format!("missed-call:{raw_num}:{}", r.date_ms),
+                    ] {
+                        if self.notification_center.read_ids.insert(id.clone()) {
+                            changed = true;
+                        }
+                        if self.notification_center.popup_shown_ids.insert(id) {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            if changed {
+                self.notification_center.save();
             }
         }
         self.error = self.call_logs_error.is_some() || self.contacts_error.is_some();
         self.status = if self.error {
             "部分手机数据读取失败，详情见页面".into()
+        } else if partial_err {
+            format!(
+                "已保留 {} 条通话记录与 {} 位联系人缓存",
+                self.call_logs.len(),
+                self.contacts.len()
+            )
         } else {
             format!(
                 "已同步 {} 条通话记录与 {} 位联系人",
@@ -987,6 +1603,9 @@ impl Companion {
 
     /// Reconnect the remembered phone, or auto-select the only StepX phone on first launch.
     pub(super) fn auto_select(&mut self) {
+        if self.connection_watch.user_paused {
+            return;
+        }
         let candidates: Vec<_> = self
             .devices
             .iter()
@@ -1005,24 +1624,43 @@ impl Companion {
                                     return Ok(Outcome::Reattached(device));
                                 }
                                 let (summary_res, caps, sms, call_logs, contacts) =
-                                    std::thread::scope(|s| {
-                                        let h_summary = s.spawn(|| device.summary(adb));
-                                        let h_caps =
-                                            s.spawn(|| bridge::capabilities(adb, &device).ok());
-                                        let h_sms = s.spawn(|| read_result(device.messages(adb)));
-                                        let h_calls =
-                                            s.spawn(|| read_result(device.call_logs(adb)));
-                                        let h_contacts =
-                                            s.spawn(|| read_result(device.contacts(adb)));
-                                        (
-                                            h_summary.join().unwrap(),
-                                            h_caps.join().unwrap(),
-                                            h_sms.join().unwrap(),
-                                            h_calls.join().unwrap(),
-                                            h_contacts.join().unwrap(),
-                                        )
-                                    });
-                                let summary = summary_res?;
+                                    if is_wireless(&device.transport) {
+                                        let (summary_res, caps) = std::thread::scope(|s| {
+                                            let h_summary = s.spawn(|| device.summary(adb));
+                                            let h_caps =
+                                                s.spawn(|| bridge::capabilities(adb, &device).ok());
+                                            (h_summary.join().unwrap(), h_caps.join().unwrap())
+                                        });
+                                        let (sms, call_logs) = std::thread::scope(|s| {
+                                            let h_sms =
+                                                s.spawn(|| read_result(device.messages(adb)));
+                                            let h_calls =
+                                                s.spawn(|| read_result(device.call_logs(adb)));
+                                            (h_sms.join().unwrap(), h_calls.join().unwrap())
+                                        });
+                                        let contacts = read_result(device.contacts(adb));
+                                        (summary_res, caps, sms, call_logs, contacts)
+                                    } else {
+                                        std::thread::scope(|s| {
+                                            let h_summary = s.spawn(|| device.summary(adb));
+                                            let h_caps =
+                                                s.spawn(|| bridge::capabilities(adb, &device).ok());
+                                            let h_sms =
+                                                s.spawn(|| read_result(device.messages(adb)));
+                                            let h_calls =
+                                                s.spawn(|| read_result(device.call_logs(adb)));
+                                            let h_contacts =
+                                                s.spawn(|| read_result(device.contacts(adb)));
+                                            (
+                                                h_summary.join().unwrap(),
+                                                h_caps.join().unwrap(),
+                                                h_sms.join().unwrap(),
+                                                h_calls.join().unwrap(),
+                                                h_contacts.join().unwrap(),
+                                            )
+                                        })
+                                    };
+                                let summary = summary_res.unwrap_or_default();
                                 let real_amoo = None; // Load conversations lazily on the Amoo page.
                                 return Ok(Outcome::Selected(
                                     device, summary, caps, real_amoo, sms, call_logs, contacts,
@@ -1049,23 +1687,39 @@ impl Companion {
     }
 
     pub(super) fn select(&mut self, id: String) {
+        self.connection_watch.user_paused = false;
         self.submit("正在验证设备…", move |adb| {
             let device = Device::inspect(adb, &id)?;
-            let (summary_res, caps, sms, call_logs, contacts) = std::thread::scope(|s| {
-                let h_summary = s.spawn(|| device.summary(adb));
-                let h_caps = s.spawn(|| bridge::capabilities(adb, &device).ok());
-                let h_sms = s.spawn(|| read_result(device.messages(adb)));
-                let h_calls = s.spawn(|| read_result(device.call_logs(adb)));
-                let h_contacts = s.spawn(|| read_result(device.contacts(adb)));
-                (
-                    h_summary.join().unwrap(),
-                    h_caps.join().unwrap(),
-                    h_sms.join().unwrap(),
-                    h_calls.join().unwrap(),
-                    h_contacts.join().unwrap(),
-                )
-            });
-            let summary = summary_res?;
+            let (summary_res, caps, sms, call_logs, contacts) = if is_wireless(&device.transport) {
+                let (summary_res, caps) = std::thread::scope(|s| {
+                    let h_summary = s.spawn(|| device.summary(adb));
+                    let h_caps = s.spawn(|| bridge::capabilities(adb, &device).ok());
+                    (h_summary.join().unwrap(), h_caps.join().unwrap())
+                });
+                let (sms, call_logs) = std::thread::scope(|s| {
+                    let h_sms = s.spawn(|| read_result(device.messages(adb)));
+                    let h_calls = s.spawn(|| read_result(device.call_logs(adb)));
+                    (h_sms.join().unwrap(), h_calls.join().unwrap())
+                });
+                let contacts = read_result(device.contacts(adb));
+                (summary_res, caps, sms, call_logs, contacts)
+            } else {
+                std::thread::scope(|s| {
+                    let h_summary = s.spawn(|| device.summary(adb));
+                    let h_caps = s.spawn(|| bridge::capabilities(adb, &device).ok());
+                    let h_sms = s.spawn(|| read_result(device.messages(adb)));
+                    let h_calls = s.spawn(|| read_result(device.call_logs(adb)));
+                    let h_contacts = s.spawn(|| read_result(device.contacts(adb)));
+                    (
+                        h_summary.join().unwrap(),
+                        h_caps.join().unwrap(),
+                        h_sms.join().unwrap(),
+                        h_calls.join().unwrap(),
+                        h_contacts.join().unwrap(),
+                    )
+                })
+            };
+            let summary = summary_res.unwrap_or_default();
             let real_amoo = None; // Load conversations lazily on the Amoo page.
             Ok(Outcome::Selected(
                 device, summary, caps, real_amoo, sms, call_logs, contacts,
@@ -1091,12 +1745,12 @@ impl Companion {
         self.amoo_gateway_online = real.gateway_online;
         self.amoo_cron_count = real.cron_jobs.len();
         self.amoo_cron_jobs = real.cron_jobs.clone();
-        if real.memory_bm25_entries > 0 {
+        if real.memory_bm25_entries > 0 || !self.demo_mode {
             self.amoo_bm25_entries = real.memory_bm25_entries;
         } else {
             self.amoo_bm25_entries = self.amoo_bm25_entries.max(self.amoo_memories.len());
         }
-        if real.total_skills_count > 0 {
+        if real.total_skills_count > 0 || !self.demo_mode {
             self.amoo_total_skills = real.total_skills_count;
         } else {
             self.amoo_total_skills = self.amoo_total_skills.max(self.amoo_skills.len());
@@ -1228,7 +1882,7 @@ impl Companion {
             self.amoo_session_idx = 0;
         }
 
-        if !real.skills.is_empty() {
+        if !real.skills.is_empty() || (!self.demo_mode && !cfg!(test)) {
             self.amoo_skills = real
                 .skills
                 .into_iter()
@@ -1239,18 +1893,27 @@ impl Companion {
                     prompt: sk.prompt,
                 })
                 .collect();
+            if self.amoo_total_skills == 0 {
+                self.amoo_total_skills = self.amoo_skills.len();
+            }
         }
 
-        let mut user_mems: Vec<AmooMemoryEntry> = self
-            .amoo_memories
-            .iter()
-            .filter(|m| m.sub.starts_with("桌面") || m.sub.starts_with("对话"))
-            .cloned()
-            .collect();
-        for (title, sub) in real.memory_entries {
-            user_mems.push(AmooMemoryEntry { title, sub });
+        if !self.demo_mode && !cfg!(test) {
+            self.amoo_memories = real
+                .memory_entries
+                .into_iter()
+                .map(|(title, sub)| AmooMemoryEntry { title, sub })
+                .collect();
+        } else {
+            let mut user_mems: Vec<AmooMemoryEntry> = self.amoo_memories.clone();
+            for (title, sub) in real.memory_entries {
+                if !user_mems.iter().any(|m| m.title == title) {
+                    user_mems.push(AmooMemoryEntry { title, sub });
+                }
+            }
+            self.amoo_memories = user_mems;
+            self.amoo_bm25_entries = self.amoo_bm25_entries.max(self.amoo_memories.len());
         }
-        self.amoo_memories = user_mems;
         self.load_work_previews();
     }
 

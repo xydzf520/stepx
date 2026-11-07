@@ -5,10 +5,13 @@ mod amoo;
 mod app_store;
 mod apps;
 mod backscreen;
+mod calendar_style;
 mod connect;
 mod expansion;
 pub(super) mod files;
 mod gallery;
+pub(super) mod home;
+pub mod notification_center;
 mod notifications;
 mod overview;
 mod phone;
@@ -64,7 +67,7 @@ impl Companion {
             self.hstack(
                 S2,
                 vec![
-                    self.ui_icon(icon, 20., p.text2),
+                    self.content_icon(icon, 20., p.text2),
                     Expanded::new(1., self.heading(name)).finish(),
                 ],
             ),
@@ -110,7 +113,7 @@ impl Companion {
             self.hstack(
                 S2,
                 vec![
-                    self.ui_icon(icon, 20., p.text2),
+                    self.content_icon(icon, 20., p.text2),
                     Expanded::new(1., self.heading(name)).finish(),
                 ],
             ),
@@ -130,38 +133,16 @@ impl Companion {
                         Hoverable::new(
                             self.mouse_state(format!("attachment-image-{url}")),
                             move |mouse| {
-                                let hovered = mouse.is_mouse_over_element();
-                                let t = if self.settings.value.reduced_motion {
-                                    if hovered {
-                                        1.
-                                    } else {
-                                        0.
-                                    }
-                                } else {
-                                    mouse.hover_progress().clamp(0., 1.)
-                                };
-                                let mix = |a: u8, b: u8| {
-                                    (a as f32 + (b as f32 - a as f32) * t) as u8
-                                };
+                                let t = self.hover_t(&mouse);
                                 let bg = if mouse.is_clicked() {
                                     p.accent_soft
                                 } else {
-                                    facloud_ui::color::ColorU::new(
-                                        mix(p.bg.r, p.hover.r),
-                                        mix(p.bg.g, p.hover.g),
-                                        mix(p.bg.b, p.hover.b),
-                                        mix(p.bg.a, p.hover.a),
-                                    )
+                                    lerp_color(p.bg, p.hover, t)
                                 };
                                 let border_color = if mouse.is_clicked() {
                                     p.accent
                                 } else {
-                                    facloud_ui::color::ColorU::new(
-                                        mix(p.border.r, p.border_strong.r),
-                                        mix(p.border.g, p.border_strong.g),
-                                        mix(p.border.b, p.border_strong.b),
-                                        mix(p.border.a, p.border_strong.a),
-                                    )
+                                    lerp_color(p.border, p.border_strong, t)
                                 };
                                 Container::new(
                                     ConstrainedBox::new(
@@ -223,7 +204,11 @@ impl Companion {
                                 Align::new(self.hstack(
                                     S2,
                                     vec![
-                                        self.ui_icon(super::icons::UiIcon::Image, 22., p.text3),
+                                        self.content_icon(
+                                            super::icons::UiIcon::Image,
+                                            22.,
+                                            p.text3,
+                                        ),
                                         self.text(label, CAPTION, p.text2),
                                     ],
                                 ))
@@ -447,35 +432,16 @@ impl Companion {
                     self.mouse_state(format!("sub-nav-{idx}-{label}")),
                     move |mouse| {
                         let hovered = mouse.is_mouse_over_element();
-                        let t = if self.settings.value.reduced_motion {
-                            if hovered {
-                                1.
-                            } else {
-                                0.
-                            }
-                        } else {
-                            mouse.hover_progress().clamp(0., 1.)
-                        };
-                        let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t) as u8;
+                        let t = self.hover_t(&mouse);
                         let bg = if mouse.is_clicked() || active {
                             p.accent_soft
                         } else {
-                            facloud_ui::color::ColorU::new(
-                                mix(p.surface.r, p.hover.r),
-                                mix(p.surface.g, p.hover.g),
-                                mix(p.surface.b, p.hover.b),
-                                mix(p.surface.a, p.hover.a),
-                            )
+                            lerp_color(p.surface, p.hover, t)
                         };
                         let border_color = if mouse.is_clicked() || active {
                             p.accent
                         } else {
-                            facloud_ui::color::ColorU::new(
-                                mix(p.border.r, p.border_strong.r),
-                                mix(p.border.g, p.border_strong.g),
-                                mix(p.border.b, p.border_strong.b),
-                                mix(p.border.a, p.border_strong.a),
-                            )
+                            lerp_color(p.border, p.border_strong, t)
                         };
                         Container::new(
                             Text::new(label.to_string(), font, BODY)
@@ -514,6 +480,8 @@ impl Companion {
 
     pub(super) fn page_content(&self) -> El {
         match self.page {
+            Page::Search => self.search_page(),
+            Page::Home => self.home_page(),
             Page::Overview => self.overview_page(),
             Page::Expansion => self.expansion_page(),
             Page::BackScreen => self.backscreen_page(),
@@ -527,7 +495,11 @@ impl Companion {
             Page::Studio => self.studio_page(),
             Page::Sms => self.sms_page(),
             Page::Notifications => self.notifications_page(),
-            Page::Phone => self.phone_page(),
+            Page::Phone => {
+                if let Some(call) = self.live_call_panel() {
+                    self.vstack(S2, vec![call, Expanded::new(1., self.phone_page()).finish()])
+                } else { self.phone_page() }
+            },
             Page::Files => self.files_page(),
             Page::AppStore => self.app_store_page(),
             Page::Apps => self.apps_page(),
@@ -538,8 +510,9 @@ impl Companion {
 
     /// Buttons on the right of the page header. At most one `Primary`.
     pub(super) fn page_actions(&self) -> Vec<El> {
-        match self.page {
-            Page::About | Page::Settings => Vec::new(),
+        let mut actions = match self.page {
+            Page::Search | Page::About | Page::Settings => Vec::new(),
+            Page::Home => self.home_actions(),
             Page::Overview => self.overview_actions(),
             Page::Expansion => self.expansion_actions(),
             Page::BackScreen => self.backscreen_actions(),
@@ -563,7 +536,9 @@ impl Companion {
             Page::Apps => self.apps_actions(),
             Page::Tools => self.tools_actions(),
             Page::Connect => self.connect_actions(),
-        }
+        };
+        actions.push(self.render_top_bar_notification_bell());
+        actions
     }
 
     /// Chat bubble shared by Amoo and SMS. `mine` aligns right with the accent tint.
@@ -611,6 +586,9 @@ impl Companion {
 
 /// "14:05" for today, "昨天 14:05", otherwise "10-18 14:05".
 pub(super) fn format_time(ms: i64) -> String {
+    if ms <= 0 {
+        return String::new();
+    }
     use chrono::{Local, TimeZone};
     let Some(t) = Local.timestamp_millis_opt(ms).single() else {
         return String::new();

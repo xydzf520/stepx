@@ -93,14 +93,43 @@ fn request(
     Ok(())
 }
 
-/// Installs a private skill with an ephemeral endpoint capability, never account credentials.
-pub fn start(adb: &Adb, device: &Device) -> Result<()> {
-    static SERVERS: std::sync::OnceLock<Mutex<std::collections::BTreeMap<String, (u16, String)>>> =
-        std::sync::OnceLock::new();
-    let mut servers = SERVERS.get_or_init(Default::default).lock().unwrap();
-    let (port, token) = if let Some(existing) = servers.get(&device.serial) {
-        existing.clone()
-    } else {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuiAgentApiHandle {
+    pub port: u16,
+    pub token: String,
+    pub serial: String,
+}
+
+static SERVERS: std::sync::OnceLock<Mutex<std::collections::BTreeMap<String, GuiAgentApiHandle>>> =
+    std::sync::OnceLock::new();
+
+pub(crate) fn ensure_started_in_registry<F>(
+    registry: &Mutex<std::collections::BTreeMap<String, GuiAgentApiHandle>>,
+    serial: &str,
+    starter: F,
+) -> Result<GuiAgentApiHandle>
+where
+    F: FnOnce() -> Result<(u16, String)>,
+{
+    let mut servers = registry.lock().unwrap();
+    if let Some(existing) = servers.get(serial) {
+        return Ok(existing.clone());
+    }
+    let (port, token) = starter()?;
+    let handle = GuiAgentApiHandle {
+        port,
+        token,
+        serial: serial.to_string(),
+    };
+    servers.insert(serial.to_string(), handle.clone());
+    Ok(handle)
+}
+
+/// Ensures the local authenticated GUI Agent HTTP endpoint is started for `device`
+/// and `adb reverse tcp:18796 tcp:{port}` is configured idempotently.
+pub fn ensure_started(adb: &Adb, device: &Device) -> Result<GuiAgentApiHandle> {
+    let registry = SERVERS.get_or_init(Default::default);
+    let handle = ensure_started_in_registry(registry, &device.serial, || {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
         let token = format!(
@@ -117,17 +146,21 @@ pub fn start(adb: &Adb, device: &Device) -> Result<()> {
                 let _ = request(stream, &secret, &state, &adb_worker, &device_worker);
             }
         });
-        servers.insert(device.serial.clone(), (port, token.clone()));
-        (port, token)
-    };
-    drop(servers);
+        Ok((port, token))
+    })?;
     adb.run(&[
         "-s",
         &device.transport,
         "reverse",
         "tcp:18796",
-        &format!("tcp:{port}"),
+        &format!("tcp:{}", handle.port),
     ])?;
+    Ok(handle)
+}
+
+/// Installs a private skill with an ephemeral endpoint capability, never account credentials.
+pub fn start(adb: &Adb, device: &Device) -> Result<()> {
+    let handle = ensure_started(adb, device)?;
     let mut ws = GatewayWs::connect(adb, device)?;
     let status = ws.call("skills.status", json!({}))?;
     let workspace = status["workspaceDir"]
@@ -136,8 +169,47 @@ pub fn start(adb: &Adb, device: &Device) -> Result<()> {
     let script = include_str!("gui_agent_skill_install.py");
     let result = ws.call(
         "stepclaw.system.run",
-        json!({"command":["python3","-c",script,workspace,token],"timeoutMs":15000}),
+        json!({"command":["python3","-c",script,workspace,handle.token],"timeoutMs":15000}),
     )?;
     ensure!(result["exitCode"] == 0, "手机技能安装未完成");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn ensure_started_in_registry_is_idempotent_per_device_serial() {
+        let registry = Mutex::new(std::collections::BTreeMap::new());
+        let calls = AtomicUsize::new(0);
+
+        let first = ensure_started_in_registry(&registry, "DEV001", || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok((19001, "tok-abc".into()))
+        })
+        .unwrap();
+        assert_eq!(first.port, 19001);
+        assert_eq!(first.token, "tok-abc");
+        assert_eq!(first.serial, "DEV001");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let second = ensure_started_in_registry(&registry, "DEV001", || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok((19002, "tok-other".into()))
+        })
+        .unwrap();
+        assert_eq!(second, first);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let other_dev = ensure_started_in_registry(&registry, "DEV002", || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok((19003, "tok-dev2".into()))
+        })
+        .unwrap();
+        assert_eq!(other_dev.port, 19003);
+        assert_eq!(other_dev.serial, "DEV002");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
 }

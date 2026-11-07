@@ -5,12 +5,23 @@ use facloud_ui::{color::ColorU, elements::*, fonts::Weight, platform::Cursor};
 use stepx_companion::device::DeviceMetrics;
 
 impl Companion {
-    fn overview_metric_card(&self, children: Vec<El>) -> El {
+    fn overview_metric_card(
+        &self,
+        id: &str,
+        target: Option<crate::ui::context_menu::Target>,
+        children: Vec<El>,
+    ) -> El {
         // A bounded shared height keeps the metric row aligned even when one
         // sensor adds a second hint line or reports an unavailable value.
-        ConstrainedBox::new(self.panel(children))
-            .with_height(160.)
-            .finish()
+        ConstrainedBox::new(self.hover_panel_interactive(
+            id,
+            self.vstack(S3, children),
+            None,
+            None,
+            target,
+        ))
+        .with_height(160.)
+        .finish()
     }
     pub(in super::super) fn overview_actions(&self) -> Vec<El> {
         if self.selected.is_none() {
@@ -32,12 +43,6 @@ impl Companion {
             ];
         }
         vec![
-            self.button(
-                "ov-account",
-                "账号与用量",
-                Action::Page(Page::Account),
-                Btn::Secondary,
-            ),
             self.button("ov-summary", "刷新状态", Action::Summary, Btn::Secondary),
             self.button_icon(
                 "ov-shot",
@@ -89,7 +94,7 @@ impl Companion {
         let left = self.hstack(
             8.,
             vec![
-                self.ui_icon(icon, 14., p.text2),
+                self.content_icon(icon, 14., p.text2),
                 self.line_w(title, CAPTION, p.text, Weight::Medium),
             ],
         );
@@ -118,7 +123,7 @@ impl Companion {
         .finish()
     }
 
-    fn hw_spec_cell(&self, icon: &'static str, label: &'static str, val: String) -> El {
+    fn hw_spec_cell(&self, icon: UiIcon, label: &'static str, val: String) -> El {
         let p = self.p();
         let icon_bg = if p.dark { p.bg } else { ColorU::white() };
         let icon_border = if p.dark {
@@ -126,7 +131,7 @@ impl Companion {
         } else {
             rgb(0xE4, 0xE4, 0xE7)
         };
-        let box_el = self.icon_box(icon, 28., icon_bg, p.text2, Some(icon_border));
+        let box_el = self.ui_icon_box(icon, 28., icon_bg, p.text2, Some(icon_border));
         let text_col = Flex::column()
             .with_spacing(2.)
             .with_cross_axis_alignment(CrossAxisAlignment::Start)
@@ -166,201 +171,337 @@ impl Companion {
         } else {
             format!("StepX {}", device.model)
         };
-        let backups = device.backup_transports();
-        let has_dual_standby = !backups.is_empty();
+        let backups = self.online_device_backups(device);
+        let has_dual_standby = self.device_has_online_usb_and_wireless(device);
+        let active_transport = self.online_device_active_transport(device);
+        let active_is_wireless = is_wireless(&active_transport);
+        let cross_standby = backups
+            .iter()
+            .find(|b| is_wireless(b) != active_is_wireless);
+        let channel_subline = if let Some(standby) = cross_standby {
+            format!(
+                "主用 {} · 热备 {}",
+                if active_is_wireless { "无线" } else { "USB" },
+                standby
+            )
+        } else {
+            format!("通道 {}", active_transport)
+        };
+        let quick_channel_action = if let Some(standby) = cross_standby {
+            let label = if is_wireless(standby) {
+                "切至无线"
+            } else {
+                "切至USB"
+            };
+            self.link_action(
+                "ov-switch-transport",
+                label,
+                Action::SwitchPreferredTransport(standby.clone()),
+            )
+        } else if !active_is_wireless {
+            self.link_action(
+                "ov-enable-standby",
+                "开启无线热备",
+                Action::EnableUsbWirelessBridge,
+            )
+        } else {
+            self.link_action("ov-heal-link", "通道自愈", Action::HealConnection)
+        };
+
+        let paint = |c: ColorU| {
+            stepx_companion::home_visuals::Paint::rgb(c.r, c.g, c.b).with_alpha(c.a as f32 / 255.0)
+        };
+        let track_paint = paint(p.text3)
+            .with_alpha(0.18)
+            .over(paint(p.card).with_alpha(1.0));
+        let link_ratio = if has_dual_standby {
+            1.0
+        } else if self.amoo_gateway_online {
+            0.85
+        } else {
+            0.65
+        };
+        let link_ring = self.svg_canvas(
+            "ov-ring-link",
+            stepx_companion::home_visuals::ring_gauge(
+                42.,
+                5.,
+                link_ratio,
+                track_paint,
+                paint(p.indigo),
+            ),
+            Some(42.),
+            42.,
+            false,
+        );
 
         // 1. Top 4-Column Metric Row
-        let card_device = self.overview_metric_card(vec![
-            self.between(
-                self.hstack(
-                    6.,
-                    vec![
-                        self.ui_icon(UiIcon::Smartphone, 15., p.text2),
-                        self.line_w("当前设备", CAPTION, p.text2, Weight::Medium),
-                    ],
-                ),
-                self.pill_badge(
-                    if has_dual_standby {
-                        "USB + 无线双通道热备"
-                    } else if is_wireless(&device.transport) {
-                        "无线连接"
-                    } else {
-                        "USB 连接"
-                    },
-                    p.success_text,
-                    p.success_soft,
-                ),
-            ),
-            Flex::column()
-                .with_spacing(2.)
-                .with_cross_axis_alignment(CrossAxisAlignment::Start)
-                .with_child(self.line_w(model_display, TITLE, p.text, Weight::Semibold))
-                .with_child(self.mono(&device.serial, CAPTION, p.text2))
-                .finish(),
-            Container::new(self.between(
-                self.line("Amoo 网关", CAPTION, p.text2),
-                self.mono(
-                    if self.amoo_gateway_online {
-                        "已连接"
-                    } else {
-                        "未连接"
-                    },
-                    CAPTION,
-                    if self.amoo_gateway_online {
-                        p.success
-                    } else {
-                        p.text2
-                    },
-                ),
-            ))
-            .with_padding_top(6.)
-            .with_border(Border::top(1.).with_border_color(p.border))
-            .finish(),
-        ]);
-
-        let card_battery = self.overview_metric_card(vec![
-            self.between(
-                self.hstack(
-                    6.,
-                    vec![
-                        self.ui_icon(UiIcon::Bolt, 15., p.text2),
-                        self.line_w("电池电量", CAPTION, p.text2, Weight::Medium),
-                    ],
-                ),
-                self.line_w(
-                    if metrics.charging_state.is_empty() {
-                        "未检测"
-                    } else {
-                        &metrics.charging_state
-                    },
-                    CAPTION,
-                    p.text2,
-                    Weight::Medium,
-                ),
-            ),
-            self.hstack(
-                8.,
-                vec![
-                    self.line_w(battery_val, METRIC, p.text, Weight::Semibold),
-                    self.line(
-                        format!(
-                            "健康：{}",
-                            if metrics.battery_health.is_empty() {
-                                "未检测"
-                            } else {
-                                &metrics.battery_health
-                            }
-                        ),
-                        CAPTION,
-                        p.text2,
+        let card_device = self.overview_metric_card(
+            "ov-card-device",
+            Some(crate::ui::context_menu::Target::OverviewCard(
+                crate::ui::context_menu::OverviewContextKind::Device,
+            )),
+            vec![
+                self.between(
+                    self.hstack(
+                        6.,
+                        vec![
+                            self.content_icon(UiIcon::Smartphone, 15., p.text2),
+                            self.line_w("当前设备", CAPTION, p.text2, Weight::Medium),
+                        ],
                     ),
-                ],
-            ),
-            Flex::column()
-                .with_spacing(4.)
-                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-                .with_child(self.progress(battery_lvl, p.success))
-                .with_child(self.between(
-                    self.line(
-                        if metrics.voltage.is_empty() {
-                            "电压未检测"
-                        } else {
-                            &metrics.voltage
-                        },
-                        CAPTION,
-                        p.text2,
+                    self.device_connection_icons("overview-connection", device),
+                ),
+                self.between(
+                    Flex::column()
+                        .with_spacing(2.)
+                        .with_cross_axis_alignment(CrossAxisAlignment::Start)
+                        .with_child(self.line_w(model_display, TITLE, p.text, Weight::Semibold))
+                        .with_child(self.mono(channel_subline, CAPTION, p.text2))
+                        .finish(),
+                    link_ring,
+                ),
+                Container::new(self.between(
+                    self.hstack(
+                        6.,
+                        vec![
+                            self.line("Amoo 网关", CAPTION, p.text2),
+                            self.mono(
+                                if self.amoo_gateway_online {
+                                    "已连接"
+                                } else {
+                                    "未连接"
+                                },
+                                CAPTION,
+                                if self.amoo_gateway_online {
+                                    p.success
+                                } else {
+                                    p.text2
+                                },
+                            ),
+                        ],
                     ),
-                    self.line("手机上报", CAPTION, p.text2),
+                    quick_channel_action,
                 ))
+                .with_padding_top(6.)
+                .with_border(Border::top(1.).with_border_color(p.border))
                 .finish(),
-        ]);
+            ],
+        );
 
-        let card_temp = self.overview_metric_card(vec![
-            self.hstack(
-                6.,
-                vec![
-                    self.ui_icon(UiIcon::Temperature, 15., p.text2),
-                    self.line_w("电池温度", CAPTION, p.text2, Weight::Medium),
-                ],
+        let bat_ratio = (battery_lvl.unwrap_or(0) as f32 / 100.0).clamp(0.0, 1.0);
+        let bat_ring = self.svg_canvas(
+            "ov-ring-battery",
+            stepx_companion::home_visuals::ring_gauge(
+                42.,
+                5.,
+                bat_ratio,
+                track_paint,
+                paint(p.success),
             ),
-            self.line_w(temperature, METRIC, p.text, Weight::Semibold),
-            self.vstack(
-                S1,
-                vec![
-                    self.line("来自手机电池传感器", CAPTION, p.text2),
-                    self.line("刷新状态获取最新读数", MICRO, p.text3),
-                ],
+            Some(42.),
+            42.,
+            false,
+        );
+        let temp_num: f32 = metrics
+            .temperature
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(28.0);
+        let temp_ratio = ((temp_num - 15.0) / 35.0).clamp(0.1, 1.0);
+        let temp_color = if temp_num >= 40.0 { p.warning } else { p.teal };
+        let temp_ring = self.svg_canvas(
+            "ov-ring-temp",
+            stepx_companion::home_visuals::ring_gauge(
+                42.,
+                5.,
+                temp_ratio,
+                track_paint,
+                paint(temp_color),
             ),
-        ]);
+            Some(42.),
+            42.,
+            false,
+        );
+        let stor_ratio = (metrics.storage_percent.unwrap_or(0) as f32 / 100.0).clamp(0.0, 1.0);
+        let stor_ring = self.svg_canvas(
+            "ov-ring-storage",
+            stepx_companion::home_visuals::ring_gauge(
+                42.,
+                5.,
+                stor_ratio,
+                track_paint,
+                paint(p.blue),
+            ),
+            Some(42.),
+            42.,
+            false,
+        );
 
-        let card_storage = self.overview_metric_card(vec![
-            self.between(
-                self.hstack(
-                    6.,
-                    vec![
-                        self.ui_icon(UiIcon::Storage, 15., p.text2),
-                        self.line_w("内部存储", CAPTION, p.text2, Weight::Medium),
-                    ],
-                ),
-                self.mono("数据分区", CAPTION, p.text2),
-            ),
-            self.hstack(
-                6.,
-                vec![
+        let card_battery = self.overview_metric_card(
+            "ov-card-battery",
+            Some(crate::ui::context_menu::Target::OverviewCard(
+                crate::ui::context_menu::OverviewContextKind::Battery,
+            )),
+            vec![
+                self.between(
+                    self.hstack(
+                        6.,
+                        vec![
+                            self.content_icon(UiIcon::Bolt, 15., p.text2),
+                            self.line_w("电池电量", CAPTION, p.text2, Weight::Medium),
+                        ],
+                    ),
                     self.line_w(
-                        if metrics.storage_used.is_empty() {
-                            "未知"
+                        if metrics.charging_state.is_empty() {
+                            "未检测"
                         } else {
-                            &metrics.storage_used
+                            &metrics.charging_state
                         },
-                        METRIC,
-                        p.text,
-                        Weight::Semibold,
-                    ),
-                    self.line(
-                        format!(
-                            "/ {}",
-                            if metrics.storage_total.is_empty() {
-                                "未知"
-                            } else {
-                                &metrics.storage_total
-                            }
-                        ),
-                        SUBHEAD,
+                        CAPTION,
                         p.text2,
+                        Weight::Medium,
                     ),
-                ],
-            ),
-            Flex::column()
-                .with_spacing(4.)
-                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-                .with_child(self.progress(metrics.storage_percent, p.accent))
-                .with_child(
-                    self.between(
+                ),
+                self.between(
+                    self.hstack(
+                        8.,
+                        vec![
+                            self.line_w(battery_val, METRIC, p.text, Weight::Semibold),
+                            self.line(
+                                format!(
+                                    "健康：{}",
+                                    if metrics.battery_health.is_empty() {
+                                        "未检测"
+                                    } else {
+                                        &metrics.battery_health
+                                    }
+                                ),
+                                CAPTION,
+                                p.text2,
+                            ),
+                        ],
+                    ),
+                    bat_ring,
+                ),
+                Flex::column()
+                    .with_spacing(4.)
+                    .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                    .with_child(self.progress(battery_lvl, p.success))
+                    .with_child(self.between(
                         self.line(
-                            metrics
-                                .storage_percent
-                                .map(|v| format!("已用 {v}%"))
-                                .unwrap_or_else(|| "暂不可用".into()),
+                            if metrics.voltage.is_empty() {
+                                "电压未检测"
+                            } else {
+                                &metrics.voltage
+                            },
                             CAPTION,
                             p.text2,
                         ),
-                        self.line(
-                            format!(
-                                "可用 {}",
-                                if metrics.storage_avail.is_empty() {
+                        self.line("手机上报", CAPTION, p.text2),
+                    ))
+                    .finish(),
+            ],
+        );
+
+        let card_temp = self.overview_metric_card(
+            "ov-card-temp",
+            Some(crate::ui::context_menu::Target::OverviewCard(
+                crate::ui::context_menu::OverviewContextKind::Battery,
+            )),
+            vec![
+                self.hstack(
+                    6.,
+                    vec![
+                        self.content_icon(UiIcon::Temperature, 15., p.text2),
+                        self.line_w("电池温度", CAPTION, p.text2, Weight::Medium),
+                    ],
+                ),
+                self.between(
+                    self.line_w(temperature, METRIC, p.text, Weight::Semibold),
+                    temp_ring,
+                ),
+            ],
+        );
+
+        let card_storage = self.overview_metric_card(
+            "ov-card-storage",
+            Some(crate::ui::context_menu::Target::OverviewCard(
+                crate::ui::context_menu::OverviewContextKind::Storage,
+            )),
+            vec![
+                self.between(
+                    self.hstack(
+                        6.,
+                        vec![
+                            self.content_icon(UiIcon::Storage, 15., p.text2),
+                            self.line_w("内部存储", CAPTION, p.text2, Weight::Medium),
+                        ],
+                    ),
+                    self.mono("数据分区", CAPTION, p.text2),
+                ),
+                self.between(
+                    self.hstack(
+                        6.,
+                        vec![
+                            self.line_w(
+                                if metrics.storage_used.is_empty() {
                                     "未知"
                                 } else {
-                                    &metrics.storage_avail
-                                }
+                                    &metrics.storage_used
+                                },
+                                METRIC,
+                                p.text,
+                                Weight::Semibold,
                             ),
-                            CAPTION,
-                            p.text2,
-                        ),
+                            self.line(
+                                format!(
+                                    "/ {}",
+                                    if metrics.storage_total.is_empty() {
+                                        "未知"
+                                    } else {
+                                        &metrics.storage_total
+                                    }
+                                ),
+                                SUBHEAD,
+                                p.text2,
+                            ),
+                        ],
                     ),
-                )
-                .finish(),
-        ]);
+                    stor_ring,
+                ),
+                Flex::column()
+                    .with_spacing(4.)
+                    .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                    .with_child(self.progress(metrics.storage_percent, p.blue))
+                    .with_child(
+                        self.between(
+                            self.line(
+                                metrics
+                                    .storage_percent
+                                    .map(|v| format!("已用 {v}%"))
+                                    .unwrap_or_else(|| "暂不可用".into()),
+                                CAPTION,
+                                p.text2,
+                            ),
+                            self.line(
+                                format!(
+                                    "可用 {}",
+                                    if metrics.storage_avail.is_empty() {
+                                        "未知"
+                                    } else {
+                                        &metrics.storage_avail
+                                    }
+                                ),
+                                CAPTION,
+                                p.text2,
+                            ),
+                        ),
+                    )
+                    .finish(),
+            ],
+        );
 
         let top_metrics = Flex::row()
             .with_main_axis_size(MainAxisSize::Max)
@@ -409,12 +550,12 @@ impl Companion {
                             self.line(
                                 if self.overview_back_preview {
                                     "背屏设计稿"
+                                } else if self.screenshot.as_ref().is_some_and(|(_, p)| {
+                                    !crate::ui::widgets::cached_image_is_black(p)
+                                }) {
+                                    "最近截图"
                                 } else {
-                                    if self.screenshot.is_some() {
-                                        "最近截图"
-                                    } else {
-                                        "外观示意"
-                                    }
+                                    "外观示意"
                                 },
                                 CAPTION,
                                 p.text2,
@@ -558,14 +699,7 @@ impl Companion {
             ))
             .finish();
 
-        let ai_hint = self.line("按键控制当前连接的手机", CAPTION, p.text2);
-
-        let control_card = self.panel(vec![
-            self.between(self.heading("快捷控制"), ai_hint),
-            row1,
-            row2,
-            focus_input_bar,
-        ]);
+        let control_card = self.panel(vec![self.heading("快捷控制"), row1, row2, focus_input_bar]);
 
         let hw_row1 = Flex::row()
             .with_main_axis_size(MainAxisSize::Max)
@@ -573,7 +707,11 @@ impl Companion {
             .with_child(
                 Expanded::new(
                     1.,
-                    self.hw_spec_cell("🛡", "系统版本", format!("Android {}", device.android)),
+                    self.hw_spec_cell(
+                        UiIcon::Shield,
+                        "系统版本",
+                        format!("Android {}", device.android),
+                    ),
                 )
                 .finish(),
             )
@@ -581,7 +719,7 @@ impl Companion {
                 Expanded::new(
                     1.,
                     self.hw_spec_cell(
-                        "📱",
+                        UiIcon::Smartphone,
                         "屏幕分辨率",
                         if metrics.screen_size.is_empty() {
                             "未检测".into()
@@ -595,7 +733,7 @@ impl Companion {
             .with_child(
                 Expanded::new(
                     1.,
-                    self.hw_spec_cell("❖", "背屏设计画布", "17 × 23 · 非实况".into()),
+                    self.hw_spec_cell(UiIcon::Matrix, "背屏设计画布", "17 × 23 · 非实况".into()),
                 )
                 .finish(),
             )
@@ -607,7 +745,7 @@ impl Companion {
             .with_child(
                 Expanded::new(
                     1.,
-                    self.hw_spec_cell("⚙", "产品型号", device.product.clone()),
+                    self.hw_spec_cell(UiIcon::Cpu, "产品型号", device.product.clone()),
                 )
                 .finish(),
             )
@@ -615,7 +753,7 @@ impl Companion {
                 Expanded::new(
                     1.,
                     self.hw_spec_cell(
-                        "⌘",
+                        UiIcon::Activity,
                         "Amoo 后台",
                         if self.amoo_gateway_online {
                             "已连接".into()
@@ -630,7 +768,7 @@ impl Companion {
                 Expanded::new(
                     1.,
                     self.hw_spec_cell(
-                        "📡",
+                        UiIcon::Wifi,
                         "手机无线地址",
                         if metrics.wifi_ipv4.is_empty() {
                             "未检测".into()
@@ -662,8 +800,14 @@ impl Companion {
                                     Btn::Secondary,
                                 ),
                                 self.button(
+                                    "ov-mirror-play",
+                                    "投屏打开商店",
+                                    Action::OpenAppInMirror("com.android.vending".into()),
+                                    Btn::Secondary,
+                                ),
+                                self.button(
                                     "ov-open-play",
-                                    "打开商店",
+                                    "手机打开商店",
                                     Action::OpenApp("com.android.vending".into()),
                                     Btn::Secondary,
                                 ),
@@ -707,10 +851,7 @@ impl Companion {
                 .with_main_axis_size(MainAxisSize::Min)
                 .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
                 .with_spacing(S2)
-                .with_child(self.between(
-                    self.heading("设备信息与小工具"),
-                    self.line("设备信息来自手机", CAPTION, p.text2),
-                ))
+                .with_child(self.heading("设备信息"))
                 .with_child(priv_row)
                 .with_child(self.vstack(S2, vec![hw_row1, hw_row2]))
                 .finish(),

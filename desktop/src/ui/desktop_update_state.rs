@@ -1,17 +1,55 @@
 //! One startup check, explicit downloads, and a fixed-footer entry in both shells.
+use stepx_companion::file_dialog::DialogKind;
 use super::{theme::*, widgets::*, *};
 use facloud_ui::TypedActionView;
-use stepx_companion::{desktop_update as updater, storage::format_bytes};
+use stepx_companion::{community_qr, desktop_update as updater, storage::format_bytes};
+
 #[derive(Clone, Debug)]
 pub(super) enum DesktopUpdateAction {
     Open,
     Close,
+    OpenWhatsNew,
+    CloseWhatsNew,
+    Explore(stepx_companion::release_notes::Destination),
+    OpenHistory,
+    MoreHistory,
+    BackToStory,
+    PlayVideo,
+    SeekVideo(i32),
+    SeekVideoTo(u32),
+    ExpandVideo,
+    Category(String),
+    ShowAuthor,
+    ChoosePersonalQr,
     Check,
     Download,
     Cancel,
     Install,
     Resolve(Box<Action>),
 }
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub(super) struct WhatsNewPersistedState {
+    pub last_seen_version: String,
+    pub personal_qr_custom_path: Option<String>,
+}
+
+impl WhatsNewPersistedState {
+    pub fn should_pop_once_for_version(&self, current_version: &str) -> bool {
+        self.last_seen_version.trim() != current_version.trim()
+    }
+
+    pub fn mark_version_seen(&mut self, current_version: &str) -> bool {
+        if self.should_pop_once_for_version(current_version) {
+            self.last_seen_version = current_version.trim().to_string();
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// A restart prerequisite is not a download failure. Keep it actionable and
 /// recompute it from live state rather than latching a generic red error.
 struct RestartBlocker {
@@ -39,6 +77,26 @@ pub(super) enum Phase {
 pub(super) struct DesktopUpdateState {
     pub phase: Phase,
     pub open: bool,
+    pub whats_new_open: bool,
+    pub whats_new_scroll: ClippedScrollStateHandle,
+    pub release_history: bool,
+    pub release_history_limit: usize,
+    pub video: Option<stepx_companion::release_video::Player>,
+    pub video_revision: u64,
+    pub video_frame: u32,
+    pub video_playing: bool,
+    pub video_ready: bool,
+    pub video_expanded: bool,
+    pub video_error: Option<String>,
+    pub release_category: String,
+    pub release_home: bool,
+    pub personal_qr_custom_path: Option<PathBuf>,
+    pub group_qr: Option<community_qr::CachedQr>,
+    pub qr_syncing: bool,
+    pub qr_last_check: Option<Instant>,
+    pub qr_next_check: Instant,
+    pub qr_last_error: Option<String>,
+    pub qr_status_note: String,
     pub release: Option<updater::Release>,
     pub error: String,
     pub received: u64,
@@ -59,6 +117,26 @@ impl Default for DesktopUpdateState {
         Self {
             phase: Phase::Idle,
             open: false,
+            whats_new_open: false,
+            whats_new_scroll: Default::default(),
+            release_history: false,
+            release_history_limit: 8,
+            video: None,
+            video_revision: 0,
+            video_frame: 0,
+            video_playing: false,
+            video_ready: false,
+            video_expanded: false,
+            video_error: None,
+            release_category: String::new(),
+            release_home: true,
+            personal_qr_custom_path: None,
+            group_qr: None,
+            qr_syncing: false,
+            qr_last_check: None,
+            qr_next_check: Instant::now(),
+            qr_last_error: None,
+            qr_status_note: String::new(),
             release: None,
             error: String::new(),
             received: 0,
@@ -149,7 +227,9 @@ impl Companion {
             Action::Page(self.job_page),
         );
         add(
-            self.work.running || self.workspace.running.is_some(),
+            self.work.running
+                || self.workspace.running.is_some()
+                || stepx_companion::desktop_work::is_running(),
             "Amoo 任务正在执行",
             "等待任务完成，或在任务中停止后再更新。".into(),
             Action::Page(Page::Amoo),
@@ -260,7 +340,74 @@ impl Companion {
         rows
     }
 
+    pub(super) fn whats_new_state_path() -> PathBuf {
+        stepx_companion::resources::user_config().join("stepx-companion/whats_new_state.json")
+    }
+
+    pub(super) fn qr_custom_dir() -> PathBuf {
+        stepx_companion::resources::user_config().join("stepx-companion")
+    }
+
+    pub(super) fn load_whats_new_state(&mut self) -> WhatsNewPersistedState {
+        let path = Self::whats_new_state_path();
+        let persisted: WhatsNewPersistedState = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
+        let default_personal = Self::qr_custom_dir().join("qr_personal.png");
+        let personal_candidate = persisted
+            .personal_qr_custom_path
+            .as_deref()
+            .map(PathBuf::from)
+            .filter(|p| p.is_file())
+            .or_else(|| default_personal.is_file().then_some(default_personal));
+        self.desktop_update.personal_qr_custom_path = personal_candidate;
+
+        // Legacy download timestamps cannot prove a QR's expiry. Leave the old
+        // files intact, but only use a validated manifest-backed cache.
+        self.desktop_update.group_qr = community_qr::load_cached(&community_qr::cache_dir());
+        persisted
+    }
+
+    pub(super) fn save_whats_new_state(&self, last_seen_version: Option<&str>) {
+        let path = Self::whats_new_state_path();
+        let existing: WhatsNewPersistedState = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
+        let state = WhatsNewPersistedState {
+            last_seen_version: last_seen_version
+                .map(str::to_string)
+                .unwrap_or(existing.last_seen_version),
+            personal_qr_custom_path: self
+                .desktop_update
+                .personal_qr_custom_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(&state) {
+            let _ = std::fs::write(&path, json);
+        }
+    }
+
+    pub(super) fn record_desktop_event(
+        &mut self,
+        _kind: &str,
+        title: impl Into<String>,
+        detail: impl Into<String>,
+    ) {
+        self.record_notice(title, detail);
+    }
+
     pub(super) fn initialize_desktop_updates(&mut self, ctx: &mut ViewContext<Self>) {
+        let mut persisted = self.load_whats_new_state();
+        if std::env::var_os("STEPX_WHATS_NEW_PREVIEW").is_some() {
+            self.desktop_update.whats_new_open = true;
+            self.desktop_update.started = Instant::now();
+        }
         if self.demo_mode || self.capture.is_some() {
             #[cfg(feature = "ui-capture")]
             if self.demo_mode && std::env::var_os("STEPX_UPDATE_PREVIEW").is_some() {
@@ -291,6 +438,22 @@ impl Companion {
             }
             return;
         }
+        if persisted.mark_version_seen(stepx_companion::build_info::VERSION)
+            || std::env::var_os("STEPX_FORCE_WHATS_NEW").is_some()
+        {
+            self.desktop_update.whats_new_open = true;
+            self.desktop_update.started = Instant::now();
+            self.save_whats_new_state(Some(stepx_companion::build_info::VERSION));
+            self.record_desktop_event(
+                "version_whats_new",
+                format!(
+                    "StepX Companion 已更新至 v{}",
+                    stepx_companion::build_info::VERSION
+                ),
+                "已升级至新版本，点击可随时查看本次更新内容、作者个人微信与交流群二维码。",
+            );
+        }
+        self.auto_sync_group_qr_silently(ctx);
         self.desktop_update.notice = updater::last_result().unwrap_or_default();
         if let Some((dir, release)) = updater::cached_ready() {
             self.desktop_update.ready = Some(dir);
@@ -310,6 +473,42 @@ impl Companion {
             },
         );
     }
+    fn auto_sync_group_qr_silently(&mut self, ctx: &mut ViewContext<Self>) {
+        let now = Instant::now();
+        if self.desktop_update.qr_syncing
+            || self
+                .desktop_update
+                .qr_last_check
+                .is_some_and(|last| now.duration_since(last) < Duration::from_secs(300))
+        {
+            return;
+        }
+        self.desktop_update.qr_syncing = true;
+        self.desktop_update.qr_last_check = Some(now);
+        let dir = community_qr::cache_dir();
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let result = community_qr::sync(&dir, chrono::Local::now().timestamp_millis())
+                .map_err(|error| error.to_string());
+            let _ = tx.send_blocking(result);
+        });
+        ctx.spawn(async move { rx.recv().await }, |me, res, ctx| {
+            me.desktop_update.qr_syncing = false;
+            let success = matches!(&res, Ok(Ok(_)));
+            me.desktop_update.qr_next_check =
+                Instant::now() + Duration::from_secs(if success { 6 * 3600 } else { 15 * 60 });
+            match res {
+                Ok(Ok(qr)) => {
+                    super::widgets::invalidate_cached_file(&qr.path);
+                    me.desktop_update.group_qr = Some(qr);
+                    me.desktop_update.qr_last_error = None;
+                }
+                Ok(Err(error)) => me.desktop_update.qr_last_error = Some(error),
+                Err(_) => me.desktop_update.qr_last_error = Some("群码更新任务中断".into()),
+            }
+            ctx.notify();
+        });
+    }
     fn start_desktop_update_check(&mut self) {
         if self.desktop_update.job.is_some() {
             return;
@@ -325,6 +524,9 @@ impl Companion {
         self.desktop_update.phase = Phase::Failed;
         self.desktop_update.error = message;
     }
+    fn reset_release_scroll(&mut self) {
+        self.desktop_update.whats_new_scroll = Default::default();
+    }
     pub(super) fn handle_desktop_update(
         &mut self,
         action: &DesktopUpdateAction,
@@ -333,6 +535,7 @@ impl Companion {
         use DesktopUpdateAction as A;
         match action {
             A::Open => {
+                self.desktop_update.whats_new_open = false;
                 self.desktop_update.open = true;
                 self.desktop_update.started = Instant::now();
                 if self.desktop_update.phase == Phase::Idle {
@@ -340,7 +543,152 @@ impl Companion {
                 }
             }
             A::Close => self.desktop_update.open = false,
+            A::OpenWhatsNew => {
+                self.desktop_update.whats_new_open = true;
+                self.desktop_update.open = false;
+                self.desktop_update.whats_new_scroll = Default::default();
+                self.desktop_update.release_history = false;
+                self.desktop_update.release_category.clear();
+                self.desktop_update.release_home = true;
+                self.desktop_update.video_expanded = false;
+                self.desktop_update.started = Instant::now();
+                self.auto_sync_group_qr_silently(ctx);
+            }
+            A::CloseWhatsNew => {
+                self.desktop_update.whats_new_open = false;
+                self.desktop_update.video = None;
+                self.desktop_update.video_playing = false;
+                self.save_whats_new_state(Some(stepx_companion::build_info::VERSION));
+            }
+            A::Explore(destination) => {
+                use stepx_companion::release_notes::Destination as D;
+                if matches!(destination, D::History) {
+                    self.handle_desktop_update(&A::OpenHistory, ctx);
+                    return;
+                }
+                self.desktop_update.whats_new_open = false;
+                self.desktop_update.video = None;
+                self.desktop_update.video_playing = false;
+                self.save_whats_new_state(Some(stepx_companion::build_info::VERSION));
+                match destination {
+                    D::Search => self.handle_action(&Action::GlobalSearch(super::global_search::SearchAction::Open), ctx),
+                    D::Agent => self.handle_action(&Action::Settings(SettingsAction::Tab(super::settings_state::AGENT_SETTINGS_TAB)), ctx),
+                    D::About => {
+                        self.handle_action(&Action::Settings(SettingsAction::Tab(4)), ctx);
+                    }
+                    D::Settings | D::Notifications | D::Storage => {
+                        let tab = match destination { D::Notifications => 3, D::Storage => 1, _ => 0 };
+                        self.handle_action(&Action::Settings(SettingsAction::Tab(tab)), ctx);
+                    }
+                    D::Files => {
+                        self.recent_files_view = true;
+                        self.handle_action(&Action::Page(Page::Files), ctx);
+                    }
+                    _ => self.handle_action(&Action::Page(match destination {
+                        D::Home => Page::Home, D::Messages => Page::Sms, D::Phone => Page::Phone,
+                        D::Amoo => Page::Amoo, D::Studio => Page::Studio, D::Calendar => Page::Calendar,
+                        D::Alarms => Page::Alarms, D::Gallery => Page::Gallery, D::BackScreen => Page::BackScreen,
+                        D::Tools => Page::Tools, D::Connect => Page::Connect, D::Account => Page::Account, D::AppStore => Page::AppStore,
+                        _ => unreachable!(),
+                    }), ctx),
+                }
+            }
+            A::OpenHistory => {
+                self.desktop_update.open = false;
+                self.desktop_update.whats_new_open = true;
+                self.desktop_update.release_history = true;
+                self.desktop_update.release_home = false;
+                self.desktop_update.release_history_limit = 8;
+                self.reset_release_scroll();
+            }
+            A::MoreHistory => {
+                self.desktop_update.release_history_limit =
+                    (self.desktop_update.release_history_limit + 8)
+                        .min(stepx_companion::release_notes::history().len());
+            }
+            A::BackToStory => {
+                self.desktop_update.release_history = false;
+                self.desktop_update.release_home = false;
+                self.desktop_update.release_category.clear();
+                self.desktop_update.video_expanded = false;
+                self.reset_release_scroll();
+            }
+            A::Category(id) => {
+                if !id.is_empty()
+                    && !stepx_companion::release_notes::current()
+                        .is_ok_and(|n| n.categories.iter().any(|c| c.id == *id))
+                {
+                    return;
+                }
+                self.desktop_update.release_category = id.clone();
+                self.desktop_update.release_history = false;
+                self.desktop_update.release_home = false;
+                self.reset_release_scroll();
+                self.desktop_update.video_expanded = false;
+                if let Some(video) = &self.desktop_update.video {
+                    video.control(stepx_companion::release_video::Control::Pause);
+                }
+            }
+            A::ShowAuthor => {
+                self.desktop_update.release_home = true;
+                self.desktop_update.release_history = false;
+                self.desktop_update.video_expanded = false;
+                self.reset_release_scroll();
+                self.desktop_update.video = None;
+                self.desktop_update.video_playing = false;
+            }
+            A::ExpandVideo => {
+                self.desktop_update.video_expanded = !self.desktop_update.video_expanded;
+                self.reset_release_scroll();
+                if self.desktop_update.video_expanded {
+                    if !self.desktop_update.video_playing {
+                        self.handle_desktop_update(&A::PlayVideo, ctx);
+                    }
+                } else if let Some(video) = &self.desktop_update.video {
+                    video.control(stepx_companion::release_video::Control::Pause);
+                }
+            }
+            A::PlayVideo => {
+                use stepx_companion::release_video::{Player, Control};
+                if self.desktop_update.video.is_none() || self.desktop_update.video_error.is_some() {
+                    self.desktop_update.video = Some(Player::start()); self.desktop_update.video_revision = 0;
+                    self.desktop_update.video_error = None;
+                }
+                if let Some(video) = &self.desktop_update.video { video.control(if self.desktop_update.video_playing { Control::Pause } else { Control::Play }); }
+            }
+            A::SeekVideoTo(second) => {
+                use stepx_companion::release_video::{Player, Control, FPS};
+                if self.desktop_update.video.is_none() { self.desktop_update.video = Some(Player::start()); }
+                if let Some(video) = &self.desktop_update.video {
+                    video.control(Control::Seek(second.saturating_mul(FPS))); video.control(Control::Play);
+                }
+            }
+            A::SeekVideo(seconds) => {
+                use stepx_companion::release_video::{Player, Control, FPS};
+                if self.desktop_update.video.is_none() { self.desktop_update.video = Some(Player::start()); }
+                let frame = (i64::from(self.desktop_update.video_frame) + i64::from(*seconds) * i64::from(FPS)).max(0) as u32;
+                if let Some(video) = &self.desktop_update.video { video.control(Control::Seek(frame)); }
+            }
+            A::ChoosePersonalQr => {
+                self.choose_path(
+                    stepx_companion::file_dialog::FileDialog::new()
+                        .add_filter("二维码图片", &["png", "jpg", "jpeg", "webp"]),
+                    DialogKind::OpenFile,
+                    |app, src, _| {
+                        let dir = Self::qr_custom_dir();
+                        std::fs::create_dir_all(&dir)?;
+                        let dst = dir.join("qr_personal.png");
+                        std::fs::copy(&src, &dst)?;
+                        super::widgets::invalidate_cached_file(&dst);
+                        app.desktop_update.personal_qr_custom_path = Some(dst);
+                        app.desktop_update.qr_status_note = "已更新个人微信二维码".into();
+                        app.save_whats_new_state(None);
+                        Ok(())
+                    },
+                );
+            }
             A::Check => {
+                self.desktop_update.whats_new_open = false;
                 self.desktop_update.open = true;
                 self.desktop_update.started = Instant::now();
                 self.start_desktop_update_check();
@@ -412,6 +760,44 @@ impl Companion {
         ctx.notify();
     }
     pub(super) fn poll_desktop_update(&mut self, ctx: &mut ViewContext<Self>) {
+        if !self.desktop_update.whats_new_open
+            || self.desktop_update.release_history
+            || self.desktop_update.release_home
+        {
+            self.desktop_update.video = None;
+            self.desktop_update.video_playing = false;
+        }
+        let snapshot = self
+            .desktop_update
+            .video
+            .as_ref()
+            .and_then(|p| p.poll(self.desktop_update.video_revision));
+        if let Some(snapshot) = snapshot {
+            self.desktop_update.video_revision = snapshot.revision;
+            self.desktop_update.video_frame = snapshot.frame;
+            self.desktop_update.video_playing = snapshot.playing;
+            self.desktop_update.video_error = snapshot.error;
+            if let Some(bytes) = snapshot.jpeg {
+                use facloud_ui::{
+                    assets::asset_cache::AssetCache, image_cache::ImageType, SingletonEntity,
+                };
+                AssetCache::handle(ctx).update(ctx, |cache, cache_ctx| {
+                    cache.insert_raw_asset_bytes::<ImageType>(
+                        stepx_companion::release_video::FRAME_ASSET.into(),
+                        &bytes,
+                        cache_ctx,
+                    );
+                });
+                self.desktop_update.video_ready = true;
+            }
+            ctx.notify();
+        }
+        if !self.demo_mode
+            && self.capture.is_none()
+            && Instant::now() >= self.desktop_update.qr_next_check
+        {
+            self.auto_sync_group_qr_silently(ctx);
+        }
         while let Some(event) = self.desktop_update.job.as_ref().and_then(|j| j.poll()) {
             let terminal = !matches!(event, updater::Event::Progress { .. });
             match event {
@@ -531,11 +917,22 @@ impl Companion {
         let mut parts = vec![
             self.between(
                 self.heading("软件更新"),
-                self.button(
-                    "desktop-update-settings",
-                    "检查更新",
-                    Action::DesktopUpdate(DesktopUpdateAction::Check),
-                    Btn::Secondary,
+                self.hstack(
+                    S2,
+                    vec![
+                        self.button(
+                            "desktop-update-whats-new",
+                            "查看本次更新与交流群",
+                            Action::DesktopUpdate(DesktopUpdateAction::OpenWhatsNew),
+                            Btn::Secondary,
+                        ),
+                        self.button(
+                            "desktop-update-settings",
+                            "检查更新",
+                            Action::DesktopUpdate(DesktopUpdateAction::Check),
+                            Btn::Secondary,
+                        ),
+                    ],
                 ),
             ),
             self.text(self.desktop_update.label(), BODY, p.text2),
@@ -550,7 +947,226 @@ impl Companion {
         }
         self.panel(parts)
     }
+
+    pub(super) fn personal_job_banner(&self, id_prefix: &str) -> El {
+        let p = self.p();
+        // The project exists to help its author find work. This is the primary
+        // message, not muted release metadata. Keep the original paragraphs.
+        let headline = self.text_w("我正在找工作，欢迎联系或内推", 26., p.text, facloud_ui::fonts::Weight::Semibold);
+        #[cfg(feature = "ui-capture")]
+        let headline = super::scenario_check::control(format!("{id_prefix}-job-headline"), headline);
+        let banner = Container::new(self.vstack(
+            S3,
+            vec![
+                self.hstack(S2, vec![
+                    self.ui_icon(super::icons::UiIcon::Briefcase, 20., p.blue),
+                    Expanded::new(1., self.text_w("董正法 · 产品负责人 / 产品专家（上海及周边 · 华东地区均可）", 16., p.text, facloud_ui::fonts::Weight::Semibold)).finish(),
+                ]),
+                headline,
+                self.text_w("求职方向：产品岗 / AI 产品岗 / 产品与 AI 应用开发复合岗", SUBHEAD, p.text, facloud_ui::fonts::Weight::Semibold),
+                self.text("能从用户与业务调研出发，完成产品规划、以用户体验为核心的界面与交互设计，借助 AI 完成前后端业务开发、测试、部署上线，并持续做运营与迭代。", BODY, p.text2),
+                self.wrap(vec![
+                    self.button_icon(
+                        &format!("{id_prefix}-copy-wx"), "联系我 · 复制微信", super::icons::UiIcon::Chat,
+                        Action::CopyText("164245026".into(), "作者微信号 164245026 已复制".into()), Btn::Primary,
+                    ),
+                    self.button_icon(
+                        &format!("{id_prefix}-copy-email"), "复制邮箱", super::icons::UiIcon::Sms,
+                        Action::CopyText("f@ab.cool".into(), "作者邮箱 f@ab.cool 已复制".into()), Btn::Secondary,
+                    ),
+                    self.text("微信 164245026 · 邮箱 f@ab.cool", BODY, p.text2),
+                ]),
+                self.text(
+                    "说句实在话：家里小孩还不满一岁，眼下非常需要一份工作，在家里也能少一点唠叨。上海附近或整个华东地区都可以，近一点、远一点都行，能干事、能扛事。如果刚好有合适的机会或能帮忙内推，欢迎随时加我微信聊聊，真心感谢！",
+                    SUBHEAD, p.text,
+                ),
+                self.divider(),
+                self.text_w("我做过什么，也能为团队做什么", SUBHEAD, p.text, facloud_ui::fonts::Weight::Semibold),
+                self.text(
+                    "10年+ 产品与管理经验，既独立带过产品团队，也统筹管过完整的产研团队；从 0 到 1 做成过 300 万用户的 App、智能硬件互联系统和企业 AI 平台，既能拆解业务带团队拿结果，也能自己动手把想法直接做成产品（比如你正在用的这款软件和企业的AI平台 SkillForge）。",
+                    SUBHEAD, p.text2,
+                ),
+                self.text_w("软硬件产品全流程交付", SUBHEAD, p.text, facloud_ui::fonts::Weight::Semibold),
+                self.text("能独立完成软硬件产品从需求调研、产品规划、开发实现、联调测试到上线交付的全流程，兼顾用户体验、运行稳定性与交付成本，并根据真实使用反馈持续迭代。", BODY, p.text2),
+                self.text_w("AI 应用开发与评估", SUBHEAD, p.text, facloud_ui::fonts::Weight::Semibold),
+                self.text("从业务场景判断是否适合用 AI，设计和开发 Agent 工作流、接入工具与业务数据，验证实际效果与稳定性，跟踪调用用量与成本。", BODY, p.text2),
+                self.wrap(vec![
+                    self.button(&format!("{id_prefix}-open-sf"), "企业的AI平台 SkillForge",
+                        Action::StudioOpenUrl("https://github.com/xydzf520/skillforge".into()), Btn::Secondary),
+                    self.button(&format!("{id_prefix}-open-gh"), "GitHub",
+                        Action::StudioOpenUrl("https://github.com/xydzf520/stepx".into()), Btn::Secondary),
+                ]),
+            ],
+        ))
+        .with_uniform_padding(S4)
+        .with_background_color(lerp_color(p.bg, p.blue, if p.dark { 0.10 } else { 0.035 }))
+        .with_border(Border::all(1.).with_border_color(lerp_color(p.border, p.blue, 0.22)))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_PANEL)))
+        .finish();
+        #[cfg(feature = "ui-capture")]
+        let banner = super::scenario_check::control(format!("{id_prefix}-job-banner"), banner);
+        banner
+    }
+
+    pub(super) fn personal_contact_cards(&self, _id_prefix: &str) -> El {
+        let p = self.p();
+        let personal_source = match &self.desktop_update.personal_qr_custom_path {
+            Some(path) if super::widgets::cached_is_file(path) => {
+                facloud_ui::assets::asset_cache::AssetSource::LocalFile {
+                    path: path.to_string_lossy().into_owned(),
+                }
+            }
+            _ => facloud_ui::assets::asset_cache::AssetSource::Bundled {
+                path: "qr_personal.png",
+            },
+        };
+        let personal_qr_frame = Align::new(
+            Container::new(
+                ConstrainedBox::new(
+                    Image::new(personal_source, CacheOption::BySize)
+                        .contain()
+                        .finish(),
+                )
+                .with_width(142.)
+                .with_height(206.)
+                .finish(),
+            )
+            .with_uniform_padding(6.)
+            .with_background_color(rgb(255, 255, 255))
+            .with_border(Border::all(1.).with_border_color(p.border))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(10.)))
+            .finish(),
+        )
+        .finish();
+
+        let personal_card = Container::new(self.vstack(
+            S2,
+            vec![
+                self.line_w(
+                    "个人微信 · 董正法（倒影颠倒）",
+                    SUBHEAD,
+                    p.text,
+                    facloud_ui::fonts::Weight::Semibold,
+                ),
+                self.text("微信：164245026 · 邮箱：f@ab.cool", MICRO, p.text2),
+                personal_qr_frame,
+                self.text(
+                    "扫码直接添加作者微信 · 欢迎工作机会联系、内推交流与拉群",
+                    MICRO,
+                    p.text3,
+                ),
+            ],
+        ))
+        .with_uniform_padding(S3)
+        .with_background_color(p.bg)
+        .with_border(Border::all(1.).with_border_color(p.border))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CARD)))
+        .finish();
+
+        #[cfg(feature = "ui-capture")]
+        let personal_card = super::scenario_check::control(format!("{_id_prefix}-personal-card"), personal_card);
+
+        let now_ms = chrono::Local::now().timestamp_millis();
+        let (group_source, expires_at_ms) = match &self.desktop_update.group_qr {
+            Some(qr) if super::widgets::cached_is_file(&qr.path) => (
+                facloud_ui::assets::asset_cache::AssetSource::LocalFile {
+                    path: qr.path.to_string_lossy().into_owned(),
+                },
+                qr.expires_at_ms,
+            ),
+            _ => (
+                facloud_ui::assets::asset_cache::AssetSource::Bundled {
+                    path: "qr_group.png",
+                },
+                community_qr::bundled_manifest()
+                    .expires_at_ms()
+                    .unwrap_or(0),
+            ),
+        };
+        let group_valid = expires_at_ms > now_ms;
+        let group_qr_frame = Align::new(
+            Container::new(
+                ConstrainedBox::new(
+                    Image::new(group_source, CacheOption::BySize)
+                        .contain()
+                        .finish(),
+                )
+                .with_width(142.)
+                .with_height(206.)
+                .finish(),
+            )
+            .with_uniform_padding(6.)
+            .with_background_color(rgb(255, 255, 255))
+            .with_border(Border::all(1.).with_border_color(p.border))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(10.)))
+            .finish(),
+        )
+        .finish();
+
+        let group_body = if group_valid {
+            group_qr_frame
+        } else {
+            ConstrainedBox::new(
+                Align::new(self.vstack(
+                    S2,
+                    vec![
+                        self.ui_icon(super::icons::UiIcon::Users, 36.0, p.text3),
+                        self.text("请扫左侧微信联系入群", CAPTION, p.text2),
+                    ],
+                ))
+                .finish(),
+            )
+            .with_height(218.)
+            .finish()
+        };
+        let group_card = Container::new(self.vstack(
+            S2,
+            vec![
+                self.line_w(
+                    "交流群 · StepX伴侣",
+                    SUBHEAD,
+                    p.text,
+                    facloud_ui::fonts::Weight::Semibold,
+                ),
+                self.text("产品与技术交流，分享使用体验与建议", MICRO, p.text2),
+                group_body,
+                self.text(
+                    if group_valid {
+                        "扫码加入交流"
+                    } else {
+                        "群码暂不可用"
+                    },
+                    MICRO,
+                    p.text3,
+                ),
+            ],
+        ))
+        .with_uniform_padding(S3)
+        .with_background_color(p.bg)
+        .with_border(Border::all(1.).with_border_color(p.border))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CARD)))
+        .finish();
+
+        #[cfg(feature = "ui-capture")]
+        let group_card = super::scenario_check::control(format!("{_id_prefix}-group-card"), group_card);
+
+        let cards_row = self.responsive_columns(560., S3, S3, CrossAxisAlignment::Stretch, vec![(1., personal_card), (1., group_card)]);
+
+        cards_row
+    }
+
+    pub(super) fn personal_and_group_qr_cards(&self, id_prefix: &str) -> El {
+        self.vstack(S3, vec![self.personal_job_banner(id_prefix), self.personal_contact_cards(id_prefix)])
+    }
+
+    pub(super) fn whats_new_overlay(&self) -> Option<El> {
+        self.release_story_overlay()
+    }
+
     pub(super) fn desktop_update_overlay(&self) -> Option<El> {
+        if self.desktop_update.whats_new_open && !self.desktop_update.open {
+            return self.whats_new_overlay();
+        }
         if !self.desktop_update.open {
             return None;
         }
@@ -735,6 +1351,12 @@ impl Companion {
             _ => {}
         }
         buttons.push(self.button(
+            "desktop-update-open-whats-new",
+            "本次更新与交流群",
+            a(DesktopUpdateAction::OpenWhatsNew),
+            Btn::Secondary,
+        ));
+        buttons.push(self.button(
             "desktop-update-later",
             if u.phase == Phase::Ready {
                 "稍后重启"
@@ -765,23 +1387,22 @@ impl Companion {
                 p.text3,
             ));
         }
-        let sheet = Container::new(self.vstack(S3, parts))
+        let sheet_inner = Container::new(self.vstack(S3, parts))
             .with_uniform_padding(S5)
-            .with_background_color(p.surface)
-            .with_border(Border::all(1.).with_border_color(p.border))
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_PANEL)))
             .finish();
+        let sheet = self.elevated_overlay_card(sheet_inner, 510., false);
         let sheet = motion::enter(sheet, u.started, !self.settings.value.reduced_motion);
         Some(
-            Container::new(
-                Align::new(ConstrainedBox::new(sheet).with_max_width(510.).finish())
-                    .bottom_right()
-                    .finish(),
-            )
-            .with_uniform_padding(S4)
-            .with_padding_bottom(38.)
-            .with_background_color(rgba(0, 0, 0, 45))
-            .finish(),
+            Container::new(Align::new(sheet).bottom_right().finish())
+                .with_uniform_padding(S4)
+                .with_padding_bottom(38.)
+                .with_background_color(if p.dark {
+                    rgba(0, 0, 0, 130)
+                } else {
+                    rgba(15, 23, 42, 90)
+                })
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(12.)))
+                .finish(),
         )
     }
 }
@@ -899,5 +1520,16 @@ mod tests {
         assert_eq!(state.label(), "下载更新 62%");
         state.phase = Phase::Ready;
         assert_eq!(state.label(), "更新已准备好");
+    }
+
+    #[test]
+    fn whats_new_pops_once_per_version() {
+        let mut persisted = WhatsNewPersistedState::default();
+        assert!(persisted.should_pop_once_for_version("0.2.125"));
+        assert!(persisted.mark_version_seen("0.2.125"));
+        assert!(!persisted.should_pop_once_for_version("0.2.125"));
+        assert!(!persisted.mark_version_seen("0.2.125"));
+        assert!(persisted.should_pop_once_for_version("0.2.126"));
+        assert!(persisted.mark_version_seen("0.2.126"));
     }
 }

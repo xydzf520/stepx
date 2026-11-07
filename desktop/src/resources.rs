@@ -1,5 +1,33 @@
 //! Locate resources beside a portable executable, inside a macOS bundle, or in source.
 use std::path::PathBuf;
+
+thread_local! {
+    static CONFIG_DIR_OVERRIDE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Keeps UI test configuration isolated even when the library is compiled as a
+/// normal dependency of a test binary (and therefore does not have `cfg(test)`).
+#[doc(hidden)]
+pub struct ConfigDirOverride {
+    previous: Option<PathBuf>,
+    // The override must be restored on the thread that installed it.
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[doc(hidden)]
+pub fn override_config_dir_for_current_thread(path: PathBuf) -> ConfigDirOverride {
+    ConfigDirOverride {
+        previous: CONFIG_DIR_OVERRIDE.with(|slot| slot.borrow_mut().replace(path)),
+        _thread_bound: std::marker::PhantomData,
+    }
+}
+
+impl Drop for ConfigDirOverride {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        let _ = CONFIG_DIR_OVERRIDE.try_with(|slot| *slot.borrow_mut() = previous);
+    }
+}
 pub fn root() -> PathBuf {
     if let Some(path) = std::env::var_os("STEPX_RESOURCE_DIR") {
         return PathBuf::from(path);
@@ -16,6 +44,9 @@ pub fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")
 }
 pub fn user_config() -> PathBuf {
+    if let Some(path) = CONFIG_DIR_OVERRIDE.with(|slot| slot.borrow().clone()) {
+        return path;
+    }
     std::env::var_os("STEPX_CONFIG_DIR")
         .or_else(|| std::env::var_os("XDG_CONFIG_HOME"))
         .or_else(|| std::env::var_os("APPDATA"))
@@ -83,6 +114,11 @@ pub fn python_command() -> std::process::Command {
     command.env("STEPX_RESOURCE_DIR", root());
     command.env("STEPX_STATE_DIR", user_state());
     command.env("PYTHONDONTWRITEBYTECODE", "1");
+    if std::env::var_os("STEPX_ADB").is_none() {
+        if let Some(adb) = crate::adb::bundled_tool("adb") {
+            command.env("STEPX_ADB", adb);
+        }
+    }
     quiet_command(&mut command);
     command
 }

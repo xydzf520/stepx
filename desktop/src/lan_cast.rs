@@ -637,10 +637,19 @@ pub fn discover_lan_receivers(adb: Option<&Adb>, serial: Option<&str>) -> LanDis
 
     // 4. Active LAN Neighbor & Port Discovery (ARP + Phone Neighbors + Port Probe)
     for r in discover_arp_and_port_receivers(&host_lan_ip, phone_lan_ip.as_deref(), adb, serial) {
-        let already_has_ip = receivers
-            .iter()
-            .any(|existing| existing.ip == r.ip && existing.protocol == r.protocol);
-        if !already_has_ip && seen_ids.insert(r.id.clone()) {
+        if let Some(existing) = receivers
+            .iter_mut()
+            .find(|existing| existing.ip == r.ip && existing.protocol == r.protocol)
+        {
+            if existing.control_url.is_none() && r.control_url.is_some() {
+                existing.control_url = r.control_url.clone();
+            }
+            if existing.mac.is_none() && r.mac.is_some() {
+                existing.mac = r.mac.clone();
+            }
+            continue;
+        }
+        if seen_ids.insert(r.id.clone()) {
             receivers.push(r);
         }
     }
@@ -846,11 +855,18 @@ fn fetch_and_parse_upnp_location(
     };
 
     let name = friendly_name.unwrap_or_else(|| format!("局域网投屏设备 ({host})"));
-    let model = match (manufacturer, model_name) {
+    let base_model = match (manufacturer, model_name) {
         (Some(m), Some(md)) if !md.starts_with(&m) => format!("{m} {md}"),
         (_, Some(md)) => md,
         (Some(m), None) => m,
         (None, None) => server_hint.unwrap_or("UPnP / DLNA").to_string(),
+    };
+    let can_direct_push =
+        matches!(protocol, LanCastProtocol::DlnaUpnp) && av_control_url.is_some();
+    let model = if matches!(protocol, LanCastProtocol::GoogleCast) {
+        format!("{base_model} · 请复制投屏链接在电视浏览器打开或用手机系统投屏")
+    } else {
+        base_model
     };
 
     Some(LanCastReceiver {
@@ -865,7 +881,7 @@ fn fetch_and_parse_upnp_location(
         location_url: Some(location.to_string()),
         mac: None,
         online: true,
-        can_direct_push: true,
+        can_direct_push,
     })
 }
 
@@ -912,11 +928,17 @@ fn discover_mdns_receivers() -> Vec<LanCastReceiver> {
                                 .unwrap_or("局域网投屏终端")
                                 .replace("\\032", " ")
                         });
-                    let model = info
+                    let base_model = info
                         .get_property_val_str("md")
                         .or_else(|| info.get_property_val_str("model"))
                         .unwrap_or(proto.short_badge())
                         .to_string();
+                    let can_direct_push = !matches!(proto, LanCastProtocol::GoogleCast);
+                    let model = if matches!(proto, LanCastProtocol::GoogleCast) {
+                        format!("{base_model} · 请复制投屏链接在电视浏览器打开或用手机系统投屏")
+                    } else {
+                        base_model
+                    };
                     out.push(LanCastReceiver {
                         id: format!("mdns:{}:{ip}:{port}", proto.short_badge()),
                         name: friendly,
@@ -929,7 +951,7 @@ fn discover_mdns_receivers() -> Vec<LanCastReceiver> {
                         location_url: None,
                         mac: None,
                         online: true,
-                        can_direct_push: true,
+                        can_direct_push,
                     });
                 }
             }
@@ -942,33 +964,139 @@ fn discover_mdns_receivers() -> Vec<LanCastReceiver> {
     out
 }
 
+fn normalize_arp_mac(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_matches(|c| c == '[' || c == ']');
+    if trimmed.is_empty() || trimmed.contains("incomplete") {
+        return None;
+    }
+    let parts: Vec<&str> = trimmed.split([':', '-']).collect();
+    if parts.len() != 6 {
+        return None;
+    }
+    let mut octets = Vec::with_capacity(6);
+    for part in parts {
+        if part.is_empty() || part.len() > 2 || !part.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        let val = u8::from_str_radix(part, 16).ok()?;
+        octets.push(format!("{val:02x}"));
+    }
+    let formatted = octets.join(":");
+    if formatted == "00:00:00:00:00:00" || formatted == "ff:ff:ff:ff:ff:ff" {
+        return None;
+    }
+    Some(formatted)
+}
+
+fn is_valid_unicast_lan_ip(ip: &str, host_prefix: &str) -> bool {
+    let Ok(addr) = ip.parse::<std::net::Ipv4Addr>() else {
+        return false;
+    };
+    let octets = addr.octets();
+    if addr.is_loopback()
+        || addr.is_multicast()
+        || addr.is_broadcast()
+        || addr.is_unspecified()
+        || octets[3] == 255
+        || octets[3] == 0
+    {
+        return false;
+    }
+    host_prefix.is_empty() || ip.starts_with(host_prefix)
+}
+
+fn parse_proc_net_arp(arp: &str, host_prefix: &str) -> HashMap<String, String> {
+    let mut ip_mac = HashMap::new();
+    for line in arp.lines().skip(1) {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() >= 6 && cols[2] != "0x0" {
+            let ip = cols[0];
+            let dev = cols[5];
+            let is_virtual = dev.starts_with("docker")
+                || dev.starts_with("br-")
+                || dev.starts_with("veth")
+                || dev.starts_with("virbr");
+            if !is_virtual && is_valid_unicast_lan_ip(ip, host_prefix) {
+                if let Some(mac) = normalize_arp_mac(cols[3]) {
+                    ip_mac.insert(ip.to_string(), mac);
+                }
+            }
+        }
+    }
+    ip_mac
+}
+
+fn parse_arp_a_output(arp: &str, host_prefix: &str) -> HashMap<String, String> {
+    let mut ip_mac = HashMap::new();
+    for line in arp.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // BSD / macOS / Linux `arp -a`: `? (192.168.1.5) at aa:bb:cc:dd:ee:ff on en0 ...`
+        if let (Some(lp), Some(rp)) = (trimmed.find('('), trimmed.find(')')) {
+            if lp + 1 < rp {
+                let ip = trimmed[lp + 1..rp].trim();
+                let rest = trimmed[rp + 1..].trim();
+                if let Some(after_at) = rest.strip_prefix("at ") {
+                    let tokens: Vec<&str> = after_at.split_whitespace().collect();
+                    let dev = tokens
+                        .iter()
+                        .position(|&w| w == "on")
+                        .and_then(|idx| tokens.get(idx + 1))
+                        .copied()
+                        .unwrap_or("");
+                    let is_virtual = dev.starts_with("docker")
+                        || dev.starts_with("br-")
+                        || dev.starts_with("veth")
+                        || dev.starts_with("virbr")
+                        || dev.starts_with("utun");
+                    if !is_virtual && is_valid_unicast_lan_ip(ip, host_prefix) {
+                        if let Some(raw_mac) = tokens.first() {
+                            if let Some(mac) = normalize_arp_mac(raw_mac) {
+                                ip_mac.insert(ip.to_string(), mac);
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
+        }
+        // Windows `arp -a`: `  192.168.1.5           aa-bb-cc-dd-ee-ff     dynamic`
+        let cols: Vec<&str> = trimmed.split_whitespace().collect();
+        if cols.len() >= 2 && is_valid_unicast_lan_ip(cols[0], host_prefix) {
+            if let Some(mac) = normalize_arp_mac(cols[1]) {
+                ip_mac.insert(cols[0].to_string(), mac);
+            }
+        }
+    }
+    ip_mac
+}
+
 fn discover_arp_and_port_receivers(
     host_ip: &str,
     phone_ip: Option<&str>,
     adb: Option<&Adb>,
     serial: Option<&str>,
 ) -> Vec<LanCastReceiver> {
-    let mut ip_mac: HashMap<String, String> = HashMap::new();
-
     let host_prefix = host_ip
         .rsplit_once('.')
         .map(|(p, _)| format!("{p}."))
         .unwrap_or_default();
 
-    if let Ok(arp) = std::fs::read_to_string("/proc/net/arp") {
-        for line in arp.lines().skip(1) {
-            let cols: Vec<&str> = line.split_whitespace().collect();
-            if cols.len() >= 6 && cols[2] != "0x0" && cols[3] != "00:00:00:00:00:00" {
-                let ip = cols[0];
-                let dev = cols[5];
-                let is_virtual = dev.starts_with("docker")
-                    || dev.starts_with("br-")
-                    || dev.starts_with("veth")
-                    || dev.starts_with("virbr");
-                let same_subnet = host_prefix.is_empty() || ip.starts_with(&host_prefix);
-                if !is_virtual && same_subnet {
-                    ip_mac.insert(ip.to_string(), cols[3].to_string());
-                }
+    let mut ip_mac: HashMap<String, String> = match std::fs::read_to_string("/proc/net/arp") {
+        Ok(arp) => parse_proc_net_arp(&arp, &host_prefix),
+        Err(_) => HashMap::new(),
+    };
+
+    if ip_mac.is_empty() {
+        let mut cmd = Command::new("arp");
+        cmd.arg("-a");
+        crate::resources::quiet_command(&mut cmd);
+        if let Ok(output) = crate::adb::run_process(cmd, None, Duration::from_secs(2)) {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for (ip, mac) in parse_arp_a_output(&text, &host_prefix) {
+                ip_mac.entry(ip).or_insert(mac);
             }
         }
     }
@@ -980,15 +1108,18 @@ fn discover_arp_and_port_receivers(
         ) {
             for line in neigh.lines() {
                 let cols: Vec<&str> = line.split_whitespace().collect();
-                if let Some(ip) = cols.first() {
-                    if ip.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-                        let mac = cols
+                if let Some(&ip) = cols.first() {
+                    if is_valid_unicast_lan_ip(ip, &host_prefix) {
+                        if let Some(raw_mac) = cols
                             .iter()
                             .position(|&w| w == "lladdr")
                             .and_then(|idx| cols.get(idx + 1))
                             .copied()
-                            .unwrap_or("未知 MAC");
-                        ip_mac.entry((*ip).to_string()).or_insert_with(|| mac.to_string());
+                        {
+                            if let Some(mac) = normalize_arp_mac(raw_mac) {
+                                ip_mac.entry(ip.to_string()).or_insert(mac);
+                            }
+                        }
                     }
                 }
             }
@@ -1064,13 +1195,15 @@ fn probe_lan_host(ip: String, mac: String) -> Option<LanCastReceiver> {
             ip: ip.clone(),
             port: 8008,
             protocol: LanCastProtocol::GoogleCast,
-            model: format!("Chromecast / DIAL 协议终端 · MAC {mac}"),
+            model: format!(
+                "Chromecast / DIAL 终端（请复制投屏链接在电视浏览器打开或用手机系统投屏） · MAC {mac}"
+            ),
             control_url: Some(format!("http://{ip}:8008/apps")),
             rendering_control_url: None,
             location_url: None,
             mac: Some(mac),
             online: true,
-            can_direct_push: true,
+            can_direct_push: false,
         });
     }
 
@@ -1196,15 +1329,34 @@ pub fn set_phone_miracast_enabled(
 pub fn open_phone_cast_settings(adb: &Adb, serial: &str) -> Result<()> {
     let resolved = crate::device::resolve_online_transport(adb, serial, "", "PZ261A", &[])
         .unwrap_or_else(|_| serial.to_string());
+    let device = crate::device::Device::inspect(adb, &resolved)?;
+    if crate::native_mcp::try_call(adb, &device,
+        "connectivitysettings_open_settings_wifi_display_settings_activity", serde_json::json!({}))?.is_some() {
+        return Ok(());
+    }
     let _ = adb.script(
         &resolved,
-        "input keyevent 224 >/dev/null 2>&1 || true; settings put global wifi_display_on 1; am start -a android.settings.CAST_SETTINGS >/dev/null 2>&1",
+        "am start -a android.settings.CAST_SETTINGS",
     )?;
     Ok(())
 }
 
-pub fn connect_phone_miracast(adb: &Adb, serial: &str, _address: &str) -> Result<()> {
-    open_phone_cast_settings(adb, serial)
+pub fn connect_phone_miracast(adb: &Adb, serial: &str, address: &str) -> Result<()> {
+    let clean_addr: String = address
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '-' | '.'))
+        .collect();
+    if clean_addr.is_empty() {
+        return open_phone_cast_settings(adb, serial);
+    }
+    let resolved = crate::device::resolve_online_transport(adb, serial, "", "PZ261A", &[])
+        .unwrap_or_else(|_| serial.to_string());
+    let script = format!(
+        "input keyevent 224 >/dev/null 2>&1 || true; settings put global wifi_display_on 1; settings put global wifi_display_chosen_device {clean_addr} >/dev/null 2>&1 || true; am start -a android.settings.CAST_SETTINGS --es wifi_display_address {clean_addr} >/dev/null 2>&1"
+    );
+    let _ = adb.script(&resolved, &script)?;
+    Ok(())
 }
 
 // ============================================================================
@@ -1430,11 +1582,37 @@ impl LanCastServer {
         self.shared.1.notify_all();
         let pid = self.h264_child_pid.swap(0, Ordering::Relaxed);
         if pid > 0 {
-            #[cfg(unix)]
-            unsafe {
-                libc::kill(pid as i32, libc::SIGTERM);
-            }
+            terminate_cast_child_pid(pid);
         }
+    }
+}
+
+fn terminate_cast_child_pid(pid: u64) {
+    if pid == 0 {
+        return;
+    }
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    #[cfg(windows)]
+    {
+        let mut cmd = Command::new("taskkill");
+        cmd.args(["/PID", &pid.to_string(), "/T", "/F"]);
+        crate::resources::quiet_command(&mut cmd);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let _ = cmd.status();
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
 }
 
@@ -1470,7 +1648,7 @@ fn find_scrcpy_server_jar() -> Option<(PathBuf, String)> {
     candidates.push(
         crate::resources::root().join(".tools/root/scrcpy-linux-x86_64-v5.0.1/scrcpy-server"),
     );
-    if let Some(home) = std::env::var_os("HOME") {
+    if let Some(home) = crate::resources::user_home() {
         candidates.push(
             PathBuf::from(home)
                 .join(".local/opt/stepx-companion/tools/root/scrcpy-linux-x86_64-v5.0.1/scrcpy-server"),
@@ -1737,6 +1915,21 @@ fn unified_h264_cast_loop(
             continue;
         }
         let q = LanCastQuality::from_u8(quality_atom.load(Ordering::Relaxed));
+        let is_wireless = active_serial.contains(':') || active_serial.starts_with("adb-");
+        let effective_bit_rate = if is_wireless {
+            q.bit_rate_bps().min(5_000_000)
+        } else {
+            q.bit_rate_bps()
+        };
+        let effective_max_fps = if is_wireless {
+            if matches!(q, LanCastQuality::Smooth720p) {
+                30
+            } else {
+                45
+            }
+        } else {
+            60
+        };
 
         // Wake sleeping phone screen & query physical resolution once per stream session
         let adb = Adb {
@@ -1804,9 +1997,14 @@ fn unified_h264_cast_loop(
                 .is_ok()
             {
                 let max_dim = q.max_dim();
-                let bit_rate = q.bit_rate_bps();
+                let bit_rate = effective_bit_rate;
+                let codec_opts = if is_wireless {
+                    "profile=1,level=4096,i-frame-interval=2"
+                } else {
+                    "profile=1,level=4096"
+                };
                 let server_cmd = format!(
-                    "CLASSPATH={remote_jar} app_process / com.genymobile.scrcpy.Server {jar_ver} scid={scid_hex} log_level=info video=true audio=false control=false tunnel_forward=true raw_stream=true cleanup=false max_size={max_dim} max_fps=60 video_bit_rate={bit_rate} video_codec_options=profile=1,level=4096"
+                    "CLASSPATH={remote_jar} app_process / com.genymobile.scrcpy.Server {jar_ver} scid={scid_hex} log_level=info video=true audio=false control=false tunnel_forward=true raw_stream=true cleanup=false max_size={max_dim} max_fps={effective_max_fps} video_bit_rate={bit_rate} video_codec_options={codec_opts}"
                 );
                 let mut cmd = Command::new(&adb_path);
                 cmd.args(["-s", &active_serial, "shell", &server_cmd])
@@ -1935,9 +2133,33 @@ fn unified_h264_cast_loop(
                         Duration::from_secs(1),
                     );
                     if !stop.load(Ordering::Relaxed) {
+                        if let Ok(resolved) = crate::device::resolve_online_transport(
+                            &adb,
+                            &active_serial,
+                            "",
+                            "PZ261A",
+                            &[],
+                        ) {
+                            if !resolved.is_empty() && resolved != active_serial {
+                                if let Ok(mut slot) = serial_slot.lock() {
+                                    *slot = resolved;
+                                }
+                            }
+                        }
                         thread::sleep(Duration::from_millis(80));
                     }
                     continue;
+                }
+            } else if !stop.load(Ordering::Relaxed) {
+                if let Ok(resolved) =
+                    crate::device::resolve_online_transport(&adb, &active_serial, "", "PZ261A", &[])
+                {
+                    if !resolved.is_empty() && resolved != active_serial {
+                        if let Ok(mut slot) = serial_slot.lock() {
+                            *slot = resolved;
+                        }
+                        continue;
+                    }
                 }
             }
         }
@@ -1953,7 +2175,7 @@ fn unified_h264_cast_loop(
             "--size",
             q.screenrecord_size(),
             "--bit-rate",
-            &q.bit_rate_bps().to_string(),
+            &effective_bit_rate.to_string(),
             "-",
         ])
         .stdin(Stdio::null())
@@ -2433,7 +2655,21 @@ pub fn push_stream_to_receiver(
             ))
         }
         LanCastProtocol::GoogleCast => {
-            bail!("已发现该 Google Cast 设备，但当前未实现 Cast V2 媒体会话。请在接收端浏览器打开本次投屏链接，或使用支持的 DLNA 接收端");
+            if let Some(app_url) = receiver.control_url.as_deref() {
+                if dial_notify_receiver(app_url, &stats.web_url).is_ok() {
+                    return Ok(format!(
+                        "已通过 DIAL 协议向 Google Cast 设备「{}」({}) 推送投屏会话 ({})",
+                        receiver.name, receiver.ip, stats.web_url
+                    ));
+                }
+            }
+            bail!(
+                "该 Google Cast 设备「{}」({}) 未开启 DIAL 接收服务且当前未实现 Cast V2 媒体会话。请复制投屏链接 {} 在接收端浏览器打开，或使用 VLC 打开 {}",
+                receiver.name,
+                receiver.ip,
+                stats.web_url,
+                stats.ts_url
+            );
         }
         LanCastProtocol::Miracast => {
             if let (Some(adb), Some(serial)) = (adb, serial) {
@@ -2611,20 +2847,37 @@ fn send_soap_action(control_url: &str, soap_action: &str, xml_body: &str) -> Res
 }
 
 fn airplay_push_hls(ip: &str, port: u16, hls_url: &str) -> Result<()> {
-    let addr: SocketAddr = format!("{ip}:{port}").parse()?;
+    let addr = format!("{ip}:{port}")
+        .to_socket_addrs()?
+        .next()
+        .context("无法解析 AirPlay 设备地址")?;
     let mut stream =
         TcpStream::connect_timeout(&addr, Duration::from_secs(2)).context("连接 AirPlay 设备超时")?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
     let body = format!("Content-Location: {hls_url}\nStart-Position: 0.0\n\n");
     let req = format!(
         "POST /play HTTP/1.1\r\nHost: {ip}:{port}\r\nUser-Agent: MediaControl/1.0\r\nContent-Type: text/parameters\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(req.as_bytes())?;
+    let mut resp = Vec::new();
+    let _ = stream.read_to_end(&mut resp);
+    let status_line = String::from_utf8_lossy(&resp);
+    if !status_line.starts_with("HTTP/1.1 200") && !status_line.starts_with("HTTP/1.0 200") {
+        bail!(
+            "AirPlay 设备拒绝未鉴权推送：{}",
+            status_line.lines().next().unwrap_or("设备未响应 HTTP 200")
+        );
+    }
     Ok(())
 }
 
 fn airplay_stop(ip: &str, port: u16) -> Result<()> {
-    let addr: SocketAddr = format!("{ip}:{port}").parse()?;
+    let addr = format!("{ip}:{port}")
+        .to_socket_addrs()?
+        .next()
+        .context("无法解析 AirPlay 设备地址")?;
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(1))?;
     let req = format!(
         "POST /stop HTTP/1.1\r\nHost: {ip}:{port}\r\nUser-Agent: MediaControl/1.0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -2637,14 +2890,37 @@ fn dial_notify_receiver(app_url: &str, web_url: &str) -> Result<()> {
     let parsed = url::Url::parse(app_url)?;
     let host = parsed.host_str().unwrap_or("127.0.0.1");
     let port = parsed.port_or_known_default().unwrap_or(8008);
-    let addr: SocketAddr = format!("{host}:{port}").parse()?;
+    let addr = format!("{host}:{port}")
+        .to_socket_addrs()?
+        .next()
+        .context("无法解析 DIAL 设备地址")?;
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(800))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(1200)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(800)));
+    let raw_path = parsed.path().trim_end_matches('/');
+    let dial_path = if raw_path.is_empty() || raw_path == "/apps" {
+        "/apps/StepX".to_string()
+    } else {
+        parsed.path().to_string()
+    };
     let req = format!(
-        "POST {} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{web_url}",
-        parsed.path(),
+        "POST {dial_path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{web_url}",
         web_url.len()
     );
-    let _ = stream.write_all(req.as_bytes());
+    stream.write_all(req.as_bytes())?;
+    let mut resp = Vec::new();
+    let _ = stream.read_to_end(&mut resp);
+    let status_line = String::from_utf8_lossy(&resp);
+    let ok = status_line.starts_with("HTTP/1.1 200")
+        || status_line.starts_with("HTTP/1.1 201")
+        || status_line.starts_with("HTTP/1.0 200")
+        || status_line.starts_with("HTTP/1.0 201");
+    if !ok {
+        bail!(
+            "DIAL 接收端点未确认启动：{}",
+            status_line.lines().next().unwrap_or("无响应")
+        );
+    }
     Ok(())
 }
 
@@ -2787,7 +3063,7 @@ fn build_web_receiver_html(host_ip: &str, port: u16, remote_enabled: bool, token
   <div class="toolbar">
     <button id="btnMjpeg" class="active" onclick="switchMode('mjpeg')">极速互动流 (MJPEG)</button>
     <button id="btnHls" onclick="switchMode('hls')">高清视频流 (H.264 HLS)</button>
-    <a class="btn" href="/live.ts" target="_blank">下载/VLC打开 MPEG-TS 流</a>
+    <a class="btn" href="/session/{token}/live.ts" target="_blank">下载/VLC打开 MPEG-TS 流</a>
     <button onclick="toggleFullscreen()">全屏显示</button>
   </div>
 </header>
@@ -2815,7 +3091,7 @@ fn build_web_receiver_html(host_ip: &str, port: u16, remote_enabled: bool, token
     </div>
     <h3>多协议流地址</h3>
     <div class="meta">
-      <div><strong>MPEG-TS (DLNA/VLC):</strong><br/>http://{host_ip}:{port}/live.ts</div>
+      <div><strong>MPEG-TS (DLNA/VLC):</strong><br/>http://{host_ip}:{port}/session/{token}/live.ts</div>
       <div style="margin-top:6px;"><strong>Apple HLS (AirPlay):</strong><br/>http://{host_ip}:{port}/session/{token}/live.m3u8</div>
     </div>
   </aside>
@@ -2942,8 +3218,120 @@ mod tests {
         let html = request_for_test("/session/secret-test/cast", "GET", false);
         assert!(html.contains("/session/secret-test/stream.mjpeg"));
         assert!(html.contains("/session/secret-test/api/control"));
+        assert!(html.contains("href=\"/session/secret-test/live.ts\""));
+        assert!(html.contains("http://127.0.0.1:"));
+        assert!(html.contains("/session/secret-test/live.ts</div>"));
+        assert!(!html.contains("href=\"/live.ts\""));
         assert!(!html.contains("Access-Control-Allow-Origin: *"));
         assert!(authorized_cast_path("/session/secret-test/api/status", "next-session").is_none());
+    }
+
+    #[test]
+    fn parse_arp_tables_across_linux_macos_and_windows_formats() {
+        let proc_arp = "\
+IP address       HW type     Flags       HW address            Mask     Device
+192.168.1.1      0x1         0x2         aa:bb:cc:dd:ee:01     *        wlan0
+192.168.1.55     0x1         0x2         02:42:ac:11:00:02     *        docker0
+192.168.1.88     0x1         0x0         00:00:00:00:00:00     *        wlan0
+10.0.0.2         0x1         0x2         11:22:33:44:55:66     *        wlan0
+";
+        let map = parse_proc_net_arp(proc_arp, "192.168.1.");
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get("192.168.1.1").map(String::as_str), Some("aa:bb:cc:dd:ee:01"));
+
+        let macos_arp = "\
+? (192.168.1.1) at aa:bb:cc:dd:ee:1 on en0 ifscope [ethernet]
+livingroom-tv.local (192.168.1.42) at 8:9:a:b:c:d on en0 expires in 1120 seconds [ethernet]
+? (192.168.1.99) at (incomplete) on en0 ifscope [ethernet]
+? (192.168.1.77) at 12:34:56:78:9a:bc on utun3 ifscope
+? (192.168.1.255) at ff:ff:ff:ff:ff:ff on en0 ifscope [ethernet]
+";
+        let mac_map = parse_arp_a_output(macos_arp, "192.168.1.");
+        assert_eq!(mac_map.len(), 2);
+        assert_eq!(mac_map.get("192.168.1.1").map(String::as_str), Some("aa:bb:cc:dd:ee:01"));
+        assert_eq!(mac_map.get("192.168.1.42").map(String::as_str), Some("08:09:0a:0b:0c:0d"));
+
+        let win_arp = "\
+Interface: 192.168.1.10 --- 0x6
+  Internet Address      Physical Address      Type
+  192.168.1.1           aa-bb-cc-dd-ee-01     dynamic
+  192.168.1.66          10-20-30-40-50-60     dynamic
+  224.0.0.22            01-00-5e-00-00-16     static
+  255.255.255.255       ff-ff-ff-ff-ff-ff     static
+";
+        let win_map = parse_arp_a_output(win_arp, "192.168.1.");
+        assert_eq!(win_map.len(), 2);
+        assert_eq!(win_map.get("192.168.1.66").map(String::as_str), Some("10:20:30:40:50:60"));
+    }
+
+    #[test]
+    fn google_cast_push_supports_dial_handoff_and_clear_guidance_on_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 512];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            stream
+                .write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+            req
+        });
+
+        let stats = LanCastStats {
+            running: true,
+            port: 19780,
+            host_ip: "192.168.1.10".into(),
+            web_url: "http://192.168.1.10:19780/session/tok123/cast".into(),
+            ts_url: "http://192.168.1.10:19780/session/tok123/live.ts".into(),
+            hls_url: "http://192.168.1.10:19780/session/tok123/live.m3u8".into(),
+            mjpeg_url: "http://192.168.1.10:19780/session/tok123/stream.mjpeg".into(),
+            ..Default::default()
+        };
+
+        let dial_rx = LanCastReceiver {
+            id: "cast:test".into(),
+            name: "客厅 Chromecast".into(),
+            ip: "127.0.0.1".into(),
+            port: addr.port(),
+            protocol: LanCastProtocol::GoogleCast,
+            model: "Chromecast".into(),
+            control_url: Some(format!("http://127.0.0.1:{}/apps", addr.port())),
+            rendering_control_url: None,
+            location_url: None,
+            mac: None,
+            online: true,
+            can_direct_push: false,
+        };
+        let msg = push_stream_to_receiver(&dial_rx, &stats, None, None)
+            .expect("DIAL handoff with 201 Created must succeed");
+        assert!(msg.contains("DIAL"));
+        let received_req = server.join().unwrap();
+        assert!(received_req.starts_with("POST /apps/StepX HTTP/1.1"));
+        assert!(received_req.contains("/session/tok123/cast"));
+
+        let no_dial_rx = LanCastReceiver {
+            control_url: None,
+            ..dial_rx
+        };
+        let err = push_stream_to_receiver(&no_dial_rx, &stats, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("/session/tok123/cast"));
+        assert!(err.contains("/session/tok123/live.ts"));
+
+        // AirPlay push must reject empty/EOF responses rather than silently succeeding
+        let ap_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ap_addr = ap_listener.local_addr().unwrap();
+        let ap_server = thread::spawn(move || {
+            let (mut stream, _) = ap_listener.accept().unwrap();
+            let mut buf = [0u8; 256];
+            let _ = stream.read(&mut buf);
+            // Close without writing HTTP 200 OK
+        });
+        assert!(airplay_push_hls("127.0.0.1", ap_addr.port(), &stats.hls_url).is_err());
+        ap_server.join().unwrap();
     }
 
     #[test]

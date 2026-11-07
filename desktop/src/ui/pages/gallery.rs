@@ -24,34 +24,20 @@ impl Companion {
         vec![
             self.button_icon(
                 "gallery-hdr-shot",
-                "截取手机屏幕入库",
+                "手机截屏",
                 UiIcon::Camera,
                 Action::BackScreen(BackScreenAction::GalleryCapturePhoneScreenshot),
                 Btn::Secondary,
             ),
             self.button_icon(
                 "gallery-hdr-import",
-                "导入电脑图片到手机",
+                "导入到手机",
                 UiIcon::Upload,
                 Action::BackScreen(BackScreenAction::GalleryImportFromDesktop),
                 Btn::Secondary,
             ),
-            self.button_icon(
-                "gallery-hdr-export-filtered",
-                "导出当前筛选",
-                UiIcon::Package,
-                Action::BackScreen(BackScreenAction::GalleryExportFiltered),
-                Btn::Secondary,
-            ),
-            self.button_icon(
-                "gallery-hdr-open-export-dir",
-                "打开电脑相册目录",
-                UiIcon::Folder,
-                Action::BackScreen(BackScreenAction::GalleryOpenExportFolder),
-                Btn::Secondary,
-            ),
             if self.back_screen.gallery_loading {
-                self.disabled_button("正在读取相册…")
+                self.disabled_button("读取中…")
             } else {
                 self.button_icon(
                     "gallery-hdr-refresh",
@@ -83,7 +69,7 @@ impl Companion {
             Align::new(self.vstack(
                 S1,
                 vec![
-                    Align::new(self.ui_icon(UiIcon::Image, 24., p.text3)).finish(),
+                    Align::new(self.content_icon(UiIcon::Image, 24., p.text3)).finish(),
                     Align::new(self.line("点击加载预览", MICRO, p.text3)).finish(),
                 ],
             ))
@@ -126,11 +112,10 @@ impl Companion {
             .contain()
             .finish()
         } else {
-            Align::new(
-                self.vstack(
-                    S2,
-                    vec![
-                        Align::new(self.ui_icon(UiIcon::Image, 28., p.text3)).finish(),
+            Align::new(self.vstack(
+                S2,
+                vec![
+                        Align::new(self.content_icon(UiIcon::Image, 28., p.text3)).finish(),
                         Align::new(self.line(
                             "正在从手机拉取高清预览图，或点击画面重试…",
                             BODY,
@@ -138,16 +123,15 @@ impl Companion {
                         ))
                         .finish(),
                     ],
-                ),
-            )
+            ))
             .finish()
         };
 
         let mut badges = Vec::new();
         if let Some((w, h)) = dims {
-            badges.push(self.mono(format!("分辨率: {w} × {h} px"), MICRO, p.accent));
+            badges.push(self.pill_badge(format!("{w} × {h} px"), p.accent, p.accent_soft));
         } else {
-            badges.push(self.line("分辨率: 待加载预览", MICRO, p.text3));
+            badges.push(self.line("待加载预览", MICRO, p.text3));
         }
         if rot_deg > 0 {
             badges.push(self.pill_badge(format!("↻ {rot_deg}°"), p.accent, p.accent_soft));
@@ -161,21 +145,7 @@ impl Companion {
                     .with_border(Border::all(1.).with_border_color(p.border))
                     .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
                     .finish(),
-                self.between(
-                    self.hstack(
-                        6.,
-                        vec![
-                            self.ui_icon(UiIcon::Lightbulb, 13., p.text3),
-                            self.line_w(
-                                "双击大图全屏沉浸看图 · 右键支持旋转 / 设为背屏 / 发给 Amoo 分析",
-                                MICRO,
-                                p.text3,
-                                Weight::Normal,
-                            ),
-                        ],
-                    ),
-                    self.hstack(S2, badges),
-                ),
+                self.between(Empty::new().finish(), self.hstack(S1, badges)),
             ],
         );
 
@@ -256,7 +226,7 @@ impl Companion {
             Align::new(self.vstack(
                 S2,
                 vec![
-                    Align::new(self.ui_icon(UiIcon::Image, 32., p.text3)).finish(),
+                    Align::new(self.content_icon(UiIcon::Image, 32., p.text3)).finish(),
                     Align::new(self.line("正在从手机拉取高清大图预览…", BODY, p.text2)).finish(),
                 ],
             ))
@@ -390,7 +360,7 @@ impl Companion {
             self.button_icon(
                 "gallery-lb-amoo",
                 "发给 Amoo 分析",
-                UiIcon::Star,
+                UiIcon::Sparkles,
                 Action::BackScreen(BackScreenAction::GallerySendToAmoo(
                     item.remote_path.clone(),
                 )),
@@ -400,6 +370,14 @@ impl Companion {
                 "gallery-lb-backscreen",
                 "设为背屏像素",
                 Action::FilePushToBackScreen(item.remote_path.clone()),
+                Btn::Secondary,
+            ),
+            self.button(
+                "gallery-lb-capcut",
+                "交给剪映一键成片",
+                Action::BackScreen(BackScreenAction::TriggerMcpQuickAction(
+                    "capcut_handoff".into(),
+                )),
                 Btn::Secondary,
             ),
             self.button(
@@ -445,34 +423,20 @@ impl Companion {
             .unwrap_or(0);
 
         let mut nav_controls = vec![
-            self.button_icon(
+            self.icon_action(
                 format!("{id_prefix}-prev"),
                 "上一张",
                 UiIcon::ArrowLeft,
-                Action::BackScreen(BackScreenAction::GalleryPrevPhoto),
-                Btn::Secondary,
+                vec![Action::BackScreen(BackScreenAction::GalleryPrevPhoto)],
+                false,
             ),
             self.pill_badge(pos_label, p.text2, p.surface),
-            self.button_icon(
+            self.icon_action(
                 format!("{id_prefix}-next"),
                 "下一张",
                 UiIcon::ArrowRight,
-                Action::BackScreen(BackScreenAction::GalleryNextPhoto),
-                Btn::Secondary,
-            ),
-            self.button(
-                format!("{id_prefix}-lightbox"),
-                if self.back_screen.gallery_lightbox {
-                    "收起沉浸大图"
-                } else {
-                    "沉浸大图"
-                },
-                Action::BackScreen(BackScreenAction::GalleryToggleLightbox),
-                if self.back_screen.gallery_lightbox {
-                    Btn::Primary
-                } else {
-                    Btn::Secondary
-                },
+                vec![Action::BackScreen(BackScreenAction::GalleryNextPhoto)],
+                false,
             ),
             self.button_icon(
                 format!("{id_prefix}-rot"),
@@ -685,9 +649,7 @@ impl Companion {
             .enumerate()
             .filter(|(idx, i)| !i.name.starts_with('.') && is_recent(*idx, i))
             .count();
-        let expansion_count = visible_items
-            .filter(|i| i.category == "expansion")
-            .count();
+        let expansion_count = visible_items.filter(|i| i.category == "expansion").count();
         let active_cat = self.back_screen.gallery_category;
         let grid_cols = self.back_screen.gallery_grid_cols.clamp(2, 4);
         let grid_cols_usize = grid_cols as usize;
@@ -790,11 +752,6 @@ impl Companion {
                 self.hstack(
                     S1,
                     vec![
-                        self.pill_badge(
-                            format!("当前显示 {} 张", filtered.len()),
-                            p.accent,
-                            p.accent_soft,
-                        ),
                         self.button(
                             "gallery-cols-2",
                             "2列大图",
@@ -828,30 +785,49 @@ impl Companion {
                     ],
                 ),
             ),
-            self.input(
-                F_GALLERY_SEARCH,
-                "输入照片名称、日期（如 20261025）筛选手机图片…",
-                None,
-            ),
-            self.between(
-                self.hstack(
-                    6.,
-                    vec![
-                        self.ui_icon(UiIcon::Lightbulb, 13., p.accent),
-                        self.line_w(
-                            "左键选图预览 · 双击大图全屏沉浸看图 · 右键支持旋转 / 设为背屏 / 发给 Amoo 分析",
-                            CAPTION,
-                            p.text2,
-                            Weight::Medium,
-                        ),
-                    ],
-                ),
-                self.button(
+            self.input(F_GALLERY_SEARCH, "搜索照片…", None),
+            self.between(Empty::new().finish(), {
+                const MORE_KEY: &str = "gallery-toolbar-more";
+                let more_open = self.ui_expanded.contains(MORE_KEY);
+                let mut tools = Vec::new();
+                if more_open {
+                    tools.push(self.button_icon(
+                        "gallery-hdr-export-filtered",
+                        "导出筛选",
+                        UiIcon::Package,
+                        Action::BackScreen(BackScreenAction::GalleryExportFiltered),
+                        Btn::Ghost,
+                    ));
+                    tools.push(self.button(
+                        "gallery-top-capcut",
+                        "剪映成片",
+                        Action::BackScreen(BackScreenAction::TriggerMcpQuickAction(
+                            "capcut_handoff".into(),
+                        )),
+                        Btn::Ghost,
+                    ));
+                    tools.push(self.button(
+                        "gallery-top-trash",
+                        "回收站",
+                        Action::BackScreen(BackScreenAction::TriggerMcpQuickAction(
+                            "open_gallery_trash".into(),
+                        )),
+                        Btn::Ghost,
+                    ));
+                }
+                tools.push(self.button_icon(
+                    "gallery-hdr-open-export-dir",
+                    "电脑相册",
+                    UiIcon::Folder,
+                    Action::BackScreen(BackScreenAction::GalleryOpenExportFolder),
+                    Btn::Secondary,
+                ));
+                tools.push(self.button(
                     "gallery-top-toggle-lightbox",
                     if self.back_screen.gallery_lightbox {
-                        "退出沉浸看图"
+                        "退出大图"
                     } else {
-                        "沉浸大图看图"
+                        "大图"
                     },
                     Action::BackScreen(BackScreenAction::GalleryToggleLightbox),
                     if self.back_screen.gallery_lightbox {
@@ -859,25 +835,27 @@ impl Companion {
                     } else {
                         Btn::Secondary
                     },
-                ),
-            ),
+                ));
+                tools.push(self.button_icon(
+                    "gallery-toolbar-more",
+                    "更多",
+                    if more_open {
+                        UiIcon::ChevronUp
+                    } else {
+                        UiIcon::ChevronDown
+                    },
+                    Action::ToggleUiExpanded(MORE_KEY.into()),
+                    Btn::Ghost,
+                ));
+                self.wrap(tools)
+            }),
         ]);
 
         // Left Column: Visual Photo Thumbnail Grid (configurable 2 / 3 / 4 columns)
-        let mut grid_rows = vec![self.between(
-            self.heading("照片缩略图网格"),
-            self.line(
-                if self.back_screen.gallery_loading {
-                    "正在同步手机相册与缩略图…"
-                } else if self.back_screen.gallery_checked {
-                    "点击卡片在右侧检视与操作"
-                } else {
-                    "准备读取手机相册"
-                },
-                CAPTION,
-                p.text3,
-            ),
-        )];
+        let mut grid_rows = Vec::new();
+        if self.back_screen.gallery_loading {
+            grid_rows.push(self.line("正在同步相册…", CAPTION, p.text3));
+        }
 
         if filtered.is_empty() {
             grid_rows.push(
@@ -921,7 +899,11 @@ impl Companion {
                 .finish(),
             );
         } else {
-            for chunk in filtered.chunks(grid_cols_usize) {
+            let page_key = format!("gallery:{active_cat}:{query}");
+            let page_size = grid_cols_usize * 8;
+            let range = self.list_page_range(&page_key,filtered.len(),page_size);
+            grid_rows.push(self.list_page_controls(&page_key,filtered.len(),page_size));
+            for chunk in filtered[range].chunks(grid_cols_usize) {
                 let mut row_cards: Vec<El> = chunk
                     .iter()
                     .map(|&(orig_idx, item)| {
@@ -956,7 +938,7 @@ impl Companion {
 
         let right_panel = if let Some(item) = selected_item {
             let mut inspector_parts = vec![self.between(
-                self.heading("照片预览与操作"),
+                self.section_heading(UiIcon::Image, "预览"),
                 self.pill_badge(
                     if item.category == "expansion" {
                         "电脑扩容 · 原图直读"
@@ -975,7 +957,7 @@ impl Companion {
             inspector_parts.push(self.wrap(vec![
                 self.button_icon(
                     "gallery-act-open",
-                    "用系统看图打开",
+                    "打开",
                     UiIcon::ExternalLink,
                     Action::BackScreen(BackScreenAction::GalleryOpenOnDesktop(
                         item.remote_path.clone(),
@@ -992,35 +974,12 @@ impl Companion {
                         .unwrap_or(0)
                         > 0
                     {
-                        "保存旋转后图片到电脑"
+                        "保存旋转图"
                     } else {
-                        "保存到电脑"
+                        "保存"
                     },
                     UiIcon::Download,
                     Action::BackScreen(BackScreenAction::GallerySaveToDesktop(
-                        item.remote_path.clone(),
-                    )),
-                    Btn::Secondary,
-                ),
-                self.button_icon(
-                    "gallery-act-amoo",
-                    "发给 Amoo 分析",
-                    UiIcon::Star,
-                    Action::BackScreen(BackScreenAction::GallerySendToAmoo(
-                        item.remote_path.clone(),
-                    )),
-                    Btn::Secondary,
-                ),
-                self.button(
-                    "gallery-act-backscreen",
-                    "设为背屏像素",
-                    Action::FilePushToBackScreen(item.remote_path.clone()),
-                    Btn::Secondary,
-                ),
-                self.button(
-                    "gallery-act-copypath-btn",
-                    "复制路径",
-                    Action::BackScreen(BackScreenAction::GalleryCopyPath(
                         item.remote_path.clone(),
                     )),
                     Btn::Secondary,
@@ -1052,11 +1011,7 @@ impl Companion {
                         self.between(
                             self.line_w(&item.name, CAPTION, p.text, Weight::Semibold),
                             self.mono(
-                                format!(
-                                    "{} · {}",
-                                    item.size_label(),
-                                    item.full_datetime_label(),
-                                ),
+                                format!("{} · {}", item.size_label(), item.full_datetime_label(),),
                                 MICRO,
                                 p.text2,
                             ),
@@ -1083,13 +1038,13 @@ impl Companion {
             self.panel(inspector_parts)
         } else {
             self.panel(vec![
-                self.heading("照片预览与操作"),
+                self.section_heading(UiIcon::Image, "预览"),
                 Container::new(
                     ConstrainedBox::new(
                         Align::new(self.vstack(
                             S2,
                             vec![
-                                Align::new(self.ui_icon(UiIcon::Image, 32., p.text3)).finish(),
+                                Align::new(self.content_icon(UiIcon::Image, 32., p.text3)).finish(),
                                 Align::new(self.line(
                                     "从左侧选择一张手机照片查看高清预览",
                                     BODY,
@@ -1107,11 +1062,6 @@ impl Companion {
                 .with_border(Border::all(1.).with_border_color(p.border))
                 .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
                 .finish(),
-                self.text(
-                    "双击任意照片直接调用系统看图软件放大打开，支持右键常用操作、90° 旋转、一键保存到电脑及发给 Amoo 分析。",
-                    CAPTION,
-                    p.text3,
-                ),
             ])
         };
 

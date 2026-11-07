@@ -797,11 +797,137 @@ pub fn load_openclaw_credentials() -> Option<OpenClawCredentials> {
     loaded
 }
 
-pub fn save_openclaw_credentials(creds: &OpenClawCredentials) -> Result<()> {
+fn resolve_openclaw_credential_paths_from(
+    xdg_config_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+    local_app_data: Option<PathBuf>,
+    app_data: Option<PathBuf>,
+    user_profile: Option<PathBuf>,
+    is_macos: bool,
+) -> Option<(PathBuf, Vec<PathBuf>)> {
+    let non_empty = |p: Option<PathBuf>| p.filter(|v| !v.as_os_str().is_empty());
+    let xdg = non_empty(xdg_config_home);
+    let home = non_empty(home);
+    let local = non_empty(local_app_data);
+    let roaming = non_empty(app_data);
+    let profile = non_empty(user_profile);
+
+    let primary_config_root = if let Some(ref c) = xdg {
+        Some(c.clone())
+    } else if let Some(ref h) = home {
+        if is_macos {
+            Some(h.join("Library/Application Support"))
+        } else {
+            Some(h.join(".config"))
+        }
+    } else if let Some(ref l) = local {
+        Some(l.clone())
+    } else if let Some(ref r) = roaming {
+        Some(r.clone())
+    } else if let Some(ref p) = profile {
+        if is_macos {
+            Some(p.join("Library/Application Support"))
+        } else {
+            Some(p.join("AppData/Local"))
+        }
+    } else {
+        None
+    }?;
+
+    let cache_path = primary_config_root.join("stepx/openclaw_auth.json");
+    let mut leveldb_dirs = Vec::new();
+
+    if let Some(ref h) = home.as_ref().or(profile.as_ref()) {
+        for rel in [
+            ".config/BraveSoftware/Brave-Origin/Default/Local Storage/leveldb",
+            ".config/BraveSoftware/Brave-Browser/Default/Local Storage/leveldb",
+            ".config/google-chrome/Default/Local Storage/leveldb",
+            ".config/chromium/Default/Local Storage/leveldb",
+            "Library/Application Support/BraveSoftware/Brave-Origin/Default/Local Storage/leveldb",
+            "Library/Application Support/BraveSoftware/Brave-Browser/Default/Local Storage/leveldb",
+            "Library/Application Support/Google/Chrome/Default/Local Storage/leveldb",
+            "Library/Application Support/Chromium/Default/Local Storage/leveldb",
+        ] {
+            leveldb_dirs.push(h.join(rel));
+        }
+    }
+    if let Some(ref c) = xdg {
+        for rel in [
+            "BraveSoftware/Brave-Origin/Default/Local Storage/leveldb",
+            "BraveSoftware/Brave-Browser/Default/Local Storage/leveldb",
+            "google-chrome/Default/Local Storage/leveldb",
+            "chromium/Default/Local Storage/leveldb",
+        ] {
+            leveldb_dirs.push(c.join(rel));
+        }
+    }
+    let win_local = local
+        .clone()
+        .or_else(|| profile.as_ref().map(|p| p.join("AppData/Local")))
+        .or_else(|| roaming.clone());
+    if let Some(wl) = win_local {
+        for rel in [
+            "BraveSoftware/Brave-Origin/User Data/Default/Local Storage/leveldb",
+            "BraveSoftware/Brave-Browser/User Data/Default/Local Storage/leveldb",
+            "Google/Chrome/User Data/Default/Local Storage/leveldb",
+            "Chromium/User Data/Default/Local Storage/leveldb",
+        ] {
+            leveldb_dirs.push(wl.join(rel));
+        }
+    }
+
+    Some((cache_path, leveldb_dirs))
+}
+
+fn fallback_unix_home(is_macos: bool) -> Option<PathBuf> {
+    #[cfg(unix)]
+    unsafe {
+        let pw = libc::getpwuid(libc::getuid());
+        if !pw.is_null() && !(*pw).pw_dir.is_null() {
+            if let Ok(s) = std::ffi::CStr::from_ptr((*pw).pw_dir).to_str() {
+                if !s.trim().is_empty() {
+                    return Some(PathBuf::from(s));
+                }
+            }
+        }
+    }
+    std::env::var_os("USER")
+        .or_else(|| std::env::var_os("LOGNAME"))
+        .filter(|u| !u.is_empty())
+        .map(|u| {
+            PathBuf::from(if is_macos { "/Users" } else { "/home" }).join(u)
+        })
+}
+
+fn current_openclaw_credential_paths() -> Option<(PathBuf, Vec<PathBuf>)> {
+    let is_macos = cfg!(target_os = "macos");
+    let xdg = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()))
+        .map(PathBuf::from);
     let home = std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .context("缺少 HOME 目录")?;
-    let cache_path = home.join(".config/stepx/openclaw_auth.json");
+        .or_else(|| {
+            if cfg!(unix) {
+                fallback_unix_home(is_macos)
+            } else {
+                None
+            }
+        });
+    resolve_openclaw_credential_paths_from(
+        xdg,
+        home,
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
+        std::env::var_os("APPDATA").map(PathBuf::from),
+        std::env::var_os("USERPROFILE").map(PathBuf::from),
+        is_macos,
+    )
+}
+
+pub fn save_openclaw_credentials(creds: &OpenClawCredentials) -> Result<()> {
+    let (cache_path, _) =
+        current_openclaw_credential_paths().context("缺少用户配置目录 (HOME/LOCALAPPDATA/APPDATA/USERPROFILE)")?;
     if let Some(parent) = cache_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -815,22 +941,34 @@ pub fn save_openclaw_credentials(creds: &OpenClawCredentials) -> Result<()> {
 }
 
 fn load_openclaw_credentials_uncached() -> Option<OpenClawCredentials> {
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    let cache_path = home.join(".config/stepx/openclaw_auth.json");
-    if let Ok(text) = fs::read_to_string(&cache_path) {
-        if let Ok(creds) = serde_json::from_str::<OpenClawCredentials>(&text) {
-            if !creds.device_id.is_empty() && !creds.device_token.is_empty() {
-                return Some(creds);
+    let (cache_path, leveldb_dirs) = current_openclaw_credential_paths()?;
+    let mut candidate_cache_files = vec![cache_path];
+    let mut push_unique = |p: PathBuf| {
+        if !candidate_cache_files.contains(&p) {
+            candidate_cache_files.push(p);
+        }
+    };
+    if let Some(home) = crate::resources::user_home()
+        .map(PathBuf::from)
+        .or_else(|| fallback_unix_home(cfg!(target_os = "macos")))
+    {
+        push_unique(home.join("Library/Application Support/stepx/openclaw_auth.json"));
+        push_unique(home.join(".config/stepx/openclaw_auth.json"));
+    }
+    for env_key in ["LOCALAPPDATA", "APPDATA"] {
+        if let Some(dir) = std::env::var_os(env_key).filter(|v| !v.is_empty()) {
+            push_unique(PathBuf::from(dir).join("stepx/openclaw_auth.json"));
+        }
+    }
+    for path in &candidate_cache_files {
+        if let Ok(text) = fs::read_to_string(path) {
+            if let Ok(creds) = serde_json::from_str::<OpenClawCredentials>(&text) {
+                if !creds.device_id.is_empty() && !creds.device_token.is_empty() {
+                    return Some(creds);
+                }
             }
         }
     }
-
-    let leveldb_dirs = [
-        home.join(".config/BraveSoftware/Brave-Origin/Default/Local Storage/leveldb"),
-        home.join(".config/BraveSoftware/Brave-Browser/Default/Local Storage/leveldb"),
-        home.join(".config/google-chrome/Default/Local Storage/leveldb"),
-        home.join(".config/chromium/Default/Local Storage/leveldb"),
-    ];
 
     let mut device_id = String::new();
     let mut public_key = String::new();
@@ -924,39 +1062,33 @@ pub struct GatewayWs {
     next_id: u64,
     pub gateway_version: String,
     request_deadline: Option<Instant>,
-    _forward: Option<GatewayForward>,
-}
-
-struct GatewayForward {
-    adb: Adb,
-    serial: String,
-    port: String,
-}
-impl Drop for GatewayForward {
-    fn drop(&mut self) {
-        let _ = self.adb.run_timeout(
-            &["-s", &self.serial, "forward", "--remove", &self.port],
-            Duration::from_secs(3),
-        );
-    }
 }
 
 impl GatewayWs {
     pub fn connect(adb: &Adb, device: &Device) -> Result<Self> {
-        device.verify(adb)?;
-        let port: u16 = adb
-            .run(&["-s", &device.transport, "forward", "tcp:0", "tcp:18789"])?
-            .trim()
-            .parse()
+        let transport = device.resolve_active_transport(adb)?;
+        let mut resolved_device = device.clone();
+        resolved_device.transport = transport.clone();
+        let (stream, port, was_cached) = adb
+            .connect_forwarded_tcp(&transport, "tcp:18789", Duration::from_secs(3))
             .context("无法建立当前手机的 OpenClaw 后台连接")?;
-        let forward = GatewayForward {
-            adb: adb.clone(),
-            serial: device.transport.clone(),
-            port: format!("tcp:{port}"),
-        };
-        let mut ws = Self::connect_at(adb, Some(device), port)?;
-        ws._forward = Some(forward);
-        Ok(ws)
+        match Self::connect_with_stream(adb, Some(&resolved_device), stream) {
+            Ok(ws) => Ok(ws),
+            Err(_) if was_cached => {
+                adb.invalidate_forwarded_tcp(&transport, "tcp:18789", Some(port));
+                let (fresh_stream, fresh_port, _) = adb
+                    .connect_forwarded_tcp(&transport, "tcp:18789", Duration::from_secs(3))
+                    .context("无法建立当前手机的 OpenClaw 后台连接")?;
+                Self::connect_with_stream(adb, Some(&resolved_device), fresh_stream).map_err(|e| {
+                    adb.invalidate_forwarded_tcp(&transport, "tcp:18789", Some(fresh_port));
+                    e
+                })
+            }
+            Err(e) => {
+                adb.invalidate_forwarded_tcp(&transport, "tcp:18789", Some(port));
+                Err(e)
+            }
+        }
     }
 
     pub fn connect_local(adb: &Adb, device: Option<&Device>) -> Result<Self> {
@@ -965,8 +1097,12 @@ impl GatewayWs {
 
     fn connect_at(adb: &Adb, device: Option<&Device>, port: u16) -> Result<Self> {
         let addr: SocketAddr = ([127, 0, 0, 1], port).into();
-        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))
+        let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))
             .context("无法连接手机 OpenClaw 网关 (127.0.0.1:18789)")?;
+        Self::connect_with_stream(adb, device, stream)
+    }
+
+    fn connect_with_stream(adb: &Adb, device: Option<&Device>, mut stream: TcpStream) -> Result<Self> {
         stream.set_read_timeout(Some(Duration::from_secs(6)))?;
         stream.set_write_timeout(Some(Duration::from_secs(6)))?;
 
@@ -1013,7 +1149,6 @@ impl GatewayWs {
             next_id: 1,
             gateway_version: String::new(),
             request_deadline: None,
-            _forward: None,
         };
 
         // 1. Read connect.challenge
@@ -1109,6 +1244,10 @@ impl GatewayWs {
                 } else {
                     let id = adb
                         .shell(&d.transport, &["settings", "get", "secure", "android_id"])
+                        .or_else(|_| {
+                            let active = d.resolve_active_transport(adb)?;
+                            adb.shell(&active, &["settings", "get", "secure", "android_id"])
+                        })
                         .unwrap_or_default()
                         .trim()
                         .to_string();
@@ -1554,7 +1693,6 @@ mod tests {
             next_id: 0,
             gateway_version: String::new(),
             request_deadline: None,
-            _forward: None,
         };
         let start = Instant::now();
         assert!(ws
@@ -1593,6 +1731,211 @@ mod tests {
     fn clean_user_metadata_prefix() {
         let raw = "Conversation info (untrusted metadata):\n```json\n{\n  \"message_id\": \"123\"\n}\n```\n\n你好";
         assert_eq!(clean_openclaw_user_text(raw), "你好");
+    }
+
+    #[test]
+    fn credential_paths_cross_platform_fallbacks() {
+        let (mac_cache, mac_ldb) = resolve_openclaw_credential_paths_from(
+            None,
+            Some(PathBuf::from("/Users/macuser")),
+            None,
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            mac_cache,
+            PathBuf::from("/Users/macuser/Library/Application Support/stepx/openclaw_auth.json")
+        );
+        assert!(mac_ldb.contains(&PathBuf::from(
+            "/Users/macuser/Library/Application Support/Google/Chrome/Default/Local Storage/leveldb"
+        )));
+
+        let (win_cache, win_ldb) = resolve_openclaw_credential_paths_from(
+            None,
+            None,
+            Some(PathBuf::from("C:\\Users\\Alice\\AppData\\Local")),
+            Some(PathBuf::from("C:\\Users\\Alice\\AppData\\Roaming")),
+            Some(PathBuf::from("C:\\Users\\Alice")),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            win_cache,
+            PathBuf::from("C:\\Users\\Alice\\AppData\\Local").join("stepx/openclaw_auth.json")
+        );
+        assert!(win_ldb.contains(
+            &PathBuf::from("C:\\Users\\Alice\\AppData\\Local")
+                .join("Google/Chrome/User Data/Default/Local Storage/leveldb")
+        ));
+
+        let (up_cache, _) = resolve_openclaw_credential_paths_from(
+            None,
+            None,
+            None,
+            None,
+            Some(PathBuf::from("C:\\Users\\Bob")),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            up_cache,
+            PathBuf::from("C:\\Users\\Bob").join("AppData/Local/stepx/openclaw_auth.json")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gateway_ws_connect_recovers_from_stale_cached_port_and_uses_failover_transport_for_android_id() {
+        use std::net::TcpListener;
+        use std::os::unix::fs::PermissionsExt;
+
+        // Force load_openclaw_credentials() to return None so connect_with_stream exercises
+        // the android_id fallback token derivation path.
+        let cache = CREDENTIALS_CACHE.get_or_init(|| Mutex::new(None));
+        let prev_creds = cache.lock().unwrap().clone();
+        *cache.lock().unwrap() = Some((Instant::now(), None));
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_adb = dir.path().join("adb");
+        let port_file = dir.path().join("port.txt");
+        let calls_log = dir.path().join("calls.log");
+
+        let stale_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stale_port = stale_listener.local_addr().unwrap().port();
+        let fresh_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let fresh_port = fresh_listener.local_addr().unwrap().port();
+
+        // Seed port_file with stale_port first so we can prime FORWARD_POOL, then switch to fresh_port.
+        std::fs::write(&port_file, format!("{stale_port}\n")).unwrap();
+
+        let script = format!(
+            r#"#!/usr/bin/env sh
+echo "$*" >> "{calls}"
+case "$*" in
+  *"-s usb-dead-openclaw-unit"*)
+    echo "error: device 'usb-dead-openclaw-unit' not found" >&2
+    exit 1
+    ;;
+  *"devices -l"*)
+    echo "List of devices attached"
+    echo "10.0.1.99:15555 device product:pandora model:PZ261A-OPENCLAW-UNIT transport_id:2"
+    exit 0
+    ;;
+  *"-s 10.0.1.99:15555 shell"*"ro.serialno"*)
+    echo "OPENCLAW_FAILOVER_SERIAL_UNIT"
+    exit 0
+    ;;
+  *"-s 10.0.1.99:15555 shell"*"android_id"*)
+    echo "deadbeef12345678"
+    exit 0
+    ;;
+  *"-s 10.0.1.99:15555 forward tcp:0 tcp:18789"*)
+    cat "{port}"
+    exit 0
+    ;;
+  *"forward --remove"*)
+    exit 0
+    ;;
+esac
+exit 1
+"#,
+            calls = calls_log.display(),
+            port = port_file.display()
+        );
+        std::fs::write(&fake_adb, script).unwrap();
+        std::fs::set_permissions(&fake_adb, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let adb = Adb { path: fake_adb };
+        let device = Device {
+            transport: "usb-dead-openclaw-unit".into(),
+            serial: "OPENCLAW_FAILOVER_SERIAL_UNIT".into(),
+            model: "PZ261A-OPENCLAW-UNIT".into(),
+            android: "16".into(),
+            product: "pandora".into(),
+        };
+
+        // Prime FORWARD_POOL with stale_port for ("10.0.1.99:15555", "tcp:18789"), then point future forwards to fresh_port.
+        let (primed_stream, primed_port, was_cached) = adb
+            .connect_forwarded_tcp("10.0.1.99:15555", "tcp:18789", Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(primed_port, stale_port);
+        assert!(!was_cached);
+        drop(primed_stream);
+        let _ = stale_listener.accept();
+        std::fs::write(&port_file, format!("{fresh_port}\n")).unwrap();
+
+        // Spawn stale server thread: accepts cached TCP connection, then closes immediately during HTTP upgrade.
+        let stale_handle = std::thread::spawn(move || {
+            if let Ok((stream, _)) = stale_listener.accept() {
+                drop(stream);
+            }
+        });
+
+        // Spawn fresh server thread: completes WebSocket upgrade, sends challenge, verifies token derived from backup transport's android_id.
+        let fresh_handle = std::thread::spawn(move || {
+            let (mut stream, _) = fresh_listener.accept().unwrap();
+            let mut req_buf = [0u8; 1024];
+            let _ = stream.read(&mut req_buf).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+                )
+                .unwrap();
+
+            let challenge = br#"{"type":"event","event":"connect.challenge","payload":{"nonce":"n1"}}"#;
+            let mut frame = vec![0x81, challenge.len() as u8];
+            frame.extend_from_slice(challenge);
+            stream.write_all(&frame).unwrap();
+
+            // Read client masked frame
+            let mut hdr = [0u8; 2];
+            stream.read_exact(&mut hdr).unwrap();
+            let mut len = (hdr[1] & 0x7f) as usize;
+            if len == 126 {
+                let mut ext = [0u8; 2];
+                stream.read_exact(&mut ext).unwrap();
+                len = u16::from_be_bytes(ext) as usize;
+            }
+            let mut mask = [0u8; 4];
+            stream.read_exact(&mut mask).unwrap();
+            let mut payload = vec![0u8; len];
+            stream.read_exact(&mut payload).unwrap();
+            for (i, b) in payload.iter_mut().enumerate() {
+                *b ^= mask[i & 3];
+            }
+            let connect_json: Value = serde_json::from_slice(&payload).unwrap();
+            let sent_token = connect_json["params"]["auth"]["token"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+
+            let resp = br#"{"type":"res","id":"connect-1","ok":true,"payload":{"server":{"version":"2026.4.26-failover"}}}"#;
+            let mut rframe = vec![0x81, resp.len() as u8];
+            rframe.extend_from_slice(resp);
+            stream.write_all(&rframe).unwrap();
+            sent_token
+        });
+
+        let ws = GatewayWs::connect(&adb, &device).expect("GatewayWs::connect should recover from stale port and failover transport");
+        assert_eq!(ws.gateway_version, "2026.4.26-failover");
+        stale_handle.join().unwrap();
+        let sent_token = fresh_handle.join().unwrap();
+        assert_eq!(
+            sent_token,
+            crate::device::derive_openclaw_token("deadbeef12345678"),
+            "GatewayWs::connect must derive fallback token using android_id from resolved active transport"
+        );
+
+        let calls = std::fs::read_to_string(&calls_log).unwrap_or_default();
+        assert!(
+            calls.contains(&format!("forward --remove tcp:{stale_port}")),
+            "stale port must be evicted via forward --remove: {calls}"
+        );
+
+        adb.invalidate_forwarded_tcp("10.0.1.99:15555", "tcp:18789", None);
+        *cache.lock().unwrap() = prev_creds;
     }
 
     #[test]

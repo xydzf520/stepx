@@ -55,14 +55,14 @@ impl Companion {
             .contain()
             .finish()
         } else {
-            Align::new(self.ui_icon(
+            Align::new(self.content_icon(
                 if app.package == "com.android.calendar" {
                     UiIcon::Calendar
                 } else {
                     UiIcon::Package
                 },
                 26.,
-                self.p().text3,
+                self.p().text2,
             ))
             .finish()
         };
@@ -72,9 +72,372 @@ impl Companion {
             .finish()
     }
 
+    fn app_spec_cell(&self, label: &str, value: String, mono_val: bool) -> El {
+        let p = self.p();
+        let val_el = if mono_val {
+            self.mono(value, MICRO, p.text)
+        } else {
+            self.line_w(value, CAPTION, p.text, Weight::Medium)
+        };
+        Container::new(self.vstack(2., vec![self.line(label, MICRO, p.text3), val_el]))
+            .with_horizontal_padding(S2 + 2.)
+            .with_vertical_padding(S1 + 2.)
+            .with_background_color(p.bg)
+            .with_border(Border::all(1.).with_border_color(p.border))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
+            .finish()
+    }
+
+    fn app_details_inspector(&self, app: &AppInfo) -> El {
+        let p = self.p();
+        let package = &app.package;
+        let details = self
+            .selected_app_details
+            .as_ref()
+            .filter(|d| d.package == *package)
+            .cloned()
+            .unwrap_or_else(|| stepx_companion::apps::demo_details(package));
+
+        // 1. Inspector Header
+        let proc_badge = if !details.running_pids.is_empty() {
+            let pids = details
+                .running_pids
+                .iter()
+                .map(|pid| pid.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let label = if let Some(kb) = details.mem_pss_kb {
+                format!("运行中 · PID {pids} · 内存 {:.1} MB", kb as f64 / 1024.0)
+            } else {
+                format!("运行中 · PID {pids}")
+            };
+            self.pill_badge(label, p.success_text, p.success_soft)
+        } else {
+            self.pill_badge("未在后台运行", p.text3, p.tag_bg)
+        };
+
+        let bucket_str = if details.standby_bucket.trim().is_empty() {
+            "活跃 (ACTIVE)"
+        } else {
+            details.standby_bucket.trim()
+        };
+        let mut header_left = vec![
+            self.pill_badge_icon(
+                "桌面应用详情与权限管理",
+                UiIcon::Shield,
+                p.accent,
+                p.accent_soft,
+            ),
+            proc_badge,
+            self.pill_badge(format!("待机分组：{bucket_str}"), p.text2, p.tag_bg),
+        ];
+        if self.selected_app_loading {
+            header_left.push(self.pill_badge_icon(
+                "正在同步实时状态…",
+                UiIcon::Refresh,
+                p.blue,
+                rgba(p.blue.r, p.blue.g, p.blue.b, if p.dark { 38 } else { 24 }),
+            ));
+        }
+
+        let header = self.between(
+            self.wrap(header_left),
+            self.button_icon(
+                "app-inspector-close",
+                "收起详情",
+                UiIcon::Close,
+                Action::InspectApp(None),
+                Btn::Ghost,
+            ),
+        );
+
+        // 2. Metadata Grid (Desktop-Native)
+        let ver_text = if !app.version_name.trim().is_empty() && app.version_code > 0 {
+            format!(
+                "v{} (versionCode {})",
+                app.version_name.trim(),
+                app.version_code
+            )
+        } else if !app.version_name.trim().is_empty() {
+            format!("v{}", app.version_name.trim())
+        } else if app.version_code > 0 {
+            format!("versionCode {}", app.version_code)
+        } else {
+            "系统默认版本".to_string()
+        };
+
+        let sdk_text = format!(
+            "targetSdk {} · minSdk {} · {}",
+            details.target_sdk.max(1),
+            details.min_sdk.max(1),
+            if details.primary_abi.trim().is_empty() {
+                "arm64-v8a"
+            } else {
+                details.primary_abi.trim()
+            }
+        );
+
+        let uid_text = if details.uid > 0 {
+            format!("UID {} · 用户 {}", details.uid, app.user_id)
+        } else {
+            format!("用户 {}", app.user_id)
+        };
+
+        let installer_text = if details.installer_package.trim().is_empty() {
+            "手动安装 / 系统预装".to_string()
+        } else {
+            details.installer_package.clone()
+        };
+
+        let time_text =
+            if !details.first_install_time.is_empty() || !details.last_update_time.is_empty() {
+                format!(
+                    "安装 {} · 更新 {}",
+                    if details.first_install_time.is_empty() {
+                        "—"
+                    } else {
+                        &details.first_install_time
+                    },
+                    if details.last_update_time.is_empty() {
+                        "—"
+                    } else {
+                        &details.last_update_time
+                    }
+                )
+            } else {
+                "系统预置或未知时间".to_string()
+            };
+
+        let apk_paths_summary = if app.apk_files.is_empty() {
+            format!("数据目录 {}", details.data_dir)
+        } else {
+            let first_path = &app.apk_files[0].path;
+            let size_label = format_bytes(app.apk_bytes());
+            if app.apk_files.len() > 1 {
+                format!(
+                    "{size_label} ({} 个分包) · {first_path} · 数据 {}",
+                    app.apk_files.len(),
+                    details.data_dir
+                )
+            } else {
+                format!("{size_label} · {first_path} · 数据 {}", details.data_dir)
+            }
+        };
+
+        let meta_row_1 = Flex::row()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_spacing(S2)
+            .with_child(
+                Expanded::new(1.1, self.app_spec_cell("应用包名", package.clone(), true)).finish(),
+            )
+            .with_child(
+                Expanded::new(1.0, self.app_spec_cell("版本信息", ver_text, false)).finish(),
+            )
+            .with_child(
+                Expanded::new(1.1, self.app_spec_cell("目标 SDK 与架构", sdk_text, false)).finish(),
+            )
+            .finish();
+
+        let meta_row_2 = Flex::row()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_spacing(S2)
+            .with_child(
+                Expanded::new(0.7, self.app_spec_cell("应用 UID", uid_text, false)).finish(),
+            )
+            .with_child(
+                Expanded::new(0.8, self.app_spec_cell("安装来源", installer_text, false)).finish(),
+            )
+            .with_child(
+                Expanded::new(1.3, self.app_spec_cell("安装与更新时间", time_text, false)).finish(),
+            )
+            .with_child(
+                Expanded::new(
+                    1.2,
+                    self.app_spec_cell("安装包体积与路径", apk_paths_summary, true),
+                )
+                .finish(),
+            )
+            .finish();
+
+        // 3. Interactive Desktop Runtime Permissions (2-column grid)
+        let granted_count = details
+            .permissions
+            .iter()
+            .filter(|perm| perm.granted)
+            .count();
+        let perm_header = self.between(
+            self.hstack(
+                S2,
+                vec![
+                    self.line_w(
+                        "应用权限开关 · 桌面端直接授权/撤销",
+                        CAPTION,
+                        p.text,
+                        Weight::Semibold,
+                    ),
+                    self.pill_badge(
+                        format!("已授权 {granted_count} / {}", details.permissions.len()),
+                        p.text2,
+                        p.tag_bg,
+                    ),
+                ],
+            ),
+            self.line(
+                "无需跳转手机设置，点击即可通过 ADB 实时变更权限",
+                MICRO,
+                p.text3,
+            ),
+        );
+
+        let mut perm_cards = Vec::with_capacity(details.permissions.len());
+        for perm in &details.permissions {
+            let zh_label = stepx_companion::apps::permission_chinese_label(&perm.name)
+                .unwrap_or(perm.label.as_str());
+            let short_suffix = perm.name.rsplit('.').next().unwrap_or(&perm.name);
+            let status_badge = if perm.granted {
+                self.pill_badge("已授权", p.success_text, p.success_soft)
+            } else {
+                self.pill_badge("未授权", p.text3, p.tag_bg)
+            };
+            let toggle_btn = self.button(
+                format!("app-perm-toggle:{}:{}", app.package, perm.name),
+                if perm.granted {
+                    "撤销权限"
+                } else {
+                    "授予权限"
+                },
+                Action::ToggleAppPermission {
+                    package: app.package.clone(),
+                    permission: perm.name.clone(),
+                    grant: !perm.granted,
+                },
+                if perm.granted {
+                    Btn::Secondary
+                } else {
+                    Btn::Primary
+                },
+            );
+            let left = self.hstack(
+                S2,
+                vec![
+                    status_badge,
+                    self.line_w(zh_label, CAPTION, p.text, Weight::Medium),
+                    self.mono(short_suffix, MICRO, p.text3),
+                ],
+            );
+            perm_cards.push(
+                Container::new(self.between(left, toggle_btn))
+                    .with_horizontal_padding(S2 + 2.)
+                    .with_vertical_padding(S1)
+                    .with_background_color(p.bg)
+                    .with_border(Border::all(1.).with_border_color(p.border))
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
+                    .finish(),
+            );
+        }
+        let mut perm_rows = Vec::new();
+        let mut iter = perm_cards.into_iter();
+        while let Some(first) = iter.next() {
+            if let Some(second) = iter.next() {
+                perm_rows.push(
+                    Flex::row()
+                        .with_main_axis_size(MainAxisSize::Max)
+                        .with_spacing(S2)
+                        .with_child(Expanded::new(1.0, first).finish())
+                        .with_child(Expanded::new(1.0, second).finish())
+                        .finish(),
+                );
+            } else {
+                perm_rows.push(
+                    Flex::row()
+                        .with_main_axis_size(MainAxisSize::Max)
+                        .with_spacing(S2)
+                        .with_child(Expanded::new(1.0, first).finish())
+                        .with_child(Expanded::new(1.0, Empty::new().finish()).finish())
+                        .finish(),
+                );
+            }
+        }
+
+        // 4. Desktop Action Bar
+        let action_bar = self.between(
+            self.wrap(vec![
+                self.button(
+                    "app-inspector-force-stop",
+                    "强行停止",
+                    Action::ForceStopApp(package.clone()),
+                    Btn::Secondary,
+                ),
+                self.button(
+                    "app-inspector-toggle-enable",
+                    if app.enabled {
+                        "停用应用"
+                    } else {
+                        "启用应用"
+                    },
+                    Action::ToggleAppEnabled {
+                        package: package.clone(),
+                        enable: !app.enabled,
+                    },
+                    Btn::Secondary,
+                ),
+                self.button(
+                    "app-inspector-clear-cache",
+                    "清理缓存",
+                    Action::ClearAppStorage {
+                        package: package.clone(),
+                        clear_data: false,
+                    },
+                    Btn::Secondary,
+                ),
+                self.button(
+                    "app-inspector-export",
+                    "导出 APK",
+                    Action::ExportApp(package.clone()),
+                    Btn::Secondary,
+                ),
+            ]),
+            self.button_icon(
+                "app-inspector-phone-settings",
+                "在手机系统设置中打开",
+                UiIcon::Smartphone,
+                Action::AppSettings(package.clone()),
+                Btn::Ghost,
+            ),
+        );
+
+        let inspector = Container::new(self.vstack(
+            S2,
+            vec![
+                header,
+                self.divider(),
+                meta_row_1,
+                meta_row_2,
+                self.divider(),
+                perm_header,
+                self.vstack(S1 + 1., perm_rows),
+                self.divider(),
+                action_bar,
+            ],
+        ))
+        .with_horizontal_padding(S3)
+        .with_vertical_padding(S2 + 4.)
+        .with_background_color(p.surface)
+        .with_border(Border::all(1.).with_border_color(p.accent))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_PANEL)))
+        .finish();
+
+        #[cfg(feature = "ui-capture")]
+        let inspector =
+            crate::ui::scenario_check::control("app-inspector-card".to_string(), inspector);
+
+        inspector
+    }
+
     fn installed_app_row(&self, app: &AppInfo) -> El {
         let p = self.p();
         let package = &app.package;
+        let is_selected = self.selected_app.as_deref() == Some(package.as_str());
         let version = if !app.version_name.trim().is_empty() {
             format!("版本 {}", app.version_name.trim())
         } else if app.version_code > 0 {
@@ -148,7 +511,13 @@ impl Companion {
         }
         right_badges.push(self.pill_badge(kind, p.text2, p.surface));
         let heading = self.between(info, self.hstack(S1 + 2., right_badges));
+        // Visible: primary (更新 / 打开) + 更多 + subtle 卸载. Everything else lives in
+        // the expanded row (toggled by 更多 via the existing selected_app state) or the
+        // right-click menu.
+        let can_open = app.launchable && app.enabled;
+        let updatable = matches!(store_state, StoreInstallState::Updatable { .. });
         let mut actions = Vec::new();
+        let mut more_actions = Vec::new();
         if let StoreInstallState::Updatable { latest_version, .. } = &store_state {
             actions.push(self.button_icon(
                 format!("app-store-upd:{package}"),
@@ -157,37 +526,27 @@ impl Companion {
                 Action::AppStore(AppStoreAction::InstallOrUpdate {
                     package: package.clone(),
                 }),
-                Btn::Secondary,
+                Btn::Primary,
             ));
         }
-        if store_match.is_some() {
-            actions.push(self.chip(
-                format!("app-store-detail:{package}"),
-                "商店详情 / 历史版本",
-                Some(UiIcon::Package),
-                vec![
-                    Action::Page(Page::AppStore),
-                    Action::AppStore(AppStoreAction::SelectApp(package.clone())),
-                ],
-                false,
-                false,
-            ));
-        }
-        if app.launchable && app.enabled {
-            actions.push(self.button(
-                format!("app-open:{package}"),
-                "打开",
-                Action::OpenApp(package.clone()),
-                Btn::Secondary,
-            ));
-            actions.push(self.button_icon(
+        if can_open {
+            let mirror = self.button_icon(
                 format!("app-open-mirror:{package}"),
                 "投屏打开",
                 UiIcon::Monitor,
                 Action::OpenAppInMirror(package.clone()),
-                Btn::Secondary,
-            ));
-        } else {
+                if updatable {
+                    Btn::Secondary
+                } else {
+                    Btn::Primary
+                },
+            );
+            if updatable {
+                more_actions.push(mirror);
+            } else {
+                actions.push(mirror);
+            }
+        } else if !updatable {
             actions.push(self.disabled_button(if app.enabled {
                 "无启动入口"
             } else {
@@ -195,39 +554,60 @@ impl Companion {
             }));
         }
         actions.push(self.button(
-            format!("app-export:{package}"),
-            "导出 APK",
-            Action::ExportApp(package.clone()),
-            Btn::Secondary,
-        ));
-        actions.push(self.button(
             format!("app-settings:{package}"),
-            "应用详情",
-            Action::AppSettings(package.clone()),
-            Btn::Secondary,
-        ));
-        actions.push(self.button_icon(
-            format!("app-copy:{package}"),
-            "复制包名",
-            UiIcon::Clipboard,
-            Action::CopyText(package.clone(), "已复制应用包名".into()),
-            Btn::Secondary,
+            if is_selected { "收起" } else { "更多" },
+            if is_selected {
+                Action::InspectApp(None)
+            } else {
+                Action::InspectApp(Some(package.clone()))
+            },
+            Btn::Ghost,
         ));
         if app.can_uninstall() {
-            actions.push(self.button(
-                format!("app-stop:{package}"),
-                "强行停止",
-                Action::ForceStopApp(package.clone()),
-                Btn::Ghost,
-            ));
             actions.push(self.button(
                 format!("app-uninstall:{package}"),
                 "卸载",
                 Action::RequestUninstallApp(package.clone()),
-                Btn::Danger,
+                Btn::Ghost,
+            ));
+        }
+        // 强行停止 / 导出 APK live in the inspector action bar below; only add the
+        // remaining row-level actions here to avoid duplicates.
+        if is_selected {
+            if can_open {
+                more_actions.push(self.button(
+                    format!("app-open:{package}"),
+                    "手机打开",
+                    Action::OpenApp(package.clone()),
+                    Btn::Secondary,
+                ));
+            }
+            if store_match.is_some() {
+                more_actions.push(self.chip(
+                    format!("app-store-detail:{package}"),
+                    "商店详情",
+                    Some(UiIcon::Package),
+                    vec![
+                        Action::Page(Page::AppStore),
+                        Action::AppStore(AppStoreAction::SelectApp(package.clone())),
+                    ],
+                    false,
+                    false,
+                ));
+            }
+            more_actions.push(self.button_icon(
+                format!("app-copy:{package}"),
+                "复制包名",
+                UiIcon::Clipboard,
+                Action::CopyText(package.clone(), "已复制应用包名".into()),
+                Btn::Secondary,
             ));
         }
         let mut contents = vec![heading, self.wrap(actions)];
+        if is_selected {
+            contents.push(self.wrap(more_actions));
+            contents.push(self.app_details_inspector(app));
+        }
         if self.pending_app_uninstall.as_deref() == Some(package.as_str()) {
             let confirmation = self.wrap(vec![
                 self.text(
@@ -259,8 +639,7 @@ impl Companion {
         let content = self.vstack(S3, contents);
         let package_dbl = package.clone();
         let package_rc = package.clone();
-        let can_open = app.launchable && app.enabled;
-        Hoverable::new(
+        let hoverable = Hoverable::new(
             self.mouse_state(format!("app-row:{package}")),
             move |mouse| {
                 let hovered = mouse.is_mouse_over_element();
@@ -273,35 +652,51 @@ impl Companion {
                 } else {
                     mouse.hover_progress().clamp(0.0, 1.0)
                 };
-                let bg = if mouse.is_clicked() {
+                let bg = if mouse.is_clicked() && !is_selected {
                     p.accent_soft
+                } else if is_selected {
+                    mix_color(p.surface, p.accent_soft, 0.35)
                 } else {
                     mix_color(ColorU::transparent_black(), p.hover, t)
+                };
+                let border_col = if is_selected {
+                    p.accent
+                } else {
+                    ColorU::transparent_black()
                 };
                 Container::new(content)
                     .with_horizontal_padding(S3)
                     .with_vertical_padding(S2 + 2.)
                     .with_background_color(bg)
+                    .with_border(Border::all(1.).with_border_color(border_col))
                     .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
                     .finish()
             },
         )
         .with_defer_events_to_children()
-        .with_cursor(Cursor::PointingHand)
-        .on_double_click(move |ctx, _, _| {
-            if can_open {
-                ctx.dispatch_typed_action(Action::OpenApp(package_dbl.clone()));
-            } else {
-                ctx.dispatch_typed_action(Action::AppSettings(package_dbl.clone()));
-            }
+        .with_cursor(if is_selected {
+            Cursor::Arrow
+        } else {
+            Cursor::PointingHand
         })
         .on_right_click(move |ctx, _, at| {
             ctx.dispatch_typed_action(Action::ContextOpen(
                 crate::ui::context_menu::Target::App(package_rc.clone()),
                 at,
             ));
-        })
-        .finish()
+        });
+        let el = if is_selected {
+            hoverable.finish()
+        } else {
+            hoverable
+                .on_double_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(Action::InspectApp(Some(package_dbl.clone())));
+                })
+                .finish()
+        };
+        #[cfg(feature = "ui-capture")]
+        let el = crate::ui::scenario_check::control(format!("app-row:{package}"), el);
+        el
     }
 
     pub(in super::super) fn apps_page(&self) -> El {
@@ -427,32 +822,8 @@ impl Companion {
             self.input(F_APP_SEARCH, "搜索应用名称或包名…", Some(240.)),
         ];
         let toolbar = self.between(self.wrap(filter_items), self.wrap(action_items));
-        let filter_label = match self.settings.apps_filter {
-            1 => "仅第三方应用",
-            2 => "StepOS 与系统组件",
-            3 => "已停用应用",
-            _ => {
-                if self.include_system_apps {
-                    "含系统组件"
-                } else {
-                    "用户安装、可启动系统应用及 Amoo"
-                }
-            }
-        };
-        let sort_label = if self.settings.apps_sort_by_name {
-            "按名称排序"
-        } else {
-            "按版本代码降序"
-        };
         let description = self.between(
-            self.line(
-                format!(
-                    "显示 {} 项 · {filter_label} · {sort_label} · 导出包含完整安装包，不包含应用数据",
-                    filtered.len(),
-                ),
-                MICRO,
-                p.text3,
-            ),
+            self.line(format!("{} 个应用", filtered.len()), MICRO, p.text3),
             if !filtered.is_empty() {
                 let all_pkgs = filtered
                     .iter()
@@ -471,7 +842,26 @@ impl Companion {
             },
         );
         let mut rows = Vec::new();
-        for app in &filtered {
+        if let Some(sel_pkg) = self.selected_app.as_deref() {
+            if !filtered.iter().any(|a| a.package == sel_pkg) {
+                let fallback_app = self
+                    .apps
+                    .iter()
+                    .find(|a| a.package == sel_pkg)
+                    .cloned()
+                    .unwrap_or_else(|| AppInfo {
+                        package: sel_pkg.to_string(),
+                        label: stepx_companion::apps::clean_app_label(sel_pkg, sel_pkg),
+                        enabled: true,
+                        launchable: true,
+                        ..AppInfo::default()
+                    });
+                rows.push(self.app_details_inspector(&fallback_app));
+            }
+        }
+        let page_key = format!("installed-apps:{}:{}:{}:{query}",self.settings.apps_filter,self.settings.apps_sort_by_name,self.include_system_apps);
+        let range = self.list_page_range(&page_key,filtered.len(),40);
+        for app in &filtered[range] {
             if !rows.is_empty() {
                 rows.push(self.divider());
             }
@@ -570,6 +960,7 @@ impl Companion {
             .with_spacing(S3)
             .with_child(toolbar)
             .with_child(description)
+            .with_child(self.list_page_controls(&page_key,filtered.len(),40))
             .with_child(Expanded::new(1., self.sub_enter(card)).finish())
             .finish()
     }

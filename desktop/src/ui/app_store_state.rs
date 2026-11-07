@@ -18,10 +18,10 @@ use stepx_companion::{
     app_store::{
         check_store_install_state, check_updates_for_installed, curated_catalog,
         download_apk_with_progress, expand_category_catalog_batch, fetch_app_full_detail,
-        get_cached_app_detail, merge_and_deduplicate_apps, search_instant_local,
-        search_multi_source, stream_batch_icons, stream_batch_screenshots, RelatedAppItem,
-        StoreApp, StoreAppDetailPayload, StoreCategory, StoreInstallState, StoreSource,
-        StoreSourceOffer,
+        get_cached_app_detail, is_blacklisted_store_item, merge_and_deduplicate_apps,
+        search_instant_local, search_multi_source, stream_batch_icons, stream_batch_screenshots,
+        PreparedExpandedQuery, RelatedAppItem, StoreApp, StoreAppDetailPayload, StoreCategory,
+        StoreInstallState, StoreSource, StoreSourceOffer,
     },
     apps::{self, AppInfo},
 };
@@ -97,6 +97,10 @@ pub enum AppStoreAction {
     CheckUpdates,
     InstallOrUpdate {
         package: String,
+    },
+    InstallFromSource {
+        package: String,
+        source_idx: usize,
     },
     InstallHistorical {
         package: String,
@@ -228,9 +232,23 @@ impl AppStoreUiState {
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
-        let search_results = init_query
-            .as_deref()
-            .map(|q| search_instant_local(q).0);
+        let mut searching = false;
+        let search_results = init_query.as_deref().map(|q| {
+            let (hits, cache_is_fresh) = search_instant_local(q);
+            if !cache_is_fresh {
+                searching = true;
+                let tx_search = tx.clone();
+                let q_owned = q.to_string();
+                std::thread::spawn(move || {
+                    let result = search_multi_source(&q_owned).map_err(|e| format!("{e:#}"));
+                    let _ = tx_search.send(StoreWorkerEvent::SearchFinished {
+                        query: q_owned,
+                        result,
+                    });
+                });
+            }
+            hits
+        });
         let last_search_query = init_query.unwrap_or_default();
         let first_n = catalog.len().min(STORE_DEFAULT_PAGE_SIZE);
         if first_n > 0 {
@@ -243,14 +261,13 @@ impl AppStoreUiState {
             }
         }
         if let Some(ref st) = sub_tag {
-            let sub_apps: Vec<StoreApp> = catalog
+            let sub_apps: Vec<&StoreApp> = catalog
                 .iter()
                 .filter(|a| app_matches_sub_tag(a, st))
                 .take(STORE_DEFAULT_PAGE_SIZE)
-                .cloned()
                 .collect();
             if !sub_apps.is_empty() {
-                Self::spawn_icon_prefetcher(&sub_apps, tx.clone());
+                Self::spawn_icon_prefetcher_refs(&sub_apps, tx.clone());
             }
         }
         let init_category = match std::env::var("STEPX_STORE_CATEGORY")
@@ -265,21 +282,20 @@ impl AppStoreUiState {
             _ => StoreCategory::All,
         };
         if init_category != StoreCategory::All {
-            let cat_apps: Vec<StoreApp> = catalog
+            let cat_apps: Vec<&StoreApp> = catalog
                 .iter()
                 .filter(|a| a.category == init_category)
                 .take(STORE_DEFAULT_PAGE_SIZE)
-                .cloned()
                 .collect();
             if !cat_apps.is_empty() {
-                Self::spawn_icon_prefetcher(&cat_apps, tx.clone());
+                Self::spawn_icon_prefetcher_refs(&cat_apps, tx.clone());
             }
         }
         Self {
             catalog,
             search_results,
             last_search_query,
-            searching: false,
+            searching,
             checking_updates: false,
             update_checked_once: false,
             loading_detail_pkg: None,
@@ -311,6 +327,11 @@ impl AppStoreUiState {
     }
 
     pub fn spawn_icon_prefetcher(apps: &[StoreApp], tx: Sender<StoreWorkerEvent>) {
+        let refs: Vec<&StoreApp> = apps.iter().collect();
+        Self::spawn_icon_prefetcher_refs(&refs, tx);
+    }
+
+    pub fn spawn_icon_prefetcher_refs(apps: &[&StoreApp], tx: Sender<StoreWorkerEvent>) {
         let mut pending: Vec<(String, String)> = Vec::new();
         for a in apps {
             if a.cached_icon.is_none() && !a.icon_url.trim().is_empty() {
@@ -385,6 +406,34 @@ impl AppStoreUiState {
         self.catalog.iter().find(|a| a.package == package)
     }
 
+    pub fn find_app_for_install(&self, package: &str) -> Option<StoreApp> {
+        let from_search = self
+            .search_results
+            .as_ref()
+            .and_then(|res| res.iter().find(|a| a.package == package))
+            .cloned();
+        let from_catalog = self.catalog.iter().find(|a| a.package == package).cloned();
+        let mut resolved = match (from_search, from_catalog) {
+            (Some(mut s), Some(c)) => {
+                Self::preserve_runtime_fields(
+                    std::slice::from_mut(&mut s),
+                    std::slice::from_ref(&c),
+                );
+                Some(s)
+            }
+            (Some(s), None) => Some(s),
+            (None, Some(c)) => Some(c),
+            (None, None) => curated_catalog()
+                .into_iter()
+                .find(|a| a.package == package),
+        };
+        if let Some(ref mut app) = resolved {
+            enrich_app_with_curated(app);
+            ensure_valid_selected_source(app);
+        }
+        resolved
+    }
+
     pub fn mutate_app<F: FnMut(&mut StoreApp)>(&mut self, package: &str, mut f: F) {
         if let Some(app) = self.catalog.iter_mut().find(|a| a.package == package) {
             f(app);
@@ -448,15 +497,328 @@ impl AppStoreUiState {
                         app.developer_apps = old.developer_apps.clone();
                     }
                 }
-                if old.selected_source_idx < app.sources.len() {
+                let old_selected_source = old
+                    .sources
+                    .get(old.selected_source_idx)
+                    .filter(|s| !s.download_url.trim().is_empty())
+                    .map(|s| s.source);
+                for old_offer in &old.sources {
+                    if old_offer.download_url.trim().is_empty() {
+                        continue;
+                    }
+                    if let Some(existing) =
+                        app.sources.iter_mut().find(|s| s.source == old_offer.source)
+                    {
+                        if existing.download_url.trim().is_empty()
+                            || (!is_direct_apk_url(&existing.download_url)
+                                && is_direct_apk_url(&old_offer.download_url))
+                        {
+                            existing.download_url = old_offer.download_url.clone();
+                            if existing.version_name.trim().is_empty() {
+                                existing.version_name = old_offer.version_name.clone();
+                            }
+                            if existing.version_code == 0 {
+                                existing.version_code = old_offer.version_code;
+                            }
+                            if existing.size_bytes == 0 {
+                                existing.size_bytes = old_offer.size_bytes;
+                            }
+                            if existing.md5.trim().is_empty() {
+                                existing.md5 = old_offer.md5.clone();
+                            }
+                        }
+                    } else {
+                        app.sources.push(old_offer.clone());
+                    }
+                }
+                if let Some(sel_src) = old_selected_source {
+                    if let Some(idx) = app.sources.iter().position(|s| s.source == sel_src) {
+                        app.selected_source_idx = idx;
+                    }
+                } else if old.selected_source_idx < app.sources.len() {
                     app.selected_source_idx = old.selected_source_idx;
                 }
             }
+            enrich_app_with_curated(app);
+            ensure_valid_selected_source(app);
         }
     }
 }
 
-fn apply_detail_to_app(app: &mut StoreApp, payload: &StoreAppDetailPayload) {
+pub fn is_direct_apk_url(url: &str) -> bool {
+    let u = url.trim();
+    (u.starts_with("http://") || u.starts_with("https://"))
+        && !u.contains("sj.qq.com/appdetail")
+        && !u.contains("appgallery.huawei.com/app/")
+        && !u.contains("wandoujia.com/")
+        && !(u.contains("f-droid.org") && u.contains("/packages/"))
+}
+
+pub fn huawei_appgallery_page_url(package: &str) -> String {
+    let appid = match package.trim() {
+        "app.huawei.auto" => Some("C104871165"),
+        "app.huawei.motor" => Some("C108819761"),
+        "com.yinwang.qiankunapp" => Some("C114128593"),
+        "com.huawei.smarthome" => Some("C10406921"),
+        "com.huawei.health" => Some("C10414141"),
+        "com.vmall.client" => Some("C10049053"),
+        "com.huawei.phoneservice" => Some("C10067631"),
+        "com.huawei.hidisk" => Some("C10055832"),
+        "com.huawei.himovie" => Some("C10393298"),
+        "com.huawei.music" => Some("C101444301"),
+        "com.huawei.browser" => Some("C100170981"),
+        _ => None,
+    };
+    match appid {
+        Some(id) => format!("https://appgallery.huawei.com/app/{id}"),
+        None => "https://appgallery.huawei.com/app/package".to_string(),
+    }
+}
+
+pub fn enrich_app_with_curated(app: &mut StoreApp) {
+    let pkg = app.package.trim();
+    if pkg.is_empty() {
+        return;
+    }
+    let Some(curated) = curated_catalog().into_iter().find(|c| c.package == pkg) else {
+        return;
+    };
+    for cur_offer in curated.sources {
+        let cur_url = cur_offer.download_url.trim();
+        if cur_url.is_empty() {
+            continue;
+        }
+        if let Some(existing) = app.sources.iter_mut().find(|s| s.source == cur_offer.source) {
+            if existing.download_url.trim().is_empty()
+                || (!is_direct_apk_url(&existing.download_url) && is_direct_apk_url(cur_url))
+            {
+                existing.download_url = cur_url.to_string();
+                if existing.version_name.trim().is_empty() {
+                    existing.version_name = cur_offer.version_name;
+                }
+                if existing.version_code == 0 {
+                    existing.version_code = cur_offer.version_code;
+                }
+                if existing.size_bytes == 0 {
+                    existing.size_bytes = cur_offer.size_bytes;
+                }
+                if existing.md5.trim().is_empty() {
+                    existing.md5 = cur_offer.md5;
+                }
+            }
+        } else {
+            app.sources.push(cur_offer);
+        }
+    }
+    if app.developer_apps.is_empty() && !curated.developer_apps.is_empty() {
+        app.developer_apps = curated.developer_apps;
+    }
+}
+
+pub fn ensure_valid_selected_source(app: &mut StoreApp) {
+    if app.sources.is_empty() {
+        enrich_app_with_curated(app);
+    }
+    if app.sources.is_empty() {
+        app.selected_source_idx = 0;
+        return;
+    }
+    if app.selected_source_idx >= app.sources.len() {
+        app.selected_source_idx = 0;
+    }
+    let cur_url = app.sources[app.selected_source_idx].download_url.trim();
+    let needs_upgrade = cur_url.is_empty()
+        || (app.selected_source_idx == 0
+            && !is_direct_apk_url(cur_url)
+            && app.sources.iter().any(|s| is_direct_apk_url(&s.download_url)));
+    if needs_upgrade {
+        if let Some(idx) = app
+            .sources
+            .iter()
+            .position(|s| is_direct_apk_url(&s.download_url))
+            .or_else(|| {
+                app.sources
+                    .iter()
+                    .position(|s| !s.download_url.trim().is_empty())
+            })
+        {
+            app.selected_source_idx = idx;
+        }
+    }
+}
+
+pub fn collect_download_candidates(
+    app: &StoreApp,
+    preferred_source_idx: Option<usize>,
+) -> Vec<StoreSourceOffer> {
+    let mut out: Vec<StoreSourceOffer> = Vec::new();
+    let mut seen_urls: HashSet<String> = HashSet::new();
+
+    let push_offer = |out: &mut Vec<StoreSourceOffer>,
+                      seen_urls: &mut HashSet<String>,
+                      offer: &StoreSourceOffer| {
+        let trimmed = offer.download_url.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if seen_urls.insert(trimmed.to_string()) {
+            let mut cloned = offer.clone();
+            cloned.download_url = trimmed.to_string();
+            if cloned.version_name.trim().is_empty() {
+                cloned.version_name = app.version_name().to_string();
+            }
+            if cloned.size_bytes == 0 {
+                cloned.size_bytes = app.size_bytes();
+            }
+            out.push(cloned);
+        }
+    };
+
+    if let Some(pref_idx) = preferred_source_idx {
+        if let Some(primary) = app.sources.get(pref_idx) {
+            push_offer(&mut out, &mut seen_urls, primary);
+        }
+    } else if let Some(selected) = app
+        .sources
+        .get(app.selected_source_idx)
+        .or_else(|| app.active_offer())
+    {
+        if is_direct_apk_url(&selected.download_url)
+            || !app.sources.iter().any(|s| is_direct_apk_url(&s.download_url))
+        {
+            push_offer(&mut out, &mut seen_urls, selected);
+        }
+    }
+
+    for offer in &app.sources {
+        if is_direct_apk_url(&offer.download_url) {
+            push_offer(&mut out, &mut seen_urls, offer);
+        }
+    }
+
+    let pkg = app.package.trim();
+    if !pkg.is_empty() {
+        if let Some(curated_app) = curated_catalog().into_iter().find(|c| c.package == pkg) {
+            for offer in &curated_app.sources {
+                if is_direct_apk_url(&offer.download_url) {
+                    push_offer(&mut out, &mut seen_urls, offer);
+                }
+            }
+        }
+    }
+
+    for offer in &app.sources {
+        push_offer(&mut out, &mut seen_urls, offer);
+    }
+
+    if !pkg.is_empty() {
+        if let Some(curated_app) = curated_catalog().into_iter().find(|c| c.package == pkg) {
+            for offer in &curated_app.sources {
+                push_offer(&mut out, &mut seen_urls, offer);
+            }
+        }
+    }
+
+    let is_huawei_related = app.sources.iter().any(|s| {
+        s.source == StoreSource::Huawei
+            || s.download_url.contains("dbankcdn.com")
+            || s.download_url.contains("dbankcloud.com")
+            || s.download_url.contains("appgallery.huawei.com")
+    }) || pkg.starts_with("app.huawei.")
+        || pkg.starts_with("com.huawei.")
+        || pkg.starts_with("com.yinwang.")
+        || pkg.starts_with("com.vmall.")
+        || pkg.starts_with("com.hihonor.")
+        || pkg.starts_with("com.seres.")
+        || pkg.starts_with("com.wj.");
+
+    if is_huawei_related
+        && !pkg.is_empty()
+        && !seen_urls
+            .iter()
+            .any(|u| u.contains("appgallery.huawei.com/app/"))
+    {
+        push_offer(
+            &mut out,
+            &mut seen_urls,
+            &StoreSourceOffer {
+                source: StoreSource::Huawei,
+                version_name: app.version_name().to_string(),
+                version_code: app.version_code(),
+                size_bytes: app.size_bytes(),
+                download_url: huawei_appgallery_page_url(pkg),
+                updated_at: String::new(),
+                md5: String::new(),
+                changelog: String::new(),
+            },
+        );
+    }
+
+    let all_global_or_oss = !app.sources.is_empty()
+        && app.sources.iter().all(|s| {
+            matches!(
+                s.source,
+                StoreSource::Global | StoreSource::FDroid | StoreSource::GitHub
+            )
+        });
+
+    if !pkg.is_empty()
+        && !pkg.starts_with("com.google.")
+        && !all_global_or_oss
+        && !seen_urls
+            .iter()
+            .any(|u| u.contains("sj.qq.com/appdetail/"))
+    {
+        push_offer(
+            &mut out,
+            &mut seen_urls,
+            &StoreSourceOffer {
+                source: StoreSource::Tencent,
+                version_name: app.version_name().to_string(),
+                version_code: app.version_code(),
+                size_bytes: app.size_bytes(),
+                download_url: format!("https://sj.qq.com/appdetail/{pkg}"),
+                updated_at: String::new(),
+                md5: String::new(),
+                changelog: String::new(),
+            },
+        );
+    }
+
+    out
+}
+
+pub fn download_with_multi_offer_fallback<D>(
+    package: &str,
+    candidates: &[StoreSourceOffer],
+    mut downloader: D,
+) -> Result<(PathBuf, StoreSourceOffer), String>
+where
+    D: FnMut(&StoreSourceOffer) -> Result<PathBuf, String>,
+{
+    let valid_candidates: Vec<&StoreSourceOffer> = candidates
+        .iter()
+        .filter(|c| !c.download_url.trim().is_empty())
+        .collect();
+    if valid_candidates.is_empty() {
+        return Err(format!("应用 ({package}) 暂未提供可用的下载源链接"));
+    }
+
+    let mut first_err: Option<String> = None;
+    for offer in valid_candidates {
+        match downloader(offer) {
+            Ok(path) => return Ok((path, offer.clone())),
+            Err(err) => {
+                if first_err.is_none() {
+                    first_err = Some(format!("[{}] {}", offer.source.short_label(), err));
+                }
+            }
+        }
+    }
+    Err(first_err.unwrap_or_else(|| "所有下载源均失败".into()))
+}
+
+pub fn apply_detail_to_app(app: &mut StoreApp, payload: &StoreAppDetailPayload) {
     if !payload.description.trim().is_empty() {
         app.description = payload.description.clone();
     }
@@ -483,28 +845,45 @@ fn apply_detail_to_app(app: &mut StoreApp, payload: &StoreAppDetailPayload) {
     }
     if !payload.extra_sources.is_empty() {
         for offer in &payload.extra_sources {
+            let trimmed_dl = offer.download_url.trim();
+            if trimmed_dl.is_empty() {
+                continue;
+            }
             if let Some(existing) = app.sources.iter_mut().find(|s| s.source == offer.source) {
-                if !offer.download_url.is_empty() {
-                    if !offer.version_name.trim().is_empty() {
-                        existing.version_name = offer.version_name.clone();
-                    }
-                    if offer.version_code > 0 {
-                        existing.version_code = offer.version_code;
-                    }
-                    if offer.size_bytes > 0 {
-                        existing.size_bytes = offer.size_bytes;
-                    }
-                    existing.download_url = offer.download_url.clone();
+                let is_older_offer = !existing.version_name.trim().is_empty()
+                    && !offer.version_name.trim().is_empty()
+                    && stepx_companion::app_store::compare_android_versions(
+                        &existing.version_name,
+                        &offer.version_name,
+                    ) == std::cmp::Ordering::Greater;
+                if is_older_offer && is_direct_apk_url(&existing.download_url) {
+                    continue;
+                }
+                if !offer.version_name.trim().is_empty() {
+                    existing.version_name = offer.version_name.clone();
+                }
+                if offer.version_code > 0 {
+                    existing.version_code = offer.version_code;
+                }
+                if offer.size_bytes > 0 {
+                    existing.size_bytes = offer.size_bytes;
+                }
+                if !is_direct_apk_url(&existing.download_url) || is_direct_apk_url(trimmed_dl) {
+                    existing.download_url = trimmed_dl.to_string();
+                }
+                if !offer.md5.trim().is_empty() {
                     existing.md5 = offer.md5.clone();
-                    if !offer.updated_at.trim().is_empty() {
-                        existing.updated_at = offer.updated_at.clone();
-                    }
-                    if !offer.changelog.trim().is_empty() {
-                        existing.changelog = offer.changelog.clone();
-                    }
+                }
+                if !offer.updated_at.trim().is_empty() {
+                    existing.updated_at = offer.updated_at.clone();
+                }
+                if !offer.changelog.trim().is_empty() {
+                    existing.changelog = offer.changelog.clone();
                 }
             } else {
-                app.sources.push(offer.clone());
+                let mut clean_offer = offer.clone();
+                clean_offer.download_url = trimmed_dl.to_string();
+                app.sources.push(clean_offer);
             }
         }
         if let Some(tc_offer) = payload.extra_sources.iter().find(|s| {
@@ -534,6 +913,39 @@ fn apply_detail_to_app(app: &mut StoreApp, payload: &StoreAppDetailPayload) {
                 }
             }
         }
+        if let Some(hw_offer) = payload.extra_sources.iter().find(|s| {
+            s.source == StoreSource::Huawei && is_direct_apk_url(&s.download_url)
+        }) {
+            for official in app
+                .sources
+                .iter_mut()
+                .filter(|s| s.source == StoreSource::Official)
+            {
+                let should_sync = official.download_url.trim().is_empty()
+                    || official.download_url.contains("appgallery.huawei.com")
+                    || ((official.download_url.contains("dbankcdn.com")
+                        || official.download_url.contains("dbankcloud.com"))
+                        && stepx_companion::app_store::compare_android_versions(
+                            &official.version_name,
+                            &hw_offer.version_name,
+                        ) == std::cmp::Ordering::Less);
+                if should_sync {
+                    if !hw_offer.version_name.trim().is_empty() {
+                        official.version_name = hw_offer.version_name.clone();
+                    }
+                    if hw_offer.version_code > 0 {
+                        official.version_code = hw_offer.version_code;
+                    }
+                    if hw_offer.size_bytes > 0 {
+                        official.size_bytes = hw_offer.size_bytes;
+                    }
+                    official.download_url = hw_offer.download_url.trim().to_string();
+                    if !hw_offer.md5.trim().is_empty() {
+                        official.md5 = hw_offer.md5.clone();
+                    }
+                }
+            }
+        }
     }
     if !payload.historical_versions.is_empty() {
         for hist in &payload.historical_versions {
@@ -558,6 +970,7 @@ fn apply_detail_to_app(app: &mut StoreApp, payload: &StoreAppDetailPayload) {
             }
         }
     }
+    ensure_valid_selected_source(app);
     app.detail_loaded = true;
 }
 
@@ -592,10 +1005,10 @@ fn user_downloads_dir() -> PathBuf {
 }
 
 impl Companion {
-    pub(super) fn filtered_store_apps(&self) -> Vec<StoreApp> {
+    pub(super) fn filtered_store_apps(&self) -> Vec<&StoreApp> {
         let query = self.fields[F_STORE_SEARCH].text.trim();
         if let Some(results) = &self.app_store.search_results {
-            results.clone()
+            results.iter().collect()
         } else {
             let sub_tag = self
                 .app_store
@@ -603,27 +1016,51 @@ impl Companion {
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty() && *s != "全部");
-            let mut list: Vec<StoreApp> = self
+            let prepared_query = (!query.is_empty()).then(|| PreparedExpandedQuery::new(query));
+            let installed_by_pkg: Option<
+                std::collections::HashMap<&str, &stepx_companion::apps::AppInfo>,
+            > = matches!(
+                self.app_store.category,
+                StoreCategory::Updatable | StoreCategory::Installed
+            )
+            .then(|| self.apps.iter().map(|a| (a.package.as_str(), a)).collect());
+            let mut list: Vec<&StoreApp> = self
                 .app_store
                 .catalog
                 .iter()
                 .filter(|app| {
+                    if is_blacklisted_store_item(&app.package, &app.name) {
+                        return false;
+                    }
                     let cat_ok = match self.app_store.category {
                         StoreCategory::All => true,
-                        StoreCategory::Updatable => matches!(
-                            check_store_install_state(&self.apps, app),
-                            StoreInstallState::Updatable { .. }
-                        ),
-                        StoreCategory::Installed => !matches!(
-                            check_store_install_state(&self.apps, app),
-                            StoreInstallState::NotInstalled
-                        ),
+                        StoreCategory::Updatable => installed_by_pkg
+                            .as_ref()
+                            .and_then(|m| m.get(app.package.as_str()))
+                            .is_some_and(|&entry| {
+                                !is_blacklisted_store_item(&entry.package, &entry.label)
+                                    && (entry.launchable || app.allow_system_update)
+                                    && matches!(
+                                        check_store_install_state(std::slice::from_ref(entry), app),
+                                        StoreInstallState::Updatable { .. }
+                                    )
+                            }),
+                        StoreCategory::Installed => installed_by_pkg
+                            .as_ref()
+                            .and_then(|m| m.get(app.package.as_str()))
+                            .is_some_and(|&entry| {
+                                !is_blacklisted_store_item(&entry.package, &entry.label)
+                                    && (entry.launchable || app.allow_system_update)
+                            }),
                         other => app.category == other,
                     };
                     let sub_ok = sub_tag.is_none_or(|tag| app_matches_sub_tag(app, tag));
-                    cat_ok && sub_ok && (query.is_empty() || app.matches_query(query))
+                    cat_ok
+                        && sub_ok
+                        && prepared_query
+                            .as_ref()
+                            .is_none_or(|pq| pq.score_app(app) > 0)
                 })
-                .cloned()
                 .collect();
             if let Some(tag) = sub_tag {
                 if tag != "装机必备" {
@@ -649,7 +1086,7 @@ impl Companion {
         let start = page * page_size;
         let end = (start + page_size).min(filtered.len());
         if start < end {
-            AppStoreUiState::spawn_icon_prefetcher(
+            AppStoreUiState::spawn_icon_prefetcher_refs(
                 &filtered[start..end],
                 self.app_store.tx.clone(),
             );
@@ -899,29 +1336,46 @@ impl Companion {
         package: String,
         app_name: String,
         version_name: String,
-        download_url: String,
+        candidates: Vec<StoreSourceOffer>,
         size_bytes: u64,
         is_downgrade: bool,
         version_idx: Option<usize>,
         force_reinstall: bool,
     ) {
-        if download_url.trim().is_empty() {
+        if self.app_store.tasks.get(&package).is_some_and(|t| {
+            matches!(
+                t.stage,
+                StoreTaskStage::Downloading { .. }
+                    | StoreTaskStage::Verifying
+                    | StoreTaskStage::Installing
+                    | StoreTaskStage::Uninstalling
+            )
+        }) {
+            self.status = format!("「{app_name}」正在下载或安装中，请稍候…");
+            return;
+        }
+
+        let valid_candidates: Vec<StoreSourceOffer> = candidates
+            .into_iter()
+            .filter(|c| !c.download_url.trim().is_empty())
+            .collect();
+        if valid_candidates.is_empty() {
             self.app_store.status_banner = Some((
                 format!("「{app_name}」当前来源暂未提供直接下载链接，请尝试切换其他来源"),
                 true,
             ));
             return;
         }
-        let Some(device) = self.selected.clone() else {
+
+        let initial_device = self.selected.clone();
+        if initial_device.is_none() {
             self.app_store.status_banner = Some((
                 format!(
-                    "当前未连接手机，正在为您将「{app_name}」v{version_name} 下载到本机 Downloads 目录…"
+                    "正在下载「{app_name}」v{version_name}（如检测到已连接手机将自动安装，否则保存至 Downloads 目录）…"
                 ),
                 false,
             ));
-            self.start_download_apk_only(package, app_name, version_name, download_url, size_bytes);
-            return;
-        };
+        }
 
         self.app_store.tasks.insert(
             package.clone(),
@@ -943,39 +1397,82 @@ impl Companion {
         std::thread::spawn(move || {
             let pkg_progress = package.clone();
             let tx_progress = tx.clone();
-            let mut last_emit = Instant::now() - Duration::from_secs(1);
-            let mut last_pct = 0u8;
+            let mut attempt_idx = 0usize;
 
-            let dl_res = download_apk_with_progress(
-                &download_url,
+            let dl_res = download_with_multi_offer_fallback(
                 &package,
-                &version_name,
-                |downloaded, total| {
-                    let effective_total = if total > 0 { total } else { size_bytes };
-                    let pct = if effective_total > 0 {
-                        ((downloaded as f64 / effective_total as f64) * 100.0)
-                            .round()
-                            .clamp(0.0, 99.0) as u8
+                &valid_candidates,
+                |offer| {
+                    let cur_attempt = attempt_idx;
+                    attempt_idx += 1;
+                    let offer_ver = if offer.version_name.trim().is_empty() {
+                        version_name.as_str()
                     } else {
-                        25
+                        offer.version_name.as_str()
                     };
-                    if pct != last_pct && last_emit.elapsed() >= Duration::from_millis(80) {
-                        last_pct = pct;
-                        last_emit = Instant::now();
+                    let offer_size = if offer.size_bytes > 0 {
+                        offer.size_bytes
+                    } else {
+                        size_bytes
+                    };
+                    if cur_attempt > 0 {
                         let _ = tx_progress.send(StoreWorkerEvent::TaskProgress {
                             package: pkg_progress.clone(),
                             stage: StoreTaskStage::Downloading {
-                                percent: pct,
-                                downloaded_bytes: downloaded,
-                                total_bytes: effective_total,
+                                percent: 0,
+                                downloaded_bytes: 0,
+                                total_bytes: offer_size,
                             },
                         });
                     }
+                    let mut last_emit = Instant::now() - Duration::from_secs(1);
+                    let mut last_pct: Option<u8> = None;
+                    download_apk_with_progress(
+                        &offer.download_url,
+                        &package,
+                        offer_ver,
+                        |downloaded, total| {
+                            let effective_total = if total > 0 { total } else { offer_size };
+                            if effective_total > 0 && downloaded >= effective_total {
+                                if last_pct != Some(100) {
+                                    last_pct = Some(100);
+                                    let _ = tx_progress.send(StoreWorkerEvent::TaskProgress {
+                                        package: pkg_progress.clone(),
+                                        stage: StoreTaskStage::Verifying,
+                                    });
+                                }
+                                return;
+                            }
+                            let pct = if effective_total > 0 {
+                                ((downloaded as f64 / effective_total as f64) * 100.0)
+                                    .round()
+                                    .clamp(0.0, 99.0) as u8
+                            } else {
+                                25
+                            };
+                            let elapsed = last_emit.elapsed();
+                            if (last_pct != Some(pct) && elapsed >= Duration::from_millis(60))
+                                || elapsed >= Duration::from_millis(180)
+                            {
+                                last_pct = Some(pct);
+                                last_emit = Instant::now();
+                                let _ = tx_progress.send(StoreWorkerEvent::TaskProgress {
+                                    package: pkg_progress.clone(),
+                                    stage: StoreTaskStage::Downloading {
+                                        percent: pct,
+                                        downloaded_bytes: downloaded,
+                                        total_bytes: effective_total,
+                                    },
+                                });
+                            }
+                        },
+                    )
+                    .map_err(|e| format!("{e:#}"))
                 },
             );
 
-            let apk_path = match dl_res {
-                Ok(path) => path,
+            let (apk_path, used_offer) = match dl_res {
+                Ok(res) => res,
                 Err(err) => {
                     let _ = tx.send(StoreWorkerEvent::TaskFinished {
                         package,
@@ -983,11 +1480,53 @@ impl Companion {
                         target_version: version_name,
                         is_downgrade,
                         version_idx,
-                        result: Err(format!("下载失败：{err:#}")),
+                        result: Err(format!("下载失败：{err}")),
                         refreshed_apps: None,
                     });
                     return;
                 }
+            };
+
+            let effective_ver = if used_offer.version_name.trim().is_empty() {
+                version_name
+            } else {
+                used_offer.version_name
+            };
+
+            let resolved_device = initial_device.or_else(|| {
+                let adb = Adb::discover().ok()?;
+                let raw = adb
+                    .run_timeout(&["devices", "-l"], Duration::from_secs(3))
+                    .ok()?;
+                for t in stepx_companion::device::parse_devices(&raw) {
+                    if t.state == "device" {
+                        if let Ok(dev) = stepx_companion::device::Device::inspect(&adb, &t.id) {
+                            return Some(dev);
+                        }
+                    }
+                }
+                None
+            });
+
+            let Some(device) = resolved_device else {
+                let dest_dir = user_downloads_dir();
+                let filename = format!(
+                    "{}_v{}.apk",
+                    sanitize_filename(&package),
+                    sanitize_filename(&effective_ver)
+                );
+                let dest = dest_dir.join(filename);
+                if apk_path != dest {
+                    let _ = std::fs::copy(&apk_path, &dest);
+                }
+                let final_path = if dest.is_file() { dest } else { apk_path };
+                let _ = tx.send(StoreWorkerEvent::ApkDownloadedOnly {
+                    package,
+                    app_name,
+                    target_version: effective_ver,
+                    result: Ok(final_path),
+                });
+                return;
             };
 
             let _ = tx.send(StoreWorkerEvent::TaskProgress {
@@ -1014,14 +1553,14 @@ impl Companion {
             match install_res {
                 Ok((_msg, refreshed_apps)) => {
                     let done_label = if is_downgrade {
-                        format!("已安装旧版 v{version_name}")
+                        format!("已安装旧版 v{effective_ver}")
                     } else {
-                        format!("已安装 v{version_name}")
+                        format!("已安装 v{effective_ver}")
                     };
                     let _ = tx.send(StoreWorkerEvent::TaskFinished {
                         package,
                         app_name,
-                        target_version: version_name,
+                        target_version: effective_ver,
                         is_downgrade,
                         version_idx,
                         result: Ok(done_label),
@@ -1029,13 +1568,29 @@ impl Companion {
                     });
                 }
                 Err(err) => {
+                    let mut err_str = format!("{err:#}");
+                    if !is_downgrade || !err_str.contains("INSTALL_FAILED_VERSION_DOWNGRADE") {
+                        let dest_dir = user_downloads_dir();
+                        let filename = format!(
+                            "{}_v{}.apk",
+                            sanitize_filename(&package),
+                            sanitize_filename(&effective_ver)
+                        );
+                        let dest = dest_dir.join(filename);
+                        if apk_path != dest {
+                            let _ = std::fs::copy(&apk_path, &dest);
+                        }
+                        if dest.is_file() {
+                            err_str = format!("{err_str}（APK 已保存至 {}）", dest.display());
+                        }
+                    }
                     let _ = tx.send(StoreWorkerEvent::TaskFinished {
                         package,
                         app_name,
-                        target_version: version_name,
+                        target_version: effective_ver,
                         is_downgrade,
                         version_idx,
-                        result: Err(format!("{err:#}")),
+                        result: Err(err_str),
                         refreshed_apps: None,
                     });
                 }
@@ -1048,10 +1603,27 @@ impl Companion {
         package: String,
         app_name: String,
         version_name: String,
-        download_url: String,
+        candidates: Vec<StoreSourceOffer>,
         size_bytes: u64,
     ) {
-        if download_url.trim().is_empty() {
+        if self.app_store.tasks.get(&package).is_some_and(|t| {
+            matches!(
+                t.stage,
+                StoreTaskStage::Downloading { .. }
+                    | StoreTaskStage::Verifying
+                    | StoreTaskStage::Installing
+                    | StoreTaskStage::Uninstalling
+            )
+        }) {
+            self.status = format!("「{app_name}」正在下载中，请稍候…");
+            return;
+        }
+
+        let valid_candidates: Vec<StoreSourceOffer> = candidates
+            .into_iter()
+            .filter(|c| !c.download_url.trim().is_empty())
+            .collect();
+        if valid_candidates.is_empty() {
             self.app_store.status_banner = Some((
                 format!("「{app_name}」当前来源暂未提供直接下载链接"),
                 true,
@@ -1078,43 +1650,90 @@ impl Companion {
         std::thread::spawn(move || {
             let pkg_progress = package.clone();
             let tx_progress = tx.clone();
-            let mut last_emit = Instant::now() - Duration::from_secs(1);
-            let mut last_pct = 0u8;
+            let mut attempt_idx = 0usize;
 
-            let dl_res = download_apk_with_progress(
-                &download_url,
+            let dl_res = download_with_multi_offer_fallback(
                 &package,
-                &version_name,
-                |downloaded, total| {
-                    let effective_total = if total > 0 { total } else { size_bytes };
-                    let pct = if effective_total > 0 {
-                        ((downloaded as f64 / effective_total as f64) * 100.0)
-                            .round()
-                            .clamp(0.0, 99.0) as u8
+                &valid_candidates,
+                |offer| {
+                    let cur_attempt = attempt_idx;
+                    attempt_idx += 1;
+                    let offer_ver = if offer.version_name.trim().is_empty() {
+                        version_name.as_str()
                     } else {
-                        25
+                        offer.version_name.as_str()
                     };
-                    if pct != last_pct && last_emit.elapsed() >= Duration::from_millis(80) {
-                        last_pct = pct;
-                        last_emit = Instant::now();
+                    let offer_size = if offer.size_bytes > 0 {
+                        offer.size_bytes
+                    } else {
+                        size_bytes
+                    };
+                    if cur_attempt > 0 {
                         let _ = tx_progress.send(StoreWorkerEvent::TaskProgress {
                             package: pkg_progress.clone(),
                             stage: StoreTaskStage::Downloading {
-                                percent: pct,
-                                downloaded_bytes: downloaded,
-                                total_bytes: effective_total,
+                                percent: 0,
+                                downloaded_bytes: 0,
+                                total_bytes: offer_size,
                             },
                         });
                     }
+                    let mut last_emit = Instant::now() - Duration::from_secs(1);
+                    let mut last_pct: Option<u8> = None;
+                    download_apk_with_progress(
+                        &offer.download_url,
+                        &package,
+                        offer_ver,
+                        |downloaded, total| {
+                            let effective_total = if total > 0 { total } else { offer_size };
+                            if effective_total > 0 && downloaded >= effective_total {
+                                if last_pct != Some(100) {
+                                    last_pct = Some(100);
+                                    let _ = tx_progress.send(StoreWorkerEvent::TaskProgress {
+                                        package: pkg_progress.clone(),
+                                        stage: StoreTaskStage::Verifying,
+                                    });
+                                }
+                                return;
+                            }
+                            let pct = if effective_total > 0 {
+                                ((downloaded as f64 / effective_total as f64) * 100.0)
+                                    .round()
+                                    .clamp(0.0, 99.0) as u8
+                            } else {
+                                25
+                            };
+                            let elapsed = last_emit.elapsed();
+                            if (last_pct != Some(pct) && elapsed >= Duration::from_millis(60))
+                                || elapsed >= Duration::from_millis(180)
+                            {
+                                last_pct = Some(pct);
+                                last_emit = Instant::now();
+                                let _ = tx_progress.send(StoreWorkerEvent::TaskProgress {
+                                    package: pkg_progress.clone(),
+                                    stage: StoreTaskStage::Downloading {
+                                        percent: pct,
+                                        downloaded_bytes: downloaded,
+                                        total_bytes: effective_total,
+                                    },
+                                });
+                            }
+                        },
+                    )
+                    .map_err(|e| format!("{e:#}"))
                 },
             );
 
-            let res = dl_res.map_err(|e| format!("{e:#}")).and_then(|cached_path| {
+            let mut final_ver = version_name.clone();
+            let res = dl_res.and_then(|(cached_path, used_offer)| {
+                if !used_offer.version_name.trim().is_empty() {
+                    final_ver = used_offer.version_name;
+                }
                 let dest_dir = user_downloads_dir();
                 let filename = format!(
                     "{}_v{}.apk",
                     sanitize_filename(&package),
-                    sanitize_filename(&version_name)
+                    sanitize_filename(&final_ver)
                 );
                 let dest = dest_dir.join(filename);
                 if cached_path != dest {
@@ -1130,7 +1749,7 @@ impl Companion {
             let _ = tx.send(StoreWorkerEvent::ApkDownloadedOnly {
                 package,
                 app_name,
-                target_version: version_name,
+                target_version: final_ver,
                 result: res,
             });
         });
@@ -1139,14 +1758,15 @@ impl Companion {
     fn advance_batch_queue(&mut self) {
         if let Some(next_pkg) = self.app_store.batch_queue.first().cloned() {
             self.app_store.batch_queue.remove(0);
-            if let Some(app) = self.app_store.find_app(&next_pkg).cloned() {
-                if let Some(offer) = app.active_offer() {
+            if let Some(app) = self.app_store.find_app_for_install(&next_pkg) {
+                let candidates = collect_download_candidates(&app, None);
+                if let Some(primary) = candidates.first().cloned() {
                     self.start_download_and_install(
-                        app.package.clone(),
-                        app.name.clone(),
-                        offer.version_name.clone(),
-                        offer.download_url.clone(),
-                        offer.size_bytes,
+                        app.package,
+                        app.name,
+                        primary.version_name,
+                        candidates,
+                        primary.size_bytes,
                         false,
                         None,
                         false,
@@ -1212,22 +1832,27 @@ impl Companion {
                 }
             }
             AppStoreAction::SelectApp(package) => {
-                if let Some(app_from_search) = self
+                if !self
                     .app_store
-                    .search_results
-                    .as_ref()
-                    .and_then(|res| res.iter().find(|a| a.package == package))
-                    .cloned()
+                    .catalog
+                    .iter()
+                    .any(|a| a.package == package)
                 {
-                    if !self
+                    if let Some(app_from_search) = self
                         .app_store
-                        .catalog
-                        .iter()
-                        .any(|a| a.package == package)
+                        .search_results
+                        .as_ref()
+                        .and_then(|res| res.iter().find(|a| a.package == package))
+                        .cloned()
+                        .or_else(|| curated_catalog().into_iter().find(|a| a.package == package))
                     {
                         self.app_store.catalog.push(app_from_search);
                     }
                 }
+                self.app_store.mutate_app(&package, |app| {
+                    enrich_app_with_curated(app);
+                    ensure_valid_selected_source(app);
+                });
                 let mut cache_fresh = false;
                 if let Some((cached_payload, is_fresh)) = get_cached_app_detail(&package) {
                     cache_fresh = is_fresh;
@@ -1391,18 +2016,54 @@ impl Companion {
                 self.spawn_store_update_check();
             }
             AppStoreAction::InstallOrUpdate { package } => {
-                let Some(app) = self.app_store.find_app(&package).cloned() else {
+                let Some(app) = self.app_store.find_app_for_install(&package) else {
                     return;
                 };
-                let Some(offer) = app.active_offer().cloned() else {
+                let candidates = collect_download_candidates(&app, None);
+                let Some(primary) = candidates.first().cloned() else {
+                    self.app_store.status_banner = Some((
+                        format!("「{}」当前来源暂未提供直接下载链接", app.name),
+                        true,
+                    ));
                     return;
                 };
                 self.start_download_and_install(
                     app.package,
                     app.name,
-                    offer.version_name,
-                    offer.download_url,
-                    offer.size_bytes,
+                    primary.version_name,
+                    candidates,
+                    primary.size_bytes,
+                    false,
+                    None,
+                    false,
+                );
+            }
+            AppStoreAction::InstallFromSource {
+                package,
+                source_idx,
+            } => {
+                self.app_store.mutate_app(&package, |app| {
+                    if source_idx < app.sources.len() {
+                        app.selected_source_idx = source_idx;
+                    }
+                });
+                let Some(app) = self.app_store.find_app_for_install(&package) else {
+                    return;
+                };
+                let candidates = collect_download_candidates(&app, Some(source_idx));
+                let Some(primary) = candidates.first().cloned() else {
+                    self.app_store.status_banner = Some((
+                        format!("「{}」当前来源暂未提供直接下载链接", app.name),
+                        true,
+                    ));
+                    return;
+                };
+                self.start_download_and_install(
+                    app.package,
+                    app.name,
+                    primary.version_name,
+                    candidates,
+                    primary.size_bytes,
                     false,
                     None,
                     false,
@@ -1414,17 +2075,27 @@ impl Companion {
                 force_reinstall,
             } => {
                 self.app_store.pending_downgrade_reinstall = None;
-                let Some(app) = self.app_store.find_app(&package).cloned() else {
+                let Some(app) = self.app_store.find_app_for_install(&package) else {
                     return;
                 };
                 let Some(hist) = app.historical_versions.get(version_idx).cloned() else {
                     return;
                 };
+                let hist_offer = StoreSourceOffer {
+                    source: hist.source,
+                    version_name: hist.version_name.clone(),
+                    version_code: hist.version_code,
+                    size_bytes: hist.size_bytes,
+                    download_url: hist.download_url.clone(),
+                    updated_at: hist.release_date.clone(),
+                    md5: String::new(),
+                    changelog: String::new(),
+                };
                 self.start_download_and_install(
                     app.package,
                     app.name,
                     hist.version_name,
-                    hist.download_url,
+                    vec![hist_offer],
                     hist.size_bytes,
                     true,
                     Some(version_idx),
@@ -1432,18 +2103,23 @@ impl Companion {
                 );
             }
             AppStoreAction::DownloadApkOnly { package } => {
-                let Some(app) = self.app_store.find_app(&package).cloned() else {
+                let Some(app) = self.app_store.find_app_for_install(&package) else {
                     return;
                 };
-                let Some(offer) = app.active_offer().cloned() else {
+                let candidates = collect_download_candidates(&app, None);
+                let Some(primary) = candidates.first().cloned() else {
+                    self.app_store.status_banner = Some((
+                        format!("「{}」当前来源暂未提供直接下载链接", app.name),
+                        true,
+                    ));
                     return;
                 };
                 self.start_download_apk_only(
                     app.package,
                     app.name,
-                    offer.version_name,
-                    offer.download_url,
-                    offer.size_bytes,
+                    primary.version_name,
+                    candidates,
+                    primary.size_bytes,
                 );
             }
             AppStoreAction::UpdateAll => {
@@ -1559,47 +2235,51 @@ impl Companion {
             AppStoreAction::OpenDeveloperApp(item) => {
                 let pkg = item.package.clone();
                 if self.app_store.find_app(&pkg).is_none() {
-                    let new_app = StoreApp {
-                        package: item.package.clone(),
-                        name: item.name.clone(),
-                        developer: item.developer.clone(),
-                        category: StoreCategory::Tools,
-                        category_label: "同厂应用".into(),
-                        tagline: if item.tagline.trim().is_empty() {
-                            format!("{} 官方出品应用", item.developer)
-                        } else {
-                            item.tagline.clone()
-                        },
-                        description: item.tagline.clone(),
-                        changelog: String::new(),
-                        icon_url: item.icon_url.clone(),
-                        cached_icon: item.cached_icon.clone(),
-                        screenshots: Vec::new(),
-                        cached_screenshots: Vec::new(),
-                        rating: None,
-                        download_count_label: String::new(),
-                        icp_number: String::new(),
-                        featured: false,
-                        allow_system_update: false,
-                        sources: vec![StoreSourceOffer {
-                            source: item.source,
-                            version_name: if item.version_name.is_empty() {
-                                "最新版".into()
+                    let mut new_app = curated_catalog()
+                        .into_iter()
+                        .find(|a| a.package == pkg)
+                        .unwrap_or_else(|| StoreApp {
+                            package: item.package.clone(),
+                            name: item.name.clone(),
+                            developer: item.developer.clone(),
+                            category: StoreCategory::Tools,
+                            category_label: "同厂应用".into(),
+                            tagline: if item.tagline.trim().is_empty() {
+                                format!("{} 官方出品应用", item.developer)
                             } else {
-                                item.version_name.clone()
+                                item.tagline.clone()
                             },
-                            version_code: 0,
-                            size_bytes: item.size_bytes,
-                            download_url: item.download_url.clone(),
-                            updated_at: String::new(),
-                            md5: String::new(),
+                            description: item.tagline.clone(),
                             changelog: String::new(),
-                        }],
-                        selected_source_idx: 0,
-                        historical_versions: Vec::new(),
-                        developer_apps: Vec::new(),
-                        detail_loaded: false,
-                    };
+                            icon_url: item.icon_url.clone(),
+                            cached_icon: item.cached_icon.clone(),
+                            screenshots: Vec::new(),
+                            cached_screenshots: Vec::new(),
+                            rating: None,
+                            download_count_label: String::new(),
+                            icp_number: String::new(),
+                            featured: false,
+                            allow_system_update: false,
+                            sources: vec![StoreSourceOffer {
+                                source: item.source,
+                                version_name: if item.version_name.is_empty() {
+                                    "最新版".into()
+                                } else {
+                                    item.version_name.clone()
+                                },
+                                version_code: 0,
+                                size_bytes: item.size_bytes,
+                                download_url: item.download_url.clone(),
+                                updated_at: String::new(),
+                                md5: String::new(),
+                                changelog: String::new(),
+                            }],
+                            selected_source_idx: 0,
+                            historical_versions: Vec::new(),
+                            developer_apps: Vec::new(),
+                            detail_loaded: false,
+                        });
+                    ensure_valid_selected_source(&mut new_app);
                     self.app_store.catalog.push(new_app);
                 }
                 self.handle_app_store_action(AppStoreAction::SelectApp(pkg), _ctx);
@@ -1874,7 +2554,11 @@ impl Companion {
                             if let Some(task) = self.app_store.tasks.get_mut(&package) {
                                 task.stage = StoreTaskStage::Completed(msg.clone());
                             }
-                            let banner = format!("「{app_name}」v{target_version} 安装完成");
+                            let banner = if msg.contains("请在手机") {
+                                format!("「{app_name}」v{target_version} {msg}")
+                            } else {
+                                format!("「{app_name}」v{target_version} 安装完成")
+                            };
                             self.app_store.status_banner = Some((banner.clone(), false));
                             self.status = banner;
                         }
@@ -1966,5 +2650,346 @@ impl Companion {
             }
         }
         changed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_aito_curated_and_candidate_collection() {
+        let catalog = curated_catalog();
+        let aito = catalog
+            .into_iter()
+            .find(|a| a.package == "app.huawei.auto")
+            .expect("curated catalog must contain AITO (app.huawei.auto)");
+
+        let candidates = collect_download_candidates(&aito, None);
+        assert!(
+            candidates.len() >= 2,
+            "expected multiple fallback candidates for AITO, got {}",
+            candidates.len()
+        );
+        assert!(
+            is_direct_apk_url(&candidates[0].download_url),
+            "primary candidate for AITO should be a direct APK URL, got {}",
+            candidates[0].download_url
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.download_url.contains("appgallery.huawei.com/app/")),
+            "candidates for AITO must include Huawei AppGallery page URL fallback"
+        );
+    }
+
+    #[test]
+    fn test_multi_offer_fallback_recovers_when_primary_url_fails() {
+        let catalog = curated_catalog();
+        let aito = catalog
+            .into_iter()
+            .find(|a| a.package == "app.huawei.auto")
+            .expect("curated catalog must contain AITO");
+        let candidates = collect_download_candidates(&aito, None);
+
+        let mut attempted_urls = Vec::new();
+        let res = download_with_multi_offer_fallback("app.huawei.auto", &candidates, |offer| {
+            attempted_urls.push(offer.download_url.clone());
+            if attempted_urls.len() == 1 {
+                Err("primary CDN connection reset".into())
+            } else {
+                Ok(PathBuf::from("/tmp/app.huawei.auto_v2.4.5.apk"))
+            }
+        });
+
+        let (path, used_offer) = res.expect("fallback offer should succeed when primary fails");
+        assert_eq!(path, PathBuf::from("/tmp/app.huawei.auto_v2.4.5.apk"));
+        assert_eq!(attempted_urls.len(), 2);
+        assert_eq!(used_offer.download_url, candidates[1].download_url);
+    }
+
+    #[test]
+    fn test_multi_offer_fallback_skips_empty_urls_and_reports_error_when_all_fail() {
+        let candidates = vec![
+            StoreSourceOffer {
+                source: StoreSource::Official,
+                version_name: "2.4.5".into(),
+                version_code: 20405,
+                size_bytes: 100,
+                download_url: "   ".into(),
+                updated_at: String::new(),
+                md5: String::new(),
+                changelog: String::new(),
+            },
+            StoreSourceOffer {
+                source: StoreSource::Huawei,
+                version_name: "2.4.5".into(),
+                version_code: 20405,
+                size_bytes: 100,
+                download_url: "https://appgallery.huawei.com/app/C104871165".into(),
+                updated_at: String::new(),
+                md5: String::new(),
+                changelog: String::new(),
+            },
+        ];
+
+        let mut calls = 0usize;
+        let res = download_with_multi_offer_fallback("app.huawei.auto", &candidates, |_offer| {
+            calls += 1;
+            Err("network unreachable".into())
+        });
+        assert_eq!(calls, 1, "empty offer URL should be skipped");
+        let err = res.expect_err("should fail when all non-empty offers fail");
+        assert!(err.contains("network unreachable"), "unexpected err: {err}");
+    }
+
+    #[test]
+    fn test_apply_detail_to_app_protects_direct_apk_url_and_fixes_empty_source_selection() {
+        let mut app = curated_catalog()
+            .into_iter()
+            .find(|a| a.package == "app.huawei.auto")
+            .expect("curated catalog must contain AITO");
+
+        // Simulate Huawei offer already resolved to a direct APK URL and Official temporarily empty
+        let direct_url = "https://apppkg.drcn.hispace.dbankcdn.com/dl/appdl/application/apk/4c/test_aito.apk?maple=0&trackId=0";
+        app.sources[0].download_url = String::new();
+        app.sources[1].download_url = direct_url.into();
+        app.selected_source_idx = 0;
+
+        let payload = StoreAppDetailPayload {
+            package: "app.huawei.auto".into(),
+            description: "AITO 汽车官方客户端".into(),
+            changelog: "修复已知问题".into(),
+            developer: "赛力斯汽车".into(),
+            icon_url: String::new(),
+            cached_icon: None,
+            screenshots: Vec::new(),
+            cached_screenshots: Vec::new(),
+            rating: Some(4.8),
+            download_count_label: "1200 万次安装".into(),
+            icp_number: String::new(),
+            extra_sources: vec![
+                // A page URL must NOT overwrite the existing direct APK URL on Huawei source
+                StoreSourceOffer {
+                    source: StoreSource::Huawei,
+                    version_name: "2.4.5".into(),
+                    version_code: 2004005000,
+                    size_bytes: 339_540_000,
+                    download_url: "https://appgallery.huawei.com/app/C104871165".into(),
+                    updated_at: String::new(),
+                    md5: String::new(),
+                    changelog: String::new(),
+                },
+                // An empty offer must be ignored
+                StoreSourceOffer {
+                    source: StoreSource::Tencent,
+                    version_name: "2.4.5".into(),
+                    version_code: 0,
+                    size_bytes: 0,
+                    download_url: String::new(),
+                    updated_at: String::new(),
+                    md5: String::new(),
+                    changelog: String::new(),
+                },
+            ],
+            historical_versions: Vec::new(),
+            developer_apps: Vec::new(),
+        };
+
+        apply_detail_to_app(&mut app, &payload);
+
+        let hw = app
+            .sources
+            .iter()
+            .find(|s| s.source == StoreSource::Huawei)
+            .unwrap();
+        assert_eq!(
+            hw.download_url, direct_url,
+            "direct APK URL must not be downgraded to page URL"
+        );
+        assert!(
+            !app.download_url().trim().is_empty(),
+            "selected source must be auto-repaired to a non-empty offer"
+        );
+    }
+
+    #[test]
+    fn test_collect_download_candidates_respects_preferred_source_idx() {
+        let mut aito = curated_catalog()
+            .into_iter()
+            .find(|a| a.package == "app.huawei.auto")
+            .expect("curated catalog must contain AITO");
+        aito.sources[1].download_url = "https://appgallery.huawei.com/app/C104871165".into();
+
+        let candidates = collect_download_candidates(&aito, Some(1));
+        assert!(!candidates.is_empty());
+        assert_eq!(candidates[0].source, StoreSource::Huawei);
+        assert_eq!(
+            candidates[0].download_url,
+            "https://appgallery.huawei.com/app/C104871165"
+        );
+        assert!(
+            candidates.iter().any(|c| is_direct_apk_url(&c.download_url)),
+            "direct APK offer must still be retained as fallback"
+        );
+    }
+
+    #[test]
+    fn test_collect_download_candidates_prioritizes_direct_apk_over_default_page_url_and_uses_real_appid(
+    ) {
+        let mut aito = curated_catalog()
+            .into_iter()
+            .find(|a| a.package == "app.huawei.auto")
+            .expect("curated catalog must contain AITO");
+        // Simulate search result where index 0 is a generic Tencent page URL and index 1 is a direct APK URL
+        aito.sources = vec![
+            StoreSourceOffer {
+                source: StoreSource::Tencent,
+                version_name: "3.0.2.320".into(),
+                version_code: 300_023_200,
+                size_bytes: 360_739_707,
+                download_url: "https://sj.qq.com/appdetail/app.huawei.auto".into(),
+                updated_at: String::new(),
+                md5: String::new(),
+                changelog: String::new(),
+            },
+            StoreSourceOffer {
+                source: StoreSource::Official,
+                version_name: "3.0.2.320".into(),
+                version_code: 300_023_200,
+                size_bytes: 360_739_707,
+                download_url: "https://appdl-drcn.dbankcdn.com/dl/appdl/application/apk/87/87521cf0b7f2403e885734de2b331cab/app.huawei.auto.2609021718.apk".into(),
+                updated_at: String::new(),
+                md5: String::new(),
+                changelog: String::new(),
+            },
+        ];
+        aito.selected_source_idx = 0;
+
+        ensure_valid_selected_source(&mut aito);
+        assert_eq!(
+            aito.selected_source_idx, 1,
+            "default selected_source_idx=0 with page URL should auto-upgrade to direct APK source"
+        );
+
+        // Even if selected_source_idx was still 0 before ensure_valid_selected_source, collect_download_candidates(.., None) must put direct APK first
+        aito.selected_source_idx = 0;
+        let candidates = collect_download_candidates(&aito, None);
+        assert!(
+            is_direct_apk_url(&candidates[0].download_url),
+            "first candidate when preferred_source_idx is None must be direct APK URL, got {}",
+            candidates[0].download_url
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.download_url == "https://appgallery.huawei.com/app/C104871165"),
+            "Huawei fallback for app.huawei.auto must use real AppGallery ID C104871165, got {:?}",
+            candidates
+                .iter()
+                .map(|c| &c.download_url)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_preserve_runtime_fields_matches_selected_source_by_identity_and_enriches_curated() {
+        let mut from_search = curated_catalog()
+            .into_iter()
+            .find(|a| a.package == "app.huawei.auto")
+            .expect("curated catalog must contain AITO");
+        from_search.sources = vec![StoreSourceOffer {
+            source: StoreSource::Tencent,
+            version_name: "3.0.2.320".into(),
+            version_code: 0,
+            size_bytes: 0,
+            download_url: "https://sj.qq.com/appdetail/app.huawei.auto".into(),
+            updated_at: String::new(),
+            md5: String::new(),
+            changelog: String::new(),
+        }];
+        from_search.selected_source_idx = 0;
+
+        let mut from_catalog = curated_catalog()
+            .into_iter()
+            .find(|a| a.package == "app.huawei.auto")
+            .expect("curated catalog must contain AITO");
+        // Select Huawei (index 1 in catalog)
+        from_catalog.selected_source_idx = 1;
+
+        AppStoreUiState::preserve_runtime_fields(
+            std::slice::from_mut(&mut from_search),
+            std::slice::from_ref(&from_catalog),
+        );
+
+        let active = from_search.active_offer().expect("must have active offer");
+        assert_eq!(
+            active.source,
+            StoreSource::Huawei,
+            "preserve_runtime_fields must preserve selected source by StoreSource identity across different source orderings"
+        );
+        assert!(is_direct_apk_url(&active.download_url));
+    }
+
+    #[test]
+    fn test_google_and_global_only_apps_skip_synthetic_tencent_fallback_and_preserve_first_err() {
+        let ytm = curated_catalog()
+            .into_iter()
+            .find(|a| a.package == "com.google.android.apps.youtube.music")
+            .expect("curated catalog must contain YouTube Music");
+
+        let candidates = collect_download_candidates(&ytm, None);
+        assert!(!candidates.is_empty());
+        assert_eq!(candidates[0].source, StoreSource::Global);
+        assert!(
+            !candidates
+                .iter()
+                .any(|c| c.source == StoreSource::Tencent
+                    || c.download_url.contains("sj.qq.com/appdetail/")),
+            "Google / Global-only apps must not append synthetic Tencent fallback, got: {:?}",
+            candidates
+        );
+
+        let multi_candidates = vec![
+            StoreSourceOffer {
+                source: StoreSource::Global,
+                version_name: "9.42.53".into(),
+                version_code: 94253240,
+                size_bytes: 77_318_664,
+                download_url: "https://pool.apk.aptoide.com/gamesandapps0/ytm.apk".into(),
+                updated_at: String::new(),
+                md5: String::new(),
+                changelog: String::new(),
+            },
+            StoreSourceOffer {
+                source: StoreSource::Huawei,
+                version_name: "9.42.53".into(),
+                version_code: 94253240,
+                size_bytes: 77_318_664,
+                download_url: "https://appgallery.huawei.com/app/C000000".into(),
+                updated_at: String::new(),
+                md5: String::new(),
+                changelog: String::new(),
+            },
+        ];
+        let mut idx = 0usize;
+        let err = download_with_multi_offer_fallback(
+            "com.google.android.apps.youtube.music",
+            &multi_candidates,
+            |_offer| {
+                idx += 1;
+                if idx == 1 {
+                    Err("primary global offer error".into())
+                } else {
+                    Err("secondary fallback error".into())
+                }
+            },
+        )
+        .expect_err("all offers fail");
+        assert!(
+            err.contains("[国际源] primary global offer error"),
+            "must return first_err rather than secondary fallback error, got: {err}"
+        );
     }
 }

@@ -5,8 +5,8 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
-JAVA = Path('/home/zhengfa/.local/opt/android-studio/jbr/bin')
-ANDROID = Path('/home/zhengfa/Android/Sdk/platforms/android-36/android.jar')
+JAVA = Path('/home/stepx-user/.local/opt/android-studio/jbr/bin')
+ANDROID = Path('/home/stepx-user/Android/Sdk/platforms/android-36/android.jar')
 
 
 class ModelDiagnosticsTest(unittest.TestCase):

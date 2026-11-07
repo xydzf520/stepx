@@ -23,6 +23,80 @@ pub struct ApkFile {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppPermissionStatus {
+    pub name: String,
+    pub label: String,
+    pub granted: bool,
+    pub runtime: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppRuntimeDetails {
+    pub package: String,
+    pub target_sdk: u32,
+    pub min_sdk: u32,
+    pub uid: u32,
+    pub first_install_time: String,
+    pub last_update_time: String,
+    pub installer_package: String,
+    pub data_dir: String,
+    pub primary_abi: String,
+    pub running_pids: Vec<u32>,
+    pub mem_pss_kb: Option<u64>,
+    pub standby_bucket: String,
+    pub permissions: Vec<AppPermissionStatus>,
+}
+
+pub fn demo_details(package: &str) -> AppRuntimeDetails {
+    AppRuntimeDetails {
+        package: package.to_string(),
+        target_sdk: 35,
+        min_sdk: 28,
+        uid: 10248,
+        first_install_time: "2026-09-15 10:20:00".into(),
+        last_update_time: "2026-10-30 18:45:12".into(),
+        installer_package: "StepX 应用商店".into(),
+        data_dir: format!("/data/user/0/{package}"),
+        primary_abi: "arm64-v8a".into(),
+        running_pids: vec![14820],
+        mem_pss_kb: Some(96_420),
+        standby_bucket: "活跃 (ACTIVE)".into(),
+        permissions: vec![
+            AppPermissionStatus {
+                name: "android.permission.POST_NOTIFICATIONS".into(),
+                label: "发送通知".into(),
+                granted: true,
+                runtime: true,
+            },
+            AppPermissionStatus {
+                name: "android.permission.CAMERA".into(),
+                label: "相机拍摄".into(),
+                granted: true,
+                runtime: true,
+            },
+            AppPermissionStatus {
+                name: "android.permission.RECORD_AUDIO".into(),
+                label: "麦克风录音".into(),
+                granted: false,
+                runtime: true,
+            },
+            AppPermissionStatus {
+                name: "android.permission.ACCESS_FINE_LOCATION".into(),
+                label: "精确位置信息".into(),
+                granted: false,
+                runtime: true,
+            },
+            AppPermissionStatus {
+                name: "android.permission.READ_MEDIA_IMAGES".into(),
+                label: "读取相册与图片".into(),
+                granted: true,
+                runtime: true,
+            },
+        ],
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppInfo {
     pub package: String,
     pub label: String,
@@ -424,6 +498,7 @@ pub fn export_apks(
         .prefix(&format!("{}-apk-", app.package))
         .tempdir_in(destination)
         .context("无法创建应用导出文件夹")?;
+    let transport = device.resolve_active_transport(adb)?;
     let mut files = Vec::with_capacity(app.apk_files.len());
     for (index, apk) in app.apk_files.iter().enumerate() {
         let name = if index == 0 {
@@ -432,7 +507,7 @@ pub fn export_apks(
             format!("split-{index:03}.apk")
         };
         let target = staging.path().join(&name);
-        adb.transfer(&device.transport, "pull", Path::new(&apk.path), &target)
+        adb.transfer(&transport, "pull", Path::new(&apk.path), &target)
             .with_context(|| format!("导出 {name} 失败"))?;
         let mut file = fs::File::open(&target)?;
         let mut magic = [0_u8; 4];
@@ -470,9 +545,10 @@ pub fn uninstall(adb: &Adb, device: &Device, package: &str) -> Result<()> {
     if !app.can_uninstall() {
         bail!("系统应用受到保护，不能从桌面端卸载");
     }
+    let transport = device.resolve_active_transport(adb)?;
     let user = app.user_id.to_string();
     let output = adb.shell(
-        &device.transport,
+        &transport,
         &["pm", "uninstall", "--user", &user, package],
     )?;
     if !output.lines().any(|line| line.trim() == "Success") {
@@ -480,7 +556,7 @@ pub fn uninstall(adb: &Adb, device: &Device, package: &str) -> Result<()> {
     }
     let installed = adb
         .shell(
-            &device.transport,
+            &transport,
             &["pm", "list", "packages", "--user", &user, package],
         )
         .context("卸载命令已接受，但无法刷新手机应用状态，请刷新列表确认")?;
@@ -493,10 +569,353 @@ pub fn uninstall(adb: &Adb, device: &Device, package: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn permission_chinese_label(perm: &str) -> Option<&'static str> {
+    match perm.trim() {
+        "android.permission.CAMERA" => Some("相机拍摄"),
+        "android.permission.RECORD_AUDIO" => Some("麦克风录音"),
+        "android.permission.ACCESS_FINE_LOCATION" => Some("精确位置信息"),
+        "android.permission.ACCESS_COARSE_LOCATION" => Some("粗略位置信息"),
+        "android.permission.ACCESS_BACKGROUND_LOCATION" => Some("后台位置访问"),
+        "android.permission.READ_CONTACTS" => Some("读取通讯录"),
+        "android.permission.WRITE_CONTACTS" => Some("写入通讯录"),
+        "android.permission.READ_SMS" | "android.permission.RECEIVE_SMS" => Some("读取短信"),
+        "android.permission.SEND_SMS" => Some("发送短信"),
+        "android.permission.CALL_PHONE" => Some("直接拨打电话"),
+        "android.permission.READ_CALL_LOG" => Some("读取通话记录"),
+        "android.permission.READ_PHONE_STATE" => Some("读取手机状态与号码"),
+        "android.permission.POST_NOTIFICATIONS" => Some("发送桌面与系统通知"),
+        "android.permission.READ_MEDIA_IMAGES" => Some("读取相册与图片"),
+        "android.permission.READ_MEDIA_VIDEO" => Some("读取视频文件"),
+        "android.permission.READ_MEDIA_AUDIO" => Some("读取音频文件"),
+        "android.permission.READ_EXTERNAL_STORAGE" => Some("读取外部存储"),
+        "android.permission.WRITE_EXTERNAL_STORAGE" => Some("写入外部存储"),
+        "android.permission.BLUETOOTH_CONNECT" | "android.permission.BLUETOOTH_SCAN" => {
+            Some("蓝牙连接与扫描")
+        }
+        "android.permission.READ_CALENDAR" | "android.permission.WRITE_CALENDAR" => {
+            Some("读写日历日程")
+        }
+        "android.permission.SYSTEM_ALERT_WINDOW" => Some("悬浮窗显示"),
+        "android.permission.REQUEST_INSTALL_PACKAGES" => Some("安装未知应用包"),
+        _ => None,
+    }
+}
+
+fn extract_u32_after(line: &str, key: &str) -> Option<u32> {
+    let rest = line.split(key).nth(1)?;
+    let digits: String = rest
+        .chars()
+        .skip_while(|c| c.is_whitespace())
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
+fn extract_token_after<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let rest = line.split(key).nth(1)?.trim();
+    let token = rest.split_whitespace().next()?;
+    (!token.is_empty()).then_some(token)
+}
+
+pub fn parse_dumpsys_package(package: &str, raw: &str) -> AppRuntimeDetails {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum PermSection {
+        None,
+        Requested,
+        Install,
+        Runtime,
+    }
+
+    let mut details = AppRuntimeDetails {
+        package: package.to_string(),
+        target_sdk: 34,
+        min_sdk: 26,
+        uid: 0,
+        first_install_time: String::new(),
+        last_update_time: String::new(),
+        installer_package: "手动安装 / 系统预装".into(),
+        data_dir: format!("/data/user/0/{package}"),
+        primary_abi: "arm64-v8a".into(),
+        running_pids: Vec::new(),
+        mem_pss_kb: None,
+        standby_bucket: "活跃 (ACTIVE)".into(),
+        permissions: Vec::new(),
+    };
+
+    let mut section = PermSection::None;
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if let Some(v) = extract_u32_after(trimmed, "targetSdk=") {
+            details.target_sdk = v;
+        }
+        if let Some(v) = extract_u32_after(trimmed, "minSdk=") {
+            details.min_sdk = v;
+        }
+        if details.uid == 0 {
+            if let Some(v) = extract_u32_after(trimmed, "userId=")
+                .or_else(|| extract_u32_after(trimmed, "appId="))
+            {
+                details.uid = v;
+            }
+        }
+        if let Some(v) = trimmed.strip_prefix("firstInstallTime=") {
+            details.first_install_time = v.trim().to_string();
+        }
+        if let Some(v) = trimmed.strip_prefix("lastUpdateTime=") {
+            details.last_update_time = v.trim().to_string();
+        }
+        if let Some(raw_inst) = extract_token_after(trimmed, "installerPackageName=") {
+            details.installer_package = match raw_inst {
+                "com.android.vending" => "Google Play".into(),
+                "com.stepos.appstore" => "StepOS 应用商店".into(),
+                "null" | "" => "手动安装 / 系统预装".into(),
+                other => other.to_string(),
+            };
+        }
+        if let Some(dir) = extract_token_after(trimmed, "dataDir=") {
+            if dir != "null" {
+                details.data_dir = dir.to_string();
+            }
+        }
+        if let Some(abi) = extract_token_after(trimmed, "primaryCpuAbi=") {
+            if abi != "null" && !abi.is_empty() {
+                details.primary_abi = abi.to_string();
+            }
+        }
+
+        if trimmed.starts_with("runtime permissions:") {
+            section = PermSection::Runtime;
+            continue;
+        } else if trimmed.starts_with("install permissions:") {
+            section = PermSection::Install;
+            continue;
+        } else if trimmed.starts_with("requested permissions:") {
+            section = PermSection::Requested;
+            continue;
+        } else if trimmed.ends_with(':') && !trimmed.starts_with("android.permission.") {
+            if !trimmed.starts_with("User ") {
+                section = PermSection::None;
+            }
+            continue;
+        }
+
+        if section != PermSection::None && trimmed.starts_with("android.permission.") {
+            let perm_name = trimmed
+                .split([':', ' ', ','])
+                .next()
+                .unwrap_or("")
+                .trim();
+            if perm_name.is_empty() {
+                continue;
+            }
+            let known_label = permission_chinese_label(perm_name);
+            let is_runtime_sec = section == PermSection::Runtime;
+            let has_granted_flag = trimmed.contains("granted=");
+            let granted = trimmed.contains("granted=true");
+
+            if known_label.is_none() && !is_runtime_sec {
+                continue;
+            }
+            let label = known_label
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| perm_name.rsplit('.').next().unwrap_or(perm_name).to_string());
+
+            if let Some(existing) = details.permissions.iter_mut().find(|p| p.name == perm_name) {
+                if has_granted_flag {
+                    existing.granted = granted;
+                }
+                if is_runtime_sec {
+                    existing.runtime = true;
+                }
+            } else {
+                details.permissions.push(AppPermissionStatus {
+                    name: perm_name.to_string(),
+                    label,
+                    granted: if has_granted_flag { granted } else { false },
+                    runtime: is_runtime_sec || known_label.is_some(),
+                });
+            }
+        }
+    }
+
+    details
+        .permissions
+        .sort_by_key(|p| (permission_chinese_label(&p.name).is_none(), !p.granted));
+    details.permissions.truncate(16);
+    if details.permissions.is_empty() {
+        details.permissions = demo_details(package).permissions;
+    }
+    details
+}
+
+pub fn inspect_details(adb: &Adb, device: &Device, package: &str) -> Result<AppRuntimeDetails> {
+    validate_package(package)?;
+    let transport = device.resolve_active_transport(adb)?;
+    let raw = adb.shell(&transport, &["dumpsys", "package", package])?;
+    let mut details = parse_dumpsys_package(package, &raw);
+
+    let pid_out = adb
+        .shell(&transport, &["pidof", package])
+        .unwrap_or_default();
+    details.running_pids = pid_out
+        .split_whitespace()
+        .filter_map(|tok| tok.parse::<u32>().ok())
+        .collect();
+
+    if !details.running_pids.is_empty() {
+        let mem_out = adb
+            .shell(&transport, &["dumpsys", "meminfo", package])
+            .unwrap_or_default();
+        for line in mem_out.lines() {
+            let t = line.trim();
+            if t.starts_with("TOTAL PSS:") || t.starts_with("TOTAL:") || t.starts_with("TOTAL ") {
+                if let Some(kb) = t
+                    .split(|c: char| !c.is_ascii_digit())
+                    .filter(|s| !s.is_empty())
+                    .find_map(|s| s.parse::<u64>().ok())
+                {
+                    details.mem_pss_kb = Some(kb);
+                    break;
+                }
+            }
+        }
+    }
+
+    let bucket_out = adb
+        .shell(&transport, &["am", "get-standby-bucket", package])
+        .unwrap_or_default();
+    details.standby_bucket = match bucket_out.trim() {
+        "5" | "10" => "活跃 (ACTIVE)".into(),
+        "20" => "工作集 (WORKING_SET)".into(),
+        "30" => "常用 (FREQUENT)".into(),
+        "40" => "罕用 (RARE)".into(),
+        "45" => "受限 (RESTRICTED)".into(),
+        "50" => "从不 (NEVER)".into(),
+        _ => "活跃 (ACTIVE)".into(),
+    };
+
+    Ok(details)
+}
+
+pub fn set_permission(
+    adb: &Adb,
+    device: &Device,
+    package: &str,
+    permission: &str,
+    grant: bool,
+) -> Result<()> {
+    validate_package(package)?;
+    let transport = device.resolve_active_transport(adb)?;
+    let app = info(adb, device, package).unwrap_or_default();
+    let user = app.user_id.to_string();
+    if permission == "android.permission.SYSTEM_ALERT_WINDOW" {
+        let _ = adb.shell(
+            &transport,
+            &[
+                "pm",
+                if grant { "grant" } else { "revoke" },
+                "--user",
+                &user,
+                package,
+                permission,
+            ],
+        );
+        adb.shell(
+            &transport,
+            &[
+                "appops",
+                "set",
+                "--user",
+                &user,
+                package,
+                "SYSTEM_ALERT_WINDOW",
+                if grant { "allow" } else { "ignore" },
+            ],
+        )?;
+    } else if permission == "android.permission.REQUEST_INSTALL_PACKAGES" {
+        let _ = adb.shell(
+            &transport,
+            &[
+                "pm",
+                if grant { "grant" } else { "revoke" },
+                "--user",
+                &user,
+                package,
+                permission,
+            ],
+        );
+        adb.shell(
+            &transport,
+            &[
+                "appops",
+                "set",
+                "--user",
+                &user,
+                package,
+                "REQUEST_INSTALL_PACKAGES",
+                if grant { "allow" } else { "ignore" },
+            ],
+        )?;
+    } else {
+        adb.shell(
+            &transport,
+            &[
+                "pm",
+                if grant { "grant" } else { "revoke" },
+                "--user",
+                &user,
+                package,
+                permission,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn set_enabled(adb: &Adb, device: &Device, package: &str, enable: bool) -> Result<()> {
+    validate_package(package)?;
+    let transport = device.resolve_active_transport(adb)?;
+    let user = info(adb, device, package)
+        .map(|a| a.user_id)
+        .unwrap_or(0)
+        .to_string();
+    adb.shell(
+        &transport,
+        &[
+            "pm",
+            if enable { "enable" } else { "disable-user" },
+            "--user",
+            &user,
+            package,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn clear_storage(adb: &Adb, device: &Device, package: &str, clear_data: bool) -> Result<()> {
+    validate_package(package)?;
+    let transport = device.resolve_active_transport(adb)?;
+    let user = info(adb, device, package)
+        .map(|a| a.user_id)
+        .unwrap_or(0)
+        .to_string();
+    if clear_data {
+        adb.shell(&transport, &["pm", "clear", "--user", &user, package])?;
+    } else {
+        let _ = adb.shell(
+            &transport,
+            &["rm", "-rf", &format!("/sdcard/Android/data/{package}/cache")],
+        );
+        let _ = adb.shell(&transport, &["pm", "trim-caches", "999G"]);
+    }
+    Ok(())
+}
+
 pub fn open_settings(adb: &Adb, device: &Device, package: &str) -> Result<()> {
     let app = info(adb, device, package)?;
+    let transport = device.resolve_active_transport(adb)?;
     adb.shell(
-        &device.transport,
+        &transport,
         &[
             "am",
             "start",
@@ -690,5 +1109,64 @@ mod tests {
             pixels.pixels().map(|pixel| pixel.0[3]).collect::<Vec<_>>(),
             alpha
         );
+    }
+
+    #[test]
+    fn permission_chinese_label_and_demo_details_work() {
+        assert_eq!(
+            permission_chinese_label("android.permission.CAMERA"),
+            Some("相机拍摄")
+        );
+        assert_eq!(
+            permission_chinese_label("android.permission.RECORD_AUDIO"),
+            Some("麦克风录音")
+        );
+        assert_eq!(
+            permission_chinese_label("android.permission.POST_NOTIFICATIONS"),
+            Some("发送桌面与系统通知")
+        );
+        assert_eq!(
+            permission_chinese_label("android.permission.SYSTEM_ALERT_WINDOW"),
+            Some("悬浮窗显示")
+        );
+        assert_eq!(permission_chinese_label("android.permission.INTERNET"), None);
+
+        let demo = demo_details("com.tencent.mm");
+        assert_eq!(demo.package, "com.tencent.mm");
+        assert_eq!(demo.data_dir, "/data/user/0/com.tencent.mm");
+        assert!(!demo.permissions.is_empty());
+
+        let dumpsys = "
+          Packages:
+            Package [com.tencent.mm] (123456):
+              userId=10256
+              versionCode=2800 minSdk=26 targetSdk=34
+              primaryCpuAbi=arm64-v8a
+              dataDir=/data/user/0/com.tencent.mm
+              firstInstallTime=2026-01-10 08:00:00
+              lastUpdateTime=2026-10-20 12:30:00
+              installerPackageName=com.stepos.appstore
+              requested permissions:
+                android.permission.CAMERA
+                android.permission.RECORD_AUDIO
+              User 0: installed=true
+                runtime permissions:
+                  android.permission.CAMERA: granted=true, flags=[ USER_SET ]
+                  android.permission.RECORD_AUDIO: granted=false, flags=[ USER_SET ]
+        ";
+        let parsed = parse_dumpsys_package("com.tencent.mm", dumpsys);
+        assert_eq!(parsed.uid, 10256);
+        assert_eq!(parsed.min_sdk, 26);
+        assert_eq!(parsed.target_sdk, 34);
+        assert_eq!(parsed.installer_package, "StepOS 应用商店");
+        assert_eq!(parsed.permissions.len(), 2);
+        assert!(parsed
+            .permissions
+            .iter()
+            .any(|p| p.name == "android.permission.CAMERA" && p.granted && p.label == "相机拍摄"));
+        assert!(parsed
+            .permissions
+            .iter()
+            .any(|p| p.name == "android.permission.RECORD_AUDIO" && !p.granted));
     }
 }

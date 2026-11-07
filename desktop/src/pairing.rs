@@ -139,6 +139,39 @@ impl QrSession {
             .find(|s| s.kind == "_adb-tls-pairing._tcp" && s.name == self.service)
         {
             adb.pair(&service.endpoint, &self.secret)?;
+            if let Ok(paired_addr) = validate_endpoint(&service.endpoint) {
+                let paired_ip = paired_addr.ip();
+                if let Some(connect) = services.iter().find(|s| {
+                    s.kind == "_adb-tls-connect._tcp"
+                        && validate_endpoint(&s.endpoint).is_ok_and(|a| a.ip() == paired_ip)
+                }) {
+                    if adb
+                        .run_timeout(&["connect", &connect.endpoint], Duration::from_secs(3))
+                        .is_ok()
+                    {
+                        return Ok(Some(connect.endpoint.clone()));
+                    }
+                }
+                for _ in 0..4 {
+                    std::thread::sleep(Duration::from_millis(350));
+                    if let Ok(polled) = crate::discovery::discover_services(adb) {
+                        if let Some(connect) = polled.iter().find(|s| {
+                            s.kind == "_adb-tls-connect._tcp"
+                                && validate_endpoint(&s.endpoint).is_ok_and(|a| a.ip() == paired_ip)
+                        }) {
+                            if adb
+                                .run_timeout(
+                                    &["connect", &connect.endpoint],
+                                    Duration::from_secs(3),
+                                )
+                                .is_ok()
+                            {
+                                return Ok(Some(connect.endpoint.clone()));
+                            }
+                        }
+                    }
+                }
+            }
             return Ok(Some(service.endpoint.clone()));
         }
         Ok(None)
@@ -196,6 +229,10 @@ pub struct WirelessIdentity {
     pub guid: String,
     #[serde(default)]
     pub endpoint: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub wlan_mac: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub wifi_ip: String,
 }
 
 impl Preferences {
@@ -283,5 +320,26 @@ mod tests {
             serde_json::from_str(r#"{"devices":[],"selected_serial":null}"#).expect("deserialize");
         assert!(p3.auto_sync_clipboard);
         assert!(p3.auto_sync_calendar);
+    }
+
+    #[test]
+    fn wireless_identity_persists_wlan_mac_and_supports_legacy_json() {
+        let legacy: WirelessIdentity =
+            serde_json::from_str(r#"{"guid":"adb-123","endpoint":"10.0.1.8:40123"}"#)
+                .expect("legacy deserialize");
+        assert_eq!(legacy.guid, "adb-123");
+        assert_eq!(legacy.endpoint, "10.0.1.8:40123");
+        assert!(legacy.wlan_mac.is_empty());
+
+        let full = WirelessIdentity {
+            guid: "adb-123".into(),
+            endpoint: "10.0.1.8:5555".into(),
+            wlan_mac: "aa:bb:cc:dd:ee:ff".into(),
+            wifi_ip: "10.0.1.8".into(),
+        };
+        let encoded = serde_json::to_string(&full).expect("serialize");
+        let decoded: WirelessIdentity = serde_json::from_str(&encoded).expect("deserialize");
+        assert_eq!(decoded.wlan_mac, "aa:bb:cc:dd:ee:ff");
+        assert_eq!(decoded.wifi_ip, "10.0.1.8");
     }
 }

@@ -23,6 +23,34 @@ struct Delivery {
 fn root() -> PathBuf {
     crate::resources::user_state().join("stepx-companion/work-delivery")
 }
+struct QueueLock(fs::File);
+impl Drop for QueueLock {fn drop(&mut self){let _=self.0.unlock();}}
+fn queue_lock(root:&Path)->Result<QueueLock>{
+    fs::create_dir_all(root)?;
+    ensure!(!fs::symlink_metadata(root)?.file_type().is_symlink(),"投递目录不能是链接");
+    let path=root.join("queue.lock");
+    if path.exists(){ensure!(!fs::symlink_metadata(&path)?.file_type().is_symlink(),"投递锁不能是链接");}
+    let f=fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path)?;
+    f.try_lock().context("投递队列正在由另一进程更新，请稍后重试")?;Ok(QueueLock(f))
+}
+/// Only abandoned staging directories are disposable. Pending files and originals
+/// remain protected, including when delivery has failed or the phone is offline.
+pub fn clean_staging()->Result<u64>{clean_staging_in(&root(),std::time::SystemTime::now())}
+fn clean_staging_in(root:&Path,now:std::time::SystemTime)->Result<u64>{
+    let _lock=queue_lock(root)?;let entries=read(root)?;let mut bytes=0;
+    for item in fs::read_dir(root)? {
+        let item=item?;let id=item.file_name().to_string_lossy().into_owned();
+        if id.len()!=36 || !id.chars().all(|c|c.is_ascii_hexdigit()||c=='-') || entries.iter().any(|v|v.id==id&&!v.done){continue;}
+        let meta=fs::symlink_metadata(item.path())?;
+        if !meta.is_dir() || meta.file_type().is_symlink() || now.duration_since(meta.modified()?).unwrap_or_default().as_secs()<7*86400 {continue;}
+        // Refuse recursive deletion if an unexpected child or symlink appeared.
+        let children=fs::read_dir(item.path())?.collect::<std::io::Result<Vec<_>>>()?;
+        if children.iter().any(|p|p.file_type().map_or(true,|t|!t.is_file()||t.is_symlink())){continue;}
+        let size:u64=children.iter().map(|p|p.metadata().map_or(0,|m|m.len())).sum();
+        fs::remove_dir_all(item.path())?;bytes+=size;
+    }
+    Ok(bytes)
+}
 fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -31,19 +59,24 @@ fn now() -> u64 {
 }
 fn read(root: &Path) -> Result<Vec<Delivery>> {
     let path = root.join("queue.json");
-    if !path.exists() {
-        return Ok(vec![]);
-    }
-    let b = fs::read(path)?;
-    ensure!(b.len() < 2 * 1024 * 1024, "传输记录过大");
-    Ok(serde_json::from_slice(&b)?)
+    Ok(crate::data_store::read(&path, 2 * 1024 * 1024)?.unwrap_or_default())
 }
+#[cfg(test)]
 fn save(root: &Path, entries: &[Delivery]) -> Result<()> {
     fs::create_dir_all(root)?;
-    let file = tempfile::NamedTempFile::new_in(root)?;
-    serde_json::to_writer(file.as_file(), entries)?;
-    file.as_file().sync_all()?;
-    file.persist(root.join("queue.json"))?;
+    crate::data_store::write(&root.join("queue.json"), entries)?;
+    Ok(())
+}
+fn save_changes(root: &Path, entries: &[Delivery], removed: &[String]) -> Result<()> {
+    fs::create_dir_all(root)?;
+    let path = root.join("queue.json");
+    if !crate::data_store::ensure_imported(&path, 2 * 1024 * 1024)? { crate::data_store::write(&path, &Vec::<Delivery>::new())?; }
+    let head = crate::data_store::read_head(&path)?.context("投递队列不存在")?;
+    let changes = entries.iter().map(|entry| Ok(crate::data_store::RecordChange {
+        section: "$root", id: &entry.id, position: None, value: serde_json::to_value(entry)?,
+    })).collect::<Result<Vec<_>>>()?;
+    let deletes = removed.iter().map(|id|("$root",id.as_str())).collect::<Vec<_>>();
+    crate::data_store::apply_delta(&path, head.revision, None, &changes, &deletes)?;
     Ok(())
 }
 pub fn enqueue(workspace: &Path, paths: &[PathBuf], serial: &str) -> Result<usize> {
@@ -51,6 +84,7 @@ pub fn enqueue(workspace: &Path, paths: &[PathBuf], serial: &str) -> Result<usiz
     enqueue_in(&root(), workspace, paths, serial)
 }
 fn enqueue_in(root: &Path, workspace: &Path, paths: &[PathBuf], serial: &str) -> Result<usize> {
+    let _lock=queue_lock(root)?;
     ensure!(!serial.is_empty(), "未指定接收手机");
     let _ = fs::create_dir_all(workspace);
     let workspace = workspace.canonicalize()?;
@@ -93,6 +127,7 @@ fn enqueue_in(root: &Path, workspace: &Path, paths: &[PathBuf], serial: &str) ->
         fs::create_dir_all(&cache)?;
         let cached = cache.join(&name);
         fs::copy(&path, &cached)?;
+        fs::File::open(&cached)?.sync_all()?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -116,21 +151,23 @@ fn enqueue_in(root: &Path, workspace: &Path, paths: &[PathBuf], serial: &str) ->
             attempt: 0,
         });
         // Save each staged file before another is copied; recoverable after interruption.
-        save(root, &entries)?;
+        save_changes(root, &entries[entries.len()-1..], &[])?;
         count += 1;
     }
     // Keep bounded history without removing pending work.
     if entries.len() > 400 {
         let mut done = entries.iter().filter(|e| e.done).count();
+        let mut removed = vec![];
         entries.retain(|e| {
             if e.done && done > 200 {
                 done -= 1;
+                removed.push(e.id.clone());
                 false
             } else {
                 true
             }
         });
-        save(root, &entries)?;
+        save_changes(root, &[], &removed)?;
     }
     Ok(count)
 }
@@ -142,6 +179,7 @@ pub fn process(adb: &Adb, device: &Device) -> Result<usize> {
         return Ok(0);
     };
     let root = root();
+    let _lock=queue_lock(&root)?;
     let mut entries = read(&root)?;
     let now_ts = now();
     let indices: Vec<usize> = entries
@@ -174,13 +212,13 @@ pub fn process(adb: &Adb, device: &Device) -> Result<usize> {
             Ok(()) => {
                 item.done = true;
                 item.error.clear();
-                save(&root, &entries)?;
+                save_changes(&root, std::slice::from_ref(item), &[])?;
                 let _ = fs::remove_dir_all(path.parent().unwrap());
                 delivered += 1;
             }
             Err(e) => {
                 item.error = format!("{e:#}");
-                save(&root, &entries)?;
+                save_changes(&root, std::slice::from_ref(item), &[])?;
                 last_err = Some(e);
                 break;
             }
@@ -196,6 +234,7 @@ pub fn process(adb: &Adb, device: &Device) -> Result<usize> {
 pub fn retry() -> Result<()> {
     let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = root();
+    let _lock=queue_lock(&root)?;
     let mut entries = read(&root)?;
     for e in &mut entries {
         if !e.done {
@@ -203,7 +242,8 @@ pub fn retry() -> Result<()> {
             e.error.clear();
         }
     }
-    save(&root, &entries)
+    let changed: Vec<_> = entries.into_iter().filter(|entry| !entry.done).collect();
+    save_changes(&root, &changed, &[])
 }
 pub fn summary() -> Option<String> {
     let _g = LOCK.try_lock().ok()?;
@@ -222,6 +262,31 @@ pub fn summary() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn delivery_progress_commits_only_the_changed_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let original: Vec<_> = (0..20).map(|i|Delivery {id:format!("file-{i}"),serial:"phone".into(),name:format!("{i}.txt"),path:dir.path().join(format!("{i}.txt")),sha256:"digest".into(),size:20,done:false,error:String::new(),attempt:0}).collect();
+        save(dir.path(),&original).unwrap();
+        let db = crate::data_store::database_for(&dir.path().join("queue.json"));
+        let before = crate::data_store::with_connection(&db,|c|Ok(c.total_changes())).unwrap();
+        let mut changed = original[8].clone(); changed.done=true; changed.attempt=120;
+        save_changes(dir.path(),&[changed],&[]).unwrap();
+        let after = crate::data_store::with_connection(&db,|c|Ok(c.total_changes())).unwrap();
+        assert_eq!(after-before,2,"one delivery and the shared snapshot revision");
+        let saved = read(dir.path()).unwrap();
+        assert_eq!(saved.len(),20);
+        assert!(saved[8].done);
+        assert!(saved.iter().enumerate().filter(|(i,_)|*i!=8).all(|(_,entry)|!entry.done&&entry.attempt==0));
+    }
+    #[test]
+    fn staging_cleanup_keeps_pending_originals_and_unknown_directories(){
+        let tmp=tempfile::tempdir().unwrap();let root=tmp.path();let pending=crate::companion_link::uuid();let orphan=crate::companion_link::uuid();
+        for id in [&pending,&orphan,"user-folder"]{fs::create_dir(root.join(id)).unwrap();fs::write(root.join(id).join("document.pdf"),b"data").unwrap();}
+        save(root,&[Delivery{id:pending.clone(),serial:"phone".into(),name:"document.pdf".into(),path:root.join("original.pdf"),sha256:"hash".into(),size:4,done:false,error:"offline".into(),attempt:0}]).unwrap();
+        let future=std::time::SystemTime::now()+std::time::Duration::from_secs(8*86400);
+        assert_eq!(clean_staging_in(root,future).unwrap(),4);
+        assert!(root.join(pending).join("document.pdf").is_file());assert!(!root.join(orphan).exists());assert!(root.join("user-folder").is_dir());
+    }
     #[test]
     fn stages_only_outputs_deduplicates_and_preserves_original() {
         let t = tempfile::tempdir().unwrap();

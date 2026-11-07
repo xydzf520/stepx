@@ -1,6 +1,6 @@
 use super::super::{
     expansion_state::ExpansionAction as EA, icons::UiIcon, studio_state::StudioAction, theme::*,
-    widgets::*, Action, Companion, FileModal, Page, F_FILE_NAME, F_FILE_SEARCH,
+    widgets::*, Action, Companion, FileModal, Page, F_FILE_NAME, F_FILE_SEARCH, FILES_PER_PAGE,
 };
 use facloud_ui::{
     assets::asset_cache::AssetSource, color::ColorU, elements::*, fonts::Weight, platform::Cursor,
@@ -128,46 +128,23 @@ fn file_symbol(entry: &stepx_companion::storage::Entry) -> (UiIcon, &'static str
         };
     }
     (
-        match entry.kind_badge() {
-            "图片" => UiIcon::Image,
-            "视频" => UiIcon::Video,
-            "音频" => UiIcon::Music,
-            "安装包" | "压缩包" => UiIcon::Package,
-            _ => UiIcon::File,
-        },
+        super::super::icon_style::file_content_icon(&entry.name, false),
         entry.kind_badge(),
     )
 }
 
 impl Companion {
     pub(in super::super) fn files_actions(&self) -> Vec<El> {
+        if self.recent_files_view {
+            return vec![];
+        }
         vec![
-            self.button_icon(
-                "files-new-txt",
-                "新建文本",
-                UiIcon::File,
-                Action::OpenNewTextFile,
-                Btn::Secondary,
-            ),
-            self.button_icon(
-                "files-mkdir",
-                "新建文件夹",
-                UiIcon::Plus,
-                Action::OpenNewFolder,
-                Btn::Secondary,
-            ),
-            self.button_icon(
-                "files-open-recv-dir",
-                "电脑接收目录",
-                UiIcon::Folder,
-                Action::CompanionReceiveFolder,
-                Btn::Secondary,
-            ),
-            self.button(
+            self.icon_action(
                 "files-refresh",
                 "刷新",
-                Action::Browse(self.directory.clone()),
-                Btn::Secondary,
+                UiIcon::Refresh,
+                vec![Action::Browse(self.directory.clone())],
+                false,
             ),
             self.button_icon(
                 "files-upload",
@@ -185,11 +162,22 @@ impl Companion {
             2.,
             vec![
                 self.button_icon(
+                    "storage-mode-recent",
+                    "最近文件",
+                    UiIcon::Clock,
+                    Action::FileView(true),
+                    if self.page == Page::Files && self.recent_files_view {
+                        Btn::Secondary
+                    } else {
+                        Btn::Ghost
+                    },
+                ),
+                self.button_icon(
                     "storage-mode-files",
                     "手机文件管理",
                     UiIcon::Folder,
-                    Action::Page(Page::Files),
-                    if self.page == Page::Files {
+                    Action::FileView(false),
+                    if self.page == Page::Files && !self.recent_files_view {
                         Btn::Secondary
                     } else {
                         Btn::Ghost
@@ -223,7 +211,9 @@ impl Companion {
                     .filter(|j| j["state"] == "archived")
                     .count() as u64
             });
-        let right_info = if archived_count > 0 {
+        let right_info = if self.page != Page::Expansion {
+            self.line("", MICRO, p.text2)
+        } else if archived_count > 0 {
             self.pill_badge(
                 format!("电脑已归档 {archived_count} 项"),
                 p.success_text,
@@ -386,6 +376,21 @@ impl Companion {
     }
 
     pub(in super::super) fn files_page(&self) -> El {
+        if self.recent_files_view {
+            return Flex::column()
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                .with_spacing(S3)
+                .with_child(self.storage_mode_bar())
+                .with_child(
+                    Expanded::new(
+                        1.,
+                        self.pane_scroll(self.scroll.clone(), self.render_recent_files()),
+                    )
+                    .finish(),
+                )
+                .finish();
+        }
         let p = self.p();
 
         // 1. Top Bar: Quick Places + Breadcrumbs + Category Filter + Sort + Direction
@@ -433,7 +438,7 @@ impl Companion {
                     Container::new(self.hstack(
                         8.,
                         vec![
-                            self.ui_icon(*icon, 15., fg),
+                            self.content_icon(*icon, 15., fg),
                             self.line_w(*label, CAPTION, fg, Weight::Medium),
                         ],
                     ))
@@ -534,7 +539,7 @@ impl Companion {
                 .flat_map(|(i, (label, path))| {
                     let mut nodes = Vec::new();
                     if i > 0 {
-                        nodes.push(self.ui_icon(UiIcon::ChevronRight, 12., p.text3));
+                        nodes.push(self.content_icon(UiIcon::ChevronRight, 12., p.text3));
                     }
                     nodes.push(self.button(
                         format!("files-crumb-{i}"),
@@ -586,6 +591,27 @@ impl Companion {
                     self.hstack(
                         S2,
                         vec![
+                            self.icon_action(
+                                "files-new-txt",
+                                "新建文本",
+                                UiIcon::File,
+                                vec![Action::OpenNewTextFile],
+                                false,
+                            ),
+                            self.icon_action(
+                                "files-mkdir",
+                                "新建文件夹",
+                                UiIcon::Plus,
+                                vec![Action::OpenNewFolder],
+                                false,
+                            ),
+                            self.icon_action(
+                                "files-open-recv-dir",
+                                "电脑接收目录",
+                                UiIcon::Folder,
+                                vec![Action::CompanionReceiveFolder],
+                                false,
+                            ),
                             self.input(F_FILE_SEARCH, "筛选当前目录…", Some(180.)),
                             if !self.fields[F_FILE_SEARCH].text.trim().is_empty() {
                                 self.button(
@@ -658,7 +684,7 @@ impl Companion {
                                 if self.permanent_delete {
                                     "确认永久删除所选文件？此操作不可撤销。"
                                 } else {
-                                    "确认将所选文件移至 StepX 安全回收站 (/sdcard/.stepx-trash)？"
+                                    "确认将所选文件移至手机回收站？需要时可恢复。"
                                 },
                                 CAPTION,
                                 p.text,
@@ -725,7 +751,7 @@ impl Companion {
                         .with_main_axis_alignment(MainAxisAlignment::Center)
                         .with_cross_axis_alignment(CrossAxisAlignment::Center)
                         .with_child(if checked {
-                            self.ui_icon(UiIcon::Check, 11., p.accent_fg)
+                            self.content_icon(UiIcon::Check, 11., p.accent_fg)
                         } else {
                             Empty::new().finish()
                         })
@@ -785,25 +811,26 @@ impl Companion {
         };
 
         let real_files = self.visible_real_files();
+        let file_page = self.file_page.min(real_files.len().saturating_sub(1) / FILES_PER_PAGE);
+        let file_start = file_page * FILES_PER_PAGE;
 
         let received_transfers = self.received_transfers();
 
         let active_real_idx = self
             .selected_file
             .filter(|&idx| real_files.iter().any(|&(orig_idx, _)| orig_idx == idx))
-            .or_else(|| real_files.first().map(|&(orig_idx, _)| orig_idx));
+            .or_else(|| real_files.get(file_start).map(|&(orig_idx, _)| orig_idx));
 
         let mut table_rows: Vec<El> = Vec::new();
         let mut visible_mock_count = 0usize;
         if !self.files.is_empty() {
-            for (row_idx, &(orig_idx, entry)) in real_files.iter().enumerate() {
+            for (row_idx, &(orig_idx, entry)) in real_files.iter().skip(file_start).take(FILES_PER_PAGE).enumerate() {
                 if row_idx > 0 {
                     table_rows.push(self.divider());
                 }
                 let selected = active_real_idx == Some(orig_idx);
                 let (symbol, kind_label) = file_symbol(entry);
-                let icon =
-                    self.ui_icon(symbol, 18., if entry.directory { p.blue } else { p.text2 });
+                let icon = self.section_icon_badge(symbol, 18., 30.);
                 let name_col = self.hstack(
                     12.,
                     vec![
@@ -821,28 +848,37 @@ impl Companion {
                         ),
                     ],
                 );
+                let row_key = format!("file-real-row:{orig_idx}");
+                let open_id = format!("f-real-open-{orig_idx}");
+                let save_id = format!("f-real-save-{orig_idx}");
+                let ren_id = format!("f-real-ren-{orig_idx}");
+                let del_id = format!("f-real-del-{orig_idx}");
+                let hover_keys = [
+                    row_key.clone(),
+                    format!("link:{open_id}"),
+                    format!("link:{save_id}"),
+                    format!("mlink:{ren_id}"),
+                    format!("link:{del_id}"),
+                ];
+                let row_hovered = {
+                    let map = self.hover_states.borrow();
+                    hover_keys.iter().any(|k| {
+                        map.get(k.as_str())
+                            .is_some_and(|(_, h)| h.lock().unwrap().is_mouse_over_element())
+                    })
+                };
                 let mut act_links = vec![self.link(
-                    format!("f-real-open-{orig_idx}"),
+                    open_id,
                     if entry.directory { "进入" } else { "打开" },
                     Action::ActivateFile(orig_idx),
                 )];
-                if !entry.directory {
-                    act_links.push(self.link(
-                        format!("f-real-save-{orig_idx}"),
-                        "下载",
-                        Action::DownloadFile(orig_idx),
-                    ));
+                if selected || row_hovered {
+                    if !entry.directory {
+                        act_links.push(self.link(save_id, "下载", Action::DownloadFile(orig_idx)));
+                    }
+                    act_links.push(self.link_muted(ren_id, "重命名", Action::RenameFile(orig_idx)));
+                    act_links.push(self.link(del_id, "删除", Action::TrashFile(orig_idx)));
                 }
-                act_links.push(self.link_muted(
-                    format!("f-real-ren-{orig_idx}"),
-                    "重命名",
-                    Action::RenameFile(orig_idx),
-                ));
-                act_links.push(self.link(
-                    format!("f-real-del-{orig_idx}"),
-                    "删除",
-                    Action::TrashFile(orig_idx),
-                ));
                 let actions_col = self.hstack(8., act_links);
                 let size_str = if entry.directory {
                     "--".to_string()
@@ -949,7 +985,7 @@ impl Companion {
                     Some(sel) => sel == i,
                     None => r.selected,
                 };
-                let icon = self.ui_icon(
+                let icon = self.content_icon(
                     if r.is_dir {
                         UiIcon::Folder
                     } else {
@@ -975,18 +1011,33 @@ impl Companion {
                         ),
                     ],
                 );
-                let actions_col = self.hstack(
-                    8.,
-                    vec![
-                        self.link(
-                            format!("f-act-open-{i}"),
-                            if r.is_dir { "进入" } else { "打开" },
-                            Action::ActivateFile(i),
-                        ),
-                        self.link_muted(format!("f-act-ren-{i}"), "重命名", Action::OpenRename),
-                        self.link(format!("f-act-del-{i}"), "删除", Action::Trash),
-                    ],
-                );
+                let row_key = format!("file-row:{i}");
+                let open_id = format!("f-act-open-{i}");
+                let ren_id = format!("f-act-ren-{i}");
+                let del_id = format!("f-act-del-{i}");
+                let hover_keys = [
+                    row_key.clone(),
+                    format!("link:{open_id}"),
+                    format!("mlink:{ren_id}"),
+                    format!("link:{del_id}"),
+                ];
+                let row_hovered = {
+                    let map = self.hover_states.borrow();
+                    hover_keys.iter().any(|k| {
+                        map.get(k.as_str())
+                            .is_some_and(|(_, h)| h.lock().unwrap().is_mouse_over_element())
+                    })
+                };
+                let mut act_links = vec![self.link(
+                    open_id,
+                    if r.is_dir { "进入" } else { "打开" },
+                    Action::ActivateFile(i),
+                )];
+                if selected || row_hovered {
+                    act_links.push(self.link_muted(ren_id, "重命名", Action::OpenRename));
+                    act_links.push(self.link(del_id, "删除", Action::Trash));
+                }
+                let actions_col = self.hstack(8., act_links);
                 let row_inner = self.file_grid_row(
                     name_col,
                     self.mono(&self.directory, CAPTION, p.text2),
@@ -1055,11 +1106,7 @@ impl Companion {
                         S1,
                         vec![
                             self.text("当前目录没有符合筛选条件的文件", BODY, p.text2),
-                            self.line(
-                                "提示：可在此处点击鼠标右键，快速新建文件夹、新建文本文档或上传电脑文件",
-                                MICRO,
-                                p.text3,
-                            ),
+                            self.line("右键可新建或上传", MICRO, p.text3),
                         ],
                     ))
                     .with_uniform_padding(S4)
@@ -1080,38 +1127,39 @@ impl Companion {
             real_files.len()
         };
 
-        let selected_entry: Option<stepx_companion::storage::Entry> = self
+        let selected_with_idx: Option<(usize, stepx_companion::storage::Entry)> = self
             .selected_file
             .filter(|&idx| real_files.iter().any(|&(orig_idx, _)| orig_idx == idx))
-            .and_then(|idx| self.files.get(idx).cloned())
+            .and_then(|idx| self.files.get(idx).cloned().map(|e| (idx, e)))
             .or_else(|| {
                 if !real_files.is_empty() {
-                    real_files.first().map(|&(_, e)| e.clone())
+                    real_files.get(file_start).map(|&(idx, e)| (idx, e.clone()))
                 } else if self.demo_mode {
                     let idx = self
                         .selected_file
                         .unwrap_or(2)
                         .min(FILE_MOCKS.len().saturating_sub(1));
                     let m = &FILE_MOCKS[idx];
-                    Some(stepx_companion::storage::Entry {
-                        name: m.name.to_string(),
-                        path: format!("{}/{}", self.directory.trim_end_matches('/'), m.name),
-                        bytes: 2_516_582,
-                        directory: m.is_dir,
-                        symlink: false,
-                    })
+                    Some((
+                        idx,
+                        stepx_companion::storage::Entry {
+                            name: m.name.to_string(),
+                            path: format!("{}/{}", self.directory.trim_end_matches('/'), m.name),
+                            bytes: 2_516_582,
+                            directory: m.is_dir,
+                            symlink: false,
+                        },
+                    ))
                 } else {
                     None
                 }
             });
+        let selected_entry: Option<stepx_companion::storage::Entry> =
+            selected_with_idx.as_ref().map(|(_, e)| e.clone());
 
         let has_sel = selected_entry.is_some();
         let sel_is_file = selected_entry.as_ref().is_some_and(|e| !e.directory);
-        let mut footer_left = vec![self.line(
-            format!("{total_items} 项 · 单击选择，双击打开"),
-            CAPTION,
-            p.text2,
-        )];
+        let mut footer_left = vec![self.line(format!("{total_items} 项"), CAPTION, p.text2)];
         if let Some(sel) = selected_entry.as_ref() {
             footer_left.push(self.line("·", CAPTION, p.text2));
             footer_left.push(self.line_w(
@@ -1122,6 +1170,11 @@ impl Companion {
             ));
         }
 
+        if total_items > FILES_PER_PAGE {
+            footer_left.push(self.line(format!("第 {} / {} 页",file_page+1,total_items.div_ceil(FILES_PER_PAGE)),CAPTION,p.text2));
+            footer_left.push(if file_page > 0 { self.button("files-page-prev","上一页",Action::FilePage(file_page-1),Btn::Ghost) } else {self.disabled_button("上一页")});
+            footer_left.push(if file_start+FILES_PER_PAGE < total_items { self.button("files-page-next","下一页",Action::FilePage(file_page+1),Btn::Ghost) } else {self.disabled_button("下一页")});
+        }
         let table_footer = Hoverable::new(self.mouse_state("files-table-ftr-ctx"), move |_| {
             Container::new(self.between(
                 self.hstack(10., footer_left),
@@ -1310,7 +1363,7 @@ impl Companion {
             );
         }
 
-        let detail_panel = if let Some(entry) = selected_entry.as_ref() {
+        let detail_panel = if let Some((sel_idx, entry)) = selected_with_idx.as_ref() {
             let (symbol, kind_label) = file_symbol(entry);
             let size_label = if entry.directory {
                 "文件夹目录".to_string()
@@ -1338,6 +1391,20 @@ impl Companion {
 
             let mut cross_actions: Vec<El> = Vec::new();
             if !entry.directory {
+                if lower_sel.ends_with(".apk") {
+                    cross_actions.push(self.button(
+                        "file-install-apk",
+                        "安装此 APK 到手机",
+                        Action::InstallRemoteApk(entry.path.clone()),
+                        Btn::Primary,
+                    ));
+                }
+                cross_actions.push(self.button(
+                    "file-inline-preview",
+                    "桌面内联预览",
+                    Action::PreviewSelectedFile(*sel_idx),
+                    Btn::Secondary,
+                ));
                 cross_actions.push(self.button(
                     "file-detail-open-sys",
                     "用系统程序打开",
@@ -1384,13 +1451,17 @@ impl Companion {
 
             let mut panel_items = vec![
                 self.between(
-                    self.heading("所选文件详情"),
+                    self.heading("详情"),
                     self.pill_badge(kind_label, p.text2, p.tag_bg),
                 ),
                 self.hstack(
                     S2,
                     vec![
-                        self.ui_icon(symbol, 22., if entry.directory { p.blue } else { p.text }),
+                        self.content_icon(
+                            symbol,
+                            22.,
+                            if entry.directory { p.blue } else { p.text },
+                        ),
                         Expanded::new(
                             1.,
                             self.vstack(
@@ -1421,14 +1492,71 @@ impl Companion {
                     ],
                 ),
                 self.divider(),
-                self.line_w("快捷操作与跨页流转", CAPTION, p.text, Weight::Medium),
+                self.line_w("操作", CAPTION, p.text, Weight::Medium),
                 self.wrap(cross_actions),
             ];
+
+            if !entry.directory
+                && self.selected_file_preview_path.as_deref() == Some(entry.path.as_str())
+            {
+                if let Some(img_path) = self.selected_file_preview_image.as_ref() {
+                    panel_items.push(self.divider());
+                    panel_items.push(self.line_w(
+                        "桌面端内容预览",
+                        CAPTION,
+                        p.text,
+                        Weight::Semibold,
+                    ));
+                    panel_items.push(
+                        Container::new(
+                            ConstrainedBox::new(
+                                Image::new(
+                                    AssetSource::LocalFile {
+                                        path: img_path.to_string_lossy().into_owned(),
+                                    },
+                                    CacheOption::BySize,
+                                )
+                                .contain()
+                                .finish(),
+                            )
+                            .with_height(180.)
+                            .finish(),
+                        )
+                        .with_uniform_padding(S2)
+                        .with_background_color(p.bg)
+                        .with_border(Border::all(1.).with_border_color(p.border))
+                        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
+                        .finish(),
+                    );
+                }
+                if let Some(text) = self.selected_file_preview_text.as_ref() {
+                    let preview_lines: String =
+                        text.lines().take(18).collect::<Vec<_>>().join("\n");
+                    panel_items.push(self.divider());
+                    panel_items.push(self.between(
+                        self.line_w("桌面端内容预览", CAPTION, p.text, Weight::Semibold),
+                        self.button(
+                            "file-copy-preview",
+                            "复制预览文本",
+                            Action::CopyText(text.clone(), "已复制文件文本内容".into()),
+                            Btn::Ghost,
+                        ),
+                    ));
+                    panel_items.push(
+                        Container::new(self.mono(preview_lines, MICRO, p.text2))
+                            .with_uniform_padding(S2)
+                            .with_background_color(p.bg)
+                            .with_border(Border::all(1.).with_border_color(p.border))
+                            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
+                            .finish(),
+                    );
+                }
+            }
 
             if !received_cards.is_empty() {
                 panel_items.push(self.divider());
                 panel_items.push(self.between(
-                    self.line_w("电脑已接收 / 下载文件", CAPTION, p.text, Weight::Semibold),
+                    self.line_w("已下载", CAPTION, p.text, Weight::Semibold),
                     self.pill_badge(format!("{} 项", received_cards.len()), p.text2, p.hover),
                 ));
                 panel_items.extend(received_cards);
@@ -1442,7 +1570,7 @@ impl Companion {
             )
         } else {
             let mut empty_items = vec![
-                self.heading("所选文件详情"),
+                self.heading("详情"),
                 self.text(
                     "单击左侧列表中的任意文件，即可用系统程序打开、复制手机路径、推送到背屏点阵创作，或交由 Amoo 分析。",
                     CAPTION,
@@ -1451,12 +1579,7 @@ impl Companion {
             ];
             if !received_cards.is_empty() {
                 empty_items.push(self.divider());
-                empty_items.push(self.line_w(
-                    "电脑已接收 / 下载文件",
-                    CAPTION,
-                    p.text,
-                    Weight::Semibold,
-                ));
+                empty_items.push(self.line_w("已下载", CAPTION, p.text, Weight::Semibold));
                 empty_items.extend(received_cards);
             }
             self.pane_scroll(

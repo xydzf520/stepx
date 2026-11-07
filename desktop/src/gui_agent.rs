@@ -1,4 +1,5 @@
-//! Amoo-account visual agent: goal → observation → one action → verification.
+//! Native-first phone actions. A phone-account planner uses the registered MCP
+//! step controller only after an explicit native-unavailable response.
 use crate::{
     adb::Adb,
     amoo_gui::{GuiRunResult, GuiRunState},
@@ -72,6 +73,12 @@ fn decision(text: &str) -> Result<Value> {
             );
         }
     }
+    let required: &[&str] = match a["type"].as_str() {
+        Some("click" | "long_press") => &["x", "y"],
+        Some("swipe") => &["x1", "y1", "x2", "y2"],
+        _ => &[],
+    };
+    ensure!(required.iter().all(|k| a[*k].is_number()), "动作缺少坐标");
     Ok(value)
 }
 fn parse_verification(text: &str) -> Result<Value> {
@@ -124,6 +131,15 @@ pub fn run(
 ) -> Result<GuiRunResult> {
     let (normalized_app, normalized_goal) = crate::amoo_screen::infer_app_and_task(app, goal);
     crate::amoo_gui::validate_request(&normalized_app, &normalized_goal)?;
+    if control.stop.load(Ordering::Relaxed) {
+        return Ok(GuiRunResult {
+            state: GuiRunState::CancelledBeforeStart,
+            message: "操作已取消，尚未发送到手机".into(),
+            invocation_id: String::new(),
+            raw_result: None,
+            elapsed_ms: 0,
+        });
+    }
     if let Some(instant) = crate::amoo_screen::try_instant_screen_command(
         adb,
         device,
@@ -133,67 +149,47 @@ pub fn run(
     )? {
         return Ok(instant);
     }
-    let started = Instant::now();
-    match crate::independent_gui::run(
+    emit(ScreenEvent::Status("正在使用手机原生执行能力…".into()));
+    let native = crate::amoo_gui::run(
+        adb,
+        device,
+        &normalized_app,
+        &normalized_goal,
+        &control.stop,
+    )?;
+    // Only an explicit, pre-execution refusal may select the installed MCP
+    // executor. A timeout, failed task or acknowledgement must never replay.
+    if native.state != GuiRunState::Unavailable {
+        return Ok(native);
+    }
+    if crate::model_source::prefers_phone()? {
+        emit(ScreenEvent::Status(
+            "正在使用手机已登录账号规划，由 MCP 执行动作；请保持桌面连接".into(),
+        ));
+        return run_with_amoo(
+            adb,
+            device,
+            &normalized_app,
+            &normalized_goal,
+            control,
+            emit,
+        );
+    }
+    emit(ScreenEvent::Status(
+        "原厂 GUI 执行器未开放，正在连接伴侣已注册的 MCP 执行器…".into(),
+    ));
+    crate::independent_gui::run(
         adb,
         device,
         &format!("应用：{normalized_app}。用户目标：{normalized_goal}"),
         None,
         control,
         &mut emit,
-    ) {
-        Ok(res)
-            if matches!(
-                res.state,
-                GuiRunState::Completed | GuiRunState::WaitingCancelled | GuiRunState::Disconnected
-            ) =>
-        {
-            Ok(res)
-        }
-        Ok(res) if control.stop.load(Ordering::Relaxed) => Ok(res),
-        Err(_) if control.stop.load(Ordering::Relaxed) => Ok(GuiRunResult {
-            state: GuiRunState::WaitingCancelled,
-            message: "已停止手机操作。".into(),
-            invocation_id: String::new(),
-            raw_result: None,
-            elapsed_ms: started.elapsed().as_millis() as u64,
-        }),
-        _ => {
-            emit(ScreenEvent::Status(
-                "手机独立执行通道未就绪，已自动切换为桌面视觉导航模式继续执行…".into(),
-            ));
-            match crate::amoo_screen::run_with_pause(
-                adb,
-                device,
-                &normalized_app,
-                &normalized_goal,
-                &control.stop,
-                &control.pause,
-                &mut emit,
-            ) {
-                Ok(fallback) => Ok(fallback),
-                Err(_) if control.stop.load(Ordering::Relaxed) => Ok(GuiRunResult {
-                    state: GuiRunState::WaitingCancelled,
-                    message: "已停止手机操作。".into(),
-                    invocation_id: String::new(),
-                    raw_result: None,
-                    elapsed_ms: started.elapsed().as_millis() as u64,
-                }),
-                Err(err) => Ok(GuiRunResult {
-                    state: GuiRunState::Failed,
-                    message: format!(
-                        "未能完成复杂多步视觉导航（{err}）。提示：点亮屏幕、截图、提取屏幕文字、打开应用、点击按钮、开关设置等基础操作可直接零配置秒级执行；多步复杂自动化可在「设置 -> 模型配置」中检查手机视觉模型连接。"
-                    ),
-                    invocation_id: String::new(),
-                    raw_result: None,
-                    elapsed_ms: 0,
-                }),
-            }
-        }
-    }
+    )
 }
 
-/// Explicit legacy route. Independent-agent failures never fall back to this account.
+/// The account stays inside Amoo. No token is exported or installed as an API key.
+/// The registered MCP controller owns every observation/action and its lease.
 pub fn run_with_amoo(
     adb: &Adb,
     device: &Device,
@@ -203,10 +199,23 @@ pub fn run_with_amoo(
     mut emit: impl FnMut(ScreenEvent),
 ) -> Result<GuiRunResult> {
     crate::amoo_gui::validate_request(app, goal)?;
+    ensure!(
+        goal.encode_utf16().count() <= 2000,
+        "手机 MCP 操控目标最多 2000 字符，请缩短目标"
+    );
     let started = Instant::now();
     let deadline = started + Duration::from_secs(1200);
-    let id = format!("{:032x}", rand::random::<u128>());
-    companion_gui::call(adb, device, json!({"op":"start","task":id,"goal":goal}))?;
+    let mut native = crate::native_mcp::Client::connect(adb, device)?;
+    let start = native.call_cancellable(
+        "stepx_gui_control",
+        json!({"op":"start","goal":goal}),
+        &control.stop,
+    )?;
+    let id = start["task"]
+        .as_str()
+        .filter(|s| s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        .context("手机 MCP 未返回有效任务标识")?
+        .to_owned();
     // A separate lease/control worker remains responsive while uploads/model calls block.
     let finished = Arc::new(AtomicBool::new(false));
     let worker = {
@@ -263,6 +272,7 @@ pub fn run_with_amoo(
     };
     let mut history = vec![];
     let mut session = None;
+    let mut uncertain_action = false;
     let result = (|| -> Result<String> {
         session = Some(Session::open(adb, device)?);
         let mut failures = 0;
@@ -275,7 +285,7 @@ pub fn run_with_amoo(
             ensure!(Instant::now() < deadline, "任务达到20分钟上限");
             ensure!(!control.stop.load(Ordering::Relaxed), "任务已停止");
             loop {
-                let state = companion_gui::call(adb, device, json!({"op":"status"}))?;
+                let state = native.call("stepx_gui_control", json!({"op":"status"}))?;
                 ensure!(
                     state["task"] == id && state["phase"] != "stopped",
                     "手机已停止任务"
@@ -295,7 +305,7 @@ pub fn run_with_amoo(
             emit(ScreenEvent::Status(format!(
                 "第 {step} 步 · Amoo 正在观察与规划"
             )));
-            let (screen, png) = companion_gui::observe(adb, device, &id)?;
+            let (screen, png) = observe_mcp(adb, device, &mut native, &id)?;
             emit(ScreenEvent::Screenshot {
                 number: step,
                 png: png.clone(),
@@ -316,8 +326,8 @@ pub fn run_with_amoo(
                 }
             };
             let a = &chosen["action"];
-            let fresh = companion_gui::call(adb, device, json!({"op":"status"}))?;
-            if fresh["epoch"] != screen["epoch"] || fresh["phase"] != "running" {
+            let fresh = native.call("stepx_gui_control", json!({"op":"status"}))?;
+            if control.pause.load(Ordering::Relaxed) || !same_observation(&fresh, &screen, &id) {
                 continue;
             }
             if a["type"] == "done" {
@@ -327,7 +337,7 @@ pub fn run_with_amoo(
                     a["answer"].as_str().unwrap_or("需要手动接管")
                 );
                 let evidence = a["evidence"].as_str().unwrap_or("");
-                let (verified, final_png) = companion_gui::observe(adb, device, &id)?;
+                let (verified, final_png) = observe_mcp(adb, device, &mut native, &id)?;
                 emit(ScreenEvent::Screenshot {
                     number: step,
                     png: final_png.clone(),
@@ -382,14 +392,16 @@ pub fn run_with_amoo(
             let executed = if a["type"] == "wait" {
                 Ok(json!({"ok":true}))
             } else {
-                companion_gui::call(
-                    adb,
-                    device,
+                uncertain_action = true;
+                native.call_cancellable(
+                    "stepx_gui_control",
                     json!({"op":"action","task":id,"epoch":screen["epoch"],"treeHash":screen["treeHash"],"action":a}),
+                    &control.stop,
                 )
             };
             match executed {
                 Ok(_) => {
+                    uncertain_action = false;
                     failures = 0;
                     emit(ScreenEvent::Step {
                         number: step,
@@ -402,12 +414,10 @@ pub fn run_with_amoo(
                     history.push(json!({"step":step,"decision":chosen,"executed":true}));
                 }
                 Err(error) => {
-                    failures += 1;
                     history.push(json!({"step":step,"decision":chosen,"executed":false,"error":error.to_string()}));
-                    emit(ScreenEvent::Status(format!(
-                        "动作未完成，重新看屏规划：{error}"
-                    )));
-                    ensure!(failures <= 3, "连续操作失败，等待接管");
+                    // A failed callback can follow an executed gesture. Do not
+                    // ask the planner to retry an uncertain click or text entry.
+                    bail!("MCP 动作结果未确认，已停止后续动作；请检查手机：{error}");
                 }
             }
             if history.len() > 12 {
@@ -419,14 +429,32 @@ pub fn run_with_amoo(
     })();
     finished.store(true, Ordering::Relaxed);
     let _ = worker.join();
-    let stopped = companion_gui::call(adb, device, json!({"op":"stop","task":id})).is_ok();
+    let stopped = native
+        .call("stepx_gui_control", json!({"op":"stop","task":id}))
+        .is_ok_and(|v| v["phase"] == "stopped");
     let cleaned = session.as_mut().is_some_and(|s| s.clean());
-    let (state, message) = match result {
-        Ok(answer) => (GuiRunState::Completed, answer),
-        Err(e) if control.stop.load(Ordering::Relaxed) => {
-            (GuiRunState::WaitingCancelled, e.to_string())
+    uncertain_action |= session.as_ref().is_some_and(|s| s.unexpected_tools);
+    let (state, message) = if uncertain_action {
+        (
+            GuiRunState::Unknown,
+            format!(
+                "MCP 动作结果未确认，未自动重试；请核对手机。{}",
+                result.err().map(|e| e.to_string()).unwrap_or_default()
+            ),
+        )
+    } else if !stopped {
+        (
+            GuiRunState::Unknown,
+            "手机 MCP 未确认停止，任务结果待核对；未自动重试".into(),
+        )
+    } else {
+        match result {
+            Ok(answer) => (GuiRunState::Completed, answer),
+            Err(e) if control.stop.load(Ordering::Relaxed) => {
+                (GuiRunState::WaitingCancelled, e.to_string())
+            }
+            Err(e) => (GuiRunState::Failed, e.to_string()),
         }
-        Err(e) => (GuiRunState::Failed, e.to_string()),
     };
     Ok(GuiRunResult {
         state,
@@ -434,9 +462,53 @@ pub fn run_with_amoo(
         invocation_id: id,
         elapsed_ms: started.elapsed().as_millis() as u64,
         raw_result: Some(
-            json!({"mode":"companion_gui_agent","steps":history,"phone_stopped":stopped,"session_deleted":cleaned}),
+            json!({"mode":"phone_account_mcp","requires_desktop":true,"credential_exported":false,"steps":history,"phone_stopped":stopped,"session_deleted":cleaned}),
         ),
     })
+}
+
+fn observe_mcp(
+    adb: &Adb,
+    device: &Device,
+    native: &mut crate::native_mcp::Client,
+    task: &str,
+) -> Result<(Value, Vec<u8>)> {
+    let observation = native.call("stepx_gui_control", json!({"op":"observe","task":task}))?;
+    ensure!(
+        observation["task"] == task
+            && observation["screenshotUri"]
+                == format!("content://com.stepx.companion.app.mcp.screenshot/{task}.jpg"),
+        "MCP 截图归属不匹配"
+    );
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("mcp-screen.jpg");
+    let transport = device.resolve_active_transport(adb)?;
+    adb.transfer(
+        &transport,
+        "pull",
+        std::path::Path::new(&format!(
+            "/sdcard/Android/data/com.stepx.companion.app/files/mcp-screen-{task}.jpg"
+        )),
+        &path,
+    )?;
+    let bytes = std::fs::read(&path)?;
+    ensure!(bytes.len() <= 350000, "MCP 截图超过容量限制");
+    let current = native.call("stepx_gui_control", json!({"op":"status"}))?;
+    ensure!(
+        same_observation(&current, &observation, task),
+        "MCP 画面已过期或用户已接管"
+    );
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::load_from_memory(&bytes)?.write_to(&mut png, image::ImageFormat::Png)?;
+    Ok((observation, png.into_inner()))
+}
+
+fn same_observation(current: &Value, observed: &Value, task: &str) -> bool {
+    current["task"] == task
+        && observed["task"] == task
+        && observed["epoch"].as_u64().is_some()
+        && current["epoch"] == observed["epoch"]
+        && current["phase"] == "running"
 }
 
 #[cfg(test)]
@@ -447,6 +519,8 @@ mod tests {
         for action in [
             json!({"type":"shell","command":"id"}),
             json!({"type":"click","x":1001,"y":20}),
+            json!({"type":"click","y":20}),
+            json!({"type":"swipe","x1":0,"y1":0,"x2":500}),
             json!({"type":"input","text":"a".repeat(2001)}),
         ] {
             assert!(decision(&json!({"observation":"page","action":action}).to_string()).is_err());
@@ -455,6 +529,25 @@ mod tests {
             r#"{"observation":"搜索框","action":{"type":"input","text":"电池健康"}}"#
         )
         .is_ok());
+    }
+    #[test]
+    fn stale_missing_epoch_or_different_task_never_authorizes_an_action() {
+        let observed = json!({"task":"own","epoch":5});
+        let current = json!({"task":"own","epoch":5,"phase":"running"});
+        assert!(same_observation(&current, &observed, "own"));
+        for changed in [
+            json!({"task":"other","epoch":5,"phase":"running"}),
+            json!({"task":"own","epoch":6,"phase":"running"}),
+            json!({"task":"own","epoch":5,"phase":"paused"}),
+            json!({"task":"own","phase":"running"}),
+        ] {
+            assert!(!same_observation(&changed, &observed, "own"));
+        }
+        assert!(!same_observation(
+            &json!({"task":"own","phase":"running"}),
+            &json!({"task":"own"}),
+            "own"
+        ));
     }
     #[test]
     fn verification_requires_explicit_visual_evidence() {

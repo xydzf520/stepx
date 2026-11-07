@@ -1,6 +1,7 @@
 //! Input handling: every `Action` is resolved here. UI-only actions return immediately;
 //! device actions are queued on the ADB worker thread (one at a time).
 
+use stepx_companion::file_dialog::DialogKind;
 use super::*;
 use facloud_ui::{clipboard::ClipboardContent, TypedActionView};
 
@@ -8,6 +9,14 @@ impl TypedActionView for Companion {
     type Action = Action;
 
     fn handle_action(&mut self, action: &Action, ctx: &mut ViewContext<Self>) {
+        if matches!(action, Action::PhoneHangup) && self.push.snapshot.live_call.ongoing(chrono::Utc::now().timestamp_millis()) {
+            self.handle_live_call(&live_calls::LiveCallAction::Control { id: self.push.snapshot.live_call.id.clone(), action: stepx_companion::phone::CallControl::Hangup }, ctx);
+            return;
+        }
+        if let Action::LiveCall(action) = action {
+            self.handle_live_call(action, ctx);
+            return;
+        }
         if self.interaction_gate(action, ctx) {
             return;
         }
@@ -15,9 +24,13 @@ impl TypedActionView for Companion {
             self.handle_desktop_update(action, ctx);
             return;
         }
-        if self.desktop_update.open {
+        if self.desktop_update.open || self.desktop_update.whats_new_open {
             if matches!(action, Action::Escape) {
-                self.desktop_update.open = false;
+                if self.desktop_update.open {
+                    self.desktop_update.open = false;
+                } else {
+                    self.desktop_update.whats_new_open = false;
+                }
                 ctx.notify();
                 return;
             }
@@ -27,12 +40,20 @@ impl TypedActionView for Companion {
                     | Action::MaximizeWindow
                     | Action::CloseWindow
                     | Action::QuitApplication
+                    | Action::CopyText(..)
                     | Action::StudioOpenUrl(_)
             ) {
                 return;
             }
         }
 
+        if self.header_actions_open && !matches!(action, Action::HeaderActions(_)) {
+            self.header_actions_open = false;
+            if matches!(action, Action::Escape) {
+                ctx.notify();
+                return;
+            }
+        }
         if self.handle_context(action, ctx) {
             self.sync_ime(ctx);
             return;
@@ -205,6 +226,8 @@ impl TypedActionView for Companion {
                     | Action::AmooRetryReply
                     | Action::SubmitFocused
                     | Action::QuickGuiScenario { .. }
+                    | Action::RunDoctorHarness { .. }
+                    | Action::ExecuteDoctorQuickAction(_)
             )
         {
             self.demote_busy_if_background();
@@ -285,6 +308,119 @@ impl TypedActionView for Companion {
             ctx.notify();
             return;
         }
+        if let Action::AutoSync(action) = action {
+            self.handle_auto_sync_action(action, ctx);
+            self.sync_ime(ctx);
+            return;
+        }
+        if let Action::NotificationCenter(action) = action {
+            if self.notification_center.items.is_empty() {
+                self.sync_notification_center();
+            }
+            let details_only = matches!(action, NotificationCenterAction::OpenPopupDetails(_));
+            let primary = if let NotificationCenterAction::TriggerItem(id)
+            | NotificationCenterAction::OpenPopupDetails(id) = action
+            {
+                self.notification_center
+                    .items
+                    .iter()
+                    .find(|i| &i.id == id)
+                    .and_then(|i| i.primary_action.as_ref().map(|(_, act)| act.clone()))
+                    .filter(|act| {
+                        !details_only
+                            || !matches!(
+                                act,
+                                NotificationPrimaryAction::CopyText { .. }
+                                    | NotificationPrimaryAction::ApproveGuiSafety(_)
+                                    | NotificationPrimaryAction::UpdateSingleApp { .. }
+                            )
+                    })
+            } else {
+                None
+            };
+            let restore_main_window = match action {
+                NotificationCenterAction::ToggleDrawer
+                | NotificationCenterAction::OpenPopupDetails(_) => true,
+                NotificationCenterAction::TriggerItem(id) => {
+                    self.item_action_focuses_main_window(id)
+                }
+                _ => false,
+            };
+            if restore_main_window {
+                self.settings.hidden = false;
+                ctx.windows().show_window_and_focus_app(ctx.window_id());
+                if details_only {
+                    self.set_compact_mode(ShellMode::Full, ctx);
+                }
+            }
+            self.apply_notification_center_action(action.clone());
+            if let Some(primary) = primary {
+                match primary {
+                    NotificationPrimaryAction::CopyText { text, .. } => {
+                        let _ = ctx.clipboard().write(ClipboardContent::plain_text(text));
+                    }
+                    NotificationPrimaryAction::UpdateSingleApp { package_name } => {
+                        self.set_compact_mode(ShellMode::Full, ctx);
+                        if !self.demo_mode {
+                            self.ensure_store_online_catalog_synced();
+                        }
+                        self.handle_app_store_action(
+                            AppStoreAction::SelectApp(package_name.clone()),
+                            ctx,
+                        );
+                        self.handle_app_store_action(
+                            AppStoreAction::InstallOrUpdate {
+                                package: package_name,
+                            },
+                            ctx,
+                        );
+                        self.sync_notification_center();
+                    }
+                    NotificationPrimaryAction::OpenAppUpdates => {
+                        self.set_compact_mode(ShellMode::Full, ctx);
+                        self.prefetch_current_store_page_icons();
+                        if !self.demo_mode {
+                            self.ensure_store_online_catalog_synced();
+                        }
+                    }
+                    NotificationPrimaryAction::OpenImThread { .. } => {
+                        self.set_compact_mode(ShellMode::Full, ctx);
+                        Self::scroll_to_end(&self.sms_messages_scroll);
+                        Self::scroll_to_end(&self.scroll_aux);
+                        self.focus_field(F_IM_REPLY, ctx);
+                    }
+                    NotificationPrimaryAction::OpenSms => {
+                        self.set_compact_mode(ShellMode::Full, ctx);
+                        Self::scroll_to_end(&self.scroll_aux);
+                        Self::scroll_to_end(&self.sms_messages_scroll);
+                        if self.selected_thread.is_some() {
+                            self.focus_field(F_SMS_BODY, ctx);
+                        }
+                        self.auto_load_for_page();
+                    }
+                    NotificationPrimaryAction::ApproveGuiSafety(approved) => {
+                        self.set_compact_mode(ShellMode::Full, ctx);
+                        self.amoo_ui.gui_unconfirmed = true;
+                        self.handle_action(&Action::AmooConfirmSafety(approved), ctx);
+                        self.page = Page::Amoo;
+                        self.sync_notification_center();
+                    }
+                    NotificationPrimaryAction::ResumeTask { .. } => {
+                        self.set_compact_mode(ShellMode::Full, ctx);
+                        self.workspace_restore();
+                        self.reveal_latest_chat();
+                    }
+                    NotificationPrimaryAction::OpenPage(_) => {
+                        self.set_compact_mode(ShellMode::Full, ctx);
+                        self.auto_load_for_page();
+                    }
+                }
+            }
+            self.sync_desktop_popup_window(ctx);
+            self.sync_ime(ctx);
+            ctx.notify();
+            return;
+        }
         if let Action::Push(action) = action {
             if matches!(
                 action,
@@ -296,7 +432,12 @@ impl TypedActionView for Companion {
             ) {
                 self.motion_started = Instant::now();
             }
+            let is_missed_call_filter = matches!(action, PushAction::SetCallFilter(1));
             self.handle_push_action(action, ctx);
+            if is_missed_call_filter {
+                self.mark_missed_calls_seen();
+            }
+            self.sync_notification_center();
             self.sync_ime(ctx);
             ctx.notify();
             return;
@@ -320,6 +461,7 @@ impl TypedActionView for Companion {
             self.compact.history = false;
         }
         if self.handle_ui_action(action, ctx) {
+            self.sync_notification_center();
             self.sync_ime(ctx);
             ctx.notify();
             return;
@@ -333,12 +475,20 @@ impl TypedActionView for Companion {
                 Action::Workspace(_)
                 | Action::Studio(_)
                 | Action::AmooUi(_)
-                | Action::AppStore(_) => {
+                | Action::AppStore(_)
+                | Action::NotificationCenter(_)
+                | Action::GlobalSearch(_)
+                | Action::AmooQueryExpress
+                | Action::HomeSubmitCommand
+                | Action::Agent(_)
+                | Action::HomeRefreshAll
+                | Action::PhoneDialBackspace => {
                     self.handle_action(&action, ctx);
                 }
                 _ => self.handle_device_action(&action),
             }
         }
+        self.sync_notification_center();
         self.sync_ime(ctx);
         ctx.notify();
     }
@@ -346,7 +496,19 @@ impl TypedActionView for Companion {
 
 impl Companion {
     /// Actions that never touch the device. Returns `true` when handled.
-    fn handle_ui_action(&mut self, action: &Action, ctx: &mut ViewContext<Self>) -> bool {
+    pub(super) fn handle_ui_action(
+        &mut self,
+        action: &Action,
+        ctx: &mut ViewContext<Self>,
+    ) -> bool {
+        if let Action::VoiceInput(action) = action {
+            self.handle_voice_input(action, ctx);
+            return true;
+        }
+        if matches!(action, Action::VoiceCapabilityRefresh) {
+            self.refresh_voice_capability(ctx);
+            return true;
+        }
         if let Action::Speak(key, text) = action {
             self.speak(key, text);
             return true;
@@ -355,9 +517,39 @@ impl Companion {
             return true;
         }
         match action {
+            Action::GlobalSearch(a) => self.handle_search(a, ctx),
+            Action::RecentFiles(a) => self.handle_recent_files(a, ctx),
+            Action::FileView(recent) => {
+                self.page = Page::Files;
+                self.recent_files_view = *recent;
+                self.file_modal = None;
+                self.selected_file = None;
+                self.focus = None;
+                self.scroll = Default::default();
+                self.scroll_aux = Default::default();
+                if !recent && self.files.is_empty() {
+                    self.browse(self.directory.clone());
+                }
+            }
+            Action::HeaderActions(open) => {
+                self.header_actions_open = *open;
+                if *open {
+                    self.dismiss_search_for_header();
+                    self.notification_center.drawer_open = false;
+                    self.back_screen.live_capsule_popover_open = false;
+                }
+            }
             Action::Page(page) => {
+                self.search.open = false;
+                self.search.closing = None;
+                self.back_screen.live_capsule_popover_open = false;
                 self.clear_text_interaction();
                 if self.page != *page {
+                    // Status messages belong to the page that produced them;
+                    // drop stale non-error text when navigating away.
+                    if !self.error && !self.busy && !self.bulk_busy {
+                        self.status = "就绪".into();
+                    }
                     if self.page == Page::Work {
                         self.work.trim_idle_previews();
                     }
@@ -379,6 +571,14 @@ impl Companion {
                 self.set_compact_mode(ShellMode::Full, ctx);
                 if let Some(i) = self.focus {
                     self.fields[i].preedit.clear();
+                }
+                if *page == Page::Home && self.context_home_is_focused() {
+                    self.handle_context_action(&crate::ui::context_state::ContextAction::Attention);
+                }
+                if *page == Page::Files {
+                    self.recent_files_view = true;
+                    self.file_modal = None;
+                    self.selected_file = None;
                 }
                 self.page = *page;
                 if *page == Page::AppStore {
@@ -410,12 +610,16 @@ impl Companion {
                 if *page == Page::Sms {
                     Self::scroll_to_end(&self.scroll_aux);
                 }
+                if *page == Page::Phone {
+                    self.mark_missed_calls_seen();
+                }
                 self.load_work_previews();
                 self.auto_load_for_page();
                 if !self.demo_mode
                     && matches!(
                         self.page,
-                        Page::Tools
+                        Page::Home
+                            | Page::Tools
                             | Page::Overview
                             | Page::Calendar
                             | Page::Schedule
@@ -426,6 +630,14 @@ impl Companion {
                     && self.selected.is_some()
                 {
                     self.handle_backscreen_action(&BackScreenAction::InspectStepOsSuite, ctx);
+                }
+                if !self.demo_mode
+                    && self.page == Page::Home
+                    && !self.push.loaded
+                    && !self.push.syncing
+                    && self.selected.is_some()
+                {
+                    self.handle_push_action(&PushAction::Refresh, ctx);
                 }
                 if !self.demo_mode
                     && self.page == Page::Gallery
@@ -524,6 +736,7 @@ impl Companion {
             }
             Action::AdbGuide(step) => {
                 self.adb_guide_step = step.map(|step| step.min(2));
+                self.adb_guide_scroll = Default::default();
                 self.focus = None;
                 if step.is_none() {
                     self.preferences.adb_guide_seen = true;
@@ -549,7 +762,13 @@ impl Companion {
                 }
                 self.auto_load_for_page();
             }
+            Action::ConnectionManage(open) => self.connection_manage_open = *open,
+            Action::ConnectionPairing(open) => {
+                self.connection_pairing_open = *open;
+                self.focus = None;
+            }
             Action::PairTab(tab) => {
+                self.connection_pairing_open = true;
                 if self.pair_tab != *tab {
                     self.pair_tab = *tab;
                     self.trigger_subtab_switch();
@@ -570,13 +789,13 @@ impl Companion {
                 self.handle_ui_action(&Action::Trash, ctx);
             }
             Action::SmsFilter(filter) => {
-                if self.sms_filter != *filter {
-                    self.trigger_subtab_switch();
-                }
                 self.sms_filter = *filter;
-                self.selected_thread = None;
-                self.fields[F_SMS_TO].clear();
                 self.pending_sms_plan = None;
+            }
+            Action::ToggleUiExpanded(key) => {
+                if !self.ui_expanded.remove(key) {
+                    self.ui_expanded.insert(key.clone());
+                }
             }
             Action::AmooToggleToolRecords(key) => {
                 if !self.amoo_expanded_tool_records.remove(key) {
@@ -611,20 +830,59 @@ impl Companion {
             }
             Action::SelectSmsThread(thread) => {
                 self.motion_started = Instant::now();
-                self.push.im_channel = stepx_companion::push::ImChannel::Sms;
-                self.push.selected_im_thread = Some(String::new());
-                self.selected_thread = thread.clone();
                 self.pending_sms_plan = None;
-                self.scroll_aux = Default::default();
-                Self::scroll_to_end(&self.scroll_aux);
+                push_state::select_sms_thread_state(
+                    &mut self.push.im_channel,
+                    &mut self.push.selected_im_thread,
+                    &mut self.selected_thread,
+                    thread.as_deref(),
+                );
                 if let Some(addr) = thread {
+                    let norm_target = stepx_companion::sms::normalize_address(addr);
+                    let addr_key = if norm_target.is_empty() {
+                        addr.trim().to_string()
+                    } else {
+                        norm_target.clone()
+                    };
+                    if !addr_key.is_empty() && addr_key != "__new__" {
+                        let sms_tkey =
+                            stepx_companion::desktop_notify::NotifyPreferences::sms_target_key(
+                                &addr_key,
+                            );
+                        if self.push.prefs.manual_unread_targets.remove(&sms_tkey) {
+                            let _ = self.push.prefs.save();
+                        }
+                        self.read_sms_addresses.insert(addr_key);
+                    }
+                    let mut marked_read = false;
+                    for m in &mut self.sms {
+                        if !m.read
+                            && (m.address == *addr
+                                || (!norm_target.is_empty()
+                                    && stepx_companion::sms::normalize_address(&m.address)
+                                        == norm_target))
+                        {
+                            m.read = true;
+                            marked_read = true;
+                        }
+                    }
+                    if marked_read {
+                        self.sync_notification_center();
+                    }
+                    self.scroll_aux = Default::default();
+                    Self::scroll_to_end(&self.scroll_aux);
+                    Self::scroll_to_end(&self.sms_messages_scroll);
                     self.fields[F_SMS_TO].set(addr);
                     self.focus_field(F_SMS_BODY, ctx);
+                } else {
+                    self.fields[F_SMS_TO].clear();
                 }
             }
             Action::NewSms => {
                 self.motion_started = Instant::now();
-                self.push.im_channel = stepx_companion::push::ImChannel::Sms;
+                if self.push.im_channel != stepx_companion::push::ImChannel::Sms {
+                    self.push.im_channel = stepx_companion::push::ImChannel::All;
+                }
                 self.push.selected_im_thread = Some(String::new());
                 self.selected_thread = Some("__new__".into());
                 self.pending_sms_plan = None;
@@ -654,17 +912,26 @@ impl Companion {
                 self.file_sort = *sort;
                 self.file_page = 0;
             }
-            Action::OpenNewFolder => {
-                if self.page != Page::Files || self.selected.is_none() {
-                    return true;
+            Action::OpenNewFolder => match self.page {
+                Page::Amoo => {
+                    self.handle_workspace(&WorkspaceAction::New, ctx);
                 }
-                self.file_modal = Some(FileModal::NewFolder);
-                self.trash_confirm = false;
-                self.fields[F_FILE_NAME].clear();
-                self.focus_field(F_FILE_NAME, ctx);
-            }
+                Page::Sms => {
+                    self.handle_ui_action(&Action::NewSms, ctx);
+                }
+                Page::Files if !self.recent_files_view => {
+                    if self.selected.is_none() {
+                        return true;
+                    }
+                    self.file_modal = Some(FileModal::NewFolder);
+                    self.trash_confirm = false;
+                    self.fields[F_FILE_NAME].clear();
+                    self.focus_field(F_FILE_NAME, ctx);
+                }
+                _ => return true,
+            },
             Action::OpenNewTextFile => {
-                if self.page != Page::Files || self.selected.is_none() {
+                if self.page != Page::Files || self.recent_files_view || self.selected.is_none() {
                     return true;
                 }
                 self.file_modal = Some(FileModal::NewTextFile);
@@ -674,7 +941,7 @@ impl Companion {
                 self.fields[F_FILE_NAME].all = true;
             }
             Action::OpenRename => {
-                if self.page != Page::Files {
+                if self.page != Page::Files || self.recent_files_view {
                     return true;
                 }
                 let sel = self
@@ -700,6 +967,15 @@ impl Companion {
             }
             Action::MoveFileSelection(delta) => {
                 if self.page == Page::Gallery {
+                    if self.back_screen.gallery_lightbox {
+                        let act = if delta.is_negative() {
+                            BackScreenAction::GalleryPrevPhoto
+                        } else {
+                            BackScreenAction::GalleryNextPhoto
+                        };
+                        self.handle_backscreen_action(&act, ctx);
+                        return true;
+                    }
                     let cols = self.back_screen.gallery_grid_cols.clamp(2, 4) as isize;
                     if delta.is_negative() {
                         for _ in 0..cols.abs() {
@@ -712,7 +988,7 @@ impl Companion {
                     }
                     return true;
                 }
-                if self.page != Page::Files {
+                if self.page != Page::Files || self.recent_files_view {
                     return true;
                 }
                 let filtered: Vec<usize> = self
@@ -756,6 +1032,24 @@ impl Companion {
             Action::SelectFile(i) => {
                 self.selected_file = Some(*i);
                 self.trash_confirm = false;
+                if let Some(entry) = self.files.get(*i).cloned() {
+                    if self.selected_file_preview_path.as_deref() != Some(entry.path.as_str()) {
+                        self.selected_file_preview_path = None;
+                        self.selected_file_preview_text = None;
+                        self.selected_file_preview_image = None;
+                        let lower = entry.name.to_ascii_lowercase();
+                        let is_text_or_img = [
+                            ".txt", ".md", ".json", ".log", ".csv", ".xml", ".yaml", ".yml",
+                            ".ini", ".conf", ".sh", ".toml", ".html", ".css", ".js", ".ts", ".py",
+                            ".rs", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp",
+                        ]
+                        .iter()
+                        .any(|ext| lower.ends_with(ext));
+                        if !entry.directory && is_text_or_img && entry.bytes <= 5 * 1024 * 1024 {
+                            self.handle_device_action(&Action::PreviewSelectedFile(*i));
+                        }
+                    }
+                }
             }
             Action::FilePage(page) => {
                 self.motion_started = Instant::now();
@@ -779,7 +1073,7 @@ impl Companion {
                     }
                     return true;
                 }
-                if self.page != Page::Files {
+                if self.page != Page::Files || self.recent_files_view {
                     return true;
                 }
                 let sel = self
@@ -795,9 +1089,21 @@ impl Companion {
                 }
             }
             Action::CancelTrash => self.trash_confirm = false,
+            Action::Focus(i) if *i == F_GLOBAL_SEARCH => {
+                self.handle_search(&SearchAction::Open, ctx)
+            }
             Action::Focus(i) => self.focus_field(*i, ctx),
             Action::ClearField(i) => {
                 self.fields[*i].clear();
+                if *i == F_GLOBAL_SEARCH {
+                    self.search_edited();
+                }
+                if *i == F_CAPSULE_PROMPT {
+                    self.settings.draft.capsule_agent_prompt.clear();
+                }
+                if *i == F_HOME_AGENT_PROMPT {
+                    self.settings.draft.home_agent_prompt.clear();
+                }
                 if [F_SMS_TO, F_SMS_BODY].contains(i) {
                     self.pending_sms_plan = None;
                 }
@@ -815,10 +1121,12 @@ impl Companion {
             }
             Action::FocusSearch => {
                 let target = match self.page {
+                    Page::Search => Some(F_GLOBAL_SEARCH),
+                    Page::Home => Some(F_HOME_COMMAND),
                     Page::Sms => Some(F_SMS_SEARCH),
                     Page::Notifications => Some(F_PUSH_SEARCH),
                     Page::Phone => Some(F_CONTACT_SEARCH),
-                    Page::Files => Some(F_FILE_SEARCH),
+                    Page::Files if !self.recent_files_view => Some(F_FILE_SEARCH),
                     Page::AppStore => Some(F_STORE_SEARCH),
                     Page::Apps => Some(F_APP_SEARCH),
                     Page::Amoo => Some(F_AMOO_SEARCH),
@@ -842,6 +1150,7 @@ impl Companion {
                     | Page::Account
                     | Page::About
                     | Page::Settings
+                    | Page::Files
                     | Page::Expansion => None,
                 };
                 if let Some(i) = target {
@@ -850,6 +1159,15 @@ impl Companion {
             }
             Action::NextField(reverse) => {
                 let order: &[usize] = match self.page {
+                    Page::Search => &[F_GLOBAL_SEARCH],
+                    Page::Home => &[
+                        F_HOME_COMMAND,
+                        F_PUSH_REPLY,
+                        F_OV_TEXT,
+                        F_PHONE_SCHEDULE_TITLE,
+                        F_CALENDAR_TIME,
+                        F_ALARM_TIME,
+                    ],
                     Page::Connect => match self.pair_tab {
                         PairTab::Qr => &[],
                         PairTab::Code => &[F_PAIR_ADDR, F_PAIR_CODE],
@@ -871,9 +1189,9 @@ impl Companion {
                     Page::Studio => &[F_STUDIO_SEARCH, F_STUDIO_NAME, F_STUDIO_URL],
                     Page::Sms => &[F_SMS_SEARCH, F_IM_REPLY, F_SMS_TO, F_SMS_BODY],
                     Page::Notifications => &[F_PUSH_SEARCH, F_PUSH_REPLY],
-                    Page::Phone => &[F_CONTACT_SEARCH, F_PHONE_DIAL],
+                    Page::Phone => &[F_CONTACT_SEARCH, F_PHONE_DIAL, F_PHONE_CONTACT_NAME],
                     Page::Files if self.file_modal.is_some() => &[F_FILE_NAME, F_FILE_SEARCH],
-                    Page::Files => &[F_FILE_SEARCH],
+                    Page::Files if !self.recent_files_view => &[F_FILE_SEARCH],
                     Page::AppStore => &[F_STORE_SEARCH],
                     Page::Apps => &[F_APP_SEARCH],
                     Page::Calendar | Page::Schedule => &[F_PHONE_SCHEDULE_TITLE, F_CALENDAR_TIME],
@@ -883,6 +1201,7 @@ impl Companion {
                     | Page::Account
                     | Page::About
                     | Page::Settings
+                    | Page::Files
                     | Page::Expansion => &[],
                 };
                 if !order.is_empty() {
@@ -894,9 +1213,46 @@ impl Companion {
                     self.focus_field(next, ctx);
                 }
             }
+            Action::Escape if self.search.open => self.handle_search(&SearchAction::Close, ctx),
             Action::Escape => {
+                if self
+                    .push
+                    .selected_key
+                    .as_deref()
+                    .is_some_and(|key| key.starts_with("msg_detail::"))
+                {
+                    self.push.selected_key = None;
+                    return true;
+                }
+                if self.notification_center.drawer_open {
+                    self.apply_notification_center_action(NotificationCenterAction::CloseDrawer);
+                    return true;
+                }
                 if self.adb_guide_step.is_some() {
                     self.handle_ui_action(&Action::AdbGuide(None), ctx);
+                    return true;
+                }
+                if self.back_screen.gallery_lightbox {
+                    self.back_screen.gallery_lightbox = false;
+                    return true;
+                }
+                if self.amoo_lightbox_open {
+                    self.amoo_lightbox_open = false;
+                    return true;
+                }
+                if self.back_screen.editing_calendar_event_id.is_some() {
+                    self.handle_backscreen_action(&BackScreenAction::CalendarCancelEdit, ctx);
+                    return true;
+                }
+                if self.back_screen.editing_alarm_id.is_some() {
+                    self.handle_backscreen_action(&BackScreenAction::AlarmCancelEdit, ctx);
+                    return true;
+                }
+                if self.page == Page::Home && self.home_module_edit_mode {
+                    let action = if self.home_drag_active() || self.home_pending_move.is_some() {
+                        pages::home::HomeModuleAction::CancelDrag
+                    } else { pages::home::HomeModuleAction::CancelEdit };
+                    self.apply_home_action(&Action::HomeModule(action), Some(ctx));
                     return true;
                 }
                 self.tool_confirmation = None;
@@ -935,7 +1291,11 @@ impl Companion {
                     self.trash_confirm = false;
                 } else if self.focus.is_some() {
                     self.focus = None;
-                } else {
+                } else if self.page == Page::Apps && self.selected_app.is_some() {
+                    self.selected_app = None;
+                    self.selected_app_details = None;
+                    self.selected_app_loading = false;
+                } else if self.page == Page::Files && !self.recent_files_view {
                     self.selected_file = None;
                 }
             }
@@ -965,13 +1325,19 @@ impl Companion {
                 }
                 self.cancel_backscreen();
                 self.stop_mirror();
-                self.close_mirror_controls(ctx);
+                if !force_quit {
+                    self.close_mirror_controls(ctx);
+                    self.close_desktop_popup_window(ctx);
+                }
                 self.workspace_flush();
                 self.remember_window(ctx, true);
                 self.settings.tray = None;
-                ctx.close_window();
                 if force_quit {
+                    // The workspace is flushed above. Explicit app exit must not
+                    // queue behind synchronous window/renderer destruction.
                     ctx.terminate_app(platform::TerminationMode::ForceTerminate, None);
+                } else {
+                    ctx.close_window();
                 }
             }
             Action::OverviewBackPreview(back) => {
@@ -987,24 +1353,28 @@ impl Companion {
             }
             Action::AmooSelectAgent(idx) => {
                 self.motion_started = Instant::now();
-                self.amoo_agent_idx = *idx;
-                let name = match *idx {
-                    0 => "Amoo 助手",
-                    1 => "桌面伙伴",
-                    2 => "飞书 / 企微",
-                    _ => "Claude 协同",
-                };
+                let len = self.amoo_agents.len().max(1);
+                self.amoo_agent_idx = *idx % len;
+                let name = self
+                    .amoo_agents
+                    .get(self.amoo_agent_idx)
+                    .cloned()
+                    .unwrap_or_else(|| "极简总结官".to_string());
                 if let Some(pos) = self.amoo_sessions.iter().position(|s| {
                     (*idx == 0 && (s.agent.contains("Amoo") || s.agent.contains("main")))
                         || (*idx == 1 && (s.agent.contains("深度") || s.agent.contains("桌面")))
                         || (*idx == 2 && (s.agent.contains("飞书") || s.agent.contains("Cron")))
                         || (*idx == 3
-                            && (s.agent.contains("Claude") || s.agent.contains("OpenClaw")))
+                            && (s.agent.contains("Claude")
+                                || s.agent.contains("OpenClaw")
+                                || s.agent.contains("总结")
+                                || s.session_key == "demo:4"))
                 }) {
                     self.amoo_session_idx = pos;
                 }
                 self.error = false;
                 self.status = format!("已切换协同智能体：{name}");
+                self.save_amoo_persona_state();
             }
             Action::AmooSelectSession(idx) => {
                 self.motion_started = Instant::now();
@@ -1017,7 +1387,12 @@ impl Companion {
                         .journal
                         .tasks
                         .iter()
-                        .find(|t| t.session.as_deref() == Some(key.as_str()))
+                        .filter(|t| {
+                            self.workspace_visible(t) && t.session.as_deref() == Some(key.as_str())
+                        })
+                        // Preserve an explicitly selected task when several saved
+                        // tasks refer to the same phone session.
+                        .min_by_key(|t| self.workspace.active.as_ref() != Some(&t.id))
                         .map(|t| t.id.clone())
                     {
                         self.workspace.active = Some(task_id);
@@ -1108,21 +1483,40 @@ impl Companion {
                 };
             }
             Action::AmooConfirmSafety(allow) => {
-                self.amoo_safety_decision = if self.demo_mode && *allow {
-                    SafetyDecision::Approved
+                if self.amoo_ui.gui_unconfirmed {
+                    self.amoo_ui.gui_unconfirmed = false;
+                    self.amoo_safety_decision = if *allow {
+                        SafetyDecision::Approved
+                    } else {
+                        SafetyDecision::Rejected
+                    };
+                    if *allow {
+                        self.amoo_ui.gui_paused = false;
+                        self.amoo_ui.gui_message = "已批准当前手机操作，可继续执行。".into();
+                        self.status = "已批准执行当前手机操作".into();
+                    } else {
+                        self.amoo_ui.gui_running = false;
+                        self.amoo_ui.gui_paused = false;
+                        self.amoo_ui.gui_message = "已拒绝当前手机敏感操作并停止等待。".into();
+                        self.status = "已拒绝当前手机敏感操作".into();
+                    }
                 } else {
-                    SafetyDecision::Rejected
-                };
-                if *allow {
-                    self.page = Page::Sms;
-                    self.selected_thread = Some("__new__".into());
-                    self.pending_sms_plan = None;
-                    self.fields[F_SMS_TO].clear();
-                    self.fields[F_SMS_BODY].clear();
-                    self.focus_field(F_SMS_TO, ctx);
-                    self.status = "请填写实际收件人和短信正文，再确认发送".into();
-                } else {
-                    self.status = "已取消短信操作".into();
+                    self.amoo_safety_decision = if self.demo_mode && *allow {
+                        SafetyDecision::Approved
+                    } else {
+                        SafetyDecision::Rejected
+                    };
+                    if *allow {
+                        self.page = Page::Sms;
+                        self.selected_thread = Some("__new__".into());
+                        self.pending_sms_plan = None;
+                        self.fields[F_SMS_TO].clear();
+                        self.fields[F_SMS_BODY].clear();
+                        self.focus_field(F_SMS_TO, ctx);
+                        self.status = "请填写实际收件人和短信正文，再确认发送".into();
+                    } else {
+                        self.status = "已取消短信操作".into();
+                    }
                 }
             }
 
@@ -1143,6 +1537,7 @@ impl Companion {
                         "关闭"
                     }
                 );
+                self.save_amoo_persona_state();
             }
             Action::AmooCycleStyle => {
                 self.amoo_style_idx = (self.amoo_style_idx + 1) % 3;
@@ -1153,6 +1548,7 @@ impl Companion {
                 };
                 self.error = false;
                 self.status = format!("已切换交流风格偏好：{label}");
+                self.save_amoo_persona_state();
             }
             Action::AmooCycleCommute => {
                 self.amoo_commute_idx = (self.amoo_commute_idx + 1) % 3;
@@ -1194,6 +1590,7 @@ impl Companion {
                 );
                 self.amoo_bm25_entries = self.amoo_bm25_entries.max(self.amoo_memories.len());
                 self.status = format!("已添加个人记忆：「{new_title}」");
+                self.save_amoo_persona_state();
             }
             Action::AmooUseMemory(mem) => {
                 self.fields[F_AMOO].set(&format!("结合我的偏好「{mem}」，帮我安排："));
@@ -1293,17 +1690,19 @@ impl Companion {
                 };
                 ctx.clipboard()
                     .write(ClipboardContent::plain_text(md.clone()));
-                if let Ok(Some(dest)) = native_dialog::FileDialog::new()
-                    .set_title("导出 Amoo 记忆库")
-                    .set_filename("StepX-Amoo-Memories.md")
-                    .set_location(&stepx_companion::settings::downloads())
-                    .show_save_single_file()
-                {
-                    let _ = std::fs::write(&dest, md);
-                    self.status = format!("已导出 {total_count} 条记忆到 {}", dest.display());
-                } else {
-                    self.status = format!("已将全部记忆导出并复制到剪贴板（共 {total_count} 条）");
-                }
+                self.status = format!("已将全部记忆导出并复制到剪贴板（共 {total_count} 条）");
+                self.choose_path(
+                    stepx_companion::file_dialog::FileDialog::new()
+                        .set_title("导出 Amoo 记忆库")
+                        .set_filename("StepX-Amoo-Memories.md")
+                        .set_location(&stepx_companion::settings::downloads()),
+                    DialogKind::SaveFile,
+                    move |app, dest, _| {
+                        std::fs::write(&dest, md)?;
+                        app.status = format!("已导出 {total_count} 条记忆到 {}", dest.display());
+                        Ok(())
+                    },
+                );
             }
             Action::AmooToggleDetails => {
                 self.amoo_show_details = !self.amoo_show_details;
@@ -1379,6 +1778,8 @@ impl Companion {
             Action::PhoneFilterMissed(missed) => {
                 self.motion_started = Instant::now();
                 self.call_filter_missed = *missed;
+                self.push.call_filter = if *missed { 1 } else { 0 };
+                self.mark_missed_calls_seen();
             }
             Action::PhoneSelectContact(idx) => {
                 self.motion_started = Instant::now();
@@ -1392,6 +1793,7 @@ impl Companion {
             Action::PhoneDialAppend(ch) => {
                 self.pending_call = None;
                 self.fields[F_PHONE_DIAL].insert(ch);
+                self.focus_field(F_PHONE_DIAL, ctx);
             }
             Action::PhoneDialBackspace => {
                 self.pending_call = None;
@@ -1399,6 +1801,7 @@ impl Companion {
                 let p = input.previous();
                 input.text.replace_range(p..input.cursor, "");
                 input.cursor = p;
+                self.focus_field(F_PHONE_DIAL, ctx);
             }
             Action::PhoneDialClear => {
                 self.pending_call = None;
@@ -1414,29 +1817,91 @@ impl Companion {
             }
             Action::PhoneSmsTo(number) => {
                 self.motion_started = Instant::now();
-                self.push.im_channel = stepx_companion::push::ImChannel::Sms;
-                self.push.selected_im_thread = Some(String::new());
                 self.pending_sms_plan = None;
-                self.fields[F_SMS_TO].set(number);
-                self.selected_thread = Some(number.clone());
-                self.page = Page::Sms;
-                self.focus_field(F_SMS_BODY, ctx);
-                self.status = format!("正在向 {number} 编写短信");
-            }
-            Action::FillDetectedPhoneIp(ip) => {
-                let endpoint = if ip.contains(':') {
-                    ip.clone()
+                let number = number.trim();
+                if number.is_empty() {
+                    if self.push.im_channel != stepx_companion::push::ImChannel::Sms {
+                        self.push.im_channel = stepx_companion::push::ImChannel::All;
+                    }
+                    self.push.selected_im_thread = Some(String::new());
+                    self.selected_thread = Some("__new__".into());
+                    self.fields[F_SMS_TO].clear();
+                    self.fields[F_SMS_BODY].clear();
+                    self.page = Page::Sms;
+                    self.auto_load_for_page();
+                    self.focus_field(F_SMS_TO, ctx);
+                    self.status = "新建短信：请在下方选择联系人或输入收件人号码".into();
                 } else {
-                    format!("{ip}:5555")
-                };
-                self.fields[F_PAIR_ADDR].set(&endpoint);
-                self.fields[F_CONNECT].set(&endpoint);
-                self.status = format!("已填入检测到的手机局域网地址：{endpoint}");
+                    self.fields[F_SMS_SEARCH].clear();
+                    self.sms_filter = SmsFilter::All;
+                    let norm_target = stepx_companion::sms::normalize_address(number);
+                    let existing_thread = self.sms_threads().into_iter().find(|t| {
+                        t.address == number
+                            || (!norm_target.is_empty()
+                                && stepx_companion::sms::normalize_address(&t.address)
+                                    == norm_target)
+                    });
+                    if let Some(existing) = existing_thread {
+                        self.selected_thread = Some(existing.address.clone());
+                        self.fields[F_SMS_TO].set(&existing.address);
+                        let addr_key = if norm_target.is_empty() {
+                            existing.address.trim().to_string()
+                        } else {
+                            norm_target.clone()
+                        };
+                        if !addr_key.is_empty() && addr_key != "__new__" {
+                            self.read_sms_addresses.insert(addr_key);
+                        }
+                        let mut marked_read = false;
+                        for m in &mut self.sms {
+                            if !m.read
+                                && (m.address == existing.address
+                                    || (!norm_target.is_empty()
+                                        && stepx_companion::sms::normalize_address(&m.address)
+                                            == norm_target))
+                            {
+                                m.read = true;
+                                marked_read = true;
+                            }
+                        }
+                        if marked_read {
+                            self.sync_notification_center();
+                        }
+                        self.scroll_aux = Default::default();
+                        Self::scroll_to_end(&self.scroll_aux);
+                        Self::scroll_to_end(&self.sms_messages_scroll);
+                    } else {
+                        self.selected_thread = Some("__new__".into());
+                        self.fields[F_SMS_TO].set(number);
+                    }
+                    if self.push.im_channel != stepx_companion::push::ImChannel::Sms {
+                        self.push.im_channel = stepx_companion::push::ImChannel::All;
+                    }
+                    self.push.selected_im_thread = Some(String::new());
+                    self.page = Page::Sms;
+                    self.auto_load_for_page();
+                    self.focus_field(F_SMS_BODY, ctx);
+                    self.status = format!("正在向 {number} 编写短信");
+                }
+            }
+            Action::FillDetectedConnectionEndpoint(endpoint) => {
+                if stepx_companion::pairing::validate_endpoint(endpoint).is_err() {
+                    self.status = "未取得有效连接端口，请使用手机无线调试页面显示的地址".into();
+                    self.error = true;
+                    return true;
+                }
+                // A connection port must never replace a pairing port.
+                self.fields[F_CONNECT].set(endpoint);
+                self.pair_tab = PairTab::Manual;
+                self.connection_pairing_open = true;
+                self.focus_field(F_CONNECT, ctx);
+                self.status = "已填入连接地址；配对码地址保持不变".into();
                 self.error = false;
             }
             Action::QuickGuiScenario { app, goal } => {
                 self.motion_started = Instant::now();
                 self.page = Page::Amoo;
+                self.auto_load_for_page();
                 self.handle_amoo_ui_action(&AmooUiAction::GuiMode(true));
                 self.fields[F_AMOO_GUI_APP].set(app);
                 self.fields[F_AMOO].set(goal);
@@ -1474,6 +1939,7 @@ impl Companion {
             Action::SendToAmoo(prompt) => {
                 self.set_compact_mode(ShellMode::Full, ctx);
                 self.page = Page::Amoo;
+                self.auto_load_for_page();
                 self.workspace.sub_view = 0;
                 self.workspace.panel = 0;
                 self.workspace.proposal = None;
@@ -1664,7 +2130,13 @@ impl Companion {
             }
             Action::AmooQueryExpress => {
                 self.amoo_express_open = true;
+                if !self.demo_mode && self.selected.is_none() {
+                    self.error = true;
+                    self.status = "快递查询需要连接手机，尚未执行；单号已保留在输入框".into();
+                    return true;
+                }
                 self.error = false;
+                self.sync_live_express_parcels();
                 if let Some(pos) = self
                     .amoo_sessions
                     .iter()
@@ -1672,26 +2144,128 @@ impl Companion {
                 {
                     self.amoo_session_idx = pos;
                 }
-                if self.demo_mode {
+                let typed_no = self.fields[F_OV_TEXT].text.trim().to_string();
+                if !typed_no.is_empty() {
+                    let extracted = stepx_companion::home_hub::extract_express_from_text_flexible(
+                        &typed_no, true,
+                    );
+                    let (carrier, clean_no) = extracted
+                        .as_ref()
+                        .map(|(c, n)| (c.to_string(), n.clone()))
+                        .unwrap_or_else(|| ("快递物流".to_string(), typed_no.clone()));
+                    if self.demo_mode {
+                        if self.express_parcels.is_empty() {
+                            self.express_parcels =
+                                stepx_companion::device::default_express_parcels();
+                        }
+                        if !self
+                            .express_parcels
+                            .iter()
+                            .any(|p| p.tracking_no.eq_ignore_ascii_case(&clean_no))
+                        {
+                            self.express_parcels.insert(
+                                0,
+                                stepx_companion::device::ExpressParcelInfo {
+                                    carrier: carrier.clone(),
+                                    tracking_no: clean_no.clone(),
+                                    pickup_code: "3-1-2088".into(),
+                                    station: "园区智能快递柜".into(),
+                                    status: "派送中 · 预计今日送达".into(),
+                                    updated_at: "刚刚".into(),
+                                },
+                            );
+                        }
+                        self.status = format!(
+                            "已查询 {carrier} 运单 {clean_no} 实时轨迹，并同步更新首页物流进度条"
+                        );
+                    } else if extracted.is_some() {
+                        if !self
+                            .express_parcels
+                            .iter()
+                            .any(|p| p.tracking_no.eq_ignore_ascii_case(&clean_no))
+                        {
+                            self.express_parcels.insert(
+                                0,
+                                stepx_companion::device::ExpressParcelInfo {
+                                    carrier: carrier.clone(),
+                                    tracking_no: clean_no.clone(),
+                                    pickup_code: String::new(),
+                                    station: format!("{carrier} · 跨端实时追踪"),
+                                    status: "正在向手机同步最新物流轨迹…".into(),
+                                    updated_at: "刚刚".into(),
+                                },
+                            );
+                        }
+                        if self.page == Page::Home {
+                            self.focus_field(F_OV_TEXT, ctx);
+                        }
+                        self.handle_backscreen_action(
+                            &BackScreenAction::TriggerMcpQuickAction("query_express_number".into()),
+                            ctx,
+                        );
+                        if self.status.is_empty() || self.error {
+                            self.error = false;
+                            self.status = format!(
+                                "已添加 {carrier} 运单 {clean_no} 到首页物流追踪，并向手机发起查询"
+                            );
+                        }
+                    } else if self.page == Page::Home {
+                        self.focus_field(F_OV_TEXT, ctx);
+                        self.fields[F_AMOO].set(&format!(
+                            "请帮我查询{carrier}运单 {clean_no} 的最新物流轨迹与取件码"
+                        ));
+                        self.status = format!(
+                            "未识别到标准运单号格式（{clean_no}），请输入顺丰/京东/中通/圆通/韵达/申通/极兔/EMS单号查询"
+                        );
+                    } else {
+                        self.fields[F_AMOO].set(&format!(
+                            "请帮我查询{carrier}运单 {clean_no} 的最新物流轨迹与取件码"
+                        ));
+                        if self.page == Page::Amoo {
+                            self.focus_field(F_AMOO, ctx);
+                        }
+                        self.status = format!(
+                            "已填入 {carrier} 运单 {clean_no} 查询指令，可在 Amoo 发送获取真实轨迹"
+                        );
+                    }
+                } else if self.demo_mode {
                     self.status =
                         "已从手机 Amoo「快递物流查询」与短信提取 2 件待取包裹（取件码 4-2-1086 / 顺丰 SF14298019283）"
                             .into();
                 } else {
+                    if !self.push.syncing {
+                        self.handle_push_action(&PushAction::Refresh, ctx);
+                    }
+                    if !self.busy {
+                        self.handle_device_action(&Action::ReadSms);
+                    }
                     let codes: Vec<String> = self
-                        .sms
+                        .express_parcels
                         .iter()
-                        .filter_map(|m| pages::sms::extract_pickup_code(&m.body))
+                        .filter(|p| !p.pickup_code.trim().is_empty())
+                        .map(|p| p.pickup_code.clone())
                         .take(3)
                         .collect();
                     if !codes.is_empty() {
                         self.status = format!(
-                            "已从手机短信提取 {} 件待取包裹（取件码 {}）",
+                            "已从手机短信与通知提取 {} 件待取包裹（取件码 {}）",
                             codes.len(),
                             codes.join(" / ")
                         );
+                    } else if !self.express_parcels.is_empty() {
+                        self.status = format!(
+                            "已从手机通知与剪贴板提取 {} 条物流记录",
+                            self.express_parcels.len()
+                        );
+                    } else if self.page == Page::Home {
+                        self.focus_field(F_OV_TEXT, ctx);
+                        self.status =
+                            "正在同步手机快递通知与取件码短信；也可直接输入运单号查询".into();
                     } else {
                         self.fields[F_AMOO].set("请帮我汇总最近的快递物流与驿站取件码");
-                        self.focus_field(F_AMOO, ctx);
+                        if self.page == Page::Amoo {
+                            self.focus_field(F_AMOO, ctx);
+                        }
                         self.status =
                             "已填入快递查询指令，按 Enter 即可向 Amoo 发起物流与取件码汇总".into();
                     }
@@ -1717,6 +2291,45 @@ impl Companion {
                     "已关闭 Amoo 后台强制保活".into()
                 };
             }
+            Action::Context(action) => self.handle_context_action(action),
+            Action::Productivity(action) => self.handle_productivity_action(action, ctx),
+            Action::Agent(action) => self.handle_agent_action(action, ctx),
+            Action::ExecuteDoctorQuickAction(
+                stepx_companion::doctor_harness::DoctorActionKind::InstallGoogleSuite
+                | stepx_companion::doctor_harness::DoctorActionKind::RepairGoogleCompatibility
+                | stepx_companion::doctor_harness::DoctorActionKind::OpenGoogleToolPage,
+            ) => {
+                self.set_compact_mode(ShellMode::Full, ctx);
+                return false;
+            }
+            Action::HomeRefreshAll
+            | Action::HomeToggleTools
+            | Action::HomeTogglePending
+            | Action::HomeSelectAiQuadrant(_)
+            | Action::HomeModule(_)
+            | Action::HomeReminder(_)
+            | Action::HomeResumeTask(_)
+            | Action::HomeShowHistory
+            | Action::HomeOpenTaskOutput { .. }
+            | Action::HomeSubmitCommand
+            | Action::HomeRunGuiCommand
+            | Action::HomeRunWorkCommand
+            | Action::HomeQuickSmsReply { .. }
+            | Action::HomeSelectReplyTarget { .. }
+            | Action::HomeQuickImReply { .. }
+            | Action::HomeExecuteIntent(_)
+            | Action::HomeToggleChecklistItem(_)
+            | Action::HomeAiRefresh
+            | Action::HomeAiCancel
+            | Action::WeatherSelectCity(_)
+            | Action::WeatherRefresh
+            | Action::WeatherSelectDay(_)
+            | Action::WeatherBringToAmoo(_)
+            | Action::WeatherBringToHomeInput(_)
+            | Action::WeatherBringToSchedule(_)
+            | Action::WeatherPushBackScreen => {
+                self.apply_home_action(action, Some(ctx));
+            }
             _ => return false,
         }
         true
@@ -1733,6 +2346,10 @@ impl Companion {
                 return None
             }
             Action::SubmitFocused => match self.focus {
+                Some(F_GLOBAL_SEARCH) => Action::GlobalSearch(SearchAction::Activate),
+                Some(F_HOME_COMMAND) => Action::HomeSubmitCommand,
+                Some(F_AGENT_REQUEST) => Action::Agent(super::agent_workbench::AgentAction::Run),
+                Some(F_PRODUCTIVITY_NOTE | F_CAPSULE_PROMPT | F_HOME_AGENT_PROMPT) => return None,
                 Some(F_PAIR_ADDR) | Some(F_PAIR_CODE) => Action::PairCode,
                 Some(F_CONNECT) => Action::Connect,
                 Some(F_SMS_TO) => {
@@ -1755,7 +2372,13 @@ impl Companion {
                     return None;
                 }
                 Some(F_FILE_NAME) => Action::SubmitFileModal,
-                Some(F_OV_TEXT) => Action::SendFocusText,
+                Some(F_OV_TEXT) => {
+                    if self.page == Page::Home {
+                        Action::AmooQueryExpress
+                    } else {
+                        Action::SendFocusText
+                    }
+                }
                 Some(F_BACK_PROMPT) => {
                     self.handle_backscreen_action(&BackScreenAction::Generate, ctx);
                     return None;
@@ -1774,7 +2397,13 @@ impl Companion {
                 }
                 Some(F_STUDIO_NAME) | Some(F_STUDIO_URL) => Action::Studio(StudioAction::Save),
                 Some(F_STORE_SEARCH) => Action::AppStore(AppStoreAction::SearchSubmit),
-                Some(F_PHONE_DIAL) => Action::PhoneCall(self.fields[F_PHONE_DIAL].text.clone()),
+                Some(F_PHONE_DIAL) => {
+                    if self.pending_call.is_some() {
+                        Action::PhoneConfirmCall
+                    } else {
+                        Action::PhoneCall(self.fields[F_PHONE_DIAL].text.clone())
+                    }
+                }
                 Some(F_CALENDAR_TIME) => {
                     self.handle_backscreen_action(
                         &BackScreenAction::CalendarCreateOnSelectedDate(None),
@@ -1838,6 +2467,25 @@ impl Companion {
                                         })
                                 })
                         })
+                    } else if self.page == Page::Home {
+                        let demo_snap;
+                        let snap = if self.demo_mode
+                            && self.push.snapshot.notifications.is_empty()
+                            && self.push.snapshot.threads.is_empty()
+                        {
+                            demo_snap = stepx_companion::push::demo_push_snapshot();
+                            &demo_snap
+                        } else {
+                            &self.push.snapshot
+                        };
+                        let target = self.resolve_home_actionable_reply_target(snap);
+                        if target.is_none() {
+                            self.error = true;
+                            self.status = "当前没有可后台回复的会话，草稿已保留；请在全部消息中选择可回复会话".into();
+                            ctx.notify();
+                            return None;
+                        }
+                        target
                     } else {
                         self.push
                             .selected_key
@@ -1856,6 +2504,25 @@ impl Companion {
                                             n.package_name.clone(),
                                             n.title.clone(),
                                         )
+                                    })
+                                    .or_else(|| {
+                                        self.push
+                                            .snapshot
+                                            .threads
+                                            .iter()
+                                            .find(|t| t.notification_key == k || t.thread_id == k)
+                                            .map(|t| {
+                                                (
+                                                    if t.notification_key.is_empty() {
+                                                        t.thread_id.clone()
+                                                    } else {
+                                                        t.notification_key.clone()
+                                                    },
+                                                    t.thread_id.clone(),
+                                                    t.package_name.clone(),
+                                                    t.title.clone(),
+                                                )
+                                            })
                                     })
                             })
                     };
@@ -1877,7 +2544,9 @@ impl Companion {
                 _ => return None,
             },
             Action::ContextRefresh => match self.page {
+                Page::Search => Action::GlobalSearch(SearchAction::Refresh),
                 Page::About | Page::Settings | Page::Expansion => return None,
+                Page::Home => Action::HomeRefreshAll,
                 Page::Overview if self.selected.is_some() => Action::Summary,
                 Page::Overview | Page::Connect => Action::Refresh,
                 Page::BackScreen => {
@@ -1906,6 +2575,9 @@ impl Companion {
                     return None;
                 }
                 Page::Phone => Action::ReadPhone,
+                Page::Files if self.recent_files_view => {
+                    Action::RecentFiles(RecentFilesAction::Refresh)
+                }
                 Page::Files => Action::Browse(self.directory.clone()),
                 Page::AppStore => Action::AppStore(AppStoreAction::RefreshCatalog),
                 Page::Apps => Action::Apps,
@@ -1937,6 +2609,15 @@ impl Companion {
                 if self.focus.is_some() {
                     return None;
                 }
+                if self.page == Page::Phone {
+                    if self.pending_call.is_some() {
+                        return Some(Action::PhoneConfirmCall);
+                    }
+                    if !self.fields[F_PHONE_DIAL].text.trim().is_empty() {
+                        return Some(Action::PhoneCall(self.fields[F_PHONE_DIAL].text.clone()));
+                    }
+                    return None;
+                }
                 if self.page == Page::Gallery {
                     if let Some(item) = self
                         .back_screen
@@ -1951,7 +2632,7 @@ impl Companion {
                     }
                     return None;
                 }
-                if self.page != Page::Files {
+                if self.page != Page::Files || self.recent_files_view {
                     return None;
                 }
                 let sel = self
@@ -1965,7 +2646,10 @@ impl Companion {
                 Action::Download
             }
             Action::ParentDirectory => {
-                if self.page != Page::Files {
+                if self.page == Page::Phone && !self.fields[F_PHONE_DIAL].text.is_empty() {
+                    return Some(Action::PhoneDialBackspace);
+                }
+                if self.page != Page::Files || self.recent_files_view {
                     return None;
                 }
                 let parent = parent_dir(&self.directory);
@@ -1976,5 +2660,27 @@ impl Companion {
             }
             other => other.clone(),
         })
+    }
+
+    pub(super) fn mark_missed_calls_seen(&mut self) {
+        for r in &self.call_logs {
+            if r.call_type == 3 {
+                let raw_num = r.number.trim();
+                let num = if raw_num.is_empty() {
+                    "unknown"
+                } else {
+                    raw_num
+                };
+                for id in [
+                    format!("missed-call:{num}:{}", r.date_ms),
+                    format!("missed-call:{raw_num}:{}", r.date_ms),
+                ] {
+                    self.notification_center.read_ids.insert(id.clone());
+                    self.notification_center.popup_shown_ids.insert(id);
+                }
+            }
+        }
+        self.notification_center.save();
+        self.sync_notification_center();
     }
 }

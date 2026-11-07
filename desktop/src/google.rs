@@ -25,16 +25,17 @@ pub fn workflow_root() -> Result<PathBuf> {
 
 pub fn run_script(device: &Device, adb: &Adb, script: &str, args: &[&str]) -> Result<String> {
     let root = workflow_root()?;
-    let output = crate::resources::python_command()
+    let mut command = crate::resources::python_command();
+    command
         .arg(root.join("tools").join(script))
         .args(args)
         .current_dir(&root)
         .env("STEPX_SERIAL", &device.transport)
         .env("STEPX_DEVICE_SERIAL", &device.serial)
         .env("STEPX_ADB", &adb.path)
-        .env_remove("PYTHONOPTIMIZE")
-        .output()
-        .context("无法启动 Google 安装组件，请检查 Python 3 环境")?;
+        .env_remove("PYTHONOPTIMIZE");
+    let output = crate::adb::run_process(command,None,std::time::Duration::from_secs(600))
+        .context("Google 安装步骤未完成，原数据已保留；请检查网络和手机连接后重试")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let reason = stderr
@@ -55,11 +56,27 @@ fn run_compatibility_script(device: &Device, adb: &Adb, action: &str) -> Result<
     if !script.is_file() {
         bail!("当前桌面安装缺少 Google Play 兼容组件，请更新 desktop 后重试");
     }
+    let selected_transport = if (device.transport.contains(':')
+        || device.transport.starts_with("adb-"))
+        && !device.serial.trim().is_empty()
+        && !device.serial.contains(':')
+        && !device.serial.starts_with("adb-")
+        && adb
+            .run_timeout(
+                &["-s", device.serial.trim(), "get-state"],
+                std::time::Duration::from_secs(2),
+            )
+            .is_ok_and(|s| s.trim() == "device")
+    {
+        device.serial.trim()
+    } else {
+        device.transport.as_str()
+    };
     let output = crate::resources::python_command()
         .arg(&script)
         .arg(action)
         .current_dir(script.parent().context("兼容组件目录无效")?)
-        .env("STEPX_SERIAL", &device.transport)
+        .env("STEPX_SERIAL", selected_transport)
         .env("STEPX_DEVICE_SERIAL", &device.serial)
         .env("STEPX_ADB", &adb.path)
         .env_remove("PYTHONOPTIMIZE")
@@ -364,14 +381,16 @@ pub fn change_compatibility(
     progress(if rollback {
         "核对备份并撤销 Google Play 兼容补丁…"
     } else {
-        "核对版本、保存备份并应用 Google Play 兼容补丁…"
+        "核对版本、保存备份并修复 Google 服务…"
     });
     let value = run_compatibility_script(device, adb, if rollback { "rollback" } else { "apply" })?;
-    let message = value["message"]
+    let patch_ok = value["ok"] == true;
+    let error_code = value["error"].as_str().unwrap_or("");
+    let mut message = value["message"]
         .as_str()
         .unwrap_or("兼容操作未完成")
         .to_string();
-    if value["ok"] != true {
+    if !patch_ok && (rollback || !matches!(error_code, "unsupported_apk" | "usb_required")) {
         bail!("{message}");
     }
     if !rollback {
@@ -387,11 +406,14 @@ pub fn change_compatibility(
         }
         progress("检查 Google 通用登录与组件更新恢复…");
         run_script(device, adb, "health.py", &["repair"])?;
+        if !patch_ok {
+            message = "Google 服务权限、登录入口与组件更新自动恢复已校验就绪。".into();
+        }
     }
     progress("重新读取 Google 服务与兼容补丁状态…");
     let status =
         inspect(device, adb).with_context(|| format!("{message} 状态回读未完成，请重新检测"))?;
-    if !status.compatibility_checked || status.compatibility_active == rollback {
+    if patch_ok && (!status.compatibility_checked || status.compatibility_active == rollback) {
         bail!(
             "兼容补丁状态回读与操作结果不一致，请点击检测状态：{}",
             status.compatibility_note
@@ -452,43 +474,6 @@ pub fn inspect(device: &Device, adb: &Adb) -> Result<GoogleSuiteStatus> {
         checked: true,
         ..Default::default()
     };
-    match run_script(device, adb, "certification.py", &[])
-        .and_then(|text| Ok(serde_json::from_str::<serde_json::Value>(&text)?))
-    {
-        Ok(value) => {
-            status.certification_note = if value["certification_block_visible"] == true {
-                "已在手机发现“设备未认证”拦截页；Google 服务当前不可按正常可用验收。"
-            } else {
-                "未读取到 Google 认证结果；请在手机 Play → 设置 → 关于核对。"
-            }
-            .into();
-            status.certification_catalog = value["catalog_note"]
-                .as_str()
-                .unwrap_or("机型列表未确认")
-                .into();
-            status.boot_security_note = format!(
-                "Bootloader：{} · Verified Boot：{}",
-                match value["bootloader_locked"].as_str() {
-                    Some("1") => "已锁定",
-                    Some("0") => "已解锁",
-                    _ => "未知",
-                },
-                value["verified_boot"].as_str().unwrap_or("未知")
-            );
-            if value["disabled_components"]
-                .as_array()
-                .is_some_and(|a| !a.is_empty())
-            {
-                status
-                    .certification_note
-                    .push_str(" 检测到 Google 组件被停用，请在手机应用设置中启用后重试。");
-            }
-        }
-        Err(_) => {
-            status.certification_note =
-                "认证诊断暂不可用；权限校验成功不代表 Google 认证通过。".into()
-        }
-    }
     for line in pkg_versions.lines() {
         let Some((pkg, ver)) = line.trim().split_once('\t') else {
             continue;
@@ -525,12 +510,77 @@ pub fn inspect(device: &Device, adb: &Adb) -> Result<GoogleSuiteStatus> {
         .into();
         return Ok(status);
     }
-    match run_compatibility_script(device, adb, "status") {
+    let (cert_res, protect_res, compat_res, manage_res, pkg_res, health_res) =
+        std::thread::scope(|s| {
+            let t_cert = s.spawn(|| {
+                run_script(device, adb, "certification.py", &[])
+                    .and_then(|text| Ok(serde_json::from_str::<serde_json::Value>(&text)?))
+            });
+            let t_protect = s.spawn(|| inspect_play_protect(device, adb));
+            let t_pkg = s.spawn(|| {
+                run_script(device, adb, "package_state.py", &[])
+                    .and_then(|text| Ok(serde_json::from_str::<serde_json::Value>(&text)?))
+            });
+            let t_runtime = s.spawn(|| {
+                let compat = run_compatibility_script(device, adb, "status");
+                let manage = run_script(device, adb, "manage.py", &["status"])
+                    .and_then(|text| Ok(serde_json::from_str::<serde_json::Value>(&text)?));
+                let health = run_script(device, adb, "health.py", &["status"])
+                    .and_then(|raw| Ok(serde_json::from_str::<serde_json::Value>(&raw)?));
+                (compat, manage, health)
+            });
+            let (compat_res, manage_res, health_res) = t_runtime
+                .join()
+                .unwrap_or_else(|_| (Err(anyhow::anyhow!("线程异常")), Err(anyhow::anyhow!("线程异常")), Err(anyhow::anyhow!("线程异常"))));
+            (
+                t_cert.join().unwrap_or_else(|_| Err(anyhow::anyhow!("线程异常"))),
+                t_protect.join().unwrap_or_else(|_| Err(anyhow::anyhow!("线程异常"))),
+                compat_res,
+                manage_res,
+                t_pkg.join().unwrap_or_else(|_| Err(anyhow::anyhow!("线程异常"))),
+                health_res,
+            )
+        });
+    match cert_res {
+        Ok(value) => {
+            status.certification_note = if value["certification_block_visible"] == true {
+                "已在手机发现“设备未认证”拦截页；Google 服务当前不可按正常可用验收。"
+            } else {
+                "未读取到 Google 认证结果；请在手机 Play → 设置 → 关于核对。"
+            }
+            .into();
+            status.certification_catalog = value["catalog_note"]
+                .as_str()
+                .unwrap_or("机型列表未确认")
+                .into();
+            status.boot_security_note = format!(
+                "Bootloader：{} · Verified Boot：{}",
+                match value["bootloader_locked"].as_str() {
+                    Some("1") => "已锁定",
+                    Some("0") => "已解锁",
+                    _ => "未知",
+                },
+                value["verified_boot"].as_str().unwrap_or("未知")
+            );
+            if value["disabled_components"]
+                .as_array()
+                .is_some_and(|a| !a.is_empty())
+            {
+                status
+                    .certification_note
+                    .push_str(" 检测到 Google 组件被停用，请在手机应用设置中启用后重试。");
+            }
+        }
+        Err(_) => {
+            status.certification_note =
+                "认证诊断暂不可用；权限校验成功不代表 Google 认证通过。".into()
+        }
+    }
+    match compat_res {
         Ok(value) => apply_compatibility_status(&mut status, &value),
         Err(error) => status.compatibility_note = format!("兼容补丁暂未完成检测：{error}"),
     }
-    // Certification is probed on its own: store usability never implies it.
-    match inspect_play_protect(device, adb) {
+    match protect_res {
         Ok(report) => {
             status.certification_note = report.summary();
             status.play_protect = report;
@@ -540,14 +590,11 @@ pub fn inspect(device: &Device, adb: &Adb) -> Result<GoogleSuiteStatus> {
         }
     }
     let verification = (|| -> Result<()> {
-        run_script(device, adb, "manage.py", &["preflight"])?;
-        let value: serde_json::Value =
-            serde_json::from_str(&run_script(device, adb, "manage.py", &["status"])?)?;
+        let value = manage_res?;
         if !apply_adapter_status(&mut status, &value) {
             bail!("当前 Google 权限已失效或未恢复；组件更新后请点击「修复 Google 服务」");
         }
-        let package_state: serde_json::Value =
-            serde_json::from_str(&run_script(device, adb, "package_state.py", &[])?)?;
+        let package_state = pkg_res?;
         status.persistent_flags_clear = package_flags_clear(&package_state["persistent_package"])?;
         if !status.persistent_flags_clear {
             bail!("检测到异常的持久化标记，请停止安装操作并检查设备");
@@ -563,9 +610,7 @@ pub fn inspect(device: &Device, adb: &Adb) -> Result<GoogleSuiteStatus> {
             "三件套已安装，适配状态未确认。请解锁手机并确认 StepClaw 可用，再检测。原因：{e}"
         ),
     };
-    match run_script(device, adb, "health.py", &["status"])
-        .and_then(|raw| Ok(serde_json::from_str::<serde_json::Value>(&raw)?))
-    {
+    match health_res {
         Ok(report) => {
             status.health_needs_repair = report["needs_repair"].as_bool().unwrap_or(true);
             status.google_accounts = report["account_count"].as_u64().unwrap_or(0) as u32;
@@ -618,6 +663,7 @@ fn install_plan(preflight: &serde_json::Value) -> Result<GoogleInstallPlan> {
                 .context("Google 包检测结果不完整")?,
         );
     }
+    if preflight["resume_install"] == true { return Ok(GoogleInstallPlan::Missing); }
     Ok(match installed {
         0 => GoogleInstallPlan::Missing,
         3 => GoogleInstallPlan::Existing,
@@ -643,7 +689,7 @@ pub fn install(device: &Device, adb: &Adb, progress: impl Fn(&str)) -> Result<Go
         bail!("请先解锁手机，再安装 Google Play 与 StepX伴侣");
     }
     let plan = install_plan(&preflight)?;
-    let companion = crate::companion_app::install(adb, device, |message| {
+    let mut companion = crate::companion_app::install(adb, device, |message| {
         progress(&format!("StepX伴侣 · {message}"));
     })
     .context("StepX伴侣未完成安装或权限校验；尚未改动 Google 安装")?;
@@ -653,10 +699,15 @@ pub fn install(device: &Device, adb: &Adb, progress: impl Fn(&str)) -> Result<Go
         })
         .with_context(|| format!("{} Google Play 安装尚未完成", companion.message))?,
         GoogleInstallPlan::Existing => "已有 Google 组件已保留，未重复安装。".into(),
-        GoogleInstallPlan::Partial => {
-            "Google 组件不完整，现有组件已保留；请按检测结果处理 Google 安装。".into()
-        }
+        GoogleInstallPlan::Partial => bail!("检测到其他来源或没有安装记录的部分 Google 组件，已保留账号和应用。请先检测状态；不能将其误报为安装完成"),
     };
+    // The Google launch hook only exists after first installation. Configure the
+    // companion chain now, never report the pre-hook result as reboot-ready.
+    if plan == GoogleInstallPlan::Missing {
+        progress("正在补齐 StepX伴侣开机恢复并回读权限…");
+        companion = crate::companion_app::complete_boot_setup(adb, device)
+            .context("Google 组件已安装；伴侣开机恢复未完成，现有数据保留，请重试修复")?;
+    }
     // Preserve a partial companion service failure in this combined entry point.
     let mut message = format!("{} {google_message}", companion.message);
     progress("正在回读 Google Play 与 StepX伴侣安装状态…");
@@ -707,7 +758,7 @@ fn install_fresh(device: &Device, adb: &Adb, progress: impl Fn(&str)) -> Result<
     let packages = preflight["google_packages"]
         .as_object()
         .context("未读取到 Google 包状态")?;
-    if packages.len() != 3 || packages.values().any(|v| v.as_bool() != Some(false)) {
+    if preflight["resume_install"] != true && (packages.len() != 3 || packages.values().any(|v| v.as_bool() != Some(false))) {
         bail!("手机已有 Google 组件，已停止重复安装；请使用检测状态");
     }
     // These scripts recheck serial, firmware, APK signatures and baseline before each mutation.
@@ -718,19 +769,10 @@ fn install_fresh(device: &Device, adb: &Adb, progress: impl Fn(&str)) -> Result<
     ] {
         progress(label);
         run_script(device, adb, "manage.py", &[stage])
-            .with_context(|| format!("Google 安装停在 {stage} 阶段；请检查原因，勿重复覆盖安装"))?;
+            .with_context(|| format!("Google 安装停在 {stage} 阶段；原数据已保留；同一设备可重试继续已验证的步骤"))?;
     }
     progress("5 / 6 · 保存首次启动前的包状态");
-    run_script(device, adb, "package_state.py", &[])?;
-    let state = crate::resources::user_state().join("google-play/state");
-    let before = state.join("package-before-first-reboot.json");
-    // Never overwrite evidence from a prior attempt.
-    let mut target = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&before)?;
-    use std::io::Write;
-    target.write_all(&std::fs::read(state.join("package-state-current.json"))?)?;
+    run_script(device, adb, "package_state.py", &["--save-first"])?;
     progress("6 / 6 · 安装开机适配，完成后需手动重启");
     run_script(device, adb, "install_adapter.py", &[])?;
     Ok("安装步骤已完成。请手动重启手机并解锁，再点击「检测状态」；确认适配通过前暂不要登录 Google。".into())
@@ -902,7 +944,7 @@ mod tests {
             "schema": "stepx-play-protect-certification-v1",
             "format": 1,
             "checked_at": "2026-10-23T10:46:53+00:00",
-            "serial": "ZYPZ261A01M692000LP",
+            "serial": "STEPXTEST8DB89E4B8927",
             "identity": {"brand": "StepX", "manufacturer": "StepX", "model": "PZ261A",
                          "device": "pandora", "name": "pandora"},
             "fingerprint": "StepX/pandora/pandora:16/BQ2A.260122.002-BP2A.250705.008/172:user/release-keys",
@@ -1172,6 +1214,20 @@ mod tests {
         assert!(firmware.same_as_current);
         assert_eq!(firmware.need_update, Some(false));
         assert_eq!(firmware.current_incremental.as_deref(), Some("172"));
+
+        let mut payload_12 = certification_payload_with_extras();
+        payload_12["fingerprint"] = serde_json::json!(
+            "StepX/pandora/pandora:16/BQ2A.260122.002-BP2A.250705.008/12:user/release-keys"
+        );
+        payload_12["firmware"]["current_incremental"] = serde_json::json!("12");
+        let report_12 = play_protect_from_value(&payload_12).unwrap();
+        assert_eq!(
+            report_12
+                .firmware
+                .as_ref()
+                .and_then(|f| f.current_incremental.as_deref()),
+            Some("12")
+        );
     }
 
     #[test]

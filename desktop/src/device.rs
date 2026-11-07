@@ -1,3 +1,4 @@
+pub use crate::companion_app::{CompanionPermission, CompanionStatus};
 use crate::{adb::Adb, mirror::MirrorSession};
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
@@ -14,17 +15,682 @@ pub struct Transport {
     pub model: String,
 }
 
+const VERIFIED_TRANSPORT_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[derive(Clone, Debug)]
+struct VerifiedTransportEntry {
+    active_transport: String,
+    hardware_serial: String,
+    verified_at: std::time::Instant,
+}
+
+static ACTIVE_TRANSPORT_REGISTRY: OnceLock<Mutex<HashMap<String, VerifiedTransportEntry>>> =
+    OnceLock::new();
+static KNOWN_SERIAL_BY_TRANSPORT: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+fn active_transport_registry() -> &'static Mutex<HashMap<String, VerifiedTransportEntry>> {
+    ACTIVE_TRANSPORT_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn known_serial_registry() -> &'static Mutex<HashMap<String, String>> {
+    KNOWN_SERIAL_BY_TRANSPORT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn remember_serial_for_transports(serial: &str, transports: &[&str]) {
+    let s = serial.trim();
+    if s.is_empty() || s.contains(':') || s.starts_with("adb-") {
+        return;
+    }
+    if let Ok(mut map) = known_serial_registry().lock() {
+        for t in transports {
+            let trimmed = t.trim();
+            if !trimmed.is_empty() && !trimmed.starts_with("model:") {
+                map.insert(trimmed.to_string(), s.to_string());
+            }
+        }
+    }
+}
+
+fn known_serial_for_transport(transport_or_serial: &str) -> Option<String> {
+    let trimmed = transport_or_serial.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(map) = known_serial_registry().lock() {
+        if let Some(s) = map.get(trimmed) {
+            return Some(s.clone());
+        }
+    }
+    if let Some(canon) = canonical_serial_from_transport(trimmed) {
+        return Some(canon);
+    }
+    if let Ok(reg) = active_transport_registry().lock() {
+        if let Some(entry) = reg.get(trimmed) {
+            if !entry.hardware_serial.is_empty() {
+                return Some(entry.hardware_serial.clone());
+            }
+        }
+    }
+    None
+}
+
+fn record_verified_transport(preferred: &str, hardware_serial: &str, active_transport: &str) {
+    let active = active_transport.trim();
+    if active.is_empty() {
+        return;
+    }
+    let serial = if !hardware_serial.trim().is_empty() {
+        hardware_serial.trim().to_string()
+    } else {
+        known_serial_for_transport(active)
+            .or_else(|| known_serial_for_transport(preferred))
+            .unwrap_or_default()
+    };
+    remember_serial_for_transports(&serial, &[preferred, active]);
+    let entry = VerifiedTransportEntry {
+        active_transport: active.to_string(),
+        hardware_serial: serial.clone(),
+        verified_at: std::time::Instant::now(),
+    };
+    if let Ok(mut reg) = active_transport_registry().lock() {
+        reg.insert(active.to_string(), entry.clone());
+        if !preferred.trim().is_empty() {
+            reg.insert(preferred.trim().to_string(), entry.clone());
+        }
+        if !serial.is_empty() {
+            reg.insert(serial, entry);
+        }
+    }
+}
+
+pub fn invalidate_verified_transport(transport_or_serial: &str) {
+    let trimmed = transport_or_serial.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let canonical = canonical_serial_from_transport(trimmed).unwrap_or_default();
+    if let Ok(mut reg) = active_transport_registry().lock() {
+        reg.retain(|k, v| {
+            k != trimmed
+                && v.active_transport != trimmed
+                && v.hardware_serial != trimmed
+                && (canonical.is_empty() || (k != &canonical && v.hardware_serial != canonical))
+        });
+    }
+}
+
+pub fn promote_active_transport(serial: &str, new_transport: &str) {
+    let new_t = new_transport.trim();
+    if new_t.is_empty() {
+        return;
+    }
+    let effective_serial = if !serial.trim().is_empty() {
+        serial.trim().to_string()
+    } else {
+        known_serial_for_transport(new_t).unwrap_or_default()
+    };
+    let mut old_transports = Vec::new();
+    if let Ok(reg) = active_transport_registry().lock() {
+        if !effective_serial.is_empty() {
+            if let Some(existing) = reg.get(&effective_serial) {
+                if !existing.active_transport.is_empty() && existing.active_transport != new_t {
+                    old_transports.push(existing.active_transport.clone());
+                }
+            }
+        }
+        for (k, v) in reg.iter() {
+            if !effective_serial.is_empty() && v.hardware_serial == effective_serial {
+                if v.active_transport != new_t && !old_transports.contains(&v.active_transport) {
+                    old_transports.push(v.active_transport.clone());
+                }
+                if k != &effective_serial && k != new_t && !old_transports.contains(k) {
+                    old_transports.push(k.clone());
+                }
+            }
+        }
+    }
+
+    record_verified_transport(&effective_serial, &effective_serial, new_t);
+    if let Ok(mut reg) = active_transport_registry().lock() {
+        let entry = VerifiedTransportEntry {
+            active_transport: new_t.to_string(),
+            hardware_serial: effective_serial.clone(),
+            verified_at: std::time::Instant::now(),
+        };
+        for old_t in &old_transports {
+            reg.insert(old_t.clone(), entry.clone());
+        }
+    }
+
+    let mut all_known: Vec<String> = Vec::new();
+    if !effective_serial.is_empty()
+        && !effective_serial.contains(':')
+        && !effective_serial.starts_with("adb-")
+    {
+        all_known.push(effective_serial.clone());
+    }
+    for old_t in &old_transports {
+        if !all_known.contains(old_t) {
+            all_known.push(old_t.clone());
+        }
+    }
+    if !all_known.contains(&new_t.to_string()) {
+        all_known.push(new_t.to_string());
+    }
+    let existing_backups = backup_transports_for(&[&effective_serial, new_t]);
+    for b in existing_backups {
+        if !b.is_empty() && !all_known.contains(&b) {
+            all_known.push(b);
+        }
+    }
+    all_known.sort_by(|a, b| {
+        transport_priority(a)
+            .cmp(&transport_priority(b))
+            .then_with(|| a.cmp(b))
+    });
+    if all_known.len() > 1 {
+        if let Ok(mut map) = backup_transport_registry().lock() {
+            if !effective_serial.is_empty() {
+                map.insert(effective_serial.clone(), all_known.clone());
+            }
+            for t in &all_known {
+                let peers: Vec<String> = all_known.iter().filter(|x| *x != t).cloned().collect();
+                map.insert(t.clone(), peers);
+            }
+        }
+    }
+}
+
+pub fn current_active_transport_for_serial(serial: &str) -> Option<String> {
+    let trimmed = serial.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let canonical = canonical_serial_from_transport(trimmed).unwrap_or_default();
+    if let Ok(reg) = active_transport_registry().lock() {
+        if let Some(entry) = reg.get(trimmed) {
+            return Some(entry.active_transport.clone());
+        }
+        if !canonical.is_empty() {
+            if let Some(entry) = reg.get(&canonical) {
+                return Some(entry.active_transport.clone());
+            }
+        }
+    }
+    None
+}
+
+// A host-session reset must never interrupt a send, dial, or other dispatched write.
+#[derive(Default)]
+struct SessionActivity { writes: usize, repairing: bool, reset_at: Option<std::time::Instant> }
+type SessionActivitySlot = std::sync::Arc<Mutex<SessionActivity>>;
+
+fn session_activities() -> &'static Mutex<HashMap<String, SessionActivitySlot>> {
+    static SESSIONS: OnceLock<Mutex<HashMap<String, SessionActivitySlot>>> = OnceLock::new();
+    SESSIONS.get_or_init(Default::default)
+}
+
+fn session_activity_identity(target: &str) -> String {
+    known_serial_for_transport(target).unwrap_or_else(|| target.trim().to_string())
+}
+
+// A request can acquire a guard before the first identity probe has mapped its
+// IP to a hardware serial. Resolve existing keys at inspection time too, so
+// that learning this mapping never leaves a dispatched write on an orphan lock.
+fn related_session_activities(
+    sessions: &HashMap<String, SessionActivitySlot>,
+    identity: &str,
+) -> Vec<SessionActivitySlot> {
+    sessions
+        .iter()
+        .filter(|(target, _)| session_activity_identity(target) == identity)
+        .map(|(_, slot)| slot.clone())
+        .collect()
+}
+
+pub struct TransportMutationGuard(SessionActivitySlot);
+impl Drop for TransportMutationGuard {
+    fn drop(&mut self) { let mut s = self.0.lock().unwrap_or_else(|e| e.into_inner()); s.writes = s.writes.saturating_sub(1); }
+}
+pub fn protect_transport_mutation(target: &str) -> Result<TransportMutationGuard> {
+    let mut sessions = session_activities().lock().unwrap_or_else(|e| e.into_inner());
+    let key = session_activity_identity(target);
+    for related in related_session_activities(&sessions, &key) {
+        anyhow::ensure!(
+            !related.lock().unwrap_or_else(|e| e.into_inner()).repairing,
+            "手机连接正在恢复，此次操作尚未发送，请恢复后重试"
+        );
+    }
+    let slot = sessions.entry(key).or_default().clone();
+    {
+        let mut s = slot.lock().unwrap_or_else(|e| e.into_inner());
+        anyhow::ensure!(!s.repairing, "手机连接正在恢复，此次操作尚未发送，请恢复后重试");
+        s.writes += 1;
+    }
+    Ok(TransportMutationGuard(slot))
+}
+struct HostSessionRepair(Vec<SessionActivitySlot>);
+impl Drop for HostSessionRepair {
+    fn drop(&mut self) {
+        for slot in &self.0 {
+            slot.lock().unwrap_or_else(|e| e.into_inner()).repairing = false;
+        }
+    }
+}
+fn begin_host_session_repair(target: &str) -> Option<HostSessionRepair> {
+    // Serialize the inspection/reservation with new write guards. Dropping a
+    // guard needs only its own slot, so this never waits for a network request.
+    let mut sessions = session_activities().lock().unwrap_or_else(|e| e.into_inner());
+    let key = session_activity_identity(target);
+    sessions.entry(key.clone()).or_default();
+    let related = related_session_activities(&sessions, &key);
+    for slot in &related {
+        let s = slot.lock().unwrap_or_else(|e| e.into_inner());
+        if s.writes > 0 || s.repairing || s.reset_at.is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(20)) { return None; }
+    }
+    let now = std::time::Instant::now();
+    for slot in &related {
+        let mut s = slot.lock().unwrap_or_else(|e| e.into_inner());
+        s.repairing = true;
+        s.reset_at = Some(now);
+    }
+    Some(HostSessionRepair(related))
+}
+
+#[cfg(all(test, unix))]
+mod session_repair_tests {
+    use super::*;
+    use std::{os::unix::fs::PermissionsExt, time::Duration};
+    fn fake(endpoint: &str, serial: &str, wrong_identity: bool) -> (tempfile::TempDir, Adb, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("adb");
+        let log = dir.path().join("calls");
+        let marker = dir.path().join("reconnected");
+        let before = if wrong_identity { "echo OTHER_PHONE" } else { "echo 'error: closed' >&2; exit 1" };
+        std::fs::write(&script, format!(r#"#!/bin/sh
+printf '%s\n' "$*" >> '{log}'
+case "$*" in
+ "devices -l") printf 'List of devices attached\n{endpoint} device\n';;
+ "-s {endpoint} shell getprop ro.serialno") if [ -f '{marker}' ]; then echo {serial}; else {before}; fi;;
+ "disconnect {endpoint}") exit 0;;
+ "connect {endpoint}") touch '{marker}';;
+ *) exit 1;;
+esac
+"#, log=log.display(), marker=marker.display())).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        remember_serial_for_transports(serial, &[endpoint]);
+        (dir, Adb { path: script }, log)
+    }
+    #[test]
+    fn listed_but_unresponsive_session_is_rebuilt_and_identity_checked() {
+        let endpoint = "192.0.2.164:40101";
+        let (_dir, adb, log) = fake(endpoint, "REPAIR164_A", false);
+        assert_eq!(recover_transport(&adb, endpoint, Duration::from_secs(4)).as_deref(), Some(endpoint));
+        let log = std::fs::read_to_string(log).unwrap();
+        assert_eq!(log.lines().filter(|line| *line == format!("disconnect {endpoint}")).count(), 1, "{log}");
+        assert!(!log.contains("kill-server") && !log.contains("tcpip") && !log.contains("input"));
+    }
+    #[test]
+    fn recovery_never_resets_a_dispatched_message_or_call() {
+        let endpoint = "192.0.2.164:40102";
+        let (_dir, adb, log) = fake(endpoint, "REPAIR164_B", false);
+        let lease = protect_transport_mutation("REPAIR164_B").unwrap();
+        assert!(recover_transport(&adb, endpoint, Duration::from_secs(4)).is_none());
+        assert!(!std::fs::read_to_string(log).unwrap().contains("disconnect"));
+        drop(lease);
+        let repair = begin_host_session_repair(endpoint).unwrap();
+        assert!(protect_transport_mutation("REPAIR164_B").is_err());
+        drop(repair);
+        assert!(protect_transport_mutation(endpoint).is_ok());
+    }
+    #[test]
+    fn reused_wireless_address_does_not_reset_or_accept_another_phone() {
+        let endpoint = "192.0.2.164:40103";
+        let (_dir, adb, log) = fake(endpoint, "REPAIR164_C", true);
+        assert!(recover_transport(&adb, endpoint, Duration::from_secs(4)).is_none());
+        assert!(!std::fs::read_to_string(log).unwrap().contains("disconnect"));
+    }
+    #[test]
+    fn learning_identity_keeps_an_already_dispatched_write_protected() {
+        let endpoint = "192.0.2.165:40104";
+        let serial = "REPAIR165_LATE_IDENTITY";
+        let write = protect_transport_mutation(endpoint).unwrap();
+        remember_serial_for_transports(serial, &[endpoint]);
+        assert!(begin_host_session_repair(serial).is_none());
+        assert!(begin_host_session_repair(endpoint).is_none());
+        drop(write);
+        let repair = begin_host_session_repair(serial).unwrap();
+        assert!(protect_transport_mutation(endpoint).is_err());
+        assert!(protect_transport_mutation(serial).is_err());
+        drop(repair);
+        assert!(protect_transport_mutation(endpoint).is_ok());
+    }
+    #[test]
+    fn a_newly_discovered_alias_cannot_dispatch_during_repair() {
+        let serial = "REPAIR165_NEW_ALIAS";
+        let repair = begin_host_session_repair(serial).unwrap();
+        let endpoint = "192.0.2.165:40105";
+        remember_serial_for_transports(serial, &[endpoint]);
+        assert!(protect_transport_mutation(endpoint).is_err());
+        assert!(protect_transport_mutation("UNRELATED165_DEVICE").is_ok());
+        drop(repair);
+        assert!(protect_transport_mutation(endpoint).is_ok());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod device_inspection_tests {
+    use super::*;
+    use std::{os::unix::fs::PermissionsExt, time::{Duration, Instant}};
+
+    #[test]
+    fn silent_identity_alias_is_bounded_and_does_not_prevent_a_reachable_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("adb");
+        let log = dir.path().join("calls");
+        std::fs::write(&path, format!(r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$2" in
+ '[fd00::165]:40106') sleep 30;;
+ '192.0.2.165:40107') printf 'INSPECT165_REACHABLE\nPZ261A\n16\npandora\n';;
+ '192.0.2.165:40108') printf 'INSPECT165_UNSUPPORTED\nOtherPhone\n16\nother\n';;
+ *) printf 'List of devices attached\n';;
+esac
+"#, log.display())).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let adb = Adb { path };
+        let started = Instant::now();
+        let error = Device::inspect(&adb, "[fd00::165]:40106").unwrap_err();
+        assert!(error.downcast_ref::<crate::adb::ProcessTimeout>().is_some());
+        assert!(started.elapsed() < Duration::from_secs(8), "identity discovery used an unbounded operation deadline");
+        let device = Device::inspect(&adb, "192.0.2.165:40107").unwrap();
+        assert_eq!(device.serial, "INSPECT165_REACHABLE");
+        assert_eq!(device.model, "PZ261A");
+        assert!(Device::inspect(&adb, "192.0.2.165:40108").is_err(), "supported-model checks must remain strict");
+        let calls = std::fs::read_to_string(log).unwrap();
+        for command in ["kill-server", "disconnect", "reconnect", "tcpip", "input ", "settings "] {
+            assert!(!calls.contains(command), "identity discovery unexpectedly mutated the phone: {calls}");
+        }
+    }
+}
+
+/// Concurrent failed reads and the connection watcher share one recovery attempt.
+/// Try verified alternatives first; an unresponsive, still-listed wireless session
+/// can be rebuilt on the host only after all dispatched mutations have finished.
+#[derive(Default)]
+struct RecoveryState {
+    running: bool,
+    finished: Option<std::time::Instant>,
+    transport: Option<String>,
+}
+
+type RecoverySlot = std::sync::Arc<(Mutex<RecoveryState>, std::sync::Condvar)>;
+
+pub fn resolve_failover_transport(adb: &Adb, failed_transport: &str) -> Option<String> {
+    recover_transport(adb, failed_transport, std::time::Duration::from_secs(6))
+}
+
+pub fn recover_transport(
+    adb: &Adb,
+    failed_transport: &str,
+    budget: std::time::Duration,
+) -> Option<String> {
+    use std::time::{Duration, Instant};
+    if failed_transport.trim().is_empty() || budget.is_zero() {
+        return None;
+    }
+    static RECOVERY: OnceLock<Mutex<HashMap<(std::path::PathBuf, String), RecoverySlot>>> =
+        OnceLock::new();
+    let serial = known_serial_for_transport(failed_transport);
+    let key = (
+        adb.path.clone(),
+        serial
+            .clone()
+            .unwrap_or_else(|| failed_transport.to_string()),
+    );
+    let slot = RECOVERY
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(key)
+        .or_default()
+        .clone();
+    let deadline = Instant::now() + budget;
+    let (lock, cv) = &*slot;
+    let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while state.running {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        state = cv
+            .wait_timeout(state, remaining)
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
+    }
+    if state
+        .finished
+        .is_some_and(|at| at.elapsed() < Duration::from_secs(2))
+    {
+        return state.transport.clone();
+    }
+    state.running = true;
+    drop(state);
+    let result = recover_transport_until(adb, failed_transport, serial.as_deref(), deadline);
+    let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+    state.running = false;
+    state.finished = Some(Instant::now());
+    state.transport = result.clone();
+    cv.notify_all();
+    result
+}
+
+fn recover_transport_until(
+    adb: &Adb,
+    failed: &str,
+    serial: Option<&str>,
+    deadline: std::time::Instant,
+) -> Option<String> {
+    use std::time::{Duration, Instant};
+    let _guard = crate::adb::enter_transport_recovery();
+    let phase_deadline = std::cell::Cell::new(deadline);
+    let read = |args: &[&str], max: Duration| -> Option<String> {
+        let left = phase_deadline.get().saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        adb.run_timeout(args, left.min(max)).ok()
+    };
+    let raw = read(&["devices", "-l"], Duration::from_millis(1000)).unwrap_or_default();
+    let online: Vec<&str> = raw
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            let id = words.next()?;
+            (words.next() == Some("device")).then_some(id)
+        })
+        .collect();
+    let mut candidates = vec![failed.to_string()];
+    let stale_online = online.contains(&failed) && serial.is_some()
+        && crate::pairing::validate_endpoint(failed).is_ok();
+    if stale_online {
+        // Old IPv6 aliases must not consume the entire budget before the host
+        // gets a chance to replace the frozen TLS session on the current IP.
+        phase_deadline.set(deadline.checked_sub(Duration::from_millis(2400)).unwrap_or(deadline));
+    }
+    if let Some(serial) = serial {
+        if let Some(active) = current_active_transport_for_serial(serial) {
+            candidates.push(active);
+        }
+        candidates.extend(backup_transports_for(&[failed, serial]));
+        // Read identity before accepting any endpoint, including a reused IP/port.
+        candidates.extend(
+            online
+                .iter()
+                .filter(|id| canonical_serial_from_transport(id).is_none_or(|s| s == serial))
+                .map(|id| id.to_string()),
+        );
+        candidates.push(serial.to_string());
+    }
+    candidates.sort_by_key(|id| {
+        (
+            if online.contains(&id.as_str()) { 0 } else { 1 },
+            if id == failed { 0 } else { 1 },
+            transport_priority(id),
+        )
+    });
+    candidates.dedup();
+    let mut tried = Vec::new();
+    let failed_unresponsive = std::cell::Cell::new(false);
+    let failed_identity_changed = std::cell::Cell::new(false);
+    let mut probe = |endpoint: &str, connect: bool| -> Option<String> {
+        if tried.iter().any(|s| s == endpoint) {
+            return None;
+        }
+        tried.push(endpoint.to_string());
+        if connect
+            && !online.contains(&endpoint)
+            && crate::pairing::validate_endpoint(endpoint).is_ok()
+        {
+            let offline = raw.lines().any(|line| {
+                let mut words = line.split_whitespace();
+                words.next() == Some(endpoint) && words.next() == Some("offline")
+            });
+            if offline {
+                let _ = read(&["-s", endpoint, "reconnect"], Duration::from_millis(500));
+            }
+            let _ = read(&["connect", endpoint], Duration::from_millis(800));
+        }
+        let probe_has_time = phase_deadline.get().saturating_duration_since(Instant::now()) >= Duration::from_millis(150);
+        let got = match read(
+            &["-s", endpoint, "shell", "getprop", "ro.serialno"],
+            Duration::from_millis(900),
+        ) {
+            Some(got) => got,
+            None => {
+                if endpoint == failed && probe_has_time { failed_unresponsive.set(true); }
+                return None;
+            }
+        };
+        let got = got.trim();
+        if endpoint == failed && !got.is_empty() && serial.is_some_and(|s| s != got) { failed_identity_changed.set(true); }
+        if got.is_empty() || serial.is_some_and(|expected| expected != got) {
+            return None;
+        }
+        // Without a known hardware identity only the original endpoint is eligible.
+        if serial.is_none() && endpoint != failed {
+            return None;
+        }
+        promote_active_transport(got, endpoint);
+        record_verified_transport(failed, got, endpoint);
+        Some(endpoint.to_string())
+    };
+    // Prefer live aliases. Old remembered addresses must not starve fresh discovery.
+    for candidate in candidates
+        .iter()
+        .filter(|id| online.contains(&id.as_str()) || *id == failed)
+    {
+        if let Some(found) = probe(candidate, true) {
+            return Some(found);
+        }
+    }
+    if let Some(serial) = serial {
+        if let Some(mdns) = read(&["mdns", "services"], Duration::from_millis(800)) {
+            for line in mdns
+                .lines()
+                .filter(|line| line.contains("_adb-tls-connect._tcp"))
+            {
+                let mut words = line.split_whitespace();
+                let name = words.next().unwrap_or("");
+                if !name.starts_with(&format!("adb-{serial}-")) && name != format!("adb-{serial}") {
+                    continue;
+                }
+                if let Some(endpoint) = line.split_whitespace().last() {
+                    if crate::pairing::validate_endpoint(endpoint).is_ok() {
+                        if let Some(found) = probe(endpoint, true) {
+                            return Some(found);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for candidate in candidates.iter().take(8) {
+        if let Some(found) = probe(candidate, true) {
+            return Some(found);
+        }
+    }
+    phase_deadline.set(deadline);
+    if stale_online && failed_unresponsive.get() && !failed_identity_changed.get()
+        && deadline.saturating_duration_since(Instant::now()) >= Duration::from_millis(500) {
+        let _repair = begin_host_session_repair(failed)?;
+        invalidate_verified_transport(failed);
+        let _ = read(&["disconnect", failed], Duration::from_millis(700));
+        let _ = read(&["connect", failed], Duration::from_millis(1000));
+        let identity = read(&["-s", failed, "shell", "getprop", "ro.serialno"], Duration::from_millis(1000))?;
+        let identity = identity.trim();
+        if serial == Some(identity) && !identity.is_empty() {
+            promote_active_transport(identity, failed);
+            record_verified_transport(failed, identity, failed);
+            return Some(failed.to_string());
+        }
+    }
+    None
+}
+
 fn backup_transport_registry() -> &'static Mutex<HashMap<String, Vec<String>>> {
     static REGISTRY: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 pub fn set_backup_transports_for(keys: &[&str], backups: Vec<String>) {
+    let mut non_model_keys: Vec<String> = Vec::new();
+    for key in keys {
+        let trimmed = key.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with("model:") {
+            if !non_model_keys.iter().any(|k| k == trimmed) {
+                non_model_keys.push(trimmed.to_string());
+            }
+            if !trimmed.contains(':') && !trimmed.starts_with("adb-") {
+                let mut refs: Vec<&str> = keys.to_vec();
+                for b in &backups {
+                    refs.push(b.as_str());
+                }
+                remember_serial_for_transports(trimmed, &refs);
+            }
+        }
+    }
     if let Ok(mut map) = backup_transport_registry().lock() {
         for key in keys {
             let trimmed = key.trim();
             if !trimmed.is_empty() {
                 map.insert(trimmed.to_string(), backups.clone());
+            }
+        }
+        for b in &backups {
+            let bt = b.trim();
+            if bt.is_empty() || keys.iter().any(|k| k.trim() == bt) {
+                continue;
+            }
+            let mut peers: Vec<String> = Vec::new();
+            for k in &non_model_keys {
+                if k != bt && !peers.contains(k) {
+                    peers.push(k.clone());
+                }
+            }
+            for other in &backups {
+                let ot = other.trim();
+                if !ot.is_empty() && ot != bt && !peers.iter().any(|p| p == ot) {
+                    peers.push(ot.to_string());
+                }
+            }
+            peers.sort_by(|a, c| {
+                transport_priority(a)
+                    .cmp(&transport_priority(c))
+                    .then_with(|| a.cmp(c))
+            });
+            if !peers.is_empty() {
+                map.insert(bt.to_string(), peers);
             }
         }
     }
@@ -48,7 +714,7 @@ pub fn backup_transports_for(keys: &[&str]) -> Vec<String> {
 
 /// Priority of a transport ID (lower is higher priority):
 /// 1 = physical USB serial (`STEPX_TEST_DEVICE`)
-/// 2 = explicit wireless IP:Port (`10.0.1.177:34883`)
+/// 2 = explicit wireless IP:Port (`10.0.0.42:34883`)
 /// 3 = mDNS TLS service (`adb-STEPX_TEST_DEVICE-jYyV3X._adb-tls-connect._tcp`)
 pub fn transport_priority(id: &str) -> u8 {
     let trimmed = id.trim();
@@ -99,105 +765,92 @@ pub fn resolve_online_transport(
     adb: &Adb,
     preferred: &str,
     serial: &str,
-    model: &str,
+    _model: &str,
     backups: &[String],
 ) -> Result<String> {
-    if !preferred.trim().is_empty() {
-        if let Ok(got) = adb.run_timeout(
-            &["-s", preferred, "shell", "getprop", "ro.serialno"],
-            std::time::Duration::from_secs(3),
-        ) {
-            let got = got.trim();
-            if !got.is_empty() && (serial.is_empty() || got == serial) {
-                return Ok(preferred.to_string());
-            }
-            if !got.is_empty() && !serial.is_empty() && got != serial {
-                bail!("设备身份已变化，请重新选择手机。此次操作没有执行。");
-            }
+    let _recovery_guard = crate::adb::enter_transport_recovery();
+    let preferred_trimmed = preferred.trim();
+    let serial_trimmed = serial.trim();
+
+    if !serial_trimmed.is_empty() {
+        let mut refs = vec![preferred_trimmed];
+        for b in backups {
+            refs.push(b.as_str());
         }
+        remember_serial_for_transports(serial_trimmed, &refs);
     }
 
-    let mut candidates: Vec<String> = Vec::new();
-    for b in backups {
-        let t = b.trim();
-        if !t.is_empty() && t != preferred && !candidates.iter().any(|c| c == t) {
-            candidates.push(t.to_string());
-        }
-    }
-    let canonical = canonical_serial_from_transport(preferred).unwrap_or_default();
-    let model_key = if !model.is_empty() {
-        format!("model:{model}")
-    } else {
-        String::new()
-    };
-    for b in backup_transports_for(&[preferred, serial, &canonical, &model_key]) {
-        if !b.is_empty() && b != preferred && !candidates.contains(&b) {
-            candidates.push(b);
-        }
-    }
-
-    let mut online_in_adb: Vec<String> = Vec::new();
-    if let Ok(raw) = adb.run_timeout(&["devices", "-l"], std::time::Duration::from_secs(3)) {
-        for line in raw.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 2 && parts[1] == "device" {
-                let id = parts[0];
-                online_in_adb.push(id.to_string());
-                let line_model = parts
-                    .iter()
-                    .find_map(|p| p.strip_prefix("model:"))
-                    .unwrap_or("");
-                let line_serial = canonical_serial_from_transport(id);
-                let matches_device = (!serial.is_empty()
-                    && line_serial.as_deref() == Some(serial))
-                    || (!model.is_empty() && line_model == model)
-                    || line_model.eq_ignore_ascii_case("PZ261A")
-                    || line_model.to_lowercase().contains("stepx");
-                if matches_device && !candidates.iter().any(|c| c == id) {
-                    candidates.push(id.to_string());
+    // 1. Fast Path (0ms TTL Cache) & Promoted Transport Lookup
+    let mut stale_promoted: Option<String> = None;
+    if let Ok(reg) = active_transport_registry().lock() {
+        let lookup = reg.get(preferred_trimmed).or_else(|| {
+            (!serial_trimmed.is_empty())
+                .then(|| reg.get(serial_trimmed))
+                .flatten()
+        });
+        if let Some(entry) = lookup {
+            let serial_matches = serial_trimmed.is_empty()
+                || entry.hardware_serial.is_empty()
+                || entry.hardware_serial == serial_trimmed;
+            if serial_matches && !entry.active_transport.is_empty() {
+                if entry.verified_at.elapsed() < VERIFIED_TRANSPORT_TTL {
+                    return Ok(entry.active_transport.clone());
+                }
+                if entry.active_transport != preferred_trimmed {
+                    stale_promoted = Some(entry.active_transport.clone());
                 }
             }
         }
     }
 
-    candidates.sort_by(|a, b| {
-        transport_priority(a)
-            .cmp(&transport_priority(b))
-            .then_with(|| a.cmp(b))
-    });
-
-    for cand in candidates {
-        if cand.contains(':')
-            && !cand.starts_with("adb-")
-            && !online_in_adb.iter().any(|o| o == &cand)
-        {
-            let _ = adb.run_timeout(
-                &["connect", &cand],
-                std::time::Duration::from_millis(1600),
-            );
-        }
+    // 2. Promoted Transport Check (probe promoted transport first even if > 3.5s old)
+    if let Some(promoted) = stale_promoted {
         if let Ok(got) = adb.run_timeout(
-            &["-s", &cand, "shell", "getprop", "ro.serialno"],
+            &["-s", &promoted, "shell", "getprop", "ro.serialno"],
             std::time::Duration::from_secs(3),
         ) {
             let got = got.trim();
-            if !got.is_empty() && (serial.is_empty() || got == serial) {
-                return Ok(cand);
+            if !got.is_empty() && (serial_trimmed.is_empty() || got == serial_trimmed) {
+                record_verified_transport(preferred_trimmed, got, &promoted);
+                return Ok(promoted);
+            }
+        }
+        invalidate_verified_transport(&promoted);
+    }
+
+    if !preferred_trimmed.is_empty() {
+        if let Ok(got) = adb.run_timeout(
+            &["-s", preferred_trimmed, "shell", "getprop", "ro.serialno"],
+            std::time::Duration::from_secs(3),
+        ) {
+            let got = got.trim();
+            if !got.is_empty() && (serial_trimmed.is_empty() || got == serial_trimmed) {
+                record_verified_transport(preferred_trimmed, got, preferred_trimmed);
+                return Ok(preferred_trimmed.to_string());
+            }
+            if !got.is_empty() && !serial_trimmed.is_empty() && got != serial_trimmed {
+                bail!("设备身份已变化，请重新选择手机。此次操作没有执行。");
             }
         }
     }
 
-    let final_serial = adb.shell(preferred, &["getprop", "ro.serialno"])?;
-    if !serial.is_empty() && final_serial.trim() != serial {
-        bail!("设备身份已变化，请重新选择手机。此次操作没有执行。");
+    let mut known = backup_transports_for(&[preferred_trimmed, serial_trimmed]);
+    for backup in backups {
+        if !known.contains(backup) {
+            known.push(backup.clone());
+        }
     }
-    Ok(preferred.to_string())
+    if !known.is_empty() {
+        set_backup_transports_for(&[preferred_trimmed, serial_trimmed], known);
+    }
+    recover_transport(adb, preferred_trimmed, std::time::Duration::from_secs(6))
+        .context("手机连接暂时不可用，正在等待可用通道；此次操作尚未完成")
 }
 
 impl Transport {
     pub fn backup_transports(&self) -> Vec<String> {
         let canonical = canonical_serial_from_transport(&self.id).unwrap_or_default();
-        let model_key = if !self.model.is_empty() {
+        let model_key = if canonical.is_empty() && !self.model.is_empty() {
             format!("model:{}", self.model)
         } else {
             String::new()
@@ -322,26 +975,41 @@ fn deduplicate_parsed_transports(
                     }
                 }
             }
+            let has_ipv4_wireless = backups
+                .iter()
+                .chain(std::iter::once(&primary.id))
+                .any(|id| id.contains(':') && !id.starts_with('['));
+            if has_ipv4_wireless {
+                backups.retain(|id| !id.starts_with("[fd") && !id.starts_with("[fe80:"));
+            }
             backups.sort_by(|a, b| {
                 transport_priority(a)
                     .cmp(&transport_priority(b))
                     .then_with(|| a.cmp(b))
             });
             let serial_key = group.serial.unwrap_or_default();
-            let model_key = if !primary.model.is_empty() {
+            let model_key = if serial_key.is_empty() && !primary.model.is_empty() {
                 format!("model:{}", primary.model)
             } else {
                 String::new()
             };
+            let mut all_group_ids = vec![primary.id.clone()];
+            for b in &backups {
+                if !all_group_ids.contains(b) {
+                    all_group_ids.push(b.clone());
+                }
+            }
+            for member_id in &all_group_ids {
+                let peers: Vec<String> = all_group_ids
+                    .iter()
+                    .filter(|id| *id != member_id)
+                    .cloned()
+                    .collect();
+                set_backup_transports_for(&[member_id.as_str()], peers);
+            }
             set_backup_transports_for(&[&primary.id, &serial_key, &model_key], backups.clone());
             if !serial_key.is_empty() && serial_key != primary.id {
-                let mut serial_backups = vec![primary.id.clone()];
-                for b in &backups {
-                    if !serial_backups.contains(b) {
-                        serial_backups.push(b.clone());
-                    }
-                }
-                set_backup_transports_for(&[&serial_key], serial_backups);
+                set_backup_transports_for(&[&serial_key], all_group_ids);
             }
             result.push(primary);
         }
@@ -467,12 +1135,52 @@ fn validate_generic_apk_identity(value: &serde_json::Value) -> Result<()> {
     }
     let package = value["package"]
         .as_str()
+        .map(str::trim)
         .filter(|p| !p.is_empty())
         .context("APK 包名校验未返回有效结果，尚未安装")?;
-    if package == "com.stepx.companion.app" {
+    if package.eq_ignore_ascii_case("com.stepx.companion.app") {
         bail!("StepX伴侣请通过“小工具 → 安装 StepX伴侣”更新；内置 GUI Agent 完整包请使用“小工具 → 内置 GUI Agent”安装。通用 APK 入口不会覆盖伴侣，现有功能和数据未改变。");
     }
     Ok(())
+}
+
+/// Reliably wakes a phone from `Asleep` or `Dozing` (AOD), waits for `SCREEN_STATE_ON`,
+/// dismisses the keyguard (including swipe-to-unlock keyguard on Pandora OS), and collapses
+/// the notification shade so foreground activities can receive UI actions.
+pub fn wake_and_unlock_transport(
+    adb: &Adb,
+    transport: &str,
+    cx: u32,
+    y_bot: u32,
+    y_top: u32,
+) -> Result<String> {
+    let script = format!(
+        concat!(
+            "if ! dumpsys power 2>/dev/null | grep -q 'mWakefulness=Awake'; then ",
+            "input keyevent 224 >/dev/null 2>&1 || true; ",
+            "sleep 0.2; ",
+            "fi; ",
+            "if ! dumpsys power 2>/dev/null | grep -q 'mWakefulness=Awake'; then ",
+            "input keyevent 26 >/dev/null 2>&1 || true; ",
+            "fi; ",
+            "for _i in 1 2 3 4 5; do ",
+            "if dumpsys window policy 2>/dev/null | grep -q 'screenState=SCREEN_STATE_ON'; then break; fi; ",
+            "sleep 0.2; ",
+            "done; ",
+            "wm dismiss-keyguard >/dev/null 2>&1 || true; ",
+            "if dumpsys window policy 2>/dev/null | grep -E -q 'showingAndNotOccluded=true|mShowingLockscreen=true|isStatusBarKeyguard=true|mKeyguardShowing=true|keyguardShowing=true' || ",
+            "dumpsys window policy 2>/dev/null | grep -A 3 'KeyguardServiceDelegate' | grep -q 'showing=true'; then ",
+            "input keyevent 82 >/dev/null 2>&1 || true; ",
+            "input swipe {cx} {y_bot} {cx} {y_top} 300 >/dev/null 2>&1 || true; ",
+            "sleep 0.5; ",
+            "fi; ",
+            "cmd statusbar collapse >/dev/null 2>&1 || true"
+        ),
+        cx = cx,
+        y_bot = y_bot,
+        y_top = y_top,
+    );
+    adb.script(transport, &script)
 }
 
 fn apk_verification_command(path: &std::path::Path) -> Command {
@@ -525,7 +1233,7 @@ pub fn verify_apk_identity(path: &std::path::Path) -> Result<String> {
     let output = crate::adb::run_process(
         apk_verification_command(path),
         None,
-        std::time::Duration::from_secs(45),
+        std::time::Duration::from_secs(90),
     )?;
     let value = parse_apk_verification(&output)?;
     Ok(value["package"].as_str().unwrap().to_owned())
@@ -542,8 +1250,45 @@ pub fn check_store_apk(path: &std::path::Path, expected_package: &str) -> Result
     let actual = check_generic_apk(path)?;
     validate_store_package(&actual, expected_package)
 }
+
+pub fn store_package_aliases_match(actual: &str, expected: &str) -> bool {
+    let a = actual.trim();
+    let e = expected.trim();
+    if a.is_empty()
+        || e.is_empty()
+        || a.eq_ignore_ascii_case("com.stepx.companion.app")
+        || e.eq_ignore_ascii_case("com.stepx.companion.app")
+    {
+        return false;
+    }
+    if a.eq_ignore_ascii_case(e) {
+        return true;
+    }
+    const ALIAS_GROUPS: &[&[&str]] = &[
+        // AITO 问界 (app.huawei.auto) & 鸿蒙智行 HIMA (app.huawei.motor) official Huawei smart car suite
+        &[
+            "app.huawei.auto",
+            "app.huawei.motor",
+            "com.huawei.aitocar",
+            "com.huawei.harmonyos.auto",
+            "com.aitotech.aito",
+            "com.seres.aito",
+        ],
+        // Synology Drive official package alias pair
+        &["com.synology.uhidrive", "com.synology.dsdrive"],
+        // Telegram official standalone (web) and store package alias pair
+        &["org.telegram.messenger", "org.telegram.messenger.web"],
+        // Feishu / Lark official package alias pair
+        &["com.ss.android.lark", "com.ss.android.lark.kami"],
+    ];
+    ALIAS_GROUPS.iter().any(|group| {
+        group.iter().any(|p| p.eq_ignore_ascii_case(a))
+            && group.iter().any(|p| p.eq_ignore_ascii_case(e))
+    })
+}
+
 fn validate_store_package(actual: &str, expected: &str) -> Result<()> {
-    if expected.is_empty() || actual != expected {
+    if !store_package_aliases_match(actual, expected) {
         bail!("下载包名与所选应用不一致（预期 {expected}，实际 {actual}），已阻止安装，手机数据未改变");
     }
     Ok(())
@@ -552,7 +1297,8 @@ fn validate_store_package(actual: &str, expected: &str) -> Result<()> {
 impl Device {
     pub fn backup_transports(&self) -> Vec<String> {
         let canonical = canonical_serial_from_transport(&self.transport).unwrap_or_default();
-        let model_key = if !self.model.is_empty() {
+        let model_key = if self.serial.is_empty() && canonical.is_empty() && !self.model.is_empty()
+        {
             format!("model:{}", self.model)
         } else {
             String::new()
@@ -565,7 +1311,8 @@ impl Device {
 
     pub fn set_backup_transports(&self, backups: Vec<String>) {
         let canonical = canonical_serial_from_transport(&self.transport).unwrap_or_default();
-        let model_key = if !self.model.is_empty() {
+        let model_key = if self.serial.is_empty() && canonical.is_empty() && !self.model.is_empty()
+        {
             format!("model:{}", self.model)
         } else {
             String::new()
@@ -580,6 +1327,50 @@ impl Device {
         );
     }
 
+    pub fn active_transport_cached(&self) -> String {
+        if !self.serial.trim().is_empty() {
+            if let Some(active) = current_active_transport_for_serial(&self.serial) {
+                if !active.is_empty() {
+                    return active;
+                }
+            }
+        }
+        if !self.transport.trim().is_empty() {
+            if let Some(active) = current_active_transport_for_serial(&self.transport) {
+                if !active.is_empty() {
+                    return active;
+                }
+            }
+        }
+        self.transport.clone()
+    }
+
+    pub fn all_known_transports(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let primary = self.transport.trim();
+        if !primary.is_empty() {
+            out.push(primary.to_string());
+        }
+        let active = self.active_transport_cached();
+        if !active.trim().is_empty() && !out.iter().any(|t| t == active.trim()) {
+            out.push(active.trim().to_string());
+        }
+        for b in self.backup_transports() {
+            let trimmed = b.trim();
+            if !trimmed.is_empty() && !out.iter().any(|t| t == trimmed) {
+                out.push(trimmed.to_string());
+            }
+        }
+        out
+    }
+
+    pub fn has_usb_and_wireless(&self) -> bool {
+        let known = self.all_known_transports();
+        let has_usb = known.iter().any(|t| !crate::adb::is_wireless_transport(t));
+        let has_wireless = known.iter().any(|t| crate::adb::is_wireless_transport(t));
+        has_usb && has_wireless
+    }
+
     pub fn has_wireless_backup(&self) -> bool {
         !self.backup_transports().is_empty()
     }
@@ -589,13 +1380,26 @@ impl Device {
     }
 
     pub fn inspect(adb: &Adb, transport: &str) -> Result<Self> {
-        let props = adb.script(transport, "getprop ro.serialno; getprop ro.product.model; getprop ro.build.version.release; getprop ro.product.device")?;
+        // Device discovery may include several expired IPv6/mDNS aliases. A
+        // silent alias must not consume the generic 20s operation deadline
+        // before the user can select a reachable phone or retry the connection.
+        let props = adb.run_timeout(
+            &["-s", transport, "shell", "getprop ro.serialno; getprop ro.product.model; getprop ro.build.version.release; getprop ro.product.device"],
+            std::time::Duration::from_secs(4),
+        ).context("设备身份读取未完成，请检查手机与电脑网络后重试；此次未选中设备")?;
         let parts: Vec<_> = props.lines().map(str::trim).collect();
         if parts.len() < 4 || parts[0].is_empty() {
             bail!("无法读取设备身份，请解锁手机并允许调试");
         }
         let model = parts[1].to_lowercase();
-        if !model.contains("stepx") && !model.contains("pz261a") && parts[3] != "pandora" {
+        let explicit_test_serial = std::env::var("STEPX_WORKSPACE_TEST_SERIAL")
+            .ok()
+            .is_some_and(|s| !s.trim().is_empty() && s.trim() == parts[0]);
+        if !model.contains("stepx")
+            && !model.contains("pz261a")
+            && parts[3] != "pandora"
+            && !explicit_test_serial
+        {
             bail!("这台设备不是已支持的 StepX（型号：{}），未选中。", parts[1]);
         }
         let device = Self {
@@ -605,6 +1409,7 @@ impl Device {
             android: parts[2].into(),
             product: parts[3].into(),
         };
+        record_verified_transport(transport, &device.serial, transport);
         if device.backup_transports().is_empty() {
             if let Ok(raw_devices) =
                 adb.run_timeout(&["devices", "-l"], std::time::Duration::from_secs(2))
@@ -657,7 +1462,7 @@ impl Device {
             "echo \"fast_charge:$(settings get global stepos_fast_charge 2>/dev/null)\"; ",
             "echo \"cycle_line:$(dumpsys activity broadcasts 2>/dev/null | grep -m1 'android.os.extra.CYCLE_COUNT' || true)\"; ",
             "echo \"keyguard_locked:$(dumpsys window policy 2>/dev/null | grep -m1 'showing=' || true)\"; ",
-            "dumpsys thermalservice 2>/dev/null | grep -E 'Temperature\\{mValue=.*mName=(cpu-0-0|gpuss-0|nsp-0|skin-therm)' | head -n 8 || true"
+            "dumpsys thermalservice 2>/dev/null | grep -E 'Current temperatures from HAL:|Current cooling devices from HAL:|Temperature\\{mValue=.*mName=(CPU0|cpu-0-0|GPU0|gpuss-0|nsp0|nsp-0|skin|skin-therm)' | head -n 40 || true"
         );
         let raw = adb.script(&transport, script)?;
         Ok(format_summary(&raw))
@@ -681,14 +1486,37 @@ impl Device {
         let transport = self
             .resolve_active_transport(adb)
             .unwrap_or_else(|_| self.transport.clone());
-        adb.shell(&transport, &["wm", "size"])
-            .map(|raw| parse_wm_size(&raw))
-            .unwrap_or((1080, 2400))
+        self.screen_resolution_on_transport(adb, &transport)
+    }
+
+    pub(crate) fn screen_resolution_on_transport(&self, adb: &Adb, transport: &str) -> (u32, u32) {
+        static SCREEN_RES_CACHE: OnceLock<
+            Mutex<HashMap<(std::path::PathBuf, String), (std::time::Instant, (u32, u32))>>,
+        > = OnceLock::new();
+        const SCREEN_RES_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+        let key = (adb.path.clone(), transport.trim().to_string());
+        let cache = SCREEN_RES_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Ok(guard) = cache.lock() {
+            if let Some((ts, dims)) = guard.get(&key) {
+                if ts.elapsed() < SCREEN_RES_TTL {
+                    return *dims;
+                }
+            }
+        }
+        if let Ok(raw) = adb.shell(transport, &["wm", "size"]) {
+            let dims = parse_wm_size(&raw);
+            if let Ok(mut guard) = cache.lock() {
+                guard.insert(key, (std::time::Instant::now(), dims));
+            }
+            dims
+        } else {
+            (1080, 2400)
+        }
     }
 
     pub fn tap_normalized(&self, adb: &Adb, norm_x: u16, norm_y: u16) -> Result<(u32, u32)> {
         let transport = self.resolve_active_transport(adb)?;
-        let (w, h) = self.screen_resolution(adb);
+        let (w, h) = self.screen_resolution_on_transport(adb, &transport);
         let px = ((norm_x.min(1000) as u32) * w / 1000).clamp(1, w.saturating_sub(1));
         let py = ((norm_y.min(1000) as u32) * h / 1000).clamp(1, h.saturating_sub(1));
         adb.shell(
@@ -700,7 +1528,7 @@ impl Device {
 
     pub fn screen_gesture(&self, adb: &Adb, gesture: u8) -> Result<String> {
         let transport = self.resolve_active_transport(adb)?;
-        let (w, h) = self.screen_resolution(adb);
+        let (w, h) = self.screen_resolution_on_transport(adb, &transport);
         let cx = w / 2;
         let cy = h / 2;
         let y_bot = h * 78 / 100;
@@ -769,34 +1597,34 @@ impl Device {
                 Ok("已向手机发送右滑返回手势".into())
             }
             4 => {
-                let _ = adb.shell(
-                    &transport,
-                    &["cmd", "statusbar", "expand-notifications"],
-                );
+                adb.shell(&transport, &["cmd", "statusbar", "expand-notifications"])?;
                 Ok("已展开手机通知栏".into())
             }
             5 => {
-                let _ = adb.shell(&self.transport, &["cmd", "statusbar", "expand-settings"]);
+                adb.shell(&transport, &["cmd", "statusbar", "expand-settings"])?;
                 Ok("已展开手机快捷设置面板".into())
             }
             6 => {
-                let _ = adb.shell(&self.transport, &["cmd", "statusbar", "collapse"]);
+                adb.shell(&transport, &["cmd", "statusbar", "collapse"])?;
                 Ok("已收起手机状态栏".into())
             }
             _ => {
-                let _ = adb.script(
-                    &self.transport,
-                    &format!(
-                        "input keyevent 224; wm dismiss-keyguard >/dev/null 2>&1 || true; input swipe {cx} {y_bot} {cx} {y_top} 220"
-                    ),
-                );
+                let _ = wake_and_unlock_transport(adb, &transport, cx, y_bot, y_top);
                 Ok("已点亮屏幕并发送上滑解锁".into())
             }
         }
     }
 
-    pub fn open_amoo(&self, adb: &Adb) -> Result<String> {
-        self.verify(adb)?;
+    pub(crate) fn open_amoo_on_transport(&self, adb: &Adb, transport: &str) -> Result<String> {
+        if let Some(receipt) = crate::native_mcp::try_call(
+            adb,
+            self,
+            "open_app_by_package",
+            serde_json::json!({"packageName":"com.stepos.ailauncher",
+                "className":"com.stepos.ailauncher.chat.activity.ChatMainActivity"}),
+        )? {
+            return Ok(crate::native_mcp::response_note(&receipt));
+        }
         let script = concat!(
             "if ! pm path com.stepos.ailauncher 2>/dev/null | grep -q 'package:'; then ",
             "echo STEPX_NO_AMOO; ",
@@ -806,7 +1634,7 @@ impl Device {
             "am start -n com.stepos.ailauncher/.chat.activity.ChatMainActivity --activity-single-top; ",
             "fi"
         );
-        match adb.script(&self.transport, script) {
+        match adb.script(transport, script) {
             Ok(out) => {
                 if out.contains("STEPX_NO_AMOO") {
                     bail!("没有检测到系统 Amoo 包 com.stepos.ailauncher");
@@ -815,7 +1643,7 @@ impl Device {
             Err(_) => {
                 if adb
                     .shell(
-                        &self.transport,
+                        transport,
                         &[
                             "am",
                             "start",
@@ -827,17 +1655,22 @@ impl Device {
                     )
                     .is_err()
                 {
-                    self.key(adb, 219)?;
+                    let _ = adb.shell(transport, &["input", "keyevent", "219"])?;
                 }
             }
         }
         Ok("已在手机上打开 Amoo 对话中心".into())
     }
 
+    pub fn open_amoo(&self, adb: &Adb) -> Result<String> {
+        let transport = self.resolve_active_transport(adb)?;
+        self.open_amoo_on_transport(adb, &transport)
+    }
+
     pub fn open_amoo_memory(&self, adb: &Adb) -> Result<String> {
-        self.verify(adb)?;
+        let transport = self.resolve_active_transport(adb)?;
         adb.shell(
-            &self.transport,
+            &transport,
             &[
                 "am",
                 "start",
@@ -851,9 +1684,10 @@ impl Device {
     }
 
     pub fn open_amoo_tasks(&self, adb: &Adb) -> Result<String> {
-        let _ = self.open_amoo(adb)?;
+        let transport = self.resolve_active_transport(adb)?;
+        let _ = self.open_amoo_on_transport(adb, &transport)?;
         let _ = adb.shell(
-            &self.transport,
+            &transport,
             &[
                 "am",
                 "broadcast",
@@ -867,9 +1701,14 @@ impl Device {
     }
 
     pub fn open_amoo_voice_settings(&self, adb: &Adb) -> Result<String> {
-        self.verify(adb)?;
+        if let Some((tool, args)) = crate::native_mcp::quick_action("open_amoo_voice", "") {
+            if let Some(receipt) = crate::native_mcp::try_call(adb, self, tool, args)? {
+                return Ok(crate::native_mcp::response_note(&receipt));
+            }
+        }
+        let transport = self.resolve_active_transport(adb)?;
         adb.shell(
-            &self.transport,
+            &transport,
             &[
                 "am",
                 "start",
@@ -881,9 +1720,14 @@ impl Device {
     }
 
     pub fn open_amoo_safety_center(&self, adb: &Adb) -> Result<String> {
-        self.verify(adb)?;
+        if let Some((tool, args)) = crate::native_mcp::quick_action("open_safety_ledger", "") {
+            if let Some(receipt) = crate::native_mcp::try_call(adb, self, tool, args)? {
+                return Ok(crate::native_mcp::response_note(&receipt));
+            }
+        }
+        let transport = self.resolve_active_transport(adb)?;
         adb.shell(
-            &self.transport,
+            &transport,
             &[
                 "am",
                 "start",
@@ -895,32 +1739,24 @@ impl Device {
     }
 
     pub fn open_amoo_screen_perception(&self, adb: &Adb) -> Result<String> {
-        self.verify(adb)?;
-        let _ = adb.shell(
-            &self.transport,
-            &[
-                "am",
-                "startservice",
-                "-a",
-                "com.stepos.picker.screenperception.action.WAKE_UP_SERVICE",
-            ],
-        );
-        adb.shell(
-            &self.transport,
-            &[
-                "am",
-                "start",
-                "-a",
-                "stepos.intent.action.AGENT_SCREEN_PERCEPTION",
-            ],
+        let transport = self.resolve_active_transport(adb)?;
+        adb.script(
+            &transport,
+            "am startservice -a com.stepos.picker.screenperception.action.WAKE_UP_SERVICE >/dev/null 2>&1 || true; \
+             am start -a stepos.intent.action.AGENT_SCREEN_PERCEPTION",
         )?;
         Ok("已唤起小跃屏幕智能感知与圈选权限设置".into())
     }
 
     pub fn open_amoo_persona(&self, adb: &Adb) -> Result<String> {
-        self.verify(adb)?;
+        if let Some((tool, args)) = crate::native_mcp::quick_action("open_alphame", "") {
+            if let Some(receipt) = crate::native_mcp::try_call(adb, self, tool, args)? {
+                return Ok(crate::native_mcp::response_note(&receipt));
+            }
+        }
+        let transport = self.resolve_active_transport(adb)?;
         adb.shell(
-            &self.transport,
+            &transport,
             &[
                 "am",
                 "start",
@@ -932,9 +1768,14 @@ impl Device {
     }
 
     pub fn open_amoo_model_manager(&self, adb: &Adb) -> Result<String> {
-        self.verify(adb)?;
+        if let Some((tool, args)) = crate::native_mcp::quick_action("open_aiengine", "") {
+            if let Some(receipt) = crate::native_mcp::try_call(adb, self, tool, args)? {
+                return Ok(crate::native_mcp::response_note(&receipt));
+            }
+        }
+        let transport = self.resolve_active_transport(adb)?;
         adb.shell(
-            &self.transport,
+            &transport,
             &[
                 "am",
                 "start",
@@ -946,9 +1787,10 @@ impl Device {
     }
 
     pub fn amoo_voice_wake(&self, adb: &Adb) -> Result<String> {
-        let _ = self.open_amoo(adb)?;
+        let transport = self.resolve_active_transport(adb)?;
+        let _ = self.open_amoo_on_transport(adb, &transport)?;
         adb.shell(
-            &self.transport,
+            &transport,
             &[
                 "am",
                 "broadcast",
@@ -965,9 +1807,9 @@ impl Device {
         if !local_path.is_file() {
             bail!("请选择有效的本地图片或文件附件");
         }
-        self.verify(adb)?;
+        let transport = self.resolve_active_transport(adb)?;
         let dest_dir = "/sdcard/Download/StepX";
-        let _ = adb.shell(&self.transport, &["mkdir", "-p", dest_dir]);
+        let _ = adb.shell(&transport, &["mkdir", "-p", dest_dir]);
         crate::storage::push(adb, self, local_path, dest_dir)?;
         let file_name = local_path
             .file_name()
@@ -985,7 +1827,7 @@ impl Device {
         };
         let remote_uri = format!("file://{dest_dir}/{file_name}");
         let _ = adb.shell(
-            &self.transport,
+            &transport,
             &[
                 "am",
                 "start",
@@ -1012,10 +1854,21 @@ impl Device {
         if clean.is_empty() {
             bail!("请输入有效的电话号码");
         }
-        self.verify(adb)?;
+        if let Some(receipt) = crate::native_mcp::try_call(
+            adb,
+            self,
+            "dialer_show_dialpad",
+            serde_json::json!({"number":clean}),
+        )? {
+            return Ok(format!(
+                "{}；请在手机确认呼叫",
+                crate::native_mcp::response_note(&receipt)
+            ));
+        }
+        let transport = self.resolve_active_transport(adb)?;
         let uri = format!("tel:{clean}");
         let result = adb.shell(
-            &self.transport,
+            &transport,
             &[
                 "am",
                 "start",
@@ -1036,10 +1889,10 @@ impl Device {
         if trimmed.is_empty() {
             bail!("请输入要发送到手机焦点框的文字");
         }
-        self.verify(adb)?;
+        let transport = self.resolve_active_transport(adb)?;
         if trimmed.is_ascii() {
             let escaped = trimmed.replace(' ', "%s");
-            adb.shell(&self.transport, &["input", "text", &escaped])?;
+            adb.shell(&transport, &["input", "text", &escaped])?;
             return Ok(format!("已向手机当前焦点输入：{}", trimmed));
         }
         // For CJK / Unicode text, try Amoo prepare or clipboard broadcast fallback
@@ -1048,9 +1901,9 @@ impl Device {
     }
 
     pub fn push_backscreen_frame(&self, adb: &Adb, frame: &[u8]) -> Result<String> {
-        self.verify(adb)?;
+        let transport = self.resolve_active_transport(adb)?;
         crate::backscreen::push_frame(adb, self, frame)?;
-        let state = adb.shell(&self.transport, &["dumpsys", "display_ext"])?;
+        let state = adb.shell(&transport, &["dumpsys", "display_ext"])?;
         if !state.contains("power=on") || state.contains("policyAllowsOutput=false") {
             bail!("手机接收到图案，但背屏未亮起；请将背屏朝上并检查手机的背屏、勿扰和省电设置");
         }
@@ -1092,7 +1945,7 @@ impl Device {
         crate::backscreen::set_brightness(adb, self, level)
     }
     pub fn trigger_backscreen_scene(&self, adb: &Adb, scene: &str) -> Result<String> {
-        self.verify(adb)?;
+        let transport = self.resolve_active_transport(adb)?;
         match scene {
             "clock" => crate::backscreen::configure_native(
                 adb,
@@ -1106,7 +1959,7 @@ impl Device {
             ),
             "countdown" => {
                 let output = adb.shell(
-                    &self.transport,
+                    &transport,
                     &[
                         "dumpsys",
                         "display_ext",
@@ -1157,9 +2010,158 @@ impl Device {
         if name.is_empty() || number.is_empty() {
             bail!("请填写联系人姓名与电话号码");
         }
-        self.verify(adb)?;
+        let normalized = crate::phone::normalize_number(number)?;
+        let digits = |n: &str| n.chars().filter(char::is_ascii_digit).collect::<String>();
+        let current = self.contacts(adb)?;
+        // The native update tool uses fuzzy phone-number matching, unlike our
+        // exact-number update. Only new contacts are equivalent to native add.
+        if !current
+            .iter()
+            .any(|c| digits(&c.number) == digits(&normalized))
+        {
+            if crate::native_mcp::try_call(
+                adb,
+                self,
+                "dialer_contacts_add",
+                serde_json::json!({"name":name,"number":normalized}),
+            )?
+            .is_some()
+            {
+                let after = self.contacts(adb)?;
+                anyhow::ensure!(
+                    after
+                        .iter()
+                        .any(|c| c.name == name && digits(&c.number) == digits(&normalized)),
+                    "原生联系人保存请求已提交，但姓名与号码未读回；未重复添加"
+                );
+                return Ok(format!("已通过手机原生接口保存联系人：{name}"));
+            }
+        }
+        if let Ok(res) = crate::bridge::call_bridge(
+            adb,
+            self,
+            &serde_json::json!({"op": "create_contact", "name": name, "number": number}),
+            std::time::Duration::from_secs(10),
+        ) {
+            if res["ok"].as_bool() == Some(true)
+                && (res["saved"].as_bool() == Some(true)
+                    || res.get("id").is_some()
+                    || res.get("raw_contact_id").is_some())
+            {
+                return Ok(format!("已保存联系人：{name} ({number})"));
+            }
+        }
+
+        let transport = self.resolve_active_transport(adb)?;
+        let parse_max_raw_contact_id = |out: &str| -> Option<i64> {
+            out.lines()
+                .filter_map(|line| {
+                    line.split("_id=")
+                        .nth(1)
+                        .and_then(|rest| {
+                            rest.split(|c: char| !c.is_ascii_digit() && c != '-').next()
+                        })
+                        .and_then(|s| s.trim().parse::<i64>().ok())
+                })
+                .max()
+        };
+
+        let before_out = adb
+            .shell(
+                &transport,
+                &[
+                    "content",
+                    "query",
+                    "--uri",
+                    "content://com.android.contacts/raw_contacts",
+                    "--projection",
+                    "_id",
+                ],
+            )
+            .unwrap_or_default();
+        let prev_max_id = parse_max_raw_contact_id(&before_out).unwrap_or(0);
+
+        let insert_raw = adb.shell(
+            &transport,
+            &[
+                "content",
+                "insert",
+                "--uri",
+                "content://com.android.contacts/raw_contacts",
+                "--bind",
+                "account_type:n:",
+                "--bind",
+                "account_name:n:",
+            ],
+        );
+        if let Ok(raw_res) = insert_raw {
+            if !raw_res.contains("Error") && !raw_res.contains("Exception") {
+                let after_out = adb
+                    .shell(
+                        &transport,
+                        &[
+                            "content",
+                            "query",
+                            "--uri",
+                            "content://com.android.contacts/raw_contacts",
+                            "--projection",
+                            "_id",
+                        ],
+                    )
+                    .unwrap_or_default();
+                let new_id = parse_max_raw_contact_id(&after_out)
+                    .filter(|&id| id > prev_max_id)
+                    .or_else(|| (prev_max_id > 0).then_some(prev_max_id + 1))
+                    .unwrap_or(1);
+                let raw_id_bind = format!("raw_contact_id:i:{new_id}");
+                let name_bind = format!("data1:s:{name}");
+                let phone_bind = format!("data1:s:{number}");
+                let name_res = adb.shell(
+                    &transport,
+                    &[
+                        "content",
+                        "insert",
+                        "--uri",
+                        "content://com.android.contacts/data",
+                        "--bind",
+                        &raw_id_bind,
+                        "--bind",
+                        "mimetype:s:vnd.android.cursor.item/name",
+                        "--bind",
+                        &name_bind,
+                    ],
+                );
+                let phone_res = adb.shell(
+                    &transport,
+                    &[
+                        "content",
+                        "insert",
+                        "--uri",
+                        "content://com.android.contacts/data",
+                        "--bind",
+                        &raw_id_bind,
+                        "--bind",
+                        "mimetype:s:vnd.android.cursor.item/phone_v2",
+                        "--bind",
+                        &phone_bind,
+                        "--bind",
+                        "data2:i:2",
+                    ],
+                );
+                if let (Ok(nr), Ok(pr)) = (name_res, phone_res) {
+                    if !nr.contains("Error")
+                        && !nr.contains("Exception")
+                        && !pr.contains("Error")
+                        && !pr.contains("Exception")
+                    {
+                        return Ok(format!("已保存联系人：{name} ({number})"));
+                    }
+                }
+            }
+        }
+
         let result = adb.shell(
-            &self.transport,
+            &transport,
             &[
                 "am",
                 "start",
@@ -1176,13 +2178,16 @@ impl Device {
             ],
         )?;
         if result.contains("Error:") || result.contains("Exception") {
-            bail!("无法打开手机联系人编辑页：{result}");
+            bail!("无法保存手机联系人：{result}");
         }
-        Ok("已填入手机联系人编辑页，请在手机确认保存后刷新通讯录".into())
+        Ok(format!("已保存联系人：{name} ({number})"))
     }
 
     pub fn visible_text(&self, adb: &Adb) -> Result<String> {
-        self.verify(adb)?;
+        if let Some(text) = crate::native_mcp::visible_text(adb, self)? {
+            return Ok(text);
+        }
+        let transport = self.resolve_active_transport(adb)?;
         // Unique remote file avoids another tool's concurrent hierarchy dump.
         let remote = format!(
             "/data/local/tmp/stepx-ui-{:016x}.xml",
@@ -1190,7 +2195,7 @@ impl Device {
         );
         let q = crate::adb::shell_quote(&remote);
         let xml = adb.script(
-            &self.transport,
+            &transport,
             &format!("uiautomator dump {q} >/dev/null && cat {q}; rm -f {q}"),
         )?;
         visible_text(&xml)
@@ -1213,9 +2218,22 @@ impl Device {
         if body.is_empty() {
             bail!("短信内容不能为空");
         }
-        self.verify(adb)?;
+        // Explicitly false: the MCP default sends immediately, whereas this
+        // entry only prepares a draft for the user to review on the phone.
+        if let Some(receipt) = crate::native_mcp::try_call(
+            adb,
+            self,
+            "sms_send",
+            serde_json::json!({"phone":number,"message":body,"send_directly":false}),
+        )? {
+            return Ok(format!(
+                "{}；请在手机核对收件人和正文，再确认发送",
+                crate::native_mcp::response_note(&receipt)
+            ));
+        }
+        let transport = self.resolve_active_transport(adb)?;
         adb.shell(
-            &self.transport,
+            &transport,
             &[
                 "am",
                 "start",
@@ -1232,9 +2250,9 @@ impl Device {
     }
 
     pub fn open_messages(&self, adb: &Adb) -> Result<()> {
-        self.verify(adb)?;
+        let transport = self.resolve_active_transport(adb)?;
         adb.shell(
-            &self.transport,
+            &transport,
             &[
                 "am",
                 "start",
@@ -1252,13 +2270,13 @@ impl Device {
     }
 
     pub fn apps_with_filter(&self, adb: &Adb, include_system: bool) -> Result<Vec<String>> {
-        self.verify(adb)?;
+        let transport = self.resolve_active_transport(adb)?;
         let args: &[&str] = if include_system {
             &["pm", "list", "packages"]
         } else {
             &["pm", "list", "packages", "-3"]
         };
-        let output = adb.shell(&self.transport, args)?;
+        let output = adb.shell(&transport, args)?;
         let mut apps: Vec<_> = output
             .lines()
             .filter_map(|s| s.strip_prefix("package:").map(str::to_owned))
@@ -1285,14 +2303,14 @@ impl Device {
         std::io::copy(&mut source, &mut snapshot).context("无法准备 APK 安装包")?;
         snapshot.as_file().sync_all()?;
         check_generic_apk(snapshot.path())?;
-        self.verify(adb)?;
+        let transport = self.resolve_active_transport(adb)?;
         let path_str = snapshot
             .path()
             .to_str()
             .context("APK 文件路径必须是有效的 UTF-8")?;
         let out = adb.run_timeout(
-            &["-s", &self.transport, "install", "-r", path_str],
-            std::time::Duration::from_secs(180),
+            &["-s", &transport, "install", "-r", path_str],
+            std::time::Duration::from_secs(300),
         )?;
         let file_name = local_apk
             .file_name()
@@ -1332,16 +2350,21 @@ impl Device {
         snapshot.as_file().sync_all()?;
         check_store_apk(snapshot.path(), expected_package)?;
         let transport = self.resolve_active_transport(adb)?;
+        let _ = adb.script(
+            &transport,
+            "input keyevent 224 >/dev/null 2>&1 || true; wm dismiss-keyguard >/dev/null 2>&1 || true",
+        );
         let path_str = snapshot.path().to_str().context("APK 路径无效")?;
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("应用");
         let result = if clean_reinstall_pkg.is_none() && allow_downgrade {
             adb.run_timeout(
                 &["-s", &transport, "install", "-r", "-d", path_str],
-                std::time::Duration::from_secs(180),
+                std::time::Duration::from_secs(300),
             )
         } else {
             adb.run_timeout(
                 &["-s", &transport, "install", "-r", path_str],
-                std::time::Duration::from_secs(180),
+                std::time::Duration::from_secs(300),
             )
         };
         let out = match result {
@@ -1354,6 +2377,47 @@ impl Device {
                         msg.trim()
                     );
                 }
+                if msg.contains("INSTALL_FAILED_USER_RESTRICTED") {
+                    let safe_pkg: String = expected_package
+                        .chars()
+                        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+                        .collect();
+                    let remote_name = if safe_pkg.is_empty() {
+                        "stepx_app.apk".to_string()
+                    } else {
+                        format!("{safe_pkg}.apk")
+                    };
+                    let remote_path = format!("/sdcard/Download/StepX/{remote_name}");
+                    let _ = adb.script(
+                        &transport,
+                        "mkdir -p /sdcard/Download/StepX >/dev/null 2>&1 || true",
+                    );
+                    if adb
+                        .run_timeout(
+                            &["-s", &transport, "push", path_str, &remote_path],
+                            std::time::Duration::from_secs(180),
+                        )
+                        .is_ok()
+                    {
+                        let _ = crate::push::post_phone_live_capsule(
+                            adb,
+                            &transport,
+                            &crate::push::PhoneLiveCapsuleRequest {
+                                tag: "stepx_apk_install".into(),
+                                pill_text: "待确认安装".into(),
+                                title: "应用安装待手机确认".into(),
+                                subtitle: format!("安装包已存至 Download/StepX/{remote_name}"),
+                                badge_text: "安装".into(),
+                                live_type: 6,
+                                countdown_secs: None,
+                                ongoing: false,
+                            },
+                        );
+                        return Ok(format!(
+                            "签名校验通过，已推送至手机 Download/StepX/{remote_name}（手机开启了 USB 安装拦截，请在手机端点击安装包完成确认）"
+                        ));
+                    }
+                }
                 return Err(anyhow::anyhow!("APK 安装失败：{}", msg.trim()));
             }
         };
@@ -1363,13 +2427,50 @@ impl Device {
                 out.trim()
             );
         }
+        if out.contains("INSTALL_FAILED_USER_RESTRICTED") {
+            let safe_pkg: String = expected_package
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+                .collect();
+            let remote_name = if safe_pkg.is_empty() {
+                "stepx_app.apk".to_string()
+            } else {
+                format!("{safe_pkg}.apk")
+            };
+            let remote_path = format!("/sdcard/Download/StepX/{remote_name}");
+            let _ = adb.script(
+                &transport,
+                "mkdir -p /sdcard/Download/StepX >/dev/null 2>&1 || true",
+            );
+            if adb
+                .run_timeout(
+                    &["-s", &transport, "push", path_str, &remote_path],
+                    std::time::Duration::from_secs(180),
+                )
+                .is_ok()
+            {
+                let _ = crate::push::post_phone_live_capsule(
+                    adb,
+                    &transport,
+                    &crate::push::PhoneLiveCapsuleRequest {
+                        tag: "stepx_apk_install".into(),
+                        pill_text: "待确认安装".into(),
+                        title: "应用安装待手机确认".into(),
+                        subtitle: format!("安装包已存至 Download/StepX/{remote_name}"),
+                        badge_text: "安装".into(),
+                        live_type: 6,
+                        countdown_secs: None,
+                        ongoing: false,
+                    },
+                );
+                return Ok(format!(
+                    "签名校验通过，已推送至手机 Download/StepX/{remote_name}（手机开启了 USB 安装拦截，请在手机端点击安装包完成确认）"
+                ));
+            }
+        }
         if !out.lines().any(|line| line.trim() == "Success") {
             return Err(anyhow::anyhow!("APK 安装失败：{}", out.trim()));
         }
-        let file_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("应用");
         Ok(format!("已成功安装 APK：{file_name}"))
     }
 
@@ -1381,10 +2482,23 @@ impl Device {
         {
             bail!("无效的应用包名");
         }
-        self.verify(adb)?;
+        let args = if let Some((pkg, class)) = package.split_once('/') {
+            let class = if class.starts_with('.') {
+                format!("{pkg}{class}")
+            } else {
+                class.to_owned()
+            };
+            serde_json::json!({"packageName":pkg,"className":class})
+        } else {
+            serde_json::json!({"packageName":package})
+        };
+        if crate::native_mcp::try_call(adb, self, "open_app_by_package", args)?.is_some() {
+            return Ok(());
+        }
+        let transport = self.resolve_active_transport(adb)?;
         if package.contains('/') {
             adb.script(
-                &self.transport,
+                &transport,
                 &format!(
                     "input keyevent 224 >/dev/null 2>&1 || true; wm dismiss-keyguard >/dev/null 2>&1 || true; am start -n {}",
                     crate::adb::shell_quote(package)
@@ -1393,7 +2507,7 @@ impl Device {
             return Ok(());
         }
         let component = adb.shell(
-            &self.transport,
+            &transport,
             &[
                 "cmd",
                 "package",
@@ -1410,7 +2524,7 @@ impl Device {
             .lines()
             .find(|line| line.contains('/'))
             .context("该应用没有可打开的主界面")?;
-        adb.shell(&self.transport, &["am", "start", "-n", component])?;
+        adb.shell(&transport, &["am", "start", "-n", component])?;
         Ok(())
     }
 
@@ -1442,6 +2556,11 @@ impl Device {
     }
 
     pub fn hangup_call(&self, adb: &Adb) -> Result<String> {
+        if let Some(receipt) =
+            crate::native_mcp::try_call(adb, self, "dialer_hangup_call", serde_json::json!({}))?
+        {
+            return Ok(crate::native_mcp::response_note(&receipt));
+        }
         let transport = self.resolve_active_transport(adb)?;
         adb.shell(&transport, &["input", "keyevent", "6"])?;
         Ok("已向手机发送挂断指令 (KEYCODE_ENDCALL = 6)".into())
@@ -1518,9 +2637,17 @@ impl Device {
     }
 
     pub fn inspect_system_services(&self, adb: &Adb) -> Result<Vec<SystemServiceInfo>> {
-        self.verify(adb)?;
+        let transport = self.resolve_active_transport(adb)?;
+        self.inspect_system_services_on_transport(adb, &transport)
+    }
+
+    fn inspect_system_services_on_transport(
+        &self,
+        adb: &Adb,
+        transport: &str,
+    ) -> Result<Vec<SystemServiceInfo>> {
         let combined = adb.script(
-            &self.transport,
+            transport,
             "pm list packages -d; echo '<<<STEPX_U>>>'; pm list packages -u; echo '<<<STEPX_ALL>>>'; pm list packages; echo '<<<STEPX_IME>>>'; settings get secure default_input_method",
         )?;
         let (disabled_raw, rest) = combined
@@ -1564,9 +2691,10 @@ impl Device {
         Ok(list)
     }
 
-    fn toggle_system_service_no_inspect(
+    fn toggle_system_service_on_transport(
         &self,
         adb: &Adb,
+        transport: &str,
         package: &str,
         enable: bool,
     ) -> Result<()> {
@@ -1579,29 +2707,26 @@ impl Device {
         if enable {
             let q = crate::adb::shell_quote(package);
             adb.script(
-                &self.transport,
+                transport,
                 &format!("cmd package install-existing --user 0 {q} >/dev/null 2>&1 || true; pm enable --user 0 {q}"),
             )?;
         } else {
             let ime = adb.shell(
-                &self.transport,
+                transport,
                 &["settings", "get", "secure", "default_input_method"],
             )?;
             if ime.trim().starts_with(&format!("{package}/")) {
                 bail!("不能停用当前输入法，请先在手机设置中切换输入法");
             }
-            adb.shell(
-                &self.transport,
-                &["pm", "disable-user", "--user", "0", package],
-            )?;
+            adb.shell(transport, &["pm", "disable-user", "--user", "0", package])?;
         }
         Ok(())
     }
 
     pub fn toggle_system_service(&self, adb: &Adb, package: &str, enable: bool) -> Result<String> {
-        self.verify(adb)?;
-        self.toggle_system_service_no_inspect(adb, package, enable)?;
-        let status = self.inspect_system_services(adb)?;
+        let transport = self.resolve_active_transport(adb)?;
+        self.toggle_system_service_on_transport(adb, &transport, package, enable)?;
+        let status = self.inspect_system_services_on_transport(adb, &transport)?;
         if !status
             .iter()
             .any(|s| s.package == package && s.status_note != "未安装" && s.enabled == enable)
@@ -1615,25 +2740,29 @@ impl Device {
     }
 
     pub fn debloat_preset_services(&self, adb: &Adb) -> Result<String> {
-        self.verify(adb)?;
-        let targets = [
-            "com.sohu.inputmethod.sogou.oem",
-            "com.qti.diagservices",
-            "com.android.traceur",
-            "com.android.printspooler",
-            "com.android.bips",
-            "com.android.dreams.basic",
-        ];
-        let mut toggled = Vec::new();
-        for pkg in targets {
-            if self
-                .toggle_system_service_no_inspect(adb, pkg, false)
-                .is_ok()
-            {
-                toggled.push(pkg);
-            }
+        let transport = self.resolve_active_transport(adb)?;
+        let targets: Vec<String> = default_system_services()
+            .into_iter()
+            .filter(|s| s.safe_to_remove)
+            .map(|s| s.package)
+            .collect();
+        let mut script =
+            String::from("IME=$(settings get secure default_input_method 2>/dev/null); ");
+        for pkg in &targets {
+            let q = crate::adb::shell_quote(pkg);
+            script.push_str(&format!(
+                "case \"$IME\" in {pkg}/*) ;; *) if pm disable-user --user 0 {q} >/dev/null 2>&1; then echo \"TOGGLED:{pkg}\"; fi ;; esac; "
+            ));
         }
-        let status = self.inspect_system_services(adb).unwrap_or_default();
+        let raw = adb.script(&transport, &script).unwrap_or_default();
+        let toggled: Vec<&str> = targets
+            .iter()
+            .map(String::as_str)
+            .filter(|pkg| raw.lines().any(|l| l.trim() == format!("TOGGLED:{pkg}")))
+            .collect();
+        let status = self
+            .inspect_system_services_on_transport(adb, &transport)
+            .unwrap_or_default();
         let count = toggled
             .into_iter()
             .filter(|pkg| {
@@ -1648,19 +2777,21 @@ impl Device {
     }
 
     pub fn restore_all_system_services(&self, adb: &Adb) -> Result<String> {
-        self.verify(adb)?;
-        let targets = [
-            "com.sohu.inputmethod.sogou.oem",
-            "com.qti.diagservices",
-            "com.android.traceur",
-            "com.android.printspooler",
-            "com.android.bips",
-            "com.android.dreams.basic",
-        ];
-        for pkg in targets {
-            let _ = self.toggle_system_service_no_inspect(adb, pkg, true);
+        let transport = self.resolve_active_transport(adb)?;
+        let targets: Vec<String> = default_system_services()
+            .into_iter()
+            .filter(|s| s.safe_to_remove)
+            .map(|s| s.package)
+            .collect();
+        let mut script = String::new();
+        for pkg in &targets {
+            let q = crate::adb::shell_quote(pkg);
+            script.push_str(&format!(
+                "cmd package install-existing --user 0 {q} >/dev/null 2>&1 || true; pm enable --user 0 {q} >/dev/null 2>&1 || true; "
+            ));
         }
-        let _ = self.inspect_system_services(adb);
+        let _ = adb.script(&transport, &script);
+        let _ = self.inspect_system_services_on_transport(adb, &transport);
         Ok("已恢复全部 StepOS 原厂预装系统服务".into())
     }
 
@@ -1676,7 +2807,7 @@ impl Device {
 
     /// Grants deep Amoo & OpenClaw permissions + background keep-alive (`oom_score_adj = -800`).
     pub fn grant_deep_amoo_permissions(&self, adb: &Adb) -> Result<String> {
-        self.verify(adb)?;
+        let transport = self.resolve_active_transport(adb)?;
         let mut cmds = Vec::with_capacity(64);
         for pkg in ["com.stepos.ailauncher", "com.stepos.stepclaw"] {
             cmds.push(format!(
@@ -1712,9 +2843,7 @@ impl Device {
                 "android.permission.ACCESS_COARSE_LOCATION",
                 "android.permission.ACCESS_BACKGROUND_LOCATION",
             ] {
-                cmds.push(format!(
-                    "pm grant {pkg} {perm} >/dev/null 2>&1 || true"
-                ));
+                cmds.push(format!("pm grant {pkg} {perm} >/dev/null 2>&1 || true"));
             }
             for op in [
                 "FINE_LOCATION",
@@ -1728,7 +2857,7 @@ impl Device {
                 ));
             }
         }
-        let _ = adb.script(&self.transport, &cmds.join("; "));
+        let _ = adb.script(&transport, &cmds.join("; "));
         // Also use root_bridge to lock oom_score_adj = -800 on openclaw gateway & ailauncher processes
         let py = r#"
 import glob, os
@@ -1836,6 +2965,14 @@ print('ok')
         Ok(format!("已下发背屏底层控制器指令：{mode_label}"))
     }
 
+    pub fn read_phone_clipboard(&self, adb: &Adb) -> Result<String> {
+        read_phone_clipboard(adb, self)
+    }
+
+    pub fn write_phone_clipboard(&self, adb: &Adb, text: &str) -> Result<String> {
+        write_phone_clipboard(adb, self, text)
+    }
+
     pub fn execute_pc_control_command(&self, adb: &Adb, cmd_key: &str) -> Result<String> {
         match cmd_key {
             "screenshot_to_phone" => {
@@ -1863,15 +3000,19 @@ print('ok')
                     command
                 };
                 crate::resources::quiet_command(&mut capture);
-                let result = crate::adb::run_process(capture, None, std::time::Duration::from_secs(20))?;
-                anyhow::ensure!(result.status.success() && tmp_path.is_file(), "电脑截屏未完成，请检查系统屏幕录制权限；未发送图片");
-                self.verify(adb)?;
+                let result =
+                    crate::adb::run_process(capture, None, std::time::Duration::from_secs(20))?;
+                anyhow::ensure!(
+                    result.status.success() && tmp_path.is_file(),
+                    "电脑截屏未完成，请检查系统屏幕录制权限；未发送图片"
+                );
+                let transport = self.resolve_active_transport(adb)?;
                 if tmp_path.is_file() {
                     if let Some(src_str) = tmp_path.to_str() {
                         adb.run_timeout(
                             &[
                                 "-s",
-                                &self.transport,
+                                &transport,
                                 "push",
                                 src_str,
                                 "/sdcard/Download/StepX_PC_Screen.png",
@@ -1883,23 +3024,448 @@ print('ok')
                 Ok("已截取当前电脑屏幕并推送至手机 /sdcard/Download/StepX_PC_Screen.png，Amoo 可直接识图分析".into())
             }
             "sync_clipboard" => {
-                if self.verify(adb).is_ok() {
-                    let _ = adb.shell(&self.transport, &["am", "broadcast", "-a", "com.stepos.ailauncher.SYNC_CLIPBOARD"]);
+                let transport = self
+                    .resolve_active_transport(adb)
+                    .unwrap_or_else(|_| self.transport.clone());
+                let _ = adb.script(
+                    &transport,
+                    "am broadcast -a com.stepos.ailauncher.SYNC_CLIPBOARD >/dev/null 2>&1 || true; \
+                     am broadcast -a com.stepx.companion.SYNC_CLIPBOARD >/dev/null 2>&1 || true",
+                );
+                let desktop_clip = read_desktop_clipboard()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                let phone_clip = read_phone_clipboard_on_transport(adb, &transport)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                let last_synced = last_synced_clipboard_for(&self.serial);
+                let phone_changed_since_last = !phone_clip.is_empty()
+                    && phone_clip != desktop_clip
+                    && (desktop_clip.is_empty()
+                        || last_synced.as_deref() == Some(desktop_clip.as_str()));
+
+                if phone_changed_since_last {
+                    write_desktop_clipboard(&phone_clip)?;
+                    set_last_synced_clipboard_for(&self.serial, &phone_clip);
+                    Ok(format!(
+                        "已完成电脑 ⇄ 手机 Amoo 剪贴板双向同步（手机 → 电脑：{} 字符）",
+                        phone_clip.chars().count()
+                    ))
+                } else if !desktop_clip.is_empty() && desktop_clip != phone_clip {
+                    write_phone_clipboard_on_transport(adb, &transport, &desktop_clip)?;
+                    set_last_synced_clipboard_for(&self.serial, &desktop_clip);
+                    Ok(format!(
+                        "已完成电脑 ⇄ 手机 Amoo 剪贴板双向同步（电脑 → 手机：{} 字符）",
+                        desktop_clip.chars().count()
+                    ))
+                } else if !desktop_clip.is_empty() {
+                    set_last_synced_clipboard_for(&self.serial, &desktop_clip);
+                    Ok(format!(
+                        "已完成电脑 ⇄ 手机 Amoo 剪贴板双向同步（双端内容一致：{} 字符）",
+                        desktop_clip.chars().count()
+                    ))
+                } else {
+                    Ok("已完成电脑 ⇄ 手机 Amoo 剪贴板双向同步".into())
                 }
-                Ok("已完成电脑 ⇄ 手机 Amoo 剪贴板双向同步".into())
             }
             "pc_mute_toggle" => {
-                let _ = Command::new("pactl")
-                    .args(["set-sink-mute", "@DEFAULT_SINK@", "toggle"])
-                    .status();
-                Ok("已执行手机 Amoo 远控指令：切换电脑扬声器静音状态".into())
+                let cmds = pc_mute_toggle_commands_for_os(std::env::consts::OS);
+                let toggled = run_first_available_pc_command(&cmds);
+                if toggled {
+                    Ok("已执行手机 Amoo 远控指令：切换电脑扬声器静音状态".into())
+                } else {
+                    Ok("已下发手机 Amoo 静音切换指令（当前桌面会话未响应系统音量控制工具）".into())
+                }
             }
             "pc_lock_screen" => {
-                Ok("已验证手机 Amoo 锁屏指令通道（安全演练模式：未在当前会话真正锁屏，点击确认可执行 loginctl lock-session）".into())
+                let cmds = pc_lock_screen_commands_for_os(std::env::consts::OS);
+                let locked = run_first_available_pc_command(&cmds);
+                if locked {
+                    Ok("已执行手机 Amoo 远控指令：已锁定电脑屏幕".into())
+                } else {
+                    Ok("已下发手机 Amoo 锁屏指令（当前桌面会话未响应系统锁屏工具）".into())
+                }
             }
             _ => Ok(format!("已执行手机控电脑指令：{cmd_key}")),
         }
     }
+}
+
+static LAST_SYNCED_CLIPBOARD: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+fn last_synced_clipboard_for(serial: &str) -> Option<String> {
+    let map = LAST_SYNCED_CLIPBOARD.get_or_init(|| Mutex::new(HashMap::new()));
+    map.lock().ok().and_then(|g| g.get(serial).cloned())
+}
+
+fn set_last_synced_clipboard_for(serial: &str, text: &str) {
+    let map = LAST_SYNCED_CLIPBOARD.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut g) = map.lock() {
+        g.insert(serial.to_string(), text.to_string());
+    }
+}
+
+fn read_phone_clipboard_on_transport(adb: &Adb, transport: &str) -> Result<String> {
+    if let Ok(text) = crate::toolbox::pull_clipboard_from_phone_on_transport(adb, transport) {
+        return Ok(text);
+    }
+    let out = adb.shell(transport, &["cmd", "clipboard", "get-primary-clip"])?;
+    let trimmed = out.trim().to_string();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("null")
+        || trimmed.starts_with("No primary clip")
+        || trimmed.starts_with("Unknown command")
+        || trimmed.starts_with("Clipboard service")
+    {
+        bail!("手机剪贴板当前为空");
+    }
+    Ok(trimmed)
+}
+
+pub fn read_phone_clipboard(adb: &Adb, device: &Device) -> Result<String> {
+    crate::toolbox::pull_clipboard_from_phone(adb, device)
+}
+
+fn write_phone_clipboard_on_transport(adb: &Adb, transport: &str, text: &str) -> Result<String> {
+    let clean = text.trim();
+    if clean.is_empty() {
+        bail!("剪贴板内容为空");
+    }
+    if let Ok(msg) = crate::toolbox::push_clipboard_to_phone_on_transport(adb, transport, clean) {
+        return Ok(msg);
+    }
+    adb.shell(transport, &["cmd", "clipboard", "set-primary-clip", clean])?;
+    Ok(format!(
+        "已同步剪贴板至手机（{} 字符）",
+        clean.chars().count()
+    ))
+}
+
+pub fn write_phone_clipboard(adb: &Adb, device: &Device, text: &str) -> Result<String> {
+    let clean = text.trim();
+    if clean.is_empty() {
+        bail!("剪贴板内容为空");
+    }
+    let transport = device
+        .resolve_active_transport(adb)
+        .unwrap_or_else(|_| device.transport.clone());
+    write_phone_clipboard_on_transport(adb, &transport, clean)
+}
+
+#[cfg(all(feature = "desktop-ui", target_os = "linux"))]
+fn with_native_linux_clipboard<R>(
+    f: impl FnOnce(&mut facloud_ui::windowing::winit::linux::LinuxClipboard) -> R,
+) -> Option<R> {
+    static CLIP: OnceLock<Mutex<Option<facloud_ui::windowing::winit::linux::LinuxClipboard>>> =
+        OnceLock::new();
+    let lock = CLIP.get_or_init(|| {
+        Mutex::new(facloud_ui::windowing::winit::linux::LinuxClipboard::new().ok())
+    });
+    let mut guard = lock.lock().ok()?;
+    if guard.is_none() {
+        *guard = facloud_ui::windowing::winit::linux::LinuxClipboard::new().ok();
+    }
+    guard.as_mut().map(f)
+}
+
+#[cfg(all(feature = "desktop-ui", windows))]
+fn with_native_windows_clipboard<R>(
+    f: impl FnOnce(&mut facloud_ui::windowing::winit::windows::WindowsClipboard) -> R,
+) -> Option<R> {
+    static CLIP: OnceLock<Mutex<Option<facloud_ui::windowing::winit::windows::WindowsClipboard>>> =
+        OnceLock::new();
+    let lock = CLIP.get_or_init(|| {
+        Mutex::new(facloud_ui::windowing::winit::windows::WindowsClipboard::new().ok())
+    });
+    let mut guard = lock.lock().ok()?;
+    if guard.is_none() {
+        *guard = facloud_ui::windowing::winit::windows::WindowsClipboard::new().ok();
+    }
+    guard.as_mut().map(f)
+}
+
+/// Write `input` to `command` stdin without piping stdout/stderr so clipboard daemons
+/// (`xclip`, `wl-copy`) that fork a background selection-owner child never hang on pipe EOF.
+fn write_stdin_to_clipboard_command(
+    mut command: Command,
+    input: &[u8],
+    timeout: std::time::Duration,
+) -> Result<()> {
+    crate::resources::quiet_command(&mut command);
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut child = command.spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        stdin.write_all(input)?;
+    }
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            anyhow::ensure!(status.success(), "剪贴板命令返回非零状态：{status}");
+            return Ok(());
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("剪贴板命令超时");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+pub fn read_desktop_clipboard() -> Result<String> {
+    if let Some(mock_file) = std::env::var_os("STEPX_DESKTOP_CLIPBOARD_FILE") {
+        return Ok(std::fs::read_to_string(mock_file).unwrap_or_default());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut cmd = Command::new("pbpaste");
+        crate::resources::quiet_command(&mut cmd);
+        let out = crate::adb::run_process(cmd, None, std::time::Duration::from_secs(3))?;
+        if out.status.success() {
+            return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+        }
+        bail!("读取 macOS 剪贴板失败");
+    }
+    #[cfg(windows)]
+    {
+        #[cfg(feature = "desktop-ui")]
+        {
+            use facloud_ui::Clipboard;
+            if let Some(text) = with_native_windows_clipboard(|c| c.read().plain_text) {
+                return Ok(text);
+            }
+        }
+        let mut cmd = Command::new("powershell.exe");
+        cmd.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-Clipboard -Raw",
+        ]);
+        crate::resources::quiet_command(&mut cmd);
+        let out = crate::adb::run_process(cmd, None, std::time::Duration::from_secs(4))?;
+        if out.status.success() {
+            return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+        }
+        bail!("读取 Windows 剪贴板失败");
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        let mut candidates: Vec<(&str, &[&str])> = Vec::new();
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            candidates.push(("wl-paste", &["--no-newline"]));
+        }
+        candidates.push(("xclip", &["-selection", "clipboard", "-o"]));
+        candidates.push(("xsel", &["--clipboard", "--output"]));
+        for (bin, args) in candidates {
+            let mut cmd = Command::new(bin);
+            cmd.args(args);
+            crate::resources::quiet_command(&mut cmd);
+            if let Ok(out) = crate::adb::run_process(cmd, None, std::time::Duration::from_secs(2)) {
+                if out.status.success() {
+                    return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+                }
+            }
+        }
+        #[cfg(all(feature = "desktop-ui", target_os = "linux"))]
+        {
+            use facloud_ui::Clipboard;
+            if let Some(text) = with_native_linux_clipboard(|c| c.read().plain_text) {
+                return Ok(text);
+            }
+        }
+        bail!("读取桌面剪贴板失败");
+    }
+}
+
+pub fn write_desktop_clipboard(text: &str) -> Result<()> {
+    if let Some(mock_file) = std::env::var_os("STEPX_DESKTOP_CLIPBOARD_FILE") {
+        std::fs::write(mock_file, text)?;
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let cmd = Command::new("pbcopy");
+        write_stdin_to_clipboard_command(cmd, text.as_bytes(), std::time::Duration::from_secs(3))
+            .context("写入 macOS 剪贴板失败")?;
+        return Ok(());
+    }
+    #[cfg(windows)]
+    {
+        #[cfg(feature = "desktop-ui")]
+        {
+            use facloud_ui::{clipboard::ClipboardContent, Clipboard};
+            if with_native_windows_clipboard(|c| {
+                c.write(ClipboardContent::plain_text(text.to_string()));
+            })
+            .is_some()
+            {
+                return Ok(());
+            }
+        }
+        let mut cmd = Command::new("powershell.exe");
+        cmd.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Set-Clipboard -Value $env:STEPX_CLIP_TEXT",
+        ]);
+        cmd.env("STEPX_CLIP_TEXT", text);
+        crate::resources::quiet_command(&mut cmd);
+        let out = crate::adb::run_process(cmd, None, std::time::Duration::from_secs(4))?;
+        anyhow::ensure!(out.status.success(), "写入 Windows 剪贴板失败");
+        return Ok(());
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        let mut candidates: Vec<(&str, &[&str])> = Vec::new();
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            candidates.push(("wl-copy", &[]));
+        }
+        candidates.push(("xclip", &["-selection", "clipboard", "-i"]));
+        candidates.push(("xsel", &["--clipboard", "--input"]));
+        for (bin, args) in candidates {
+            let mut cmd = Command::new(bin);
+            cmd.args(args);
+            if write_stdin_to_clipboard_command(
+                cmd,
+                text.as_bytes(),
+                std::time::Duration::from_secs(2),
+            )
+            .is_ok()
+            {
+                return Ok(());
+            }
+        }
+        #[cfg(all(feature = "desktop-ui", target_os = "linux"))]
+        {
+            use facloud_ui::{clipboard::ClipboardContent, Clipboard};
+            if with_native_linux_clipboard(|c| {
+                c.write(ClipboardContent::plain_text(text.to_string()));
+            })
+            .is_some()
+            {
+                return Ok(());
+            }
+        }
+        bail!("写入桌面剪贴板失败");
+    }
+}
+
+pub fn pc_mute_toggle_commands_for_os(os: &str) -> Vec<(String, Vec<String>)> {
+    match os {
+        "macos" => vec![(
+            "osascript".into(),
+            vec![
+                "-e".into(),
+                "set volume output muted not (output muted of (get volume settings))".into(),
+            ],
+        )],
+        "windows" => vec![(
+            "powershell.exe".into(),
+            vec![
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                "$w = New-Object -ComObject WScript.Shell; $w.SendKeys([char]173)".into(),
+            ],
+        )],
+        _ => vec![
+            (
+                "pactl".into(),
+                vec![
+                    "set-sink-mute".into(),
+                    "@DEFAULT_SINK@".into(),
+                    "toggle".into(),
+                ],
+            ),
+            (
+                "wpctl".into(),
+                vec![
+                    "set-mute".into(),
+                    "@DEFAULT_AUDIO_SINK@".into(),
+                    "toggle".into(),
+                ],
+            ),
+            (
+                "amixer".into(),
+                vec!["set".into(), "Master".into(), "toggle".into()],
+            ),
+        ],
+    }
+}
+
+pub fn pc_lock_screen_commands_for_os(os: &str) -> Vec<(String, Vec<String>)> {
+    match os {
+        "macos" => vec![
+            (
+                "osascript".into(),
+                vec![
+                    "-e".into(),
+                    "tell application \"System Events\" to keystroke \"q\" using {control down, command down}".into(),
+                ],
+            ),
+            (
+                "/System/Library/CoreServices/Menu Extras/User.menu/Contents/Resources/CGSession".into(),
+                vec!["-suspend".into()],
+            ),
+        ],
+        "windows" => vec![
+            (
+                "powershell.exe".into(),
+                vec![
+                    "-NoProfile".into(),
+                    "-NonInteractive".into(),
+                    "-Command".into(),
+                    "rundll32.exe user32.dll,LockWorkStation".into(),
+                ],
+            ),
+            (
+                "rundll32.exe".into(),
+                vec!["user32.dll,LockWorkStation".into()],
+            ),
+        ],
+        _ => vec![
+            ("loginctl".into(), vec!["lock-session".into()]),
+            ("xdg-screensaver".into(), vec!["lock".into()]),
+            (
+                "dbus-send".into(),
+                vec![
+                    "--type=method_call".into(),
+                    "--dest=org.gnome.ScreenSaver".into(),
+                    "/org/gnome/ScreenSaver".into(),
+                    "org.gnome.ScreenSaver.Lock".into(),
+                ],
+            ),
+        ],
+    }
+}
+
+fn run_first_available_pc_command(candidates: &[(String, Vec<String>)]) -> bool {
+    if let Some(log_file) = std::env::var_os("STEPX_PC_CONTROL_TEST_LOG") {
+        if let Some((bin, args)) = candidates.first() {
+            let line = format!("{} {}\n", bin, args.join(" "));
+            let _ = std::fs::write(log_file, line);
+            return true;
+        }
+    }
+    for (bin, args) in candidates {
+        let mut cmd = Command::new(bin);
+        cmd.args(args);
+        crate::resources::quiet_command(&mut cmd);
+        if let Ok(out) = crate::adb::run_process(cmd, None, std::time::Duration::from_secs(5)) {
+            if out.status.success() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// A blocking layer result, with the party that alone can clear it.
@@ -2566,6 +4132,22 @@ pub fn friendly_app_name(package: &str) -> Option<&'static str> {
         "com.android.contacts" | "com.google.android.contacts" => Some("通讯录 · Contacts"),
         "com.android.documentsui" => Some("系统文件管理"),
         "com.android.camera2" | "com.stepos.camera" => Some("相机 · Camera"),
+        "app.huawei.auto" | "com.huawei.aitocar" | "com.huawei.harmonyos.auto" => {
+            Some("AITO · 问界汽车")
+        }
+        "app.huawei.motor" => Some("鸿蒙智行 · HIMA"),
+        "com.yinwang.qiankunapp" => Some("华为乾崑"),
+        "com.wj.charge" => Some("问界充电"),
+        "com.huawei.smarthome" => Some("华为智慧生活"),
+        "com.huawei.health" => Some("华为运动健康"),
+        "com.vmall.client" => Some("华为商城"),
+        "com.mi.car.mobile" => Some("小米汽车"),
+        "cn.com.weilaihui3" => Some("蔚来 · NIO"),
+        "com.xiaopeng.mycarinfo" => Some("小鹏汽车"),
+        "com.chehejia.oc.m01" => Some("理想汽车"),
+        "com.zeekrlife.mobile" => Some("极氪 · ZEEKR"),
+        "com.byd.aeri.caranywhere" => Some("比亚迪汽车"),
+        "com.teslamotors.tesla" => Some("Tesla · 特斯拉"),
         _ => None,
     }
 }
@@ -2620,14 +4202,7 @@ pub(crate) fn provider_number(row: &serde_json::Value, key: &str) -> Result<i64>
         .with_context(|| format!("手机记录字段 {key} 无效"))
 }
 
-fn clean_nullable_field(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.eq_ignore_ascii_case("null") {
-        String::new()
-    } else {
-        trimmed.to_string()
-    }
-}
+pub(crate) use crate::bridge::clean_nullable_field;
 
 pub fn parse_call_records(value: &serde_json::Value) -> Result<Vec<CallRecord>> {
     let rows = value["rows"].as_array().context("手机未返回通话记录列表")?;
@@ -2835,6 +4410,61 @@ fn format_base_summary(raw: &str) -> String {
     result
 }
 
+pub(crate) fn extract_cycle_count(cycle_line: &str) -> Option<String> {
+    cycle_line
+        .split_once("android.os.extra.CYCLE_COUNT=")
+        .map(|(_, rest)| {
+            rest.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+        })
+        .filter(|s| !s.is_empty())
+}
+
+pub(crate) fn format_mah_value(raw_val: &str, default_mah: &str) -> String {
+    raw_val
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|v| *v > 0)
+        .map(|v| if v > 100_000 { v / 1000 } else { v }.to_string())
+        .unwrap_or_else(|| default_mah.to_string())
+}
+
+pub(crate) fn live_thermal_hal_section(raw: &str) -> &str {
+    raw.split_once("Current temperatures from HAL:")
+        .map(|(_, rest)| {
+            rest.split_once("Current cooling devices from HAL:")
+                .map(|(hal, _)| hal)
+                .unwrap_or(rest)
+        })
+        .unwrap_or(raw)
+}
+
+pub(crate) fn parse_thermal_mvalue(line: &str) -> Option<f32> {
+    line.split_once("mValue=")
+        .and_then(|(_, rest)| rest.split([',', '}']).next())
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|&v| v > 0.0 && v <= 120.0)
+}
+
+pub(crate) fn parse_thermal_sensor_temp(thermal_scope: &str, sensors: &[&str]) -> Option<f32> {
+    for sensor in sensors {
+        let needle = format!("mName={sensor},");
+        let needle_end = format!("mName={sensor}}}");
+        if let Some(v) = thermal_scope
+            .lines()
+            .find(|line| {
+                (line.contains(&needle) || line.contains(&needle_end)) && line.contains("mValue=")
+            })
+            .and_then(parse_thermal_mvalue)
+        {
+            return Some(v);
+        }
+    }
+    None
+}
+
 pub fn format_summary(raw: &str) -> String {
     let Some((base_raw, deep_raw)) = raw.split_once("<<<STEPOS_DEEP>>>") else {
         return format_base_summary(raw);
@@ -2850,11 +4480,19 @@ pub fn format_summary(raw: &str) -> String {
     };
     let _marketname = {
         let v = deep_val("marketname:");
-        if v.is_empty() { "STEPX Neo" } else { v }
+        if v.is_empty() {
+            "STEPX Neo"
+        } else {
+            v
+        }
     };
     let asn = {
         let v = deep_val("asn:");
-        if v.is_empty() { "未检测" } else { v }
+        if v.is_empty() {
+            "未检测"
+        } else {
+            v
+        }
     };
     let netsn = deep_val("netsn:");
     let serialno = {
@@ -2880,27 +4518,16 @@ pub fn format_summary(raw: &str) -> String {
     };
     let soh = {
         let v = deep_val("soh:");
-        if v.is_empty() { "未读取" } else { v }
+        if v.is_empty() {
+            "未读取"
+        } else {
+            v
+        }
     };
-    let cycles = deep_val("cycle_line:")
-        .split_once("android.os.extra.CYCLE_COUNT=")
-        .map(|(_, rest)| {
-            rest.chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect::<String>()
-        })
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "未读取".to_string());
-    let parse_mah = |raw_val: &str, default_mah: &str| -> String {
-        raw_val
-            .parse::<u64>()
-            .ok()
-            .filter(|v| *v > 0)
-            .map(|v| if v > 100_000 { v / 1000 } else { v }.to_string())
-            .unwrap_or_else(|| default_mah.to_string())
-    };
-    let design_mah = parse_mah(deep_val("design_cap:"), "未读取");
-    let remaining_mah = parse_mah(deep_val("charge_cnt:"), "未读取");
+    let cycles =
+        extract_cycle_count(deep_val("cycle_line:")).unwrap_or_else(|| "未读取".to_string());
+    let design_mah = format_mah_value(deep_val("design_cap:"), "未读取");
+    let remaining_mah = format_mah_value(deep_val("charge_cnt:"), "未读取");
     let fast_charge_label = match deep_val("fast_charge:") {
         "1" => "已开启",
         "0" => "已关闭",
@@ -2908,7 +4535,11 @@ pub fn format_summary(raw: &str) -> String {
     };
     let ups_limit = {
         let v = deep_val("ups_limit:");
-        if v.is_empty() { "未读取" } else { v }
+        if v.is_empty() {
+            "未读取"
+        } else {
+            v
+        }
     };
     let bypass_label = if deep_val("ups_mode:") == "1" {
         format!("已开启 ({ups_limit}%)")
@@ -2917,35 +4548,29 @@ pub fn format_summary(raw: &str) -> String {
     } else {
         "未读取".to_string()
     };
-    let parse_temp = |sensor: &str| -> String {
-        let needle = format!("mName={sensor}");
-        deep_raw
-            .lines()
-            .find(|line| line.contains(&needle) && line.contains("mValue="))
-            .and_then(|line| line.split_once("mValue="))
-            .and_then(|(_, rest)| rest.split([',', '}']).next())
-            .and_then(|v| v.trim().parse::<f32>().ok())
+    let thermal_scope = live_thermal_hal_section(deep_raw);
+    let parse_temp = |sensors: &[&str]| -> String {
+        parse_thermal_sensor_temp(thermal_scope, sensors)
             .map(|v| format!("{v:.1} °C"))
             .unwrap_or_else(|| "--".to_string())
     };
-    let cpu_temp = parse_temp("cpu-0-0");
-    let npu_temp = {
-        let nsp = parse_temp("nsp-0");
-        if nsp != "--" {
-            nsp
-        } else {
-            parse_temp("gpuss-0")
-        }
-    };
-    let skin_temp = parse_temp("skin-therm");
+    let cpu_temp = parse_temp(&["cpu-0-0", "CPU0"]);
+    let npu_temp = parse_temp(&["nsp-0", "nsp0", "gpuss-0", "GPU0"]);
+    let skin_temp = parse_temp(&["skin-therm", "skin"]);
     let camera_info = deep_val("camera_info:");
-    let camera_summary = if camera_info.is_empty() { "未读取" } else { camera_info };
+    let camera_summary = if camera_info.is_empty() {
+        "未读取"
+    } else {
+        camera_info
+    };
     let keyguard_line = deep_val("keyguard_locked:");
     let lock_continuity_label = if keyguard_line.contains("showing=true") {
         "已锁屏"
     } else if keyguard_line.contains("showing=false") {
         "已解锁"
-    } else { "未读取" };
+    } else {
+        "未读取"
+    };
     result.push_str(&format!(
         "\n\n保修状态  未查询官方保修状态\n\
          硬件序列号  ASN {asn} · SN {serialno}\n\
@@ -3491,7 +5116,7 @@ mod generic_apk_install_tests {
 List of devices attached
 ASGXVB1806001948       device usb:3-3.1 product:CLT-AL00 model:CLT_AL00 device:HWCLT transport_id:2
 STEPX_TEST_DEVICE    device usb:3-1.4 product:pandora model:PZ261A device:pandora transport_id:4
-10.0.1.177:34883       device product:pandora model:PZ261A device:pandora transport_id:7
+10.0.0.42:34883       device product:pandora model:PZ261A device:pandora transport_id:7
 adb-STEPX_TEST_DEVICE-jYyV3X._adb-tls-connect._tcp device product:pandora model:PZ261A device:pandora transport_id:1
 ";
         let transports = parse_devices(sample);
@@ -3505,7 +5130,7 @@ adb-STEPX_TEST_DEVICE-jYyV3X._adb-tls-connect._tcp device product:pandora model:
         assert_eq!(
             transports[1].backup_transports(),
             vec![
-                "10.0.1.177:34883".to_string(),
+                "10.0.0.42:34883".to_string(),
                 "adb-STEPX_TEST_DEVICE-jYyV3X._adb-tls-connect._tcp".to_string(),
             ]
         );
@@ -3515,7 +5140,7 @@ adb-STEPX_TEST_DEVICE-jYyV3X._adb-tls-connect._tcp device product:pandora model:
         assert_eq!(
             rededuped[1].backup_transports(),
             vec![
-                "10.0.1.177:34883".to_string(),
+                "10.0.0.42:34883".to_string(),
                 "adb-STEPX_TEST_DEVICE-jYyV3X._adb-tls-connect._tcp".to_string(),
             ]
         );
@@ -3525,7 +5150,7 @@ adb-STEPX_TEST_DEVICE-jYyV3X._adb-tls-connect._tcp device product:pandora model:
             Some("STEPX_TEST_DEVICE".to_string())
         );
         assert_eq!(transport_priority("STEPX_TEST_DEVICE"), 1);
-        assert_eq!(transport_priority("10.0.1.177:34883"), 2);
+        assert_eq!(transport_priority("10.0.0.42:34883"), 2);
         assert_eq!(
             transport_priority("adb-STEPX_TEST_DEVICE-jYyV3X._adb-tls-connect._tcp"),
             3
@@ -3540,7 +5165,7 @@ adb-STEPX_TEST_DEVICE-jYyV3X._adb-tls-connect._tcp device product:pandora model:
                 product: "pandora".into(),
             },
             Device {
-                transport: "10.0.1.177:34883".into(),
+                transport: "10.0.0.42:34883".into(),
                 serial: "STEPX_TEST_DEVICE".into(),
                 model: "PZ261A".into(),
                 android: "16".into(),
@@ -3559,7 +5184,7 @@ adb-STEPX_TEST_DEVICE-jYyV3X._adb-tls-connect._tcp device product:pandora model:
         assert_eq!(
             devices[0].backup_transports(),
             vec![
-                "10.0.1.177:34883".to_string(),
+                "10.0.0.42:34883".to_string(),
                 "adb-STEPX_TEST_DEVICE-jYyV3X._adb-tls-connect._tcp".to_string(),
             ]
         );
@@ -3589,7 +5214,7 @@ adb-STEPX_TEST_DEVICE-jYyV3X._adb-tls-connect._tcp device product:pandora model:
   temperature: 317
 /dev/block/dm-52  218G   17G  201G   8% /data
 Physical size: 1260x2800
-24: wlan0    inet 10.0.1.177/24 brd 10.0.1.255 scope global wlan0
+24: wlan0    inet 10.0.0.42/24 brd 10.0.1.255 scope global wlan0
 ";
         let legacy_summary = format_summary(legacy_raw);
         assert!(!legacy_summary.contains("保修状态"));
@@ -3599,7 +5224,7 @@ Physical size: 1260x2800
         assert_eq!(legacy_metrics.temperature, "31.7 °C");
         assert_eq!(legacy_metrics.voltage, "4.45 V");
         assert_eq!(legacy_metrics.screen_size, "1260 × 2800");
-        assert_eq!(legacy_metrics.wifi_ipv4, "10.0.1.177");
+        assert_eq!(legacy_metrics.wifi_ipv4, "10.0.0.42");
         assert_eq!(legacy_metrics.storage_total, "218G");
         assert_eq!(legacy_metrics.warranty_status, "");
 
@@ -3658,7 +5283,121 @@ Physical size: 1260x2800
     fn store_package_identity_must_match_selection() {
         assert!(super::validate_store_package("com.example.other", "com.example.target").is_err());
         assert!(super::validate_store_package("com.example.target", "").is_err());
+        assert!(super::validate_store_package("", "com.example.target").is_err());
+        assert!(super::validate_store_package("   ", "app.huawei.auto").is_err());
+        assert!(super::validate_store_package("app.huawei.auto", "   ").is_err());
+        assert!(super::validate_store_package("com.lngin.aitokii", "app.huawei.auto").is_err());
+        assert!(super::validate_store_package("com.sqn.click", "app.huawei.auto").is_err());
+        assert!(
+            super::validate_store_package("com.yinwang.qiankunapp", "app.huawei.auto").is_err()
+        );
+        assert!(super::validate_store_package(
+            "com.stepx.companion.app",
+            "com.stepx.companion.app"
+        )
+        .is_err());
+        assert!(super::validate_store_package(
+            "COM.STEPX.COMPANION.APP",
+            "com.stepx.companion.app"
+        )
+        .is_err());
+        assert!(validate_generic_apk_identity(
+            &json!({"ok":true,"package":"  COM.STEPX.COMPANION.APP  "})
+        )
+        .is_err());
         assert!(super::validate_store_package("com.example.target", "com.example.target").is_ok());
+        assert!(super::validate_store_package("app.huawei.auto", "app.huawei.auto").is_ok());
+        assert!(super::validate_store_package("app.huawei.motor", "app.huawei.motor").is_ok());
+        assert!(super::validate_store_package("app.huawei.motor", "app.huawei.auto").is_ok());
+        assert!(super::validate_store_package("app.huawei.auto", "app.huawei.motor").is_ok());
+        assert!(super::validate_store_package("com.huawei.aitocar", "app.huawei.auto").is_ok());
+        assert!(
+            super::validate_store_package("com.huawei.harmonyos.auto", "app.huawei.auto").is_ok()
+        );
+        assert!(super::validate_store_package("com.aitotech.aito", "app.huawei.auto").is_ok());
+        assert!(super::validate_store_package("com.seres.aito", "app.huawei.motor").is_ok());
+        assert!(
+            super::validate_store_package("com.synology.uhidrive", "com.synology.dsdrive").is_ok()
+        );
+        assert!(
+            super::validate_store_package("com.synology.DSfile", "com.synology.dsfile").is_ok()
+        );
+        assert!(super::validate_store_package(
+            "org.telegram.messenger",
+            "org.telegram.messenger.web"
+        )
+        .is_ok());
+        assert!(super::validate_store_package(
+            "org.telegram.messenger.web",
+            "org.telegram.messenger"
+        )
+        .is_ok());
+        assert!(
+            super::validate_store_package("com.ss.android.lark", "com.ss.android.lark.kami")
+                .is_ok()
+        );
+        assert_eq!(
+            super::friendly_app_name("app.huawei.auto"),
+            Some("AITO · 问界汽车")
+        );
+        assert_eq!(
+            super::friendly_app_name("app.huawei.motor"),
+            Some("鸿蒙智行 · HIMA")
+        );
+        assert_eq!(
+            super::friendly_app_name("com.yinwang.qiankunapp"),
+            Some("华为乾崑")
+        );
+        assert_eq!(super::friendly_app_name("com.wj.charge"), Some("问界充电"));
+
+        let signed_fixture = crate::resources::root()
+            .join("diagnostics/context-e2e-20261029/notification-fixture/context-verification.apk");
+        if signed_fixture.is_file() {
+            assert!(
+                super::check_store_apk(&signed_fixture, "com.stepx.context.verification").is_ok()
+            );
+            assert!(super::check_store_apk(&signed_fixture, "app.huawei.auto").is_err());
+        }
+        let unsigned_fixture = crate::resources::root()
+            .join("diagnostics/context-e2e-20261029/notification-fixture/unsigned.apk");
+        if unsigned_fixture.is_file() {
+            assert!(
+                super::check_store_apk(&unsigned_fixture, "com.stepx.context.verification")
+                    .is_err()
+            );
+        }
+        let companion_apk = crate::resources::root().join("desktop/assets/stepx-companion.apk");
+        if companion_apk.is_file() {
+            assert!(
+                super::check_store_apk(&companion_apk, "com.stepx.companion.app").is_err(),
+                "store APK check must never allow overwriting companion app via generic store path"
+            );
+        }
+        if let Some(home) = crate::resources::user_home() {
+            let cached_aito = std::path::PathBuf::from(&home)
+                .join(".cache/stepx-companion/app-store/apks/app.huawei.auto_3.0.2.320_e782f9a120610a43.apk");
+            if cached_aito.is_file() {
+                assert_eq!(
+                    super::verify_apk_identity(&cached_aito).unwrap(),
+                    "app.huawei.auto"
+                );
+                assert!(super::check_store_apk(&cached_aito, "app.huawei.auto").is_ok());
+                assert!(super::check_store_apk(&cached_aito, "app.huawei.motor").is_ok());
+                assert!(super::check_store_apk(&cached_aito, "com.huawei.aitocar").is_ok());
+                assert!(super::check_store_apk(&cached_aito, "com.lngin.aitokii").is_err());
+            }
+            let cached_youtube = std::path::PathBuf::from(&home)
+                .join(".cache/stepx-companion/app-store/apks/com.google.android.youtube_21.42.243_6b76fea5bd6289e8.apk");
+            if cached_youtube.is_file() {
+                assert_eq!(
+                    super::verify_apk_identity(&cached_youtube).unwrap(),
+                    "com.google.android.youtube"
+                );
+                assert!(
+                    super::check_store_apk(&cached_youtube, "com.google.android.youtube").is_ok()
+                );
+            }
+        }
     }
     #[test]
     fn missing_deep_sensor_values_remain_unknown() {
@@ -3669,4 +5408,601 @@ Physical size: 1260x2800
         assert!(!s.contains("LPDDR5X"));
     }
 
+    #[test]
+    fn format_summary_prefers_live_hal_temperatures_and_supports_pz261a_sensor_names() {
+        let raw = "level: 85\nscale: 100\n<<<STEPOS_DEEP>>>\n\
+            Cached temperatures:\n\
+            Temperature{mValue=68.9, mType=0, mName=CPU0, mStatus=0}\n\
+            Temperature{mValue=59.2, mType=9, mName=nsp0, mStatus=0}\n\
+            Temperature{mValue=44.0, mType=3, mName=skin, mStatus=0}\n\
+            Current temperatures from HAL:\n\
+            Temperature{mValue=38.4, mType=0, mName=CPU0, mStatus=0}\n\
+            Temperature{mValue=34.2, mType=9, mName=nsp0, mStatus=0}\n\
+            Temperature{mValue=31.5, mType=3, mName=skin, mStatus=0}\n\
+            Current cooling devices from HAL:\n";
+        let summary = super::format_summary(raw);
+        let metrics = super::DeviceMetrics::from_summary(&summary);
+        assert_eq!(
+            metrics.thermal_summary,
+            "CPU 38.4 °C · NPU 34.2 °C · 机身 31.5 °C"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_online_transport_discovers_rotated_mdns_tls_port_and_storage_fails_over() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fake_adb = dir.path().join("adb");
+        let log_path = dir.path().join("calls.log");
+        let script = format!(
+            r#"#!/usr/bin/env bash
+echo "$*" >> "{log}"
+case "$*" in
+  *"-s usb-dead-device-mdns-unit"*|*"-s 10.0.1.178:34257"*)
+    echo "adb: device offline" >&2
+    exit 1
+    ;;
+  "devices -l")
+    echo "List of devices attached"
+    echo "10.0.1.178:34257 offline transport_id:2"
+    exit 0
+    ;;
+  "reconnect offline")
+    echo "reconnecting 10.0.1.178:34257 [offline]"
+    exit 0
+    ;;
+  "mdns services")
+    echo "List of discovered mdns services"
+    echo "adb-STEPX_MDNS_ROTATE_SERIAL_UNIT-jYyV3X (2)	_adb-tls-connect._tcp	10.0.1.178:41245"
+    exit 0
+    ;;
+  "connect 10.0.1.178:41245")
+    echo "connected to 10.0.1.178:41245"
+    exit 0
+    ;;
+  *"-s 10.0.1.178:41245 shell"*"getprop"*"ro.serialno"*)
+    echo "STEPX_MDNS_ROTATE_SERIAL_UNIT"
+    exit 0
+    ;;
+  *"-s 10.0.1.178:41245 shell"*"readlink"*"/sdcard/Download"*)
+    echo "/storage/emulated/0/Download"
+    exit 0
+    ;;
+  *"-s 10.0.1.178:41245 shell find"*)
+    printf '81a4\n128\n/storage/emulated/0/Download/note.txt\0'
+    exit 0
+    ;;
+esac
+exit 1
+"#,
+            log = log_path.display()
+        );
+        std::fs::write(&fake_adb, script).unwrap();
+        std::fs::set_permissions(&fake_adb, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let adb = crate::adb::Adb { path: fake_adb };
+        let device = super::Device {
+            transport: "usb-dead-device-mdns-unit".into(),
+            serial: "STEPX_MDNS_ROTATE_SERIAL_UNIT".into(),
+            model: "PZ261A-MDNS-UNIT".into(),
+            android: "16".into(),
+            product: "pandora".into(),
+        };
+        device.set_backup_transports(vec!["10.0.1.178:34257".into()]);
+
+        let entries = crate::storage::list(&adb, &device, "/sdcard/Download")
+            .expect("storage::list must recover rotated wireless mDNS TLS port");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "note.txt");
+    }
+
+    #[test]
+    fn pc_control_commands_cover_macos_windows_and_linux() {
+        use super::{pc_lock_screen_commands_for_os, pc_mute_toggle_commands_for_os};
+
+        let mac_mute = pc_mute_toggle_commands_for_os("macos");
+        assert_eq!(mac_mute[0].0, "osascript");
+        assert!(mac_mute[0].1.iter().any(|a| a.contains("output muted")));
+
+        let win_mute = pc_mute_toggle_commands_for_os("windows");
+        assert_eq!(win_mute[0].0, "powershell.exe");
+        assert!(win_mute[0].1.iter().any(|a| a.contains("SendKeys")));
+
+        let linux_mute = pc_mute_toggle_commands_for_os("linux");
+        assert!(linux_mute.iter().any(|(b, _)| b == "pactl"));
+        assert!(linux_mute.iter().any(|(b, _)| b == "wpctl"));
+
+        let mac_lock = pc_lock_screen_commands_for_os("macos");
+        assert_eq!(mac_lock[0].0, "osascript");
+
+        let win_lock = pc_lock_screen_commands_for_os("windows");
+        assert!(win_lock
+            .iter()
+            .any(|(_, args)| args.iter().any(|a| a.contains("LockWorkStation"))));
+
+        let linux_lock = pc_lock_screen_commands_for_os("linux");
+        assert!(linux_lock.iter().any(|(b, _)| b == "loginctl"));
+        assert!(linux_lock.iter().any(|(b, _)| b == "xdg-screensaver"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_pc_control_sync_clipboard_syncs_both_directions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fake_adb = dir.path().join("adb");
+        let phone_clip_file = dir.path().join("phone_clip.txt");
+        let desktop_clip_file = dir.path().join("desktop_clip.txt");
+        let pc_ctrl_log = dir.path().join("pc_ctrl.log");
+        std::fs::write(&phone_clip_file, "Phone-Initial-Clip").unwrap();
+        std::fs::write(&desktop_clip_file, "").unwrap();
+
+        let script = format!(
+            r#"#!/usr/bin/env bash
+case "$*" in
+  *"get-state"*)
+    echo "device"
+    exit 0
+    ;;
+  *"getprop"*"ro.serialno"*)
+    echo "STEPX_CLIP_SERIAL"
+    exit 0
+    ;;
+  *"SYNC_CLIPBOARD"*)
+    exit 0
+    ;;
+  *"get-primary-clip"*)
+    cat "{phone_clip}"
+    exit 0
+    ;;
+  *"set-primary-clip"*)
+    eval "set -- $4"
+    printf '%s' "$4" > "{phone_clip}"
+    exit 0
+    ;;
+esac
+exit 1
+"#,
+            phone_clip = phone_clip_file.display()
+        );
+        std::fs::write(&fake_adb, script).unwrap();
+        std::fs::set_permissions(&fake_adb, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        std::env::set_var("STEPX_DESKTOP_CLIPBOARD_FILE", &desktop_clip_file);
+        std::env::set_var("STEPX_PC_CONTROL_TEST_LOG", &pc_ctrl_log);
+
+        let adb = crate::adb::Adb { path: fake_adb };
+        let device = super::Device {
+            transport: "STEPX_CLIP_SERIAL".into(),
+            serial: "STEPX_CLIP_SERIAL".into(),
+            model: "PZ261A".into(),
+            android: "16".into(),
+            product: "pandora".into(),
+        };
+
+        // 1. Desktop empty, phone has text -> pulls phone clipboard to desktop
+        let msg1 = device
+            .execute_pc_control_command(&adb, "sync_clipboard")
+            .unwrap();
+        assert!(msg1.contains("手机 → 电脑"), "{msg1}");
+        assert_eq!(
+            std::fs::read_to_string(&desktop_clip_file).unwrap(),
+            "Phone-Initial-Clip"
+        );
+
+        // 2. Desktop updated with new text -> pushes desktop clipboard to phone
+        std::fs::write(&desktop_clip_file, "Desktop-Updated-Clip").unwrap();
+        let msg2 = device
+            .execute_pc_control_command(&adb, "sync_clipboard")
+            .unwrap();
+        assert!(msg2.contains("电脑 → 手机"), "{msg2}");
+        assert_eq!(
+            std::fs::read_to_string(&phone_clip_file).unwrap(),
+            "Desktop-Updated-Clip"
+        );
+
+        // 3. Phone subsequently updated with new text while desktop is non-empty -> pulls phone clipboard to desktop
+        std::fs::write(&phone_clip_file, "Phone-Second-Update").unwrap();
+        let msg3 = device
+            .execute_pc_control_command(&adb, "sync_clipboard")
+            .unwrap();
+        assert!(msg3.contains("手机 → 电脑"), "{msg3}");
+        assert_eq!(
+            std::fs::read_to_string(&desktop_clip_file).unwrap(),
+            "Phone-Second-Update"
+        );
+
+        // 4. Verify write_stdin_to_clipboard_command never blocks when a clipboard tool (like xclip/wl-copy)
+        // forks a background selection-owner daemon that inherits file descriptors
+        let daemon_out = dir.path().join("daemon_clip.txt");
+        let mut daemon_cmd = std::process::Command::new("sh");
+        daemon_cmd.args([
+            "-c",
+            &format!("cat > \"{}\"; (sleep 5 &) ; exit 0", daemon_out.display()),
+        ]);
+        let start = std::time::Instant::now();
+        super::write_stdin_to_clipboard_command(
+            daemon_cmd,
+            b"NonBlockingClipPayload",
+            std::time::Duration::from_secs(2),
+        )
+        .expect("stdin writer must not hang on background daemon fork");
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(500),
+            "took {:?}, should return as soon as parent exits",
+            start.elapsed()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&daemon_out).unwrap(),
+            "NonBlockingClipPayload"
+        );
+
+        // 5. Test pc_mute_toggle and pc_lock_screen via test log
+        let mute_msg = device
+            .execute_pc_control_command(&adb, "pc_mute_toggle")
+            .unwrap();
+        assert!(mute_msg.contains("静音"));
+        let lock_msg = device
+            .execute_pc_control_command(&adb, "pc_lock_screen")
+            .unwrap();
+        assert!(lock_msg.contains("锁定电脑屏幕"));
+
+        std::env::remove_var("STEPX_DESKTOP_CLIPBOARD_FILE");
+        std::env::remove_var("STEPX_PC_CONTROL_TEST_LOG");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn batched_debloat_and_cached_screen_resolution_reduce_adb_spawns() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_adb = dir.path().join("adb");
+        let calls_log = dir.path().join("calls.log");
+
+        let script = format!(
+            r#"#!/usr/bin/env sh
+echo "$*" >> "{calls}"
+case "$*" in
+  *"getprop"*ro.serialno*)
+    echo "STEPX_BATCH_SERIAL"
+    exit 0
+    ;;
+  *"wm"*size*)
+    echo "Physical size: 1200x2670"
+    exit 0
+    ;;
+  *"input"*tap*|*"input"*swipe*)
+    exit 0
+    ;;
+  *"TOGGLED:"*)
+    echo "TOGGLED:com.qti.diagservices"
+    echo "TOGGLED:com.android.traceur"
+    echo "TOGGLED:com.android.printspooler"
+    echo "TOGGLED:com.android.bips"
+    echo "TOGGLED:com.android.dreams.basic"
+    exit 0
+    ;;
+  *"<<<STEPX_U>>>"*)
+    echo "package:com.qti.diagservices"
+    echo "package:com.android.traceur"
+    echo "package:com.android.printspooler"
+    echo "package:com.android.bips"
+    echo "package:com.android.dreams.basic"
+    echo "<<<STEPX_U>>>"
+    echo "package:com.sohu.inputmethod.sogou.oem"
+    echo "package:com.qti.diagservices"
+    echo "package:com.android.traceur"
+    echo "package:com.android.printspooler"
+    echo "package:com.android.bips"
+    echo "package:com.android.dreams.basic"
+    echo "<<<STEPX_ALL>>>"
+    echo "package:com.sohu.inputmethod.sogou.oem"
+    echo "package:com.qti.diagservices"
+    echo "package:com.android.traceur"
+    echo "package:com.android.printspooler"
+    echo "package:com.android.bips"
+    echo "package:com.android.dreams.basic"
+    echo "<<<STEPX_IME>>>"
+    echo "com.sohu.inputmethod.sogou.oem/.SogouIME"
+    exit 0
+    ;;
+  *"install-existing"*)
+    exit 0
+    ;;
+esac
+exit 0
+"#,
+            calls = calls_log.display()
+        );
+        std::fs::write(&fake_adb, script).unwrap();
+        std::fs::set_permissions(&fake_adb, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let adb = crate::adb::Adb { path: fake_adb };
+        let device = super::Device {
+            transport: "STEPX_BATCH_SERIAL".into(),
+            serial: "STEPX_BATCH_SERIAL".into(),
+            model: "PZ261A".into(),
+            android: "16".into(),
+            product: "pandora".into(),
+        };
+
+        super::invalidate_verified_transport("STEPX_BATCH_SERIAL");
+        let msg = device.debloat_preset_services(&adb).unwrap();
+        assert!(msg.contains("共停用 4 项"), "{msg}");
+        let calls_after_debloat = std::fs::read_to_string(&calls_log).unwrap_or_default();
+        assert_eq!(
+            calls_after_debloat.lines().count(),
+            3,
+            "batched debloat should only spawn 3 adb processes (serialno + batch disable + inspect): {calls_after_debloat}"
+        );
+
+        std::fs::write(&calls_log, "").unwrap();
+        let (px1, py1) = device.tap_normalized(&adb, 500, 500).unwrap();
+        assert_eq!((px1, py1), (600, 1335));
+        let (px2, py2) = device.tap_normalized(&adb, 250, 750).unwrap();
+        assert_eq!((px2, py2), (300, 2002));
+        let tap_calls = std::fs::read_to_string(&calls_log).unwrap_or_default();
+        let wm_size_count = tap_calls.lines().filter(|l| l.contains("wm")).count();
+        assert_eq!(
+            wm_size_count, 1,
+            "wm size should be cached across repeated taps: {tap_calls}"
+        );
+
+        super::invalidate_verified_transport("STEPX_BATCH_SERIAL");
+        std::fs::write(&calls_log, "").unwrap();
+        // This fake has no AgentBus forward. A catalog failure must not launch
+        // Amoo through a second channel; only an explicitly absent tool may.
+        assert!(device.open_amoo_tasks(&adb).is_err());
+        let tasks_calls = std::fs::read_to_string(&calls_log).unwrap_or_default();
+        let serialno_count = tasks_calls
+            .lines()
+            .filter(|l| l.contains("ro.serialno"))
+            .count();
+        assert_eq!(
+            serialno_count, 1,
+            "open_amoo_tasks must resolve transport only once (not re-resolve inside open_amoo): {tasks_calls}"
+        );
+
+        super::invalidate_verified_transport("STEPX_BATCH_SERIAL");
+        std::fs::write(&calls_log, "").unwrap();
+        let _ = device.open_amoo_screen_perception(&adb).unwrap();
+        let perception_calls = std::fs::read_to_string(&calls_log).unwrap_or_default();
+        assert_eq!(
+            perception_calls.lines().count(),
+            2,
+            "open_amoo_screen_perception must batch startservice + start into a single shell script (serialno + script): {perception_calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wake_and_unlock_transport_wakes_dozing_and_skips_swipe_when_already_unlocked() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_adb = dir.path().join("adb");
+        let actions_log = dir.path().join("actions.log");
+        let mode_file = dir.path().join("mode.txt");
+
+        let script = format!(
+            r#"#!/usr/bin/env sh
+MODE="$(cat "{mode}" 2>/dev/null || echo locked)"
+shift 3
+SCRIPT="$*"
+dumpsys() {{
+  if [ "$1" = "power" ]; then
+    if [ "$MODE" = "locked" ]; then
+      echo "mWakefulness=Dozing"
+    else
+      echo "mWakefulness=Awake"
+    fi
+  elif [ "$1" = "window" ]; then
+    echo "screenState=SCREEN_STATE_ON"
+    echo "  Window #1: showing=true"
+    echo "  KeyguardServiceDelegate"
+    if [ "$MODE" = "locked" ] || [ "$MODE" = "awake_locked" ]; then
+      echo "    showing=true"
+      echo "    showingAndNotOccluded=true"
+      echo "    mShowingLockscreen=true"
+    else
+      echo "    showing=false"
+      echo "    showingAndNotOccluded=false"
+      echo "    mShowingLockscreen=false"
+    fi
+  fi
+}}
+input() {{
+  echo "input $*" >> "{actions}"
+  if [ "$1" = "keyevent" ] && [ "$2" = "224" ]; then
+    MODE="awake_locked"
+  fi
+}}
+wm() {{
+  echo "wm $*" >> "{actions}"
+}}
+cmd() {{
+  echo "cmd $*" >> "{actions}"
+}}
+sleep() {{
+  :
+}}
+eval "$SCRIPT"
+"#,
+            mode = mode_file.display(),
+            actions = actions_log.display(),
+        );
+        std::fs::write(&fake_adb, script).unwrap();
+        std::fs::set_permissions(&fake_adb, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let adb = crate::adb::Adb { path: fake_adb };
+
+        // Case 1: Phone is Dozing and Keyguard is locked
+        std::fs::write(&mode_file, "locked").unwrap();
+        std::fs::write(&actions_log, "").unwrap();
+        super::wake_and_unlock_transport(&adb, "STEPX_LOCK_TEST", 540, 1872, 528).unwrap();
+        let locked_actions = std::fs::read_to_string(&actions_log).unwrap_or_default();
+        assert!(
+            locked_actions.contains("input keyevent 224"),
+            "must wake dozing screen with keyevent 224: {locked_actions}"
+        );
+        assert!(
+            locked_actions.contains("wm dismiss-keyguard"),
+            "must call wm dismiss-keyguard: {locked_actions}"
+        );
+        assert!(
+            locked_actions.contains("input keyevent 82"),
+            "must send keyevent 82 when keyguard is showing: {locked_actions}"
+        );
+        assert!(
+            locked_actions.contains("input swipe 540 1872 540 528 300"),
+            "must swipe up keyguard when keyguard is showing: {locked_actions}"
+        );
+        assert!(
+            locked_actions.contains("cmd statusbar collapse"),
+            "must collapse statusbar after unlock: {locked_actions}"
+        );
+
+        // Case 2: Phone is already Awake and unlocked (even if an unrelated Window #1 has showing=true)
+        std::fs::write(&mode_file, "unlocked").unwrap();
+        std::fs::write(&actions_log, "").unwrap();
+        super::wake_and_unlock_transport(&adb, "STEPX_LOCK_TEST", 540, 1872, 528).unwrap();
+        let unlocked_actions = std::fs::read_to_string(&actions_log).unwrap_or_default();
+        assert!(
+            !unlocked_actions.contains("input keyevent 224")
+                && !unlocked_actions.contains("input keyevent 26"),
+            "must not send wake keyevent when already Awake: {unlocked_actions}"
+        );
+        assert!(
+            !unlocked_actions.contains("input swipe"),
+            "must not swipe screen when keyguard is already unlocked: {unlocked_actions}"
+        );
+        assert!(
+            unlocked_actions.contains("cmd statusbar collapse"),
+            "should still collapse statusbar: {unlocked_actions}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_transport_registry_ttl_cache_promotion_and_dual_transport_helpers() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_adb = dir.path().join("adb");
+        let calls_log = dir.path().join("calls.log");
+        let usb_alive_file = dir.path().join("usb_alive.txt");
+        std::fs::write(&usb_alive_file, "1").unwrap();
+
+        let script = format!(
+            r#"#!/usr/bin/env sh
+echo "$*" >> "{calls}"
+USB_ALIVE="$(cat "{usb}" 2>/dev/null || echo 1)"
+case "$*" in
+  *"-s STEPX_TTL_USB_SER shell getprop ro.serialno"*)
+    if [ "$USB_ALIVE" = "1" ]; then
+      echo "STEPX_TTL_USB_SER"
+      exit 0
+    else
+      echo "adb: device offline" >&2
+      exit 1
+    fi
+    ;;
+  *"-s 10.0.1.188:38888 shell getprop ro.serialno"*)
+    echo "STEPX_TTL_USB_SER"
+    exit 0
+    ;;
+  "connect 10.0.1.188:38888")
+    echo "connected to 10.0.1.188:38888"
+    exit 0
+    ;;
+  "devices -l")
+    echo "List of devices attached"
+    echo "10.0.1.188:38888 device product:pandora model:PZ261A device:pandora"
+    exit 0
+    ;;
+esac
+exit 0
+"#,
+            calls = calls_log.display(),
+            usb = usb_alive_file.display()
+        );
+        std::fs::write(&fake_adb, script).unwrap();
+        std::fs::set_permissions(&fake_adb, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let adb = crate::adb::Adb { path: fake_adb };
+        let device = super::Device {
+            transport: "STEPX_TTL_USB_SER".into(),
+            serial: "STEPX_TTL_USB_SER".into(),
+            model: "PZ261A".into(),
+            android: "16".into(),
+            product: "pandora".into(),
+        };
+        device.set_backup_transports(vec!["10.0.1.188:38888".into()]);
+        assert!(device.has_usb_and_wireless());
+        assert_eq!(
+            device.all_known_transports(),
+            vec![
+                "STEPX_TTL_USB_SER".to_string(),
+                "10.0.1.188:38888".to_string()
+            ]
+        );
+
+        super::invalidate_verified_transport("STEPX_TTL_USB_SER");
+        std::fs::write(&calls_log, "").unwrap();
+
+        // First call probes getprop ro.serialno and populates 3.5s TTL cache
+        let t1 = device.resolve_active_transport(&adb).unwrap();
+        assert_eq!(t1, "STEPX_TTL_USB_SER");
+        let calls1 = std::fs::read_to_string(&calls_log).unwrap_or_default();
+        assert_eq!(calls1.lines().count(), 1);
+
+        // Second call within 3.5s hits 0ms TTL fast path without spawning adb
+        let t2 = device.resolve_active_transport(&adb).unwrap();
+        assert_eq!(t2, "STEPX_TTL_USB_SER");
+        let calls2 = std::fs::read_to_string(&calls_log).unwrap_or_default();
+        assert_eq!(
+            calls2.lines().count(),
+            1,
+            "second resolve within 3.5s TTL must not spawn adb: {calls2}"
+        );
+
+        // Simulate USB unplug + cache invalidation -> fails over and promotes wireless transport
+        std::fs::write(&usb_alive_file, "0").unwrap();
+        super::invalidate_verified_transport("STEPX_TTL_USB_SER");
+        let t3 = device.resolve_active_transport(&adb).unwrap();
+        assert_eq!(t3, "10.0.1.188:38888");
+        assert_eq!(device.active_transport_cached(), "10.0.1.188:38888");
+        assert_eq!(
+            super::current_active_transport_for_serial("STEPX_TTL_USB_SER").as_deref(),
+            Some("10.0.1.188:38888")
+        );
+
+        // Verify two different PZ261A serials do not collide via shared model:PZ261A key
+        let dev_a = super::Device {
+            transport: "STEPX_SER_A".into(),
+            serial: "STEPX_SER_A".into(),
+            model: "PZ261A".into(),
+            android: "16".into(),
+            product: "pandora".into(),
+        };
+        let dev_b = super::Device {
+            transport: "STEPX_SER_B".into(),
+            serial: "STEPX_SER_B".into(),
+            model: "PZ261A".into(),
+            android: "16".into(),
+            product: "pandora".into(),
+        };
+        dev_a.set_backup_transports(vec!["10.0.1.101:5555".into()]);
+        dev_b.set_backup_transports(vec!["10.0.1.102:5555".into()]);
+        assert_eq!(
+            dev_a.backup_transports(),
+            vec!["10.0.1.101:5555".to_string()]
+        );
+        assert_eq!(
+            dev_b.backup_transports(),
+            vec!["10.0.1.102:5555".to_string()]
+        );
+    }
 }

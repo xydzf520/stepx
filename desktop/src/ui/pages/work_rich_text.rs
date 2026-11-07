@@ -187,12 +187,81 @@ fn sanitize_links(line: &mut FormattedTextLine) {
     }
 }
 
+fn formatted_line_char_count(line: &FormattedTextLine) -> usize {
+    match line {
+        FormattedTextLine::Heading(header) => {
+            header.text.iter().map(|f| f.text.chars().count()).sum()
+        }
+        FormattedTextLine::Line(fragments) => {
+            fragments.iter().map(|f| f.text.chars().count()).sum()
+        }
+        FormattedTextLine::TaskList(task) => {
+            task.text.iter().map(|f| f.text.chars().count()).sum()
+        }
+        FormattedTextLine::OrderedList(list) => {
+            let prefix_chars = format!("{}. ", list.number.unwrap_or(1)).chars().count();
+            prefix_chars
+                + list
+                    .indented_text
+                    .text
+                    .iter()
+                    .map(|f| f.text.chars().count())
+                    .sum::<usize>()
+        }
+        FormattedTextLine::UnorderedList(list) => {
+            3 + list.text.iter().map(|f| f.text.chars().count()).sum::<usize>()
+        }
+        FormattedTextLine::CodeBlock(code) => code.code.chars().count(),
+        FormattedTextLine::Table(table) => table
+            .headers
+            .iter()
+            .chain(table.rows.iter().flatten())
+            .flat_map(|cell| cell.iter())
+            .map(|f| f.text.chars().count())
+            .sum(),
+        FormattedTextLine::Image(_)
+        | FormattedTextLine::HorizontalRule
+        | FormattedTextLine::LineBreak
+        | FormattedTextLine::Embedded(_) => 0,
+    }
+}
+
+fn block_char_count(block: &RichBlock) -> usize {
+    let text = match block {
+        RichBlock::Markdown(text) | RichBlock::Quote(text) => text,
+    };
+    text.lines.iter().map(formatted_line_char_count).sum()
+}
+
+fn segment_bloom(
+    char_offset: &mut usize,
+    seg_chars: usize,
+    bloom: Option<GlyphBloomSchedule>,
+) -> Option<GlyphBloomSchedule> {
+    let start = *char_offset;
+    let end = start + seg_chars;
+    *char_offset = end;
+    let schedule = bloom?;
+    if seg_chars == 0 || end <= schedule.reveal_start_char {
+        return None;
+    }
+    let local_start = schedule.reveal_start_char.saturating_sub(start);
+    let skipped = start.saturating_sub(schedule.reveal_start_char);
+    Some(GlyphBloomSchedule {
+        reveal_start_char: local_start,
+        elapsed_ms: (schedule.elapsed_ms - skipped as f32 * schedule.stagger_ms).max(0.0),
+        stagger_ms: schedule.stagger_ms,
+        duration_ms: schedule.duration_ms,
+    })
+}
+
 impl Companion {
     fn work_formatted(
         &self,
         text: FormattedText,
         weight: Option<Weight>,
         alignment: TextAlignment,
+        bloom: Option<GlyphBloomSchedule>,
     ) -> El {
         let p = self.p();
         let mut element = FormattedTextElement::new(
@@ -216,6 +285,8 @@ impl Companion {
         .with_hyperlink_font_color(p.blue)
         .with_inline_code_properties(Some(p.text), Some(p.surface))
         .with_alignment(alignment)
+        .with_optical_dark_weight(p.is_dark)
+        .with_glyph_bloom(bloom)
         .register_default_click_handlers_with_action_support(|link, ctx, _| {
             if let HyperlinkLens::Url(url) = link {
                 if safe_link(url) {
@@ -226,12 +297,18 @@ impl Companion {
             }
         });
         if let Some(weight) = weight {
-            element = element.with_weight(weight);
+            element = element.with_weight(p.optical_weight(weight));
         }
         element.finish()
     }
 
-    fn work_markdown_table(&self, table: &FormattedTable, id: &str) -> El {
+    fn work_markdown_table(
+        &self,
+        table: &FormattedTable,
+        id: &str,
+        char_offset: &mut usize,
+        bloom: Option<GlyphBloomSchedule>,
+    ) -> El {
         let p = self.p();
         let columns = table.headers.len().max(1);
         let key = format!("work-table-full-{id}");
@@ -245,6 +322,8 @@ impl Companion {
             let cells = (0..columns)
                 .map(|column| {
                     let content = row.get(column).cloned().unwrap_or_default();
+                    let cell_chars: usize = content.iter().map(|f| f.text.chars().count()).sum();
+                    let cell_bloom = segment_bloom(char_offset, cell_chars, bloom);
                     let alignment = match table.alignments.get(column) {
                         Some(TableAlignment::Center) => TextAlignment::Center,
                         Some(TableAlignment::Right) => TextAlignment::Right,
@@ -256,6 +335,7 @@ impl Companion {
                             FormattedText::new([FormattedTextLine::Line(content)]),
                             (row_index == 0).then_some(Weight::Semibold),
                             alignment,
+                            cell_bloom,
                         ))
                         .with_uniform_padding(S2)
                         .with_border(Border::right(1.).with_border_color(p.border))
@@ -282,6 +362,17 @@ impl Companion {
             );
         }
         if table.rows.len() > 12 {
+            if !expanded {
+                let skipped_chars: usize = table
+                    .rows
+                    .iter()
+                    .skip(row_limit)
+                    .flatten()
+                    .flat_map(|cell| cell.iter())
+                    .map(|f| f.text.chars().count())
+                    .sum();
+                *char_offset += skipped_chars;
+            }
             rows.push(self.button(
                 format!("{key}-toggle"),
                 if expanded {
@@ -298,31 +389,51 @@ impl Companion {
             .finish()
     }
 
-    fn work_markdown_lines(&self, text: &FormattedText, id: &str) -> El {
+    fn work_markdown_lines(
+        &self,
+        text: &FormattedText,
+        id: &str,
+        char_offset: &mut usize,
+        bloom: Option<GlyphBloomSchedule>,
+    ) -> El {
         let p = self.p();
         let mut elements = Vec::new();
         let mut lines = Vec::new();
-        let flush = |elements: &mut Vec<El>, lines: &mut Vec<FormattedTextLine>| {
+        let mut pending_chars = 0usize;
+        let flush = |elements: &mut Vec<El>,
+                     lines: &mut Vec<FormattedTextLine>,
+                     pending_chars: &mut usize,
+                     char_offset: &mut usize| {
             if !lines.is_empty() {
+                let seg_bloom = segment_bloom(char_offset, *pending_chars, bloom);
+                *pending_chars = 0;
                 elements.push(self.work_formatted(
                     FormattedText::new(std::mem::take(lines)),
                     None,
                     TextAlignment::Left,
+                    seg_bloom,
                 ));
             }
         };
         for (index, line) in text.lines.iter().enumerate() {
             match line {
                 FormattedTextLine::Table(table) => {
-                    flush(&mut elements, &mut lines);
-                    elements.push(self.work_markdown_table(table, &format!("{id}-{index}")));
+                    flush(&mut elements, &mut lines, &mut pending_chars, char_offset);
+                    elements.push(self.work_markdown_table(
+                        table,
+                        &format!("{id}-{index}"),
+                        char_offset,
+                        bloom,
+                    ));
                 }
                 FormattedTextLine::CodeBlock(code) => {
-                    flush(&mut elements, &mut lines);
+                    flush(&mut elements, &mut lines, &mut pending_chars, char_offset);
                     let body = code.code.clone();
+                    let code_chars = body.chars().count();
+                    let code_bloom = segment_bloom(char_offset, code_chars, bloom);
                     let line_count = body.lines().count();
                     let key = format!("work-code-expanded-{id}-{index}");
-                    let collapsible = line_count > 8 || body.chars().count() > 480;
+                    let collapsible = line_count > 8 || code_chars > 480;
                     let expanded = !collapsible || self.amoo_expanded_tool_records.contains(&key);
                     let mut contents = vec![self.between(
                         if collapsible {
@@ -350,6 +461,7 @@ impl Companion {
                             Text::new(body, self.mono_font, CAPTION)
                                 .with_color(p.text)
                                 .with_line_height_ratio(1.5)
+                                .with_glyph_bloom(code_bloom)
                                 .finish(),
                         );
                     }
@@ -363,11 +475,11 @@ impl Companion {
                     );
                 }
                 FormattedTextLine::HorizontalRule => {
-                    flush(&mut elements, &mut lines);
+                    flush(&mut elements, &mut lines, &mut pending_chars, char_offset);
                     elements.push(self.divider());
                 }
                 FormattedTextLine::Image(image) => {
-                    flush(&mut elements, &mut lines);
+                    flush(&mut elements, &mut lines, &mut pending_chars, char_offset);
                     let label = if image.alt_text.is_empty() {
                         "图片"
                     } else {
@@ -385,28 +497,57 @@ impl Companion {
                         None,
                     ));
                 }
-                other => lines.push(other.clone()),
+                other => {
+                    pending_chars += formatted_line_char_count(other);
+                    lines.push(other.clone());
+                }
             }
         }
-        flush(&mut elements, &mut lines);
+        flush(&mut elements, &mut lines, &mut pending_chars, char_offset);
         self.vstack(S3, elements)
     }
 
     pub(in super::super) fn work_rich_text(&self, body: &str, id: &str) -> El {
+        let bloom = self.reply_motion.take_render_bloom(id);
+        self.work_rich_text_bloom(body, id, bloom)
+    }
+
+    pub(in super::super) fn work_rich_text_bloom(
+        &self,
+        body: &str,
+        id: &str,
+        bloom: Option<GlyphBloomSchedule>,
+    ) -> El {
         let p = self.p();
         let blocks = RICH_TEXT_CACHE.with(|cache| cache.borrow_mut().get(body));
+        let adjusted_bloom = bloom.map(|mut schedule| {
+            let raw_total = body.chars().count();
+            let rendered_total: usize = blocks.iter().map(block_char_count).sum();
+            if rendered_total < raw_total {
+                let frontier = raw_total.saturating_sub(schedule.reveal_start_char);
+                schedule.reveal_start_char = rendered_total.saturating_sub(frontier);
+            }
+            schedule
+        });
+        let mut char_offset = 0usize;
         self.vstack(
             S3,
             blocks
                 .iter()
                 .enumerate()
                 .map(|(index, block)| match block {
-                    RichBlock::Markdown(text) => {
-                        self.work_markdown_lines(text, &format!("{id}-{index}"))
-                    }
-                    RichBlock::Quote(text) => Container::new(
-                        self.work_markdown_lines(text, &format!("{id}-quote-{index}")),
-                    )
+                    RichBlock::Markdown(text) => self.work_markdown_lines(
+                        text,
+                        &format!("{id}-{index}"),
+                        &mut char_offset,
+                        adjusted_bloom,
+                    ),
+                    RichBlock::Quote(text) => Container::new(self.work_markdown_lines(
+                        text,
+                        &format!("{id}-quote-{index}"),
+                        &mut char_offset,
+                        adjusted_bloom,
+                    ))
                     .with_uniform_padding(S3)
                     .with_background_color(p.surface)
                     .with_border(Border::left(3.).with_border_color(p.border_strong))
@@ -414,6 +555,15 @@ impl Companion {
                 })
                 .collect(),
         )
+    }
+
+    pub(in super::super) fn render_rich_message_bloom(
+        &self,
+        body: &str,
+        id: &str,
+        bloom: Option<GlyphBloomSchedule>,
+    ) -> El {
+        self.work_rich_text_bloom(body, id, bloom)
     }
 }
 
@@ -499,5 +649,22 @@ mod tests {
         sanitize_links(&mut line);
         assert!(line.hyperlinks(false).is_empty());
         assert!(line.raw_text().contains("unsafe"));
+    }
+    #[test]
+    fn segment_bloom_skips_settled_blocks_and_offsets_trailing_frontier() {
+        let schedule = Some(GlyphBloomSchedule {
+            reveal_start_char: 8,
+            elapsed_ms: 48.0,
+            stagger_ms: 16.0,
+            duration_ms: 90.0,
+        });
+        let mut offset = 0;
+        assert!(segment_bloom(&mut offset, 6, schedule).is_none());
+        let first_active = segment_bloom(&mut offset, 4, schedule).unwrap();
+        assert_eq!(first_active.reveal_start_char, 2);
+        assert_eq!(first_active.elapsed_ms, 48.0);
+        let second_active = segment_bloom(&mut offset, 5, schedule).unwrap();
+        assert_eq!(second_active.reveal_start_char, 0);
+        assert!((second_active.elapsed_ms - 16.0).abs() < 1e-3);
     }
 }
