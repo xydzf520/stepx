@@ -17,7 +17,7 @@ use metal::{
 use objc::{msg_send, sel, sel_impl};
 
 use facloud_ui_core::fonts::{canvas, RasterizedGlyph};
-use facloud_ui_core::scene::{CornerRadius, GlyphFade, Icon, Image, Layer, Scene};
+use facloud_ui_core::scene::{CornerRadius, Icon, Image, Layer, Scene};
 use pathfinder_color::{ColorF, ColorU};
 use pathfinder_geometry::{
     rect::RectF,
@@ -33,6 +33,10 @@ use std::{io::Write, os::raw::c_void};
 
 const METAL_LIB_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shaders.metallib"));
 static WRITE_LIB_TO_FILE: Once = Once::new();
+
+#[path = "glyph_fade.rs"]
+mod glyph_fade;
+use glyph_fade::glyph_fade_uniforms;
 
 /// A structure to help manage a single rendering pass.
 struct RenderPass<'a> {
@@ -647,10 +651,7 @@ impl<'a> Frame<'a> {
                 },
             ) {
                 Ok(Some(gto)) => {
-                    let (fade_start, fade_end) = match &glyph.fade {
-                        None => (&0.0, &-1.0),
-                        Some(GlyphFade::Horizontal { start, end }) => (start, end),
-                    };
+                    let (fade_start, fade_end) = glyph_fade_uniforms(glyph.fade, scale_factor);
 
                     // Adjust the horizontal position by the subpixel alignment
                     // so that we only shift the glyph over by the amount that
@@ -670,8 +671,8 @@ impl<'a> Frame<'a> {
                         uv_region.origin_y(),
                         uv_region.width(),
                         uv_region.height(),
-                        fade_start * scale_factor,
-                        fade_end * scale_factor,
+                        fade_start,
+                        fade_end,
                         glyph.color.to_f32().into(),
                         gto.is_emoji,
                     );
@@ -750,6 +751,7 @@ fn new_metal_buffer<T>(
         options,
     )
 }
+
 
 mod shader {
     #![allow(non_upper_case_globals)]
