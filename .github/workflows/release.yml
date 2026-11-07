@@ -97,6 +97,9 @@ jobs:
       - name: Runtime and updater tests
         if: ${{ !cancelled() }}
         run: python scripts/ci-platform-smoke.py
+      - name: macOS Retina text rendering regression
+        if: runner.os == 'macOS' && success()
+        run: python3 scripts/test-metal-glyph-fade.py
       - name: Isolated release homepage performance gate
         if: runner.os == 'Linux' && success()
         run: |
