@@ -1,3 +1,4 @@
+use stepx_companion::file_dialog::DialogKind;
 use super::*;
 use facloud_ui::{clipboard::ClipboardContent, TypedActionView};
 use stepx_companion::studio::{self, CloudLibrary, Work};
@@ -244,18 +245,26 @@ impl Companion {
                 }
             }
             StudioAction::ImportLocalFile => {
-                let picked = native_dialog::FileDialog::new()
-                    .set_title("导入本地作品到我的作品库")
-                    .add_filter(
-                        "作品与成果文件",
-                        &[
-                            "pptx", "ppt", "docx", "doc", "xlsx", "xls", "csv", "pdf", "html",
-                            "htm", "png", "jpg", "jpeg", "webp", "md", "txt",
-                        ],
-                    )
-                    .show_open_single_file();
-                match picked {
-                    Ok(Some(src)) if src.is_file() => {
+                let expected_device = self.selected.as_ref().map(|d| d.serial.clone());
+                let expected_scope = self.amoo_ui.account_scope.clone();
+                self.choose_path(
+                    stepx_companion::file_dialog::FileDialog::new()
+                        .set_title("导入本地作品到我的作品库")
+                        .add_filter(
+                            "作品与成果文件",
+                            &[
+                                "pptx", "ppt", "docx", "doc", "xlsx", "xls", "csv", "pdf", "html", "htm",
+                                "png", "jpg", "jpeg", "webp", "md", "txt",
+                            ],
+                        ),
+                    DialogKind::OpenFile,
+                    move |app, src, _| {
+                        app.ensure_file_dialog_device(&expected_device)?;
+                        anyhow::ensure!(
+                            app.amoo_ui.account_scope == expected_scope,
+                            "手机账号已变化，请重新导入作品"
+                        );
+                        anyhow::ensure!(src.is_file(), "所选作品文件已不存在，请重新选择");
                         let name = src
                             .file_name()
                             .and_then(|s| s.to_str())
@@ -266,16 +275,14 @@ impl Companion {
                             .and_then(|s| s.to_str())
                             .unwrap_or("")
                             .to_ascii_lowercase();
-                        let dest_dir =
-                            stepx_companion::resources::user_state().join("studio-imported");
+                        let dest_dir = stepx_companion::resources::user_state().join("studio-imported");
                         let _ = std::fs::create_dir_all(&dest_dir);
                         let dest_path = dest_dir.join(&name);
-                        let final_path =
-                            if src != dest_path && std::fs::copy(&src, &dest_path).is_ok() {
-                                dest_path
-                            } else {
-                                src.clone()
-                            };
+                        let final_path = if src != dest_path && std::fs::copy(&src, &dest_path).is_ok() {
+                            dest_path
+                        } else {
+                            src.clone()
+                        };
                         let kind = if matches!(ext.as_str(), "ppt" | "pptx") {
                             "PPT 演示"
                         } else if matches!(ext.as_str(), "xls" | "xlsx" | "csv") {
@@ -291,8 +298,8 @@ impl Companion {
                             "文档报告"
                         };
                         let mut task = stepx_companion::amoo_workspace::Task::new(
-                            self.selected.as_ref().map(|d| d.serial.clone()),
-                            self.amoo_ui.account_scope.clone(),
+                            app.selected.as_ref().map(|d| d.serial.clone()),
+                            app.amoo_ui.account_scope.clone(),
                         );
                         task.title = format!("本地导入 · {name}");
                         task.add_output(stepx_companion::amoo_workspace::Output {
@@ -301,22 +308,17 @@ impl Companion {
                             kind: kind.into(),
                             lab_id: None,
                         });
-                        self.workspace.journal.tasks.insert(0, task);
-                        let journal_path = stepx_companion::resources::user_state()
-                            .join("amoo-workspace/tasks.json");
-                        let _ = self.workspace.journal.save(&journal_path);
-                        self.studio.tab = 0;
-                        self.studio.source = 3;
-                        self.status = format!("已导入作品「{name}」到我的作品库");
-                        self.record_notice("我的作品", self.status.clone());
-                        self.motion_started = Instant::now();
-                    }
-                    Err(e) => {
-                        self.status = format!("导入失败：{e}");
-                        self.error = true;
-                    }
-                    _ => {}
-                }
+                        app.workspace.journal.tasks.insert(0, task);
+                        app.workspace_persist();
+                        app.studio.tab = 0;
+                        app.studio.source = 3;
+                        app.status = format!("已导入作品「{name}」到我的作品库");
+                        app.record_notice("我的作品", app.status.clone());
+                        app.motion_started = Instant::now();
+
+                        Ok(())
+                    },
+                );
             }
             StudioAction::SetFilter(f) => {
                 self.studio.filter = (*f).min(2);
@@ -777,7 +779,7 @@ impl Companion {
             StudioAction::SaveQr => {
                 if let Some((_, path)) = self.studio.qr.clone() {
                     self.submit("正在导出分享二维码…", move |_| {
-                        let destination = native_dialog::FileDialog::new()
+                        let destination = stepx_companion::file_dialog::FileDialog::new()
                             .set_filename("Studio-作品二维码.png")
                             .add_filter("PNG", &["png"])
                             .show_save_single_file()?;

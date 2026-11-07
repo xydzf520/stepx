@@ -1,6 +1,6 @@
 //! Conventional context actions, sharing the same validation as keyboard/buttons.
 use super::{theme::*, widgets::*, *};
-use facloud_ui::{color::ColorU, platform::Cursor, TypedActionView};
+use facloud_ui::{color::ColorU, fonts::Weight, platform::Cursor, TypedActionView};
 
 fn mix_color(a: ColorU, b: ColorU, t: f32) -> ColorU {
     let t = t.clamp(0.0, 1.0);
@@ -19,6 +19,248 @@ fn mix_color(a: ColorU, b: ColorU, t: f32) -> ColorU {
     }
     ColorU::new(mix(a.r, b.r), mix(a.g, b.g), mix(a.b, b.b), mix(a.a, b.a))
 }
+#[allow(non_upper_case_globals)]
+impl icons::UiIcon {
+    const FileText: Self = Self::ScanText;
+    const Eye: Self = Self::Lock;
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ContextMenuEntry {
+    pub(super) label: String,
+    pub(super) key: String,
+    pub(super) action: Option<Action>,
+    pub(super) icon: icons::UiIcon,
+    pub(super) is_danger: bool,
+    pub(super) separator_before: bool,
+}
+
+fn classify_context_entry(label: &str, action: Option<&Action>) -> (icons::UiIcon, bool, u8) {
+    use icons::UiIcon;
+    if label.starts_with("✓ 立即过期") || label.starts_with("🧹 一键清理") {
+        return (UiIcon::Check, false, 0);
+    }
+    if label.starts_with("⏱ 稍后提醒") {
+        return (UiIcon::Clock, false, 1);
+    }
+    if label.starts_with("⌛ ") {
+        return (UiIcon::Clock, false, 2);
+    }
+    if label.starts_with("✓ ⚙ ") || label.starts_with("⚙ ") {
+        return (UiIcon::Settings, false, 2);
+    }
+    if label.starts_with("🔕 屏蔽") {
+        return (UiIcon::Ban, true, 3);
+    }
+    if label.starts_with("🗂 打开首页提醒与过期管理") {
+        return (UiIcon::Layers, false, 4);
+    }
+    let is_otp = label.contains("复制验证码")
+        || label.starts_with("复制码值")
+        || matches!(action, Some(Action::Push(PushAction::CopyOtp(_))));
+    if is_otp {
+        return (UiIcon::Key, false, 0);
+    }
+
+    let is_danger = label.contains("删除")
+        || label.contains("移至回收站")
+        || label.contains("卸载")
+        || label.contains("移除")
+        || label.contains("清除")
+        || label.contains("清空");
+    if is_danger {
+        return (UiIcon::Trash, true, 3);
+    }
+
+    if label.contains("剪切") {
+        return (UiIcon::Edit, false, 1);
+    }
+    if label.contains("粘贴") {
+        return (UiIcon::Clipboard, false, 2);
+    }
+    if label.contains("复制") {
+        return (UiIcon::Copy, false, 2);
+    }
+    if label.starts_with("✓ ")
+        || label.contains("全选")
+        || label.contains("标为已读")
+        || label.contains("标为未读")
+        || label.contains("标记为已完成")
+        || label.contains("标记完成")
+        || label.contains("取消已完成")
+        || label.contains("设为未完")
+        || label.contains("启用此系统服务")
+    {
+        return (UiIcon::Check, false, 0);
+    }
+    if label.contains("设为过期") || label.contains("不再提醒") {
+        return (UiIcon::Clock, false, 1);
+    }
+    if label.contains("恢复有效提醒") || label.contains("恢复今日闹钟提醒") {
+        return (UiIcon::Restore, false, 1);
+    }
+    if label.contains("撤销") || label.contains("向左平移") || label.contains("返回上一级") {
+        return (
+            UiIcon::ArrowLeft,
+            false,
+            if label.contains("撤销") { 0 } else { 1 },
+        );
+    }
+    if label.contains("重做") || label.contains("向右平移") {
+        return (
+            UiIcon::ArrowRight,
+            false,
+            if label.contains("重做") { 0 } else { 1 },
+        );
+    }
+    if label.contains("向上平移") || label.contains("上滑解锁") {
+        return (UiIcon::ArrowUp, false, 1);
+    }
+    if label.contains("向下平移") || label.contains("下拉手机通知栏") {
+        return (UiIcon::ArrowDown, false, 1);
+    }
+    if label.contains("置顶") || label.contains("取消置顶") {
+        return (UiIcon::Pin, false, 0);
+    }
+    if label.contains("引用并继续提问")
+        || label.contains("切换至此对话")
+        || label.contains("查看所在对话")
+        || label.contains("仅聊天问答")
+    {
+        let group = if label.contains("切换至此对话") { 0 } else { 1 };
+        return (UiIcon::Chat, false, group);
+    }
+    if label.contains("Amoo") || label.contains("自动识别") || label.contains("智能") {
+        return (UiIcon::Sparkles, false, 1);
+    }
+    if label.contains("重新生成") || label.contains("重试") {
+        return (UiIcon::Retry, false, 1);
+    }
+    if label.contains("朗读") || label.contains("声音：") {
+        return (UiIcon::Speaker, false, 1);
+    }
+    if label.contains("重命名") || label.contains("修改") || label.contains("编辑") {
+        return (UiIcon::Edit, false, 1);
+    }
+    if label.contains("文本文件") || label.contains("处理文件") {
+        return (UiIcon::FileText, false, 2);
+    }
+    if label.contains("新建文件夹") || label.contains("新建") {
+        let group = if label.contains("在此目录新建") { 2 } else { 0 };
+        return (UiIcon::Plus, false, group);
+    }
+    if label.contains("日历")
+        || label.contains("日程")
+        || label.contains("顺延")
+        || label.contains("克隆日程")
+        || label.contains("快速添加：")
+    {
+        let group = if label.contains("快速添加：") { 0 } else { 1 };
+        return (UiIcon::Calendar, false, group);
+    }
+    if label.contains("闹钟") || label.contains("推迟 10 分钟") || label.contains("时钟应用") {
+        return (UiIcon::Clock, false, 1);
+    }
+    if label.contains("下载")
+        || label.contains("保存到电脑")
+        || label.contains("导出")
+        || label.contains("另存")
+        || label.contains("保存截图")
+    {
+        return (UiIcon::Download, false, 2);
+    }
+    if label.contains("上传") || label.contains("导入") {
+        return (UiIcon::Upload, false, 2);
+    }
+    if label.contains("文件夹")
+        || label.contains("文件管理器")
+        || label.contains("目录")
+        || label.contains("文件管理")
+    {
+        return (UiIcon::Folder, false, 0);
+    }
+    if label.contains("全屏") || label.contains("预览") {
+        return (UiIcon::Maximize, false, 0);
+    }
+    if label.contains("旋转") || label.contains("刷新") || label.contains("同步") {
+        return (UiIcon::Refresh, false, 1);
+    }
+    if label.contains("反色") {
+        return (UiIcon::Contrast, false, 1);
+    }
+    if label.contains("背屏") || label.contains("像素") || label.contains("点阵") {
+        let group = if label.contains("立即应用") || label.contains("关联到背屏") {
+            0
+        } else {
+            1
+        };
+        return (UiIcon::Matrix, false, group);
+    }
+    if label.contains("还原") {
+        return (UiIcon::Restore, false, 0);
+    }
+    if label.contains("拨打") || label.contains("回拨") || label.contains("拨号盘") {
+        let group = if label.contains("立即拨打") || label.contains("填入拨号盘") {
+            0
+        } else {
+            1
+        };
+        return (UiIcon::Phone, false, group);
+    }
+    if label.contains("短信") {
+        return (UiIcon::Sms, false, 1);
+    }
+    if label.contains("收藏") || label.contains("默认连接设备") {
+        let group = if label.contains("默认连接设备") { 0 } else { 1 };
+        return (UiIcon::Star, false, group);
+    }
+    if label.contains("强行停止") || label.contains("停止") || label.contains("停用") {
+        return (UiIcon::Ban, false, 1);
+    }
+    if label.contains("查看应用详情与权限") || matches!(action, Some(Action::InspectApp(_))) {
+        return (UiIcon::Settings, false, 0);
+    }
+    if label.contains("设置") || label.contains("详情与权限") {
+        return (UiIcon::Settings, false, 1);
+    }
+    if label.contains("截图") || label.contains("截取") {
+        return (UiIcon::Camera, false, 2);
+    }
+    if label.contains("制作应用") || label.contains("小游戏") {
+        return (UiIcon::Apps, false, 0);
+    }
+    if label.contains("生成图片") || label.contains("海报") || label.contains("看图") {
+        return (UiIcon::Image, false, 0);
+    }
+    if label.contains("隐藏输入") || label.contains("显示输入") {
+        return (UiIcon::Eye, false, 2);
+    }
+    if label.contains("回到手机桌面") {
+        return (UiIcon::Home, false, 1);
+    }
+    if label.contains("投屏") {
+        return (UiIcon::Monitor, false, 0);
+    }
+    if label.contains("存储空间") {
+        return (UiIcon::Storage, false, 0);
+    }
+    if label.contains("扩容归档") {
+        return (UiIcon::Archive, false, 0);
+    }
+    if label.contains("手机") || label.contains("连接此设备") || label.contains("连接设备") {
+        let group = if label.contains("发送到手机") || label.contains("发送提醒到手机") {
+            1
+        } else {
+            0
+        };
+        return (UiIcon::Smartphone, false, group);
+    }
+    if label.contains("打开") || label.contains("浏览器") {
+        return (UiIcon::ExternalLink, false, 0);
+    }
+    (UiIcon::Tools, false, 1)
+}
+
 #[derive(Clone, Debug)]
 pub(super) enum StudioWorkTarget {
     WorkspaceOutput {
@@ -100,6 +342,7 @@ pub(super) enum Target {
         address: String,
         sender: String,
         body: String,
+        date_ms: i64,
         otp_code: Option<String>,
     },
     ImThread {
@@ -114,6 +357,7 @@ pub(super) enum Target {
         thread_id: String,
         package_name: String,
         title: String,
+        msg_id: String,
         sender: String,
         text: String,
         notification_key: String,
@@ -170,6 +414,9 @@ pub(super) enum Target {
     },
     BackScreenCanvas,
     FilesDirectory,
+    HomeReminder(pages::home::HomeReminderContextTarget),
+    HomeModule(pages::home::HomeModuleId),
+    HomeCanvas,
 }
 pub(super) struct Menu {
     pub(super) target: Target,
@@ -275,7 +522,13 @@ impl Companion {
                     .windows()
                     .platform_window(ctx.window_id())
                     .map(|w| w.size());
-                menu.at = clamp_menu_position(*at, count, window_size);
+                let menu_w = match &menu.target {
+                    Target::WorkspaceIntent(_) => 280.,
+                    Target::CalendarDate { .. } => 264.,
+                    Target::HomeReminder(_) | Target::HomeModule(_) | Target::HomeCanvas => 296.,
+                    _ => 248.,
+                };
+                menu.at = clamp_menu_position_with_width(*at, count, window_size, menu_w);
                 self.context_menu = Some(menu);
                 ctx.notify();
                 true
@@ -296,7 +549,7 @@ impl Companion {
                             .unwrap_or(if *direction > 0 { -1 } else { count as isize });
                         for _ in 0..count {
                             i = (i + *direction as isize).rem_euclid(count as isize);
-                            if entries[i as usize].2.is_some() {
+                            if entries[i as usize].action.is_some() {
                                 break;
                             }
                         }
@@ -308,8 +561,11 @@ impl Companion {
             }
             Action::ContextActivate => {
                 let next = self.context_menu.as_ref().and_then(|m| {
-                    m.selected
-                        .and_then(|i| self.context_entries(m).get(i).and_then(|e| e.2.clone()))
+                    m.selected.and_then(|i| {
+                        self.context_entries(m)
+                            .get(i)
+                            .and_then(|e| e.action.clone())
+                    })
                 });
                 if let Some(next) = next {
                     self.run_context_action(&next, ctx);
@@ -377,8 +633,8 @@ impl Companion {
         self.context_menu = None;
         self.handle_action(&next, ctx);
     }
-    fn context_entries(&self, menu: &Menu) -> Vec<(String, String, Option<Action>)> {
-        let mut entries: Vec<(String, String, Option<Action>)> = Vec::new();
+    pub(super) fn context_entries(&self, menu: &Menu) -> Vec<ContextMenuEntry> {
+        let mut raw_entries: Vec<(String, String, Option<Action>)> = Vec::new();
         let command = if cfg!(target_os = "macos") {
             "⌘"
         } else {
@@ -389,48 +645,46 @@ impl Companion {
         let cut_key = format!("{command}+X");
         let all_key = format!("{command}+A");
         let mut push = |label: &str, key: &str, action: Option<Action>| {
-            entries.push((label.to_string(), key.to_string(), action));
+            raw_entries.push((label.to_string(), key.to_string(), action));
         };
         match &menu.target {
             Target::WorkspaceIntent(_) => {
                 use stepx_companion::amoo_workspace::Intent;
-                return vec![
-                    (
-                        "自动识别（推荐）".into(),
-                        String::new(),
-                        Some(Action::Workspace(WorkspaceAction::Intent(Intent::Auto))),
-                    ),
-                    (
-                        "仅聊天问答".into(),
-                        String::new(),
-                        Some(Action::Workspace(WorkspaceAction::Intent(Intent::Chat))),
-                    ),
-                    (
-                        "处理文件（PPT / Word / 表格）".into(),
-                        String::new(),
-                        Some(Action::Workspace(WorkspaceAction::Intent(Intent::Files))),
-                    ),
-                    (
-                        "制作应用 / 小游戏".into(),
-                        String::new(),
-                        Some(Action::Workspace(WorkspaceAction::Intent(Intent::App))),
-                    ),
-                    (
-                        "生成图片 / 海报".into(),
-                        String::new(),
-                        Some(Action::Workspace(WorkspaceAction::Intent(Intent::Image))),
-                    ),
-                    (
-                        "生成背屏图案".into(),
-                        String::new(),
-                        Some(Action::Workspace(WorkspaceAction::Intent(Intent::Screen))),
-                    ),
-                    (
-                        "操作手机屏幕".into(),
-                        String::new(),
-                        Some(Action::AmooUi(AmooUiAction::GuiMode(true))),
-                    ),
-                ];
+                push(
+                    "自动识别（推荐）",
+                    "",
+                    Some(Action::Workspace(WorkspaceAction::Intent(Intent::Auto))),
+                );
+                push(
+                    "仅聊天问答",
+                    "",
+                    Some(Action::Workspace(WorkspaceAction::Intent(Intent::Chat))),
+                );
+                push(
+                    "处理文件（PPT / Word / 表格）",
+                    "",
+                    Some(Action::Workspace(WorkspaceAction::Intent(Intent::Files))),
+                );
+                push(
+                    "制作应用 / 小游戏",
+                    "",
+                    Some(Action::Workspace(WorkspaceAction::Intent(Intent::App))),
+                );
+                push(
+                    "生成图片 / 海报",
+                    "",
+                    Some(Action::Workspace(WorkspaceAction::Intent(Intent::Image))),
+                );
+                push(
+                    "生成背屏图案",
+                    "",
+                    Some(Action::Workspace(WorkspaceAction::Intent(Intent::Screen))),
+                );
+                push(
+                    "操作手机屏幕",
+                    "",
+                    Some(Action::AmooUi(AmooUiAction::GuiMode(true))),
+                );
             }
             Target::Input(i) => {
                 let f = &self.fields[*i];
@@ -880,10 +1134,26 @@ impl Companion {
                 title,
             } => {
                 if let Some(tid) = workspace_task_id {
+                    let is_pinned = self
+                        .workspace
+                        .journal
+                        .tasks
+                        .iter()
+                        .find(|t| &t.id == tid)
+                        .is_some_and(|t| t.pinned);
                     push(
                         "切换至此对话",
-                        "",
+                        "Enter",
                         Some(Action::Workspace(WorkspaceAction::Select(tid.clone()))),
+                    );
+                    push(
+                        if is_pinned {
+                            "取消置顶此对话"
+                        } else {
+                            "置顶此对话"
+                        },
+                        "",
+                        Some(Action::Workspace(WorkspaceAction::TogglePin(tid.clone()))),
                     );
                     push(
                         "复制全部对话内容",
@@ -899,24 +1169,61 @@ impl Companion {
                     );
                     push(
                         "删除此对话",
-                        "",
+                        "Delete",
                         Some(Action::Workspace(WorkspaceAction::Delete(tid.clone()))),
                     );
                 } else if let Some(idx) = phone_session_idx {
+                    let sess = self.amoo_sessions.get(*idx);
+                    let is_pinned = sess.is_some_and(|s| {
+                        self.workspace
+                            .journal
+                            .pinned_sessions
+                            .contains(&s.session_key)
+                    });
                     push(
                         "切换至此对话",
-                        "",
+                        "Enter",
                         Some(Action::Workspace(WorkspaceAction::PhoneSession(*idx))),
                     );
+                    if let Some(s) = sess {
+                        push(
+                            if is_pinned {
+                                "取消置顶此对话"
+                            } else {
+                                "置顶此对话"
+                            },
+                            "",
+                            Some(Action::Workspace(WorkspaceAction::TogglePin(format!(
+                                "phone:{}",
+                                s.session_key
+                            )))),
+                        );
+                        push(
+                            "复制全部对话内容",
+                            "",
+                            Some(Action::Workspace(WorkspaceAction::CopyTaskTranscript(
+                                format!("phone:{}", s.session_key),
+                            ))),
+                        );
+                    } else {
+                        push(
+                            "复制全部对话内容",
+                            "",
+                            Some(Action::CopyText(
+                                title.clone(),
+                                "已复制全部对话内容".into(),
+                            )),
+                        );
+                    }
                     push(
                         "复制对话标题",
                         "",
                         Some(Action::CopyText(title.clone(), "已复制对话标题".into())),
                     );
-                    if let Some(s) = self.amoo_sessions.get(*idx) {
+                    if let Some(s) = sess {
                         push(
                             "删除此对话",
-                            "",
+                            "Delete",
                             Some(Action::Workspace(WorkspaceAction::Delete(format!(
                                 "phone:{}",
                                 s.session_key
@@ -1095,6 +1402,38 @@ impl Companion {
                 last_body,
                 otp_code,
             } => {
+                let norm = stepx_companion::sms::normalize_address(address);
+                let addr_key = if norm.is_empty() {
+                    address.trim().to_string()
+                } else {
+                    norm
+                };
+                let pin_key =
+                    stepx_companion::desktop_notify::NotifyPreferences::sms_target_key(&addr_key);
+                let is_pinned = self.push.prefs.is_pinned(&pin_key);
+                let is_unread = self.push.prefs.manual_unread_targets.contains(&pin_key)
+                    || (!self.read_sms_addresses.contains(&addr_key)
+                        && self.sms.iter().any(|m| {
+                            stepx_companion::sms::normalize_address(&m.address) == addr_key
+                                && m.kind == 1
+                                && !m.read
+                        }));
+                push(
+                    if is_pinned { "取消置顶" } else { "置顶此对话" },
+                    "",
+                    (!addr_key.is_empty())
+                        .then(|| Action::Push(PushAction::TogglePinTarget(pin_key))),
+                );
+                push(
+                    if is_unread { "标为已读" } else { "标为未读" },
+                    "",
+                    (!address.is_empty()).then(|| {
+                        Action::Push(PushAction::ToggleThreadRead {
+                            is_im: false,
+                            target_id: address.clone(),
+                        })
+                    }),
+                );
                 if let Some(code) = otp_code {
                     push(
                         &format!("复制验证码 / 取件码：{code}"),
@@ -1155,11 +1494,38 @@ impl Companion {
                         ))),
                     );
                 }
+                push(
+                    "清空短信记录",
+                    "",
+                    (!address.is_empty()).then(|| {
+                        Action::Push(PushAction::ClearThreadMessages {
+                            is_im: false,
+                            target_id: address.clone(),
+                            package_name: "com.android.mms".into(),
+                            title: if name.is_empty() {
+                                address.clone()
+                            } else {
+                                name.clone()
+                            },
+                        })
+                    }),
+                );
+                push(
+                    "删除此对话",
+                    "Del",
+                    (!address.is_empty()).then(|| {
+                        Action::Push(PushAction::DeleteSmsThread {
+                            address: address.clone(),
+                            name: name.clone(),
+                        })
+                    }),
+                );
             }
             Target::SmsMessage {
                 address,
                 sender,
                 body,
+                date_ms,
                 otp_code,
             } => {
                 if let Some(code) = otp_code {
@@ -1177,6 +1543,17 @@ impl Companion {
                     &copy_key,
                     (!body.is_empty())
                         .then(|| Action::CopyText(body.clone(), "已复制短信全文".into())),
+                );
+                push(
+                    "引用回复",
+                    "",
+                    (!body.is_empty()).then(|| {
+                        Action::Push(PushAction::QuoteReply {
+                            is_im: false,
+                            sender: address.clone(),
+                            text: body.clone(),
+                        })
+                    }),
                 );
                 push(
                     "复制发件号码",
@@ -1209,14 +1586,52 @@ impl Companion {
                         Action::SendToAmoo(format!("请帮我处理来自「{sender}」的短信：\n{body}"))
                     }),
                 );
+                push(
+                    "删除此条短信",
+                    "Del",
+                    (!body.is_empty() || *date_ms > 0).then(|| {
+                        Action::Push(PushAction::DeleteSmsMessage {
+                            address: address.clone(),
+                            date_ms: *date_ms,
+                            body: body.clone(),
+                        })
+                    }),
+                );
             }
             Target::ImThread {
+                thread_id,
+                package_name,
                 title,
                 last_message,
                 notification_key,
                 otp_code,
-                ..
             } => {
+                let pin_key =
+                    stepx_companion::desktop_notify::NotifyPreferences::im_target_key(thread_id);
+                let is_pinned = self.push.prefs.is_pinned(&pin_key);
+                let is_unread = self
+                    .push
+                    .snapshot
+                    .threads
+                    .iter()
+                    .find(|t| &t.thread_id == thread_id)
+                    .is_some_and(|t| t.unread_count > 0);
+                push(
+                    if is_pinned { "取消置顶" } else { "置顶此对话" },
+                    "",
+                    (!thread_id.is_empty())
+                        .then(|| Action::Push(PushAction::TogglePinTarget(pin_key))),
+                );
+                push(
+                    if is_unread { "标为已读" } else { "标为未读" },
+                    "",
+                    (!thread_id.is_empty()).then(|| {
+                        Action::Push(PushAction::ToggleThreadRead {
+                            is_im: true,
+                            target_id: thread_id.clone(),
+                        })
+                    }),
+                );
                 if let Some(code) = otp_code {
                     push(
                         &format!("复制验证码 / 取件码：{code}"),
@@ -1264,14 +1679,39 @@ impl Companion {
                         ))),
                     );
                 }
+                push(
+                    "清空聊天记录",
+                    "",
+                    (!thread_id.is_empty()).then(|| {
+                        Action::Push(PushAction::ClearThreadMessages {
+                            is_im: true,
+                            target_id: thread_id.clone(),
+                            package_name: package_name.clone(),
+                            title: title.clone(),
+                        })
+                    }),
+                );
+                push(
+                    "删除此对话",
+                    "Del",
+                    (!thread_id.is_empty()).then(|| {
+                        Action::Push(PushAction::DeleteImThread {
+                            thread_id: thread_id.clone(),
+                            package_name: package_name.clone(),
+                            title: title.clone(),
+                        })
+                    }),
+                );
             }
             Target::ImMessage {
+                thread_id,
+                package_name,
                 title,
+                msg_id,
                 sender,
                 text,
                 notification_key,
                 otp_code,
-                ..
             } => {
                 if let Some(code) = otp_code {
                     push(
@@ -1288,6 +1728,17 @@ impl Companion {
                     &copy_key,
                     (!text.is_empty())
                         .then(|| Action::CopyText(text.clone(), "已复制消息全文".into())),
+                );
+                push(
+                    "引用回复",
+                    "",
+                    (!text.is_empty()).then(|| {
+                        Action::Push(PushAction::QuoteReply {
+                            is_im: true,
+                            sender: sender.clone(),
+                            text: text.clone(),
+                        })
+                    }),
                 );
                 if !notification_key.is_empty() {
                     push(
@@ -1316,6 +1767,18 @@ impl Companion {
                         Action::SendToAmoo(format!(
                             "请帮我处理或回复「{title} · {sender}」的消息：\n{text}"
                         ))
+                    }),
+                );
+                push(
+                    "删除此条消息",
+                    "Del",
+                    (!msg_id.is_empty() || !text.is_empty()).then(|| {
+                        Action::Push(PushAction::DeleteMessage {
+                            thread_id: thread_id.clone(),
+                            package_name: package_name.clone(),
+                            msg_id: msg_id.clone(),
+                            text: text.clone(),
+                        })
                     }),
                 );
             }
@@ -1377,15 +1840,12 @@ impl Companion {
                     .cloned();
                 if let Some(n) = notif {
                     let combined = format!("{} {}", n.title, n.text);
-                    if !self.push.prefs.privacy_mask {
-                        if let Some(code) = super::pages::sms::extract_verification_code(&combined)
-                        {
-                            push(
-                                &format!("复制验证码 / 取件码：{code}"),
-                                "",
-                                Some(Action::Push(PushAction::CopyOtp(code))),
-                            );
-                        }
+                    if let Some(code) = super::pages::sms::extract_verification_code(&combined) {
+                        push(
+                            &format!("复制验证码 / 取件码：{code}"),
+                            "",
+                            Some(Action::Push(PushAction::CopyOtp(code))),
+                        );
                     }
                     push(
                         "在手机上打开应用",
@@ -1428,6 +1888,18 @@ impl Companion {
                             n.app_name, n.title, n.text
                         ))),
                     );
+                    let app_label = if n.app_name.trim().is_empty() {
+                        stepx_companion::push::ImChannel::from_package(&n.package_name)
+                            .label()
+                            .to_string()
+                    } else {
+                        n.app_name.clone()
+                    };
+                    push(
+                        "只看该应用通知",
+                        "",
+                        Some(Action::Push(PushAction::SelectAppFilter(Some(app_label)))),
+                    );
                     push(
                         "清除此通知",
                         "Delete",
@@ -1438,8 +1910,19 @@ impl Companion {
             Target::App(pkg) => {
                 if let Some(app) = self.apps.iter().find(|a| &a.package == pkg) {
                     push(
-                        "在手机上打开应用",
+                        "查看应用详情与权限",
                         "Enter",
+                        Some(Action::InspectApp(Some(app.package.clone()))),
+                    );
+                    push(
+                        "投屏到电脑打开",
+                        "",
+                        (app.launchable && app.enabled)
+                            .then(|| Action::OpenAppInMirror(app.package.clone())),
+                    );
+                    push(
+                        "在手机上打开应用",
+                        "",
                         (app.launchable && app.enabled)
                             .then(|| Action::OpenApp(app.package.clone())),
                     );
@@ -1450,14 +1933,14 @@ impl Companion {
                             .then(|| Action::ForceStopApp(app.package.clone())),
                     );
                     push(
-                        "应用详情与权限设置",
-                        "",
-                        Some(Action::AppSettings(app.package.clone())),
-                    );
-                    push(
                         "导出安装包 (APK)…",
                         "",
                         Some(Action::ExportApp(app.package.clone())),
+                    );
+                    push(
+                        "在手机系统设置中打开",
+                        "",
+                        Some(Action::AppSettings(app.package.clone())),
                     );
                     push(
                         "复制应用包名",
@@ -1481,15 +1964,36 @@ impl Companion {
                     .back_screen
                     .completed_calendar_events
                     .contains(event_id);
+                let now_ms = chrono::Local::now().timestamp_millis();
+                let cal_key = format!("cal:{event_id}");
+                let sched_key = format!("schedule:{event_id}");
+                let is_suppressed = self.reminder_governance.is_any_key_suppressed(
+                    &[cal_key.clone(), sched_key.clone()],
+                    None,
+                    None,
+                    None,
+                    now_ms,
+                );
                 let ev = self
                     .back_screen
                     .stepos_suite
                     .calendar_events
                     .iter()
                     .find(|e| e.id == *event_id);
+                let event_title_or_default = ev
+                    .map(|e| e.title.clone())
+                    .filter(|t| !t.trim().is_empty())
+                    .unwrap_or_else(|| format!("日程 #{event_id}"));
+                push(
+                    "编辑日程…",
+                    "Enter",
+                    Some(Action::BackScreen(BackScreenAction::CalendarEditEvent(
+                        *event_id,
+                    ))),
+                );
                 push(
                     if done {
-                        "取消已完成标记"
+                        "设为未完成"
                     } else {
                         "标记为已完成"
                     },
@@ -1499,49 +2003,58 @@ impl Companion {
                     ))),
                 );
                 push(
-                    "编辑日程内容",
+                    if is_suppressed {
+                        "恢复有效提醒"
+                    } else {
+                        "设为过期 · 不再提醒"
+                    },
                     "",
-                    Some(Action::BackScreen(BackScreenAction::CalendarEditEvent(
-                        *event_id,
-                    ))),
+                    Some(if is_suppressed {
+                        let restore_key = if self.reminder_governance.is_key_suppressed(
+                            &sched_key,
+                            None,
+                            None,
+                            now_ms,
+                        ) {
+                            sched_key
+                        } else {
+                            cal_key
+                        };
+                        Action::HomeReminder(pages::home::HomeReminderAction::RestoreReminder(
+                            restore_key,
+                        ))
+                    } else {
+                        let spec =
+                            stepx_companion::home_reminder_governance::ReminderTargetSpec::new(
+                                cal_key,
+                                stepx_companion::home_reminder_governance::ReminderCategory::ScheduleAndMeeting,
+                                event_title_or_default,
+                            )
+                            .with_aliases([
+                                sched_key,
+                                format!("conflict:conflict-cal-{event_id}"),
+                            ]);
+                        Action::HomeReminder(pages::home::HomeReminderAction::ManualExpire(
+                            pages::home::HomeReminderContextTarget {
+                                spec,
+                                ..Default::default()
+                            },
+                        ))
+                    }),
                 );
                 push(
-                    "顺延至明天同一时间",
+                    "顺延至明天同一时间 (+1天)",
                     "",
                     Some(Action::BackScreen(
                         BackScreenAction::CalendarPostponeOneDay(*event_id),
                     )),
                 );
-                push(
-                    "克隆日程到明天",
-                    "",
-                    Some(Action::BackScreen(
-                        BackScreenAction::CalendarDuplicateToTomorrow(*event_id),
-                    )),
-                );
                 if let Some(e) = ev {
                     let summary = format!("{}（{}）", e.title, e.hm_label());
                     push(
-                        "复制日程内容",
-                        "",
-                        Some(Action::CopyText(
-                            summary.clone(),
-                            format!("已复制日程：{}", e.title),
-                        )),
-                    );
-                    push(
-                        "发送提醒到手机",
-                        "",
-                        Some(Action::BackScreen(
-                            BackScreenAction::CalendarSendReminderToPhone(*event_id),
-                        )),
-                    );
-                    push(
-                        "交给 Amoo 安排",
-                        "",
-                        Some(Action::Workspace(WorkspaceAction::SendScheduleToAmoo(
-                            summary,
-                        ))),
+                        "复制日程时间与标题",
+                        &copy_key,
+                        Some(Action::CopyText(summary, "已复制日程信息".into())),
                     );
                 }
                 push(
@@ -1553,8 +2066,38 @@ impl Companion {
                 );
             }
             Target::AlarmItem(alarm_id) => {
+                let now_ms = chrono::Local::now().timestamp_millis();
+                let alarm_key = format!("alarm:{alarm_id}");
+                let cap_key = format!("capsule:alarm-{alarm_id}");
+                let is_suppressed = self.reminder_governance.is_any_key_suppressed(
+                    &[alarm_key.clone(), cap_key.clone()],
+                    None,
+                    None,
+                    None,
+                    now_ms,
+                );
+                let alarm = self
+                    .back_screen
+                    .stepos_suite
+                    .alarms
+                    .iter()
+                    .find(|a| a.id == *alarm_id);
+                if let Some(alarm) = alarm {
+                    push(
+                        if alarm.enabled {
+                            "关闭此闹钟"
+                        } else {
+                            "开启此闹钟"
+                        },
+                        "",
+                        Some(Action::BackScreen(BackScreenAction::AlarmToggle(
+                            *alarm_id,
+                            !alarm.enabled,
+                        ))),
+                    );
+                }
                 push(
-                    "修改闹钟时间与标签…",
+                    "编辑闹钟时间与标签…",
                     "Enter",
                     Some(Action::BackScreen(BackScreenAction::AlarmEdit(*alarm_id))),
                 );
@@ -1565,39 +2108,57 @@ impl Companion {
                         *alarm_id, 10,
                     ))),
                 );
-                if let Some(alarm) = self
-                    .back_screen
-                    .stepos_suite
-                    .alarms
-                    .iter()
-                    .find(|a| a.id == *alarm_id)
-                {
-                    push(
-                        if alarm.enabled {
-                            "关闭闹钟"
+                push(
+                    if is_suppressed {
+                        "恢复今日闹钟提醒"
+                    } else {
+                        "今日不再提醒（设为过期）"
+                    },
+                    "",
+                    Some(if is_suppressed {
+                        let restore_key = if self.reminder_governance.is_key_suppressed(
+                            &cap_key,
+                            None,
+                            None,
+                            now_ms,
+                        ) {
+                            cap_key
                         } else {
-                            "开启闹钟"
-                        },
-                        "",
-                        Some(Action::BackScreen(BackScreenAction::AlarmToggle(
-                            *alarm_id,
-                            !alarm.enabled,
-                        ))),
-                    );
+                            alarm_key
+                        };
+                        Action::HomeReminder(pages::home::HomeReminderAction::RestoreReminder(
+                            restore_key,
+                        ))
+                    } else {
+                        let label = alarm
+                            .map(|a| format!("{} {}", a.time_label(), a.display_title()))
+                            .unwrap_or_else(|| format!("闹钟 #{alarm_id}"));
+                        let spec =
+                            stepx_companion::home_reminder_governance::ReminderTargetSpec::new(
+                                alarm_key,
+                                stepx_companion::home_reminder_governance::ReminderCategory::LiveTimer,
+                                label,
+                            )
+                            .with_aliases([cap_key]);
+                        Action::HomeReminder(pages::home::HomeReminderAction::ManualExpire(
+                            pages::home::HomeReminderContextTarget {
+                                spec,
+                                capsule_id: format!("alarm-{alarm_id}"),
+                                ..Default::default()
+                            },
+                        ))
+                    }),
+                );
+                if let Some(alarm) = alarm {
                     push(
                         "复制闹钟时间与标签",
-                        "",
+                        &copy_key,
                         Some(Action::CopyText(
                             format!("{} {}", alarm.time_label(), alarm.display_title()),
                             "已复制闹钟信息".into(),
                         )),
                     );
                 }
-                push(
-                    "在手机打开时钟应用",
-                    "",
-                    Some(Action::BackScreen(BackScreenAction::McpQuickOpenAlarm)),
-                );
                 push(
                     "删除此闹钟",
                     "Delete",
@@ -1765,6 +2326,11 @@ impl Companion {
                         label.clone(),
                         package.clone(),
                     ))),
+                );
+                push(
+                    "投屏到电脑打开",
+                    "",
+                    Some(Action::OpenAppInMirror(package.clone())),
                 );
                 push(
                     "在手机上打开应用",
@@ -1951,13 +2517,56 @@ impl Companion {
                 );
             }
             Target::CalendarDate { year, month, day } => {
+                use chrono::Datelike;
+                let now_local = chrono::Local::now();
+                let today = now_local.date_naive();
+                let now_ms = now_local.timestamp_millis();
                 let day_events: Vec<_> = self
                     .back_screen
                     .stepos_suite
                     .calendar_events
                     .iter()
-                    .filter(|ev| ev.date_ymd() == (*year, *month, *day))
+                    .filter(|ev| {
+                        ev.date_ymd() == (*year, *month, *day)
+                            && !stepx_companion::home_hub::any_synthetic_e2e_probe(&[
+                                &ev.title,
+                                &ev.location,
+                                &ev.description,
+                            ])
+                            && !ev.title.contains("StepX 日历网格验证")
+                            && !ev.title.contains("StepX E2E")
+                    })
                     .collect();
+                let target_date = chrono::NaiveDate::from_ymd_opt(*year, *month, *day);
+                let valid_day_events = day_events
+                    .iter()
+                    .filter(|ev| {
+                        if self.back_screen.completed_calendar_events.contains(&ev.id) {
+                            return false;
+                        }
+                        if self.reminder_governance.is_any_key_suppressed(
+                            &[format!("cal:{}", ev.id), format!("schedule:{}", ev.id)],
+                            None,
+                            None,
+                            None,
+                            now_ms,
+                        ) {
+                            return false;
+                        }
+                        match target_date {
+                            Some(d) if d > today => true,
+                            Some(d) if d == today => {
+                                ev.all_day
+                                    || (if ev.dtend > ev.dtstart {
+                                        ev.dtend
+                                    } else {
+                                        ev.dtstart + 3_600_000
+                                    }) > now_ms
+                            }
+                            _ => false,
+                        }
+                    })
+                    .count();
                 push(
                     &format!("在 {month:02}月{day:02}日 新建日程…"),
                     "Enter",
@@ -1965,84 +2574,11 @@ impl Companion {
                         BackScreenAction::CalendarStartCreateOnDate(*year, *month, *day),
                     )),
                 );
-                push(
-                    "快速添加：09:30 晨会同步",
-                    "",
-                    Some(Action::BackScreen(
-                        BackScreenAction::CalendarQuickAddOnDate {
-                            year: *year,
-                            month: *month,
-                            day: *day,
-                            title: "晨会与重点同步".into(),
-                            time: "09:30-10:00".into(),
-                        },
-                    )),
-                );
-                push(
-                    "快速添加：14:00 项目评审会",
-                    "",
-                    Some(Action::BackScreen(
-                        BackScreenAction::CalendarQuickAddOnDate {
-                            year: *year,
-                            month: *month,
-                            day: *day,
-                            title: "项目评审与讨论".into(),
-                            time: "14:00-15:00".into(),
-                        },
-                    )),
-                );
-                push(
-                    "快速添加：18:30 下班取件/待办",
-                    "",
-                    Some(Action::BackScreen(
-                        BackScreenAction::CalendarQuickAddOnDate {
-                            year: *year,
-                            month: *month,
-                            day: *day,
-                            title: "下班驿站取件与复盘".into(),
-                            time: "18:30-19:00".into(),
-                        },
-                    )),
-                );
-                push(
-                    "快速添加：全天重要提醒",
-                    "",
-                    Some(Action::BackScreen(
-                        BackScreenAction::CalendarQuickAddOnDate {
-                            year: *year,
-                            month: *month,
-                            day: *day,
-                            title: "全天重要事项提醒".into(),
-                            time: "09:00-18:00".into(),
-                        },
-                    )),
-                );
-                for ev in day_events.iter().take(3) {
-                    let short_title: String = ev.title.chars().take(12).collect();
+                if (*year, *month, *day) != (today.year(), today.month(), today.day()) {
                     push(
-                        &format!("修改日程：{} {}", ev.hm_label(), short_title),
+                        "回到「今天」",
                         "",
-                        Some(Action::BackScreen(BackScreenAction::CalendarEditEvent(
-                            ev.id,
-                        ))),
-                    );
-                    let toggle_prefix =
-                        if self.back_screen.completed_calendar_events.contains(&ev.id) {
-                            "设为未完"
-                        } else {
-                            "标记完成"
-                        };
-                    push(
-                        &format!("{toggle_prefix}：{short_title}"),
-                        "",
-                        Some(Action::BackScreen(BackScreenAction::CalendarToggleDone(
-                            ev.id,
-                        ))),
-                    );
-                    push(
-                        &format!("删除日程：{} {}", ev.hm_label(), short_title),
-                        "",
-                        Some(Action::BackScreen(BackScreenAction::CalendarDelete(ev.id))),
+                        Some(Action::BackScreen(BackScreenAction::CalendarToday)),
                     );
                 }
                 if !day_events.is_empty() {
@@ -2052,36 +2588,35 @@ impl Companion {
                         .collect::<Vec<_>>()
                         .join("\n");
                     push(
-                        &format!("复制当日 {} 项日程清单", day_events.len()),
-                        "",
-                        Some(Action::CopyText(
-                            summary,
-                            format!("已复制 {month:02}月{day:02}日 日程清单"),
-                        )),
-                    );
-                    push(
                         &format!(
-                            "清空 {month:02}月{day:02}日 全部 {} 项日程",
+                            "复制当日日程清单（{} 项有效 / 共 {} 项）",
+                            valid_day_events,
                             day_events.len()
                         ),
+                        &copy_key,
+                        Some(Action::CopyText(
+                            summary,
+                            format!(
+                                "已复制 {month:02}月{day:02}日 {} 项日程",
+                                day_events.len()
+                            ),
+                        )),
+                    );
+                }
+                push(
+                    "同步日历",
+                    "",
+                    Some(Action::BackScreen(BackScreenAction::InspectStepOsSuite)),
+                );
+                if !day_events.is_empty() {
+                    push(
+                        &format!("清空当日全部 {} 项日程", day_events.len()),
                         "Delete",
                         Some(Action::BackScreen(BackScreenAction::CalendarClearDay(
                             *year, *month, *day,
                         ))),
                     );
                 }
-                push(
-                    &format!("让 Amoo 规划 {month:02}月{day:02}日 行程"),
-                    "",
-                    Some(Action::Workspace(WorkspaceAction::SendScheduleToAmoo(
-                        format!("请帮我规划 {year}-{month:02}-{day:02} 的日程安排"),
-                    ))),
-                );
-                push(
-                    "同步系统与手机日历",
-                    "",
-                    Some(Action::BackScreen(BackScreenAction::InspectStepOsSuite)),
-                );
             }
             Target::BackScreenCanvas => {
                 push(
@@ -2125,120 +2660,416 @@ impl Companion {
                     Some(Action::BackScreen(BackScreenAction::Stop)),
                 );
             }
+            Target::HomeReminder(target) => {
+                use stepx_companion::home_reminder_governance::ReminderCategory;
+                if let Some((ref label, ref act)) = target.primary_action {
+                    push(label, "Enter", Some((**act).clone()));
+                }
+                if !target.otp_or_pickup_code.is_empty() {
+                    push(
+                        &format!("复制码值 {}", target.otp_or_pickup_code),
+                        &copy_key,
+                        Some(Action::CopyText(
+                            target.otp_or_pickup_code.clone(),
+                            format!("已复制码值 {}", target.otp_or_pickup_code),
+                        )),
+                    );
+                }
+                push(
+                    "✓ 立即过期 · 不再提醒",
+                    "Delete",
+                    Some(Action::HomeReminder(
+                        pages::home::HomeReminderAction::ManualExpire(target.clone()),
+                    )),
+                );
+                push(
+                    "⏱ 稍后提醒：30 分钟后",
+                    "",
+                    Some(Action::HomeReminder(
+                        pages::home::HomeReminderAction::SnoozeMinutes(target.clone(), 30),
+                    )),
+                );
+                push(
+                    "⏱ 稍后提醒：2 小时后",
+                    "",
+                    Some(Action::HomeReminder(
+                        pages::home::HomeReminderAction::SnoozeMinutes(target.clone(), 120),
+                    )),
+                );
+                push(
+                    "⏱ 稍后提醒：今晚 20:00",
+                    "",
+                    Some(Action::HomeReminder(
+                        pages::home::HomeReminderAction::SnoozeTonight20(target.clone()),
+                    )),
+                );
+                push(
+                    "⏱ 稍后提醒：明早 09:00",
+                    "",
+                    Some(Action::HomeReminder(
+                        pages::home::HomeReminderAction::SnoozeTomorrow09(target.clone()),
+                    )),
+                );
+                push(
+                    "⌛ 设为 1 小时后自动过期",
+                    "",
+                    Some(Action::HomeReminder(
+                        pages::home::HomeReminderAction::CustomExpireHours(target.clone(), 1),
+                    )),
+                );
+                push(
+                    "⌛ 设为 4 小时后自动过期",
+                    "",
+                    Some(Action::HomeReminder(
+                        pages::home::HomeReminderAction::CustomExpireHours(target.clone(), 4),
+                    )),
+                );
+                push(
+                    "⌛ 设为今日 24:00 自动过期",
+                    "",
+                    Some(Action::HomeReminder(
+                        pages::home::HomeReminderAction::CustomExpireTonight24(target.clone()),
+                    )),
+                );
+                let cur_ttl_mins = self
+                    .reminder_governance
+                    .effective_ttl_mins(target.spec.category);
+                let presets: &[(u32, &str)] = match target.spec.category {
+                    ReminderCategory::OtpCode => &[(15, "15分钟"), (30, "30分钟"), (60, "1小时")],
+                    ReminderCategory::TakeoutAndMobility => {
+                        &[(60, "1小时"), (120, "2小时"), (240, "4小时")]
+                    }
+                    ReminderCategory::ExpressPickup => {
+                        &[(720, "12小时"), (1440, "24小时"), (2880, "48小时")]
+                    }
+                    _ => &[(60, "1小时"), (240, "4小时"), (1440, "24小时")],
+                };
+                for &(mins, label_str) in presets {
+                    let prefix = if cur_ttl_mins == mins { "✓ ⚙" } else { "⚙" };
+                    push(
+                        &format!(
+                            "{prefix} 设「{}」默认过期为 {label_str}",
+                            target.spec.category.label()
+                        ),
+                        "",
+                        Some(Action::HomeReminder(
+                            pages::home::HomeReminderAction::SetCategoryTtlMins {
+                                category: target.spec.category,
+                                ttl_mins: Some(mins),
+                            },
+                        )),
+                    );
+                }
+                if !target.mute_source_key.is_empty() {
+                    push(
+                        &format!("🔕 屏蔽「{}」此类提醒", target.mute_source_label),
+                        "",
+                        Some(Action::HomeReminder(
+                            pages::home::HomeReminderAction::MuteSource {
+                                source_key: target.mute_source_key.clone(),
+                                label: target.mute_source_label.clone(),
+                            },
+                        )),
+                    );
+                }
+                push(
+                    "复制提醒标题与详情",
+                    "",
+                    Some(Action::CopyText(
+                        target.copy_text.clone(),
+                        format!("已复制「{}」", target.spec.title),
+                    )),
+                );
+                push(
+                    "发给 Amoo 跟进处理",
+                    "",
+                    Some(Action::SendToAmoo(target.amoo_prompt.clone())),
+                );
+                push(
+                    "🗂 打开首页提醒与过期管理…",
+                    "",
+                    Some(Action::HomeReminder(
+                        pages::home::HomeReminderAction::OpenGovernanceDrawer(true),
+                    )),
+                );
+            }
+            Target::HomeModule(mod_id) => {
+                for width in pages::home::HomeModuleWidth::ALL {
+                    push(&format!("{}宽度 · {}", if self.home_modules.module_width(*mod_id) == width { "✓ " } else { "" }, width.short_label()), "",
+                        Some(Action::HomeModule(pages::home::HomeModuleAction::SetModuleWidth(*mod_id, width))));
+                }
+                for height in pages::home::HomeModuleHeight::ALL {
+                    push(&format!("{}内容 · {}", if self.home_modules.module_height(*mod_id) == height { "✓ " } else { "" }, height.short_label()), "",
+                        Some(Action::HomeModule(pages::home::HomeModuleAction::SetModuleHeight(*mod_id, height))));
+                }
+                push("向前移动", "", Some(Action::HomeModule(pages::home::HomeModuleAction::MoveUp(*mod_id))));
+                push("向后移动", "", Some(Action::HomeModule(pages::home::HomeModuleAction::MoveDown(*mod_id))));
+                push("移到最前", "", Some(Action::HomeModule(pages::home::HomeModuleAction::MoveToTop(*mod_id))));
+                push("隐藏模块", "", Some(Action::HomeModule(pages::home::HomeModuleAction::RemoveModule(*mod_id))));
+                if !self.home_module_edit_mode {
+                    push("调整首页布局", "", Some(Action::HomeModule(pages::home::HomeModuleAction::SetEditMode(true))));
+                }
+            }
+            Target::HomeCanvas => {
+                push(
+                    "🗂 打开首页提醒与过期管理…",
+                    "",
+                    Some(Action::HomeReminder(
+                        pages::home::HomeReminderAction::OpenGovernanceDrawer(true),
+                    )),
+                );
+                push(
+                    "🧹 一键清理已结束提醒",
+                    "",
+                    Some(Action::HomeReminder(
+                        pages::home::HomeReminderAction::PurgeExpiredNow,
+                    )),
+                );
+                push("刷新首页全部数据", "", Some(Action::HomeRefreshAll));
+                push(
+                    if self.home_module_edit_mode {
+                        "完成首页模块编辑"
+                    } else {
+                        "调整首页模块布局…"
+                    },
+                    "",
+                    Some(Action::HomeModule(
+                        pages::home::HomeModuleAction::ToggleEditMode,
+                    )),
+                );
+                push(
+                    &format!("显示全部 {} 个首页模块", pages::home::HomeModuleId::ALL.len()),
+                    "",
+                    Some(Action::HomeModule(
+                        pages::home::HomeModuleAction::ShowAllModules,
+                    )),
+                );
+                push(
+                    "恢复首页默认布局",
+                    "",
+                    Some(Action::HomeModule(
+                        pages::home::HomeModuleAction::ResetDefault,
+                    )),
+                );
+            }
         }
-        entries
+        let is_intent = matches!(menu.target, Target::WorkspaceIntent(_));
+        let is_home_ctx = matches!(
+            menu.target,
+            Target::HomeReminder(_) | Target::HomeModule(_) | Target::HomeCanvas
+        );
+        let total = raw_entries.len();
+        let mut prev_group: Option<u8> = None;
+        let mut prev_danger = false;
+        raw_entries
+            .into_iter()
+            .enumerate()
+            .map(|(idx, (label, key, action))| {
+                let (icon, is_danger, group) = classify_context_entry(&label, action.as_ref());
+                let separator_before = if is_intent || idx == 0 {
+                    false
+                } else if is_home_ctx {
+                    prev_group != Some(group)
+                } else if is_danger && !prev_danger {
+                    true
+                } else if !is_danger && prev_danger {
+                    !label.starts_with("停止手机背屏")
+                } else if label.starts_with("在此目录新建文件夹") {
+                    true
+                } else if total >= 4 && prev_group == Some(0) && group > 0 {
+                    true
+                } else {
+                    false
+                };
+                prev_group = Some(group);
+                prev_danger = is_danger;
+                ContextMenuEntry {
+                    label,
+                    key,
+                    action,
+                    icon,
+                    is_danger,
+                    separator_before,
+                }
+            })
+            .collect()
     }
     pub(super) fn context_overlay(&self) -> Option<El> {
         let menu = self.context_menu.as_ref()?;
         let p = self.p();
         let entries = self.context_entries(menu);
         let is_intent = matches!(menu.target, Target::WorkspaceIntent(_));
-        let rows = entries
-            .into_iter()
-            .enumerate()
-            .map(|(i, (label, key, action))| {
-                let enabled = action.is_some();
-                let label = label.to_owned();
-                let key = key.to_owned();
-                let row = Hoverable::new(self.mouse_state(format!("context-{i}")), move |mouse| {
-                    let hovered = mouse.is_mouse_over_element();
-                    let t = if self.settings.value.reduced_motion {
-                        if hovered {
-                            1.0
-                        } else {
-                            0.0
-                        }
+        let mut rows: Vec<El> = Vec::with_capacity(entries.len() + 4);
+        for (i, entry) in entries.into_iter().enumerate() {
+            if entry.separator_before && i > 0 {
+                rows.push(
+                    Container::new(self.divider())
+                        .with_horizontal_padding(S2)
+                        .with_vertical_padding(3.)
+                        .finish(),
+                );
+            }
+            let enabled = entry.action.is_some();
+            let label = entry.label;
+            let key = entry.key;
+            let action = entry.action;
+            let icon = entry.icon;
+            let is_danger = entry.is_danger;
+            let row = Hoverable::new(self.mouse_state(format!("context-{i}")), move |mouse| {
+                let hovered = mouse.is_mouse_over_element();
+                let t = if self.settings.value.reduced_motion {
+                    if hovered {
+                        1.0
                     } else {
-                        mouse.hover_progress().clamp(0.0, 1.0)
-                    };
-                    let content = if is_intent {
-                        use stepx_companion::amoo_workspace::Intent;
-                        let description = [
-                            "按你说的内容自动判断，聊天或直接生成",
-                            "直接与手机 Amoo 对话、查信息，不生成文件",
-                            "整理资料，生成 PPT、Word 或 Excel 文件",
-                            "制作可试玩、可发手机的小应用与小游戏",
-                            "描述画面，生成图片或视觉海报",
-                            "描述图案，生成并推送到手机背屏点阵",
-                            "投屏接管手机屏幕，AI 自动点击滑动",
-                        ]
-                        .get(i)
-                        .copied()
-                        .unwrap_or("");
-                        let selected = [
-                            Some(Intent::Auto),
-                            Some(Intent::Chat),
-                            Some(Intent::Files),
-                            Some(Intent::App),
-                            Some(Intent::Image),
-                            Some(Intent::Screen),
-                            None,
-                        ]
-                        .get(i)
-                        .copied()
-                        .flatten()
-                            == Some(self.workspace.intent);
-                        let left = if self.workspace.viewport.y() < 560. || description.is_empty() {
-                            self.line(&label, BODY, p.text)
-                        } else {
-                            self.vstack(
-                                1.,
-                                vec![
-                                    self.line(&label, BODY, p.text),
-                                    self.line(description, MICRO, p.text3),
-                                ],
-                            )
-                        };
-                        self.between(
-                            left,
-                            if selected {
-                                self.ui_icon(icons::UiIcon::Check, 16., p.text)
-                            } else {
-                                self.line("", MICRO, p.text3)
-                            },
-                        )
-                    } else {
-                        self.between(
-                            self.line(&label, BODY, if enabled { p.text } else { p.text3 }),
-                            self.line(&key, MICRO, p.text3),
-                        )
-                    };
-                    let bg = if !enabled {
-                        ColorU::transparent_black()
-                    } else if mouse.is_clicked() {
-                        p.accent_soft
-                    } else if menu.selected == Some(i) {
-                        p.hover
-                    } else {
-                        mix_color(ColorU::transparent_black(), p.hover, t)
-                    };
-                    Container::new(content)
-                        .with_horizontal_padding(S3)
-                        .with_vertical_padding(if is_intent { S1 } else { S2 })
-                        .with_background_color(bg)
-                        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
-                        .finish()
-                })
-                .with_cursor(if enabled {
-                    Cursor::PointingHand
-                } else {
-                    Cursor::Arrow
-                })
-                .on_click(move |ctx, _, _| {
-                    if let Some(a) = &action {
-                        ctx.dispatch_typed_action(Action::ContextRun(Box::new(a.clone())));
+                        0.0
                     }
-                })
-                .finish();
-                SavePosition::new(row, &format!("context-choice-{i}"))
-                    .for_single_frame()
+                } else {
+                    mouse.hover_progress().clamp(0.0, 1.0)
+                };
+                let active = hovered || menu.selected == Some(i) || mouse.is_clicked();
+                let content = if is_intent {
+                    use stepx_companion::amoo_workspace::Intent;
+                    let description = [
+                        "按你说的内容自动判断，聊天或直接生成",
+                        "直接与手机 Amoo 对话、查信息，不生成文件",
+                        "整理资料，生成 PPT、Word 或 Excel 文件",
+                        "制作可试玩、可发手机的小应用与小游戏",
+                        "描述画面，生成图片或视觉海报",
+                        "描述图案，生成并推送到手机背屏点阵",
+                        "投屏接管手机屏幕，AI 自动点击滑动",
+                    ]
+                    .get(i)
+                    .copied()
+                    .unwrap_or("");
+                    let selected = [
+                        Some(Intent::Auto),
+                        Some(Intent::Chat),
+                        Some(Intent::Files),
+                        Some(Intent::App),
+                        Some(Intent::Image),
+                        Some(Intent::Screen),
+                        None,
+                    ]
+                    .get(i)
+                    .copied()
+                    .flatten()
+                        == Some(self.workspace.intent);
+                    let icon_color = if selected || active {
+                        p.accent
+                    } else {
+                        p.text2
+                    };
+                    let text_col = if self.workspace.viewport.y() < 560. || description.is_empty() {
+                        self.line_w(&label, BODY, p.text, Weight::Medium)
+                    } else {
+                        self.vstack(
+                            1.,
+                            vec![
+                                self.line_w(&label, BODY, p.text, Weight::Medium),
+                                self.line(description, MICRO, p.text3),
+                            ],
+                        )
+                    };
+                    let left = self.hstack(
+                        S2,
+                        vec![
+                            self.ui_icon(icon, 16., icon_color),
+                            Expanded::new(1., text_col).finish(),
+                        ],
+                    );
+                    self.between(
+                        left,
+                        if selected {
+                            self.ui_icon(icons::UiIcon::Check, 16., p.text)
+                        } else {
+                            self.line("", MICRO, p.text3)
+                        },
+                    )
+                } else {
+                    let (text_color, icon_color, key_color) = if !enabled {
+                        (p.text3, p.text3, p.text3)
+                    } else if is_danger {
+                        (p.danger, p.danger, mix_color(p.danger, p.text3, 0.35))
+                    } else {
+                        (
+                            p.text,
+                            if active { p.accent } else { p.text2 },
+                            p.text3,
+                        )
+                    };
+                    let display_label = label
+                        .strip_prefix("✓ ⚙ ")
+                        .or_else(|| label.strip_prefix("✓ "))
+                        .or_else(|| label.strip_prefix("⏱ "))
+                        .or_else(|| label.strip_prefix("⌛ "))
+                        .or_else(|| label.strip_prefix("⚙ "))
+                        .or_else(|| label.strip_prefix("🔕 "))
+                        .or_else(|| label.strip_prefix("🗂 "))
+                        .or_else(|| label.strip_prefix("🧹 "))
+                        .unwrap_or(&label);
+                    let left = self.hstack(
+                        S2,
+                        vec![
+                            self.ui_icon(icon, 15., icon_color),
+                            Expanded::new(
+                                1.,
+                                self.line_w(display_label, BODY, text_color, Weight::Medium),
+                            )
+                            .finish(),
+                        ],
+                    );
+                    if key.is_empty() {
+                        left
+                    } else {
+                        self.between(left, self.mono(&key, MICRO, key_color))
+                    }
+                };
+                let bg = if !enabled {
+                    ColorU::transparent_black()
+                } else if is_danger {
+                    if mouse.is_clicked() {
+                        mix_color(p.danger_soft, p.danger, 0.18)
+                    } else if menu.selected == Some(i) {
+                        p.danger_soft
+                    } else {
+                        mix_color(ColorU::transparent_black(), p.danger_soft, t)
+                    }
+                } else if mouse.is_clicked() {
+                    p.accent_soft
+                } else if menu.selected == Some(i) {
+                    p.hover
+                } else {
+                    mix_color(ColorU::transparent_black(), p.hover, t)
+                };
+                Container::new(content)
+                    .with_horizontal_padding(S3)
+                    .with_vertical_padding(if is_intent { S1 } else { S2 })
+                    .with_background_color(bg)
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
                     .finish()
             })
-            .collect();
+            .with_cursor(if enabled {
+                Cursor::PointingHand
+            } else {
+                Cursor::Arrow
+            })
+            .on_click(move |ctx, _, _| {
+                if let Some(a) = &action {
+                    ctx.dispatch_typed_action(Action::ContextRun(Box::new(a.clone())));
+                }
+            })
+            .finish();
+            let row = SavePosition::new(row, &format!("context-choice-{i}"))
+                .for_single_frame()
+                .finish();
+            rows.push(row);
+        }
         let menu_w = match menu.target {
             Target::WorkspaceIntent(_) => 280.,
-            Target::CalendarDate { .. } => 264.,
-            _ => 228.,
+            Target::CalendarDate { .. } => 296.,
+            Target::ScheduleEvent(_) | Target::AlarmItem(_) => 268.,
+            Target::HomeReminder(_) | Target::HomeModule(_) | Target::HomeCanvas => 296.,
+            _ => 248.,
         };
         let surface = self.fixed_w(
             menu_w,
@@ -2258,53 +3089,214 @@ impl Companion {
         } else {
             surface
         };
-        let dismiss = Hoverable::new(self.mouse_state("context-dismiss"), |_| {
-            Container::new(Empty::new().finish())
-                .with_background_color(ColorU::transparent_black())
-                .finish()
-        })
-        .on_mouse_down(|ctx, _, _| ctx.dispatch_typed_action(Action::ContextClose))
-        .on_right_click(|ctx, _, _| ctx.dispatch_typed_action(Action::ContextClose))
+        let card_bounds: std::rc::Rc<std::cell::Cell<Option<pathfinder_geometry::rect::RectF>>> =
+            std::rc::Rc::new(std::cell::Cell::new(None));
+        let tracked_surface = ContextMenuCardBounds {
+            child: surface,
+            bounds: card_bounds.clone(),
+        }
         .finish();
+        let positioned_surface = SavePosition::new(tracked_surface, "context-surface")
+            .for_single_frame()
+            .finish();
+        let overlay_stack = Stack::new()
+            .with_child(Align::new(Empty::new().finish()).finish())
+            .with_positioned_child(
+                positioned_surface,
+                if let Target::WorkspaceIntent(above) = menu.target {
+                    OffsetPositioning::offset_from_save_position_element(
+                        "workspace-intent-anchor",
+                        Vector2F::new(0., if above { -6. } else { 6. }),
+                        PositionedElementOffsetBounds::WindowByPosition,
+                        if above {
+                            PositionedElementAnchor::TopLeft
+                        } else {
+                            PositionedElementAnchor::BottomLeft
+                        },
+                        if above {
+                            ChildAnchor::BottomLeft
+                        } else {
+                            ChildAnchor::TopLeft
+                        },
+                    )
+                } else {
+                    OffsetPositioning::offset_from_parent(
+                        menu.at,
+                        ParentOffsetBounds::WindowByPosition,
+                        ParentAnchor::TopLeft,
+                        ChildAnchor::TopLeft,
+                    )
+                },
+            )
+            .finish();
         Some(
-            Stack::new()
-                .with_child(dismiss)
-                .with_positioned_child(
-                    SavePosition::new(surface, "context-surface")
-                        .for_single_frame()
-                        .finish(),
-                    if let Target::WorkspaceIntent(above) = menu.target {
-                        OffsetPositioning::offset_from_save_position_element(
-                            "workspace-intent-anchor",
-                            Vector2F::new(0., if above { -6. } else { 6. }),
-                            PositionedElementOffsetBounds::WindowByPosition,
-                            if above {
-                                PositionedElementAnchor::TopLeft
-                            } else {
-                                PositionedElementAnchor::BottomLeft
-                            },
-                            if above {
-                                ChildAnchor::BottomLeft
-                            } else {
-                                ChildAnchor::TopLeft
-                            },
-                        )
-                    } else {
-                        OffsetPositioning::offset_from_parent(
-                            menu.at,
-                            ParentOffsetBounds::WindowByPosition,
-                            ParentAnchor::TopLeft,
-                            ChildAnchor::TopLeft,
-                        )
-                    },
-                )
-                .finish(),
+            ContextMenuOverlayStack {
+                overlay_stack,
+                card_bounds,
+            }
+            .finish(),
         )
     }
 }
 
+struct ContextMenuCardBounds {
+    child: El,
+    bounds: std::rc::Rc<std::cell::Cell<Option<pathfinder_geometry::rect::RectF>>>,
+}
+
+impl facloud_ui::Element for ContextMenuCardBounds {
+    fn layout(
+        &mut self,
+        c: SizeConstraint,
+        ctx: &mut LayoutContext,
+        app: &facloud_ui::AppContext,
+    ) -> Vector2F {
+        self.child.layout(c, ctx, app)
+    }
+
+    fn after_layout(&mut self, ctx: &mut AfterLayoutContext, app: &facloud_ui::AppContext) {
+        self.child.after_layout(ctx, app);
+        if let (Some(origin), Some(sz)) = (self.child.origin(), self.child.size()) {
+            self.bounds.set(Some(pathfinder_geometry::rect::RectF::new(
+                pathfinder_geometry::vector::vec2f(origin.x(), origin.y()),
+                sz,
+            )));
+        }
+    }
+
+    fn paint(
+        &mut self,
+        origin: Vector2F,
+        ctx: &mut PaintContext,
+        app: &facloud_ui::AppContext,
+    ) {
+        if let Some(sz) = self.child.size() {
+            self.bounds
+                .set(Some(pathfinder_geometry::rect::RectF::new(origin, sz)));
+        }
+        self.child.paint(origin, ctx, app);
+    }
+
+    fn size(&self) -> Option<Vector2F> {
+        self.child.size()
+    }
+
+    fn origin(&self) -> Option<Point> {
+        self.child.origin()
+    }
+
+    fn dispatch_event(
+        &mut self,
+        event: &DispatchedEvent,
+        ctx: &mut EventContext,
+        app: &facloud_ui::AppContext,
+    ) -> bool {
+        self.child.dispatch_event(event, ctx, app)
+    }
+}
+
+struct ContextMenuOverlayStack {
+    overlay_stack: El,
+    card_bounds: std::rc::Rc<std::cell::Cell<Option<pathfinder_geometry::rect::RectF>>>,
+}
+
+impl ContextMenuOverlayStack {
+    fn point_in_overlay(&self, pos: Vector2F) -> bool {
+        let Some(rect) = self.card_bounds.get() else {
+            return true;
+        };
+        let margin = 6.0;
+        let min_x = rect.origin().x() - margin;
+        let max_x = rect.origin().x() + rect.width() + margin;
+        let min_y = rect.origin().y() - margin;
+        let max_y = rect.origin().y() + rect.height() + margin;
+        pos.x() >= min_x && pos.x() <= max_x && pos.y() >= min_y && pos.y() <= max_y
+    }
+}
+
+impl facloud_ui::Element for ContextMenuOverlayStack {
+    fn layout(
+        &mut self,
+        c: SizeConstraint,
+        ctx: &mut LayoutContext,
+        app: &facloud_ui::AppContext,
+    ) -> Vector2F {
+        self.overlay_stack.layout(c, ctx, app)
+    }
+
+    fn after_layout(&mut self, ctx: &mut AfterLayoutContext, app: &facloud_ui::AppContext) {
+        self.overlay_stack.after_layout(ctx, app);
+    }
+
+    fn paint(
+        &mut self,
+        origin: Vector2F,
+        ctx: &mut PaintContext,
+        app: &facloud_ui::AppContext,
+    ) {
+        self.overlay_stack.paint(origin, ctx, app);
+    }
+
+    fn size(&self) -> Option<Vector2F> {
+        self.overlay_stack.size()
+    }
+
+    fn origin(&self) -> Option<Point> {
+        self.overlay_stack.origin()
+    }
+
+    fn dispatch_event(
+        &mut self,
+        event: &DispatchedEvent,
+        ctx: &mut EventContext,
+        app: &facloud_ui::AppContext,
+    ) -> bool {
+        let pointer_pos = match event.raw_event() {
+            Event::ScrollWheel { position, .. }
+            | Event::MouseMoved { position, .. }
+            | Event::LeftMouseDown { position, .. }
+            | Event::LeftMouseUp { position, .. }
+            | Event::LeftMouseDragged { position, .. }
+            | Event::RightMouseDown { position, .. } => Some(*position),
+            _ => None,
+        };
+
+        if let Some(pos) = pointer_pos {
+            if self.point_in_overlay(pos) {
+                let _ = self.overlay_stack.dispatch_event(event, ctx, app);
+                return true;
+            }
+            match event.raw_event() {
+                Event::ScrollWheel { .. } => return true,
+                Event::LeftMouseDown { .. } => {
+                    ctx.dispatch_typed_action(Action::ContextClose);
+                    return true;
+                }
+                Event::RightMouseDown { .. } => {
+                    ctx.dispatch_typed_action(Action::ContextClose);
+                    return false;
+                }
+                _ => {
+                    let _ = self.overlay_stack.dispatch_event(event, ctx, app);
+                    return true;
+                }
+            }
+        }
+
+        self.overlay_stack.dispatch_event(event, ctx, app)
+    }
+}
+
 fn clamp_menu_position(at: Vector2F, item_count: usize, window_size: Option<Vector2F>) -> Vector2F {
-    const MENU_W: f32 = 218.0;
+    clamp_menu_position_with_width(at, item_count, window_size, 248.0)
+}
+
+fn clamp_menu_position_with_width(
+    at: Vector2F,
+    item_count: usize,
+    window_size: Option<Vector2F>,
+    menu_w: f32,
+) -> Vector2F {
     const ROW_H: f32 = 34.0;
     const PADDING_H: f32 = 16.0;
     const MARGIN: f32 = 8.0;
@@ -2312,7 +3304,7 @@ fn clamp_menu_position(at: Vector2F, item_count: usize, window_size: Option<Vect
     let Some(size) = window_size else {
         return Vector2F::new(at.x().max(MARGIN), at.y().max(MARGIN));
     };
-    let max_x = (size.x() - MENU_W - MARGIN).max(MARGIN);
+    let max_x = (size.x() - menu_w - MARGIN).max(MARGIN);
     let raw_y = if at.y() + est_h + MARGIN > size.y() && at.y() > est_h + MARGIN {
         at.y() - est_h
     } else {
@@ -2366,7 +3358,7 @@ mod intent_tests {
             6,
             Some(Vector2F::new(1024., 800.)),
         );
-        assert!(clamped.x() <= 1024. - 218. - 8.);
+        assert!(clamped.x() <= 1024. - 248. - 8.);
         assert!(clamped.y() < 760.);
     }
     #[test]
@@ -2385,11 +3377,12 @@ mod intent_tests {
         let cal_labels: Vec<String> = app
             .context_entries(&cal_menu)
             .into_iter()
-            .map(|(l, _, _)| l)
+            .map(|e| e.label)
             .collect();
         assert!(cal_labels.iter().any(|l| l.contains("新建日程")));
-        assert!(cal_labels.iter().any(|l| l.contains("快速添加：09:30")));
-        assert!(cal_labels.iter().any(|l| l.contains("让 Amoo 规划")));
+        assert!(cal_labels.iter().any(|l| l.contains("同步日历")));
+        assert!(!cal_labels.iter().any(|l| l.contains("快速添加")));
+        assert!(!cal_labels.iter().any(|l| l.contains("让 Amoo 规划")));
 
         let canvas_menu = Menu {
             target: Target::BackScreenCanvas,
@@ -2400,7 +3393,7 @@ mod intent_tests {
         let canvas_labels: Vec<String> = app
             .context_entries(&canvas_menu)
             .into_iter()
-            .map(|(l, _, _)| l)
+            .map(|e| e.label)
             .collect();
         assert!(canvas_labels.iter().any(|l| l == "反色当前点阵画布"));
         assert!(canvas_labels.iter().any(|l| l == "清空点阵画布"));
@@ -2414,7 +3407,7 @@ mod intent_tests {
         let dir_labels: Vec<String> = app
             .context_entries(&dir_menu)
             .into_iter()
-            .map(|(l, _, _)| l)
+            .map(|e| e.label)
             .collect();
         assert!(dir_labels.iter().any(|l| l == "新建文件夹…"));
         assert!(dir_labels.iter().any(|l| l == "新建文本文件…"));
@@ -2429,7 +3422,7 @@ mod intent_tests {
         let screen_labels: Vec<String> = app
             .context_entries(&screen_menu)
             .into_iter()
-            .map(|(l, _, _)| l)
+            .map(|e| e.label)
             .collect();
         assert!(screen_labels.iter().any(|l| l.contains("实时画面同步")));
         assert!(screen_labels.iter().any(|l| l.contains("独立高帧率投屏")));
@@ -2444,5 +3437,41 @@ mod intent_tests {
         assert!(screen_labels
             .iter()
             .any(|l| l.contains("一键点亮并上滑解锁")));
+    }
+
+    #[test]
+    fn context_entries_assign_icons_dividers_and_danger_styles() {
+        let mut app = Companion::new_for_test();
+        let mut t = stepx_companion::amoo_workspace::Task::new(None, None);
+        t.title = "测试对话".into();
+        let tid = t.id.clone();
+        app.workspace.journal.tasks.push(t);
+
+        let session_menu = Menu {
+            target: Target::ChatSession {
+                workspace_task_id: Some(tid),
+                phone_session_idx: None,
+                title: "测试对话".into(),
+            },
+            at: Vector2F::new(100., 100.),
+            text: None,
+            selected: None,
+        };
+        let entries = app.context_entries(&session_menu);
+        assert!(entries
+            .iter()
+            .any(|e| e.label == "切换至此对话" && e.icon == icons::UiIcon::Chat));
+        assert!(entries
+            .iter()
+            .any(|e| e.label == "置顶此对话" && e.icon == icons::UiIcon::Pin));
+        assert!(entries
+            .iter()
+            .any(|e| e.label == "复制全部对话内容" && e.icon == icons::UiIcon::Copy));
+        assert!(entries
+            .iter()
+            .any(|e| e.label == "删除此对话"
+                && e.icon == icons::UiIcon::Trash
+                && e.is_danger
+                && e.separator_before));
     }
 }

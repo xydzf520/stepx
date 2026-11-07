@@ -288,7 +288,7 @@ fn verify(p: &Path, j: &Value) -> Result<()> {
     );
     Ok(())
 }
-fn free_space(p: &Path) -> Result<u64> {
+pub(crate) fn free_space(p: &Path) -> Result<u64> {
     #[cfg(unix)]
     {
         use std::{ffi::CString, os::unix::ffi::OsStrExt};

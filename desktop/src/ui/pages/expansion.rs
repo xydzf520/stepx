@@ -140,7 +140,7 @@ impl Companion {
             self.hstack(
                 S2,
                 vec![
-                    self.ui_icon(UiIcon::Storage, 20., p.text),
+                    self.content_icon(UiIcon::Storage, 20., p.text),
                     self.heading("存储扩容"),
                 ],
             ),
@@ -330,7 +330,7 @@ impl Companion {
                                     self.hstack(
                                         S1,
                                         vec![
-                                            self.ui_icon(icon, 16., p.text2),
+                                            self.content_icon(icon, 16., p.text2),
                                             self.line(cat_label, CAPTION, p.text2),
                                         ],
                                     ),
@@ -578,7 +578,7 @@ impl Companion {
         let mut sections = vec![self.storage_mode_bar()];
         if e.settings {
             sections.push(self.between(
-                self.heading("设置自动迁移"),
+                self.section_heading(UiIcon::Storage, "设置自动迁移"),
                 self.text(format!("第 {} 步 / 共 3 步", e.step + 1), CAPTION, p.text2),
             ));
             sections.push(
@@ -625,7 +625,10 @@ impl Companion {
                                 self.panel(vec![
                                     self.hstack(
                                         S2,
-                                        vec![self.ui_icon(icon, 20., p.text), self.heading(name)],
+                                        vec![
+                                            self.content_icon(icon, 20., p.text),
+                                            self.heading(name),
+                                        ],
                                     ),
                                     self.text(note, CAPTION, p.text2),
                                     self.wrap(vec![if on {
@@ -649,23 +652,23 @@ impl Companion {
                             .finish(),
                         );
                     }
-                    sections.push(self.heading("选择要自动迁移的类型"));
+                    sections.push(self.section_heading(UiIcon::Folder, "选择要自动迁移的类型"));
                     sections.push(self.hstack(S3, cards));
                     sections.push(self.panel(vec![self.heading("什么时候迁移？"),self.wrap([(0,"写入完成后迁移"),(7,"保留最近 7 天"),(30,"保留最近 30 天")].into_iter().map(|(d,t)|self.ex_button(format!("exp-days-{d}"),t,EA::Days(d),if q["retentionDays"].as_u64().unwrap_or(7)==d{Btn::Primary}else{Btn::Secondary})).collect()),
                         self.text(if q["retentionDays"]==0{"文件停止写入至少 2 分钟后迁移；连接时新文件也会按此规则处理。"}else{"只迁移早于所选天数的文件。最近拍摄的照片和视频会继续留在手机，满期后再迁移。"},BODY,p.text2),
                         self.text("截图、应用缓存与隐藏文件不在自动迁移范围；恢复到手机的文件不会被重复迁移。",CAPTION,p.text3)]));
                 }
                 1 => {
-                    sections.push(self.panel(vec![self.heading("选择电脑上的原件保存位置"),self.text(e.draft_folder.as_ref().map(|f|f.join("StepX Storage").display().to_string()).unwrap_or_else(||"尚未选择保存文件夹".into()),BODY,p.text),
+                    sections.push(self.panel(vec![self.section_heading(UiIcon::Folder, "选择电脑上的原件保存位置"),self.text(e.draft_folder.as_ref().map(|f|f.join("StepX Storage").display().to_string()).unwrap_or_else(||"尚未选择保存文件夹".into()),BODY,p.text),
                         self.wrap(vec![self.ex_button("exp-folder","选择文件夹…",EA::Folder,Btn::Primary),if e.draft_folder.is_some(){self.ex_button("exp-open-folder","打开位置",EA::OpenFolder,Btn::Ghost)}else{self.disabled_button("打开位置")}]),
                         self.text("迁移后的原件保存在这里。请使用长期连接、空间充足的磁盘，并保留这个目录。",BODY,p.text2)]));
                     sections.push(self.panel(vec![
-                        self.heading("连接与权限"),
+                        self.section_heading(UiIcon::Shield, "连接与权限"),
                         if e.snapshot.online {
                             self.hstack(
                                 6.,
                                 vec![
-                                    self.ui_icon(UiIcon::Check, 14., p.success),
+                                    self.content_icon(UiIcon::Check, 14., p.success),
                                     self.line("手机已连接，USB 与无线 ADB 均可使用", BODY, p.text2),
                                 ],
                             )
@@ -676,7 +679,7 @@ impl Companion {
                             self.hstack(
                                 6.,
                                 vec![
-                                    self.ui_icon(UiIcon::Check, 14., p.success),
+                                    self.content_icon(UiIcon::Check, 14., p.success),
                                     self.line("手机已授予文件管理权限", BODY, p.text2),
                                 ],
                             )
@@ -768,7 +771,10 @@ impl Companion {
                 }
             }
             let view_switcher = self.wrap(switcher_btns);
-            sections.push(self.between(self.heading("已扩容文件 · 迁移记录"), view_switcher));
+            sections.push(self.between(
+                self.section_heading(UiIcon::Archive, "已扩容文件 · 迁移记录"),
+                view_switcher,
+            ));
             let total_cnt = all_files.len();
             let photos_cnt = all_files
                 .iter()
@@ -891,6 +897,9 @@ impl Companion {
             ]));
             let files_owned = self.expansion_filtered_files();
             let files: Vec<&Value> = files_owned.iter().collect();
+            let page_key = format!("expansion:{}:{}:{}:{}:{}",e.config.kind,e.config.filter,e.config.sort,e.config.descending,self.fields[F_GALLERY_SEARCH].text);
+            let range = self.list_page_range(&page_key,files.len(),40);
+            sections.push(self.list_page_controls(&page_key,files.len(),40));
             if files.is_empty() {
                 sections.push(self.panel(if all_files.is_empty() {
                     vec![
@@ -914,10 +923,10 @@ impl Companion {
                     ]
                 }));
             } else if e.gallery_grid_mode {
-                let limited: Vec<&Value> = files.iter().copied().take(e.limit).collect();
+                let limited: Vec<&Value> = files.iter().copied().skip(range.start).take(range.len()).collect();
                 sections.extend(self.expansion_timeline_gallery(&limited));
             } else {
-                for j in files.iter().take(e.limit) {
+                for j in files.iter().skip(range.start).take(range.len()) {
                     let id = label(j, "id");
                     let phone_rel = label(j, "path");
                     let is_archived = j["state"] == "archived";
@@ -936,7 +945,7 @@ impl Companion {
                     let icon = match j["kind"].as_str() {
                         Some("photos") => UiIcon::Image,
                         Some("videos") => UiIcon::Video,
-                        _ => UiIcon::File,
+                        _ => crate::ui::icon_style::file_content_icon(&phone_rel, false),
                     };
                     let mut actions = vec![
                         self.ex_button(
@@ -973,7 +982,7 @@ impl Companion {
                                 self.hstack(
                                     S2,
                                     vec![
-                                        self.ui_icon(icon, 20., p.text2),
+                                        self.content_icon(icon, 20., p.text2),
                                         self.heading(label(j, "name")),
                                     ],
                                 ),
@@ -1037,14 +1046,6 @@ impl Companion {
                         .finish(),
                     );
                 }
-            }
-            if files.len() > e.limit {
-                sections.push(self.wrap(vec![self.ex_button(
-                    "exp-more",
-                    "加载更多",
-                    EA::More,
-                    Btn::Secondary,
-                )]));
             }
         }
         let body = self.sub_enter(
@@ -1297,8 +1298,8 @@ impl Companion {
                 .finish()
         } else {
             let icon = match kind {
-                "videos" => UiIcon::Monitor,
-                "documents" => UiIcon::Folder,
+                "videos" => UiIcon::Video,
+                "documents" => crate::ui::icon_style::file_content_icon(&path_str, false),
                 "audiobooks" => UiIcon::Music,
                 "packages" => UiIcon::Package,
                 "photos" => UiIcon::Image,
@@ -1318,7 +1319,7 @@ impl Companion {
                             Flex::row()
                                 .with_main_axis_size(MainAxisSize::Max)
                                 .with_main_axis_alignment(MainAxisAlignment::Center)
-                                .with_child(self.ui_icon(icon, 28., p.text2))
+                                .with_child(self.content_icon(icon, 28., p.text2))
                                 .finish(),
                         )
                         .with_child(self.line(&path_str, MICRO, p.text3))

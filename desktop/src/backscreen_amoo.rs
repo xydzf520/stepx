@@ -440,6 +440,470 @@ fn abort_owned_session(bus: &mut AgentBus, key: &str) {
     }
 }
 
+/// StepOS 12 `AgentSprite` 24-state dot-matrix AI status states for the 17×23 physical backscreen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum AgentSpriteState {
+    Thinking,
+    Executing,
+    TaskRunning,
+    TaskSuccess,
+    TaskError,
+    AwaitingUserAuthorize,
+    Listening,
+    Speaking,
+    Nap,
+    Idle,
+    WakeUp,
+    Searching,
+    Analyzing,
+    Writing,
+    Coding,
+    Calling,
+    MusicPlaying,
+    TimerCountdown,
+    AlarmRinging,
+    NotificationAlert,
+    BatteryCharging,
+    LowBattery,
+    DoNotDisturb,
+    Celebrating,
+}
+
+impl Default for AgentSpriteState {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
+impl AgentSpriteState {
+    pub const ALL: [AgentSpriteState; 24] = [
+        Self::Thinking,
+        Self::Executing,
+        Self::TaskRunning,
+        Self::TaskSuccess,
+        Self::TaskError,
+        Self::AwaitingUserAuthorize,
+        Self::Listening,
+        Self::Speaking,
+        Self::Nap,
+        Self::Idle,
+        Self::WakeUp,
+        Self::Searching,
+        Self::Analyzing,
+        Self::Writing,
+        Self::Coding,
+        Self::Calling,
+        Self::MusicPlaying,
+        Self::TimerCountdown,
+        Self::AlarmRinging,
+        Self::NotificationAlert,
+        Self::BatteryCharging,
+        Self::LowBattery,
+        Self::DoNotDisturb,
+        Self::Celebrating,
+    ];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Thinking => "thinking",
+            Self::Executing => "executing",
+            Self::TaskRunning => "task_running",
+            Self::TaskSuccess => "task_success",
+            Self::TaskError => "task_error",
+            Self::AwaitingUserAuthorize => "awaiting_user_authorize",
+            Self::Listening => "listening",
+            Self::Speaking => "speaking",
+            Self::Nap => "nap",
+            Self::Idle => "idle",
+            Self::WakeUp => "wake_up",
+            Self::Searching => "searching",
+            Self::Analyzing => "analyzing",
+            Self::Writing => "writing",
+            Self::Coding => "coding",
+            Self::Calling => "calling",
+            Self::MusicPlaying => "music_playing",
+            Self::TimerCountdown => "timer_countdown",
+            Self::AlarmRinging => "alarm_ringing",
+            Self::NotificationAlert => "notification_alert",
+            Self::BatteryCharging => "battery_charging",
+            Self::LowBattery => "low_battery",
+            Self::DoNotDisturb => "do_not_disturb",
+            Self::Celebrating => "celebrating",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Thinking => "深度思考",
+            Self::Executing => "指令执行",
+            Self::TaskRunning => "任务运行",
+            Self::TaskSuccess => "任务成功",
+            Self::TaskError => "异常告警",
+            Self::AwaitingUserAuthorize => "等待授权",
+            Self::Listening => "语音聆听",
+            Self::Speaking => "语音播报",
+            Self::Nap => "小憩休眠",
+            Self::Idle => "待机呼吸",
+            Self::WakeUp => "灵动唤醒",
+            Self::Searching => "全局检索",
+            Self::Analyzing => "数据分析",
+            Self::Writing => "文档撰稿",
+            Self::Coding => "代码构建",
+            Self::Calling => "通话协同",
+            Self::MusicPlaying => "音乐律动",
+            Self::TimerCountdown => "倒计时中",
+            Self::AlarmRinging => "闹钟提醒",
+            Self::NotificationAlert => "重要通知",
+            Self::BatteryCharging => "闪充补能",
+            Self::LowBattery => "低电提醒",
+            Self::DoNotDisturb => "静默勿扰",
+            Self::Celebrating => "高光庆祝",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        let norm = key.trim().to_ascii_lowercase().replace('-', "_");
+        Self::ALL
+            .into_iter()
+            .find(|s| s.key() == norm)
+            .or_else(|| match norm.as_str() {
+                "running" => Some(Self::TaskRunning),
+                "success" | "done" => Some(Self::TaskSuccess),
+                "error" | "failed" => Some(Self::TaskError),
+                "authorize" | "auth" => Some(Self::AwaitingUserAuthorize),
+                "sleep" => Some(Self::Nap),
+                _ => None,
+            })
+    }
+}
+
+fn set_grid_px(grid: &mut [[u8; 23]; 17], x: i32, y: i32, val: u8) {
+    if (0..17).contains(&x) && (0..23).contains(&y) {
+        let ux = x as usize;
+        let uy = y as usize;
+        if !crate::device::is_backscreen_corner(ux, uy) {
+            grid[ux][uy] = val.min(5);
+        }
+    }
+}
+
+fn draw_amoo_base_head(grid: &mut [[u8; 23]; 17], y_off: i32, eyes_closed: bool, blink: bool) {
+    for x in 5..=11 {
+        set_grid_px(grid, x, 6 + y_off, 3);
+        set_grid_px(grid, x, 14 + y_off, 3);
+    }
+    for y in 8..=12 {
+        set_grid_px(grid, 3, y + y_off, 3);
+        set_grid_px(grid, 13, y + y_off, 3);
+    }
+    set_grid_px(grid, 4, 7 + y_off, 3);
+    set_grid_px(grid, 12, 7 + y_off, 3);
+    set_grid_px(grid, 4, 13 + y_off, 3);
+    set_grid_px(grid, 12, 13 + y_off, 3);
+    set_grid_px(grid, 8, 4 + y_off, 4);
+    set_grid_px(grid, 8, 5 + y_off, 3);
+
+    if eyes_closed || blink {
+        for x in 5..=7 {
+            set_grid_px(grid, x, 10 + y_off, 4);
+        }
+        for x in 9..=11 {
+            set_grid_px(grid, x, 10 + y_off, 4);
+        }
+    } else {
+        for dy in 9..=11 {
+            set_grid_px(grid, 6, dy + y_off, 5);
+            set_grid_px(grid, 10, dy + y_off, 5);
+        }
+    }
+}
+
+/// Generates a 17×23 dot-matrix frame (`grid[col][row]`, brightness `0..=5`) for the given
+/// `AgentSpriteState` and animation `tick`.
+pub fn sprite_frame_17x23(state: AgentSpriteState, tick: usize) -> [[u8; 23]; 17] {
+    let mut grid = [[0u8; 23]; 17];
+    let phase = tick % 12;
+    let blink = phase == 11;
+
+    match state {
+        AgentSpriteState::Thinking => {
+            draw_amoo_base_head(&mut grid, 1, false, blink);
+            let dots = [(5, 2), (8, 1), (11, 2), (13, 4)];
+            for (idx, &(dx, dy)) in dots.iter().enumerate() {
+                let b = if (tick + idx) % 4 == 0 { 5 } else { 2 };
+                set_grid_px(&mut grid, dx, dy, b);
+            }
+            for i in 0..3 {
+                let b = if (tick / 2) % 3 == i { 5 } else { 2 };
+                set_grid_px(&mut grid, 6 + (i as i32) * 2, 18, b);
+            }
+        }
+        AgentSpriteState::Executing | AgentSpriteState::TaskRunning => {
+            let bounce = if tick % 2 == 0 { 0 } else { -1 };
+            draw_amoo_base_head(&mut grid, bounce, false, false);
+            let bar_pos = (tick * 2) % 11;
+            for x in 3..=13 {
+                set_grid_px(&mut grid, x, 18, 1);
+            }
+            for dx in 0..3 {
+                set_grid_px(&mut grid, 3 + ((bar_pos + dx) % 11) as i32, 18, 5);
+                if matches!(state, AgentSpriteState::TaskRunning) {
+                    set_grid_px(&mut grid, 3 + ((bar_pos + dx) % 11) as i32, 19, 4);
+                }
+            }
+        }
+        AgentSpriteState::TaskSuccess | AgentSpriteState::Celebrating => {
+            let bounce = if matches!(state, AgentSpriteState::Celebrating) && tick % 2 == 1 {
+                -1
+            } else {
+                0
+            };
+            draw_amoo_base_head(&mut grid, bounce, false, false);
+            let check = [(5, 18), (6, 19), (7, 20), (8, 19), (9, 18), (10, 17), (11, 16)];
+            for &(cx, cy) in &check {
+                set_grid_px(&mut grid, cx, cy, 5);
+            }
+            if matches!(state, AgentSpriteState::Celebrating) || tick % 2 == 0 {
+                let b = if tick % 2 == 0 { 5 } else { 3 };
+                set_grid_px(&mut grid, 2, 4, b);
+                set_grid_px(&mut grid, 14, 4, b);
+                set_grid_px(&mut grid, 3, 19, 3);
+                set_grid_px(&mut grid, 13, 19, 3);
+            }
+        }
+        AgentSpriteState::TaskError => {
+            draw_amoo_base_head(&mut grid, 0, false, false);
+            let b = if tick % 2 == 0 { 5 } else { 3 };
+            for i in 0..5 {
+                set_grid_px(&mut grid, 6 + i, 16 + i, b);
+                set_grid_px(&mut grid, 10 - i, 16 + i, b);
+            }
+        }
+        AgentSpriteState::AwaitingUserAuthorize => {
+            draw_amoo_base_head(&mut grid, 0, false, blink);
+            for x in 6..=10 {
+                for y in 17..=20 {
+                    set_grid_px(&mut grid, x, y, 4);
+                }
+            }
+            set_grid_px(&mut grid, 7, 15, 3);
+            set_grid_px(&mut grid, 8, 15, 5);
+            set_grid_px(&mut grid, 9, 15, 3);
+            set_grid_px(&mut grid, 7, 16, 3);
+            set_grid_px(&mut grid, 9, 16, 3);
+            set_grid_px(&mut grid, 8, 18, if tick % 2 == 0 { 0 } else { 5 });
+        }
+        AgentSpriteState::Listening => {
+            draw_amoo_base_head(&mut grid, -1, false, false);
+            let heights = [2i32, 4, 5, 3, 5, 4, 2];
+            for (i, &h) in heights.iter().enumerate() {
+                let dyn_h = ((h as usize + tick + i) % 5).max(1) as i32;
+                let x = 5 + i as i32;
+                for dy in 0..dyn_h {
+                    set_grid_px(&mut grid, x, 20 - dy, 5);
+                }
+            }
+        }
+        AgentSpriteState::Speaking => {
+            draw_amoo_base_head(&mut grid, 0, false, false);
+            let mouth_open = (tick % 3) as i32;
+            for x in 7..=9 {
+                set_grid_px(&mut grid, x, 12, 5);
+                if mouth_open > 0 {
+                    set_grid_px(&mut grid, x, 13, 4);
+                }
+            }
+            let wave_r = (tick % 3) as i32;
+            set_grid_px(&mut grid, 2 - wave_r.min(1), 10, 4);
+            set_grid_px(&mut grid, 14 + wave_r.min(1), 10, 4);
+            set_grid_px(&mut grid, 8, 17 + wave_r, 4);
+        }
+        AgentSpriteState::Nap => {
+            draw_amoo_base_head(&mut grid, 2, true, true);
+            let z_shift = (tick % 3) as i32;
+            for dx in 0..3 {
+                set_grid_px(&mut grid, 11 + dx, 2 + (z_shift % 2), 4);
+                set_grid_px(&mut grid, 13 - dx, 2 + dx + (z_shift % 2), 4);
+                set_grid_px(&mut grid, 11 + dx, 4 + (z_shift % 2), 4);
+            }
+            set_grid_px(&mut grid, 9, 5, if tick % 2 == 0 { 3 } else { 1 });
+        }
+        AgentSpriteState::Idle => {
+            let y_off = if tick % 2 == 0 { 0 } else { 1 };
+            draw_amoo_base_head(&mut grid, y_off, false, blink);
+            set_grid_px(&mut grid, 8, 18, if tick % 2 == 0 { 4 } else { 2 });
+        }
+        AgentSpriteState::WakeUp => {
+            let y_off = if tick % 2 == 0 { -1 } else { 0 };
+            draw_amoo_base_head(&mut grid, y_off, false, false);
+            for &(rx, ry) in &[(4, 3), (8, 1), (12, 3), (2, 8), (14, 8)] {
+                set_grid_px(&mut grid, rx, ry, if tick % 2 == 0 { 5 } else { 2 });
+            }
+        }
+        AgentSpriteState::Searching => {
+            draw_amoo_base_head(&mut grid, 0, false, blink);
+            let lens_x = 5 + ((tick % 5) as i32);
+            set_grid_px(&mut grid, lens_x, 16, 5);
+            set_grid_px(&mut grid, lens_x + 1, 16, 5);
+            set_grid_px(&mut grid, lens_x, 17, 5);
+            set_grid_px(&mut grid, lens_x + 1, 17, 5);
+            set_grid_px(&mut grid, lens_x + 2, 18, 4);
+            set_grid_px(&mut grid, lens_x + 3, 19, 4);
+        }
+        AgentSpriteState::Analyzing => {
+            draw_amoo_base_head(&mut grid, 0, false, false);
+            let bars = [2i32, 4, 3, 5, 2];
+            for (i, &bh) in bars.iter().enumerate() {
+                let h = ((bh as usize + tick + i) % 5).max(1) as i32;
+                let x = 4 + (i as i32) * 2;
+                for dy in 0..h {
+                    set_grid_px(&mut grid, x, 20 - dy, 4);
+                }
+            }
+        }
+        AgentSpriteState::Writing => {
+            draw_amoo_base_head(&mut grid, 0, false, blink);
+            let pen_x = 4 + ((tick % 8) as i32);
+            for x in 4..=pen_x {
+                set_grid_px(&mut grid, x, 19, 3);
+            }
+            set_grid_px(&mut grid, pen_x, 18, 5);
+            set_grid_px(&mut grid, pen_x + 1, 17, 4);
+        }
+        AgentSpriteState::Coding => {
+            draw_amoo_base_head(&mut grid, 0, false, false);
+            // Draw `<` and `>` code brackets at bottom with blinking cursor
+            set_grid_px(&mut grid, 5, 17, 4);
+            set_grid_px(&mut grid, 4, 18, 5);
+            set_grid_px(&mut grid, 5, 19, 4);
+            set_grid_px(&mut grid, 11, 17, 4);
+            set_grid_px(&mut grid, 12, 18, 5);
+            set_grid_px(&mut grid, 11, 19, 4);
+            set_grid_px(&mut grid, 8, 18, if tick % 2 == 0 { 5 } else { 1 });
+        }
+        AgentSpriteState::Calling => {
+            let bounce = if tick % 2 == 0 { 0 } else { -1 };
+            draw_amoo_base_head(&mut grid, bounce, false, false);
+            set_grid_px(&mut grid, 2, 7, if tick % 2 == 0 { 5 } else { 2 });
+            set_grid_px(&mut grid, 14, 7, if tick % 2 == 0 { 2 } else { 5 });
+            for x in 6..=10 {
+                set_grid_px(&mut grid, x, 18, 4);
+            }
+        }
+        AgentSpriteState::MusicPlaying => {
+            let y_off = if tick % 2 == 0 { 0 } else { -1 };
+            draw_amoo_base_head(&mut grid, y_off, false, false);
+            let note_y = 18 - ((tick % 2) as i32);
+            set_grid_px(&mut grid, 5, note_y, 5);
+            set_grid_px(&mut grid, 6, note_y - 1, 4);
+            set_grid_px(&mut grid, 11, note_y - 1, 5);
+            set_grid_px(&mut grid, 12, note_y - 2, 4);
+        }
+        AgentSpriteState::TimerCountdown => {
+            draw_amoo_base_head(&mut grid, 0, false, false);
+            for x in 6..=10 {
+                set_grid_px(&mut grid, x, 16, 4);
+                set_grid_px(&mut grid, x, 20, 4);
+            }
+            set_grid_px(&mut grid, 7, 17, 3);
+            set_grid_px(&mut grid, 9, 17, 3);
+            set_grid_px(&mut grid, 8, 18, if tick % 2 == 0 { 5 } else { 2 });
+            set_grid_px(&mut grid, 7, 19, 3);
+            set_grid_px(&mut grid, 9, 19, 3);
+        }
+        AgentSpriteState::AlarmRinging => {
+            let shake_y = if tick % 2 == 0 { -1 } else { 1 };
+            draw_amoo_base_head(&mut grid, shake_y, false, false);
+            set_grid_px(&mut grid, 3, 4, if tick % 2 == 0 { 5 } else { 2 });
+            set_grid_px(&mut grid, 13, 4, if tick % 2 == 0 { 2 } else { 5 });
+            for x in 6..=10 {
+                set_grid_px(&mut grid, x, 18, 5);
+            }
+        }
+        AgentSpriteState::NotificationAlert => {
+            draw_amoo_base_head(&mut grid, 0, false, false);
+            let b = if tick % 2 == 0 { 5 } else { 2 };
+            set_grid_px(&mut grid, 8, 16, b);
+            set_grid_px(&mut grid, 8, 17, b);
+            set_grid_px(&mut grid, 8, 18, b);
+            set_grid_px(&mut grid, 8, 20, 5);
+        }
+        AgentSpriteState::BatteryCharging => {
+            draw_amoo_base_head(&mut grid, 0, false, blink);
+            let fill = ((tick % 4) + 1) as i32;
+            for x in 5..=11 {
+                set_grid_px(&mut grid, x, 17, 2);
+                set_grid_px(&mut grid, x, 19, 2);
+            }
+            for dx in 0..fill {
+                set_grid_px(&mut grid, 6 + dx, 18, 5);
+            }
+        }
+        AgentSpriteState::LowBattery => {
+            draw_amoo_base_head(&mut grid, 1, false, true);
+            let b = if tick % 2 == 0 { 5 } else { 1 };
+            for x in 5..=11 {
+                set_grid_px(&mut grid, x, 18, b);
+            }
+        }
+        AgentSpriteState::DoNotDisturb => {
+            draw_amoo_base_head(&mut grid, 1, true, true);
+            for x in 5..=11 {
+                set_grid_px(&mut grid, x, 18, if tick % 2 == 0 { 4 } else { 2 });
+            }
+        }
+    }
+
+    for x in 0..17 {
+        for y in 0..23 {
+            if crate::device::is_backscreen_corner(x, y) {
+                grid[x][y] = 0;
+            }
+        }
+    }
+    grid
+}
+
+/// Flattens `sprite_frame_17x23(state, tick)` into the 391-element row-major pixel buffer (`y * 17 + x`)
+/// used by `BackScreenState` and StepOS `stepos_back_screen_basic_data`.
+pub fn sprite_frame_flat_391(state: AgentSpriteState, tick: usize) -> Vec<u8> {
+    let grid = sprite_frame_17x23(state, tick);
+    let mut flat = vec![0u8; 17 * 23];
+    for y in 0..23 {
+        for x in 0..17 {
+            flat[y * 17 + x] = grid[x][y];
+        }
+    }
+    flat
+}
+
+/// Pushes an `AgentSpriteState` 17×23 dot-matrix frame and status label to the connected phone's backscreen.
+pub fn sync_sprite_state_to_backscreen(
+    adb: &Adb,
+    device: &Device,
+    state: AgentSpriteState,
+    tick: usize,
+) -> Result<String> {
+    let transport = device.resolve_active_transport(adb)?;
+    let flat = sprite_frame_flat_391(state, tick);
+    let matrix_csv = flat
+        .iter()
+        .map(|v| if *v > 0 { "1" } else { "0" })
+        .collect::<Vec<_>>()
+        .join(",");
+    let label = state.label();
+    let quoted_label = crate::adb::shell_quote(label);
+    let script = format!(
+        "settings put system stepos_back_screen_basic_type 1 >/dev/null 2>&1 || true; \
+         settings put system stepos_back_screen_basic_text {quoted_label} >/dev/null 2>&1 || true; \
+         settings put system stepos_back_screen_basic_data '{matrix_csv}' >/dev/null 2>&1 || true; \
+         am broadcast -a com.stepos.backscreen.ACTION_AGENT_SPRITE_STATE --es state '{}' --es label {quoted_label} >/dev/null 2>&1 || true",
+        state.key()
+    );
+    adb.script(&transport, &script)?;
+    Ok(format!("已同步背屏 AI 精灵状态：{label} ({})", state.key()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,5 +919,28 @@ mod tests {
     fn parse_image_requires_deliverable_description() {
         assert!(parse_plan(r#"{"kind":"image","summary":"x","image_prompt":"","brightness":3,"fps":2,"duration_secs":30}"#).is_err());
         assert!(parse_plan("```json\n{\"kind\":\"image\",\"summary\":\"猫\",\"image_prompt\":\"白猫\",\"brightness\":3,\"fps\":2,\"duration_secs\":30}\n```").is_ok());
+    }
+
+    #[test]
+    fn agent_sprite_24_states_generate_valid_17x23_frames_with_masked_corners() {
+        assert_eq!(AgentSpriteState::ALL.len(), 24);
+        for state in AgentSpriteState::ALL {
+            let f0 = sprite_frame_17x23(state, 0);
+            let f1 = sprite_frame_17x23(state, 1);
+            let lit0: usize = f0.iter().flat_map(|col| col.iter()).filter(|&&v| v > 0).count();
+            assert!(lit0 >= 15, "state {:?} must have visible lit pixels", state);
+            assert_ne!(f0, f1, "state {:?} should animate across ticks", state);
+            for x in 0..17 {
+                for y in 0..23 {
+                    if crate::device::is_backscreen_corner(x, y) {
+                        assert_eq!(f0[x][y], 0, "corner ({x}, {y}) must be masked off");
+                    }
+                    assert!(f0[x][y] <= 5);
+                }
+            }
+            let flat = sprite_frame_flat_391(state, 0);
+            assert_eq!(flat.len(), 391);
+            assert_eq!(AgentSpriteState::from_key(state.key()), Some(state));
+        }
     }
 }

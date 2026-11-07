@@ -63,7 +63,10 @@ impl Companion {
     fn bs_title(&self, icon: UiIcon, title: &str) -> El {
         self.hstack(
             S2,
-            vec![self.ui_icon(icon, 16., self.p().text2), self.heading(title)],
+            vec![
+                self.content_icon(icon, 16., self.p().text2),
+                self.heading(title),
+            ],
         )
     }
     pub(in super::super) fn backscreen_actions(&self) -> Vec<El> {
@@ -81,7 +84,7 @@ impl Companion {
         if custom_active || self.selected.is_some() {
             actions.push(self.bs_button(
                 "restore-default-top",
-                "恢复手机默认背屏",
+                "恢复默认",
                 restore_action,
                 if custom_active {
                     Btn::Primary
@@ -92,7 +95,7 @@ impl Companion {
         }
         actions.push(self.bs_button(
             "inspect-top",
-            "刷新手机状态",
+            "刷新",
             BsAction::CompanionInspect,
             Btn::Secondary,
         ));
@@ -101,7 +104,7 @@ impl Companion {
             if self.back_screen.advanced {
                 "收起设置"
             } else {
-                "背屏设置"
+                "设置"
             },
             BsAction::Advanced,
             Btn::Secondary,
@@ -183,13 +186,6 @@ impl Companion {
             self.mono("17 × 23 · 379 灯珠", MICRO, p.text2),
         ];
         if editable_canvas {
-            parts.push(self.hstack(
-                6.,
-                vec![
-                    self.ui_icon(UiIcon::Lightbulb, 13., p.text3),
-                    self.line("点击上方灯阵格可直接手绘/擦除像素", MICRO, p.text3),
-                ],
-            ));
             parts.push(self.wrap(vec![
                 self.bs_button_icon(
                     "diy-invert",
@@ -245,19 +241,45 @@ impl Companion {
             BsAction::TogglePreview,
             Btn::Secondary,
         ));
-        parts.push(self.text(
-            if game {
-                "面对背屏，左倾向左、右倾向右。翻到正面结束本局。"
-            } else {
-                &state.status
-            },
-            CAPTION,
-            if state.error.is_some() && !game {
-                p.danger
-            } else {
-                p.text2
-            },
-        ));
+        // The idle default status is a usage hint; hide it.
+        if game || state.status != "点击图案预览，再应用到手机背屏" {
+            parts.push(self.text(
+                if game {
+                    "面对背屏，左倾向左、右倾向右。翻到正面结束本局。"
+                } else {
+                    &state.status
+                },
+                CAPTION,
+                if state.error.is_some() && !game {
+                    p.danger
+                } else {
+                    p.text2
+                },
+            ));
+        }
+        if game
+            && self.selected.is_some()
+            && (state.companion_installed == Some(false)
+                || (state.companion_installed == Some(true) && !state.companion_permission)
+                || state.status.contains("安装／修复")
+                || state
+                    .error
+                    .as_ref()
+                    .is_some_and(|e| e.contains("安装／修复") || e.contains("背屏权限")))
+        {
+            parts.push(self.bs_button(
+                "repair-companion-inline",
+                if state.companion_busy {
+                    "正在安装／修复伴侣…"
+                } else if state.companion_installed == Some(false) {
+                    "安装 StepX伴侣"
+                } else {
+                    "安装／修复背屏权限"
+                },
+                BsAction::CompanionInstall,
+                Btn::Secondary,
+            ));
+        }
         if !state.applied_title.is_empty() {
             parts.push(self.divider());
             parts.push(self.line("手机当前", MICRO, p.text3));
@@ -300,6 +322,28 @@ impl Companion {
         };
         parts.push(self.divider());
         parts.push(primary);
+        parts.push(self.bs_button_icon(
+            "sync-phone-live-capsule-preview",
+            "同步到手机顶部实况胶囊",
+            UiIcon::Smartphone,
+            BsAction::PushPhoneLiveCapsule {
+                tag: "stepx_backscreen".into(),
+                pill_text: self.back_screen.title.clone(),
+                title: format!("背屏协同 · {}", self.back_screen.title),
+                subtitle: self.back_screen.description.clone(),
+                countdown_secs: if self.back_screen.pomodoro_active {
+                    Some(u64::from(
+                        self.back_screen
+                            .pomodoro_last_remaining_secs
+                            .unwrap_or(self.back_screen.pomodoro_duration_secs),
+                    ))
+                } else {
+                    None
+                },
+                sync_backscreen: true,
+            },
+            Btn::Secondary,
+        ));
         if state.playing {
             parts.push(self.bs_button("stop", "停止并恢复", BsAction::Stop, Btn::Secondary));
         } else if state.applied_to_phone && state.companion_mode != "native" {
@@ -310,21 +354,20 @@ impl Companion {
                 Btn::Secondary,
             ));
         }
-        parts.push(self.text(
-            if game {
-                "背屏朝向自己，轻敲三下开始；翻到正面结束并恢复原显示。"
-            } else if state.native_feature.is_some() {
-                "应用后，由手机系统管理显示。"
-            } else if state.temporary_app() {
-                "需保持桌面连接，计时结束后恢复原显示。"
-            } else if matches!(state.source, bs::Source::Preset(bs::Preset::Countdown)) {
-                "倒计时在手机运行，到时恢复原显示。"
-            } else {
-                "应用后由手机持续显示，选择其他图案不会立即更换。"
-            },
-            MICRO,
-            p.text3,
-        ));
+        let note = if game {
+            Some("背屏朝向自己，轻敲三下开始；翻到正面结束并恢复原显示。")
+        } else if state.native_feature.is_some() {
+            Some("应用后，由手机系统管理显示。")
+        } else if state.temporary_app() {
+            Some("需保持桌面连接，计时结束后恢复原显示。")
+        } else if matches!(state.source, bs::Source::Preset(bs::Preset::Countdown)) {
+            Some("倒计时在手机运行，到时恢复原显示。")
+        } else {
+            None
+        };
+        if let Some(note) = note {
+            parts.push(self.text(note, MICRO, p.text3));
+        }
         let preview = Container::new(self.vstack(S3, parts))
             .with_uniform_padding(S4)
             .with_background_color(p.bg)
@@ -381,9 +424,9 @@ impl Companion {
                 )
                 .finish(),
                 if selected {
-                    self.ui_icon(UiIcon::Check, 16., p.text)
+                    self.content_icon(UiIcon::Check, 16., p.text)
                 } else {
-                    self.ui_icon(UiIcon::ChevronRight, 14., p.text3)
+                    self.content_icon(UiIcon::ChevronRight, 14., p.text3)
                 },
             ],
         );
@@ -474,7 +517,7 @@ impl Companion {
 
         let mut parts = vec![
             self.between(
-                self.bs_title(UiIcon::Smile, "有趣，也实用"),
+                Empty::new().finish(),
                 self.line(
                     format!(
                         "当前显示 {} / {} 种效果",
@@ -484,11 +527,6 @@ impl Companion {
                     CAPTION,
                     p.text3,
                 ),
-            ),
-            self.text(
-                "点击图案预览，满意后点击「应用到背屏」。时钟和电量由手机实时更新。",
-                CAPTION,
-                p.text2,
             ),
             self.wrap(vec![
                 self.bs_button(
@@ -716,7 +754,7 @@ impl Companion {
             ],
         );
         let mut parts = vec![
-            self.bs_title(UiIcon::Star, "让 Amoo 理解你的想法"),
+            self.bs_title(UiIcon::Sparkles, "让 Amoo 理解你的想法"),
             self.text(if state.amoo_image {"调用手机 Amoo 实际生成图片，再转成适合背屏的单色像素。"} else {"描述图案或用途，Amoo 会选择动画、亮度、速度与时长，也能创作新图片。"}, CAPTION, p.text2),
             modes, self.bs_prompt_input(),
             self.wrap(vec![
@@ -730,17 +768,82 @@ impl Companion {
             self.hstack(
                 6.,
                 vec![
-                    self.ui_icon(UiIcon::Bolt, 14., p.accent),
-                    self.line("常用状态灯牌一键生成 (免手机直出 23×17 点阵)", CAPTION, p.text2),
+                    self.content_icon(UiIcon::Bolt, 14., p.accent),
+                    self.line(
+                        "StepOS 12 原生 1–6 字中文签名 & 状态灯牌一键直出 (17×23 点阵)",
+                        CAPTION,
+                        p.text2,
+                    ),
                 ],
             ),
             self.wrap(vec![
                 self.chip(
+                    "bs-badge-cn-meeting",
+                    "中文: 开会勿扰",
+                    Some(UiIcon::Briefcase),
+                    vec![
+                        Action::BackScreen(BsAction::SetMarqueePreset("开会勿扰".into())),
+                        Action::BackScreen(BsAction::Prompt("开会勿扰".into())),
+                        Action::BackScreen(BsAction::LocalSynthesize),
+                    ],
+                    false,
+                    false,
+                ),
+                self.chip(
+                    "bs-badge-cn-focus",
+                    "中文: 专注中",
+                    Some(UiIcon::Bolt),
+                    vec![
+                        Action::BackScreen(BsAction::SetMarqueePreset("专注中".into())),
+                        Action::BackScreen(BsAction::Prompt("专注中".into())),
+                        Action::BackScreen(BsAction::LocalSynthesize),
+                    ],
+                    false,
+                    false,
+                ),
+                self.chip(
+                    "bs-badge-cn-eat",
+                    "中文: 去吃饭",
+                    Some(UiIcon::Coffee),
+                    vec![
+                        Action::BackScreen(BsAction::SetMarqueePreset("去吃饭".into())),
+                        Action::BackScreen(BsAction::Prompt("去吃饭".into())),
+                        Action::BackScreen(BsAction::LocalSynthesize),
+                    ],
+                    false,
+                    false,
+                ),
+                self.chip(
+                    "bs-badge-cn-back",
+                    "中文: 马上回来",
+                    Some(UiIcon::Clock),
+                    vec![
+                        Action::BackScreen(BsAction::SetMarqueePreset("马上回来".into())),
+                        Action::BackScreen(BsAction::Prompt("马上回来".into())),
+                        Action::BackScreen(BsAction::LocalSynthesize),
+                    ],
+                    false,
+                    false,
+                ),
+                self.chip(
+                    "bs-badge-cn-rest",
+                    "中文: 休息一下",
+                    Some(UiIcon::Smile),
+                    vec![
+                        Action::BackScreen(BsAction::SetMarqueePreset("休息一下".into())),
+                        Action::BackScreen(BsAction::Prompt("休息一下".into())),
+                        Action::BackScreen(BsAction::LocalSynthesize),
+                    ],
+                    false,
+                    false,
+                ),
+                self.chip(
                     "bs-badge-dnd",
-                    "勿扰",
+                    "请勿打扰",
                     Some(UiIcon::Ban),
                     vec![
-                        Action::BackScreen(BsAction::Prompt("勿扰 DND".into())),
+                        Action::BackScreen(BsAction::SetMarqueePreset("请勿打扰".into())),
+                        Action::BackScreen(BsAction::Prompt("请勿打扰".into())),
                         Action::BackScreen(BsAction::LocalSynthesize),
                     ],
                     false,
@@ -751,7 +854,8 @@ impl Companion {
                     "会议中",
                     Some(UiIcon::Briefcase),
                     vec![
-                        Action::BackScreen(BsAction::Prompt("会议中 MEET".into())),
+                        Action::BackScreen(BsAction::SetMarqueePreset("会议中".into())),
+                        Action::BackScreen(BsAction::Prompt("会议中".into())),
                         Action::BackScreen(BsAction::LocalSynthesize),
                     ],
                     false,
@@ -759,10 +863,11 @@ impl Companion {
                 ),
                 self.chip(
                     "bs-badge-coffee",
-                    "休息中",
+                    "已下班",
                     Some(UiIcon::Coffee),
                     vec![
-                        Action::BackScreen(BsAction::Prompt("休息中 COFFEE".into())),
+                        Action::BackScreen(BsAction::SetMarqueePreset("已下班".into())),
+                        Action::BackScreen(BsAction::Prompt("已下班".into())),
                         Action::BackScreen(BsAction::LocalSynthesize),
                     ],
                     false,
@@ -773,6 +878,7 @@ impl Companion {
                     "取件码",
                     Some(UiIcon::Package),
                     vec![
+                        Action::BackScreen(BsAction::SetMarqueePreset("取件".into())),
                         Action::BackScreen(BsAction::Prompt("取件码 8-2-104".into())),
                         Action::BackScreen(BsAction::LocalSynthesize),
                     ],
@@ -803,10 +909,11 @@ impl Companion {
                 ),
                 self.chip(
                     "bs-badge-bolt",
-                    "充能中",
+                    "充电中",
                     Some(UiIcon::Bolt),
                     vec![
-                        Action::BackScreen(BsAction::Prompt("闪电充能 POWER".into())),
+                        Action::BackScreen(BsAction::SetMarqueePreset("充电中".into())),
+                        Action::BackScreen(BsAction::Prompt("充电中".into())),
                         Action::BackScreen(BsAction::LocalSynthesize),
                     ],
                     false,
@@ -817,6 +924,7 @@ impl Companion {
                     "SOS",
                     Some(UiIcon::AlertTriangle),
                     vec![
+                        Action::BackScreen(BsAction::SetMarqueePreset("SOS".into())),
                         Action::BackScreen(BsAction::Prompt("SOS".into())),
                         Action::BackScreen(BsAction::LocalSynthesize),
                     ],
@@ -824,6 +932,15 @@ impl Companion {
                     false,
                 ),
             ]),
+            if !state.advanced {
+                self.input(
+                    F_BACK_MARQUEE,
+                    "输入 1–6 字中文签名（如：开会勿扰）或英文/数字灯牌",
+                    None,
+                )
+            } else {
+                Empty::new().finish()
+            },
             if state.generating {
                 self.bs_button(
                     "cancel-generation",
@@ -836,9 +953,16 @@ impl Companion {
                     self.bs_button("amoo-generate", "生成背屏方案", BsAction::Generate, Btn::Primary),
                     self.bs_button_icon(
                         "amoo-local-synth",
-                        "本地极速生成点阵",
+                        "本地秒级点阵预览",
                         UiIcon::Bolt,
                         BsAction::LocalSynthesize,
+                        Btn::Secondary,
+                    ),
+                    self.bs_button_icon(
+                        "amoo-save-marquee",
+                        "一键中文签名上屏",
+                        UiIcon::Check,
+                        BsAction::SaveMarquee,
                         Btn::Secondary,
                     ),
                 ])
@@ -849,7 +973,7 @@ impl Companion {
                 self.hstack(
                     S2,
                     vec![
-                        self.ui_icon(
+                        self.content_icon(
                             if state.generating {
                                 UiIcon::Clock
                             } else {
@@ -1130,7 +1254,9 @@ impl Companion {
                 p.text3,
             ));
         } else {
-            for app in apps {
+            let range = self.list_page_range("backscreen-apps",apps.len(),30);
+            parts.push(self.list_page_controls("backscreen-apps",apps.len(),30));
+            for app in apps.into_iter().skip(range.start).take(range.len()) {
                 let selected = matches!(&state.source, bs::Source::App {package, ..} if package == &app.package);
                 let icon = if let Some(path) = &app.icon_path {
                     ConstrainedBox::new(
@@ -1147,7 +1273,7 @@ impl Companion {
                     .with_height(28.)
                     .finish()
                 } else {
-                    self.ui_icon(UiIcon::Package, 28., p.text3)
+                    self.content_icon(UiIcon::Package, 28., p.text3)
                 };
                 let pkg_click = app.package.clone();
                 let lbl_click = app.label.clone();
@@ -1272,7 +1398,7 @@ impl Companion {
                 self.hstack(
                     S2,
                     vec![
-                        self.ui_icon(UiIcon::Wave, 16., p.text2),
+                        self.content_icon(UiIcon::Wave, 16., p.text2),
                         self.line(
                             format!("帧率 · {} 帧/秒", state.config.fps),
                             CAPTION,
@@ -1297,8 +1423,6 @@ impl Companion {
                 ),
                 length,
             ));
-        } else {
-            settings.push(self.text("应用后持续显示；停止或应用新图案时更换。", MICRO, p.text3));
         }
         self.panel(settings)
     }
@@ -1337,7 +1461,12 @@ impl Companion {
         ];
         if self.selected.is_some() && !state.companion_busy {
             game.push(self.wrap(vec![
-                self.bs_button("game-now", "立即开始一局", BsAction::GameStart, Btn::Primary),
+                self.bs_button(
+                    "game-now",
+                    "立即开始一局",
+                    BsAction::GameStart,
+                    Btn::Primary,
+                ),
                 self.bs_button(
                     "game-arm-right",
                     "启用三敲启动",
@@ -1471,8 +1600,42 @@ impl Companion {
                     Btn::Secondary,
                 ),
             ]),
-            self.input(F_BACK_MARQUEE, "输入英文或数字个性文字", None),
+            self.input(
+                F_BACK_MARQUEE,
+                "输入 1–6 字中文签名（如：开会勿扰）或英文/数字灯牌",
+                None,
+            ),
             self.wrap(vec![
+                self.bs_button(
+                    "bs-marquee-preset-cn-meeting",
+                    "中文: 开会勿扰",
+                    BsAction::SetMarqueePreset("开会勿扰".into()),
+                    Btn::Ghost,
+                ),
+                self.bs_button(
+                    "bs-marquee-preset-cn-focus",
+                    "中文: 专注中",
+                    BsAction::SetMarqueePreset("专注中".into()),
+                    Btn::Ghost,
+                ),
+                self.bs_button(
+                    "bs-marquee-preset-cn-eat",
+                    "中文: 去吃饭",
+                    BsAction::SetMarqueePreset("去吃饭".into()),
+                    Btn::Ghost,
+                ),
+                self.bs_button(
+                    "bs-marquee-preset-cn-back",
+                    "中文: 马上回来",
+                    BsAction::SetMarqueePreset("马上回来".into()),
+                    Btn::Ghost,
+                ),
+                self.bs_button(
+                    "bs-marquee-preset-cn-rest",
+                    "中文: 休息一下",
+                    BsAction::SetMarqueePreset("休息一下".into()),
+                    Btn::Ghost,
+                ),
                 self.bs_button(
                     "bs-marquee-preset-stepx",
                     "预设: STEPX AI",
@@ -1505,20 +1668,27 @@ impl Companion {
                 ),
                 self.bs_button(
                     "native-save-text",
-                    "保存到手机背屏",
+                    "一键中文签名上屏",
                     BsAction::SaveMarquee,
+                    Btn::Primary,
+                ),
+                self.bs_button_icon(
+                    "advanced-local-synth",
+                    "本地秒级点阵预览",
+                    UiIcon::Bolt,
+                    BsAction::LocalSynthesize,
                     Btn::Secondary,
                 ),
             ]),
             self.text(
-                "手机原生字库支持英文、数字和简单标点；中文图案可通过 Amoo 图片创作。",
+                "StepOS 12 原生支持 1–6 个汉字签名直接光栅化上屏（同时兼容 172 固件 17×23 点阵直推），并支持最多 64 个英文/数字滚动跑马灯！",
                 MICRO,
                 p.text3,
             ),
             self.divider(),
             self.bs_title(UiIcon::Matrix, "背屏控制说明"),
             self.text(
-                "预览是桌面模拟。应用后由 StepX伴侣在手机上播放；应用专属临时联动需要保持桌面连接。",
+                "预览是桌面模拟。基础设置与单帧优先调用手机原生能力；连续动画由手机本地驱动播放。实际显示遵循手机背屏状态；应用临时联动需要保持桌面连接。",
                 CAPTION,
                 p.text2,
             ),
@@ -1654,7 +1824,7 @@ impl Companion {
                     self.hstack(
                         S2,
                         vec![
-                            self.ui_icon(UiIcon::Clock, 16., p.accent),
+                            self.content_icon(UiIcon::Clock, 16., p.accent),
                             self.line_w(
                                 "25 分钟背屏专注番茄钟",
                                 BODY,
@@ -1726,7 +1896,7 @@ impl Companion {
 
         self.panel(vec![
             self.between(
-                self.bs_title(UiIcon::Star, "背屏场景化自动律动 & 25 分钟专注番茄钟"),
+                self.bs_title(UiIcon::Sparkles, "背屏场景化自动律动 & 25 分钟专注番茄钟"),
                 self.pill_badge(
                     if state.pomodoro_active {
                         "番茄钟运行中"
@@ -1743,6 +1913,475 @@ impl Companion {
             pomodoro_card,
         ])
     }
+    fn bs_smart_display_panel(&self) -> El {
+        let p = self.p();
+        let state = &self.back_screen;
+        let live_slides = &state.smart_display_live_slides;
+
+        let elapsed_secs = (state.elapsed_ms / 1000) as usize;
+        let step_in_slide = elapsed_secs % bs::SMART_SLIDE_PROGRESS_CELLS;
+        let remaining_cells = bs::SMART_SLIDE_PROGRESS_CELLS
+            .saturating_sub(step_in_slide)
+            .max(1);
+
+        let active_idx = if live_slides.is_empty() {
+            0
+        } else {
+            (elapsed_secs / bs::SMART_SLIDE_PROGRESS_CELLS) % live_slides.len()
+        };
+
+        // Determine which stage(s) of the unified automatic workflow are currently active from REAL data
+        let is_idle = live_slides.is_empty();
+        let has_real_otp = live_slides
+            .iter()
+            .any(|s| matches!(s, bs::SmartDisplaySlide::OtpCode { .. }));
+        let is_single = live_slides.len() == 1 && !has_real_otp;
+        let is_multi = live_slides.len() >= 2;
+
+        let status_label = if !state.smart_display_enabled {
+            "已关闭".to_string()
+        } else if is_idle {
+            "无通知待机 · 旋转太空人".to_string()
+        } else if live_slides.len() == 1 {
+            format!("当前显示 · {}", live_slides[0].short_badge())
+        } else {
+            format!("实况轮播 · {} 项", live_slides.len())
+        };
+
+        // 1. Unified Workflow Pipeline (无通知待机 → 单条通知 → 多通知轮播 → 短信验证码)
+        let idle_frame = bs::frame(
+            &bs::Source::Preset(bs::Preset::Astronaut),
+            &state.config,
+            std::time::Duration::from_millis(state.elapsed_ms),
+            &bs::LiveData::default(),
+        );
+        let single_stage_frame = if let Some(first) = live_slides.first() {
+            bs::synthesize_smart_slide_frame(first, remaining_cells, 8, state.config.invert)
+        } else {
+            bs::synthesize_smart_notification_frame(
+                bs::SmartMessageIconKind::WeChat,
+                1,
+                8,
+                state.config.invert,
+            )
+        };
+        let multi_stage_frame = if is_multi {
+            bs::synthesize_smart_slide_frame(
+                &live_slides[active_idx],
+                remaining_cells,
+                8,
+                state.config.invert,
+            )
+        } else {
+            bs::synthesize_smart_notification_frame(
+                bs::SmartMessageIconKind::Feishu,
+                3,
+                8,
+                state.config.invert,
+            )
+        };
+        let otp_stage_frame = if let Some(otp_slide) = live_slides
+            .iter()
+            .find(|s| matches!(s, bs::SmartDisplaySlide::OtpCode { .. }))
+        {
+            bs::synthesize_smart_slide_frame(otp_slide, remaining_cells, 8, state.config.invert)
+        } else {
+            bs::synthesize_smart_slide_frame(
+                &bs::SmartDisplaySlide::OtpCode {
+                    code: "888888".into(),
+                    label: String::new(),
+                },
+                bs::SMART_SLIDE_PROGRESS_CELLS,
+                8,
+                state.config.invert,
+            )
+        };
+
+        let make_flow_step =
+            |step_no: &str, title: &str, sub: &str, frame: Vec<u8>, active: bool| -> El {
+                let thumb = ConstrainedBox::new(
+                    Container::new(
+                        Align::new(self.matrix_grid(&frame, 1.15, 0.35, false)).finish(),
+                    )
+                    .with_background_color(rgb(0x16, 0x16, 0x1B))
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
+                    .finish(),
+                )
+                .with_width(40.)
+                .with_height(48.)
+                .finish();
+
+                let inner = self.hstack(
+                    S2,
+                    vec![
+                        thumb,
+                        Expanded::new(
+                            1.,
+                            self.vstack(
+                                2.,
+                                vec![
+                                    self.hstack(
+                                        S1,
+                                        vec![
+                                            self.mono(
+                                                step_no,
+                                                MICRO,
+                                                if active { p.accent } else { p.text3 },
+                                            ),
+                                            self.line_w(
+                                                title,
+                                                CAPTION,
+                                                if active { p.accent } else { p.text },
+                                                Weight::Semibold,
+                                            ),
+                                        ],
+                                    ),
+                                    self.line(sub, MICRO, p.text2),
+                                ],
+                            ),
+                        )
+                        .finish(),
+                    ],
+                );
+
+                Expanded::new(
+                    1.,
+                    Container::new(inner)
+                        .with_uniform_padding(S3)
+                        .with_background_color(if active { p.selected } else { p.bg })
+                        .with_border(Border::all(1.).with_border_color(if active {
+                            p.accent
+                        } else {
+                            p.border
+                        }))
+                        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
+                        .finish(),
+                )
+                .finish()
+            };
+
+        let flow_arrow = || -> El {
+            Container::new(self.content_icon(UiIcon::ArrowRight, 14., p.text3))
+                .with_padding_top(16.)
+                .finish()
+        };
+
+        let single_sub = if is_single {
+            live_slides[0].short_badge()
+        } else {
+            "应用图标 + 数量".to_string()
+        };
+
+        let pipeline_row = Flex::row()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(S2)
+            .with_child(make_flow_step(
+                "01",
+                "无通知待机",
+                if is_idle {
+                    "当前生效 · 太空人"
+                } else {
+                    "旋转太空人"
+                },
+                idle_frame.clone(),
+                is_idle,
+            ))
+            .with_child(flow_arrow())
+            .with_child(make_flow_step(
+                "02",
+                "单条通知",
+                &single_sub,
+                single_stage_frame,
+                is_single,
+            ))
+            .with_child(flow_arrow())
+            .with_child(make_flow_step(
+                "03",
+                "多通知轮播",
+                if is_multi {
+                    "当前生效 · 10s切换"
+                } else {
+                    "底部10格倒计时"
+                },
+                multi_stage_frame,
+                is_multi,
+            ))
+            .with_child(flow_arrow())
+            .with_child(make_flow_step(
+                "04",
+                "短信验证码",
+                if has_real_otp {
+                    "当前生效 · 置顶显示"
+                } else {
+                    "收到验证码自动置顶"
+                },
+                otp_stage_frame,
+                has_real_otp,
+            ))
+            .finish();
+
+        // 2. Real Active Notification Queue (only shown when real notifications exist!)
+        let make_progress_cells_row = || -> Vec<El> {
+            (0..bs::SMART_SLIDE_PROGRESS_CELLS)
+                .map(|i| {
+                    let lit = !is_idle && i < remaining_cells;
+                    ConstrainedBox::new(
+                        Container::new(Empty::new().finish())
+                            .with_background_color(if lit { p.accent } else { p.border })
+                            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(2.)))
+                            .finish(),
+                    )
+                    .with_width(14.)
+                    .with_height(6.)
+                    .finish()
+                })
+                .collect()
+        };
+
+        let live_content_section = if is_idle {
+            Container::new(self.between(
+                self.hstack(
+                    S3,
+                    vec![
+                        ConstrainedBox::new(
+                            Container::new(
+                                Align::new(self.matrix_grid(&idle_frame, 1.15, 0.35, false))
+                                    .finish(),
+                            )
+                            .with_background_color(rgb(0x16, 0x16, 0x1B))
+                            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
+                            .finish(),
+                        )
+                        .with_width(40.)
+                        .with_height(48.)
+                        .finish(),
+                        self.vstack(
+                            2.,
+                            vec![
+                                self.line_w(
+                                    "当前手机无未读通知",
+                                    BODY,
+                                    p.text,
+                                    Weight::Semibold,
+                                ),
+                                self.line(
+                                    "背屏自动播放默认待机动画（旋转太空人），收到新通知时自动切入显示",
+                                    MICRO,
+                                    p.text2,
+                                ),
+                            ],
+                        ),
+                    ],
+                ),
+                self.pill_badge("待机动画运行中", p.success, p.success_soft),
+            ))
+            .with_uniform_padding(S3)
+            .with_background_color(p.bg)
+            .with_border(Border::all(1.).with_border_color(p.border))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
+            .finish()
+        } else {
+            let slide_cards: Vec<El> = live_slides
+                .iter()
+                .enumerate()
+                .map(|(idx, slide)| {
+                    let is_current = idx == active_idx;
+                    let frame = bs::synthesize_smart_slide_frame(
+                        slide,
+                        if is_current {
+                            remaining_cells
+                        } else {
+                            bs::SMART_SLIDE_PROGRESS_CELLS
+                        },
+                        8,
+                        state.config.invert,
+                    );
+                    let thumb = ConstrainedBox::new(
+                        Container::new(
+                            Align::new(self.matrix_grid(&frame, 1.15, 0.35, false)).finish(),
+                        )
+                        .with_background_color(rgb(0x16, 0x16, 0x1B))
+                        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
+                        .finish(),
+                    )
+                    .with_width(40.)
+                    .with_height(48.)
+                    .finish();
+
+                    let row = self.between(
+                        self.hstack(
+                            S3,
+                            vec![
+                                thumb,
+                                self.vstack(
+                                    2.,
+                                    vec![
+                                        self.line_w(
+                                            &slide.short_badge(),
+                                            BODY,
+                                            p.text,
+                                            Weight::Semibold,
+                                        ),
+                                        self.line(slide.display_label(), MICRO, p.text2),
+                                    ],
+                                ),
+                            ],
+                        ),
+                        if is_current {
+                            self.hstack(
+                                S2,
+                                vec![
+                                    self.hstack(4., make_progress_cells_row()),
+                                    self.mono(&format!("{remaining_cells}s"), MICRO, p.accent),
+                                ],
+                            )
+                        } else {
+                            self.pill_badge(&format!("队列 #{}", idx + 1), p.text2, p.surface)
+                        },
+                    );
+
+                    Container::new(row)
+                        .with_uniform_padding(S3)
+                        .with_background_color(if is_current { p.selected } else { p.bg })
+                        .with_border(Border::all(1.).with_border_color(if is_current {
+                            p.accent
+                        } else {
+                            p.border
+                        }))
+                        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
+                        .finish()
+                })
+                .collect();
+
+            self.vstack(S2, slide_cards)
+        };
+
+        // 3. Priority Order Strip (超过 12 条通知时按此优先级显示)
+        let priority_chain: [(&str, bs::SmartMessageIconKind); 7] = [
+            ("微信", bs::SmartMessageIconKind::WeChat),
+            ("飞书", bs::SmartMessageIconKind::Feishu),
+            ("钉钉", bs::SmartMessageIconKind::DingTalk),
+            ("企业微信", bs::SmartMessageIconKind::WeWork),
+            ("短信/验证码", bs::SmartMessageIconKind::SmsOrOtp),
+            ("外卖/快递", bs::SmartMessageIconKind::Delivery),
+            ("未接来电", bs::SmartMessageIconKind::PhoneCall),
+        ];
+
+        let mut priority_items: Vec<El> = Vec::new();
+        for (idx, (label, kind)) in priority_chain.into_iter().enumerate() {
+            if idx > 0 {
+                priority_items.push(self.content_icon(UiIcon::ChevronRight, 12., p.text3));
+            }
+            let icon_frame = bs::synthesize_smart_notification_frame(kind, 1, 8, false);
+            let mini_matrix = ConstrainedBox::new(
+                Container::new(
+                    Align::new(self.matrix_grid(&icon_frame, 0.78, 0.22, false)).finish(),
+                )
+                .with_background_color(rgb(0x16, 0x16, 0x1B))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(5.)))
+                .finish(),
+            )
+            .with_width(24.)
+            .with_height(30.)
+            .finish();
+
+            let active_in_queue = live_slides.iter().any(|s| match s {
+                bs::SmartDisplaySlide::AppNotification { kind: k, .. } => *k == kind,
+                bs::SmartDisplaySlide::OtpCode { .. } => kind == bs::SmartMessageIconKind::SmsOrOtp,
+            });
+
+            priority_items.push(
+                Container::new(self.hstack(
+                    S1,
+                    vec![
+                        mini_matrix,
+                        self.line_w(
+                            label,
+                            MICRO,
+                            if active_in_queue { p.accent } else { p.text },
+                            Weight::Medium,
+                        ),
+                    ],
+                ))
+                .with_padding_left(S2)
+                .with_padding_right(S2)
+                .with_padding_top(S1)
+                .with_padding_bottom(S1)
+                .with_background_color(if active_in_queue { p.selected } else { p.bg })
+                .with_border(Border::all(1.).with_border_color(if active_in_queue {
+                    p.accent
+                } else {
+                    p.border
+                }))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
+                .finish(),
+            );
+        }
+
+        self.vstack(
+            S3,
+            vec![
+                self.panel(vec![
+                    self.between(
+                        self.hstack(
+                            S2,
+                            vec![
+                                self.bs_title(UiIcon::Sparkles, "智能显示"),
+                                self.pill_badge(
+                                    &status_label,
+                                    if state.smart_display_enabled {
+                                        p.success
+                                    } else {
+                                        p.text2
+                                    },
+                                    if state.smart_display_enabled {
+                                        p.success_soft
+                                    } else {
+                                        p.bg
+                                    },
+                                ),
+                            ],
+                        ),
+                        self.hstack(
+                            S2,
+                            vec![
+                                self.bs_button(
+                                    "smart-toggle",
+                                    if state.smart_display_enabled {
+                                        "已开启"
+                                    } else {
+                                        "已关闭"
+                                    },
+                                    BsAction::ToggleSmartDisplay,
+                                    if state.smart_display_enabled {
+                                        Btn::Secondary
+                                    } else {
+                                        Btn::Ghost
+                                    },
+                                ),
+                                self.bs_button(
+                                    "smart-sync-now",
+                                    "同步背屏",
+                                    BsAction::SyncSmartDisplayNow,
+                                    Btn::Primary,
+                                ),
+                            ],
+                        ),
+                    ),
+                    pipeline_row,
+                    live_content_section,
+                ]),
+                self.panel(vec![
+                    self.between(
+                        self.line_w("优先级排序", BODY, p.text, Weight::Semibold),
+                        self.line("超过 12 条通知时按优先级显示", MICRO, p.text3),
+                    ),
+                    self.wrap(priority_items),
+                ]),
+            ],
+        )
+    }
     pub(in super::super) fn backscreen_page(&self) -> El {
         let state = &self.back_screen;
         let tabs = self.segmented(
@@ -1752,6 +2391,11 @@ impl Companion {
                     "灵感图库".into(),
                     state.tab == 0,
                     Action::BackScreen(BsAction::Tab(0)),
+                ),
+                (
+                    "智能显示".into(),
+                    state.tab == 5,
+                    Action::BackScreen(BsAction::Tab(5)),
                 ),
                 (
                     "Amoo 创作".into(),
@@ -1780,6 +2424,7 @@ impl Companion {
             2 => self.bs_images(),
             3 => self.bs_android(),
             4 => self.bs_games(),
+            5 => self.bs_smart_display_panel(),
             _ => self.bs_gallery(),
         };
         let mut creative = Vec::new();

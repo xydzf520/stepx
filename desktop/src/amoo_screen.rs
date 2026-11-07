@@ -149,23 +149,41 @@ pub(crate) struct Session {
     device: Device,
     bus: AgentBus,
     key: String,
+    account_scope: String,
+    pending_run: Option<String>,
+    pub(crate) unexpected_tools: bool,
     uploads: Vec<String>,
 }
 impl Session {
     pub(crate) fn open(adb: &Adb, device: &Device) -> Result<Self> {
+        let account_scope = crate::amoo_usage::account_scope_fresh(adb, device)?
+            .context("请先在手机登录 Amoo 账号")?;
         let mut bus = AgentBus::connect(adb, device)?;
         let key = bus.create_session()?;
         ensure!(
             key.starts_with("agent:main:desktop-") && key.len() < 160,
             "模型未返回独立桌面会话，未继续"
         );
+        require_same_account(
+            &account_scope,
+            crate::amoo_usage::account_scope_fresh(adb, device)?.as_deref(),
+        )?;
         Ok(Self {
             adb: adb.clone(),
             device: device.clone(),
             bus,
             key,
+            account_scope,
+            pending_run: None,
+            unexpected_tools: false,
             uploads: vec![],
         })
+    }
+    fn check_account(&self) -> Result<()> {
+        require_same_account(
+            &self.account_scope,
+            crate::amoo_usage::account_scope_fresh(&self.adb, &self.device)?.as_deref(),
+        )
     }
     pub(crate) fn reply(
         &mut self,
@@ -175,6 +193,7 @@ impl Session {
         deadline: Instant,
     ) -> Result<String> {
         check(&self.adb, &self.device, cancel, deadline)?;
+        self.check_account()?;
         let folder = tempfile::tempdir()?;
         let path = folder.path().join("current-screen.png");
         fs::write(&path, png)?;
@@ -186,11 +205,13 @@ impl Session {
         )?;
         self.uploads.push(uploaded.directory.clone());
         check(&self.adb, &self.device, cancel, deadline)?;
-        let pending = self.bus.send_with_attachments(
+        self.check_account()?;
+        let pending = self.bus.send_observation(
             &self.key,
             &uploaded.message(text),
             &uploaded.wire_attachments()?,
         )?;
+        self.pending_run = Some(pending.run_id.clone());
         let response_deadline = deadline.min(Instant::now() + Duration::from_secs(150));
         loop {
             ensure!(
@@ -208,6 +229,11 @@ impl Session {
             let rows = history["messages"]
                 .as_array()
                 .context("手机没有返回视觉会话历史")?;
+            self.unexpected_tools = planner_called_tools(rows, &pending.run_id);
+            ensure!(
+                !self.unexpected_tools,
+                "手机规划会话调用了额外工具，已停止桌面后续动作；请核对手机状态"
+            );
             let messages = crate::amoo::parse_messages(rows)?;
             let relevant: Vec<_> = messages
                 .iter()
@@ -230,6 +256,8 @@ impl Session {
                             .contains(&last.stop_reason.to_ascii_lowercase().as_str()),
                     "手机视觉模型没有完成回复"
                 );
+                self.check_account()?;
+                self.pending_run = None;
                 return relevant
                     .iter()
                     .rev()
@@ -246,14 +274,21 @@ impl Session {
         }
     }
     pub(crate) fn clean(&mut self) -> bool {
-        let deleted = self
-            .bus
-            .call_with_timeout(
-                "sessions.delete",
-                json!({"key":self.key}),
-                Duration::from_secs(4),
-            )
-            .is_ok();
+        let same_account = self.check_account().is_ok();
+        if same_account {
+            if let Some(run) = self.pending_run.take() {
+                let _ = self.bus.abort(&self.key, Some(&run));
+            }
+        }
+        let deleted = same_account
+            && self
+                .bus
+                .call_with_timeout(
+                    "sessions.delete",
+                    json!({"key":self.key}),
+                    Duration::from_secs(4),
+                )
+                .is_ok();
         for directory in self.uploads.drain(..) {
             if let Some(id) = directory.strip_prefix("/sdcard/Download/Amoo Work/") {
                 if id.len() == 32
@@ -268,6 +303,24 @@ impl Session {
         }
         deleted
     }
+}
+
+fn require_same_account(expected: &str, actual: Option<&str>) -> Result<()> {
+    ensure!(
+        !expected.is_empty() && actual == Some(expected),
+        "手机登录账号已变化或无法核实，已停止本次操作；请重新发起任务"
+    );
+    Ok(())
+}
+
+fn planner_called_tools(rows: &[Value], run: &str) -> bool {
+    rows.iter()
+        .filter(|r| r["runId"].as_str() == Some(run))
+        .any(|r| {
+            r["toolCalls"]
+                .as_array()
+                .is_some_and(|calls| !calls.is_empty())
+        })
 }
 
 fn screenshot(adb: &Adb, device: &Device) -> Result<(Vec<u8>, u32, u32)> {
@@ -801,48 +854,7 @@ pub fn launch(adb: &Adb, device: &Device, app_name: &str) -> Result<crate::apps:
     )?;
     crate::apps::validate_package(&package)?;
     device.verify(adb)?;
-    let resolved = adb
-        .shell(
-            &device.transport,
-            &[
-                "cmd",
-                "package",
-                "resolve-activity",
-                "--brief",
-                "-a",
-                "android.intent.action.MAIN",
-                "-c",
-                "android.intent.category.LAUNCHER",
-                "-p",
-                &package,
-            ],
-        )
-        .unwrap_or_default();
-    if let Some(component) = resolved
-        .lines()
-        .map(str::trim)
-        .find(|s| s.starts_with(&format!("{package}/")))
-    {
-        ensure!(
-            component
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || "._/$".contains(c)),
-            "目标应用启动组件无效"
-        );
-        adb.shell(&device.transport, &["am", "start", "-n", component])?;
-    } else {
-        adb.shell(
-            &device.transport,
-            &[
-                "monkey",
-                "-p",
-                &package,
-                "-c",
-                "android.intent.category.LAUNCHER",
-                "1",
-            ],
-        )?;
-    }
+    device.open_app(adb, &package)?;
     Ok(crate::apps::AppInfo {
         package,
         label: chosen_label,
@@ -895,6 +907,34 @@ pub fn try_instant_screen_command(
             elapsed_ms: started.elapsed().as_millis() as u64,
         }))
     };
+
+    if let Some((method, args)) = crate::native_mcp::screen_command(t) {
+        if let Some(value) = crate::native_mcp::try_call(adb, device, method, args)? {
+            return finish(
+                t.into(),
+                crate::native_mcp::response_note(&value),
+                capture_png(adb, device).ok(),
+                "native_mcp",
+                json!({"tool":method,"receipt":value}),
+                &mut on_event,
+            );
+        }
+    }
+
+    if matches!(
+        t,
+        "截屏" | "截图" | "截取画面" | "截取手机画面" | "帮我截取手机画面"
+    ) {
+        let (_, message) = crate::toolbox::capture_phone_screenshot_to_gallery(adb, device)?;
+        return finish(
+            "手机原生截屏并保存相册".into(),
+            message,
+            capture_png(adb, device).ok(),
+            "screenshot_to_gallery",
+            json!({}),
+            &mut on_event,
+        );
+    }
 
     // 1. Wake & Swipe Unlock
     if matches!(
@@ -966,22 +1006,9 @@ pub fn try_instant_screen_command(
         device.verify(adb)?;
         on_event(ScreenEvent::Status("正在截取手机当前实时画面…".into()));
         let png = capture_png(adb, device)?;
-        let summary = hierarchy(adb, device)
+        let summary = device.visible_text(adb)
             .ok()
-            .map(|nodes| {
-                let mut labels = Vec::new();
-                for n in nodes {
-                    for s in [n.text.trim(), n.description.trim()] {
-                        if !s.is_empty() && !labels.iter().any(|x: &String| x == s) {
-                            labels.push(s.to_string());
-                        }
-                    }
-                    if labels.len() >= 8 {
-                        break;
-                    }
-                }
-                labels
-            })
+            .map(|text| text.lines().filter(|s|!s.trim().is_empty()).take(8).map(str::to_owned).collect::<Vec<_>>())
             .unwrap_or_default();
         let msg = if summary.is_empty() {
             "已截取当前手机实时画面，可在下方预览原图。".into()
@@ -1018,22 +1045,10 @@ pub fn try_instant_screen_command(
         ));
         let png = capture_png(adb, device).ok();
         let mut lines = Vec::new();
-        if let Ok(list) = hierarchy(adb, device) {
-            for n in list {
-                for raw in [n.text.trim(), n.description.trim()] {
-                    if !raw.is_empty() && !lines.iter().any(|existing: &String| existing == raw) {
-                        lines.push(raw.to_string());
-                    }
-                }
-            }
-        }
-        if lines.is_empty() {
-            if let Ok(vis) = device.visible_text(adb) {
-                for line in vis.lines().map(str::trim).filter(|s| !s.is_empty()) {
-                    if !lines.iter().any(|existing: &String| existing == line) {
-                        lines.push(line.to_string());
-                    }
-                }
+        let vis = device.visible_text(adb)?;
+        for line in vis.lines().map(str::trim).filter(|s| !s.is_empty()) {
+            if !lines.iter().any(|existing: &String| existing == line) {
+                lines.push(line.to_string());
             }
         }
         let msg = if lines.is_empty() {
@@ -1484,6 +1499,26 @@ pub fn run_with_pause(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn planning_session_requires_the_original_phone_account() {
+        assert!(require_same_account("account-a", Some("account-a")).is_ok());
+        assert!(require_same_account("account-a", Some("account-b")).is_err());
+        assert!(require_same_account("account-a", None).is_err());
+        assert!(require_same_account("", Some("")).is_err());
+    }
+    #[test]
+    fn only_current_planner_tool_calls_block_followup_actions() {
+        let other = json!({"runId":"old","toolCalls":[{"name":"ability"}]});
+        assert!(!planner_called_tools(&[other], "current"));
+        assert!(!planner_called_tools(
+            &[json!({"runId":"current","toolCalls":[]})],
+            "current"
+        ));
+        assert!(planner_called_tools(
+            &[json!({"runId":"current","toolCalls":[{"name":"ability"}]})],
+            "current"
+        ));
+    }
     #[test]
     fn only_bounded_single_navigation_actions_are_accepted() {
         assert!(parse_decision(r#"{"screen_task":1,"observation":"设置列表","action":{"type":"click","x":200,"y":300,"target":"关于手机"}}"#).is_ok());

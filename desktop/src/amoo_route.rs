@@ -25,6 +25,109 @@ impl DocKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DoctorQueryKind {
+    GooglePlayGuide,
+    CompanionSelfHeal,
+    PcTroubleshoot,
+}
+
+impl DoctorQueryKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::GooglePlayGuide => "Google Play 安装与使用指导",
+            Self::CompanionSelfHeal => "伴侣连接与权限自愈",
+            Self::PcTroubleshoot => "电脑小问题智能排障",
+        }
+    }
+}
+
+const GOOGLE_PLAY_GUIDE_TERMS: &[&str] = &[
+    "googleplay",
+    "google play",
+    "play商店",
+    "playstore",
+    "play store",
+    "谷歌商店",
+    "谷歌play",
+    "谷歌服务",
+    "谷歌框架",
+    "谷歌三件套",
+    "gms",
+    "gsf",
+    "google服务",
+    "google商店",
+    "google安装",
+    "安装google",
+    "装不了google",
+    "安装不了google",
+    "google不会用",
+    "谷歌怎么装",
+    "谷歌安装",
+    "play保护",
+    "play认证",
+    "google认证",
+    "google登录",
+    "谷歌登录",
+];
+
+const COMPANION_SELF_HEAL_TERMS: &[&str] = &[
+    "连不上手机",
+    "手机连不上",
+    "无线连接断",
+    "adb连不上",
+    "微信不弹窗",
+    "消息不弹窗",
+    "收不到通知",
+    "通知不同步",
+    "权限掉了",
+    "无障碍掉了",
+    "投屏黑屏",
+    "投屏卡",
+    "伴侣连不上",
+    "伴侣装不上",
+];
+
+const PC_TROUBLESHOOT_TERMS: &[&str] = &[
+    "电脑好卡",
+    "电脑很卡",
+    "电脑卡顿",
+    "清理电脑",
+    "清理缓存",
+    "c盘满了",
+    "磁盘满了",
+    "空间不足",
+    "端口占用",
+    "端口被占用",
+    "代理异常",
+    "网页打不开",
+    "网络打不开",
+    "修电脑",
+    "电脑小问题",
+    "处理电脑的小问题",
+    "解决使用过程中的麻烦",
+];
+
+/// Detect whether a user message in Amoo is asking about Google Play installation/usage,
+/// Companion self-healing, or PC troubleshooting so the UI can invoke the Phone-Token Doctor Harness
+/// and attach an interactive guided action card.
+pub fn detect_doctor_or_google_guide_query(text: &str) -> Option<DoctorQueryKind> {
+    let t = normalize(text);
+    if GOOGLE_PLAY_GUIDE_TERMS.iter().any(|term| t.contains(term)) {
+        return Some(DoctorQueryKind::GooglePlayGuide);
+    }
+    if COMPANION_SELF_HEAL_TERMS
+        .iter()
+        .any(|term| t.contains(term))
+    {
+        return Some(DoctorQueryKind::CompanionSelfHeal);
+    }
+    if PC_TROUBLESHOOT_TERMS.iter().any(|term| t.contains(term)) {
+        return Some(DoctorQueryKind::PcTroubleshoot);
+    }
+    None
+}
+
 /// Context of the current conversation used for one routing decision.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RouteCtx {
@@ -765,6 +868,16 @@ pub fn route_attached(text: &str, att: Attached, ctx: &RouteCtx) -> RouteDecisio
     if has(&t, CHAT_ONLY) {
         return RouteDecision::chat(true);
     }
+    // Phone-selected sources belong to the companion's native MCP queue. A
+    // local file-generation route cannot see their selection/consent receipt.
+    // Keep this delegation in ordinary Amoo even when it asks for an XLSX/PPT.
+    if !att.office && !att.image
+        && (has(&t, &["stepx伴侣", "stepx companion", "伴侣里", "伴侣中"])
+            || has(&t, &["手机选的", "手机刚选", "手机上选", "手机中选"]))
+        && has(&t, &["交给电脑", "用电脑", "电脑处理", "电脑分析", "电脑生成", "回传手机", "送回手机", "送到手机"])
+    {
+        return RouteDecision::chat(true);
+    }
     // 2. Knowledge questions stay chat ("如何制作一个贪吃蛇小游戏？").
     let question = is_question(&t);
     if question {
@@ -840,6 +953,17 @@ pub fn route_attached(text: &str, att: Attached, ctx: &RouteCtx) -> RouteDecisio
 mod tests {
     use super::*;
     #[test]
+    fn phone_source_delegation_stays_on_official_amoo() {
+        let ctx = RouteCtx { sticky: Some(Intent::Files), ..Default::default() };
+        let text = "请用 StepX伴侣把我刚选的 CSV 交给电脑处理，生成汇总表 sales.xlsx，并把成果送回手机";
+        assert!(route_intent(text, &[], &ctx).is_chat());
+        assert!(route_intent("分析手机上选择的表格，交给电脑生成报告", &[], &ctx).is_chat());
+        assert!(route_intent("请通过 StepX伴侣处理我已选的 StepX-lifecycle.csv：用电脑统计 amount 列，制作 final-report.txt 和 final-summary.xlsx 两份成果，送到手机", &[], &ctx).is_chat());
+        assert_eq!(route_intent("为 StepX伴侣生成产品介绍 PPT", &[], &ctx).intent, Intent::Files);
+        assert_eq!(route_intent(text, &[PathBuf::from("sales.csv")], &ctx).intent, Intent::Files);
+        assert_eq!(route_intent(text, &[], &RouteCtx { forced: Some(Intent::Files), ..ctx }).intent, Intent::Files);
+    }
+    #[test]
     fn normalize_joins_cjk_and_latin_and_folds_width() {
         assert_eq!(normalize("生成 Word 报告"), "生成word报告");
         assert_eq!(normalize("ＰＰＴ　做一个"), "ppt做一个");
@@ -881,5 +1005,75 @@ mod tests {
             Some(("微信".into(), "打开微信".into()))
         );
         assert_eq!(parse_instant_phone_control("7 乘 8 等于多少？"), None);
+    }
+    #[test]
+    fn detect_doctor_or_google_guide_query_classifies_google_play_companion_and_pc() {
+        for q in [
+            "google play 安装不了，不会用",
+            "怎么装谷歌三件套",
+            "play商店打不开",
+            "google登录不上",
+            "谷歌服务框架 GMS 装不了",
+            "Play Store 怎么认证？",
+        ] {
+            assert_eq!(
+                detect_doctor_or_google_guide_query(q),
+                Some(DoctorQueryKind::GooglePlayGuide),
+                "{q}"
+            );
+        }
+        assert_eq!(
+            DoctorQueryKind::GooglePlayGuide.label(),
+            "Google Play 安装与使用指导"
+        );
+
+        for q in [
+            "连不上手机",
+            "微信不弹窗",
+            "收不到通知",
+            "权限掉了",
+            "投屏黑屏",
+            "无线连接断了怎么办",
+            "伴侣连不上电脑",
+        ] {
+            assert_eq!(
+                detect_doctor_or_google_guide_query(q),
+                Some(DoctorQueryKind::CompanionSelfHeal),
+                "{q}"
+            );
+        }
+        assert_eq!(
+            DoctorQueryKind::CompanionSelfHeal.label(),
+            "伴侣连接与权限自愈"
+        );
+
+        for q in [
+            "电脑好卡",
+            "清理电脑缓存",
+            "网络打不开",
+            "网页打不开",
+            "端口被占用",
+            "端口占用怎么查",
+            "C盘满了空间不足",
+            "调用手机的token,解决使用过程中的麻烦和处理电脑的小问题",
+        ] {
+            assert_eq!(
+                detect_doctor_or_google_guide_query(q),
+                Some(DoctorQueryKind::PcTroubleshoot),
+                "{q}"
+            );
+        }
+        assert_eq!(
+            DoctorQueryKind::PcTroubleshoot.label(),
+            "电脑小问题智能排障"
+        );
+
+        for q in [
+            "帮我生成一份季度汇报 PPT",
+            "今天上海天气怎么样？",
+            "写个贪吃蛇小游戏",
+        ] {
+            assert_eq!(detect_doctor_or_google_guide_query(q), None, "{q}");
+        }
     }
 }

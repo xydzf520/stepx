@@ -1,4 +1,5 @@
 //! One visible task, composer and result collection; existing executors remain internal.
+use stepx_companion::file_dialog::DialogKind;
 use super::*;
 use anyhow::Context;
 use facloud_ui::TypedActionView;
@@ -70,6 +71,7 @@ pub(super) enum WorkspaceAction {
     RevealOutput(usize),
     CopyTaskTranscript(String),
     SendTaskOutputToPhone(String, usize),
+    TogglePin(String),
 }
 #[derive(Clone)]
 pub(super) struct Proposal {
@@ -94,7 +96,6 @@ struct ImageDelivery {
 pub(super) fn is_verification_harness() -> bool {
     std::env::args().any(|a| a.starts_with("--verify-"))
         || [
-            "STEPX_SCENARIO_DIR",
             "STEPX_CHAT_FIRST_TEST",
             "STEPX_RESPONSIVE_TEST",
             "STEPX_ENTER_TEST",
@@ -132,55 +133,11 @@ pub(super) struct WorkspaceUi {
     pub panel_entered: Instant,
     writer: Option<mpsc::Sender<Journal>>,
     writer_thread: Option<std::thread::JoinHandle<()>>,
+    writer_status: Option<mpsc::Receiver<Result<(), String>>>,
+    persistence_error: Option<String>,
     last_saved: Instant,
     last_draft: (String, Vec<PathBuf>),
 }
-fn journal_eq(a: &Journal, b: &Journal) -> bool {
-    a.deleted_sessions == b.deleted_sessions
-        && a.tasks.len() == b.tasks.len()
-        && a.tasks.iter().zip(&b.tasks).all(|(x, y)| {
-            x.id == y.id
-                && x.title == y.title
-                && x.updated == y.updated
-                && x.session == y.session
-                && x.workspace == y.workspace
-                && x.device == y.device
-                && x.account == y.account
-                && x.draft == y.draft
-                && x.attachments == y.attachments
-                && x.submitted_files == y.submitted_files
-                && x.intent == y.intent
-                && x.route_note == y.route_note
-                && x.route == y.route
-                && x.note == y.note
-                && x.turns.len() == y.turns.len()
-                && x.turns
-                    .iter()
-                    .zip(&y.turns)
-                    .all(|(tx, ty)| tx.user == ty.user && tx.text == ty.text)
-                && x.steps.len() == y.steps.len()
-                && x.steps.iter().zip(&y.steps).all(|(sx, sy)| {
-                    sx.executor == sy.executor && sx.phase == sy.phase && sx.note == sy.note
-                })
-                && x.outputs.len() == y.outputs.len()
-                && x.outputs.iter().zip(&y.outputs).all(|(ox, oy)| {
-                    ox.path == oy.path
-                        && ox.name == oy.name
-                        && ox.kind == oy.kind
-                        && ox.lab_id == oy.lab_id
-                })
-                && x.receipts.len() == y.receipts.len()
-                && x.receipts.iter().zip(&y.receipts).all(|(rx, ry)| {
-                    rx.path == ry.path
-                        && rx.note == ry.note
-                        && rx.success == ry.success
-                        && rx.device == ry.device
-                        && rx.account == ry.account
-                        && rx.cloud_url == ry.cloud_url
-                })
-        })
-}
-
 impl Default for WorkspaceUi {
     fn default() -> Self {
         let path = stepx_companion::resources::user_state().join("amoo-workspace/tasks.json");
@@ -194,25 +151,14 @@ impl Default for WorkspaceUi {
             Err(e) => (Journal::default(), Some(e.to_string())),
         };
         let mut writer_thread = None;
+        let mut writer_status = None;
         let writer = if error.is_none() && !demo {
             let (tx, rx) = mpsc::channel::<Journal>();
             let initial_saved = journal.clone();
+            let (status_tx, status_rx) = mpsc::channel();
+            writer_status = Some(status_rx);
             writer_thread = Some(std::thread::spawn(move || {
-                let mut last_saved = Some(initial_saved);
-                while let Ok(mut journal) = rx.recv() {
-                    while let Ok(newer) = rx.recv_timeout(Duration::from_millis(300)) {
-                        journal = newer;
-                    }
-                    if last_saved
-                        .as_ref()
-                        .is_some_and(|prev| journal_eq(prev, &journal))
-                    {
-                        continue;
-                    }
-                    if journal.save(&path).is_ok() {
-                        last_saved = Some(journal);
-                    }
-                }
+                model::write_journal_updates(path, initial_saved, rx, status_tx);
             }));
             Some(tx)
         } else {
@@ -258,6 +204,8 @@ impl Default for WorkspaceUi {
             panel_entered: Instant::now(),
             writer,
             writer_thread,
+            writer_status,
+            persistence_error: None,
             last_saved: Instant::now(),
             last_draft: Default::default(),
         }
@@ -286,7 +234,7 @@ impl Companion {
         let id = self.workspace.active.as_ref()?;
         self.workspace.journal.tasks.iter().find(|t| &t.id == id)
     }
-    fn workspace_task_mut(&mut self) -> Option<&mut Task> {
+    pub(super) fn workspace_task_mut(&mut self) -> Option<&mut Task> {
         let id = self.workspace.active.as_ref()?;
         self.workspace
             .journal
@@ -342,6 +290,24 @@ impl Companion {
         if let Some(thread) = self.workspace.writer_thread.take() {
             let _ = thread.join();
         }
+        self.workspace_poll_persistence();
+    }
+    fn workspace_poll_persistence(&mut self) -> bool {
+        let messages: Vec<_> = self.workspace.writer_status.as_ref().map(|rx| rx.try_iter().collect()).unwrap_or_default();
+        let changed = !messages.is_empty();
+        for message in messages {
+            match message {
+                Ok(()) => {
+                    if self.workspace.error == self.workspace.persistence_error { self.workspace.error = None; }
+                    self.workspace.persistence_error = None;
+                }
+                Err(error) => {
+                    self.workspace.error = Some(error.clone());
+                    self.workspace.persistence_error = Some(error);
+                }
+            }
+        }
+        changed
     }
     pub(super) fn workspace_persist(&self) {
         if !self.demo_mode {
@@ -355,14 +321,14 @@ impl Companion {
             }
         }
     }
-    fn workspace_ensure_task(&mut self) {
+    pub(super) fn workspace_ensure_task(&mut self) {
         if self.workspace.active.is_none() {
             let task = Task::new(None, None);
             self.workspace.active = Some(task.id.clone());
             self.workspace.journal.tasks.push(task);
         }
     }
-    fn workspace_capture_draft(&mut self) {
+    pub(super) fn workspace_capture_draft(&mut self) {
         let draft = self.fields[F_AMOO].text.clone();
         let paths = self
             .amoo_attachments
@@ -374,12 +340,31 @@ impl Companion {
             if draft.trim().is_empty() && paths.is_empty() {
                 return;
             }
-            // A new conversation is lazy until it has actual input. Persist
-            // that input before history/window switches, even before sending.
-            self.workspace_ensure_task();
+            let trimmed = draft.trim();
+            if let Some(existing_id) = self
+                .workspace
+                .journal
+                .tasks
+                .iter()
+                .find(|t| {
+                    self.workspace_visible(t)
+                        && model::draft_task_signature(t)
+                            .is_some_and(|(p, f)| p == trimmed && f == paths)
+                })
+                .map(|t| t.id.clone())
+            {
+                self.workspace.active = Some(existing_id);
+            } else {
+                // A new conversation is lazy until it has actual input. Persist
+                // that input before history/window switches, even before sending.
+                self.workspace_ensure_task();
+            }
         }
         let intent = self.workspace.intent;
         if let Some(task) = self.workspace_task_mut() {
+            if task.draft != draft || task.attachments != paths {
+                task.updated = chrono::Utc::now().timestamp();
+            }
             if task.turns.is_empty() && task.session.is_none() {
                 task.title = if draft.trim().is_empty() {
                     "新对话".into()
@@ -390,6 +375,13 @@ impl Companion {
             task.draft = draft;
             task.attachments = paths;
             task.intent = intent;
+        }
+        if let Some(merged_id) = self
+            .workspace
+            .journal
+            .deduplicate_draft_tasks(self.workspace.active.as_deref())
+        {
+            self.workspace.active = Some(merged_id);
         }
     }
     pub(super) fn workspace_skill_imported(&mut self, root: &PathBuf) {
@@ -628,7 +620,8 @@ impl Companion {
                 if *panel == 3 && !(1..=4).contains(&self.work.tab) {
                     self.work.tab = 2;
                 }
-                self.workspace.panel = if self.workspace.panel == *panel {
+                self.workspace.panel = if !self.workspace.history && self.workspace.panel == *panel
+                {
                     0
                 } else {
                     *panel
@@ -662,15 +655,24 @@ impl Companion {
             }
             A::ChooseFolder => {
                 anyhow::ensure!(!self.workspace_busy(), "执行期间不能修改资料目录");
-                if let Some(path) = native_dialog::FileDialog::new()
-                    .set_title("选择此任务可读取资料、保存成果的文件夹")
-                    .show_open_single_dir()?
-                {
-                    self.workspace_ensure_task();
-                    let path = path.canonicalize()?;
-                    self.work.workspace = Some(path.clone());
-                    self.workspace_task_mut().unwrap().workspace = Some(path);
-                }
+                let expected_task = self.workspace.active.clone();
+                self.choose_path(
+                    stepx_companion::file_dialog::FileDialog::new()
+                        .set_title("选择此任务可读取资料、保存成果的文件夹"),
+                    DialogKind::OpenFolder,
+                    move |app, path, _ctx| {
+                        anyhow::ensure!(
+                            !app.workspace_busy() && app.workspace.active == expected_task,
+                            "当前任务已变化，请重新选择资料目录"
+                        );
+                        app.workspace_ensure_task();
+                        let path = path.canonicalize()?;
+                        app.work.workspace = Some(path.clone());
+                        app.workspace_task_mut().unwrap().workspace = Some(path);
+                        app.workspace_persist();
+                        Ok(())
+                    },
+                );
             }
             A::Prepare => {
                 self.workspace_prepare_and_confirm(Some(ctx))?;
@@ -696,44 +698,7 @@ impl Companion {
                 self.workspace_stop();
             }
             A::Retry => {
-                anyhow::ensure!(!self.workspace_active_busy(), "请等待当前操作完成");
-                let task = self
-                    .workspace_task()
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("请选择任务"))?;
-                let prompt = task
-                    .turns
-                    .iter()
-                    .rev()
-                    .find(|t| t.user)
-                    .map(|t| t.text.clone())
-                    .unwrap_or_default();
-                self.fields[F_AMOO].set(&prompt);
-                let start = task
-                    .steps
-                    .iter()
-                    .position(|s| {
-                        matches!(s.phase, Phase::Failed | Phase::Stopped | Phase::Unconfirmed)
-                    })
-                    .unwrap_or(task.steps.len().saturating_sub(1));
-                let steps = task
-                    .steps
-                    .iter()
-                    .skip(start)
-                    .map(|s| s.executor)
-                    .collect::<Vec<_>>();
-                let files = if steps.first() == Some(&Executor::App) {
-                    vec![]
-                } else {
-                    task.submitted_files
-                };
-                self.amoo_attachments.clear();
-                self.add_amoo_paths(&files)?;
-                self.workspace.proposal = Some(Proposal {
-                    text: prompt,
-                    files,
-                    steps,
-                });
+                self.workspace_retry_opt(Some(ctx))?;
             }
             A::Preview(i) => {
                 let output = self
@@ -886,6 +851,12 @@ impl Companion {
                     } else {
                         let a = self.studio_lab_selected().cloned().unwrap();
                         let open = self.workspace.open_phone;
+                        self.back_screen.active_phone_capsule = Some((
+                            "stepx_amoo".into(),
+                            "✨ Amoo已送达".into(),
+                            format!("作品已送达 · {}", a.name),
+                            Instant::now(),
+                        ));
                         self.with_device("正在保存到手机作品库…", move |adb, d| {
                             let result = (|| {
                                 let html = stepx_companion::studio_lab::verified_html(&a)?;
@@ -895,6 +866,29 @@ impl Companion {
                                 if open {
                                     stepx_companion::studio_delivery::open_local(adb, &d, &r.id)?;
                                 }
+                                let capsule_req =
+                                    stepx_companion::push::PhoneLiveCapsuleRequest {
+                                        tag: "stepx_amoo".into(),
+                                        pill_text: "✨ Amoo已送达".into(),
+                                        title: format!("作品已送达 · {}", a.name),
+                                        subtitle: "已保存到手机作品库并同步背屏灵动反馈".into(),
+                                        badge_text: "Amoo协同".into(),
+                                        live_type: 1,
+                                        countdown_secs: None,
+                                        ongoing: false,
+                                    };
+                                let _ = stepx_companion::push::post_phone_live_capsule(
+                                    adb,
+                                    &d.serial,
+                                    &capsule_req,
+                                );
+                                let _ =
+                                    stepx_companion::backscreen_amoo::sync_sprite_state_to_backscreen(
+                                        adb,
+                                        &d,
+                                        stepx_companion::backscreen_amoo::AgentSpriteState::Celebrating,
+                                        0,
+                                    );
                                 Ok(format!(
                                     "{} 已保存到手机作品库，可离线打开{}",
                                     a.name,
@@ -910,17 +904,49 @@ impl Companion {
                     }
                 } else {
                     anyhow::ensure!(!cloud, "文件请先导出；官网同步支持已验证的应用源码");
+                    let output_title = output.name.clone();
                     let path = output.path;
                     let task = self.workspace.active.clone().unwrap_or_default();
+                    self.back_screen.active_phone_capsule = Some((
+                        "stepx_amoo".into(),
+                        "✨ Amoo已送达".into(),
+                        format!("成果已送达 · {output_title}"),
+                        Instant::now(),
+                    ));
                     self.with_device("正在发送文件到手机…", move |adb, d| {
-                        let result =
-                            stepx_companion::companion_link::send_files(adb, &d, &[path.clone()])
-                                .map(|count| {
-                                    format!(
-                                        "已校验并发送 {count} 个文件到 StepX伴侣 → 文件 → 接收文件"
-                                    )
-                                })
-                                .map_err(|e| e.to_string());
+                        let result = stepx_companion::companion_link::send_files(
+                            adb,
+                            &d,
+                            &[path.clone()],
+                        )
+                        .map(|count| {
+                            let capsule_req = stepx_companion::push::PhoneLiveCapsuleRequest {
+                                tag: "stepx_amoo".into(),
+                                pill_text: "✨ Amoo已送达".into(),
+                                title: format!("成果已送达 · {output_title}"),
+                                subtitle: format!(
+                                    "已发送 {count} 个文件到 StepX伴侣并同步背屏庆祝动画"
+                                ),
+                                badge_text: "Amoo协同".into(),
+                                live_type: 1,
+                                countdown_secs: None,
+                                ongoing: false,
+                            };
+                            let _ = stepx_companion::push::post_phone_live_capsule(
+                                adb,
+                                &d.serial,
+                                &capsule_req,
+                            );
+                            let _ =
+                                stepx_companion::backscreen_amoo::sync_sprite_state_to_backscreen(
+                                    adb,
+                                    &d,
+                                    stepx_companion::backscreen_amoo::AgentSpriteState::Celebrating,
+                                    0,
+                                );
+                            format!("已校验并发送 {count} 个文件到 StepX伴侣 → 文件 → 接收文件")
+                        })
+                        .map_err(|e| e.to_string());
                         Ok(Outcome::WorkspaceDelivered(task, path, d.serial, result))
                     });
                 }
@@ -945,26 +971,13 @@ impl Companion {
                     },
                 );
             }
-            A::SelectPersona(idx) => {
-                self.amoo_style_idx = *idx % 3;
-                let label = match self.amoo_style_idx {
-                    0 => "直接精炼 · 不长篇解释",
-                    1 => "温和详细 · 分步拆解",
-                    _ => "极客专业 · 附带命令",
-                };
-                self.status = format!("Amoo 沟通风格已切换为：{label}");
-                self.error = false;
-            }
-            A::SelectAgentRole(idx) => {
-                self.amoo_agent_idx = *idx % 4;
-                let label = match self.amoo_agent_idx {
-                    0 => "Amoo 全能助手",
-                    1 => "桌面交付伙伴",
-                    2 => "办公协同专员",
-                    _ => "研发架构专家",
-                };
-                self.status = format!("Amoo 角色人设已切换为：{label}");
-                self.error = false;
+            A::SelectPersona(_)
+            | A::SelectAgentRole(_)
+            | A::ToggleMemory
+            | A::MemoryCategory(_)
+            | A::AddMemory
+            | A::DeleteMemory(_) => {
+                let _ = self.apply_persona_or_memory_action(action)?;
             }
             A::ToggleOpenClawSkill(idx) => {
                 if let Some(skill) = self.amoo_skills.get_mut(*idx) {
@@ -1005,55 +1018,6 @@ impl Companion {
                 self.status = "已将个人记忆带入当前对话输入框".into();
                 self.error = false;
                 self.focus_field(F_AMOO, ctx);
-            }
-            A::ToggleMemory => {
-                self.amoo_memory_enabled = !self.amoo_memory_enabled;
-                self.status = if self.amoo_memory_enabled {
-                    "已开启个人记忆自动关联".into()
-                } else {
-                    "已暂停个人记忆自动关联".into()
-                };
-                self.error = false;
-            }
-            A::MemoryCategory(cat) => {
-                self.workspace.memory_category = *cat % 4;
-            }
-            A::AddMemory => {
-                let raw_input = self.fields[F_AMOO_MEMORY_INPUT].text.trim().to_string();
-                let fallback = self.fields[F_AMOO].text.trim().to_string();
-                let content = if !raw_input.is_empty() {
-                    raw_input
-                } else {
-                    fallback
-                };
-                anyhow::ensure!(
-                    !content.is_empty(),
-                    "请先在记忆输入框填写要记住的偏好或备忘内容"
-                );
-                let cat_label = match self.workspace.memory_category {
-                    1 => "关于我 · 个人画像",
-                    2 => "交流偏好 · 称呼与语气",
-                    3 => "备忘事项 · 重要记录",
-                    _ => "关于我 · 个人记忆",
-                };
-                self.amoo_memories.insert(
-                    0,
-                    AmooMemoryEntry {
-                        title: content.clone(),
-                        sub: format!("{cat_label} · 刚刚添加"),
-                    },
-                );
-                self.amoo_bm25_entries = self.amoo_bm25_entries.max(self.amoo_memories.len());
-                self.fields[F_AMOO_MEMORY_INPUT].clear();
-                self.status = format!("已添加个人记忆：「{content}」（{cat_label}）");
-                self.error = false;
-            }
-            A::DeleteMemory(idx) => {
-                if *idx < self.amoo_memories.len() {
-                    let removed = self.amoo_memories.remove(*idx);
-                    self.status = format!("已移除个人记忆：「{}」", removed.title);
-                    self.error = false;
-                }
             }
             A::SendScheduleToAmoo(summary) => {
                 self.workspace.sub_view = 0;
@@ -1314,6 +1278,8 @@ impl Companion {
                     let last_user_idx = task.turns.iter().rposition(|t| t.user);
                     let (text, files) = if let Some(idx) = last_user_idx {
                         task.turns.truncate(idx + 1);
+                        task.draft.clear();
+                        task.attachments.clear();
                         (task.turns[idx].text.clone(), task.submitted_files.clone())
                     } else {
                         let fallback = if !task.draft.trim().is_empty() {
@@ -1354,9 +1320,14 @@ impl Companion {
                     }
                     (last_user_idx.is_some(), files, decision.steps)
                 };
+                if has_user_turn {
+                    self.fields[F_AMOO].clear();
+                    self.amoo_attachments.clear();
+                    self.workspace.last_draft = Default::default();
+                    self.workspace.proposal = None;
+                }
                 if has_user_turn && !self.demo_mode {
-                    let has_local_model = self.studio_lab.config.has_key
-                        || stepx_companion::work::has_local_model_backend();
+                    let has_local_model = stepx_companion::work::has_local_model_backend();
                     let requires_phone = steps.iter().any(|s| match s {
                         Executor::Phone | Executor::Image => true,
                         Executor::Files | Executor::App => !has_local_model,
@@ -1400,25 +1371,94 @@ impl Companion {
                 self.workspace.selected_output = Some(*idx);
                 return self.do_workspace(&A::Deliver(false), ctx);
             }
+            A::TogglePin(target_id) => {
+                if let Some(key) = target_id.strip_prefix("phone:") {
+                    let key = key.trim().to_string();
+                    if self.workspace.journal.pinned_sessions.remove(&key) {
+                        self.status = "已取消置顶".into();
+                    } else if !key.is_empty() {
+                        self.workspace.journal.pinned_sessions.insert(key);
+                        self.status = "已置顶对话".into();
+                    }
+                    self.error = false;
+                } else if let Some(task) = self
+                    .workspace
+                    .journal
+                    .tasks
+                    .iter_mut()
+                    .find(|t| &t.id == target_id)
+                {
+                    task.pinned = !task.pinned;
+                    self.status = if task.pinned {
+                        "已置顶对话".into()
+                    } else {
+                        "已取消置顶".into()
+                    };
+                    self.error = false;
+                }
+            }
             A::CopyTaskTranscript(task_id) => {
-                if let Some(task) = self
+                let format_session_items = |title: &str, items: &[AmooChatItem]| -> String {
+                    let mut lines = vec![format!("# {}", title)];
+                    for item in items {
+                        match item {
+                            AmooChatItem::UserText { text, .. }
+                            | AmooChatItem::UserVoice {
+                                transcript: text, ..
+                            } => {
+                                lines.push(format!("\n**我**：\n{text}"));
+                            }
+                            AmooChatItem::AssistantRich {
+                                text: Some(text), ..
+                            } if !text.trim().is_empty() => {
+                                lines.push(format!("\n**Amoo**：\n{text}"));
+                            }
+                            _ => {}
+                        }
+                    }
+                    lines.join("\n")
+                };
+                if let Some(key) = task_id.strip_prefix("phone:") {
+                    let key = key.trim();
+                    if let Some(sess) = self.amoo_sessions.iter().find(|s| s.session_key == key) {
+                        let title = super::amoo_display::session_title(&sess.title);
+                        let transcript = format_session_items(&title, &sess.items);
+                        ctx.clipboard()
+                            .write(facloud_ui::clipboard::ClipboardContent::plain_text(
+                                transcript,
+                            ));
+                        self.status = "已复制全部对话内容".into();
+                        self.error = false;
+                    }
+                } else if let Some(task) = self
                     .workspace
                     .journal
                     .tasks
                     .iter()
                     .find(|t| &t.id == task_id)
                 {
-                    let mut lines = vec![format!("# {}", task.title)];
-                    for turn in &task.turns {
-                        let role = if turn.user { "我" } else { "Amoo" };
-                        lines.push(format!("\n**{role}**：\n{}", turn.text));
-                    }
-                    let transcript = lines.join("\n");
+                    let transcript = if task.turns.is_empty() {
+                        if let Some(sess) = task.session.as_deref().and_then(|key| {
+                            self.amoo_sessions.iter().find(|s| s.session_key == key)
+                        }) {
+                            format_session_items(&task.title, &sess.items)
+                        } else {
+                            format!("# {}", task.title)
+                        }
+                    } else {
+                        let mut lines = vec![format!("# {}", task.title)];
+                        for turn in &task.turns {
+                            let role = if turn.user { "我" } else { "Amoo" };
+                            lines.push(format!("\n**{role}**：\n{}", turn.text));
+                        }
+                        lines.join("\n")
+                    };
                     ctx.clipboard()
                         .write(facloud_ui::clipboard::ClipboardContent::plain_text(
                             transcript,
                         ));
                     self.status = format!("已复制「{}」的对话内容", task.title);
+                    self.error = false;
                 }
             }
             A::SendTaskOutputToPhone(task_id, idx) => {
@@ -1612,6 +1652,70 @@ impl Companion {
                 return Ok(());
             }
         }
+        if let Some(kind) = stepx_companion::amoo_route::detect_doctor_or_google_guide_query(&text)
+        {
+            let topic = match kind {
+                stepx_companion::amoo_route::DoctorQueryKind::GooglePlayGuide => {
+                    stepx_companion::doctor_harness::DoctorTopic::GooglePlayGuide
+                }
+                stepx_companion::amoo_route::DoctorQueryKind::CompanionSelfHeal => {
+                    stepx_companion::doctor_harness::DoctorTopic::CompanionSelfHeal
+                }
+                stepx_companion::amoo_route::DoctorQueryKind::PcTroubleshoot => {
+                    stepx_companion::doctor_harness::DoctorTopic::PcTroubleshoot
+                }
+            };
+            let initial_report = if self.demo_mode {
+                stepx_companion::doctor_harness::default_demo_report(topic, &text)
+            } else {
+                stepx_companion::doctor_harness::pending_report(topic, &text)
+            };
+            self.doctor_report = Some(initial_report.clone());
+            self.workspace_ensure_task();
+            if self.demo_mode || self.selected.is_none() {
+                if let Some(task) = self.workspace_task_mut() {
+                    if task.turns.is_empty() {
+                        task.title = model::clean_task_title(&text);
+                    }
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    task.turns.push(Turn {
+                        at_ms: Some(now_ms),
+                        user: true,
+                        text: text.clone(),
+                    });
+                    task.turns.push(Turn {
+                        at_ms: Some(now_ms),
+                        user: false,
+                        text: initial_report.ai_guidance_markdown.clone(),
+                    });
+                    task.steps = vec![Step {
+                        executor: Executor::Phone,
+                        phase: Phase::Done,
+                        note: format!(
+                            "{}：{}",
+                            initial_report.model_label, initial_report.headline
+                        ),
+                    }];
+                    task.route_note = kind.label().to_string();
+                    task.draft.clear();
+                    task.attachments.clear();
+                    task.updated = chrono::Utc::now().timestamp();
+                }
+                self.fields[F_AMOO].clear();
+                self.amoo_attachments.clear();
+                self.workspace.last_draft = Default::default();
+                self.workspace.proposal = None;
+                self.workspace.panel = 0;
+                self.handle_device_action(&Action::RunDoctorHarness { topic, query: text });
+                self.reveal_latest_chat();
+                return Ok(());
+            } else {
+                self.handle_device_action(&Action::RunDoctorHarness {
+                    topic,
+                    query: text.clone(),
+                });
+            }
+        }
         if matches!(self.workspace.intent, Intent::Files | Intent::App)
             && stepx_companion::amoo_route::breaks_active_route(
                 self.workspace.intent,
@@ -1676,8 +1780,7 @@ impl Companion {
         {
             self.workspace_stop();
         }
-        let has_local_model =
-            self.studio_lab.config.has_key || stepx_companion::work::has_local_model_backend();
+        let has_local_model = stepx_companion::work::has_local_model_backend();
         let requires_phone = proposal.steps.iter().any(|s| match s {
             Executor::Phone | Executor::Image => true,
             Executor::Files | Executor::App => !has_local_model,
@@ -1693,8 +1796,9 @@ impl Companion {
         if proposal.steps.contains(&Executor::App) && !self.demo_mode {
             anyhow::ensure!(self.studio_lab.loaded, "正在读取模型配置，请稍后重试");
             anyhow::ensure!(
-                !self.studio_lab.config.has_key
-                    || (!self.studio_lab.config.model.is_empty()
+                self.studio_lab_uses_phone()
+                    || (self.studio_lab.config.has_key
+                        && !self.studio_lab.config.model.is_empty()
                         && !self.studio_lab_config_dirty()),
                 "制作应用需先在“模型与账号”中保存并测试自己的 API"
             );
@@ -1710,54 +1814,332 @@ impl Companion {
             });
         let device = self.selected.as_ref().map(|d| d.serial.clone());
         let account = self.amoo_ui.account_scope.clone();
-        let task = self.workspace_task_mut().unwrap();
-        if requires_phone || device.is_some() {
-            task.device = device;
-            task.account = account;
-        }
-        if task.turns.is_empty() {
-            task.title = model::clean_task_title(&proposal.text);
-        }
-        task.turns.push(Turn {
-            user: true,
-            text: proposal.text.clone(),
-        });
-        task.steps = proposal
-            .steps
-            .iter()
-            .map(|e| Step {
-                executor: *e,
-                phase: Phase::Ready,
-                note: String::new(),
-            })
-            .collect();
-        task.updated = chrono::Utc::now().timestamp();
-        if task.workspace.is_none()
-            && proposal
+        let proposal_text = proposal.text.clone();
+        let session_to_replace = {
+            let task = self.workspace_task_mut().unwrap();
+            if requires_phone || device.is_some() {
+                task.device = device;
+                task.account = account;
+            }
+            let has_failed_step = task.steps.iter().any(|s| s.phase == Phase::Failed);
+            let has_incomplete_step = !task.steps.is_empty()
+                && task.steps.iter().any(|s| {
+                    matches!(s.phase, Phase::Failed | Phase::Stopped | Phase::Unconfirmed)
+                });
+            let last_user_idx = task.turns.iter().rposition(|t| t.user);
+            let replacing_failed_turn = has_incomplete_step
+                && match last_user_idx {
+                    Some(idx) => {
+                        let same_prompt = proposal.text.trim() == task.turns[idx].text.trim();
+                        let has_real_assistant_reply = task.turns[idx + 1..].iter().any(|t| {
+                            !t.user
+                                && !t.text.trim().is_empty()
+                                && t.text.trim() != "已停止"
+                                && !model::is_unconfirmed_placeholder(&t.text)
+                        });
+                        has_failed_step || same_prompt || !has_real_assistant_reply
+                    }
+                    None => true,
+                };
+            if replacing_failed_turn {
+                if let Some(last_user_idx) = last_user_idx {
+                    task.turns.truncate(last_user_idx);
+                } else {
+                    task.turns.clear();
+                }
+            }
+            if task.turns.is_empty() {
+                task.title = model::clean_task_title(&proposal.text);
+            }
+            task.turns.push(Turn {
+                at_ms: Some(chrono::Utc::now().timestamp_millis()),
+                user: true,
+                text: proposal.text.clone(),
+            });
+            task.steps = proposal
                 .steps
                 .iter()
-                .any(|e| matches!(e, Executor::Files | Executor::App | Executor::Image))
-        {
-            task.workspace = Some(default_root.join(&task.id));
+                .map(|e| Step {
+                    executor: *e,
+                    phase: Phase::Ready,
+                    note: String::new(),
+                })
+                .collect();
+            task.updated = chrono::Utc::now().timestamp();
+            if task.workspace.is_none()
+                && proposal
+                    .steps
+                    .iter()
+                    .any(|e| matches!(e, Executor::Files | Executor::App | Executor::Image))
+            {
+                task.workspace = Some(default_root.join(&task.id));
+            }
+            if let Some(ref dir) = task.workspace {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            task.submitted_files = proposal.files;
+            task.draft.clear();
+            task.attachments.clear();
+            task.intent = Intent::Auto;
+            task.note.clear();
+            replacing_failed_turn
+                .then(|| task.session.clone())
+                .flatten()
+        };
+        if let Some(key) = session_to_replace {
+            if let Some(sess) = self.amoo_sessions.iter_mut().find(|s| s.session_key == key) {
+                if let Some(last_u) = sess
+                    .items
+                    .iter()
+                    .rposition(|it| matches!(it, AmooChatItem::UserText { .. }))
+                {
+                    let prev_att = match &sess.items[last_u] {
+                        AmooChatItem::UserText { attachment, .. } => attachment.clone(),
+                        _ => None,
+                    };
+                    sess.items[last_u] = AmooChatItem::UserText {
+                        text: proposal_text,
+                        attachment: prev_att,
+                    };
+                    sess.items.truncate(last_u + 1);
+                }
+            }
         }
-        if let Some(ref dir) = task.workspace {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        task.submitted_files = proposal.files;
-        task.draft.clear();
-        task.intent = Intent::Auto;
-        task.note.clear();
+        self.workspace.last_draft = Default::default();
         self.workspace.proposal = None;
         self.workspace.panel = 0;
         // One-shot forced routes reset after sending; sticky route lives on `task.route`.
         self.workspace.intent = Intent::Auto;
         self.workspace.next = true;
+        if let Some(merged_id) = self
+            .workspace
+            .journal
+            .deduplicate_draft_tasks(self.workspace.active.as_deref())
+        {
+            self.workspace.active = Some(merged_id);
+        }
         if let Err(e) = self.workspace_start_next_opt(ctx) {
             let msg = e.to_string();
             self.workspace_finish(Phase::Failed, msg.clone());
             self.status = msg;
             self.error = true;
             return Ok(());
+        }
+        Ok(())
+    }
+    pub(super) fn workspace_retry_opt(
+        &mut self,
+        ctx: Option<&mut ViewContext<Self>>,
+    ) -> Result<()> {
+        anyhow::ensure!(!self.workspace_active_busy(), "请等待当前操作完成");
+        let task_snapshot = self
+            .workspace_task()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("请选择任务"))?;
+        let prompt = task_snapshot
+            .turns
+            .iter()
+            .rev()
+            .find(|t| t.user)
+            .map(|t| t.text.clone())
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                let d = task_snapshot.draft.trim();
+                (!d.is_empty()).then(|| d.to_string())
+            })
+            .or_else(|| {
+                let f = self.fields[F_AMOO].text.trim();
+                (!f.is_empty()).then(|| f.to_string())
+            })
+            .unwrap_or_default();
+        let files = if !task_snapshot.submitted_files.is_empty() {
+            task_snapshot.submitted_files.clone()
+        } else {
+            task_snapshot.attachments.clone()
+        };
+        let (first_retry_step, planned_steps): (usize, Vec<Executor>) =
+            if task_snapshot.steps.is_empty() {
+                let route_ctx = stepx_companion::amoo_route::RouteCtx {
+                    forced: (self.workspace.intent != Intent::Auto)
+                        .then_some(self.workspace.intent),
+                    sticky: task_snapshot.route,
+                    last: None,
+                };
+                (
+                    0,
+                    stepx_companion::amoo_route::route_intent(&prompt, &files, &route_ctx).steps,
+                )
+            } else {
+                let start = task_snapshot
+                    .steps
+                    .iter()
+                    .position(|s| {
+                        matches!(s.phase, Phase::Failed | Phase::Stopped | Phase::Unconfirmed)
+                    })
+                    .unwrap_or(task_snapshot.steps.len().saturating_sub(1));
+                (
+                    start,
+                    task_snapshot
+                        .steps
+                        .iter()
+                        .skip(start)
+                        .map(|s| s.executor)
+                        .collect(),
+                )
+            };
+        let uses_work_runner = planned_steps
+            .iter()
+            .any(|s| matches!(s, Executor::Files | Executor::Image));
+        let uses_app_runner = planned_steps.contains(&Executor::App);
+        if self.workspace.running.is_some()
+            || (uses_work_runner && self.work.running)
+            || (uses_app_runner && self.studio_lab.handle.is_some())
+        {
+            self.workspace_stop();
+        }
+        let has_local_model = stepx_companion::work::has_local_model_backend();
+        let requires_phone = planned_steps.iter().any(|s| match s {
+            Executor::Phone | Executor::Image => true,
+            Executor::Files | Executor::App => !has_local_model,
+            Executor::Screen => false,
+        });
+        anyhow::ensure!(
+            self.demo_mode || !requires_phone || self.selected.is_some(),
+            "请连接手机后重试；草稿和附件已保留"
+        );
+        let default_root = self
+            .settings
+            .value
+            .work_directory
+            .clone()
+            .unwrap_or_else(|| {
+                stepx_companion::resources::user_state().join("amoo-workspace/files")
+            });
+        let device = self.selected.as_ref().map(|d| d.serial.clone());
+        let account = self.amoo_ui.account_scope.clone();
+        let session_to_truncate = if let Some(task) = self.workspace_task_mut() {
+            if requires_phone || device.is_some() {
+                if device.is_some() {
+                    task.device = device;
+                }
+                if account.is_some() {
+                    task.account = account;
+                }
+            }
+            if let Some(last_user_idx) = task.turns.iter().rposition(|t| t.user) {
+                let keep_len = (last_user_idx + 1 + first_retry_step).min(task.turns.len());
+                task.turns.truncate(keep_len);
+                if first_retry_step > 0 && task.turns.len() > last_user_idx + 1 {
+                    let retry_step_note = task
+                        .steps
+                        .get(first_retry_step)
+                        .map(|s| s.note.trim().to_string())
+                        .unwrap_or_default();
+                    let retry_step_summary = model::failure_summary(&retry_step_note);
+                    if task.turns.last().is_some_and(|t| {
+                        !t.user
+                            && (model::is_unconfirmed_placeholder(&t.text)
+                                || t.text.trim() == "已停止"
+                                || (!retry_step_note.is_empty()
+                                    && (t.text.trim() == retry_step_note
+                                        || t.text.trim() == retry_step_summary.trim())))
+                    }) {
+                        task.turns.pop();
+                    }
+                }
+            } else if !prompt.is_empty() {
+                task.title = model::clean_task_title(&prompt);
+                task.turns.push(Turn {
+                    at_ms: Some(chrono::Utc::now().timestamp_millis()),
+                    user: true,
+                    text: prompt.clone(),
+                });
+            }
+            if task.steps.is_empty() {
+                task.steps = planned_steps
+                    .iter()
+                    .map(|e| Step {
+                        executor: *e,
+                        phase: Phase::Ready,
+                        note: String::new(),
+                    })
+                    .collect();
+            } else if task
+                .steps
+                .iter()
+                .any(|s| matches!(s.phase, Phase::Failed | Phase::Stopped | Phase::Unconfirmed))
+            {
+                for step in &mut task.steps {
+                    if matches!(
+                        step.phase,
+                        Phase::Failed | Phase::Stopped | Phase::Unconfirmed
+                    ) {
+                        step.phase = Phase::Ready;
+                        step.note.clear();
+                    }
+                }
+            } else if let Some(last_step) = task.steps.last_mut() {
+                last_step.phase = Phase::Ready;
+                last_step.note.clear();
+            }
+            if task.workspace.is_none()
+                && task.steps.iter().any(|s| {
+                    matches!(
+                        s.executor,
+                        Executor::Files | Executor::App | Executor::Image
+                    )
+                })
+            {
+                task.workspace = Some(default_root.join(&task.id));
+            }
+            if let Some(ref dir) = task.workspace {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            task.submitted_files = files;
+            task.draft.clear();
+            task.attachments.clear();
+            task.intent = Intent::Auto;
+            task.note.clear();
+            task.updated = chrono::Utc::now().timestamp();
+            task.session.clone()
+        } else {
+            None
+        };
+        if let Some(key) = session_to_truncate {
+            if let Some(sess) = self.amoo_sessions.iter_mut().find(|s| s.session_key == key) {
+                if let Some(last_u) = sess
+                    .items
+                    .iter()
+                    .rposition(|it| matches!(it, AmooChatItem::UserText { .. }))
+                {
+                    sess.items.truncate(last_u + 1);
+                }
+            }
+        }
+        self.fields[F_AMOO].clear();
+        self.amoo_attachments.clear();
+        self.workspace.last_draft = Default::default();
+        self.workspace.proposal = None;
+        self.workspace.panel = 0;
+        self.workspace.intent = Intent::Auto;
+        self.workspace.error = None;
+        self.error = false;
+        self.workspace.next = true;
+        if let Some(merged_id) = self
+            .workspace
+            .journal
+            .deduplicate_draft_tasks(self.workspace.active.as_deref())
+        {
+            self.workspace.active = Some(merged_id);
+        }
+        if !self.demo_mode || planned_steps.contains(&Executor::App) {
+            if let Err(e) = self.workspace_start_next_opt(ctx) {
+                let msg = e.to_string();
+                self.workspace_finish(Phase::Failed, msg.clone());
+                self.status = msg;
+                self.error = true;
+                return Ok(());
+            }
         }
         Ok(())
     }
@@ -1853,6 +2235,13 @@ impl Companion {
             Executor::Phone | Executor::Image => {
                 // Ensure unrelated background sync flags do not prevent starting the phone/image request.
                 self.busy = false;
+                let saved_active_composer = (!is_active_task).then(|| {
+                    (
+                        self.fields[F_AMOO].text.clone(),
+                        self.amoo_attachments.clone(),
+                        self.workspace.last_draft.clone(),
+                    )
+                });
                 self.fields[F_AMOO].set(&original);
                 if executor == Executor::Image {
                     self.work.mode = 2;
@@ -1864,9 +2253,27 @@ impl Companion {
                     if self.busy && is_active_task {
                         self.fields[F_AMOO].clear();
                         self.amoo_attachments.clear();
+                        self.workspace.last_draft = Default::default();
                     }
                 } else {
+                    if !is_active_task {
+                        self.amoo_attachments.clear();
+                    }
+                    if self.amoo_attachments.is_empty() && !task.submitted_files.is_empty() {
+                        let _ = self.add_amoo_paths(&task.submitted_files);
+                    }
                     self.send_amoo_draft();
+                    if self.busy && is_active_task {
+                        self.fields[F_AMOO].clear();
+                        self.amoo_attachments.clear();
+                        self.workspace.last_draft = Default::default();
+                    }
+                }
+                if let Some((prev_text, prev_attachments, prev_last_draft)) = saved_active_composer
+                {
+                    self.fields[F_AMOO].set(&prev_text);
+                    self.amoo_attachments = prev_attachments;
+                    self.workspace.last_draft = prev_last_draft;
                 }
                 if !self.busy {
                     self.workspace_finish(Phase::Failed, self.status.clone());
@@ -2065,18 +2472,41 @@ impl Companion {
                 let prompt = self.studio_lab.last_prompt.trim().to_string();
                 if !prompt.is_empty() {
                     task.turns.push(Turn {
+                        at_ms: Some(chrono::Utc::now().timestamp_millis()),
                         user: true,
                         text: prompt,
                     });
                 }
+                let verified = self
+                    .studio_lab
+                    .artifacts
+                    .iter()
+                    .any(|a| &a.id == lab_id && a.passed);
                 task.turns.push(Turn {
+                    at_ms: Some(chrono::Utc::now().timestamp_millis()),
                     user: false,
-                    text: format!("已在创作工坊完成「{}」生成与本机自动自检。", output.name),
+                    text: if verified {
+                        format!("「{}」已生成并通过本机交互检查。", output.name)
+                    } else {
+                        format!(
+                            "「{}」已生成，功能检查尚未通过；可先预览，再继续修改。",
+                            output.name
+                        )
+                    },
                 });
                 task.steps.push(Step {
                     executor: Executor::App,
-                    phase: Phase::Done,
-                    note: "已在创作工坊生成并验证".into(),
+                    phase: if verified {
+                        Phase::Done
+                    } else {
+                        Phase::Unconfirmed
+                    },
+                    note: if verified {
+                        "已通过本机交互检查"
+                    } else {
+                        "功能待验证"
+                    }
+                    .into(),
                 });
                 task.add_output(output);
                 self.workspace.journal.tasks.push(task);
@@ -2341,13 +2771,20 @@ impl Companion {
         self.error = false;
     }
     pub(super) fn workspace_finish(&mut self, phase: Phase, note: String) {
+        let display_note = if phase == Phase::Failed {
+            model::failure_summary(&note)
+        } else {
+            note.clone()
+        };
         // A late download receipt must not complete a later request in the same chat.
         self.workspace.image_delivery = None;
         self.workspace.stream_tool_status = None;
         self.workspace.stream_delta_count = 0;
         let mut finished_files = false;
+        let mut restore_active: Option<(String, Vec<PathBuf>)> = None;
         if let Some(run) = self.workspace.running.take() {
             finished_files = run.executor == Executor::Files;
+            let is_active = self.workspace.active.as_deref() == Some(run.task.as_str());
             if let Some(task) = self
                 .workspace
                 .journal
@@ -2360,36 +2797,107 @@ impl Companion {
                     step.note = note.clone();
                 }
                 task.note = note.clone();
+                let last_user_idx = task.turns.iter().rposition(|t| t.user);
+                let step_has_own_assistant_turn = last_user_idx
+                    .is_some_and(|idx| task.turns.len() > idx + 1 + run.step)
+                    && task.turns.last().is_some_and(|t| !t.user);
                 if run.executor == Executor::Phone && phase == Phase::Unconfirmed {
                     // Keep any real streaming reply in turns; step.note carries the unconfirmed status.
                 } else if run.executor == Executor::Phone && phase == Phase::Stopped {
                     task.turns
                         .retain(|t| t.user || !model::is_unconfirmed_placeholder(&t.text));
-                    if task.turns.last().is_none_or(|t| t.user) {
+                    if !step_has_own_assistant_turn || task.turns.last().is_none_or(|t| t.user) {
                         task.turns.push(Turn {
+                            at_ms: Some(chrono::Utc::now().timestamp_millis()),
                             user: false,
                             text: note,
                         });
                     }
-                } else if run.executor == Executor::Phone
-                    && task.turns.last().is_some_and(|t| !t.user)
-                {
+                } else if run.executor == Executor::Phone && step_has_own_assistant_turn {
                     if let Some(last) = task.turns.last_mut() {
-                        last.text = note;
+                        last.text = display_note;
                     }
                 } else {
                     task.turns.push(Turn {
+                        at_ms: Some(chrono::Utc::now().timestamp_millis()),
                         user: false,
-                        text: note,
+                        text: display_note,
                     });
+                }
+                if phase == Phase::Failed
+                    && !run.accepted
+                    && matches!(run.executor, Executor::Phone | Executor::Image)
+                {
+                    let typed_in_flight = if is_active {
+                        self.fields[F_AMOO].text.clone()
+                    } else {
+                        String::new()
+                    };
+                    if !typed_in_flight.trim().is_empty() {
+                        task.draft = typed_in_flight;
+                    } else if task.draft.trim().is_empty() {
+                        if let Some(last_user) = task.turns.iter().rev().find(|t| t.user) {
+                            task.draft = last_user.text.clone();
+                        }
+                    }
+                    if task.attachments.is_empty() && !task.submitted_files.is_empty() {
+                        task.attachments = task.submitted_files.clone();
+                    }
+                    if is_active {
+                        restore_active = Some((task.draft.clone(), task.attachments.clone()));
+                    }
+                } else if phase == Phase::Done
+                    && task.steps.iter().all(|s| s.phase == Phase::Done)
+                    && task
+                        .turns
+                        .iter()
+                        .rev()
+                        .find(|t| t.user)
+                        .is_some_and(|u| u.text.trim() == task.draft.trim())
+                {
+                    task.draft.clear();
+                    task.attachments.clear();
                 }
                 task.updated = chrono::Utc::now().timestamp();
                 self.workspace.next =
                     phase == Phase::Done && task.steps.iter().any(|s| s.phase == Phase::Ready);
             }
         }
+        if let Some((restored_draft, restored_files)) = restore_active {
+            if self.fields[F_AMOO].text.trim().is_empty() && !restored_draft.is_empty() {
+                self.fields[F_AMOO].set(&restored_draft);
+            }
+            if self.amoo_attachments.is_empty() && !restored_files.is_empty() {
+                self.amoo_attachments = restored_files
+                    .iter()
+                    .map(|p| AmooAttachment {
+                        name: p
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned(),
+                        size_label: std::fs::metadata(p)
+                            .map(|m| storage::format_bytes(m.len()))
+                            .unwrap_or("文件已移动，请重新添加".into()),
+                        is_image: p.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+                            ["png", "jpg", "jpeg", "webp", "gif"]
+                                .contains(&e.to_lowercase().as_str())
+                        }),
+                        local_path: Some(p.clone()),
+                    })
+                    .collect();
+            }
+            self.workspace.last_draft = (self.fields[F_AMOO].text.clone(), restored_files);
+        }
         if finished_files {
             self.workspace_on_work_finished();
+        }
+        if let Some(merged_id) = self
+            .workspace
+            .journal
+            .deduplicate_draft_tasks(self.workspace.active.as_deref())
+        {
+            self.workspace.active = Some(merged_id);
         }
         self.workspace_persist();
     }
@@ -2620,6 +3128,11 @@ impl Companion {
             }
 
             if !assistant_msgs.is_empty() {
+                let reply_at_ms = assistant_msgs
+                    .iter()
+                    .map(|m| m.timestamp_ms)
+                    .filter(|ms| *ms > 0)
+                    .max();
                 let failure = assistant_msgs.iter().rev().find(|m| m.is_error).map(|m| {
                     m.error_message
                         .clone()
@@ -2646,6 +3159,7 @@ impl Companion {
                         .retain(|t| t.user || !model::is_unconfirmed_placeholder(&t.text));
                     if task.turns.last().is_none_or(|t| t.user) {
                         task.turns.push(Turn {
+                            at_ms: reply_at_ms,
                             user: false,
                             text: error,
                         });
@@ -2681,17 +3195,33 @@ impl Companion {
                     if !reply_text.is_empty() {
                         if let Some(last) = task.turns.last_mut().filter(|t| !t.user) {
                             last.text = reply_text;
+                            if reply_at_ms.is_some() {
+                                last.at_ms = reply_at_ms;
+                            }
                         } else {
                             task.turns.push(Turn {
+                                at_ms: reply_at_ms,
                                 user: false,
                                 text: reply_text,
                             });
                         }
                     } else if task.turns.last().is_none_or(|t| t.user) {
                         task.turns.push(Turn {
+                            at_ms: reply_at_ms,
                             user: false,
                             text: note,
                         });
+                    }
+                    if task.steps.iter().all(|s| s.phase == Phase::Done)
+                        && task
+                            .turns
+                            .iter()
+                            .rev()
+                            .find(|t| t.user)
+                            .is_some_and(|u| u.text.trim() == task.draft.trim())
+                    {
+                        task.draft.clear();
+                        task.attachments.clear();
                     }
                     task.updated = chrono::Utc::now().timestamp();
                     self.amoo_pending_reply.remove(&session_key);
@@ -2760,6 +3290,17 @@ impl Companion {
                     clear_active_running = true;
                 }
             }
+        }
+        let before_dedup = self.workspace.journal.tasks.len();
+        if let Some(merged_id) = self
+            .workspace
+            .journal
+            .deduplicate_draft_tasks(self.workspace.active.as_deref())
+        {
+            self.workspace.active = Some(merged_id);
+        }
+        if self.workspace.journal.tasks.len() != before_dedup {
+            changed = true;
         }
         if clear_active_running {
             self.workspace.running = None;
@@ -2860,7 +3401,7 @@ impl Companion {
         });
     }
     pub(super) fn tick_workspace(&mut self, ctx: &mut ViewContext<Self>) -> bool {
-        let mut changed = false;
+        let mut changed = self.workspace_poll_persistence();
         let image_result =
             self.workspace.image_delivery.as_ref().and_then(|delivery| {
                 match delivery.receiver.try_recv() {
@@ -3631,10 +4172,12 @@ impl Companion {
                     weather_task.updated = 1_761_468_000;
                     weather_task.turns = vec![
                         Turn {
+                            at_ms: None,
                             user: true,
                             text: "上海天气".into(),
                         },
                         Turn {
+                            at_ms: None,
                             user: false,
                             text: weather_reply.into(),
                         },
@@ -3652,10 +4195,12 @@ impl Companion {
                     schedule_task.updated = 1_761_464_000;
                     schedule_task.turns = vec![
                         Turn {
+                            at_ms: None,
                             user: true,
                             text: "帮我核对一下今天和明天的手机日程安排".into(),
                         },
                         Turn {
+                            at_ms: None,
                             user: false,
                             text: "已为您核对手机日程：今天 15:00 有产品体验评审，明天 10:00 有晨会提醒，均已同步至桌面日历。".into(),
                         },
@@ -3672,10 +4217,12 @@ impl Companion {
                     doc_task.updated = 1_761_460_000;
                     doc_task.turns = vec![
                         Turn {
+                            at_ms: None,
                             user: true,
                             text: "帮我列一份季度经营汇报大纲".into(),
                         },
                         Turn {
+                            at_ms: None,
                             user: false,
                             text: "已为您整理包含核心指标、业务进展与下季度规划的汇报大纲。".into(),
                         },
@@ -4045,6 +4592,141 @@ impl Companion {
             ctx.notify();
         });
     }
+
+    pub(super) fn amoo_persona_state_path() -> PathBuf {
+        super::ui_user_config_dir()
+            .join("stepx-companion")
+            .join("amoo-persona-memories.json")
+    }
+
+    pub(super) fn save_amoo_persona_state(&self) {
+        let state = AmooPersonaPersistence {
+            amoo_agent_idx: self.amoo_agent_idx,
+            amoo_style_idx: self.amoo_style_idx,
+            amoo_memory_enabled: self.amoo_memory_enabled,
+            amoo_memories: self.amoo_memories.clone(),
+        };
+        let path = Self::amoo_persona_state_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(&state) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+
+    pub(super) fn load_amoo_persona_state(&mut self) {
+        let path = Self::amoo_persona_state_path();
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let Ok(state) = serde_json::from_str::<AmooPersonaPersistence>(&raw) else {
+            return;
+        };
+        if self.amoo_agents.len() < 4 {
+            self.amoo_agents = default_amoo_agents();
+        }
+        let len = self.amoo_agents.len().max(1);
+        self.amoo_agent_idx = state.amoo_agent_idx % len;
+        self.amoo_style_idx = state.amoo_style_idx % 3;
+        self.amoo_memory_enabled = state.amoo_memory_enabled;
+        self.amoo_memories = state.amoo_memories;
+        self.amoo_bm25_entries = self.amoo_bm25_entries.max(self.amoo_memories.len());
+    }
+
+    pub(super) fn apply_persona_or_memory_action(
+        &mut self,
+        action: &WorkspaceAction,
+    ) -> anyhow::Result<bool> {
+        use WorkspaceAction as A;
+        match action {
+            A::SelectPersona(idx) => {
+                self.amoo_style_idx = *idx % 3;
+                let label = match self.amoo_style_idx {
+                    0 => "直接精炼 · 不长篇解释",
+                    1 => "温和详细 · 分步拆解",
+                    _ => "极客专业 · 附带命令",
+                };
+                self.status = format!("Amoo 沟通风格已切换为：{label}");
+                self.error = false;
+                self.save_amoo_persona_state();
+            }
+            A::SelectAgentRole(idx) => {
+                let len = self.amoo_agents.len().max(1);
+                self.amoo_agent_idx = *idx % len;
+                let label = self
+                    .amoo_agents
+                    .get(self.amoo_agent_idx)
+                    .cloned()
+                    .unwrap_or_else(|| "极简总结官".to_string());
+                self.status = format!("Amoo 角色人设已切换为：{label}");
+                self.error = false;
+                self.save_amoo_persona_state();
+            }
+            A::ToggleMemory => {
+                self.amoo_memory_enabled = !self.amoo_memory_enabled;
+                self.status = if self.amoo_memory_enabled {
+                    "已开启个人记忆自动关联".into()
+                } else {
+                    "已暂停个人记忆自动关联".into()
+                };
+                self.error = false;
+                self.save_amoo_persona_state();
+            }
+            A::MemoryCategory(cat) => {
+                self.workspace.memory_category = *cat % 4;
+            }
+            A::AddMemory => {
+                let raw_input = self.fields[F_AMOO_MEMORY_INPUT].text.trim().to_string();
+                let fallback = self.fields[F_AMOO].text.trim().to_string();
+                let content = if !raw_input.is_empty() {
+                    raw_input
+                } else {
+                    fallback
+                };
+                anyhow::ensure!(
+                    !content.is_empty(),
+                    "请先在记忆输入框填写要记住的偏好或备忘内容"
+                );
+                let cat_label = match self.workspace.memory_category {
+                    1 => "关于我 · 个人画像",
+                    2 => "交流偏好 · 称呼与语气",
+                    3 => "备忘事项 · 重要记录",
+                    _ => "关于我 · 个人记忆",
+                };
+                self.amoo_memories.insert(
+                    0,
+                    AmooMemoryEntry {
+                        title: content.clone(),
+                        sub: format!("{cat_label} · 刚刚添加"),
+                    },
+                );
+                self.amoo_bm25_entries = self.amoo_bm25_entries.max(self.amoo_memories.len());
+                self.fields[F_AMOO_MEMORY_INPUT].clear();
+                self.status = format!("已添加个人记忆：「{content}」（{cat_label}）");
+                self.error = false;
+                self.save_amoo_persona_state();
+            }
+            A::DeleteMemory(idx) => {
+                if *idx < self.amoo_memories.len() {
+                    let removed = self.amoo_memories.remove(*idx);
+                    self.status = format!("已移除个人记忆：「{}」", removed.title);
+                    self.error = false;
+                    self.save_amoo_persona_state();
+                }
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct AmooPersonaPersistence {
+    amoo_agent_idx: usize,
+    amoo_style_idx: usize,
+    amoo_memory_enabled: bool,
+    amoo_memories: Vec<AmooMemoryEntry>,
 }
 
 #[cfg(test)]
@@ -4157,10 +4839,12 @@ mod tests {
         task.session = Some("agent:main:reconcile-test".into());
         task.turns = vec![
             Turn {
+                at_ms: None,
                 user: true,
                 text: "今天北京天气怎么样".into(),
             },
             Turn {
+                at_ms: None,
                 user: false,
                 text: "已停止等待；手机任务可能仍继续，可同步查看结果".into(),
             },
@@ -4229,6 +4913,7 @@ mod tests {
         let mut bg_task = Task::new(None, None);
         bg_task.session = Some("agent:main:bg-running-test".into());
         bg_task.turns = vec![Turn {
+            at_ms: None,
             user: true,
             text: "帮我查一下上海明天的天气".into(),
         }];
@@ -4360,10 +5045,12 @@ mod tests {
         stale_task.note = "已停止等待；手机任务可能仍继续，可同步查看结果".into();
         stale_task.turns = vec![
             Turn {
+                at_ms: None,
                 user: true,
                 text: "未到达手机的测试提问".into(),
             },
             Turn {
+                at_ms: None,
                 user: false,
                 text: "已停止等待；手机任务可能仍继续，可同步查看结果".into(),
             },
@@ -4469,10 +5156,12 @@ mod tests {
         task.route_note = "生成 Word 文档".into();
         task.turns = vec![
             Turn {
+                at_ms: None,
                 user: true,
                 text: "生成一份季度报告 Word 文档".into(),
             },
             Turn {
+                at_ms: None,
                 user: false,
                 text: "正在处理".into(),
             },
@@ -4650,18 +5339,24 @@ mod tests {
         app.amoo_ui.gui_screenshot = Some(shot);
         assert!(app.workspace_gui_pip_card().is_none());
 
-        // When gui_running or gui_paused is true, the PIP card is rendered
+        // When gui_running, gui_paused, or gui_unconfirmed is true, the PIP card is rendered
         app.amoo_ui.gui_running = true;
         assert!(app.workspace_gui_pip_card().is_some());
         app.amoo_ui.gui_running = false;
         app.amoo_ui.gui_paused = true;
         assert!(app.workspace_gui_pip_card().is_some());
+        app.amoo_ui.gui_paused = false;
+        app.amoo_ui.gui_unconfirmed = true;
+        assert!(app.workspace_gui_pip_card().is_some());
+        app.amoo_ui.gui_unconfirmed = false;
+        assert!(app.workspace_gui_pip_card().is_none());
 
         // 2. Stopping an unaccepted/in-flight phone turn transitions to Phase::Stopped
         // and clears running + amoo_pending_reply
         let mut task = Task::new(None, None);
         task.session = Some("agent:main:stop-test".into());
         task.turns = vec![Turn {
+            at_ms: None,
             user: true,
             text: "测试停止".into(),
         }];
@@ -4916,6 +5611,7 @@ mod tests {
         let mut fixture2 = Task::new(None, None);
         fixture2.title = "日常任务".into();
         fixture2.turns.push(Turn {
+            at_ms: None,
             user: true,
             text: "这是 StepX Companion 统一任务验收。请输出报告。".into(),
         });
@@ -5020,15 +5716,169 @@ mod tests {
         app.workspace_switch_new().unwrap();
         assert!(app.workspace.active.is_none());
         app.workspace_capture_draft();
-        assert!(app.workspace.active.is_none(), "empty welcome must not create history");
+        assert!(
+            app.workspace.active.is_none(),
+            "empty welcome must not create history"
+        );
         app.fields[F_AMOO].set("尚未发送的中文草稿\n第二行保持原样");
         app.workspace_toggle_history();
-        let id = app.workspace.active.clone().expect("unsent input has a draft record");
+        let id = app
+            .workspace
+            .active
+            .clone()
+            .expect("unsent input has a draft record");
+        assert!(
+            app.workspace_task().unwrap().meaningful(),
+            "draft must be selectable in history"
+        );
         app.workspace_switch_new().unwrap();
         app.fields[F_AMOO].set("第二条草稿");
         app.workspace_select_task(&id).unwrap();
-        assert_eq!(app.fields[F_AMOO].text, "尚未发送的中文草稿\n第二行保持原样");
-        assert!(app.workspace.journal.tasks.iter().any(|t| t.draft == "第二条草稿"));
+        assert_eq!(
+            app.fields[F_AMOO].text,
+            "尚未发送的中文草稿\n第二行保持原样"
+        );
+        assert!(app
+            .workspace
+            .journal
+            .tasks
+            .iter()
+            .any(|t| t.draft == "第二条草稿"));
+    }
+
+    #[test]
+    fn amoo_four_roles_projects_button_and_persona_memory_persistence_work_end_to_end() {
+        let _guard = TEST_CONFIG_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let _cfg_guard = super::super::TestUiConfigDirGuard::set(cfg_dir.path());
+
+        let mut app = Companion::new_for_test();
+        assert_eq!(
+            app.amoo_agents,
+            vec![
+                "Amoo 全能助手".to_string(),
+                "桌面交付伙伴".to_string(),
+                "办公协同专员".to_string(),
+                "极简总结官".to_string(),
+            ]
+        );
+
+        // Verify all 4 roles (0..=3, including "极简总结官") work without out-of-bounds fallback
+        for (idx, expected) in [
+            (0, "Amoo 全能助手"),
+            (1, "桌面交付伙伴"),
+            (2, "办公协同专员"),
+            (3, "极简总结官"),
+        ] {
+            assert!(app
+                .apply_persona_or_memory_action(&WorkspaceAction::SelectAgentRole(idx))
+                .unwrap());
+            assert_eq!(app.amoo_agent_idx, idx);
+            assert_eq!(app.active_amoo_agent_name(), expected);
+            assert!(app.status.contains(expected));
+        }
+
+        // Verify top-bar workspace_actions includes the new projects button even when more menu is collapsed
+        app.amoo_expanded_tool_records.clear();
+        app.workspace.history = false;
+        app.workspace.panel = 0;
+        let top_actions_collapsed = app.workspace_actions();
+        assert!(
+            top_actions_collapsed.len() >= 4,
+            "workspace_actions must include projects button, GUI button, more button, and new chat button when collapsed"
+        );
+        app.workspace.panel = 4;
+        let _ = app.workspace_page(false);
+
+        // Verify style, memory toggle, memory add, and memory delete persist across restart
+        assert!(app
+            .apply_persona_or_memory_action(&WorkspaceAction::SelectPersona(2))
+            .unwrap());
+        assert_eq!(app.amoo_style_idx, 2);
+
+        app.workspace.memory_category = 3;
+        app.fields[F_AMOO_MEMORY_INPUT].set("每周五下午四点自动归档项目周报");
+        assert!(app
+            .apply_persona_or_memory_action(&WorkspaceAction::AddMemory)
+            .unwrap());
+        assert_eq!(app.amoo_memories[0].title, "每周五下午四点自动归档项目周报");
+
+        assert!(app
+            .apply_persona_or_memory_action(&WorkspaceAction::ToggleMemory)
+            .unwrap());
+        assert!(!app.amoo_memory_enabled);
+
+        // Reload into a fresh instance and verify persisted fields
+        let mut reloaded = Companion::new_for_test();
+        reloaded.load_amoo_persona_state();
+        assert_eq!(reloaded.amoo_agent_idx, 3);
+        assert_eq!(reloaded.active_amoo_agent_name(), "极简总结官");
+        assert_eq!(reloaded.amoo_style_idx, 2);
+        assert!(!reloaded.amoo_memory_enabled);
+        assert_eq!(
+            reloaded.amoo_memories[0].title,
+            "每周五下午四点自动归档项目周报"
+        );
+
+        // Verify clear_device_state() and apply_real_amoo_data_recorded() do NOT wipe persisted desktop memories
+        reloaded.clear_device_state();
+        assert!(reloaded
+            .amoo_memories
+            .iter()
+            .any(|m| m.title == "每周五下午四点自动归档项目周报"));
+        let mut real_data = RealAmooData::default();
+        real_data
+            .memory_entries
+            .push(("手机端同步记忆项".into(), "手机端 OpenClaw 记忆库".into()));
+        reloaded.apply_real_amoo_data_recorded(real_data);
+        assert!(
+            reloaded
+                .amoo_memories
+                .iter()
+                .any(|m| m.title == "每周五下午四点自动归档项目周报"),
+            "apply_real_amoo_data_recorded must preserve category-prefixed desktop memories"
+        );
+        assert!(reloaded
+            .amoo_memories
+            .iter()
+            .any(|m| m.title == "手机端同步记忆项"));
+
+        // Delete the added memory and verify persistence updates
+        let del_idx = reloaded
+            .amoo_memories
+            .iter()
+            .position(|m| m.title == "每周五下午四点自动归档项目周报")
+            .unwrap();
+        assert!(reloaded
+            .apply_persona_or_memory_action(&WorkspaceAction::DeleteMemory(del_idx))
+            .unwrap());
+        let mut after_delete = Companion::new_for_test();
+        after_delete.load_amoo_persona_state();
+        assert!(after_delete
+            .amoo_memories
+            .iter()
+            .all(|m| m.title != "每周五下午四点自动归档项目周报"));
+
+        // Verify tools confirmation dialog renders NeoConnectAmoo and NeoExecutionMode(true/false) cleanly
+        for tool_action in [
+            Action::NeoConnectAmoo,
+            Action::NeoExecutionMode(true),
+            Action::NeoExecutionMode(false),
+            Action::NeoRestore,
+        ] {
+            reloaded.page = Page::Tools;
+            reloaded.tool_page = Some(ToolPage::Neo);
+            reloaded.tool_confirmation = Some(Box::new(tool_action));
+            let _ = reloaded.tools_page();
+        }
+        reloaded.tool_confirmation = None;
+
+        // Verify AppStore downgrade confirmation banner renders with pending_downgrade_reinstall
+        reloaded.page = Page::AppStore;
+        reloaded.app_store.pending_downgrade_reinstall = Some(("com.tencent.mm".into(), 0));
+        let _ = reloaded.app_store_page();
     }
 
     #[test]
@@ -5065,5 +5915,358 @@ mod tests {
             gallery.len()
         );
         let _ = summary;
+    }
+
+    #[test]
+    fn turn_failure_restores_draft_and_retry_clears_draft_and_reuses_conversation_without_duplication(
+    ) {
+        let mut app = Companion::new_for_test();
+        app.demo_mode = false;
+        app.selected = Some(Device {
+            serial: "test-phone-retry".into(),
+            transport: "test-phone-retry".into(),
+            ..Default::default()
+        });
+
+        // 1. User sends "上海天气"
+        app.fields[F_AMOO].set("上海天气");
+        app.workspace_prepare_and_confirm(None)
+            .expect("send initial message");
+        app.workspace_capture_draft();
+
+        assert_eq!(app.workspace.journal.tasks.len(), 1);
+        let task_id = app.workspace.active.clone().expect("active task id");
+        {
+            let task = app.workspace_task().unwrap();
+            assert_eq!(task.title, "上海天气");
+            assert!(
+                task.draft.is_empty(),
+                "in-flight phone turn must clear draft so '有草稿' is not stuck"
+            );
+            assert!(app.fields[F_AMOO].text.is_empty());
+            assert_eq!(task.turns.len(), 1);
+            assert!(task.turns[0].user);
+            assert_eq!(task.turns[0].text, "上海天气");
+            assert_eq!(task.steps.len(), 1);
+            assert_eq!(task.steps[0].phase, Phase::Running);
+        }
+
+        // 2. Simulate transient AgentBus connection failure (os error 11) before acceptance
+        let err_msg = "Amoo 云连接已中断或超时；请检查手机网络及小工具中的伴侣后台协作状态，未确认发送的草稿与附件已保留: Resource temporarily unavailable (os error 11)";
+        app.workspace_finish(Phase::Failed, err_msg.into());
+
+        {
+            let task = app.workspace_task().unwrap();
+            assert_eq!(task.steps[0].phase, Phase::Failed);
+            assert_eq!(
+                task.draft, "上海天气",
+                "failed unaccepted turn must restore draft"
+            );
+            assert_eq!(app.fields[F_AMOO].text, "上海天气");
+            assert_eq!(task.turns.len(), 2);
+            assert!(task.turns[0].user);
+            assert!(!task.turns[1].user);
+            assert!(task.turns[1].text.contains("os error 11"));
+        }
+
+        // 3. User clicks [重试] (Retry): must clear restored draft, remove failed error turn,
+        // reuse the same task/conversation slot and user turn without duplication, and start retry
+        app.workspace_retry_opt(None).expect("retry failed turn");
+        app.workspace_capture_draft();
+
+        assert_eq!(
+            app.workspace.journal.tasks.len(),
+            1,
+            "Retry must reuse existing conversation without creating a duplicate"
+        );
+        assert_eq!(app.workspace.active.as_deref(), Some(task_id.as_str()));
+        assert!(app.workspace.proposal.is_none());
+        assert!(
+            app.fields[F_AMOO].text.is_empty(),
+            "Retry must consume and clear input draft"
+        );
+        let retried = app.workspace_task().unwrap();
+        assert!(
+            retried.draft.is_empty(),
+            "Retry must clear task.draft so '有草稿' does not stay stuck"
+        );
+        assert_eq!(
+            retried.turns.len(),
+            1,
+            "Retry must remove failed error turn and keep a single user turn without duplication"
+        );
+        assert!(retried.turns[0].user);
+        assert_eq!(retried.turns[0].text, "上海天气");
+        assert_eq!(retried.steps.len(), 1);
+        assert_eq!(retried.steps[0].phase, Phase::Running);
+    }
+
+    #[test]
+    fn turn_failure_send_on_restored_draft_reuses_failed_turn_and_conversation() {
+        let mut app = Companion::new_for_test();
+        app.demo_mode = false;
+        app.selected = Some(Device {
+            serial: "test-phone-send-after-fail".into(),
+            transport: "test-phone-send-after-fail".into(),
+            ..Default::default()
+        });
+
+        // 1. Initial send of "上海天气" fails and restores draft
+        app.fields[F_AMOO].set("上海天气");
+        app.workspace_prepare_and_confirm(None).unwrap();
+        app.workspace_capture_draft();
+        let task_id = app.workspace.active.clone().unwrap();
+
+        app.workspace_finish(
+            Phase::Failed,
+            "Amoo 云连接已中断或超时: Resource temporarily unavailable (os error 11)".into(),
+        );
+        assert_eq!(app.fields[F_AMOO].text, "上海天气");
+        assert_eq!(app.workspace_task().unwrap().draft, "上海天气");
+        assert_eq!(app.workspace_task().unwrap().turns.len(), 2);
+
+        // 2. User presses Send (Prepare) directly on the restored draft (or slightly edited draft)
+        app.workspace_prepare_and_confirm(None)
+            .expect("Send on restored draft");
+        app.workspace_capture_draft();
+
+        assert_eq!(
+            app.workspace.journal.tasks.len(),
+            1,
+            "Send on restored draft must reuse the same conversation"
+        );
+        assert_eq!(app.workspace.active.as_deref(), Some(task_id.as_str()));
+        let task = app.workspace_task().unwrap();
+        assert!(
+            task.draft.is_empty(),
+            "Send on restored draft must clear task.draft"
+        );
+        assert!(app.fields[F_AMOO].text.is_empty());
+        assert_eq!(
+            task.turns.len(),
+            1,
+            "Send on restored draft in failed conversation must replace failed turn instead of duplicating user turn"
+        );
+        assert!(task.turns[0].user);
+        assert_eq!(task.turns[0].text, "上海天气");
+        assert_eq!(task.steps[0].phase, Phase::Running);
+    }
+
+    #[test]
+    fn duplicate_unsent_and_failed_draft_conversations_are_deduplicated_in_history() {
+        let mut app = Companion::new_for_test();
+        app.demo_mode = true;
+
+        let mut dup1 = Task::new(None, None);
+        dup1.title = "请帮我汇总最近的快递物流与驿站取件码".into();
+        dup1.draft = "请帮我汇总最近的快递物流与驿站取件码".into();
+        dup1.updated = 1775810203;
+        let dup1_id = dup1.id.clone();
+
+        let mut dup2 = Task::new(None, None);
+        dup2.title = "请帮我汇总最近的快递物流与驿站取件码".into();
+        dup2.draft = "请帮我汇总最近的快递物流与驿站取件码".into();
+        dup2.updated = 1775827972;
+
+        let mut distinct = Task::new(None, None);
+        distinct.title = "另一条不同草稿".into();
+        distinct.draft = "另一条不同草稿".into();
+
+        app.workspace.journal.tasks = vec![dup1, dup2, distinct];
+        app.workspace.active = Some(dup1_id.clone());
+
+        // Deduplicating on journal load / capture collapses identical draft-only tasks into one
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("tasks.json");
+        app.workspace.journal.save(&journal_path).unwrap();
+        let loaded = stepx_companion::amoo_workspace::Journal::load(&journal_path).unwrap();
+        assert_eq!(
+            loaded
+                .tasks
+                .iter()
+                .filter(|t| t.draft == "请帮我汇总最近的快递物流与驿站取件码")
+                .count(),
+            1,
+            "Journal::load must deduplicate identical draft-only tasks"
+        );
+        assert_eq!(loaded.tasks.len(), 2);
+
+        // Switching to New and capturing the same draft text reuses the existing draft task
+        // instead of creating a second "有草稿" entry in 对话历史
+        app.workspace.journal = loaded;
+        app.workspace_switch_new().unwrap();
+        assert!(app.workspace.active.is_none());
+        app.fields[F_AMOO].set("请帮我汇总最近的快递物流与驿站取件码");
+        app.workspace_capture_draft();
+        assert_eq!(
+            app.workspace
+                .journal
+                .tasks
+                .iter()
+                .filter(|t| t.draft == "请帮我汇总最近的快递物流与驿站取件码")
+                .count(),
+            1,
+            "capturing an identical draft from New chat must reuse existing draft task"
+        );
+        assert_eq!(app.workspace.journal.tasks.len(), 2);
+    }
+
+    #[test]
+    fn multi_step_turn_phone_failure_and_retry_preserves_completed_earlier_step_turn_and_outputs() {
+        let mut app = Companion::new_for_test();
+        app.demo_mode = false;
+        app.selected = Some(Device {
+            serial: "test-phone-multistep".into(),
+            transport: "test-phone-multistep".into(),
+            ..Default::default()
+        });
+
+        let mut task = Task::new(Some("test-phone-multistep".into()), None);
+        task.title = "整理报销并发给阿무".into();
+        task.turns = vec![
+            Turn {
+                at_ms: Some(1000),
+                user: true,
+                text: "整理报销并发给阿무".into(),
+            },
+            Turn {
+                at_ms: Some(2000),
+                user: false,
+                text: "已生成报销汇总表 report.xlsx".into(),
+            },
+        ];
+        task.steps = vec![
+            Step {
+                executor: Executor::Files,
+                phase: Phase::Done,
+                note: "已生成 1 个文件".into(),
+            },
+            Step {
+                executor: Executor::Phone,
+                phase: Phase::Running,
+                note: String::new(),
+            },
+        ];
+        task.outputs.push(stepx_companion::amoo_workspace::Output {
+            path: std::path::PathBuf::from("/tmp/report.xlsx"),
+            name: "report.xlsx".into(),
+            kind: "表格".into(),
+            lab_id: None,
+        });
+        let task_id = task.id.clone();
+        app.workspace.journal.tasks = vec![task];
+        app.workspace.active = Some(task_id.clone());
+        app.workspace.running = Some(ActiveRun {
+            task: task_id.clone(),
+            step: 1,
+            executor: Executor::Phone,
+            accepted: false,
+            started_at: Instant::now(),
+        });
+
+        // Step 1 (Phone) fails with os error 11; Step 0's assistant turn and output must NOT be overwritten
+        app.workspace_finish(
+            Phase::Failed,
+            "Amoo 云连接已中断或超时: Resource temporarily unavailable (os error 11)".into(),
+        );
+
+        {
+            let t = app.workspace_task().unwrap();
+            assert_eq!(t.steps[0].phase, Phase::Done);
+            assert_eq!(t.steps[1].phase, Phase::Failed);
+            assert_eq!(t.outputs.len(), 1);
+            assert_eq!(
+                t.turns.len(),
+                3,
+                "Step 1 Phone failure must append its own error turn instead of overwriting Step 0's turn"
+            );
+            assert_eq!(t.turns[1].text, "已生成报销汇总表 report.xlsx");
+            assert!(t.turns[2].text.contains("os error 11"));
+        }
+
+        // Clicking Retry must remove only Step 1's failed turn, keep Step 0's turn and output, and re-run Step 1
+        app.workspace_retry_opt(None).expect("retry step 1");
+        let t = app.workspace_task().unwrap();
+        assert_eq!(t.steps[0].phase, Phase::Done);
+        assert_eq!(t.steps[1].phase, Phase::Running);
+        assert_eq!(t.outputs.len(), 1);
+        assert_eq!(
+            t.turns.len(),
+            2,
+            "Retry must keep user turn + Step 0's completed assistant turn and remove Step 1's error turn"
+        );
+        assert_eq!(t.turns[0].text, "整理报销并发给阿무");
+        assert_eq!(t.turns[1].text, "已生成报销汇总表 report.xlsx");
+        assert!(t.draft.is_empty());
+        assert!(app.fields[F_AMOO].text.is_empty());
+    }
+
+    #[test]
+    fn in_flight_typing_and_background_task_do_not_desync_or_clobber_active_draft() {
+        let mut app = Companion::new_for_test();
+        app.demo_mode = false;
+        app.selected = Some(Device {
+            serial: "test-phone-inflight".into(),
+            transport: "test-phone-inflight".into(),
+            ..Default::default()
+        });
+
+        app.fields[F_AMOO].set("上海天气");
+        app.workspace_prepare_and_confirm(None).unwrap();
+        assert!(app.fields[F_AMOO].text.is_empty());
+
+        // User starts typing a new prompt while the unaccepted turn is still in-flight
+        app.fields[F_AMOO].set("明天去北京出差");
+        app.workspace_finish(
+            Phase::Failed,
+            "Amoo 云连接已中断或超时: Resource temporarily unavailable (os error 11)".into(),
+        );
+
+        let task = app.workspace_task().unwrap();
+        assert_eq!(
+            app.fields[F_AMOO].text, "明天去北京出差",
+            "newly typed text in composer must be preserved"
+        );
+        assert_eq!(
+            task.draft, "明天去北京出差",
+            "task.draft must stay synchronized with in-flight typed composer text"
+        );
+
+        // Also verify unconfirmed/stopped turn with a real streaming reply is NOT truncated when sending a different follow-up
+        let mut streaming_task = Task::new(Some("test-phone-inflight".into()), None);
+        streaming_task.title = "上海天气".into();
+        streaming_task.turns = vec![
+            Turn {
+                at_ms: Some(1000),
+                user: true,
+                text: "上海天气".into(),
+            },
+            Turn {
+                at_ms: Some(2000),
+                user: false,
+                text: "上海今天多云转晴，气温 18~25°C。".into(),
+            },
+        ];
+        streaming_task.steps = vec![Step {
+            executor: Executor::Phone,
+            phase: Phase::Unconfirmed,
+            note: "等待最终确认".into(),
+        }];
+        let st_id = streaming_task.id.clone();
+        app.workspace.journal.tasks = vec![streaming_task];
+        app.workspace.active = Some(st_id);
+        app.workspace.running = None;
+
+        app.fields[F_AMOO].set("那明天呢？");
+        app.workspace_prepare_and_confirm(None).unwrap();
+        let st = app.workspace_task().unwrap();
+        assert_eq!(
+            st.turns.len(),
+            3,
+            "sending a different follow-up after a real streaming reply must preserve previous turn"
+        );
+        assert_eq!(st.turns[0].text, "上海天气");
+        assert_eq!(st.turns[1].text, "上海今天多云转晴，气温 18~25°C。");
+        assert_eq!(st.turns[2].text, "那明天呢？");
     }
 }

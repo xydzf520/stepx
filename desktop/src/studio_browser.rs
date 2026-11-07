@@ -73,11 +73,29 @@ pub fn browser_path() -> Result<PathBuf> {
                     "chromium-browser",
                     "microsoft-edge",
                     "microsoft-edge-stable",
+                    "brave-browser",
+                    "brave",
                 ][..]
             } {
                 paths.push(directory.join(name));
             }
         }
+    }
+    #[cfg(target_os = "linux")]
+    for candidate in [
+        "/opt/google/chrome/google-chrome",
+        "/opt/google/chrome/chrome",
+        "/opt/microsoft/msedge/msedge",
+        "/opt/brave.com/brave/brave",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/google-chrome",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/microsoft-edge-stable",
+        "/usr/bin/microsoft-edge",
+        "/snap/bin/chromium",
+    ] {
+        paths.push(PathBuf::from(candidate));
     }
     for path in paths {
         if path.is_file() {

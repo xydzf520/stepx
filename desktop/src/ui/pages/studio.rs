@@ -10,20 +10,19 @@ use stepx_companion::studio::{CloudWork, Work};
 
 impl Companion {
     pub(in super::super) fn studio_actions(&self) -> Vec<El> {
+        // 导入 / 打开目录 live next to the library search (see studio_workspace).
         vec![
-            self.st_button(
-                "st-import-local",
-                "导入本地作品",
-                St::ImportLocalFile,
-                Btn::Secondary,
-            ),
-            self.st_button(
-                "st-open-works-dir",
-                "打开作品目录",
-                St::OpenWorksFolder,
-                Btn::Secondary,
-            ),
-            self.st_button("st-sync", "同步", St::CloudRefresh, Btn::Secondary),
+            if self.busy {
+                self.disabled_button("同步")
+            } else {
+                self.icon_action(
+                    "st-sync",
+                    "同步",
+                    UiIcon::Refresh,
+                    vec![Action::Studio(St::CloudRefresh)],
+                    false,
+                )
+            },
             if self.studio_lab.handle.is_some() {
                 self.st_button("st-create", "查看运行任务", St::Tab(2), Btn::Secondary)
             } else if self.busy {
@@ -76,9 +75,9 @@ impl Companion {
                 St::ContinueOutputInAmoo(..) | St::ContinueLabInAmoo(_) => Some(UiIcon::Chat),
                 St::OpenPath(_) => Some(UiIcon::Play),
                 St::RevealPath(_) | St::OpenWorksFolder => Some(UiIcon::Folder),
-                St::SetDeliverableFilter(1) => Some(UiIcon::Chart),
+                St::SetDeliverableFilter(1) => Some(UiIcon::Presentation),
                 St::SetDeliverableFilter(2) => Some(UiIcon::File),
-                St::SetDeliverableFilter(3) => Some(UiIcon::Chart),
+                St::SetDeliverableFilter(3) => Some(UiIcon::Spreadsheet),
                 St::SetDeliverableFilter(4) => Some(UiIcon::Apps),
                 St::SetDeliverableFilter(5) => Some(UiIcon::Image),
                 _ => None,
@@ -101,14 +100,10 @@ impl Companion {
         };
         let tabs = self.segmented(
             "studio-tabs",
-            [
-                (0, "我的作品库"),
-                (2, "高级创作工坊"),
-                (3, "连接与模型设置"),
-            ]
-            .iter()
-            .map(|(i, t)| ((*t).into(), active_tab == *i, Action::Studio(St::Tab(*i))))
-            .collect(),
+            [(0, "我的作品库"), (2, "工坊"), (3, "设置")]
+                .iter()
+                .map(|(i, t)| ((*t).into(), active_tab == *i, Action::Studio(St::Tab(*i))))
+                .collect(),
         );
         let web = self.studio.web.as_ref().is_some_and(|c| c.authorized);
         let phone = self.studio.cloud.as_ref().is_some_and(|c| c.authorized);
@@ -274,7 +269,7 @@ impl Companion {
             self.vstack(
                 2.,
                 vec![
-                    self.heading("Amoo 对话成果"),
+                    self.section_heading(UiIcon::Sparkles, "Amoo 对话成果"),
                     self.text(
                         "在 Amoo 对话里做出的应用、文档、表格、PPT 与图片。可一键预览或在 Amoo 中接着改。",
                         CAPTION,
@@ -296,7 +291,7 @@ impl Companion {
             .collect();
         tasks.sort_by(|a, b| b.updated.cmp(&a.updated));
         let mut matched_outputs = Vec::new();
-        'tasks: for task in tasks {
+        for task in tasks {
             let raw_title = task.title.trim();
             let title: String = if raw_title.is_empty() {
                 "未命名对话".into()
@@ -306,9 +301,6 @@ impl Companion {
                 raw_title.into()
             };
             for (i, output) in task.outputs.iter().enumerate().rev() {
-                if matched_outputs.len() >= 80 {
-                    break 'tasks;
-                }
                 let cat = Self::output_deliverable_cat(output);
                 if self.studio.deliverable_filter != 0 && self.studio.deliverable_filter != cat {
                     continue;
@@ -336,8 +328,11 @@ impl Companion {
             }),
             _ => {}
         }
+        let page_key = format!("studio-deliverables:{}:{}:{query}",self.studio.deliverable_filter,self.studio.sort_mode);
+        let range = self.list_page_range(&page_key,matched_outputs.len(),20);
+        rows.push(self.list_page_controls(&page_key,matched_outputs.len(),20));
         let mut cards = vec![];
-        for (task, title, i, output, _) in matched_outputs {
+        for (task, title, i, output, _) in matched_outputs.into_iter().skip(range.start).take(range.len()) {
             {
                 let ext = output
                     .path
@@ -348,21 +343,23 @@ impl Companion {
                 let is_app = output.lab_id.is_some()
                     || output.kind.contains("应用")
                     || matches!(ext.as_str(), "html" | "htm");
-                let (icon, badge_label, badge_color) = if is_app {
+                let (icon, badge_label, _) = if is_app {
                     (UiIcon::Apps, "交互应用", p.accent)
                 } else if matches!(
                     ext.as_str(),
                     "png" | "jpg" | "jpeg" | "webp" | "gif" | "svg"
                 ) {
                     (UiIcon::Image, "图片成果", p.accent)
+                } else if ext == "pdf" {
+                    (UiIcon::FilePdf, "PDF", p.text2)
                 } else if matches!(ext.as_str(), "doc" | "docx") || output.kind.contains("文档") {
                     (UiIcon::File, "Word 文档", p.accent)
                 } else if matches!(ext.as_str(), "xls" | "xlsx" | "csv")
                     || output.kind.contains("表格")
                 {
-                    (UiIcon::File, "Excel 表格", p.success)
+                    (UiIcon::Spreadsheet, "Excel 表格", p.success)
                 } else if matches!(ext.as_str(), "ppt" | "pptx") || output.kind.contains("演示") {
-                    (UiIcon::File, "PPT 演示", p.warning)
+                    (UiIcon::Presentation, "PPT 演示", p.warning)
                 } else {
                     let k = if output.kind.trim().is_empty() {
                         "文件成果"
@@ -371,22 +368,73 @@ impl Companion {
                     };
                     (UiIcon::File, k, p.text2)
                 };
+                let style = crate::ui::icon_style::content_style(icon, &p);
                 let tid = task.id.clone();
                 let path = output.path.clone();
                 let menu_path = path.clone();
-                let open_click = path.clone();
                 let open_double = path.clone();
                 let menu_tid = tid.clone();
                 let menu_title = output.name.clone();
+                let card_id = format!("st-out-card-{tid}-{i}");
+                let cont_id = format!("st-out-continue-{tid}-{i}");
+                let open_id = format!("st-out-open-{tid}-{i}");
+                let reveal_id = format!("st-out-reveal-{tid}-{i}");
+                let task_id_btn = format!("st-out-task-{tid}-{i}");
+                let hover_keys = [
+                    format!("hpanel:{card_id}"),
+                    format!("btn:{cont_id}"),
+                    format!("btn:{open_id}"),
+                    format!("btn:{reveal_id}"),
+                    format!("btn:{task_id_btn}"),
+                ];
+                let card_hovered = {
+                    let map = self.hover_states.borrow();
+                    hover_keys.iter().any(|k| {
+                        map.get(k.as_str())
+                            .is_some_and(|(_, h)| h.lock().unwrap().is_mouse_over_element())
+                    })
+                };
+                let mut action_btns = vec![
+                    self.st_button(
+                        &cont_id,
+                        "在 Amoo 中继续改",
+                        St::ContinueOutputInAmoo(tid.clone(), i),
+                        Btn::Primary,
+                    ),
+                    self.st_button(
+                        &open_id,
+                        if is_app {
+                            "立即试玩"
+                        } else {
+                            "打开预览"
+                        },
+                        St::OpenPath(path.clone()),
+                        Btn::Secondary,
+                    ),
+                ];
+                if card_hovered {
+                    action_btns.push(self.st_button(
+                        &reveal_id,
+                        "所在文件夹",
+                        St::RevealPath(path),
+                        Btn::Ghost,
+                    ));
+                    action_btns.push(self.st_button(
+                        &task_id_btn,
+                        "回到原对话",
+                        St::BackToTask(tid),
+                        Btn::Ghost,
+                    ));
+                }
                 cards.push(self.hover_panel_interactive(
-                    format!("st-out-card-{tid}-{i}"),
+                    card_id,
                     self.vstack(
                         S3,
                         vec![
                             self.between(
                                 self.lead(
                                     S3,
-                                    self.studio_icon_box(icon, 40., badge_color, p.surface),
+                                    self.section_icon_badge(icon, 22., 40.),
                                     Expanded::new(
                                         1.,
                                         self.vstack(
@@ -403,37 +451,12 @@ impl Companion {
                                     )
                                     .finish(),
                                 ),
-                                self.pill_badge(badge_label, badge_color, p.surface),
+                                self.pill_badge(badge_label, style.foreground, style.background),
                             ),
-                            self.wrap(vec![
-                                self.st_button(
-                                    &format!("st-out-continue-{tid}-{i}"),
-                                    "在 Amoo 中继续改",
-                                    St::ContinueOutputInAmoo(tid.clone(), i),
-                                    Btn::Primary,
-                                ),
-                                self.st_button(
-                                    &format!("st-out-open-{tid}-{i}"),
-                                    if is_app { "立即试玩" } else { "打开预览" },
-                                    St::OpenPath(path.clone()),
-                                    Btn::Secondary,
-                                ),
-                                self.st_button(
-                                    &format!("st-out-reveal-{tid}-{i}"),
-                                    "所在文件夹",
-                                    St::RevealPath(path),
-                                    Btn::Ghost,
-                                ),
-                                self.st_button(
-                                    &format!("st-out-task-{tid}-{i}"),
-                                    "回到原对话",
-                                    St::BackToTask(tid),
-                                    Btn::Ghost,
-                                ),
-                            ]),
+                            self.wrap(action_btns),
                         ],
                     ),
-                    Some(Action::Studio(St::OpenPath(open_click))),
+                    None,
                     Some(Action::Studio(St::OpenPath(open_double))),
                     Some(crate::ui::context_menu::Target::StudioWork(
                         crate::ui::context_menu::StudioWorkTarget::WorkspaceOutput {
@@ -512,7 +535,26 @@ impl Companion {
         };
         let mut content = vec![self.between(self.wrap(vec![sources]), right_action)];
         let query = self.fields[F_STUDIO_SEARCH].text.trim().to_lowercase();
-        let search_input = self.input(F_STUDIO_SEARCH, "搜索作品名称、应用描述或对话标题…", None);
+        let search_input = Flex::row()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(S1)
+            .with_child(Expanded::new(1., self.input(F_STUDIO_SEARCH, "搜索作品…", None)).finish())
+            .with_child(self.icon_action(
+                "st-import-local",
+                "导入本地作品",
+                UiIcon::Download,
+                vec![Action::Studio(St::ImportLocalFile)],
+                false,
+            ))
+            .with_child(self.icon_action(
+                "st-open-works-dir",
+                "打开作品目录",
+                UiIcon::Folder,
+                vec![Action::Studio(St::OpenWorksFolder)],
+                false,
+            ))
+            .finish();
         if matches!(source, 0..=2) {
             content.push(
                 self.between(
@@ -582,7 +624,7 @@ impl Companion {
         }
         let Some(library) = library.filter(|c| c.authorized) else {
             content.push(self.panel(vec![
-                self.ui_icon(if source==0{UiIcon::Monitor}else{UiIcon::Smartphone},36.,p.text2),
+                self.content_icon(if source==0{UiIcon::Monitor}else{UiIcon::Smartphone},36.,p.text2),
                 self.heading(if source==0{"把官网项目带到工作台"}else{"连接 Amoo 的手机作品"}),
                 self.text(if source==0{"在手机伴侣中完成一次 Studio 官网登录，应用、技能与智能体项目会自动出现在这里，包含尚未在手机上试用的草稿。"}else{"使用手机已有的 Amoo 账号授权，自动读取可在手机打开的作品。"},BODY,p.text2),
                 self.wrap(vec![
@@ -639,7 +681,7 @@ impl Companion {
                     self.between(
                         self.lead(
                             S3,
-                            self.ui_icon(Self::studio_icon(&w.category), 20., p.text2),
+                            self.content_icon(Self::studio_icon(&w.category), 20., p.text2),
                             Expanded::new(
                                 1.,
                                 self.vstack(
@@ -666,7 +708,7 @@ impl Companion {
                             )
                             .finish(),
                         ),
-                        self.ui_icon(UiIcon::ChevronRight, 14., p.text3),
+                        self.content_icon(UiIcon::ChevronRight, 14., p.text3),
                     ),
                     selected.is_some_and(|(j, _)| j == *i),
                     Some(Action::Studio(if source == 0 {
@@ -785,12 +827,8 @@ impl Companion {
                 self.hstack(
                     S2,
                     vec![
-                        self.heading("本机离线应用"),
-                        self.pill_badge(
-                            format!("{} 款可玩", matching_lab.len()),
-                            p.accent,
-                            p.surface,
-                        ),
+                        self.section_heading(UiIcon::Apps, "本机应用"),
+                        self.pill_badge(format!("{}", matching_lab.len()), p.accent, p.surface),
                     ],
                 ),
                 if matching_lab.len() > 6 {
@@ -801,7 +839,7 @@ impl Companion {
                         Btn::Ghost,
                     )
                 } else {
-                    self.st_button("st-go-lab", "进入高级创作工坊", St::Tab(2), Btn::Ghost)
+                    self.st_button("st-go-lab", "工坊 →", St::Tab(2), Btn::Ghost)
                 },
             )];
             for (i, a) in matching_lab.iter().take(6) {
@@ -827,7 +865,7 @@ impl Companion {
                 S3,
                 vec![
                     self.between(
-                        self.heading("我的收藏"),
+                        self.section_heading(UiIcon::Star, "我的收藏"),
                         self.st_button("st-view-saved", "管理收藏", St::Source(2), Btn::Ghost),
                     ),
                     self.studio_saved(query),
@@ -898,7 +936,7 @@ impl Companion {
     fn studio_icon(category: &str) -> UiIcon {
         match category {
             "技能" => UiIcon::Bolt,
-            "智能体" => UiIcon::Star,
+            "智能体" => UiIcon::Sparkles,
             _ => UiIcon::Apps,
         }
     }
@@ -912,7 +950,7 @@ impl Companion {
     }
     fn studio_empty(&self, title: &str, description: &str) -> El {
         self.panel(vec![
-            self.ui_icon(UiIcon::Folder, 28., self.p().text3),
+            self.content_icon(UiIcon::Folder, 28., self.p().text3),
             self.heading(title),
             self.text(description, BODY, self.p().text2),
         ])
@@ -923,7 +961,7 @@ impl Companion {
         let title = self.between(
             self.lead(
                 S3,
-                self.ui_icon(Self::studio_icon(&w.category), 32., p.text),
+                self.content_icon(Self::studio_icon(&w.category), 32., p.text),
                 Expanded::new(
                     1.,
                     self.vstack(
@@ -1148,7 +1186,7 @@ impl Companion {
                     self.between(
                         self.lead(
                             S3,
-                            self.ui_icon(Self::studio_icon(&w.category), 18., p.accent),
+                            self.content_icon(Self::studio_icon(&w.category), 18., p.accent),
                             Expanded::new(
                                 1.,
                                 self.vstack(
@@ -1173,7 +1211,7 @@ impl Companion {
                             )
                             .finish(),
                         ),
-                        self.ui_icon(UiIcon::ChevronRight, 14., p.text3),
+                        self.content_icon(UiIcon::ChevronRight, 14., p.text3),
                     ),
                     selected.is_some_and(|(j, _)| j == *i),
                     Some(Action::Studio(St::Select(*i))),
@@ -1328,10 +1366,12 @@ impl Companion {
     ) -> El {
         let p = self.p();
         Container::new(
-            ConstrainedBox::new(Align::new(self.ui_icon(icon, (size * 0.48).round(), fg)).finish())
-                .with_width(size)
-                .with_height(size)
-                .finish(),
+            ConstrainedBox::new(
+                Align::new(self.content_icon(icon, (size * 0.48).round(), fg)).finish(),
+            )
+            .with_width(size)
+            .with_height(size)
+            .finish(),
         )
         .with_background_color(bg)
         .with_border(Border::all(1.).with_border_color(p.border))
@@ -1369,8 +1409,63 @@ impl Companion {
         } else {
             self.studio_icon_box(UiIcon::Apps, 48., p.accent, p.accent_soft)
         };
+        let card_id = format!("st-offline-card-{i}");
+        let preview_id = format!("st-offline-preview-{i}");
+        let amoo_id = format!("st-offline-amoo-{i}");
+        let phone_id = format!("st-offline-phone-{i}");
+        let folder_id = format!("st-offline-folder-{i}");
+        let lab_id = format!("st-offline-open-lab-{i}");
+        let more_key = format!("studio-offline-more-{i}");
+        let more_open = self.ui_expanded.contains(&more_key);
+        let mut action_btns = vec![
+            self.button_icon(
+                preview_id,
+                "试玩",
+                UiIcon::Play,
+                Action::StudioLab(StudioLabAction::PreviewAt(i)),
+                Btn::Primary,
+            ),
+            self.st_button(&amoo_id, "继续改", St::ContinueLabInAmoo(i), Btn::Secondary),
+            self.button_icon(
+                format!("st-offline-more-{i}"),
+                "更多",
+                if more_open {
+                    UiIcon::ChevronUp
+                } else {
+                    UiIcon::ChevronDown
+                },
+                Action::ToggleUiExpanded(more_key),
+                Btn::Ghost,
+            ),
+        ];
+        if more_open {
+            action_btns.push(if self.selected.is_some() && has_html {
+                self.button_icon(
+                    phone_id,
+                    "发送到手机",
+                    UiIcon::Smartphone,
+                    Action::StudioLab(StudioLabAction::DeliverPhoneAt(i)),
+                    Btn::Secondary,
+                )
+            } else {
+                self.disabled_button("连接手机后可发送")
+            });
+            action_btns.push(self.st_button(
+                &folder_id,
+                "打开文件夹",
+                St::RevealPath(a.html_path.clone()),
+                Btn::Ghost,
+            ));
+            action_btns.push(self.button_icon(
+                lab_id,
+                "工坊",
+                UiIcon::Tools,
+                Action::StudioLab(StudioLabAction::OpenInWorkbench(i)),
+                Btn::Ghost,
+            ));
+        }
         self.hover_panel_interactive(
-            format!("st-offline-card-{i}"),
+            card_id,
             self.vstack(
                 S3,
                 vec![
@@ -1385,7 +1480,11 @@ impl Companion {
                                     vec![
                                         self.heading(&a.name),
                                         self.line(
-                                            format!("版本 v{} · {}", a.round, a.summary),
+                                            if a.summary.starts_with("内置示例") {
+                                                "内置示例".to_string()
+                                            } else {
+                                                format!("v{} · {}", a.round, a.summary)
+                                            },
                                             CAPTION,
                                             p.text2,
                                         ),
@@ -1397,48 +1496,10 @@ impl Companion {
                         if a.passed {
                             self.pill_badge_icon("可直接运行", UiIcon::Check, p.success, p.surface)
                         } else {
-                            self.pill_badge("离线可玩", p.accent, p.surface)
+                            Empty::new().finish()
                         },
                     ),
-                    self.wrap(vec![
-                        self.button_icon(
-                            format!("st-offline-preview-{i}"),
-                            "立即试玩",
-                            UiIcon::Play,
-                            Action::StudioLab(StudioLabAction::PreviewAt(i)),
-                            Btn::Primary,
-                        ),
-                        self.st_button(
-                            &format!("st-offline-amoo-{i}"),
-                            "在 Amoo 中继续改",
-                            St::ContinueLabInAmoo(i),
-                            Btn::Secondary,
-                        ),
-                        if self.selected.is_some() && has_html {
-                            self.button_icon(
-                                format!("st-offline-phone-{i}"),
-                                "发送到手机",
-                                UiIcon::Smartphone,
-                                Action::StudioLab(StudioLabAction::DeliverPhoneAt(i)),
-                                Btn::Secondary,
-                            )
-                        } else {
-                            self.disabled_button("连接手机后可发送")
-                        },
-                        self.st_button(
-                            &format!("st-offline-folder-{i}"),
-                            "打开文件夹",
-                            St::RevealPath(a.html_path.clone()),
-                            Btn::Ghost,
-                        ),
-                        self.button_icon(
-                            format!("st-offline-open-lab-{i}"),
-                            "高级工坊",
-                            UiIcon::Tools,
-                            Action::StudioLab(StudioLabAction::OpenInWorkbench(i)),
-                            Btn::Ghost,
-                        ),
-                    ]),
+                    self.wrap(action_btns),
                 ],
             ),
             Some(Action::StudioLab(StudioLabAction::Select(i))),
@@ -1478,13 +1539,12 @@ impl Companion {
             _ => filtered.sort_by(|a, b| b.1.created_at.cmp(&a.1.created_at)),
         }
         if filtered.is_empty() {
-            return self.studio_empty(
-                "暂无匹配的本机离线应用",
-                "在「高级创作工坊」或 Amoo 对话中输入想法即可生成可直接运行的离线 HTML 应用。",
-            );
+            return self.studio_empty("暂无本机应用", "在「工坊」或 Amoo 对话中生成。");
         }
-        let mut rows = vec![];
-        for (i, a) in filtered.iter().take(16) {
+        let page_key = format!("studio-local-apps:{}:{}",self.studio.sort_mode,self.fields[F_STUDIO_SEARCH].text);
+        let range = self.list_page_range(&page_key,filtered.len(),16);
+        let mut rows = vec![self.list_page_controls(&page_key,filtered.len(),16)];
+        for (i, a) in filtered.iter().skip(range.start).take(range.len()) {
             rows.push(self.studio_local_artifact_card(*i, a));
         }
         self.vstack(S3, rows)
@@ -1495,10 +1555,10 @@ impl Companion {
         let phone = self.studio.cloud.as_ref().is_some_and(|c| c.authorized);
         self.vstack(S4,vec![
             self.studio_lab_settings(),
-            self.panel(vec![self.between(self.heading("Studio 官网"),self.pill_badge(if web.is_some(){"已连接"}else{"未登录"},p.text2,p.surface)),self.text(web.map(|c|format!("{} · {} 个官网项目",c.name,c.items.len())).unwrap_or("同步应用、技能与智能体项目，包含官网草稿。首次需在手机完成官网验证。".into()),BODY,p.text2),self.wrap(vec![self.st_button("st-web-login",if web.is_some(){"管理官网登录"}else{"连接官网"},St::WebsiteLogin,Btn::Primary),self.st_button("st-web-off","断开官网",St::WebsiteDisconnect,Btn::Ghost)]),self.caption("点击继续编辑会连接独立的桌面工作窗口，复用伴侣内的官网登录，无需再次登录；不会读取系统浏览器账号。")]),
-            self.panel(vec![self.between(self.heading("Amoo 手机作品"),self.pill_badge(if phone{"已授权"}else{"未连接"},p.text2,p.surface)),self.text("读取可在手机打开的作品。应用可直接在手机上试用，技能与智能体可前往 Amoo 确认安装。",BODY,p.text2),self.wrap(vec![self.st_button("st-native-login","连接手机账号",St::ConnectAccount,Btn::Secondary),self.st_button("st-native-off","断开作品同步",St::DisconnectAccount,Btn::Ghost)])]),
-            self.panel(vec![self.heading("手机与分享"),self.text("作品发送到手机后可独立打开、分享和添加桌面图标。分享只使用官方体验地址；编辑入口和登录信息不会进入二维码。",BODY,p.text2),self.wrap(vec![self.st_button("st-phone-library","手机作品库",St::PhoneLibrary,Btn::Secondary),self.st_button("st-amoo-library","Amoo 我的作品",St::AmooWorks,Btn::Secondary),self.st_button("st-phone-check","检查连接",St::CheckPhone,Btn::Ghost)])]),
-            self.panel(vec![self.heading("Studio 构建器创作模板"),self.text("一键复制面向手机端体验优化的应用、智能体与技能创作提示词简报。",BODY,p.text2),self.wrap((0..3).map(|i| self.st_button(&format!("st-brief-{i}"), match i { 0 => "随手记账简报", 1 => "差旅助手简报", _ => "票据整理简报" }, St::Brief(i), Btn::Ghost)).collect())]),
+            self.panel(vec![self.between(self.section_heading(UiIcon::Package, "Studio 官网"),self.pill_badge(if web.is_some(){"已连接"}else{"未登录"},p.text2,p.surface)),self.text(web.map(|c|format!("{} · {} 个官网项目",c.name,c.items.len())).unwrap_or("同步应用、技能与智能体项目，包含官网草稿。首次需在手机完成官网验证。".into()),BODY,p.text2),self.wrap(vec![self.st_button("st-web-login",if web.is_some(){"管理官网登录"}else{"连接官网"},St::WebsiteLogin,Btn::Primary),self.st_button("st-web-off","断开官网",St::WebsiteDisconnect,Btn::Ghost)]),self.caption("点击继续编辑会连接独立的桌面工作窗口，复用伴侣内的官网登录，无需再次登录；不会读取系统浏览器账号。")]),
+            self.panel(vec![self.between(self.section_heading(UiIcon::Smartphone, "Amoo 手机作品"),self.pill_badge(if phone{"已授权"}else{"未连接"},p.text2,p.surface)),self.text("读取可在手机打开的作品。应用可直接在手机上试用，技能与智能体可前往 Amoo 确认安装。",BODY,p.text2),self.wrap(vec![self.st_button("st-native-login","连接手机账号",St::ConnectAccount,Btn::Secondary),self.st_button("st-native-off","断开作品同步",St::DisconnectAccount,Btn::Ghost)])]),
+            self.panel(vec![self.section_heading(UiIcon::Smartphone, "手机与分享"),self.text("作品发送到手机后可独立打开、分享和添加桌面图标。分享只使用官方体验地址；编辑入口和登录信息不会进入二维码。",BODY,p.text2),self.wrap(vec![self.st_button("st-phone-library","手机作品库",St::PhoneLibrary,Btn::Secondary),self.st_button("st-amoo-library","Amoo 我的作品",St::AmooWorks,Btn::Secondary),self.st_button("st-phone-check","检查连接",St::CheckPhone,Btn::Ghost)])]),
+            self.panel(vec![self.section_heading(UiIcon::Code, "Studio 构建器创作模板"),self.text("一键复制面向手机端体验优化的应用、智能体与技能创作提示词简报。",BODY,p.text2),self.wrap((0..3).map(|i| self.st_button(&format!("st-brief-{i}"), match i { 0 => "随手记账简报", 1 => "差旅助手简报", _ => "票据整理简报" }, St::Brief(i), Btn::Ghost)).collect())]),
         ])
     }
 }

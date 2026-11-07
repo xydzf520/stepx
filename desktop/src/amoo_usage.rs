@@ -233,6 +233,8 @@ mod tests {
     }
 }
 
+const ACCOUNT_SCOPE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
 static SCOPE_CACHE: std::sync::Mutex<Option<(String, String, std::time::Instant, Option<String>)>> =
     std::sync::Mutex::new(None);
 
@@ -242,20 +244,49 @@ pub fn account_scope(
     adb: &crate::adb::Adb,
     device: &crate::device::Device,
 ) -> anyhow::Result<Option<String>> {
+    account_scope_inner(adb, device, true)
+}
+
+/// Account-bound imports must recheck after reading private history, without
+/// accepting the short UI cache as evidence that the account did not change.
+pub fn account_scope_fresh(
+    adb: &crate::adb::Adb,
+    device: &crate::device::Device,
+) -> anyhow::Result<Option<String>> {
+    account_scope_inner(adb, device, false)
+}
+
+fn account_scope_inner(
+    adb: &crate::adb::Adb,
+    device: &crate::device::Device,
+    use_cache: bool,
+) -> anyhow::Result<Option<String>> {
     use anyhow::{anyhow, Context};
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
     let can_cache = device.serial != "phone"
         && adb
             .path
             .file_stem()
             .and_then(|s| s.to_str())
             .is_some_and(|s| s.eq_ignore_ascii_case("adb"));
-    if can_cache {
+    let mut resolved;
+    let device = if can_cache {
+        if let Ok(active) = device.resolve_active_transport(adb) {
+            resolved = device.clone();
+            resolved.transport = active;
+            &resolved
+        } else {
+            device
+        }
+    } else {
+        device
+    };
+    if can_cache && use_cache {
         if let Ok(guard) = SCOPE_CACHE.lock() {
             if let Some((transport, serial, at, cached)) = guard.as_ref() {
                 if transport == &device.transport
                     && serial == &device.serial
-                    && at.elapsed() < Duration::from_secs(15)
+                    && at.elapsed() < ACCOUNT_SCOPE_CACHE_TTL
                 {
                     return Ok(cached.clone());
                 }

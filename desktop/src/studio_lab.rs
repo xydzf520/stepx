@@ -301,6 +301,8 @@ fn query(request: Value) -> Result<Value> {
     Ok(value)
 }
 pub fn test_connection() -> Result<ModelTest> {
+    ensure!(crate::model_source::load()?.source == crate::model_source::Source::IndependentApi,
+        "当前使用手机账号；请明确选择独立 API 后再测试其服务");
     let config = configured()?;
     let began = Instant::now();
     let result = query(json!({"op":"test","config":config}))?;
@@ -574,74 +576,13 @@ fn write_starter_preview(path: &Path, kind: u8) -> Result<()> {
 
 pub fn ensure_starter_artifacts() -> Result<()> {
     let runs = runs_directory()?;
-    let starters: [(&str, &str, u8, u64, &str, Value); 4] = [
-        (
-            "starter-neon-snake",
-            "霓虹贪吃蛇大作战",
-            0,
-            1_792_930_004,
-            STARTER_NEON_SNAKE_HTML,
-            json!([
-                {"label": "桌面布局", "passed": true, "detail": "可见内容与横向溢出检查"},
-                {"label": "手机布局", "passed": true, "detail": "可见内容与横向溢出检查"},
-                {"label": "Canvas 渲染检查", "passed": true, "detail": "assert_canvas · #game-canvas"},
-                {"label": "触控方向键与加速响应", "passed": true, "detail": "click · #dpad-right / #btn-boost"},
-                {"label": "暂停与重开状态切换", "passed": true, "detail": "click · #btn-toggle / #btn-restart"},
-                {"label": "最高分本地持久化", "passed": true, "detail": "assert_storage · stepx_snake_best"},
-                {"label": "JavaScript 运行错误", "passed": true, "detail": "未发现未捕获错误"},
-                {"label": "离线运行", "passed": true, "detail": "无外部资源请求"}
-            ]),
-        ),
-        (
-            "starter-cyber-2048",
-            "2048 赛博方块",
-            1,
-            1_792_930_003,
-            STARTER_CYBER_2048_HTML,
-            json!([
-                {"label": "桌面布局", "passed": true, "detail": "可见内容与横向溢出检查"},
-                {"label": "手机布局", "passed": true, "detail": "可见内容与横向溢出检查"},
-                {"label": "4×4 棋盘初始化", "passed": true, "detail": "assert_count · .tile-cell · 16"},
-                {"label": "方向滑动合并与积分变化", "passed": true, "detail": "click · #move-left / #move-down"},
-                {"label": "悔棋与新局重置验证", "passed": true, "detail": "click · #btn-undo / #btn-new"},
-                {"label": "JavaScript 运行错误", "passed": true, "detail": "未发现未捕获错误"},
-                {"label": "离线运行", "passed": true, "detail": "无外部资源请求"}
-            ]),
-        ),
-        (
-            "starter-pomodoro-app",
-            "StepX 番茄专注时钟",
-            2,
-            1_792_930_002,
-            STARTER_POMODORO_HTML,
-            json!([
-                {"label": "桌面布局", "passed": true, "detail": "可见内容与横向溢出检查"},
-                {"label": "手机布局", "passed": true, "detail": "可见内容与横向溢出检查"},
-                {"label": "SVG 进度环与倒计时显示", "passed": true, "detail": "assert_text · #timer-display · 25:00"},
-                {"label": "专注/休息模式切换与启停", "passed": true, "detail": "click · #mode-break / #btn-start"},
-                {"label": "专注清单新增与本地持久化", "passed": true, "detail": "click · #task-add / localStorage"},
-                {"label": "JavaScript 运行错误", "passed": true, "detail": "未发现未捕获错误"},
-                {"label": "离线运行", "passed": true, "detail": "无外部资源请求"}
-            ]),
-        ),
-        (
-            "starter-expense-app",
-            "随手记账与预算看板",
-            3,
-            1_792_930_001,
-            STARTER_EXPENSE_HTML,
-            json!([
-                {"label": "桌面布局", "passed": true, "detail": "可见内容与横向溢出检查"},
-                {"label": "手机布局", "passed": true, "detail": "可见内容与横向溢出检查"},
-                {"label": "月度预算进度条与分类汇总", "passed": true, "detail": "assert_text · #total-spent"},
-                {"label": "快速记账表单提交与总额更新", "passed": true, "detail": "click · #exp-add"},
-                {"label": "分类筛选与账单本地持久化", "passed": true, "detail": "click · .filter-btn / localStorage"},
-                {"label": "JavaScript 运行错误", "passed": true, "detail": "未发现未捕获错误"},
-                {"label": "离线运行", "passed": true, "detail": "无外部资源请求"}
-            ]),
-        ),
+    let starters: [(&str, &str, u8, u64, &str); 4] = [
+        ("starter-neon-snake", "霓虹贪吃蛇大作战", 0, 1_792_930_004, STARTER_NEON_SNAKE_HTML),
+        ("starter-cyber-2048", "2048 赛博方块", 1, 1_792_930_003, STARTER_CYBER_2048_HTML),
+        ("starter-pomodoro-app", "StepX 番茄专注时钟", 2, 1_792_930_002, STARTER_POMODORO_HTML),
+        ("starter-expense-app", "随手记账与预算看板", 3, 1_792_930_001, STARTER_EXPENSE_HTML),
     ];
-    for (dir_name, title, kind, created_at, html, checks) in starters {
+    for (dir_name, title, kind, created_at, html) in starters {
         let round_dir = runs.join(dir_name).join("round-1");
         let html_path = round_dir.join("index.html");
         let report_path = round_dir.join("report.json");
@@ -652,18 +593,24 @@ pub fn ensure_starter_artifacts() -> Result<()> {
             && preview_path.is_file()
             && artifact_path.is_file()
         {
-            continue;
+            // Upgrade old bundled examples that incorrectly advertised fabricated
+            // browser checks; preserve any actual locally verified report.
+            let old = fs::read(&report_path).ok().and_then(|v| serde_json::from_slice::<Value>(&v).ok());
+            if old.as_ref().is_some_and(|v| v["source"] == "bundled-example"
+                || v["limitations"] != "内置可玩样板已通过桌面与 390×844 手机布局及交互验收。") {
+                continue;
+            }
         }
         private_directory(&runs.join(dir_name))?;
         private_directory(&round_dir)?;
         fs::write(&html_path, html.as_bytes())?;
         let _ = write_starter_preview(&preview_path, kind);
-        let check_count = checks.as_array().map_or(7, Vec::len);
         let report = json!({
-            "passed": true,
+            "passed": false,
+            "source": "bundled-example",
             "html_sha256": html_hash(html.as_bytes()),
-            "checks": checks,
-            "limitations": "内置可玩样板已通过桌面与 390×844 手机布局及交互验收。"
+            "checks": [],
+            "limitations": "内置示例，可直接体验；本机尚未执行功能验收。修改后会运行浏览器检查。"
         });
         fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
         let artifact = LabArtifact {
@@ -673,9 +620,9 @@ pub fn ensure_starter_artifacts() -> Result<()> {
             html_path,
             screenshot_path: preview_path.is_file().then_some(preview_path),
             report_path,
-            passed: true,
+            passed: false,
             round: 1,
-            summary: format!("{check_count} / {check_count} 项自动检查通过"),
+            summary: "内置示例 · 可体验，尚未在本机验收".into(),
             created_at,
         };
         fs::write(&artifact_path, serde_json::to_vec_pretty(&artifact)?)?;
@@ -871,6 +818,9 @@ pub fn start_with_phone(
     let stop = cancel.clone();
     thread::spawn(move || {
         let run = || -> Result<()> {
+            let source=crate::model_source::load()?.source;
+            ensure!((source==crate::model_source::Source::PhoneAccount)==phone.is_some(),
+                "模型来源与当前连接已变化，请重新开始；未自动切换账号或独立 API");
             ensure!(
                 !request.prompt.trim().is_empty() && request.prompt.len() <= 20000,
                 "请输入 1–20000 字节的作品需求"
@@ -880,6 +830,9 @@ pub fn start_with_phone(
             } else {
                 serde_json::to_value(configured()?)?
             };
+            let review_connection = phone.clone();
+            let (review_tx, review_events) = mpsc::channel();
+            let mut reviewer = None;
             let (phone_tx, phone_events) = mpsc::channel();
             let mut phone = phone
                 .map(|(adb, device)| crate::work::PhoneBackend::for_lab(adb, device, phone_tx))
@@ -920,21 +873,36 @@ pub fn start_with_phone(
                     Ok(value) => {
                         if value["event"] == "model_request" {
                             let reply = (|| -> Result<String> {
-                                let backend =
-                                    phone.as_mut().context("当前模型不支持手机请求通道")?;
                                 let system = value["system"].as_str().context("缺少生成规则")?;
                                 let prompt = value["prompt"].as_str().context("缺少生成需求")?;
                                 ensure!(
                                     system.len() + prompt.len() <= 2 * 1024 * 1024,
                                     "应用创作上下文过大，请缩小任务"
                                 );
-                                let _ = tx.send(LabEvent::Status(
-                                    "手机 Amoo 正在编写应用；随后会在电脑运行检查…".into(),
-                                ));
-                                backend.generate(&format!("这是桌面离线应用创作请求。请直接按下面格式返回完整源码和验收规则，不创建云任务，不调用手机文件或代码执行工具。电脑会保存并独立运行检查。\n{system}\n用户需求与上一轮验证反馈：\n{prompt}"), &stop)
+                                if value["purpose"] == "acceptance_review" {
+                                    if reviewer.is_none() {
+                                        let (adb, device) = review_connection.clone().context("当前模型不支持手机复核通道")?;
+                                        let account = phone.as_ref().context("手机任务账号未绑定")?.account_scope();
+                                        reviewer = Some(crate::work::PhoneBackend::for_lab_in_account(adb, device, review_tx.clone(), account)?);
+                                    }
+                                    let _ = tx.send(LabEvent::Status("正在单独复核验收预期，核对计算结果与操作流程…".into()));
+                                    reviewer.as_mut().unwrap().generate(&format!("这是独立的验收规则复核。只返回要求的 JSON，不生成源码，不创建任务，不调用工具。\n{system}\n{prompt}"), &stop)
+                                } else {
+                                    let backend = phone.as_mut().context("当前模型不支持手机请求通道")?;
+                                    let _ = tx.send(LabEvent::Status("手机 Amoo 正在编写应用；随后会在电脑运行检查…".into()));
+                                    backend.generate(&format!("这是桌面离线应用创作请求。请直接按下面格式返回完整源码和验收规则，不创建云任务，不调用手机文件或代码执行工具。电脑会保存并独立运行检查。\n{system}\n用户需求与上一轮验证反馈：\n{prompt}"), &stop)
+                                }
                             })();
                             for event in phone_events.try_iter() {
                                 let _ = tx.send(LabEvent::Phone(event));
+                            }
+                            // Review has a separate phone conversation so the generated
+                            // implementation cannot bias its expectations. Keep usage,
+                            // but never replace the user's task session with the reviewer.
+                            for event in review_events.try_iter() {
+                                if matches!(event, crate::work::WorkEvent::ModelResponse { .. }) {
+                                    let _ = tx.send(LabEvent::Phone(event));
+                                }
                             }
                             let result = reply.and_then(|text| {
                                 let stdin = child.stdin.as_mut().context("模型响应通道已关闭")?;
@@ -2024,7 +1992,7 @@ mod tests {
             "starter-expense-app",
         ] {
             let found = list.iter().find(|a| a.id == id).expect(id);
-            assert!(found.passed);
+            assert!(!found.passed);
             assert!(found.html_path.is_file());
             assert!(found.screenshot_path.as_ref().is_some_and(|p| p.is_file()));
             assert!(!verified_html(found).unwrap().is_empty());

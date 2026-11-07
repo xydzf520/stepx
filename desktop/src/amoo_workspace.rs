@@ -1,9 +1,22 @@
 //! Task records shared by chat, desktop file work and local app creation.
 //! Requests are routed automatically (see `amoo_route`); the chosen route is
 //! recorded on the task so the UI can show it and the user can correct it.
+pub use crate::amoo_route::{detect_doctor_or_google_guide_query, DoctorQueryKind};
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+
+/// Short, actionable text for the conversation; the step retains diagnostics.
+pub fn failure_summary(detail: &str) -> String {
+    if detail.contains("模型连续未给出有效文件操作") || detail.contains("桌面执行协议不是有效 JSON")
+    {
+        "这次文件生成没有完成：模型返回的文件结构有误。已生成的文件会保留，可以点击“重试”。".into()
+    } else if detail.contains("未生成实际文件") || detail.contains("未写入实际文件") {
+        "还没有收到可打开的文件，因此没有标记为完成。请点击“重试”，重新生成并检查成果。".into()
+    } else {
+        detail.to_owned()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Intent {
@@ -65,14 +78,18 @@ pub enum Phase {
     Stopped,
     Unconfirmed,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Step {
     pub executor: Executor,
     pub phase: Phase,
     pub note: String,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Turn {
+    /// Source time of this turn. Old journals have no per-turn time; preserve that
+    /// uncertainty instead of assigning the migration or latest task-update time.
+    #[serde(default)]
+    pub at_ms: Option<i64>,
     pub user: bool,
     pub text: String,
 }
@@ -83,7 +100,7 @@ pub struct Output {
     pub kind: String,
     pub lab_id: Option<String>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Receipt {
     pub path: PathBuf,
     pub note: String,
@@ -92,7 +109,7 @@ pub struct Receipt {
     pub account: Option<String>,
     pub cloud_url: Option<String>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Task {
     pub id: String,
     pub title: String,
@@ -119,8 +136,29 @@ pub struct Task {
     /// Sticky route for follow-up edits ("改成蓝色" continues the last artifact).
     #[serde(default)]
     pub route: Option<Intent>,
+    #[serde(default)]
+    pub pinned: bool,
 }
 impl Task {
+    /// Keep retries in the journal, but present one latest card per app build.
+    /// Documents and distinct builds remain separate deliverables.
+    pub fn current_output_indices(&self) -> Vec<usize> {
+        let mut builds = std::collections::HashSet::new();
+        let mut indices = Vec::new();
+        for (i, output) in self.outputs.iter().enumerate().rev() {
+            let build = output
+                .lab_id
+                .as_deref()
+                .and_then(|id| id.rsplit_once('-'))
+                .filter(|(_, round)| round.parse::<usize>().is_ok())
+                .map(|(id, _)| id);
+            if build.is_none_or(|id| builds.insert(id)) {
+                indices.push(i);
+            }
+        }
+        indices.reverse();
+        indices
+    }
     pub fn new(device: Option<String>, account: Option<String>) -> Self {
         Self {
             id: format!("task-{:032x}", rand::random::<u128>()),
@@ -141,6 +179,7 @@ impl Task {
             updated: chrono::Utc::now().timestamp(),
             route_note: String::new(),
             route: None,
+            pinned: false,
         }
     }
     pub fn visible(&self, device: Option<&str>, account: Option<&str>) -> bool {
@@ -170,7 +209,11 @@ impl Task {
         }
     }
     pub fn meaningful(&self) -> bool {
-        !self.turns.is_empty() || !self.outputs.is_empty() || self.session.is_some()
+        !self.draft.trim().is_empty()
+            || !self.attachments.is_empty()
+            || !self.turns.is_empty()
+            || !self.outputs.is_empty()
+            || self.session.is_some()
     }
 }
 
@@ -246,23 +289,146 @@ pub fn is_automated_test_task(task: &Task) -> bool {
     task.turns.iter().any(|t| matches_marker(&t.text))
 }
 
+pub fn is_deduplicatable_draft_task(task: &Task) -> bool {
+    if task.session.is_some() || !task.outputs.is_empty() || !task.receipts.is_empty() {
+        return false;
+    }
+    let unsent_draft_only = task.turns.is_empty()
+        && task.steps.is_empty()
+        && (!task.draft.trim().is_empty() || !task.attachments.is_empty());
+    let uncompleted_single_turn = !task.steps.is_empty()
+        && !task.steps.iter().any(|s| s.phase == Phase::Done)
+        && task.turns.iter().filter(|t| t.user).count() <= 1;
+    unsent_draft_only || uncompleted_single_turn
+}
+
+pub fn draft_task_signature(task: &Task) -> Option<(String, Vec<PathBuf>)> {
+    if !is_deduplicatable_draft_task(task) {
+        return None;
+    }
+    let prompt = if !task.draft.trim().is_empty() {
+        task.draft.trim().to_string()
+    } else {
+        task.turns
+            .iter()
+            .find(|t| t.user)
+            .map(|t| t.text.trim().to_string())
+            .unwrap_or_default()
+    };
+    let files = if !task.attachments.is_empty() {
+        task.attachments.clone()
+    } else {
+        task.submitted_files.clone()
+    };
+    if prompt.is_empty() && files.is_empty() {
+        None
+    } else {
+        Some((prompt, files))
+    }
+}
+
+fn merge_draft_task(target: &mut Task, source: Task) {
+    let prefer_source_turns = (target.turns.is_empty() && !source.turns.is_empty())
+        || (!source.turns.is_empty() && source.updated > target.updated);
+    if prefer_source_turns {
+        target.turns = source.turns;
+        target.steps = source.steps;
+        target.note = source.note;
+        target.route = source.route;
+        target.route_note = source.route_note;
+        if target.workspace.is_none() {
+            target.workspace = source.workspace;
+        }
+        if target.submitted_files.is_empty() {
+            target.submitted_files = source.submitted_files;
+        }
+    }
+    let target_has_active_or_done_step = target
+        .steps
+        .iter()
+        .any(|s| matches!(s.phase, Phase::Ready | Phase::Running | Phase::Done));
+    if target_has_active_or_done_step {
+        target.draft.clear();
+        target.attachments.clear();
+    } else {
+        if target.draft.trim().is_empty() && !source.draft.trim().is_empty() {
+            target.draft = source.draft;
+        }
+        if target.attachments.is_empty() && !source.attachments.is_empty() {
+            target.attachments = source.attachments;
+        }
+    }
+    if target.device.is_none() {
+        target.device = source.device;
+    }
+    if target.account.is_none() {
+        target.account = source.account;
+    }
+    target.pinned |= source.pinned;
+    target.updated = target.updated.max(source.updated);
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct Journal {
+    #[serde(skip)]
+    persisted_revision: std::cell::Cell<Option<i64>>,
     pub tasks: Vec<Task>,
     #[serde(default)]
     pub deleted_sessions: Vec<String>,
+    #[serde(default)]
+    pub pinned_sessions: std::collections::HashSet<String>,
 }
 impl Journal {
-    pub fn load(path: &Path) -> Result<Self> {
-        if !path.exists() {
-            return Ok(Self::default());
+    /// Deduplicate sessionless draft-only or failed single-turn tasks that share
+    /// the same normalized prompt, attachments, and device/account scope.
+    /// If `active_id` was merged into another task, returns the surviving task ID.
+    pub fn deduplicate_draft_tasks(&mut self, active_id: Option<&str>) -> Option<String> {
+        let mut replacement_active: Option<String> = None;
+        let mut i = 0;
+        while i < self.tasks.len() {
+            let Some(sig_i) = draft_task_signature(&self.tasks[i]) else {
+                i += 1;
+                continue;
+            };
+            let mut j = i + 1;
+            let mut removed_i = false;
+            while j < self.tasks.len() {
+                let is_dup = draft_task_signature(&self.tasks[j])
+                    .is_some_and(|sig_j| sig_j == sig_i)
+                    && (self.tasks[i].device.is_none()
+                        || self.tasks[j].device.is_none()
+                        || self.tasks[i].device == self.tasks[j].device)
+                    && (self.tasks[i].account.is_none()
+                        || self.tasks[j].account.is_none()
+                        || self.tasks[i].account == self.tasks[j].account);
+                if !is_dup {
+                    j += 1;
+                    continue;
+                }
+                if active_id == Some(self.tasks[j].id.as_str()) {
+                    let src = self.tasks.remove(i);
+                    // Now the former `j` is at index `j - 1`
+                    merge_draft_task(&mut self.tasks[j - 1], src);
+                    removed_i = true;
+                    break;
+                } else {
+                    let src = self.tasks.remove(j);
+                    if active_id == Some(src.id.as_str()) {
+                        replacement_active = Some(self.tasks[i].id.clone());
+                    }
+                    merge_draft_task(&mut self.tasks[i], src);
+                }
+            }
+            if !removed_i {
+                i += 1;
+            }
         }
-        ensure!(
-            std::fs::metadata(path)?.len() < 16 * 1024 * 1024,
-            "任务记录过大"
-        );
-        let mut value: Self = serde_json::from_slice(&std::fs::read(path)?)
-            .context("任务记录无法读取，原文件已保留")?;
+        replacement_active
+    }
+
+    pub fn load(path: &Path) -> Result<Self> {
+        let (mut value, _) = read_journal(path)?;
+        let before_snapshot = value.clone();
         let mut deleted_sessions = value.deleted_sessions;
         value.tasks.retain(|task| {
             if is_automated_test_task(task) {
@@ -322,6 +488,23 @@ impl Journal {
                     task.title = better;
                 }
             }
+            for step in &mut task.steps {
+                if step.phase == Phase::Running {
+                    step.phase = Phase::Unconfirmed;
+                    step.note = "上次执行已中断；手机任务需同步核对，不会自动重发".into();
+                }
+            }
+            if !task.steps.is_empty()
+                && task.steps.iter().all(|s| s.phase == Phase::Done)
+                && task
+                    .turns
+                    .iter()
+                    .rev()
+                    .find(|t| t.user)
+                    .is_some_and(|u| u.text.trim() == task.draft.trim())
+            {
+                task.draft.clear();
+            }
             // Routing is automatic. Older records stored `Chat` as the default
             // mode; a forced route is one-shot and never restored on launch.
             if task.intent == Intent::Chat
@@ -329,31 +512,410 @@ impl Journal {
             {
                 task.intent = Intent::Auto;
             }
-            for step in &mut task.steps {
-                if step.phase == Phase::Running {
-                    step.phase = Phase::Unconfirmed;
-                    step.note = "上次执行已中断；手机任务需同步核对，不会自动重发".into();
-                }
-            }
+        }
+        value.deduplicate_draft_tasks(None);
+        if !value.same_contents(&before_snapshot) {
+            value.save(path)?;
         }
         Ok(value)
     }
+    fn same_contents(&self, other: &Self) -> bool {
+        self.tasks == other.tasks
+            && self.deleted_sessions == other.deleted_sessions
+            && self.pinned_sessions == other.pinned_sessions
+    }
+    /// Synchronous callers keep the revision captured by load/previous save.
+    /// The UI uses JournalWriter directly to retain its typed baseline.
     pub fn save(&self, path: &Path) -> Result<()> {
-        let parent = path.parent().context("任务目录无效")?;
-        std::fs::create_dir_all(parent)?;
-        let mut file = tempfile::NamedTempFile::new_in(parent)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
-            file.as_file()
-                .set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
-        use std::io::Write;
-        file.write_all(&serde_json::to_vec(self)?)?;
-        file.as_file().sync_all()?;
-        file.persist(path)?;
+        let (saved, created) = read_journal(path)?;
+        ensure!(
+            self.persisted_revision.get() == saved.persisted_revision.get()
+                || (self.persisted_revision.get().is_none() && created),
+            "任务记录已变化，请重新读取；未覆盖其他写入或未保存草稿"
+        );
+        let mut writer = JournalWriter::from_loaded(path.to_path_buf(), saved)?;
+        let mut pending = self.clone();
+        writer.commit(&mut pending)?;
+        self.persisted_revision
+            .set(writer.saved.persisted_revision.get());
         Ok(())
+    }
+}
+
+const JOURNAL_LIMIT: usize = 16 * 1024 * 1024;
+
+fn journal_key(path: &Path) -> Result<String> {
+    ensure!(
+        !path
+            .components()
+            .any(|p| matches!(p, std::path::Component::ParentDir)),
+        "任务路径不能包含上级目录"
+    );
+    Ok(if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    }
+    .to_string_lossy()
+    .into_owned())
+}
+
+/// Import the original JSON once, retaining it unchanged. Missing sections from
+/// older journals are added without rewriting existing task rows. Read rows and
+/// their optimistic revision in one transaction, including on first startup.
+fn read_journal(path: &Path) -> Result<(Journal, bool)> {
+    use rusqlite::{params, OptionalExtension, TransactionBehavior};
+    let db = crate::data_store::database_for(path);
+    if !crate::data_store::has_snapshot(path)? {
+        let _: Option<Journal> = crate::data_store::read(path, JOURNAL_LIMIT as u64)?;
+    }
+    let name = journal_key(path)?;
+    crate::data_store::with_connection(&db, |conn| {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<String> = tx
+            .query_row("SELECT shape FROM snapshots WHERE name=?", [&name], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        let created = existing.is_none();
+        let mut shape: serde_json::Value = match existing.as_ref() {
+            Some(raw) => serde_json::from_str(raw)?,
+            None => serde_json::json!({"root_array":false,"sections":{}}),
+        };
+        ensure!(shape["root_array"] == false, "任务记录结构无效，原数据保留");
+        let sections = shape["sections"].as_object_mut().context("任务分区无效")?;
+        let mut upgraded = false;
+        for section in ["tasks", "deleted_sessions", "pinned_sessions"] {
+            match sections.get(section) {
+                Some(v) => ensure!(*v == true, "任务分区不是数组，原数据保留"),
+                None => {
+                    sections.insert(section.into(), true.into());
+                    upgraded = true;
+                }
+            }
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        if created {
+            tx.execute(
+                "INSERT INTO snapshots(name,head,shape,updated) VALUES(?1,'{}',?2,?3)",
+                params![name, serde_json::to_string(&shape)?, now],
+            )?;
+        } else if upgraded {
+            tx.execute(
+                "UPDATE snapshots SET shape=?2,revision=revision+1,updated=?3 WHERE name=?1",
+                params![name, serde_json::to_string(&shape)?, now],
+            )?;
+        }
+        let revision: i64 = tx.query_row(
+            "SELECT revision FROM snapshots WHERE name=?",
+            [&name],
+            |r| r.get(0),
+        )?;
+        let mut journal = Journal::default();
+        let mut bytes = 0usize;
+        {
+            let mut stmt = tx.prepare_cached(
+                "SELECT section,body FROM records WHERE snapshot=? ORDER BY section,position,id",
+            )?;
+            let mut rows = stmt.query([&name])?;
+            while let Some(row) = rows.next()? {
+                let section = row.get_ref(0)?.as_str()?;
+                let body = row.get_ref(1)?.as_str()?;
+                bytes = bytes.saturating_add(body.len() + 1);
+                ensure!(bytes < JOURNAL_LIMIT, "任务记录过大，原数据保留");
+                match section {
+                    "tasks" => journal.tasks.push(serde_json::from_str(body)?),
+                    "deleted_sessions" => {
+                        journal.deleted_sessions.push(serde_json::from_str(body)?)
+                    }
+                    "pinned_sessions" => {
+                        journal.pinned_sessions.insert(serde_json::from_str(body)?);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        tx.commit()?;
+        journal.persisted_revision.set(Some(revision));
+        Ok((journal, created))
+    })
+}
+
+/// A worker-owned committed baseline. Incoming UI journals remain intact on
+/// failure. Success swaps ownership, avoiding another full history clone.
+pub struct JournalWriter {
+    path: PathBuf,
+    saved: Journal,
+    sizes: JournalSize,
+}
+struct JournalSize {
+    rows: std::collections::HashMap<(String, String), usize>,
+    sections: std::collections::HashMap<String, (bool, usize)>,
+    framing: usize,
+    row_bytes: usize,
+}
+impl JournalWriter {
+    pub fn from_loaded(path: PathBuf, saved: Journal) -> Result<Self> {
+        ensure!(
+            saved.persisted_revision.get().is_some(),
+            "任务记录未成功读取，不能启动保存"
+        );
+        let name = journal_key(&path)?;
+        let sizes = crate::data_store::with_connection(&crate::data_store::database_for(&path), |conn| {
+            let tx = conn.transaction()?;
+            let (head, shape): (String,String) = tx.query_row(
+                "SELECT head,shape FROM snapshots WHERE name=?", [&name],
+                |r| Ok((r.get(0)?,r.get(1)?)),
+            )?;
+            // Keep an initially stale writer alive so its queued draft can be
+            // reported/recovered. apply_delta checks the original revision
+            // atomically; this size account never permits rebasing that draft.
+            let shape: serde_json::Value = serde_json::from_str(&shape)?;
+            let fields = shape["sections"].as_object().context("任务分区无效")?;
+            let mut sections = std::collections::HashMap::new();
+            let mut framing = head.len();
+            for (section,array) in fields {
+                framing += serde_json::to_string(section)?.len() + 3; // key, colon, [] / {}
+                sections.insert(section.clone(), (array.as_bool().context("任务分区无效")?,0usize));
+            }
+            framing += if head == "{}" { fields.len().saturating_sub(1) } else { fields.len() };
+            let mut rows = std::collections::HashMap::new();
+            let mut row_bytes = 0usize;
+            {
+                let mut statement = tx.prepare("SELECT section,id,length(CAST(body AS BLOB)) FROM records WHERE snapshot=?")?;
+                let mut values = statement.query([&name])?;
+                while let Some(row) = values.next()? {
+                    let section: String=row.get(0)?;let id:String=row.get(1)?;
+                    let (array,count)=sections.get_mut(&section).context("任务分区无效")?;
+                    let bytes=usize::try_from(row.get::<_,i64>(2)?).context("任务容量状态无效")?
+                        + if *array {0} else {serde_json::to_string(&id)?.len()+1};
+                    row_bytes += bytes;*count+=1;rows.insert((section,id),bytes);
+                }
+            }
+            tx.commit()?;
+            Ok(JournalSize {rows,sections,framing,row_bytes})
+        })?;
+        Ok(Self { path, saved, sizes })
+    }
+    /// On success `pending` receives the previous baseline and may be dropped.
+    /// On error it is unchanged and must be retained for retry/recovery.
+    pub fn commit(&mut self, pending: &mut Journal) -> Result<usize> {
+        use std::collections::{HashMap, HashSet};
+        let revision = self
+            .saved
+            .persisted_revision
+            .get()
+            .context("任务修订缺失")?;
+        let previous: HashMap<_, _> = self
+            .saved
+            .tasks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.id.as_str(), (i, t)))
+            .collect();
+        ensure!(
+            previous.len() == self.saved.tasks.len(),
+            "旧任务标识重复，原数据保留"
+        );
+        let mut ids = HashSet::new();
+        let mut changes: Vec<(&str, String, Option<i64>, serde_json::Value)> = Vec::new();
+        for (position, task) in pending.tasks.iter().enumerate() {
+            ensure!(
+                !task.id.is_empty() && ids.insert(task.id.as_str()),
+                "任务标识重复或为空，未覆盖原数据"
+            );
+            let old = previous.get(task.id.as_str());
+            if old.is_some_and(|(i, t)| *i == position && *t == task) {
+                continue;
+            }
+            changes.push((
+                "tasks",
+                task.id.clone(),
+                if old.is_some_and(|(i, _)| *i == position) {
+                    None
+                } else {
+                    Some(position as i64)
+                },
+                serde_json::to_value(task)?,
+            ));
+        }
+        let mut deletes: Vec<(&str, String)> = self
+            .saved
+            .tasks
+            .iter()
+            .filter(|t| !ids.contains(t.id.as_str()))
+            .map(|t| ("tasks", t.id.clone()))
+            .collect();
+        fn strings(
+            section: &'static str,
+            old: &[String],
+            new: &[String],
+            changes: &mut Vec<(&'static str, String, Option<i64>, serde_json::Value)>,
+            deletes: &mut Vec<(&'static str, String)>,
+        ) {
+            for (i, value) in new.iter().enumerate() {
+                if old.get(i) != Some(value) {
+                    changes.push((
+                        section,
+                        format!("#{i}"),
+                        Some(i as i64),
+                        value.clone().into(),
+                    ));
+                }
+            }
+            deletes.extend((new.len()..old.len()).map(|i| (section, format!("#{i}"))));
+        }
+        strings(
+            "deleted_sessions",
+            &self.saved.deleted_sessions,
+            &pending.deleted_sessions,
+            &mut changes,
+            &mut deletes,
+        );
+        if self.saved.pinned_sessions != pending.pinned_sessions {
+            // HashSet serialization order is not stable. Rewrite this small
+            // metadata section by explicit position only when the set changes.
+            let mut new: Vec<_> = pending.pinned_sessions.iter().cloned().collect();
+            new.sort();
+            for (i, value) in new.iter().enumerate() {
+                changes.push((
+                    "pinned_sessions",
+                    format!("#{i}"),
+                    Some(i as i64),
+                    value.clone().into(),
+                ));
+            }
+            deletes.extend(
+                (new.len()..self.saved.pinned_sessions.len())
+                    .map(|i| ("pinned_sessions", format!("#{i}"))),
+            );
+        }
+        // Track the exact persisted JSON size, including framing, escaped keys,
+        // UTF-8 bodies and unknown retained sections. Only changed rows are
+        // serialized; do not rewrite the whole journal to check each keystroke.
+        let mut size_changes = std::collections::HashMap::new();
+        for (section,id) in &deletes { size_changes.insert(((*section).to_string(),id.clone()),None); }
+        for (section,id,_,value) in &changes {
+            let array=self.sizes.sections.get(*section).context("任务分区无效")?.0;
+            let bytes=serde_json::to_vec(value)?.len()+if array {0}else{serde_json::to_string(id)?.len()+1};
+            size_changes.insert(((*section).to_string(),id.clone()),Some(bytes));
+        }
+        let mut sections=self.sizes.sections.clone();
+        let mut row_bytes=self.sizes.row_bytes;
+        for (key,next) in &size_changes {
+            let old=self.sizes.rows.get(key).copied();
+            row_bytes=row_bytes.checked_sub(old.unwrap_or(0)).context("任务容量状态无效")?
+                .checked_add(next.unwrap_or(0)).context("任务容量溢出")?;
+            let count=&mut sections.get_mut(&key.0).context("任务分区无效")?.1;
+            *count=*count-usize::from(old.is_some())+usize::from(next.is_some());
+        }
+        let total=self.sizes.framing.saturating_add(row_bytes)
+            .saturating_add(sections.values().map(|(_,count)|count.saturating_sub(1)).sum::<usize>());
+        ensure!(total<=JOURNAL_LIMIT,"任务记录超过保存容量，未覆盖原数据；当前草稿保留，请先另存整理已有对话");
+        let records: Vec<_> = changes
+            .iter()
+            .map(
+                |(section, id, position, value)| crate::data_store::RecordChange {
+                    section,
+                    id,
+                    position: *position,
+                    value: value.clone(),
+                },
+            )
+            .collect();
+        let removals: Vec<_> = deletes
+            .iter()
+            .map(|(section, id)| (*section, id.as_str()))
+            .collect();
+        let changed =
+            crate::data_store::apply_delta(&self.path, revision, None, &records, &removals)?;
+        self.sizes.row_bytes=row_bytes;self.sizes.sections=sections;
+        for (key,next) in size_changes {
+            if let Some(bytes)=next {self.sizes.rows.insert(key,bytes);} else {self.sizes.rows.remove(&key);}
+        }
+        pending
+            .persisted_revision
+            .set(Some(revision + i64::from(changed > 0)));
+        std::mem::swap(&mut self.saved, pending);
+        Ok(changed)
+    }
+}
+
+/// Debounced persistence with a retained pending journal and visible failures.
+/// A conflicting writer is never silently rebased onto stale UI contents.
+pub fn write_journal_updates(
+    path: PathBuf,
+    initial: Journal,
+    updates: std::sync::mpsc::Receiver<Journal>,
+    status: std::sync::mpsc::Sender<std::result::Result<(), String>>,
+) {
+    use std::{sync::mpsc::RecvTimeoutError, time::Duration};
+    let mut writer = match JournalWriter::from_loaded(path.clone(), initial) {
+        Ok(writer) => writer,
+        Err(error) => {
+            let _ = status.send(Err(error.to_string()));
+            return;
+        }
+    };
+    let mut pending = None;
+    let mut disconnected = false;
+    let mut last_error = None;
+    loop {
+        if pending.is_none() {
+            match updates.recv() {
+                Ok(next) => pending = Some(next),
+                Err(_) => break,
+            }
+        }
+        while !disconnected {
+            match updates.recv_timeout(Duration::from_millis(if last_error.is_some() {
+                1000
+            } else {
+                300
+            })) {
+                Ok(next) => pending = Some(next),
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => disconnected = true,
+            }
+        }
+        match writer.commit(pending.as_mut().unwrap()) {
+            Ok(_) => {
+                pending = None;
+                last_error = None;
+                let _ = status.send(Ok(()));
+            }
+            Err(error) => {
+                let message = format!("对话草稿尚未保存：{error}");
+                if last_error.as_ref() != Some(&message) {
+                    let _ = status.send(Err(message.clone()));
+                    last_error = Some(message);
+                }
+                if disconnected {
+                    // Keep an explicit recovery artifact when closing after a
+                    // conflict/error. Never replace the committed database or
+                    // original migration JSON with the uncommitted snapshot.
+                    let recovery = path.with_file_name(format!(
+                        "tasks-unsaved-{}.json",
+                        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+                    ));
+                    let result = (|| -> Result<()> {
+                        let raw = serde_json::to_vec(
+                            &serde_json::json!({"base_revision":writer.saved.persisted_revision.get(),"journal":pending.as_ref().unwrap()}),
+                        )?;
+                        crate::local_store::write_if_changed(&recovery, &raw)?;
+                        Ok(())
+                    })();
+                    let _ = status.send(Err(match result {
+                        Ok(()) => format!("对话未提交；草稿恢复副本：{}", recovery.display()),
+                        Err(error) => format!("对话未提交，草稿恢复副本也未能保存：{error}"),
+                    }));
+                    break;
+                }
+            }
+        }
+        if disconnected {
+            break;
+        }
     }
 }
 
@@ -496,6 +1058,234 @@ pub fn app_context(task: &Task) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn journal_fixture(count: usize) -> Journal {
+        let mut journal = Journal::default();
+        journal.tasks = (0..count)
+            .map(|i| {
+                let mut task = Task::new(None, None);
+                task.id = format!("task-{i}");
+                task.title = format!("记录 {i}");
+                task.draft = format!("第 {i} 项未发送草稿🙂");
+                task.turns = vec![Turn {
+                    at_ms: Some(100 + i as i64),
+                    user: false,
+                    text: format!("历史正文 {i}"),
+                }];
+                task
+            })
+            .collect();
+        journal
+    }
+    #[test]
+    fn journal_capacity_includes_json_framing_unicode_and_retained_sections() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("tasks.json");
+        let original=journal_fixture(2);
+        let mut raw=serde_json::to_value(&original).unwrap();
+        raw["保留的\"头🙂"]=serde_json::json!("原头\"\\🙂");
+        raw["未知\"分区🙂"]=serde_json::json!({"转义\"键🙂":"旧内容\"\\🙂"});
+        crate::data_store::write(&path,&raw).unwrap();
+        let loaded=read_journal(&path).unwrap().0;
+        let mut writer=JournalWriter::from_loaded(path.clone(),loaded.clone()).unwrap();
+        let measured=|writer:&JournalWriter|writer.sizes.framing+writer.sizes.row_bytes
+            +writer.sizes.sections.values().map(|(_,count)|count.saturating_sub(1)).sum::<usize>();
+        assert_eq!(measured(&writer),crate::data_store::read_bytes(&path,u64::MAX).unwrap().len());
+        let mut pending=loaded.clone();
+        pending.tasks[0].draft="汉字\"\\🙂".repeat(40);
+        pending.tasks.remove(1);
+        pending.deleted_sessions=vec!["已删除\"\\🙂".into()];
+        pending.pinned_sessions.insert("置顶\"\\🙂".into());
+        writer.commit(&mut pending).unwrap();
+        assert_eq!(measured(&writer),crate::data_store::read_bytes(&path,u64::MAX).unwrap().len());
+        let stored:serde_json::Value=crate::data_store::read(&path,u64::MAX).unwrap().unwrap();
+        assert_eq!(stored["保留的\"头🙂"],raw["保留的\"头🙂"]);
+        assert_eq!(stored["未知\"分区🙂"],raw["未知\"分区🙂"]);
+        let revision=writer.saved.persisted_revision.get();
+        let before=crate::data_store::read_bytes(&path,u64::MAX).unwrap();
+        let mut pending=writer.saved.clone();
+        pending.tasks[0].draft="x".repeat(JOURNAL_LIMIT);
+        let retained=pending.tasks[0].draft.clone();
+        assert!(writer.commit(&mut pending).unwrap_err().to_string().contains("容量"));
+        assert_eq!(pending.tasks[0].draft,retained);
+        assert_eq!(writer.saved.persisted_revision.get(),revision);
+        assert_eq!(crate::data_store::read_bytes(&path,u64::MAX).unwrap(),before);
+        assert_eq!(measured(&writer),before.len());
+        pending.tasks[0].draft="较小的重试草稿".into();
+        writer.commit(&mut pending).unwrap();
+        assert_eq!(read_journal(&path).unwrap().0.tasks[0].draft,"较小的重试草稿");
+        assert_eq!(measured(&writer),crate::data_store::read_bytes(&path,u64::MAX).unwrap().len());
+    }
+    #[test]
+    fn journal_sql_migration_and_single_draft_keep_all_other_rows() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("tasks.json");
+        let mut original = journal_fixture(24);
+        original.deleted_sessions = vec!["deleted-old".into()];
+        original.pinned_sessions.insert("pinned-old".into());
+        let legacy = serde_json::to_vec(&original).unwrap();
+        std::fs::write(&path, &legacy).unwrap();
+        let loaded = Journal::load(&path).unwrap();
+        assert!(loaded.same_contents(&original));
+        assert_eq!(std::fs::read(&path).unwrap(), legacy);
+        let mut writer = JournalWriter::from_loaded(path.clone(), loaded.clone()).unwrap();
+        let mut pending = loaded.clone();
+        pending.tasks[7].draft.push('新');
+        pending.tasks[7].turns[0].at_ms = Some(777); // formerly omitted by UI equality
+        let expected = pending.clone();
+        let db = crate::data_store::database_for(&path);
+        let before = crate::data_store::with_connection(&db, |c| Ok(c.total_changes())).unwrap();
+        assert_eq!(writer.commit(&mut pending).unwrap(), 1);
+        let after = crate::data_store::with_connection(&db, |c| Ok(c.total_changes())).unwrap();
+        assert_eq!(after - before, 2, "only target task plus snapshot revision");
+        assert!(read_journal(&path).unwrap().0.same_contents(&expected));
+        assert_eq!(std::fs::read(&path).unwrap(), legacy);
+        let mut unchanged = expected.clone();
+        assert_eq!(writer.commit(&mut unchanged).unwrap(), 0);
+        crate::data_store::close_thread_connections();
+        assert!(read_journal(&path).unwrap().0.same_contents(&expected));
+    }
+    #[test]
+    fn journal_deletes_pins_and_conflicts_are_atomic() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("tasks.json");
+        let original = journal_fixture(8);
+        original.save(&path).unwrap();
+        let loaded = Journal::load(&path).unwrap();
+        let mut first = JournalWriter::from_loaded(path.clone(), loaded.clone()).unwrap();
+        let mut stale = JournalWriter::from_loaded(path.clone(), loaded.clone()).unwrap();
+        let mut pending = loaded.clone();
+        pending.tasks.remove(2);
+        pending.tasks.swap(0, 4);
+        pending.deleted_sessions.push("removed-session".into());
+        pending.pinned_sessions.insert("pinned-session".into());
+        let expected = pending.clone();
+        first.commit(&mut pending).unwrap();
+        assert!(read_journal(&path).unwrap().0.same_contents(&expected));
+        let mut stale_draft = loaded;
+        stale_draft.tasks[0].draft = "不能丢失的冲突草稿".into();
+        let retained = stale_draft.clone();
+        assert!(stale.commit(&mut stale_draft).is_err());
+        assert!(stale_draft.same_contents(&retained));
+        assert!(read_journal(&path).unwrap().0.same_contents(&expected));
+        assert!(
+            retained.save(&path).is_err(),
+            "a stale direct save is rejected too"
+        );
+        assert!(
+            Journal::default().save(&path).is_err(),
+            "unbased empty defaults never overwrite records"
+        );
+    }
+    #[test]
+    fn journal_failed_commit_retains_draft_retries_and_corruption_stays_untouched() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("tasks.json");
+        journal_fixture(4).save(&path).unwrap();
+        let loaded = Journal::load(&path).unwrap();
+        let mut writer = JournalWriter::from_loaded(path.clone(), loaded.clone()).unwrap();
+        let mut pending = loaded.clone();
+        pending.tasks[0].draft = "重试草稿".into();
+        pending.tasks[1].draft = "第二条变化".into();
+        pending.deleted_sessions.push("tombstone".into());
+        let expected = pending.clone();
+        let db = crate::data_store::database_for(&path);
+        crate::data_store::with_connection(&db,|c| { c.execute_batch("CREATE TEMP TRIGGER reject_journal BEFORE UPDATE ON records WHEN NEW.section='tasks' AND NEW.id='task-1' BEGIN SELECT RAISE(ABORT,'injected failure'); END;")?; Ok(()) }).unwrap();
+        assert!(writer.commit(&mut pending).is_err());
+        assert!(pending.same_contents(&expected));
+        assert!(read_journal(&path).unwrap().0.same_contents(&loaded));
+        crate::data_store::with_connection(&db, |c| {
+            c.execute_batch("DROP TRIGGER reject_journal")?;
+            Ok(())
+        })
+        .unwrap();
+        writer.commit(&mut pending).unwrap();
+        assert!(read_journal(&path).unwrap().0.same_contents(&expected));
+        let broken = root.path().join("broken/tasks.json");
+        std::fs::create_dir_all(broken.parent().unwrap()).unwrap();
+        std::fs::write(&broken, b"corrupt original").unwrap();
+        assert!(Journal::load(&broken).is_err());
+        assert!(Journal::default().save(&broken).is_err());
+        assert_eq!(std::fs::read(broken).unwrap(), b"corrupt original");
+    }
+    #[test]
+    fn journal_worker_retries_pending_draft_without_another_ui_edit() {
+        let root=tempfile::tempdir().unwrap();
+        let path=root.path().join("tasks.json");
+        journal_fixture(2).save(&path).unwrap();
+        let initial=Journal::load(&path).unwrap();
+        let mut pending=initial.clone();
+        pending.tasks[0].draft="不需再次编辑即可重试的草稿".into();
+        let expected=pending.clone();
+        let db=crate::data_store::database_for(&path);
+        crate::data_store::with_connection(&db,|c| { c.execute_batch("CREATE TRIGGER reject_worker BEFORE UPDATE ON records BEGIN SELECT RAISE(ABORT,'retry probe'); END;")?; Ok(()) }).unwrap();
+        let (tx,rx)=std::sync::mpsc::channel();
+        let (status_tx,status_rx)=std::sync::mpsc::channel();
+        let worker_path=path.clone();
+        let worker=std::thread::spawn(move||write_journal_updates(worker_path,initial,rx,status_tx));
+        tx.send(pending).unwrap();
+        assert!(status_rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap().is_err());
+        crate::data_store::with_connection(&db,|c| { c.execute_batch("DROP TRIGGER reject_worker")?; Ok(()) }).unwrap();
+        assert!(status_rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap().is_ok());
+        drop(tx);
+        worker.join().unwrap();
+        assert!(read_journal(&path).unwrap().0.same_contents(&expected));
+    }
+    #[test]
+    fn journal_worker_retains_conflicting_draft_in_explicit_recovery_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("tasks.json");
+        journal_fixture(2).save(&path).unwrap();
+        let initial = Journal::load(&path).unwrap();
+        let mut other = Journal::load(&path).unwrap();
+        other.tasks[1].draft = "另一个写入".into();
+        other.save(&path).unwrap();
+        let mut pending = initial.clone();
+        pending.tasks[0].draft = "关闭时仍未提交的草稿".into();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (status_tx, status_rx) = std::sync::mpsc::channel();
+        tx.send(pending.clone()).unwrap();
+        drop(tx);
+        write_journal_updates(path.clone(), initial, rx, status_tx);
+        assert!(status_rx.try_iter().any(|r| r.is_err()));
+        assert!(read_journal(&path).unwrap().0.same_contents(&other));
+        let recovery = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("tasks-unsaved-")
+            })
+            .unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&recovery).unwrap()).unwrap();
+        assert_eq!(
+            saved["journal"]["tasks"][0]["draft"],
+            pending.tasks[0].draft
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(recovery).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+    #[test]
+    fn old_turn_time_remains_unknown_and_new_turn_time_round_trips() {
+        let old: Turn = serde_json::from_str(r#"{"user":true,"text":"昨天讨论的方案"}"#).unwrap();
+        assert_eq!(old.at_ms, None);
+        let new = Turn {
+            at_ms: Some(1_793_232_000_000),
+            user: true,
+            text: "新的决定".into(),
+        };
+        let decoded: Turn = serde_json::from_str(&serde_json::to_string(&new).unwrap()).unwrap();
+        assert_eq!(decoded.at_ms, new.at_ms);
+        assert_eq!(decoded.text, new.text);
+    }
     use crate::amoo_route::{route_intent, RouteCtx};
     fn auto(
         text: &str,
@@ -514,6 +1304,25 @@ mod tests {
             },
         )
         .steps
+    }
+    #[test]
+    fn app_retry_cards_collapse_but_distinct_deliverables_survive() {
+        let mut task = Task::new(None, None);
+        for (name, id) in [
+            ("first", Some("build-a-1")),
+            ("report", None),
+            ("second", Some("build-a-2")),
+            ("other", Some("build-b-1")),
+        ] {
+            task.outputs.push(Output {
+                path: PathBuf::from(name),
+                name: name.into(),
+                kind: String::new(),
+                lab_id: id.map(str::to_owned),
+            });
+        }
+        assert_eq!(task.current_output_indices(), vec![1, 2, 3]);
+        assert_eq!(task.outputs.len(), 4);
     }
     #[test]
     fn auto_is_default_and_explicit_deliverables_route_cleanly() {
@@ -875,6 +1684,19 @@ mod tests {
         );
     }
     #[test]
+    fn history_keeps_unsent_text_and_attachment_drafts_but_not_empty_conversations() {
+        let mut task = Task::new(None, None);
+        assert!(!task.meaningful());
+        task.draft = "  \n".into();
+        assert!(!task.meaningful());
+        task.draft = "尚未发送的草稿".into();
+        assert!(task.meaningful());
+        task.draft.clear();
+        task.attachments.push(PathBuf::from("待发送.csv"));
+        assert!(task.meaningful());
+    }
+
+    #[test]
     fn task_records_keep_drafts_outputs_and_do_not_resume_jobs() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("tasks.json");
@@ -992,5 +1814,108 @@ mod tests {
             lab_id: Some("starter-neon-snake".into()),
         });
         assert_eq!(app_context(&t).unwrap(), "");
+    }
+
+    #[test]
+    fn journal_load_deduplicates_identical_draft_tasks_and_clears_completed_task_stale_drafts() {
+        let root = tempfile::tempdir().unwrap();
+        let p = root.path().join("tasks.json");
+
+        let mut d1 = Task::new(Some("dev-1".into()), None);
+        d1.id = "task-d1".into();
+        d1.title = "请帮我汇总最近的快递通知并生成取件提醒".into();
+        d1.draft = "请帮我汇总最近的快递通知并生成取件提醒".into();
+
+        let mut d2 = Task::new(Some("dev-1".into()), None);
+        d2.id = "task-d2".into();
+        d2.title = "请帮我汇总最近的快递通知并生成取件提醒".into();
+        d2.draft = "请帮我汇总最近的快递通知并生成取件提醒".into();
+
+        let mut done_task = Task::new(Some("dev-1".into()), Some("s-weather".into()));
+        done_task.id = "task-weather".into();
+        done_task.title = "上海天气".into();
+        done_task.draft = "上海天气".into();
+        done_task.turns.push(Turn {
+            user: true,
+            text: "上海天气".into(),
+            at_ms: Some(1),
+        });
+        done_task.turns.push(Turn {
+            user: false,
+            text: "上海今天多云，22°C".into(),
+            at_ms: Some(2),
+        });
+        done_task.steps.push(Step {
+            executor: Executor::Phone,
+            phase: Phase::Done,
+            note: "已完成".into(),
+        });
+
+        Journal {
+            tasks: vec![d1, d2, done_task],
+            ..Default::default()
+        }
+        .save(&p)
+        .unwrap();
+
+        let loaded = Journal::load(&p).unwrap();
+        let courier_tasks: Vec<_> = loaded
+            .tasks
+            .iter()
+            .filter(|t| t.title.contains("快递通知"))
+            .collect();
+        assert_eq!(courier_tasks.len(), 1);
+        let weather = loaded
+            .tasks
+            .iter()
+            .find(|t| t.id == "task-weather")
+            .unwrap();
+        assert!(
+            weather.draft.is_empty(),
+            "Completed task should not keep a stale draft matching its last user turn"
+        );
+
+        let raw_on_disk: Journal = crate::data_store::read(&p, 16 * 1024 * 1024)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            raw_on_disk.tasks.len(),
+            2,
+            "Journal::load must persist deduplicated tasks back to disk"
+        );
+
+        // Merging an unsent draft task into an active Running/Ready task must not re-populate draft
+        let mut stale_draft = Task::new(Some("dev-1".into()), None);
+        stale_draft.id = "task-stale-draft".into();
+        stale_draft.title = "上海天气".into();
+        stale_draft.draft = "上海天气".into();
+
+        let mut active_sending = Task::new(Some("dev-1".into()), None);
+        active_sending.id = "task-active-sending".into();
+        active_sending.title = "上海天气".into();
+        active_sending.turns.push(Turn {
+            at_ms: Some(10),
+            user: true,
+            text: "上海天气".into(),
+        });
+        active_sending.steps.push(Step {
+            executor: Executor::Phone,
+            phase: Phase::Running,
+            note: String::new(),
+        });
+
+        let mut journal = Journal {
+            tasks: vec![stale_draft, active_sending],
+            deleted_sessions: vec![],
+            pinned_sessions: Default::default(),
+            ..Default::default()
+        };
+        journal.deduplicate_draft_tasks(Some("task-active-sending"));
+        assert_eq!(journal.tasks.len(), 1);
+        assert_eq!(journal.tasks[0].id, "task-active-sending");
+        assert!(
+            journal.tasks[0].draft.is_empty(),
+            "Merging an old unsent draft into a running task must keep draft cleared"
+        );
     }
 }

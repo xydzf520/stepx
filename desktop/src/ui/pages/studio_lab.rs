@@ -15,6 +15,11 @@ impl Companion {
             .unwrap_or((None, title));
         let icon = parsed_icon.or(match &action {
             Lab::Start => Some(UiIcon::Play),
+            Lab::Source(stepx_companion::model_source::Source::PhoneAccount) => {
+                Some(UiIcon::Smartphone)
+            }
+            Lab::CheckPhoneConnection | Lab::ProbePhoneText => Some(UiIcon::Refresh),
+            Lab::CancelPhoneTextProbe => Some(UiIcon::Close),
             Lab::Stop => Some(UiIcon::Close),
             Lab::Fresh => Some(UiIcon::Plus),
             Lab::Refresh | Lab::Models | Lab::CloudModels => Some(UiIcon::Refresh),
@@ -113,7 +118,10 @@ impl Companion {
     pub(in super::super) fn studio_lab_page(&self) -> El {
         let p = self.p();
         let running = self.studio_lab.handle.is_some();
-        let configured = self.studio_lab.config.has_key && !self.studio_lab.config.model.is_empty();
+        let phone_source = self.studio_lab_uses_phone();
+        let configured = !phone_source
+            && self.studio_lab.config.has_key
+            && !self.studio_lab.config.model.is_empty();
         let phone_ready = self.selected.is_some();
         // 不再重复「对话 / 交付 / 工坊」三选一切换栏：做应用平时直接在 Amoo 里说，
         // 这里只是用自己的模型反复调整的高级入口。
@@ -140,17 +148,17 @@ impl Companion {
         )]);
         let mut left = vec![self.panel(vec![
             self.between(
-                self.heading("高级：用自己的模型做应用"),
+                self.heading("应用创作"),
                 if configured {
                     self.pill_badge(
                         format!("自有模型 · {}", self.studio_lab.config.model),
                         p.success,
                         p.surface,
                     )
-                } else if phone_ready {
-                    self.pill_badge("手机已连接", p.success, p.surface)
+                } else if phone_source {
+                    self.pill_badge("使用手机账号", p.accent, p.surface)
                 } else {
-                    self.pill_badge("内置 4 个示例", p.accent, p.surface)
+                    self.pill_badge("独立 API 待配置", p.text2, p.surface)
                 },
             ),
             self.text(
@@ -208,10 +216,12 @@ impl Companion {
             },
         ));
         composer.push(self.text(
-            if !configured && phone_ready {
-                "Enter 开始 · Shift+Enter 换行 · 出错会自动修复，最多 3 次 · 现在用手机上的 Amoo 来做"
+            if phone_source && phone_ready {
+                "Enter 开始 · Shift+Enter 换行 · 本次使用手机账号，由手机路由模型"
+            } else if phone_source {
+                "请先通过 USB 或无线连接手机；不会自动切换到独立 API"
             } else {
-                "Enter 开始 · Shift+Enter 换行 · 出错会自动修复，最多 3 次"
+                "Enter 开始 · Shift+Enter 换行 · 本次使用已选择的独立 API"
             },
             MICRO,
             p.text3,
@@ -413,7 +423,7 @@ impl Companion {
         let p = self.p();
         let Some(a) = self.studio_lab_selected() else {
             return self.panel(vec![
-                self.ui_icon(UiIcon::Monitor, 36., p.text3),
+                self.content_icon(UiIcon::Monitor, 36., p.text3),
                 self.heading("成果与预览"),
                 self.text(
                     "做好后，这里会显示截图、检查结果和发到手机的按钮。",
@@ -589,7 +599,7 @@ impl Companion {
                     let label = check["label"].as_str().unwrap_or("检查项");
                     rows.push(self.lead(
                         S2,
-                        self.ui_icon(
+                        self.content_icon(
                             if pass { UiIcon::Check } else { UiIcon::Close },
                             14.,
                             if pass { p.success } else { p.danger },
@@ -628,11 +638,14 @@ impl Companion {
             ),
         ];
         if current && !self.studio_lab.cloud_models.is_empty() {
+            let range = self.list_page_range("studio-lab-cloud-models",self.studio_lab.cloud_models.len(),40);
+            cloud.push(self.list_page_controls("studio-lab-cloud-models",self.studio_lab.cloud_models.len(),40));
             cloud.push(
                 self.wrap(
                     self.studio_lab
                         .cloud_models
                         .iter()
+                        .skip(range.start).take(range.len())
                         .map(|m| {
                             self.lab_button(
                                 &format!("cloud-model-{}", m.id),
@@ -698,134 +711,321 @@ impl Companion {
         all.push(self.panel(cloud));
         self.vstack(S3, all)
     }
+    fn lab_settings_paragraph(
+        &self,
+        text: impl Into<String>,
+        size: f32,
+        color: facloud_ui::color::ColorU,
+    ) -> El {
+        Text::new(text.into(), self.font, size)
+            .with_color(color)
+            .with_line_height_ratio(1.45)
+            .soft_wrap(true)
+            .finish()
+    }
     pub(in super::super) fn studio_lab_settings(&self) -> El {
+        use stepx_companion::model_source::Source;
         let p = self.p();
+        let phone = self.studio_lab_uses_phone();
+        let (automatic_ready, automatic_reason) = self.context_automatic_source_status();
         let mut rows = vec![
-            self.between(
-                self.heading("自己的模型服务"),
-                self.pill_badge(
-                    if self.studio_lab.config.has_key {
-                        "已保存密钥"
-                    } else if self.selected.is_some() {
-                        "手机已连接"
-                    } else {
-                        "未配置"
-                    },
-                    if self.studio_lab.config.has_key || self.selected.is_some() {
-                        p.success
-                    } else {
-                        p.text2
-                    },
-                    p.surface,
-                ),
-            ),
-            self.text(
-                "连接手机时默认用手机上的 Amoo 来做应用和小游戏；也可以在下面填写自己的模型服务，用自己的额度。",
+            self.between(self.heading("AI 来源"),self.pill_badge(self.studio_lab.model_source.label(),p.accent,p.surface)),
+            self.lab_settings_paragraph("默认使用手机账号，电脑延续手机上的 AI 能力。只有明确选择独立 API 后，才使用单独配置的服务与额度。",BODY,p.text2),
+            self.wrap(vec![
+                self.lab_button("source-phone","手机账号",Lab::Source(Source::PhoneAccount),if phone {Btn::Primary} else {Btn::Secondary}),
+                self.lab_button("source-api","独立 API",Lab::Source(Source::IndependentApi),if !phone {Btn::Primary} else {Btn::Secondary}),
+            ]),
+        ];
+        rows.push(self.lab_settings_paragraph(
+            "模型用量与可用额度由手机或所选服务决定；服务未返回的额度不显示。",
+            CAPTION,
+            p.text3,
+        ));
+        if let Some(error) = &self.studio_lab.model_source_error {
+            rows.push(self.lab_settings_paragraph(error, CAPTION, p.danger));
+        }
+        if phone {
+            rows.push(self.heading("沿用手机账号"));
+            rows.push(self.lab_settings_paragraph(
+                self.studio_lab_phone_connection_label(),
                 BODY,
-                p.text2,
-            ),
-            self.hstack(
-                6.,
-                vec![
-                    self.ui_icon(UiIcon::Bolt, 14., p.accent),
-                    self.caption("一键选择常用大模型服务商 (免手动查接口地址)"),
-                ],
-            ),
-            self.wrap(
-                [
-                    (0u8, "阶跃星辰 StepFun"),
-                    (1, "DeepSeek"),
-                    (2, "通义千问 Qwen"),
-                    (3, "Kimi"),
-                    (4, "智谱 GLM"),
-                    (5, "OpenAI"),
-                    (6, "Claude"),
-                    (7, "Ollama 本地免Key"),
-                ]
-                .into_iter()
-                .map(|(idx, name)| {
+                p.text,
+            ));
+            rows.push(self.lab_settings_paragraph(if automatic_ready {
+                "可以点击生成或批量整理当前资料，任务会逐份完成。当前设备账号的无人值守通道已核验；如需跟随新资料自动更新，可在首页来源设置中另外开启。USB与无线均支持。"
+            } else {"手机账号支持点击生成、批量整理当前资料。当前客户端尚未支持此账号的无人值守生成；通知、短信和讨论资料仍可自动同步。USB 与无线均支持。"},BODY,p.text2));
+            rows.push(self.lab_settings_paragraph(&automatic_reason, CAPTION, p.text2));
+            if let Some(meta) = self.context.accepted_phone_inference(
+                self.selected.as_ref(),
+                self.amoo_ui.account_scope.as_deref(),
+            ) {
+                let model = if meta.model.trim().is_empty() {
+                    "手机未报告模型标识".to_owned()
+                } else {
+                    meta.model
+                        .chars()
+                        .map(|c| if c.is_control() { ' ' } else { c })
+                        .take(100)
+                        .collect()
+                };
+                rows.push(self.lab_settings_paragraph(
+                    format!("最近已接受成果 · 实际手机模型：{model}"),
+                    BODY,
+                    p.text,
+                ));
+                let count = |value: Option<u64>| {
+                    value
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "未知".into())
+                };
+                let input = meta.usage.as_ref().and_then(|usage| usage.input_tokens);
+                let output = meta.usage.as_ref().and_then(|usage| usage.output_tokens);
+                rows.push(self.lab_settings_paragraph(
+                    format!(
+                        "服务返回计数 · 输入 {} Token · 输出 {} Token",
+                        count(input),
+                        count(output)
+                    ),
+                    CAPTION,
+                    p.text2,
+                ));
+                rows.push(self.lab_settings_paragraph(
+                    "以上是该已接受结果的推理计数，不表示账户余额或账单。",
+                    CAPTION,
+                    p.text3,
+                ));
+                rows.push(self.lab_settings_paragraph(
+                    meta.session_cleanup_label(),
+                    CAPTION,
+                    p.text2,
+                ));
+            } else {
+                rows.push(self.lab_settings_paragraph("尚未读取到当前账号的成稿调用凭证；成功生成并完成读取后，会显示实际手机模型与服务返回用量。",CAPTION,p.text3));
+            }
+
+            rows.push(self.wrap(vec![
+                self.button_icon(
+                    "lab-phone-account",
+                    "账号与用量",
+                    UiIcon::Smartphone,
+                    Action::Page(super::super::Page::Account),
+                    Btn::Secondary,
+                ),
+                if self.selected.is_some() {
                     self.lab_button(
-                        &format!("provider-preset-{idx}"),
-                        name,
-                        Lab::ApplyProviderPreset(idx),
+                        "phone-check",
+                        "检查连接",
+                        Lab::CheckPhoneConnection,
                         Btn::Secondary,
                     )
-                })
-                .collect(),
-            ),
-            self.caption("API Base URL"),
-            self.input(F_LAB_ENDPOINT, "https://你的服务地址/v1", None),
-            self.segmented(
-                "lab-protocol",
-                [("OpenAI 兼容", 0), ("Anthropic", 1)]
-                    .iter()
-                    .map(|(name, i)| {
-                        (
-                            (*name).into(),
-                            self.studio_lab.protocol == *i,
-                            Action::StudioLab(Lab::Protocol(*i)),
+                } else {
+                    self.disabled_button("检查连接")
+                },
+            ]));
+            if self.studio_lab.phone_probe_cancel.is_some() {
+                rows.push(self.lab_button(
+                    "phone-probe-cancel",
+                    "取消通道验证",
+                    Lab::CancelPhoneTextProbe,
+                    Btn::Secondary,
+                ));
+                rows.push(self.lab_settings_paragraph(
+                    "正在等待手机模型；取消后不会自动重发。",
+                    CAPTION,
+                    p.text2,
+                ));
+            } else if !stepx_companion::home_ai::phone_text_probe_supported() {
+                rows.push(self.disabled_button("当前客户端尚未适配后台账号通道"));
+            } else if self.selected.is_some() && self.amoo_ui.account_scope.is_some() {
+                rows.push(self.lab_button(
+                    "phone-text-probe",
+                    "验证手机纯文本通道（至多一次模型调用）",
+                    Lab::ProbePhoneText,
+                    Btn::Secondary,
+                ));
+            } else {
+                rows.push(self.disabled_button("连接手机并确认账号后可验证纯文本通道"));
+            }
+            if let Some((serial, account, result)) = &self.studio_lab.phone_probe_note {
+                if self
+                    .selected
+                    .as_ref()
+                    .is_some_and(|device| &device.serial == serial)
+                    && self.amoo_ui.account_scope.as_deref() == Some(account.as_str())
+                {
+                    match result {
+                        Ok(meta) => {
+                            let model = if meta.model.is_empty() {
+                                "手机未报告模型标识"
+                            } else {
+                                meta.model.as_str()
+                            };
+                            rows.push(self.lab_settings_paragraph(
+                                format!("通道验证通过 · 实际模型：{model}"),
+                                BODY,
+                                p.text,
+                            ));
+                            let count = |value: Option<u64>| {
+                                value
+                                    .map(|n| n.to_string())
+                                    .unwrap_or_else(|| "未知".into())
+                            };
+                            rows.push(self.lab_settings_paragraph(
+                                format!(
+                                    "验证调用的服务计数 · 输入 {} · 输出 {} Token",
+                                    count(meta.usage.as_ref().and_then(|u| u.input_tokens)),
+                                    count(meta.usage.as_ref().and_then(|u| u.output_tokens))
+                                ),
+                                CAPTION,
+                                p.text2,
+                            ));
+                            rows.push(self.lab_settings_paragraph(
+                                meta.session_cleanup_label(),
+                                CAPTION,
+                                p.text2,
+                            ));
+                            rows.push(self.lab_settings_paragraph(
+                                "验证不会开启后台生成；需要在首页来源设置中明确开启。",
+                                CAPTION,
+                                p.text3,
+                            ));
+                        }
+                        Err(error) => rows.push(self.lab_settings_paragraph(
+                            format!("通道验证未通过：{error}"),
+                            CAPTION,
+                            p.danger,
+                        )),
+                    }
+                }
+            }
+            if let Some((serial, result)) = &self.studio_lab.phone_connection_note {
+                if self
+                    .selected
+                    .as_ref()
+                    .is_some_and(|device| &device.serial == serial)
+                {
+                    match result {
+                        Ok(note) => rows.push(self.lab_settings_paragraph(note, CAPTION, p.text2)),
+                        Err(note) => rows.push(self.lab_settings_paragraph(
+                            format!("上次连接检查未通过：{note}"),
+                            CAPTION,
+                            p.danger,
+                        )),
+                    }
+                }
+            }
+            rows.push(self.lab_settings_paragraph("检查连接不会调用模型。手机不可用时会提示处理，不会自动改用独立 API。已有 API 配置保留。",CAPTION,p.text3));
+        } else {
+            rows.push(self.heading("独立 API 配置"));
+            rows.push(self.lab_settings_paragraph(
+                "以下设置仅用于已选择的独立 API。实际调用测试会使用该服务的额度。",
+                BODY,
+                p.text2,
+            ));
+            rows.extend(vec![
+                self.hstack(
+                    6.,
+                    vec![
+                        self.content_icon(UiIcon::Bolt, 14., p.accent),
+                        self.caption("一键选择常用大模型服务商 (免手动查接口地址)"),
+                    ],
+                ),
+                self.wrap(
+                    [
+                        (0u8, "阶跃星辰 StepFun"),
+                        (1, "DeepSeek"),
+                        (2, "通义千问 Qwen"),
+                        (3, "Kimi"),
+                        (4, "智谱 GLM"),
+                        (5, "OpenAI"),
+                        (6, "Claude"),
+                        (7, "Ollama 本地免Key"),
+                    ]
+                    .into_iter()
+                    .map(|(idx, name)| {
+                        self.lab_button(
+                            &format!("provider-preset-{idx}"),
+                            name,
+                            Lab::ApplyProviderPreset(idx),
+                            Btn::Secondary,
                         )
                     })
                     .collect(),
-            ),
-            self.caption("API Key"),
-            self.input(
-                F_LAB_KEY,
-                if self.studio_lab.config.has_key {
-                    "已安全保存；留空保留，粘贴新密钥可替换"
-                } else {
-                    "粘贴密钥，仅保存到本机"
-                },
-                None,
-            ),
-            self.caption("模型名称"),
-            self.input(F_LAB_MODEL, "填写模型 ID，或读取下方模型目录", None),
-            self.wrap(vec![
-                self.lab_button("config-save", "保存设置", Lab::Save, Btn::Primary),
-                self.lab_button("config-test", "测试实际调用", Lab::Test, Btn::Secondary),
-                self.lab_button("config-models", "读取模型", Lab::Models, Btn::Secondary),
-                self.lab_button("config-clear", "清除密钥", Lab::ClearKey, Btn::Ghost),
-            ]),
-        ];
-        if self.studio_lab_config_dirty() {
-            rows.push(self.text("有尚未保存的模型设置", CAPTION, p.text3));
+                ),
+                self.caption("API Base URL"),
+                self.input(F_LAB_ENDPOINT, "https://你的服务地址/v1", None),
+                self.segmented(
+                    "lab-protocol",
+                    [("OpenAI 兼容", 0), ("Anthropic", 1)]
+                        .iter()
+                        .map(|(name, i)| {
+                            (
+                                (*name).into(),
+                                self.studio_lab.protocol == *i,
+                                Action::StudioLab(Lab::Protocol(*i)),
+                            )
+                        })
+                        .collect(),
+                ),
+                self.caption("API Key"),
+                self.input(
+                    F_LAB_KEY,
+                    if self.studio_lab.config.has_key {
+                        "已安全保存；留空保留，粘贴新密钥可替换"
+                    } else {
+                        "粘贴密钥，仅保存到本机"
+                    },
+                    None,
+                ),
+                self.caption("模型名称"),
+                self.input(F_LAB_MODEL, "填写模型 ID，或读取下方模型目录", None),
+                self.wrap(vec![
+                    self.lab_button("config-save", "保存设置", Lab::Save, Btn::Primary),
+                    self.lab_button("config-test", "测试实际调用", Lab::Test, Btn::Secondary),
+                    self.lab_button("config-models", "读取模型", Lab::Models, Btn::Secondary),
+                    self.lab_button("config-clear", "清除密钥", Lab::ClearKey, Btn::Ghost),
+                ]),
+            ]);
+            if self.studio_lab_config_dirty() {
+                rows.push(self.lab_settings_paragraph("有尚未保存的 API 设置", CAPTION, p.text3));
+            }
+            let query = self.fields[F_LAB_MODEL].text.trim().to_lowercase();
+            let query = if self
+                .studio_lab
+                .models
+                .iter()
+                .any(|m| m.to_lowercase() == query)
+            {
+                String::new()
+            } else {
+                query
+            };
+            let filtered: Vec<_> = self
+                .studio_lab
+                .models
+                .iter()
+                .filter(|m| query.is_empty() || m.to_lowercase().contains(&query))
+                .take(12)
+                .collect();
+            if !filtered.is_empty() {
+                rows.push(self.divider());
+                rows.push(self.caption("模型目录 · 输入模型名筛选，选择后保存"));
+                for m in filtered {
+                    rows.push(self.list_row(
+                        format!("lab-model-{m}"),
+                        self.line(m, CAPTION, p.text),
+                        self.fields[F_LAB_MODEL].text == *m,
+                        Some(Action::StudioLab(Lab::Model(m.clone()))),
+                        None,
+                    ));
+                }
+            }
         }
         if let Some(note) = &self.studio_lab.model_note {
-            rows.push(self.text(note, CAPTION, p.success));
+            rows.push(self.lab_settings_paragraph(note, CAPTION, p.text2));
         }
         if let Some(error) = &self.studio_lab.error {
-            rows.push(self.text(error, CAPTION, p.danger));
-        }
-        let query = self.fields[F_LAB_MODEL].text.trim().to_lowercase();
-        let query = if self
-            .studio_lab
-            .models
-            .iter()
-            .any(|m| m.to_lowercase() == query)
-        {
-            String::new()
-        } else {
-            query
-        };
-        let filtered: Vec<_> = self
-            .studio_lab
-            .models
-            .iter()
-            .filter(|m| query.is_empty() || m.to_lowercase().contains(&query))
-            .take(12)
-            .collect();
-        if !filtered.is_empty() {
-            rows.push(self.divider());
-            rows.push(self.caption("模型目录 · 输入模型名筛选，选择后保存"));
-            for m in filtered {
-                rows.push(self.list_row(
-                    format!("lab-model-{m}"),
-                    self.line(m, CAPTION, p.text),
-                    self.fields[F_LAB_MODEL].text == *m,
-                    Some(Action::StudioLab(Lab::Model(m.clone()))),
-                    None,
-                ));
-            }
+            rows.push(self.lab_settings_paragraph(error, CAPTION, p.danger));
         }
         self.panel(rows)
     }

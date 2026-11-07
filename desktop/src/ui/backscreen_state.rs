@@ -1,7 +1,39 @@
 //! Backscreen editor: edits are local until the user starts playback.
+use stepx_companion::file_dialog::DialogKind;
 use super::*;
-use facloud_ui::clipboard::ClipboardContent;
+use facloud_ui::{clipboard::ClipboardContent, TypedActionView};
 use stepx_companion::{backscreen as bs, backscreen_amoo as ba, companion_app as ca};
+
+/// UI requests only advance an atomic generation. Phone commands serialize on workers;
+/// once a stop/restart supersedes a queued command, that command never reaches ADB.
+// Shared across state resets too: reconnecting the same phone must not let a new stop
+// race an already-running start from the previous UI state. Only workers take this lock.
+static POMODORO_WORKER_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[derive(Default)]
+struct PomodoroCommandLane {
+    generation: std::sync::atomic::AtomicU64,
+}
+
+impl PomodoroCommandLane {
+    fn advance(&self) -> u64 {
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            .wrapping_add(1)
+    }
+
+    fn current(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn run_if_current<T>(&self, generation: u64, operation: impl FnOnce() -> T) -> Option<T> {
+        let _worker = POMODORO_WORKER_GATE.lock().unwrap_or_else(|e| e.into_inner());
+        if self.generation.load(std::sync::atomic::Ordering::Acquire) != generation {
+            return None;
+        }
+        Some(operation())
+    }
+}
 
 fn days_in_calendar_month(year: i32, month: u32) -> u32 {
     let (next_y, next_m) = if month >= 12 {
@@ -18,11 +50,23 @@ fn days_in_calendar_month(year: i32, month: u32) -> u32 {
     (first_of_next - first_of_this).num_days().clamp(28, 31) as u32
 }
 
+#[cfg(test)]
+fn rewrite_local_calendar_ics(_events: &[stepx_companion::toolbox::PhoneCalendarEvent]) {}
+
+#[cfg(not(test))]
 fn rewrite_local_calendar_ics(events: &[stepx_companion::toolbox::PhoneCalendarEvent]) {
     let path =
         stepx_companion::resources::user_config().join("stepx-companion/desktop-calendar.ics");
     let _ = std::fs::remove_file(&path);
     let _ = stepx_companion::toolbox::export_merged_calendar_ics(events);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) enum LiveCapsuleFilter {
+    #[default]
+    All,
+    LiveOnly,
+    ImportantOnly,
 }
 
 #[derive(Clone, Debug)]
@@ -65,18 +109,26 @@ pub(super) enum BackScreenAction {
     CompanionStop,
     ToggleAutoAiBreath,
     ToggleAutoNotifyFlash,
+    ToggleSmartDisplay,
+    SelectSmartPreviewKind(bs::SmartMessageIconKind),
+    SelectSmartPreviewCount(u32),
+    SelectSmartPreviewMode(u8),
+    SyncSmartDisplayNow,
     StartPomodoro(u32),
     StopPomodoro,
     InspectStepOsSuite,
+    SyncCalendarAndSuite,
     PushDesktopClipboard,
     PullPhoneClipboard,
     TriggerMcpQuickAction(String),
+    FillOtpOnPhone(String),
     CalendarCreatePreset(u8),
     CalendarDelete(i64),
     CalendarPrevMonth,
     CalendarNextMonth,
     CalendarToday,
     CalendarSelectDate(i32, u32, u32),
+    CalendarOpenOccurrence(i64, i64),
     CalendarCreateOnSelectedDate(Option<&'static str>),
     ToggleAutoSyncCalendar,
     ToggleAutoSyncClipboard,
@@ -144,6 +196,33 @@ pub(super) enum BackScreenAction {
     AlarmToggleAll(bool),
     McpCategoryFilter(u8),
     PushSpecificClipboard(String),
+    ToggleLiveCapsulePopover,
+    CloseLiveCapsulePopover,
+    SetLiveCapsuleFilter(LiveCapsuleFilter),
+    CompleteCapsuleItem {
+        id: String,
+        pickup_code: Option<String>,
+        sms_address: Option<String>,
+        im_thread_id: Option<String>,
+        notif_key: Option<String>,
+    },
+    OpenFulfillment { id: String },
+    OpenCapsuleTarget {
+        sms_address: Option<String>,
+        im_thread_id: Option<String>,
+        open_calendar: bool,
+        open_alarms: bool,
+    },
+    PushPhoneLiveCapsule {
+        tag: String,
+        pill_text: String,
+        title: String,
+        subtitle: String,
+        countdown_secs: Option<u64>,
+        sync_backscreen: bool,
+    },
+    DismissPhoneLiveCapsule(String),
+    ClearAllPhoneLiveCapsules,
 }
 
 enum CompanionEvent {
@@ -222,15 +301,41 @@ pub(super) struct BackScreenUiState {
     image_rx: Option<mpsc::Receiver<std::result::Result<(PathBuf, String, Vec<u8>), String>>>,
     pub auto_ai_breath: bool,
     pub auto_notify_flash: bool,
+    pub smart_display_enabled: bool,
+    pub smart_display_active_on_phone: bool,
+    pub last_synced_autonomous_cfg: Option<(bool, bool, u8, bool)>,
+    pub smart_display_last_pushed: Option<(bs::SmartMessageIconKind, u32)>,
+    pub smart_display_last_pushed_slides: Option<Vec<bs::SmartDisplaySlide>>,
+    pub smart_display_live_slides: Vec<bs::SmartDisplaySlide>,
+    pub smart_display_cleared_ids: std::collections::HashSet<String>,
+    pub smart_display_seen_unread_ids: std::collections::HashSet<String>,
+    pub smart_display_live_kind: bs::SmartMessageIconKind,
+    pub smart_display_live_count: u32,
+    pub smart_display_live_summary: String,
+    pub smart_display_preview_kind: bs::SmartMessageIconKind,
+    pub smart_display_preview_count: u32,
+    pub smart_display_preview_mode: u8,
+    pub smart_display_preview_otp: String,
     pub pomodoro_active: bool,
     pub pomodoro_started_at: Option<Instant>,
     pub pomodoro_duration_secs: u32,
     pub pomodoro_last_remaining_secs: Option<u32>,
     pub stepos_suite: stepx_companion::toolbox::StepOsAiSuiteReport,
     pub stepos_suite_loading: bool,
+    pub stepos_suite_synced_at: Option<Instant>,
+    pub stepos_suite_error: Option<String>,
+    // Per-operation identity survives resets through its captured Instant, so an old
+    // device's callback cannot overwrite a later request on the same device.
+    stepos_suite_request: Option<Instant>,
+    mcp_request: Option<Instant>,
+    pomodoro_request: Option<Instant>,
+    pomodoro_device: Option<String>,
+    pomodoro_lane: std::sync::Arc<PomodoroCommandLane>,
     pub calendar_year: i32,
     pub calendar_month: u32,
     pub selected_calendar_day: u32,
+    pub calendar_month_motion_started: Option<Instant>,
+    pub calendar_day_motion_started: Option<Instant>,
     pub gallery_items: Vec<stepx_companion::toolbox::PhoneGalleryItem>,
     pub gallery_loading: bool,
     pub gallery_checked: bool,
@@ -241,6 +346,7 @@ pub(super) struct BackScreenUiState {
     pub gallery_grid_cols: u8,
     pub gallery_rotations: std::collections::HashMap<String, u16>,
     pub completed_calendar_events: std::collections::HashSet<i64>,
+    pub(super) calendar_state_scope: Option<String>,
     pub editing_calendar_event_id: Option<i64>,
     pub editing_alarm_id: Option<i64>,
     pub preset_filter: u8,
@@ -250,9 +356,34 @@ pub(super) struct BackScreenUiState {
     pub last_clipboard_check: Instant,
     pub clipboard_history: Vec<String>,
     pub mcp_category_filter: u8,
+    pub live_capsule_popover_open: bool,
+    pub live_capsule_filter: LiveCapsuleFilter,
+    pub live_capsule_scroll: ClippedScrollStateHandle,
+    pub dismissed_capsule_ids: std::collections::HashSet<String>,
+    pub active_phone_capsule: Option<(String, String, String, Instant)>,
 }
 
 impl BackScreenUiState {
+    fn cancel_pomodoro_commands(&mut self) {
+        self.pomodoro_lane.advance();
+        self.pomodoro_request = None;
+        self.pomodoro_device = None;
+    }
+
+    fn accept_pomodoro_reply(
+        &mut self,
+        request: Instant,
+        expected_serial: &str,
+        selected_serial: Option<&str>,
+    ) -> bool {
+        if self.pomodoro_request != Some(request) {
+            return false;
+        }
+        self.pomodoro_request = None;
+        self.pomodoro_device = None;
+        selected_serial == Some(expected_serial)
+    }
+
     pub fn record_clipboard_history(&mut self, text: &str) {
         let clean = text.trim();
         if clean.is_empty() {
@@ -283,6 +414,7 @@ impl Default for BackScreenUiState {
                     "images" => 2,
                     "android" => 3,
                     "games" => 4,
+                    "smart" => 5,
                     _ => 0,
                 })
                 .unwrap_or(0),
@@ -338,15 +470,39 @@ impl Default for BackScreenUiState {
             image_rx: None,
             auto_ai_breath: true,
             auto_notify_flash: true,
+            smart_display_enabled: true,
+            smart_display_active_on_phone: false,
+            last_synced_autonomous_cfg: None,
+            smart_display_last_pushed: None,
+            smart_display_last_pushed_slides: None,
+            smart_display_live_slides: Vec::new(),
+            smart_display_cleared_ids: std::collections::HashSet::new(),
+            smart_display_seen_unread_ids: std::collections::HashSet::new(),
+            smart_display_live_kind: bs::SmartMessageIconKind::GeneralMessage,
+            smart_display_live_count: 0,
+            smart_display_live_summary: "正在监听手机真实通知 · 手机端自主驱动背屏（断开电脑仍生效），无通知时自动播放旋转太空人动画".into(),
+            smart_display_preview_kind: bs::SmartMessageIconKind::WeChat,
+            smart_display_preview_count: 1,
+            smart_display_preview_mode: 0,
+            smart_display_preview_otp: String::new(),
             pomodoro_active: false,
             pomodoro_started_at: None,
             pomodoro_duration_secs: 25 * 60,
             pomodoro_last_remaining_secs: None,
             stepos_suite: stepx_companion::toolbox::default_stepos_ai_suite_report(),
             stepos_suite_loading: false,
+            stepos_suite_synced_at: None,
+            stepos_suite_error: None,
+            stepos_suite_request: None,
+            mcp_request: None,
+            pomodoro_request: None,
+            pomodoro_device: None,
+            pomodoro_lane: Default::default(),
             calendar_year: today.year(),
             calendar_month: today.month(),
             selected_calendar_day: today.day(),
+            calendar_month_motion_started: None,
+            calendar_day_motion_started: None,
             gallery_items: Vec::new(),
             gallery_loading: false,
             gallery_checked: false,
@@ -357,6 +513,7 @@ impl Default for BackScreenUiState {
             gallery_grid_cols: 3,
             gallery_rotations: std::collections::HashMap::new(),
             completed_calendar_events: std::collections::HashSet::new(),
+            calendar_state_scope: None,
             editing_calendar_event_id: None,
             editing_alarm_id: None,
             preset_filter: 0,
@@ -366,7 +523,16 @@ impl Default for BackScreenUiState {
             last_clipboard_check: Instant::now(),
             clipboard_history: Vec::new(),
             mcp_category_filter: 0,
+            live_capsule_popover_open: false,
+            live_capsule_filter: LiveCapsuleFilter::All,
+            live_capsule_scroll: Default::default(),
+            dismissed_capsule_ids: std::collections::HashSet::new(),
+            active_phone_capsule: None,
         };
+        if !cfg!(test) {
+            state.load_completed_calendar_events();
+            state.load_gallery_rotations();
+        }
         #[cfg(feature = "ui-capture")]
         if let Some(path) = std::env::args()
             .position(|arg| arg == "--backscreen-image")
@@ -381,6 +547,8 @@ impl Default for BackScreenUiState {
 
 impl Drop for BackScreenUiState {
     fn drop(&mut self) {
+        // Device switches replace this state; invalidate any workers still in the lane.
+        self.pomodoro_lane.advance();
         if let Some(playback) = &self.playback {
             playback.cancel();
         }
@@ -415,6 +583,64 @@ impl BackScreenUiState {
             }
         }
         self.gallery_rotations.insert(remote_path, deg);
+        self.save_gallery_rotations();
+    }
+
+    pub(super) fn calendar_state_dir(&self) -> Option<PathBuf> {
+        self.calendar_state_scope.as_ref().map(|scope| super::ui_user_config_dir()
+            .join("stepx-companion").join("calendar-state")
+            .join(stepx_companion::context_ledger::scope_id(scope, None)))
+    }
+
+    pub fn completed_calendar_events_path(&self) -> Option<PathBuf> {
+        self.calendar_state_dir().map(|dir| dir.join("completed-calendar-events.json"))
+    }
+
+    pub fn save_completed_calendar_events(&self) {
+        let Some(path) = self.completed_calendar_events_path() else { return; };
+        let mut sorted: Vec<i64> = self.completed_calendar_events.iter().copied().collect();
+        sorted.sort_unstable();
+        if let Ok(json) = serde_json::to_string_pretty(&sorted) {
+            let _ = persist_calendar_state(&path, json.as_bytes());
+        }
+    }
+
+    pub fn load_completed_calendar_events(&mut self) {
+        self.completed_calendar_events.clear();
+        let Some(path) = self.completed_calendar_events_path() else { return; };
+        if path.is_symlink() || std::fs::metadata(&path).is_ok_and(|m| m.len() > 512 * 1024) { return; }
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            return;
+        };
+        if let Ok(ids) = serde_json::from_str::<Vec<i64>>(&raw) {
+            self.completed_calendar_events = ids.into_iter().collect();
+        }
+    }
+
+    pub fn gallery_rotations_path() -> PathBuf {
+        super::ui_user_config_dir()
+            .join("stepx-companion")
+            .join("gallery-rotations.json")
+    }
+
+    pub fn save_gallery_rotations(&self) {
+        let path = Self::gallery_rotations_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(&self.gallery_rotations) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+
+    pub fn load_gallery_rotations(&mut self) {
+        let path = Self::gallery_rotations_path();
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            return;
+        };
+        if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, u16>>(&raw) {
+            self.gallery_rotations = map;
+        }
     }
 
     pub fn pomodoro_remaining_secs(&self) -> u32 {
@@ -449,6 +675,7 @@ impl BackScreenUiState {
     pub(super) fn needs_poll(&self) -> bool {
         self.preview_visible
             || self.pomodoro_active
+            || self.pomodoro_request.is_some()
             || self.playback.is_some()
             || self.generation.is_some()
             || self.companion_rx.is_some()
@@ -539,6 +766,36 @@ impl BackScreenUiState {
 }
 
 impl Companion {
+    pub(super) fn stepos_read_error_is_fatal(err: Option<&str>) -> bool {
+        let Some(raw) = err.map(str::trim).filter(|s| !s.is_empty()) else {
+            return false;
+        };
+        raw.split('；')
+            .map(str::trim)
+            .filter(|seg| !seg.is_empty())
+            .any(|seg| !seg.starts_with("部分电脑") && !seg.starts_with("双端日历未能保存"))
+    }
+
+    /// An incomplete bridge read must not replace a useful snapshot with default zeros.
+    /// `checked` prevents an automatic retry loop; the Home retry button is explicit.
+    pub(super) fn reject_incomplete_stepos_snapshot(
+        &mut self,
+        report: &stepx_companion::toolbox::StepOsAiSuiteReport,
+    ) -> bool {
+        if !Self::stepos_read_error_is_fatal(report.read_error.as_deref()) {
+            return false;
+        }
+        let Some(error) = &report.read_error else {
+            return false;
+        };
+        self.back_screen.stepos_suite.checked = true;
+        self.back_screen.stepos_suite_error = Some(error.clone());
+        self.error = true;
+        self.status = format!("部分手机数据未读取，已保留上次快照：{error}");
+        self.tools_feedback = Some((self.tool_page, self.status.clone(), true));
+        true
+    }
+
     pub(super) fn tick_auto_clipboard_sync(&mut self, ctx: &mut ViewContext<Self>) {
         if self.demo_mode
             || !self.prefs.auto_sync_clipboard
@@ -573,6 +830,7 @@ impl Companion {
                 if let Ok(Ok(pushed)) = result {
                     me.back_screen.last_synced_phone_clip = pushed.clone();
                     me.back_screen.stepos_suite.phone_clipboard = pushed;
+                    me.sync_live_express_parcels();
                     ctx.notify();
                 }
             });
@@ -596,6 +854,7 @@ impl Companion {
                         me.back_screen.last_synced_phone_clip = phone_clip.clone();
                         me.back_screen.last_synced_desktop_clip = phone_clip.clone();
                         me.back_screen.stepos_suite.phone_clipboard = phone_clip.clone();
+                        me.sync_live_express_parcels();
                         ctx.clipboard()
                             .write(ClipboardContent::plain_text(phone_clip));
                         ctx.notify();
@@ -663,6 +922,23 @@ impl Companion {
             .collect()
     }
 
+    fn set_calendar_focus(&mut self, year: i32, month: u32, day: u32) {
+        let day = day.clamp(1, days_in_calendar_month(year, month));
+        let calendar = &mut self.back_screen;
+        let now = Instant::now();
+        if (calendar.calendar_year, calendar.calendar_month) != (year, month) {
+            calendar.calendar_month_motion_started = Some(now);
+        }
+        if (calendar.calendar_year, calendar.calendar_month, calendar.selected_calendar_day)
+            != (year, month, day)
+        {
+            calendar.calendar_day_motion_started = Some(now);
+        }
+        calendar.calendar_year = year;
+        calendar.calendar_month = month;
+        calendar.selected_calendar_day = day;
+    }
+
     pub(super) fn handle_backscreen_action(
         &mut self,
         action: &BackScreenAction,
@@ -675,6 +951,7 @@ impl Companion {
                 | BackScreenAction::CalendarNextMonth
                 | BackScreenAction::CalendarToday
                 | BackScreenAction::CalendarSelectDate(_, _, _)
+                | BackScreenAction::CalendarOpenOccurrence(_, _)
                 | BackScreenAction::CalendarStartCreateOnDate(_, _, _)
                 | BackScreenAction::GalleryCategory(_)
                 | BackScreenAction::GallerySelect(_)
@@ -693,28 +970,131 @@ impl Companion {
             self.error = true;
         }
     }
+    fn is_desktop_native_mcp_quick_action(action_key: &str) -> bool {
+        matches!(
+            action_key,
+            "open_filemanager"
+                | "search_files"
+                | "open_file_trash"
+                | "open_safebox"
+                | "open_app_manager"
+                | "open_dialer"
+                | "open_xms_service_numbers"
+                | "open_mms"
+                | "open_gallery"
+                | "open_gallery_trash"
+                | "open_backscreen"
+                | "calendar_event"
+                | "note_create"
+                | "todo_create"
+                | "open_remote_agent_hub"
+                | "open_aiengine"
+                | "open_aiengine_settings"
+                | "open_operate_phone"
+                | "open_alphame"
+                | "open_alphame_address"
+                | "open_amoo_memory"
+                | "open_alphame_wifi"
+                | "open_safety_ledger"
+                | "open_agent_perm_manager"
+                | "open_permission_manager"
+                | "open_screen_perception"
+        )
+    }
+    fn reject_offline_phone_action(&mut self, action: &BackScreenAction) -> bool {
+        let requires_phone = match action {
+            BackScreenAction::TriggerMcpQuickAction(k) => {
+                !Self::is_desktop_native_mcp_quick_action(k)
+            }
+            _ => matches!(
+                action,
+                BackScreenAction::CalendarCreatePreset(_)
+                    | BackScreenAction::CalendarDelete(_)
+                    | BackScreenAction::CalendarCreateOnSelectedDate(_)
+                    | BackScreenAction::CalendarQuickAddOnDate { .. }
+                    | BackScreenAction::CalendarClearDay(_, _, _)
+                    | BackScreenAction::CalendarDuplicateToTomorrow(_)
+                    | BackScreenAction::CalendarPostponeOneDay(_)
+                    | BackScreenAction::AlarmCreatePreset(_)
+                    | BackScreenAction::AlarmCreateCustom
+                    | BackScreenAction::AlarmToggle(_, _)
+                    | BackScreenAction::AlarmDelete(_)
+                    | BackScreenAction::AlarmShiftMinutes(_, _)
+                    | BackScreenAction::AlarmToggleAll(_)
+                    | BackScreenAction::SetBrightnessPercent(_)
+                    | BackScreenAction::FillOtpOnPhone(_)
+                    | BackScreenAction::McpToggleDnd
+            ),
+        };
+        if !self.demo_mode && self.selected.is_none() && requires_phone {
+            self.error = true;
+            self.status = "手机未连接，操作尚未执行；原有快照与输入已保留".into();
+            return true;
+        }
+        false
+    }
+
     fn do_backscreen_action(
         &mut self,
         action: &BackScreenAction,
         ctx: &mut ViewContext<Self>,
     ) -> Result<()> {
+        let calendar_id = match action {
+            BackScreenAction::CalendarDelete(id)
+            | BackScreenAction::CalendarToggleDone(id)
+            | BackScreenAction::CalendarEditEvent(id)
+            | BackScreenAction::CalendarDuplicateToTomorrow(id)
+            | BackScreenAction::CalendarPostponeOneDay(id)
+            | BackScreenAction::CalendarSendReminderToPhone(id) => Some(*id),
+            BackScreenAction::CalendarCreateOnSelectedDate(_) => self.back_screen.editing_calendar_event_id,
+            BackScreenAction::CalendarClearDay(y, m, d) => self.back_screen.stepos_suite.calendar_events.iter()
+                .find(|event| event.date_ymd() == (*y, *m, *d)
+                    && self.calendar_event_action_limit(event.id).is_some()).map(|event| event.id),
+            _ => None,
+        };
+        if let Some(reason) = calendar_id.and_then(|id| self.calendar_event_action_limit(id)) {
+            self.record_notice("日程未修改", reason);
+            anyhow::bail!(reason);
+        }
+        // Reject before optimistic mutations, including nested calendar/alarm actions.
+        if self.reject_offline_phone_action(action) {
+            return Ok(());
+        }
         let is_smart_or_stepos = matches!(
             action,
             BackScreenAction::SetMarqueePreset(_)
                 | BackScreenAction::ToggleAutoAiBreath
                 | BackScreenAction::ToggleAutoNotifyFlash
+                | BackScreenAction::ToggleSmartDisplay
+                | BackScreenAction::SelectSmartPreviewKind(_)
+                | BackScreenAction::SelectSmartPreviewCount(_)
+                | BackScreenAction::SelectSmartPreviewMode(_)
+                | BackScreenAction::SyncSmartDisplayNow
                 | BackScreenAction::StartPomodoro(_)
                 | BackScreenAction::StopPomodoro
                 | BackScreenAction::InspectStepOsSuite
+                | BackScreenAction::SyncCalendarAndSuite
                 | BackScreenAction::PushDesktopClipboard
+                | BackScreenAction::PushSpecificClipboard(_)
                 | BackScreenAction::PullPhoneClipboard
+                | BackScreenAction::ToggleLiveCapsulePopover
+                | BackScreenAction::CloseLiveCapsulePopover
+                | BackScreenAction::SetLiveCapsuleFilter(_)
+                | BackScreenAction::CompleteCapsuleItem { .. }
+                | BackScreenAction::OpenFulfillment { .. }
+                | BackScreenAction::OpenCapsuleTarget { .. }
+                | BackScreenAction::PushPhoneLiveCapsule { .. }
+                | BackScreenAction::DismissPhoneLiveCapsule(_)
+                | BackScreenAction::ClearAllPhoneLiveCapsules
                 | BackScreenAction::TriggerMcpQuickAction(_)
+                | BackScreenAction::FillOtpOnPhone(_)
                 | BackScreenAction::CalendarCreatePreset(_)
                 | BackScreenAction::CalendarDelete(_)
                 | BackScreenAction::CalendarPrevMonth
                 | BackScreenAction::CalendarNextMonth
                 | BackScreenAction::CalendarToday
                 | BackScreenAction::CalendarSelectDate(_, _, _)
+                | BackScreenAction::CalendarOpenOccurrence(_, _)
                 | BackScreenAction::CalendarCreateOnSelectedDate(_)
                 | BackScreenAction::CalendarStartCreateOnDate(_, _, _)
                 | BackScreenAction::CalendarQuickAddOnDate { .. }
@@ -837,8 +1217,20 @@ impl Companion {
         }
         match action {
             BackScreenAction::Tab(tab) => {
+                if self.page != Page::BackScreen {
+                    self.page = Page::BackScreen;
+                }
                 if self.back_screen.tab != *tab {
                     self.back_screen.tab = *tab;
+                    if *tab == 5 {
+                        if self.back_screen.smart_display_live_count > 0 {
+                            self.back_screen.smart_display_preview_kind =
+                                self.back_screen.smart_display_live_kind;
+                            self.back_screen.smart_display_preview_count =
+                                self.back_screen.smart_display_live_count;
+                        }
+                        self.apply_smart_preview_to_canvas();
+                    }
                     self.trigger_subtab_switch();
                 }
                 self.back_screen.scroll = Default::default();
@@ -920,7 +1312,17 @@ impl Companion {
             }
             BackScreenAction::SetMarqueePreset(preset) => {
                 self.fields[F_BACK_MARQUEE].set(preset);
+                self.back_screen.stepos_suite.backscreen_signature = preset.trim().to_string();
                 self.matrix_marquee_on = true;
+                let frame = bs::synthesize_chinese_signature_frame(
+                    preset.trim(),
+                    self.back_screen.config.invert,
+                );
+                self.back_screen.native_feature = None;
+                self.back_screen.source = bs::Source::Image(frame.clone());
+                self.back_screen.frame = frame;
+                self.back_screen.title = format!("背屏状态 · {}", preset.trim());
+                self.back_screen.revision = self.back_screen.revision.wrapping_add(1);
                 self.back_screen.status =
                     format!("已填入跑马灯预设「{preset}」，点击保存即可同步至手机背屏");
                 self.status = self.back_screen.status.clone();
@@ -938,9 +1340,10 @@ impl Companion {
                 );
                 self.back_screen.clear_confirmation = false;
                 self.start_backscreen_setting(|adb, device| {
-                    device.verify(adb)?;
+                    let transport = device.resolve_active_transport(adb)?;
+                    let _ = bs::release_custom_frame_owner(adb, device);
                     bs::clear_frame(adb, device)?;
-                    let state = adb.shell(&device.transport, &["dumpsys", "display_ext"])?;
+                    let state = adb.shell(&transport, &["dumpsys", "display_ext"])?;
                     anyhow::ensure!(
                         state.contains("appUsesCustomFrame=false"),
                         "背屏仍被其他应用占用，请先关闭该应用的背屏功能"
@@ -951,6 +1354,7 @@ impl Companion {
             BackScreenAction::Brightness(level) => {
                 self.back_screen.config.brightness = (*level).clamp(1, 8);
                 self.back_screen.refresh_frame();
+                self.sync_smart_backscreen_display();
             }
             BackScreenAction::Fps(fps) => {
                 self.back_screen.config.fps = *fps;
@@ -963,6 +1367,7 @@ impl Companion {
             BackScreenAction::Invert => {
                 self.back_screen.config.invert = !self.back_screen.config.invert;
                 self.back_screen.refresh_frame();
+                self.sync_smart_backscreen_display();
             }
             BackScreenAction::TogglePreview => {
                 self.back_screen.preview_running = !self.back_screen.preview_running;
@@ -982,14 +1387,17 @@ impl Companion {
                 self.back_screen.status = "正在停止，并恢复手机原来的背屏设置…".into();
             }
             BackScreenAction::PickImage => {
-                if let Some(path) = native_dialog::FileDialog::new()
-                    .set_title("选择图片，预览背屏点阵")
-                    .add_filter("图片", &["png", "jpg", "jpeg", "webp", "gif"])
-                    .show_open_single_file()?
-                {
-                    self.back_screen.apply_image(path, "本地图片")?;
-                    self.back_screen.tab = 2;
-                }
+                self.choose_path(
+                    stepx_companion::file_dialog::FileDialog::new()
+                        .set_title("选择图片，预览背屏点阵")
+                        .add_filter("图片", &["png", "jpg", "jpeg", "webp", "gif"]),
+                    DialogKind::OpenFile,
+                    move |app, path, _ctx| {
+                        app.back_screen.apply_image(path, "本地图片")?;
+                        app.back_screen.tab = 2;
+                        Ok(())
+                    },
+                );
             }
             BackScreenAction::Dither => {
                 self.back_screen.image_options.dither = !self.back_screen.image_options.dither;
@@ -1084,6 +1492,7 @@ impl Companion {
             }
             BackScreenAction::ToggleAutoNotifyFlash => {
                 self.back_screen.auto_notify_flash = !self.back_screen.auto_notify_flash;
+                self.sync_smart_backscreen_display();
                 let note = if self.back_screen.auto_notify_flash {
                     "已开启：收到验证码或重要消息时背屏闪烁提醒"
                 } else {
@@ -1092,13 +1501,79 @@ impl Companion {
                 self.back_screen.status = note.into();
                 self.status = note.into();
             }
+            BackScreenAction::ToggleSmartDisplay => {
+                self.back_screen.smart_display_enabled = !self.back_screen.smart_display_enabled;
+                if self.back_screen.smart_display_enabled {
+                    self.back_screen.smart_display_last_pushed = None;
+                    self.back_screen.smart_display_last_pushed_slides = None;
+                    self.back_screen.smart_display_preview_mode = 0;
+                    self.sync_smart_backscreen_display();
+                    let note = "已开启背屏智能显示：由手机端伴侣自主监听通知并驱动背屏轮播（断开电脑仍生效），无通知播放太空人动画";
+                    self.back_screen.status = note.into();
+                    self.status = note.into();
+                } else {
+                    self.sync_smart_backscreen_display();
+                    self.back_screen.smart_display_live_summary = "智能显示已关闭".into();
+                    let note = "已关闭背屏智能显示";
+                    self.back_screen.status = note.into();
+                    self.status = note.into();
+                }
+            }
+            BackScreenAction::SelectSmartPreviewKind(kind) => {
+                self.back_screen.smart_display_preview_kind = *kind;
+                if self.back_screen.smart_display_preview_mode == 0
+                    || self.back_screen.smart_display_preview_mode == 3
+                    || self.back_screen.smart_display_preview_mode == 4
+                {
+                    self.back_screen.smart_display_preview_mode = 1;
+                }
+                self.apply_smart_preview_to_canvas();
+                self.push_current_smart_preview_to_phone();
+            }
+            BackScreenAction::SelectSmartPreviewCount(count) => {
+                self.back_screen.smart_display_preview_count = (*count).max(1);
+                if self.back_screen.smart_display_preview_mode == 0
+                    || self.back_screen.smart_display_preview_mode == 3
+                    || self.back_screen.smart_display_preview_mode == 4
+                {
+                    self.back_screen.smart_display_preview_mode = 1;
+                }
+                self.apply_smart_preview_to_canvas();
+                self.push_current_smart_preview_to_phone();
+            }
+            BackScreenAction::SelectSmartPreviewMode(mode) => {
+                self.back_screen.smart_display_preview_mode = *mode;
+                self.apply_smart_preview_to_canvas();
+                self.push_current_smart_preview_to_phone();
+            }
+            BackScreenAction::SyncSmartDisplayNow => {
+                self.back_screen.smart_display_enabled = true;
+                self.back_screen.smart_display_last_pushed = None;
+                self.back_screen.smart_display_last_pushed_slides = None;
+                self.back_screen.smart_display_cleared_ids.clear();
+                self.back_screen.smart_display_preview_mode = 0;
+                self.sync_smart_backscreen_display();
+                self.apply_smart_preview_to_canvas();
+                self.push_current_smart_preview_to_phone();
+            }
             BackScreenAction::StartPomodoro(seconds) => {
+                // A restart supersedes any earlier start/stop callback, even offline.
+                self.back_screen.pomodoro_request = None;
+                self.back_screen.pomodoro_device = None;
+                let dispatch_generation = self.back_screen.pomodoro_lane.advance();
                 let raw_secs = if *seconds <= 60 {
                     (*seconds).saturating_mul(60)
                 } else {
                     *seconds
                 };
                 let dur = raw_secs.clamp(60, 3600);
+                let minutes = (dur / 60).max(1);
+                self.back_screen.active_phone_capsule = Some((
+                    "stepx_pomodoro".into(),
+                    format!("🍅 {minutes}:00"),
+                    format!("番茄专注 {minutes} 分钟"),
+                    Instant::now(),
+                ));
                 self.back_screen.pomodoro_active = true;
                 self.back_screen.pomodoro_started_at = Some(Instant::now());
                 self.back_screen.pomodoro_duration_secs = dur;
@@ -1114,20 +1589,59 @@ impl Companion {
                 self.back_screen.origin = "背屏专注番茄钟".into();
                 self.back_screen.revision = self.back_screen.revision.wrapping_add(1);
                 self.back_screen.reset_preview();
-                if let Some(device) = self.selected.clone() {
+                if let Some(device) = self.selected.clone().filter(|_| !self.demo_mode) {
                     let brightness = self.back_screen.config.brightness;
                     let revision = self.back_screen.revision;
+                    let request = Instant::now();
+                    let serial = device.serial.clone();
+                    self.back_screen.pomodoro_request = Some(request);
+                    self.back_screen.pomodoro_device = Some(serial.clone());
+                    let lane = self.back_screen.pomodoro_lane.clone();
                     self.back_screen.status =
                         format!("正在向手机物理背屏同步 {} 分钟专注倒计时…", dur / 60);
                     self.status = self.back_screen.status.clone();
                     let (tx, rx) = async_channel::bounded(1);
                     std::thread::spawn(move || {
-                        let res = Adb::discover().and_then(|adb| {
-                            bs::start_pomodoro_countdown(&adb, &device, dur, brightness)
-                        });
+                        let Some(res) = lane.run_if_current(dispatch_generation, || {
+                            Adb::discover().and_then(|adb| {
+                                let capsule_req =
+                                    stepx_companion::push::PhoneLiveCapsuleRequest {
+                                        tag: "stepx_pomodoro".into(),
+                                        pill_text: format!("🍅 {minutes}:00"),
+                                        title: format!("番茄专注 {minutes} 分钟"),
+                                        subtitle: "桌面与手机顶部胶囊、背屏点阵同步倒计时".into(),
+                                        badge_text: "专注计时".into(),
+                                        live_type: 11,
+                                        countdown_secs: Some(u64::from(dur)),
+                                        ongoing: true,
+                                    };
+                                let _ = stepx_companion::push::post_phone_live_capsule(
+                                    &adb,
+                                    &device.serial,
+                                    &capsule_req,
+                                );
+                                let _ =
+                                    stepx_companion::backscreen_amoo::sync_sprite_state_to_backscreen(
+                                        &adb,
+                                        &device,
+                                        stepx_companion::backscreen_amoo::AgentSpriteState::TimerCountdown,
+                                        0,
+                                    );
+                                bs::start_pomodoro_countdown(&adb, &device, dur, brightness)
+                            })
+                        }) else {
+                            return;
+                        };
                         let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
                     });
                     ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                        if !me.back_screen.accept_pomodoro_reply(
+                            request,
+                            &serial,
+                            me.selected.as_ref().map(|device| device.serial.as_str()),
+                        ) {
+                            return;
+                        }
                         match result {
                             Ok(Ok(msg)) => {
                                 me.back_screen.applied_title = title;
@@ -1143,45 +1657,100 @@ impl Companion {
                                     format!("桌面番茄钟已开启（手机背屏同步提示：{err}）");
                                 me.status = me.back_screen.status.clone();
                             }
-                            Err(_) => {}
+                            Err(_) => {
+                                me.back_screen.status =
+                                    "桌面番茄钟已开启；手机背屏回执中断，同步结果未确认".into();
+                                me.status = me.back_screen.status.clone();
+                            }
                         }
                         ctx.notify();
                     });
                 } else {
                     self.back_screen.status = format!(
-                        "已开启 {} 分钟桌面专注番茄钟（连接手机后同步物理背屏）",
+                        "已开启 {} 分钟桌面专注番茄钟（尚未同步手机背屏）",
                         dur / 60
                     );
                     self.status = self.back_screen.status.clone();
                 }
             }
             BackScreenAction::StopPomodoro => {
+                // Invalidate the start immediately; stopping does not wait for its receipt.
+                self.back_screen.pomodoro_request = None;
+                self.back_screen.pomodoro_device = None;
+                let dispatch_generation = self.back_screen.pomodoro_lane.advance();
                 self.back_screen.pomodoro_active = false;
                 self.back_screen.pomodoro_started_at = None;
                 self.back_screen.pomodoro_last_remaining_secs = None;
-                self.back_screen.status = "已结束专注番茄钟，恢复背屏常规预览".into();
+                if self
+                    .back_screen
+                    .active_phone_capsule
+                    .as_ref()
+                    .is_some_and(|(tag, _, _, _)| tag == "stepx_pomodoro")
+                {
+                    self.back_screen.active_phone_capsule = None;
+                }
+                self.back_screen.status = "已结束桌面专注番茄钟；手机背屏停止状态尚未确认".into();
                 self.status = self.back_screen.status.clone();
-                if let Some(device) = self.selected.clone() {
+                if let Some(device) = self.selected.clone().filter(|_| !self.demo_mode) {
+                    let request = Instant::now();
+                    let serial = device.serial.clone();
+                    self.back_screen.pomodoro_request = Some(request);
+                    self.back_screen.pomodoro_device = Some(serial.clone());
+                    let lane = self.back_screen.pomodoro_lane.clone();
+                    self.back_screen.status = "桌面计时已停止，正在停止手机背屏倒计时…".into();
+                    self.status = self.back_screen.status.clone();
                     let (tx, rx) = async_channel::bounded(1);
                     std::thread::spawn(move || {
-                        let res = Adb::discover()
-                            .and_then(|adb| bs::stop_pomodoro_countdown(&adb, &device));
+                        let Some(res) = lane.run_if_current(dispatch_generation, || {
+                            Adb::discover().and_then(|adb| {
+                                let _ = stepx_companion::push::dismiss_phone_live_capsule(
+                                    &adb,
+                                    &device.serial,
+                                    "stepx_pomodoro",
+                                );
+                                bs::stop_pomodoro_countdown(&adb, &device)
+                            })
+                        }) else {
+                            return;
+                        };
                         let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
                     });
-                    ctx.spawn(async move { rx.recv().await }, |me, result, ctx| {
-                        if let Ok(Ok(msg)) = result {
-                            me.back_screen.applied_to_phone = false;
-                            me.back_screen.applied_revision = None;
-                            me.back_screen.applied_title.clear();
-                            me.back_screen.applied_status = msg.clone();
-                            me.back_screen.status = msg.clone();
-                            me.status = msg;
+                    ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                        if !me.back_screen.accept_pomodoro_reply(
+                            request,
+                            &serial,
+                            me.selected.as_ref().map(|device| device.serial.as_str()),
+                        ) {
+                            return;
+                        }
+                        match result {
+                            Ok(Ok(msg)) => {
+                                me.back_screen.applied_to_phone = false;
+                                me.back_screen.applied_revision = None;
+                                me.back_screen.applied_title.clear();
+                                me.back_screen.applied_status = msg.clone();
+                                me.back_screen.status = msg.clone();
+                                me.status = msg;
+                            }
+                            Ok(Err(err)) => {
+                                me.error = true;
+                                me.back_screen.status = format!(
+                                    "桌面计时已停止；手机背屏停止未确认：{err}"
+                                );
+                                me.status = me.back_screen.status.clone();
+                            }
+                            Err(_) => {
+                                me.error = true;
+                                me.back_screen.status =
+                                    "桌面计时已停止；手机背屏停止回执中断，请重试".into();
+                                me.status = me.back_screen.status.clone();
+                            }
                         }
                         ctx.notify();
                     });
                 }
             }
-            BackScreenAction::InspectStepOsSuite => {
+            BackScreenAction::InspectStepOsSuite | BackScreenAction::SyncCalendarAndSuite => {
                 if self.back_screen.stepos_suite_loading {
                     return Ok(());
                 }
@@ -1190,19 +1759,60 @@ impl Companion {
                     return Ok(());
                 };
                 self.back_screen.stepos_suite_loading = true;
+                self.back_screen.stepos_suite_error = None;
+                let request = Instant::now();
+                let serial = device.serial.clone();
+                self.back_screen.stepos_suite_request = Some(request);
                 self.back_screen.stepos_suite.last_action_note =
                     "正在读取手机屏幕使用统计、剪贴板与系统服务状态…".into();
                 let (tx, rx) = async_channel::bounded(1);
+                let sync_calendar = matches!(action, BackScreenAction::SyncCalendarAndSuite);
                 std::thread::spawn(move || {
                     let res = Adb::discover().and_then(|adb| {
-                        stepx_companion::toolbox::inspect_stepos_ai_suite(&adb, &device)
+                        let mut report = stepx_companion::toolbox::inspect_stepos_ai_suite(&adb, &device)?;
+                        // This is the explicit calendar/suite synchronization
+                        // job, not a passive capability/status probe.
+                        if sync_calendar { stepx_companion::toolbox::sync_stepos_ai_suite_calendar(&adb, &device, &mut report)?; }
+                        Ok(report)
                     });
                     let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
                 });
-                ctx.spawn(async move { rx.recv().await }, |me, result, ctx| {
+                ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                    if me.back_screen.stepos_suite_request != Some(request) {
+                        return;
+                    }
+                    me.back_screen.stepos_suite_request = None;
                     me.back_screen.stepos_suite_loading = false;
+                    if me.selected.as_ref().map(|d| d.serial.as_str()) != Some(serial.as_str()) {
+                        return;
+                    }
+                    let was_background_synced = me
+                        .auto_sync
+                        .domain_status(AutoSyncDomain::CalendarAndSuite)
+                        .is_synced()
+                        && me.back_screen.stepos_suite_synced_at.is_some();
                     match result {
                         Ok(Ok(report)) => {
+                            if me.reject_incomplete_stepos_snapshot(&report) {
+                                if was_background_synced {
+                                    me.back_screen.stepos_suite_error = None;
+                                    me.touch_auto_sync_domain_synced(AutoSyncDomain::CalendarAndSuite);
+                                } else {
+                                    me.apply_auto_sync_results(vec![(
+                                        AutoSyncDomain::CalendarAndSuite,
+                                        report.read_error.clone(),
+                                    )]);
+                                    me.reconcile_auto_sync_domains_from_state();
+                                }
+                                ctx.notify();
+                                return;
+                            }
+                            let sync_error = report.read_error.as_deref()
+                                .map(str::trim)
+                                .filter(|error| !error.is_empty())
+                                .map(str::to_string);
+                            me.back_screen.stepos_suite_synced_at = Some(Instant::now());
+                            me.back_screen.stepos_suite_error = sync_error.clone();
                             let phone_clip = report.phone_clipboard.trim().to_string();
                             if !phone_clip.is_empty() {
                                 me.back_screen.record_clipboard_history(&phone_clip);
@@ -1218,23 +1828,58 @@ impl Companion {
                                         .write(ClipboardContent::plain_text(phone_clip));
                                 }
                             }
+                            let sig_text = report.backscreen_signature.trim().to_string();
+                            if !sig_text.is_empty() {
+                                me.back_screen.frame = bs::synthesize_chinese_signature_frame(
+                                    &sig_text,
+                                    me.back_screen.config.invert,
+                                );
+                            }
                             let note = report.last_action_note.clone();
                             me.back_screen.stepos_suite = report;
+                            me.reconcile_calendar_event_states_from_descriptions();
+                            me.sync_live_express_parcels();
                             if !me.busy {
                                 me.status = note.clone();
+                                me.error = sync_error.is_some();
                             }
-                            me.tools_feedback = Some((me.tool_page, note, false));
+                            me.tools_feedback = Some((me.tool_page, note, sync_error.is_some()));
                         }
                         Ok(Err(err)) => {
+                            if was_background_synced {
+                                me.back_screen.stepos_suite_error = None;
+                                me.touch_auto_sync_domain_synced(AutoSyncDomain::CalendarAndSuite);
+                                ctx.notify();
+                                return;
+                            }
+                            me.back_screen.stepos_suite_error = Some(err.clone());
                             me.back_screen.stepos_suite.checked = true;
                             me.back_screen.stepos_suite.last_action_note =
                                 format!("读取状态未完成：{err}");
                             if !me.busy {
                                 me.status = format!("读取手机统计未完成：{err}");
+                                me.error = true;
                             }
+                            me.tools_feedback = Some((me.tool_page,
+                                format!("读取手机统计未完成：{err}"), true));
                         }
-                        Err(_) => {}
+                        Err(_) => {
+                            if was_background_synced {
+                                me.back_screen.stepos_suite_error = None;
+                                me.touch_auto_sync_domain_synced(AutoSyncDomain::CalendarAndSuite);
+                                ctx.notify();
+                                return;
+                            }
+                            me.back_screen.stepos_suite.checked = true;
+                            me.back_screen.stepos_suite_error = Some("读取任务已中断，请重试".into());
+                            me.tools_feedback = Some((me.tool_page, "读取任务已中断，请重试".into(), true));
+                        }
                     }
+                    me.apply_auto_sync_results(vec![(
+                        AutoSyncDomain::CalendarAndSuite,
+                        me.back_screen.stepos_suite_error.clone(),
+                    )]);
+                    me.reconcile_auto_sync_domains_from_state();
                     ctx.notify();
                 });
             }
@@ -1257,15 +1902,38 @@ impl Companion {
                 };
                 self.back_screen.stepos_suite.last_action_note = "正在推送电脑剪贴板到手机…".into();
                 self.status = "正在推送电脑剪贴板到手机…".into();
+                let serial = device.serial.clone();
                 let (tx, rx) = async_channel::bounded(1);
                 std::thread::spawn(move || {
                     let res = Adb::discover().and_then(|adb| {
                         stepx_companion::toolbox::push_clipboard_to_phone(&adb, &device, &clip_text)
-                            .map(|note| (clip_text, note))
+                            .map(|note| {
+                                let preview: String = clip_text.chars().take(48).collect();
+                                let capsule_req =
+                                    stepx_companion::push::PhoneLiveCapsuleRequest {
+                                        tag: "stepx_clipboard".into(),
+                                        pill_text: "📋 剪贴板已达".into(),
+                                        title: "电脑已推送剪贴板到手机".into(),
+                                        subtitle: preview,
+                                        badge_text: "双端协同".into(),
+                                        live_type: 1,
+                                        countdown_secs: None,
+                                        ongoing: false,
+                                    };
+                                let _ = stepx_companion::push::post_phone_live_capsule(
+                                    &adb,
+                                    &device.serial,
+                                    &capsule_req,
+                                );
+                                (clip_text, note)
+                            })
                     });
                     let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
                 });
                 ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                    if me.selected.as_ref().map(|d| d.serial.as_str()) != Some(serial.as_str()) {
+                        return;
+                    }
                     match result {
                         Ok(Ok((pushed_text, note))) => {
                             me.back_screen.record_clipboard_history(&pushed_text);
@@ -1273,6 +1941,12 @@ impl Companion {
                             me.back_screen.last_synced_phone_clip = pushed_text.clone();
                             me.back_screen.stepos_suite.phone_clipboard = pushed_text;
                             me.back_screen.stepos_suite.last_action_note = note.clone();
+                            me.back_screen.active_phone_capsule = Some((
+                                "stepx_clipboard".into(),
+                                "📋 剪贴板已达".into(),
+                                "电脑已推送剪贴板到手机".into(),
+                                Instant::now(),
+                            ));
                             me.error = false;
                             me.status = note.clone();
                             me.tools_feedback = Some((me.tool_page, note, false));
@@ -1300,15 +1974,38 @@ impl Companion {
                 }
                 self.back_screen.stepos_suite.last_action_note = "正在推送剪贴板记录到手机…".into();
                 self.status = "正在推送剪贴板记录到手机…".into();
+                let serial = device.serial.clone();
                 let (tx, rx) = async_channel::bounded(1);
                 std::thread::spawn(move || {
                     let res = Adb::discover().and_then(|adb| {
                         stepx_companion::toolbox::push_clipboard_to_phone(&adb, &device, &clip_text)
-                            .map(|note| (clip_text, note))
+                            .map(|note| {
+                                let preview: String = clip_text.chars().take(48).collect();
+                                let capsule_req =
+                                    stepx_companion::push::PhoneLiveCapsuleRequest {
+                                        tag: "stepx_clipboard".into(),
+                                        pill_text: "📋 剪贴板已达".into(),
+                                        title: "电脑已推送剪贴板到手机".into(),
+                                        subtitle: preview,
+                                        badge_text: "双端协同".into(),
+                                        live_type: 1,
+                                        countdown_secs: None,
+                                        ongoing: false,
+                                    };
+                                let _ = stepx_companion::push::post_phone_live_capsule(
+                                    &adb,
+                                    &device.serial,
+                                    &capsule_req,
+                                );
+                                (clip_text, note)
+                            })
                     });
                     let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
                 });
                 ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                    if me.selected.as_ref().map(|d| d.serial.as_str()) != Some(serial.as_str()) {
+                        return;
+                    }
                     match result {
                         Ok(Ok((pushed_text, note))) => {
                             me.back_screen.record_clipboard_history(&pushed_text);
@@ -1316,6 +2013,12 @@ impl Companion {
                             me.back_screen.last_synced_phone_clip = pushed_text.clone();
                             me.back_screen.stepos_suite.phone_clipboard = pushed_text;
                             me.back_screen.stepos_suite.last_action_note = note.clone();
+                            me.back_screen.active_phone_capsule = Some((
+                                "stepx_clipboard".into(),
+                                "📋 剪贴板已达".into(),
+                                "电脑已推送剪贴板到手机".into(),
+                                Instant::now(),
+                            ));
                             me.error = false;
                             me.status = note.clone();
                             me.tools_feedback = Some((me.tool_page, note, false));
@@ -1340,6 +2043,7 @@ impl Companion {
                 self.back_screen.stepos_suite.last_action_note =
                     "正在从手机拉取最新剪贴板内容…".into();
                 self.status = "正在从手机拉取剪贴板…".into();
+                let serial = device.serial.clone();
                 let (tx, rx) = async_channel::bounded(1);
                 std::thread::spawn(move || {
                     let res = Adb::discover().and_then(|adb| {
@@ -1348,6 +2052,9 @@ impl Companion {
                     let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
                 });
                 ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                    if me.selected.as_ref().map(|d| d.serial.as_str()) != Some(serial.as_str()) {
+                        return;
+                    }
                     match result {
                         Ok(Ok(text)) => {
                             ctx.clipboard()
@@ -1363,6 +2070,7 @@ impl Companion {
                             );
                             me.back_screen.stepos_suite.phone_clipboard = text;
                             me.back_screen.stepos_suite.last_action_note = note.clone();
+                            me.sync_live_express_parcels();
                             me.error = false;
                             me.status = note.clone();
                             me.tools_feedback = Some((me.tool_page, note, false));
@@ -1381,14 +2089,145 @@ impl Companion {
             BackScreenAction::McpCategoryFilter(cat) => {
                 self.back_screen.mcp_category_filter = *cat;
             }
-            BackScreenAction::TriggerMcpQuickAction(action_key) => {
-                let key = action_key.clone();
-                let payload = if key == "open_clip_url_phone" {
-                    self.back_screen
-                        .stepos_suite
-                        .phone_clipboard
-                        .trim()
-                        .to_string()
+            BackScreenAction::TriggerMcpQuickAction(_) | BackScreenAction::FillOtpOnPhone(_) => {
+                let (action_key, displayed_code) = match action {
+                    BackScreenAction::TriggerMcpQuickAction(key) => (key.as_str(), None),
+                    BackScreenAction::FillOtpOnPhone(code) => ("fill_otp_one_by_one", Some(code.as_str())),
+                    _ => unreachable!(),
+                };
+                match action_key {
+                    "open_filemanager" | "search_files" | "open_file_trash" | "open_safebox" => {
+                        self.handle_action(&Action::Page(Page::Files), ctx);
+                        self.status = "已在桌面端打开文件管理器".into();
+                        self.back_screen.stepos_suite.last_action_note = self.status.clone();
+                        self.error = false;
+                        return Ok(());
+                    }
+                    "open_app_manager" => {
+                        self.handle_action(&Action::Page(Page::Apps), ctx);
+                        self.status = "已在桌面端打开应用与权限管理".into();
+                        self.back_screen.stepos_suite.last_action_note = self.status.clone();
+                        self.error = false;
+                        return Ok(());
+                    }
+                    "open_dialer" | "open_xms_service_numbers" => {
+                        self.handle_action(&Action::Page(Page::Phone), ctx);
+                        self.status = "已在桌面端打开电话".into();
+                        self.back_screen.stepos_suite.last_action_note = self.status.clone();
+                        self.error = false;
+                        return Ok(());
+                    }
+                    "open_mms" => {
+                        self.handle_action(&Action::Page(Page::Sms), ctx);
+                        self.status = "已在桌面端打开消息".into();
+                        self.back_screen.stepos_suite.last_action_note = self.status.clone();
+                        self.error = false;
+                        return Ok(());
+                    }
+                    "open_gallery" | "open_gallery_trash" => {
+                        self.handle_action(&Action::Page(Page::Gallery), ctx);
+                        if action_key == "open_gallery_trash" {
+                            self.back_screen.gallery_category = 0;
+                        }
+                        self.status = "已在桌面端打开图库与相册管理".into();
+                        self.back_screen.stepos_suite.last_action_note = self.status.clone();
+                        self.error = false;
+                        return Ok(());
+                    }
+                    "open_backscreen" => {
+                        self.handle_action(&Action::Page(Page::BackScreen), ctx);
+                        self.status = "已在桌面端打开背屏点阵工坊".into();
+                        self.back_screen.stepos_suite.last_action_note = self.status.clone();
+                        self.error = false;
+                        return Ok(());
+                    }
+                    "calendar_event" => {
+                        self.handle_action(&Action::Page(Page::Calendar), ctx);
+                        self.status = "已在桌面端打开日历日程".into();
+                        self.back_screen.stepos_suite.last_action_note = self.status.clone();
+                        self.error = false;
+                        return Ok(());
+                    }
+                    "note_create" | "todo_create" => {
+                        self.handle_action(&Action::Page(Page::Schedule), ctx);
+                        self.status = "已在桌面端打开日程与待办工作台".into();
+                        self.back_screen.stepos_suite.last_action_note = self.status.clone();
+                        self.error = false;
+                        return Ok(());
+                    }
+                    "open_remote_agent_hub"
+                    | "open_aiengine"
+                    | "open_aiengine_settings"
+                    | "open_operate_phone" => {
+                        self.handle_action(&Action::Page(Page::Amoo), ctx);
+                        self.status = "已在桌面端打开 Amoo 智能助手工作台".into();
+                        self.back_screen.stepos_suite.last_action_note = self.status.clone();
+                        self.error = false;
+                        return Ok(());
+                    }
+                    "open_alphame" | "open_alphame_address" | "open_amoo_memory" => {
+                        self.handle_action(&Action::AmooOpenMemory, ctx);
+                        return Ok(());
+                    }
+                    "open_alphame_wifi" => {
+                        self.handle_action(&Action::Page(Page::Connect), ctx);
+                        self.status = "已在桌面端打开无线调试与设备连接".into();
+                        self.back_screen.stepos_suite.last_action_note = self.status.clone();
+                        self.error = false;
+                        return Ok(());
+                    }
+                    "open_safety_ledger"
+                    | "open_agent_perm_manager"
+                    | "open_permission_manager"
+                    | "open_screen_perception" => {
+                        self.handle_action(&Action::OpenTool(Some(ToolPage::AiSafety)), ctx);
+                        self.status = "已在桌面端打开 AI 安全审计与权限台账".into();
+                        self.back_screen.stepos_suite.last_action_note = self.status.clone();
+                        self.error = false;
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+                let key = action_key.to_owned();
+                let payload = if let Some(code) = displayed_code {
+                    anyhow::ensure!(
+                        (4..=8).contains(&code.len()) && code.bytes().all(|byte| byte.is_ascii_digit()),
+                        "当前验证码格式无效，请刷新后重试"
+                    );
+                    code.to_owned()
+                } else if key == "open_clip_url_phone"
+                    || key == "fill_otp_one_by_one"
+                    || key == "query_express_number"
+                {
+                    let typed = self.fields[F_OV_TEXT].text.trim();
+                    if !typed.is_empty() {
+                        typed.to_string()
+                    } else {
+                        self.back_screen
+                            .stepos_suite
+                            .phone_clipboard
+                            .trim()
+                            .to_string()
+                    }
+                } else if key == "capcut_handoff" {
+                    let typed = self.fields[F_PHONE_SCHEDULE_TITLE].text.trim();
+                    if !typed.is_empty() {
+                        typed.to_string()
+                    } else if let Some(sel) = self
+                        .back_screen
+                        .gallery_items
+                        .get(self.back_screen.gallery_selected)
+                    {
+                        sel.remote_path.clone()
+                    } else {
+                        self.back_screen
+                            .gallery_items
+                            .iter()
+                            .take(4)
+                            .map(|i| i.remote_path.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    }
                 } else {
                     let s = self.fields[F_OV_TEXT].text.trim().to_string();
                     if s.is_empty() {
@@ -1397,27 +2236,239 @@ impl Companion {
                         s
                     }
                 };
-                let Some(device) = self.selected.clone() else {
+                if let Some(sig) = key.strip_prefix("backscreen_sig:") {
+                    let stripped = sig.trim_start_matches(|c: char| {
+                        c.is_whitespace()
+                            || (c as u32) >= 0x1F000
+                            || matches!(c, '📲' | '⏱' | '📦' | '✨' | '🔥' | '🔔')
+                    });
+                    let sig_clean = if stripped.trim().is_empty() {
+                        sig.trim().to_string()
+                    } else {
+                        stripped.trim().to_string()
+                    };
+                    self.fields[F_BACK_MARQUEE].set(&sig_clean);
+                    self.back_screen.stepos_suite.backscreen_signature = sig_clean.clone();
+                    self.matrix_marquee_on = true;
+                    let frame = bs::synthesize_chinese_signature_frame(
+                        &sig_clean,
+                        self.back_screen.config.invert,
+                    );
+                    self.back_screen.native_feature = None;
+                    self.back_screen.source = bs::Source::Image(frame.clone());
+                    self.back_screen.frame = frame;
+                    self.back_screen.title = format!("背屏状态 · {sig_clean}");
+                    self.back_screen.revision = self.back_screen.revision.wrapping_add(1);
+                }
+                if !self.demo_mode && self.selected.is_none() {
                     self.status = "请先连接手机后再执行快捷指令".into();
                     self.error = true;
                     return Ok(());
+                }
+                let prev_dnd = self.back_screen.stepos_suite.controls.dnd_on;
+                let prev_wifi = self.back_screen.stepos_suite.controls.wifi_on;
+                let prev_bt = self.back_screen.stepos_suite.controls.bluetooth_on;
+                let evidence = &self.back_screen.stepos_suite.capability_evidence;
+                let privacy_state = match key.as_str() {
+                    "toggle_delete_protect" => Some(evidence.delete_protect_enabled),
+                    "toggle_global_camera" => Some(evidence.camera_allowed),
+                    "toggle_global_mic" => Some(evidence.microphone_allowed),
+                    "toggle_global_location" => Some(evidence.location_enabled),
+                    "toggle_screen_perception" => Some(evidence.screen_perception),
+                    _ => None,
                 };
-                self.back_screen.stepos_suite.last_action_note = "正在手机端执行快捷指令…".into();
-                self.status = "正在手机端执行快捷指令…".into();
+                let is_privacy = privacy_state.is_some();
+                let privacy_target = privacy_state.flatten().map(|enabled| !enabled);
+                if is_privacy && !self.demo_mode {
+                    if self.back_screen.mcp_request.is_some() {
+                        self.status = "正在等待手机操作回执，请稍候再修改隐私设置".into();
+                        return Ok(());
+                    }
+                    if privacy_target.is_none() {
+                        self.handle_backscreen_action(&BackScreenAction::InspectStepOsSuite, ctx);
+                        self.status = "先读取隐私开关状态，未修改手机；读取后请再次确认操作".into();
+                        return Ok(());
+                    }
+                }
+                let prev_flip = self.back_screen.stepos_suite.backscreen_flip_keep_running;
+                let prev_stay = self.back_screen.stepos_suite.backscreen_stay_on_secs;
+
+                let optimistic_note = if let Some(sig) = key.strip_prefix("backscreen_sig:") {
+                    let stripped = sig.trim_start_matches(|c: char| {
+                        c.is_whitespace()
+                            || (c as u32) >= 0x1F000
+                            || matches!(c, '📲' | '⏱' | '📦' | '✨' | '🔥' | '🔔')
+                    });
+                    let s = if stripped.trim().is_empty() {
+                        sig.trim()
+                    } else {
+                        stripped.trim()
+                    };
+                    format!("已将背屏汉字签名设为：「{s}」")
+                } else if key == "toggle_dnd" {
+                    let next = !prev_dnd;
+                    self.back_screen.stepos_suite.controls.dnd_on = next;
+                    if next {
+                        "已开启手机勿扰模式（专注免打扰）".into()
+                    } else {
+                        "已关闭手机勿扰模式（恢复正常通知）".into()
+                    }
+                } else if key == "set_dnd_on" {
+                    self.back_screen.stepos_suite.controls.dnd_on = true;
+                    "已开启手机勿扰模式（专注免打扰）".into()
+                } else if key == "set_dnd_off" {
+                    self.back_screen.stepos_suite.controls.dnd_on = false;
+                    "已关闭手机勿扰模式（恢复正常通知）".into()
+                } else if key == "toggle_wifi" {
+                    let next = !prev_wifi;
+                    self.back_screen.stepos_suite.controls.wifi_on = next;
+                    if next {
+                        "已开启手机 Wi-Fi 网络".into()
+                    } else {
+                        "已关闭手机 Wi-Fi 网络".into()
+                    }
+                } else if key == "toggle_bluetooth" {
+                    let next = !prev_bt;
+                    self.back_screen.stepos_suite.controls.bluetooth_on = next;
+                    if next {
+                        "已开启手机蓝牙连接".into()
+                    } else {
+                        "已关闭手机蓝牙连接".into()
+                    }
+                } else if is_privacy {
+                    "正在保存手机系统设置并回读确认…".into()
+                } else if key == "backscreen_toggle_flip_keep" {
+                    let next = !prev_flip;
+                    self.back_screen.stepos_suite.backscreen_flip_keep_running = next;
+                    if next {
+                        "已开启翻转手机继续运行".into()
+                    } else {
+                        "已关闭翻转手机继续运行".into()
+                    }
+                } else if key == "backscreen_stay_15" {
+                    self.back_screen.stepos_suite.backscreen_stay_on_secs = 15;
+                    "已将背屏常亮时长设为 15 秒".into()
+                } else if key == "backscreen_stay_30" {
+                    self.back_screen.stepos_suite.backscreen_stay_on_secs = 30;
+                    "已将背屏常亮时长设为 30 秒".into()
+                } else if key == "backscreen_stay_60" {
+                    self.back_screen.stepos_suite.backscreen_stay_on_secs = 60;
+                    "已将背屏常亮时长设为 60 秒".into()
+                } else if key == "open_alipay_coupons" {
+                    "已触发端侧快捷指令：打开支付宝领券中心".into()
+                } else if key == "capcut_handoff" {
+                    "已触发跨端影像流转：将相册素材移交剪映 AI 成片".into()
+                } else if key == "pull_remote_agent_files" {
+                    "已同步拉取手机端智能体产出文件到桌面".into()
+                } else if key == "fill_otp_one_by_one" {
+                    "正在向手机当前输入框输入验证码…".into()
+                } else {
+                    format!("已执行快捷指令：{key}")
+                };
+
+                if self.demo_mode {
+                    self.back_screen.stepos_suite.last_action_note = optimistic_note.clone();
+                    self.error = false;
+                    self.status = optimistic_note.clone();
+                    self.tools_feedback = Some((self.tool_page, optimistic_note, false));
+                    return Ok(());
+                }
+                let Some(device) = self.selected.clone() else {
+                    return Ok(());
+                };
+                self.back_screen.stepos_suite.last_action_note = optimistic_note.clone();
+                self.status = optimistic_note;
+                self.error = false;
+                let request = Instant::now();
+                let serial = device.serial.clone();
+                self.back_screen.mcp_request = Some(request);
                 let key_for_apply = key.clone();
                 let (tx, rx) = async_channel::bounded(1);
                 std::thread::spawn(move || {
                     let res = Adb::discover().and_then(|adb| {
-                        stepx_companion::toolbox::trigger_stepos_mcp_action(
-                            &adb, &device, &key, &payload,
-                        )
+                        if is_privacy {
+                            let note = stepx_companion::toolbox::set_stepos_privacy_setting(
+                                &adb, &device, &key, privacy_target,
+                            )?;
+                            let fresh = stepx_companion::toolbox::inspect_stepos_ai_suite(&adb, &device)
+                                .map_err(|error| anyhow::anyhow!("设置已返回，但最新状态读取失败，请刷新核对：{error:#}"))?;
+                            let observed = match key.as_str() {
+                                "toggle_delete_protect" => fresh.capability_evidence.delete_protect_enabled,
+                                "toggle_global_camera" => fresh.capability_evidence.camera_allowed,
+                                "toggle_global_mic" => fresh.capability_evidence.microphone_allowed,
+                                "toggle_global_location" => fresh.capability_evidence.location_enabled,
+                                _ => fresh.capability_evidence.screen_perception,
+                            };
+                            anyhow::ensure!(observed == privacy_target,
+                                "设置已返回，但最新读取未确认目标状态；请在手机核对后刷新");
+                            Ok((note, Some(fresh)))
+                        } else {
+                            stepx_companion::toolbox::trigger_stepos_mcp_action(
+                                &adb, &device, &key, &payload,
+                            ).map(|note| (note, None))
+                        }
                     });
                     let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
                 });
                 ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                    if is_privacy && me.back_screen.mcp_request != Some(request) {
+                        return;
+                    }
+                    if me.back_screen.mcp_request == Some(request) {
+                        me.back_screen.mcp_request = None;
+                    }
+                    if me.selected.as_ref().map(|d| d.serial.as_str()) != Some(serial.as_str()) {
+                        return;
+                    }
+                    let rollback = |me: &mut Self| {
+                        // A failed or interrupted setting receipt is not fresh
+                        // evidence; keep the cached data but require a new read.
+                        if is_privacy {
+                            let evidence = &mut me.back_screen.stepos_suite.capability_evidence;
+                            match key_for_apply.as_str() {
+                                "toggle_delete_protect" => evidence.delete_protect_enabled = None,
+                                "toggle_global_camera" => evidence.camera_allowed = None,
+                                "toggle_global_mic" => evidence.microphone_allowed = None,
+                                "toggle_global_location" => evidence.location_enabled = None,
+                                "toggle_screen_perception" => evidence.screen_perception = None,
+                                _ => {}
+                            }
+                        }
+                        match key_for_apply.as_str() {
+                            "toggle_dnd" | "set_dnd_on" | "set_dnd_off" => {
+                                me.back_screen.stepos_suite.controls.dnd_on = prev_dnd;
+                            }
+                            "toggle_wifi" => {
+                                me.back_screen.stepos_suite.controls.wifi_on = prev_wifi;
+                            }
+                            "toggle_bluetooth" => {
+                                me.back_screen.stepos_suite.controls.bluetooth_on = prev_bt;
+                            }
+                            "backscreen_toggle_flip_keep" => {
+                                me.back_screen.stepos_suite.backscreen_flip_keep_running = prev_flip;
+                            }
+                            "backscreen_stay_15" | "backscreen_stay_30" | "backscreen_stay_60" => {
+                                me.back_screen.stepos_suite.backscreen_stay_on_secs = prev_stay;
+                            }
+                            _ => {}
+                        }
+                    };
                     match result {
-                        Ok(Ok(note)) => {
-                            if key_for_apply == "toggle_dnd" {
+                        Ok(Ok((note, privacy_report))) => {
+                            if let Some(fresh) = privacy_report {
+                                let current = &mut me.back_screen.stepos_suite;
+                                current.capability_evidence = fresh.capability_evidence;
+                                current.global_camera_enabled = fresh.global_camera_enabled;
+                                current.global_mic_enabled = fresh.global_mic_enabled;
+                                current.global_location_enabled = fresh.global_location_enabled;
+                                current.delete_protect_enabled = fresh.delete_protect_enabled;
+                                current.screen_perception_ready = fresh.screen_perception_ready;
+                                current.gui_accessibility_enabled = fresh.gui_accessibility_enabled;
+                                current.notification_listener_enabled = fresh.notification_listener_enabled;
+                                current.mcp_permission_granted = fresh.mcp_permission_granted;
+                                current.mcp_services = fresh.mcp_services;
+                            }
+                            if matches!(key_for_apply.as_str(), "toggle_dnd" | "set_dnd_on" | "set_dnd_off") {
                                 me.back_screen.stepos_suite.controls.dnd_on =
                                     note.contains("已开启");
                             } else if key_for_apply == "toggle_wifi" {
@@ -1426,9 +2477,43 @@ impl Companion {
                             } else if key_for_apply == "toggle_bluetooth" {
                                 me.back_screen.stepos_suite.controls.bluetooth_on =
                                     !note.contains("已关闭");
-                            } else if key_for_apply == "toggle_screen_perception" {
-                                me.back_screen.stepos_suite.screen_perception_ready =
+                            } else if key_for_apply == "backscreen_toggle_flip_keep" {
+                                me.back_screen.stepos_suite.backscreen_flip_keep_running =
                                     note.contains("已开启");
+                            } else if key_for_apply == "backscreen_stay_15" {
+                                me.back_screen.stepos_suite.backscreen_stay_on_secs = 15;
+                            } else if key_for_apply == "backscreen_stay_30" {
+                                me.back_screen.stepos_suite.backscreen_stay_on_secs = 30;
+                            } else if key_for_apply == "backscreen_stay_60" {
+                                me.back_screen.stepos_suite.backscreen_stay_on_secs = 60;
+                            } else if let Some(sig_raw) =
+                                key_for_apply.strip_prefix("backscreen_sig:")
+                            {
+                                let stripped = sig_raw.trim_start_matches(|c: char| {
+                                    c.is_whitespace()
+                                        || (c as u32) >= 0x1F000
+                                        || matches!(c, '📲' | '⏱' | '📦' | '✨' | '🔥' | '🔔')
+                                });
+                                let sig = if stripped.trim().is_empty() {
+                                    "专注中"
+                                } else {
+                                    stripped.trim()
+                                };
+                                me.back_screen.stepos_suite.backscreen_signature = sig.to_string();
+                                me.back_screen.frame = bs::synthesize_chinese_signature_frame(
+                                    sig,
+                                    me.back_screen.config.invert,
+                                );
+                            } else if key_for_apply == "query_express_number" {
+                                if let Some((carrier, number)) =
+                                    stepx_companion::home_hub::extract_express_from_text_flexible(
+                                        &note, true,
+                                    )
+                                {
+                                    me.back_screen.stepos_suite.phone_clipboard =
+                                        format!("{carrier} {number}");
+                                }
+                                me.sync_live_express_parcels();
                             }
                             me.back_screen.stepos_suite.last_action_note = note.clone();
                             me.error = false;
@@ -1436,12 +2521,19 @@ impl Companion {
                             me.tools_feedback = Some((me.tool_page, note, false));
                         }
                         Ok(Err(err)) => {
+                            rollback(me);
                             me.back_screen.stepos_suite.last_action_note =
                                 format!("操作未完成：{err}");
                             me.error = true;
                             me.status = format!("操作未完成：{err}");
+                            me.tools_feedback = Some((me.tool_page, me.status.clone(), true));
                         }
-                        Err(_) => {}
+                        Err(_) => {
+                            rollback(me);
+                            me.error = true;
+                            me.status = "手机操作回执中断，结果未确认；请刷新手机状态".into();
+                            me.tools_feedback = Some((me.tool_page, me.status.clone(), true));
+                        }
                     }
                     ctx.notify();
                 });
@@ -1461,6 +2553,7 @@ impl Companion {
                 };
                 self.back_screen.stepos_suite.last_action_note = "正在向手机日历写入新日程…".into();
                 self.status = "正在向手机日历写入新日程…".into();
+                let serial = device.serial.clone();
                 let (tx, rx) = async_channel::bounded(1);
                 std::thread::spawn(move || {
                     let res = Adb::discover().and_then(|adb| {
@@ -1474,6 +2567,9 @@ impl Companion {
                     let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
                 });
                 ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                    if me.selected.as_ref().map(|d| d.serial.as_str()) != Some(serial.as_str()) {
+                        return;
+                    }
                     match result {
                         Ok(Ok((_id, events, note))) => {
                             me.fields[F_PHONE_SCHEDULE_TITLE].clear();
@@ -1497,13 +2593,14 @@ impl Companion {
             }
             BackScreenAction::CalendarDelete(event_id) => {
                 let id = *event_id;
-                let removed_title = self
+                let removed_ev = self
                     .back_screen
                     .stepos_suite
                     .calendar_events
                     .iter()
                     .find(|e| e.id == id)
-                    .map(|e| e.title.clone());
+                    .cloned();
+                let removed_title = removed_ev.as_ref().map(|e| e.title.clone());
                 self.back_screen
                     .stepos_suite
                     .calendar_events
@@ -1511,11 +2608,11 @@ impl Companion {
                 if self.back_screen.editing_calendar_event_id == Some(id) {
                     self.back_screen.editing_calendar_event_id = None;
                 }
-                self.back_screen.completed_calendar_events.remove(&id);
+                self.remove_calendar_event_state(id);
                 if self.prefs.auto_sync_calendar {
                     rewrite_local_calendar_ics(&self.back_screen.stepos_suite.calendar_events);
                 }
-                if self.demo_mode || self.selected.is_none() {
+                if self.demo_mode {
                     let note = match removed_title {
                         Some(t) => format!("已删除日程：「{t}」"),
                         None => "已移除该日程".into(),
@@ -1528,23 +2625,64 @@ impl Companion {
                 let Some(device) = self.selected.clone() else {
                     return Ok(());
                 };
+                if id <= 0 {
+                    let note = match removed_title {
+                        Some(t) => format!("已移除本地日程：「{t}」"),
+                        None => "已移除该本地日程".into(),
+                    };
+                    self.back_screen.stepos_suite.last_action_note = note.clone();
+                    self.status = note;
+                    self.error = false;
+                    return Ok(());
+                }
                 self.back_screen.stepos_suite.last_action_note = "正在从手机日历移除日程…".into();
                 self.status = "正在从手机日历移除日程…".into();
+                let serial = device.serial.clone();
                 let (tx, rx) = async_channel::bounded(1);
                 std::thread::spawn(move || {
                     let res = Adb::discover().and_then(|adb| {
-                        stepx_companion::toolbox::delete_phone_calendar_event(&adb, &device, id)
+                        let (mut events, note) =
+                            stepx_companion::toolbox::delete_phone_calendar_event(
+                                &adb, &device, id,
+                            )?;
+                        if let Some(ref rev) = removed_ev {
+                            let matching_ids: Vec<i64> = events
+                                .iter()
+                                .filter(|e| {
+                                    e.id > 0
+                                        && e.title
+                                            .trim()
+                                            .eq_ignore_ascii_case(rev.title.trim())
+                                        && (e.dtstart - rev.dtstart).abs() < 60_000
+                                })
+                                .map(|e| e.id)
+                                .collect();
+                            for mid in matching_ids {
+                                if let Ok((updated, _)) =
+                                    stepx_companion::toolbox::delete_phone_calendar_event(
+                                        &adb, &device, mid,
+                                    )
+                                {
+                                    events = updated;
+                                }
+                            }
+                        }
+                        Ok((events, note))
                     });
                     let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
                 });
                 ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                    if me.selected.as_ref().map(|d| d.serial.as_str()) != Some(serial.as_str()) {
+                        return;
+                    }
                     match result {
                         Ok(Ok((events, note))) => {
                             me.back_screen.stepos_suite.calendar_events = events;
                             if me.back_screen.editing_calendar_event_id == Some(id) {
                                 me.back_screen.editing_calendar_event_id = None;
                             }
-                            me.back_screen.completed_calendar_events.remove(&id);
+                            me.remove_calendar_event_state(id);
+                            rewrite_local_calendar_ics(&me.back_screen.stepos_suite.calendar_events);
                             me.back_screen.stepos_suite.last_action_note = note.clone();
                             me.error = false;
                             me.status = note.clone();
@@ -1563,26 +2701,104 @@ impl Companion {
             }
             BackScreenAction::AlarmCreatePreset(preset) => {
                 let preset_idx = *preset;
-                let custom_label = {
+                let fallback_label = {
                     let l = self.fields[F_ALARM_LABEL].text.trim().to_string();
-                    if l.is_empty() {
-                        self.fields[F_PHONE_SCHEDULE_TITLE].text.trim().to_string()
-                    } else {
+                    if !l.is_empty() || self.page == Page::Home {
                         l
+                    } else {
+                        let sched = self.fields[F_PHONE_SCHEDULE_TITLE].text.trim().to_string();
+                        if !sched.is_empty() {
+                            sched
+                        } else {
+                            self.fields[F_OV_TEXT].text.trim().to_string()
+                        }
                     }
                 };
-                let fallback_label = if custom_label.is_empty() {
-                    self.fields[F_OV_TEXT].text.trim().to_string()
-                } else {
-                    custom_label
+                use chrono::Timelike;
+                let now = chrono::Local::now();
+                let (hour, minutes, default_label) = match preset_idx {
+                    0 => {
+                        let target = now + chrono::Duration::minutes(15);
+                        (target.hour(), target.minute(), "15分钟专注提醒")
+                    }
+                    1 => {
+                        let target = now + chrono::Duration::minutes(30);
+                        (target.hour(), target.minute(), "30分钟专注提醒")
+                    }
+                    _ => (8, 0, "晨间早起闹钟"),
                 };
+                let label = if fallback_label.is_empty() {
+                    default_label.to_string()
+                } else {
+                    fallback_label.clone()
+                };
+                if self.demo_mode {
+                    let next_id = self
+                        .back_screen
+                        .stepos_suite
+                        .alarms
+                        .iter()
+                        .map(|a| a.id)
+                        .max()
+                        .unwrap_or(100)
+                        + 1;
+                    self.back_screen.stepos_suite.alarms.push(
+                        stepx_companion::toolbox::PhoneAlarmItem {
+                            id: next_id,
+                            hour: hour as u8,
+                            minutes: minutes as u8,
+                            enabled: true,
+                            days_of_week: 0,
+                            vibrate: true,
+                            message: label.clone(),
+                        },
+                    );
+                    self.back_screen.stepos_suite.checked = true;
+                    if self.back_screen.stepos_suite_synced_at.is_none() {
+                        self.back_screen.stepos_suite_synced_at = Some(std::time::Instant::now());
+                    }
+                    let note = format!("已添加并开启 {:02}:{:02} 闹钟：「{label}」", hour, minutes);
+                    self.back_screen.stepos_suite.last_action_note = note.clone();
+                    self.status = note;
+                    self.error = false;
+                    return Ok(());
+                }
                 let Some(device) = self.selected.clone() else {
                     self.status = "请先连接手机后再创建手机闹钟".into();
                     self.error = true;
                     return Ok(());
                 };
-                self.back_screen.stepos_suite.last_action_note = "正在向手机时钟写入新闹钟…".into();
-                self.status = "正在向手机时钟写入新闹钟…".into();
+                let next_id = self
+                    .back_screen
+                    .stepos_suite
+                    .alarms
+                    .iter()
+                    .map(|a| a.id)
+                    .max()
+                    .unwrap_or(100)
+                    + 1;
+                self.back_screen.stepos_suite.alarms.push(
+                    stepx_companion::toolbox::PhoneAlarmItem {
+                        id: next_id,
+                        hour: hour as u8,
+                        minutes: minutes as u8,
+                        enabled: true,
+                        days_of_week: 0,
+                        vibrate: true,
+                        message: label.clone(),
+                    },
+                );
+                self.back_screen.stepos_suite.checked = true;
+                if self.back_screen.stepos_suite_synced_at.is_none() {
+                    self.back_screen.stepos_suite_synced_at = Some(std::time::Instant::now());
+                }
+                let optimistic_note =
+                    format!("已添加 {:02}:{:02} 闹钟：「{label}」（正在同步至手机…）", hour, minutes);
+                self.back_screen.stepos_suite.last_action_note = optimistic_note.clone();
+                self.status = optimistic_note;
+                self.error = false;
+                let serial = device.serial.clone();
+                let device_for_cleanup = device.clone();
                 let (tx, rx) = async_channel::bounded(1);
                 std::thread::spawn(move || {
                     let res = Adb::discover().and_then(|adb| {
@@ -1596,16 +2812,43 @@ impl Companion {
                     let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
                 });
                 ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                    if me.selected.as_ref().map(|d| d.serial.as_str()) != Some(serial.as_str()) {
+                        return;
+                    }
                     match result {
-                        Ok(Ok((_id, alarms, note))) => {
+                        Ok(Ok((created_id, mut alarms, note))) => {
+                            let was_deleted = !me
+                                .back_screen
+                                .stepos_suite
+                                .alarms
+                                .iter()
+                                .any(|a| a.id == next_id);
                             me.fields[F_ALARM_LABEL].clear();
-                            me.fields[F_PHONE_SCHEDULE_TITLE].clear();
+                            if me.page != Page::Home {
+                                me.fields[F_PHONE_SCHEDULE_TITLE].clear();
+                            }
                             me.back_screen.stepos_suite.checked = true;
-                            me.back_screen.stepos_suite.alarms = alarms;
-                            me.back_screen.stepos_suite.last_action_note = note.clone();
-                            me.error = false;
-                            me.status = note.clone();
-                            me.tools_feedback = Some((me.tool_page, note, false));
+                            me.back_screen.stepos_suite_synced_at = Some(std::time::Instant::now());
+                            if was_deleted && created_id > 0 {
+                                alarms.retain(|a| a.id != created_id);
+                                me.back_screen.stepos_suite.alarms = alarms;
+                                let dev = device_for_cleanup.clone();
+                                std::thread::spawn(move || {
+                                    if let Ok(adb) = Adb::discover() {
+                                        let _ = stepx_companion::toolbox::delete_phone_alarm(
+                                            &adb,
+                                            &dev,
+                                            created_id,
+                                        );
+                                    }
+                                });
+                            } else {
+                                me.back_screen.stepos_suite.alarms = alarms;
+                                me.back_screen.stepos_suite.last_action_note = note.clone();
+                                me.error = false;
+                                me.status = note.clone();
+                                me.tools_feedback = Some((me.tool_page, note, false));
+                            }
                         }
                         Ok(Err(err)) => {
                             me.back_screen.stepos_suite.last_action_note =
@@ -1630,7 +2873,7 @@ impl Companion {
                 {
                     alarm.enabled = target_enabled;
                 }
-                if self.demo_mode || self.selected.is_none() {
+                if self.demo_mode {
                     let note = if target_enabled {
                         "已开启闹钟".to_string()
                     } else {
@@ -1644,6 +2887,7 @@ impl Companion {
                 let Some(device) = self.selected.clone() else {
                     return Ok(());
                 };
+                let serial = device.serial.clone();
                 let (tx, rx) = async_channel::bounded(1);
                 std::thread::spawn(move || {
                     let res = Adb::discover().and_then(|adb| {
@@ -1657,6 +2901,9 @@ impl Companion {
                     let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
                 });
                 ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                    if me.selected.as_ref().map(|d| d.serial.as_str()) != Some(serial.as_str()) {
+                        return;
+                    }
                     match result {
                         Ok(Ok((alarms, note))) => {
                             me.back_screen.stepos_suite.alarms = alarms;
@@ -1678,11 +2925,18 @@ impl Companion {
             }
             BackScreenAction::AlarmDelete(alarm_id) => {
                 let id = *alarm_id;
+                let removed_alarm = self
+                    .back_screen
+                    .stepos_suite
+                    .alarms
+                    .iter()
+                    .find(|a| a.id == id)
+                    .cloned();
                 if self.back_screen.editing_alarm_id == Some(id) {
                     self.back_screen.editing_alarm_id = None;
                 }
                 self.back_screen.stepos_suite.alarms.retain(|a| a.id != id);
-                if self.demo_mode || self.selected.is_none() {
+                if self.demo_mode {
                     let note = "已移除该闹钟".to_string();
                     self.back_screen.stepos_suite.last_action_note = note.clone();
                     self.status = note;
@@ -1692,14 +2946,39 @@ impl Companion {
                 let Some(device) = self.selected.clone() else {
                     return Ok(());
                 };
+                let serial = device.serial.clone();
                 let (tx, rx) = async_channel::bounded(1);
                 std::thread::spawn(move || {
                     let res = Adb::discover().and_then(|adb| {
-                        stepx_companion::toolbox::delete_phone_alarm(&adb, &device, id)
+                        let (mut alarms, note) =
+                            stepx_companion::toolbox::delete_phone_alarm(&adb, &device, id)?;
+                        if let Some(ref ra) = removed_alarm {
+                            let matching_ids: Vec<i64> = alarms
+                                .iter()
+                                .filter(|a| {
+                                    a.id > 0
+                                        && a.hour == ra.hour
+                                        && a.minutes == ra.minutes
+                                        && a.message.trim() == ra.message.trim()
+                                })
+                                .map(|a| a.id)
+                                .collect();
+                            for mid in matching_ids {
+                                if let Ok((updated, _)) =
+                                    stepx_companion::toolbox::delete_phone_alarm(&adb, &device, mid)
+                                {
+                                    alarms = updated;
+                                }
+                            }
+                        }
+                        Ok((alarms, note))
                     });
                     let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
                 });
                 ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                    if me.selected.as_ref().map(|d| d.serial.as_str()) != Some(serial.as_str()) {
+                        return;
+                    }
                     match result {
                         Ok(Ok((alarms, note))) => {
                             if me.back_screen.editing_alarm_id == Some(id) {
@@ -1723,12 +3002,25 @@ impl Companion {
                 });
             }
             BackScreenAction::SetBrightnessPercent(percent) => {
-                let target_pct = *percent;
-                let Some(device) = self.selected.clone() else {
+                let target_pct = (*percent).clamp(5, 100);
+                if !self.demo_mode && self.selected.is_none() {
                     self.status = "请先连接手机后再调节屏幕亮度".into();
                     self.error = true;
                     return Ok(());
+                }
+                let prev_pct = self.back_screen.stepos_suite.controls.brightness_percent;
+                self.back_screen.stepos_suite.controls.brightness_percent = target_pct;
+                let note = format!("已将手机屏幕亮度调节为 {target_pct}%");
+                self.back_screen.stepos_suite.last_action_note = note.clone();
+                self.status = note;
+                self.error = false;
+                if self.demo_mode {
+                    return Ok(());
+                }
+                let Some(device) = self.selected.clone() else {
+                    return Ok(());
                 };
+                let serial = device.serial.clone();
                 let (tx, rx) = async_channel::bounded(1);
                 std::thread::spawn(move || {
                     let res = Adb::discover().and_then(|adb| {
@@ -1739,6 +3031,9 @@ impl Companion {
                     let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
                 });
                 ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                    if me.selected.as_ref().map(|d| d.serial.as_str()) != Some(serial.as_str()) {
+                        return;
+                    }
                     match result {
                         Ok(Ok((pct, note))) => {
                             me.back_screen.stepos_suite.controls.brightness_percent = pct;
@@ -1748,58 +3043,54 @@ impl Companion {
                             me.tools_feedback = Some((me.tool_page, note, false));
                         }
                         Ok(Err(err)) => {
+                            me.back_screen.stepos_suite.controls.brightness_percent = prev_pct;
                             me.back_screen.stepos_suite.last_action_note =
                                 format!("调节亮度未完成：{err}");
                             me.error = true;
                             me.status = format!("调节亮度未完成：{err}");
                         }
-                        Err(_) => {}
+                        Err(_) => {
+                            me.back_screen.stepos_suite.controls.brightness_percent = prev_pct;
+                        }
                     }
                     ctx.notify();
                 });
             }
             BackScreenAction::CalendarPrevMonth => {
-                if self.back_screen.calendar_month <= 1 {
-                    self.back_screen.calendar_year -= 1;
-                    self.back_screen.calendar_month = 12;
+                let state = &self.back_screen;
+                let (year, month) = if state.calendar_month <= 1 {
+                    (state.calendar_year - 1, 12)
                 } else {
-                    self.back_screen.calendar_month -= 1;
-                }
-                let max_d = days_in_calendar_month(
-                    self.back_screen.calendar_year,
-                    self.back_screen.calendar_month,
-                );
-                self.back_screen.selected_calendar_day =
-                    self.back_screen.selected_calendar_day.clamp(1, max_d);
+                    (state.calendar_year, state.calendar_month - 1)
+                };
+                self.set_calendar_focus(year, month, state.selected_calendar_day);
             }
             BackScreenAction::CalendarNextMonth => {
-                if self.back_screen.calendar_month >= 12 {
-                    self.back_screen.calendar_year += 1;
-                    self.back_screen.calendar_month = 1;
+                let state = &self.back_screen;
+                let (year, month) = if state.calendar_month >= 12 {
+                    (state.calendar_year + 1, 1)
                 } else {
-                    self.back_screen.calendar_month += 1;
-                }
-                let max_d = days_in_calendar_month(
-                    self.back_screen.calendar_year,
-                    self.back_screen.calendar_month,
-                );
-                self.back_screen.selected_calendar_day =
-                    self.back_screen.selected_calendar_day.clamp(1, max_d);
+                    (state.calendar_year, state.calendar_month + 1)
+                };
+                self.set_calendar_focus(year, month, state.selected_calendar_day);
             }
             BackScreenAction::CalendarToday => {
                 use chrono::Datelike;
                 let today = chrono::Local::now().date_naive();
-                self.back_screen.calendar_year = today.year();
-                self.back_screen.calendar_month = today.month();
-                self.back_screen.selected_calendar_day = today.day();
+                self.set_calendar_focus(today.year(), today.month(), today.day());
             }
             BackScreenAction::CalendarSelectDate(y, m, d) => {
-                let year = *y;
-                let month = (*m).clamp(1, 12);
-                let max_d = days_in_calendar_month(year, month);
-                self.back_screen.calendar_year = year;
-                self.back_screen.calendar_month = month;
-                self.back_screen.selected_calendar_day = (*d).clamp(1, max_d);
+                self.set_calendar_focus(*y, (*m).clamp(1, 12), *d);
+            }
+            BackScreenAction::CalendarOpenOccurrence(id, start) => {
+                if let Some(event) = self.back_screen.stepos_suite.calendar_events.iter()
+                    .find(|event| event.id == *id && event.dtstart == *start) {
+                    let (year, month, day) = event.date_ymd();
+                    self.set_calendar_focus(year, month, day);
+                    self.page = Page::Calendar;
+                    self.back_screen.editing_calendar_event_id = None;
+                    self.focus = None;
+                }
             }
             BackScreenAction::ToggleAutoSyncCalendar => {
                 let next = !self.prefs.auto_sync_calendar;
@@ -1835,21 +3126,81 @@ impl Companion {
             }
             BackScreenAction::CalendarCreateOnSelectedDate(preset_time) => {
                 let raw_title = self.fields[F_PHONE_SCHEDULE_TITLE].text.trim().to_string();
+                let mut time_str = preset_time
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| self.fields[F_CALENDAR_TIME].text.trim().to_string());
                 let title = if raw_title.is_empty() {
                     "桌面协同日程".to_string()
+                } else if preset_time.is_none() {
+                    if let Some((first_tok, rest)) = raw_title.split_once(char::is_whitespace) {
+                        let tok = first_tok.trim();
+                        let rest_trimmed = rest.trim();
+                        if !rest_trimmed.is_empty()
+                            && tok.chars().next().is_some_and(|c| c.is_ascii_digit())
+                            && (tok.contains(':') || tok.contains('：'))
+                        {
+                            time_str = tok.to_string();
+                            rest_trimmed.to_string()
+                        } else {
+                            raw_title
+                        }
+                    } else {
+                        raw_title
+                    }
                 } else {
                     raw_title
                 };
-                let time_str = preset_time
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| self.fields[F_CALENDAR_TIME].text.trim().to_string());
+                let clean_time = normalize_calendar_time_input(&time_str);
                 let y = self.back_screen.calendar_year;
                 let m = self.back_screen.calendar_month;
                 let d = self.back_screen.selected_calendar_day;
                 let auto_sync = self.prefs.auto_sync_calendar;
                 let editing_old_id = self.back_screen.editing_calendar_event_id.take();
-                let (dtstart, dtend) =
-                    stepx_companion::toolbox::parse_event_time_range(y, m, d, &time_str)?;
+                let prev_event = editing_old_id.and_then(|old_id| {
+                    self.back_screen
+                        .stepos_suite
+                        .calendar_events
+                        .iter()
+                        .find(|e| e.id == old_id)
+                        .cloned()
+                });
+                let preserved_all_day = if clean_time.contains("全天") {
+                    true
+                } else if clean_time.is_empty() {
+                    prev_event.as_ref().map(|e| e.all_day).unwrap_or(false)
+                } else {
+                    false
+                };
+                let (dtstart, mut dtend) = if preserved_all_day {
+                    let (start_0, _) =
+                        stepx_companion::toolbox::parse_event_time_range(y, m, d, "00:00")?;
+                    let dur = prev_event
+                        .as_ref()
+                        .map(|p| (p.dtend - p.dtstart).max(86_400_000))
+                        .unwrap_or(86_400_000);
+                    (start_0, start_0 + dur)
+                } else {
+                    stepx_companion::toolbox::parse_event_time_range(y, m, d, &clean_time)?
+                };
+                if let Some(prev) = &prev_event {
+                    let has_explicit_range = clean_time.contains('-');
+                    let prev_dur = prev.dtend - prev.dtstart;
+                    if !preserved_all_day
+                        && prev_dur > 0
+                        && (!has_explicit_range || clean_time == prev.hm_label())
+                    {
+                        dtend = dtstart + prev_dur;
+                    }
+                }
+                let preserved_location = prev_event
+                    .as_ref()
+                    .map(|e| e.location.clone())
+                    .unwrap_or_default();
+                let preserved_description = prev_event
+                    .as_ref()
+                    .map(|e| e.description.clone())
+                    .filter(|desc| !desc.trim().is_empty())
+                    .unwrap_or_else(|| "由 StepX 桌面端直接同步创建".into());
                 if let Some(old_id) = editing_old_id {
                     self.back_screen
                         .stepos_suite
@@ -1867,13 +3218,14 @@ impl Companion {
                         + 1
                 });
                 let local_ev = stepx_companion::toolbox::PhoneCalendarEvent {
+                    recurring: Some(false),
                     id: local_id,
                     title: title.clone(),
                     dtstart,
                     dtend,
-                    all_day: false,
-                    location: String::new(),
-                    description: "由 StepX 桌面端直接同步创建".into(),
+                    all_day: preserved_all_day,
+                    location: preserved_location.clone(),
+                    description: preserved_description.clone(),
                     source: if auto_sync {
                         "双端已同步".into()
                     } else {
@@ -1885,11 +3237,20 @@ impl Companion {
                     .stepos_suite
                     .calendar_events
                     .sort_by_key(|e| e.dtstart);
+                self.back_screen.stepos_suite.checked = true;
+                if self.back_screen.stepos_suite_synced_at.is_none() {
+                    self.back_screen.stepos_suite_synced_at = Some(std::time::Instant::now());
+                }
                 if auto_sync {
                     rewrite_local_calendar_ics(&self.back_screen.stepos_suite.calendar_events);
                 }
-                if self.demo_mode || self.selected.is_none() {
-                    self.fields[F_PHONE_SCHEDULE_TITLE].clear();
+                self.fields[F_PHONE_SCHEDULE_TITLE].clear();
+                if self.page == Page::Home {
+                    self.fields[F_CALENDAR_TIME].set("15:00");
+                } else {
+                    self.fields[F_CALENDAR_TIME].clear();
+                }
+                if self.demo_mode {
                     let msg = if editing_old_id.is_some() {
                         format!("已保存日程修改：「{title}」（{y}-{m:02}-{d:02}）")
                     } else {
@@ -1907,9 +3268,11 @@ impl Companion {
                 self.back_screen.stepos_suite.last_action_note = if editing_old_id.is_some() {
                     "正在保存并更新手机日历日程…".into()
                 } else {
-                    "正在向手机日历写入选中日期日程…".into()
+                    format!("已在 {y}-{m:02}-{d:02} 添加日程：「{title}」（正在同步至手机…）")
                 };
                 self.status = self.back_screen.stepos_suite.last_action_note.clone();
+                let serial = device.serial.clone();
+                let device_for_cleanup = device.clone();
                 let (tx, rx) = async_channel::bounded(1);
                 std::thread::spawn(move || {
                     let res = Adb::discover().and_then(|adb| {
@@ -1918,17 +3281,61 @@ impl Companion {
                                 &adb, &device, old_id,
                             );
                         }
-                        stepx_companion::toolbox::create_calendar_event_at(
-                            &adb, &device, &title, y, m, d, &time_str, auto_sync,
+                        create_phone_calendar_event_preserving_details(
+                            &adb,
+                            &device,
+                            &title,
+                            dtstart,
+                            dtend,
+                            preserved_all_day,
+                            &preserved_location,
+                            &preserved_description,
+                            auto_sync,
+                            y,
+                            m,
+                            d,
                         )
                     });
                     let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
                 });
                 ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                    if me.selected.as_ref().map(|d| d.serial.as_str()) != Some(serial.as_str()) {
+                        return;
+                    }
                     match result {
-                        Ok(Ok((_id, events, msg))) => {
-                            me.fields[F_PHONE_SCHEDULE_TITLE].clear();
-                            me.apply(Outcome::StepOsCalendarUpdated(events, msg));
+                        Ok(Ok((new_id, mut events, msg))) => {
+                            let was_deleted = editing_old_id.is_none()
+                                && !me
+                                    .back_screen
+                                    .stepos_suite
+                                    .calendar_events
+                                    .iter()
+                                    .any(|e| e.id == local_id);
+                            if was_deleted && new_id > 0 {
+                                events.retain(|e| e.id != new_id);
+                                me.back_screen.stepos_suite.calendar_events = events;
+                                if me.prefs.auto_sync_calendar {
+                                    rewrite_local_calendar_ics(
+                                        &me.back_screen.stepos_suite.calendar_events,
+                                    );
+                                }
+                                let dev = device_for_cleanup.clone();
+                                std::thread::spawn(move || {
+                                    if let Ok(adb) = Adb::discover() {
+                                        let _ =
+                                            stepx_companion::toolbox::delete_phone_calendar_event(
+                                                &adb, &dev, new_id,
+                                            );
+                                    }
+                                });
+                            } else {
+                                if let Some(old_id) = editing_old_id {
+                                    if old_id != new_id && new_id > 0 {
+                                        me.migrate_calendar_event_state(old_id, new_id);
+                                    }
+                                }
+                                me.apply(Outcome::StepOsCalendarUpdated(events, msg));
+                            }
                         }
                         Ok(Err(err)) => {
                             me.back_screen.stepos_suite.last_action_note =
@@ -1949,7 +3356,7 @@ impl Companion {
                 let time_str = self.fields[F_ALARM_TIME].text.trim().to_string();
                 let label = {
                     let l = self.fields[F_ALARM_LABEL].text.trim().to_string();
-                    if l.is_empty() {
+                    if l.is_empty() && self.page != Page::Home {
                         self.fields[F_PHONE_SCHEDULE_TITLE].text.trim().to_string()
                     } else {
                         l
@@ -1962,7 +3369,17 @@ impl Companion {
                 };
                 let (hour, minutes) = stepx_companion::toolbox::parse_alarm_time_str(&time_str)?;
                 let editing_old_id = self.back_screen.editing_alarm_id.take();
-                if let Some(edit_id) = editing_old_id {
+                let prev_alarm = editing_old_id.and_then(|edit_id| {
+                    self.back_screen
+                        .stepos_suite
+                        .alarms
+                        .iter()
+                        .find(|a| a.id == edit_id)
+                        .cloned()
+                });
+                let preserved_days_of_week = prev_alarm.as_ref().map(|a| a.days_of_week).unwrap_or(0);
+                let preserved_vibrate = prev_alarm.as_ref().map(|a| a.vibrate).unwrap_or(true);
+                let local_alarm_id = if let Some(edit_id) = editing_old_id {
                     if let Some(existing) = self
                         .back_screen
                         .stepos_suite
@@ -1974,6 +3391,8 @@ impl Companion {
                         existing.minutes = minutes;
                         existing.message = clean_label.clone();
                         existing.enabled = true;
+                        existing.days_of_week = preserved_days_of_week;
+                        existing.vibrate = preserved_vibrate;
                     } else {
                         self.back_screen.stepos_suite.alarms.push(
                             stepx_companion::toolbox::PhoneAlarmItem {
@@ -1981,12 +3400,13 @@ impl Companion {
                                 hour,
                                 minutes,
                                 enabled: true,
-                                days_of_week: 0,
-                                vibrate: true,
+                                days_of_week: preserved_days_of_week,
+                                vibrate: preserved_vibrate,
                                 message: clean_label.clone(),
                             },
                         );
                     }
+                    edit_id
                 } else {
                     let next_id = self
                         .back_screen
@@ -2008,10 +3428,17 @@ impl Companion {
                             message: clean_label.clone(),
                         },
                     );
+                    next_id
+                };
+                self.back_screen.stepos_suite.checked = true;
+                if self.back_screen.stepos_suite_synced_at.is_none() {
+                    self.back_screen.stepos_suite_synced_at = Some(std::time::Instant::now());
                 }
-                if self.demo_mode || self.selected.is_none() {
+                if self.demo_mode {
                     self.fields[F_ALARM_LABEL].clear();
-                    self.fields[F_PHONE_SCHEDULE_TITLE].clear();
+                    if self.page != Page::Home {
+                        self.fields[F_PHONE_SCHEDULE_TITLE].clear();
+                    }
                     let msg = if editing_old_id.is_some() {
                         format!(
                             "已保存闹钟修改：{:02}:{:02}「{clean_label}」",
@@ -2038,6 +3465,8 @@ impl Companion {
                     "正在向手机时钟写入闹钟…".into()
                 };
                 self.status = self.back_screen.stepos_suite.last_action_note.clone();
+                let serial = device.serial.clone();
+                let device_for_cleanup = device.clone();
                 let (tx, rx) = async_channel::bounded(1);
                 std::thread::spawn(move || {
                     let res = Adb::discover().and_then(|adb| {
@@ -2045,22 +3474,51 @@ impl Companion {
                             let _ =
                                 stepx_companion::toolbox::delete_phone_alarm(&adb, &device, old_id);
                         }
-                        stepx_companion::toolbox::create_phone_alarm(
+                        create_phone_alarm_preserving_details(
                             &adb,
                             &device,
                             hour,
                             minutes,
                             &clean_label,
+                            preserved_days_of_week,
+                            preserved_vibrate,
                         )
                     });
                     let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
                 });
                 ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                    if me.selected.as_ref().map(|d| d.serial.as_str()) != Some(serial.as_str()) {
+                        return;
+                    }
                     match result {
-                        Ok(Ok((_id, alarms, msg))) => {
+                        Ok(Ok((created_id, mut alarms, msg))) => {
+                            let was_deleted = editing_old_id.is_none()
+                                && !me
+                                    .back_screen
+                                    .stepos_suite
+                                    .alarms
+                                    .iter()
+                                    .any(|a| a.id == local_alarm_id);
                             me.fields[F_ALARM_LABEL].clear();
-                            me.fields[F_PHONE_SCHEDULE_TITLE].clear();
-                            me.apply(Outcome::StepOsAlarmsUpdated(alarms, msg));
+                            if me.page != Page::Home {
+                                me.fields[F_PHONE_SCHEDULE_TITLE].clear();
+                            }
+                            if was_deleted && created_id > 0 {
+                                alarms.retain(|a| a.id != created_id);
+                                me.back_screen.stepos_suite.alarms = alarms;
+                                let dev = device_for_cleanup.clone();
+                                std::thread::spawn(move || {
+                                    if let Ok(adb) = Adb::discover() {
+                                        let _ = stepx_companion::toolbox::delete_phone_alarm(
+                                            &adb,
+                                            &dev,
+                                            created_id,
+                                        );
+                                    }
+                                });
+                            } else {
+                                me.apply(Outcome::StepOsAlarmsUpdated(alarms, msg));
+                            }
                         }
                         Ok(Err(err)) => {
                             me.back_screen.stepos_suite.last_action_note =
@@ -2283,7 +3741,7 @@ impl Companion {
                         let thumb_path = PathBuf::from(&thumb_str);
                         let img = image::open(&thumb_path)
                             .map_err(|e| anyhow::anyhow!("读取本地预览图进行旋转失败：{e}"))?;
-                        let rotated = image::imageops::rotate90(&img);
+                        let rotated = img.rotate90();
                         let cache_dir = std::env::temp_dir().join("stepx-gallery-cache");
                         let _ = std::fs::create_dir_all(&cache_dir);
                         let rot_path = cache_dir.join(format!("rot_{}_{}.png", item_idx, next_deg));
@@ -2291,6 +3749,46 @@ impl Companion {
                             .save(&rot_path)
                             .map_err(|e| anyhow::anyhow!("保存旋转后的预览图失败：{e}"))?;
                         let rot_str = rot_path.to_string_lossy().into_owned();
+                        let remote_path_ref = std::path::Path::new(remote_path);
+                        if remote_path_ref.is_file() {
+                            save_image_matching_path_format(&rotated, remote_path_ref)
+                                .map_err(|e| anyhow::anyhow!("写回旋转图片到原文件失败：{e}"))?;
+                        } else if !self.demo_mode && remote_path.starts_with('/') {
+                            if let Some(device) = self.selected.clone() {
+                                let remote_for_push = remote_path.clone();
+                                let ext = remote_path_ref
+                                    .extension()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or("jpg");
+                                let local_for_push = cache_dir
+                                    .join(format!("rot_push_{}_{}.{}", item_idx, next_deg, ext));
+                                let _ = save_image_matching_path_format(&rotated, &local_for_push);
+                                std::thread::spawn(move || {
+                                    if let Ok(adb) = Adb::discover() {
+                                        if let Ok(transport) = device.resolve_active_transport(&adb)
+                                        {
+                                            let _ = adb.transfer(
+                                                &transport,
+                                                "push",
+                                                &local_for_push,
+                                                std::path::Path::new(&remote_for_push),
+                                            );
+                                            let _ = adb.shell(
+                                                &transport,
+                                                &[
+                                                    "am",
+                                                    "broadcast",
+                                                    "-a",
+                                                    "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
+                                                    "-d",
+                                                    &format!("file://{remote_for_push}"),
+                                                ],
+                                            );
+                                        }
+                                    }
+                                });
+                            }
+                        }
                         self.back_screen.gallery_items[item_idx].local_thumb_path =
                             Some(rot_str.clone());
                         self.work.insert_image_preview(rot_str, rot_path);
@@ -2322,21 +3820,30 @@ impl Companion {
                             let res = Adb::discover().and_then(|adb| {
                                 storage::pull(&adb, &device, &remote, &raw_file)?;
                                 let img = image::open(&raw_file)?;
-                                let rotated = match next_deg {
-                                    90 => image::DynamicImage::ImageRgba8(
-                                        image::imageops::rotate90(&img),
-                                    ),
-                                    180 => image::DynamicImage::ImageRgba8(
-                                        image::imageops::rotate180(&img),
-                                    ),
-                                    270 => image::DynamicImage::ImageRgba8(
-                                        image::imageops::rotate270(&img),
-                                    ),
-                                    _ => img,
-                                };
+                                let rotated = rotate_dynamic_image_by_deg(img, next_deg);
                                 let rot_file = cache_dir
                                     .join(format!("sel_{item_idx}_{safe_name}_rot{next_deg}.png"));
                                 rotated.save(&rot_file)?;
+                                save_image_matching_path_format(&rotated, &raw_file)?;
+                                if let Ok(transport) = device.resolve_active_transport(&adb) {
+                                    let _ = adb.transfer(
+                                        &transport,
+                                        "push",
+                                        &raw_file,
+                                        std::path::Path::new(&remote),
+                                    );
+                                    let _ = adb.shell(
+                                        &transport,
+                                        &[
+                                            "am",
+                                            "broadcast",
+                                            "-a",
+                                            "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
+                                            "-d",
+                                            &format!("file://{remote}"),
+                                        ],
+                                    );
+                                }
                                 Ok(rot_file)
                             });
                             let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
@@ -2750,77 +4257,83 @@ impl Companion {
                     self.error = true;
                     return Ok(());
                 };
-                if let Some(local_paths) = native_dialog::FileDialog::new()
-                    .add_filter("图片", &["png", "jpg", "jpeg", "webp"])
-                    .show_open_multiple_file()
-                    .ok()
-                    .filter(|v| !v.is_empty())
-                {
-                    let count = local_paths.len();
-                    let first_name = local_paths[0]
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("image.png")
-                        .to_string();
-                    let summary = if count == 1 {
-                        first_name
-                    } else {
-                        format!("{first_name} 等 {count} 张图片")
-                    };
-                    self.back_screen.gallery_loading = true;
-                    self.status = format!("正在导入 {summary} 到手机相册 (/sdcard/Pictures)…");
-                    let (tx, rx) = async_channel::bounded(1);
-                    std::thread::spawn(move || {
-                        let res = Adb::discover().and_then(|adb| {
-                            for local_path in &local_paths {
-                                storage::push(&adb, &device, local_path, "/sdcard/Pictures")?;
-                                if let Some(fname) = local_path.file_name().and_then(|n| n.to_str())
-                                {
-                                    let _ = adb.shell(
-                                        &device.transport,
-                                        &[
-                                            "am",
-                                            "broadcast",
-                                            "-a",
-                                            "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
-                                            "-d",
-                                            &format!("file:///sdcard/Pictures/{fname}"),
-                                        ],
-                                    );
+                self.choose_paths(
+                    stepx_companion::file_dialog::FileDialog::new()
+                        .add_filter("图片", &["png", "jpg", "jpeg", "webp"]),
+                    DialogKind::OpenFiles,
+                    move |app, local_paths, ctx| {
+                        app.ensure_file_dialog_device(&Some(device.serial.clone()))?;
+                        anyhow::ensure!(
+                            !app.back_screen.gallery_loading,
+                            "相册正在更新，请完成后重新导入"
+                        );
+                        let count = local_paths.len();
+                        let first_name = local_paths[0]
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("image.png")
+                            .to_string();
+                        let summary = if count == 1 {
+                            first_name
+                        } else {
+                            format!("{first_name} 等 {count} 张图片")
+                        };
+                        app.back_screen.gallery_loading = true;
+                        app.status = format!("正在导入 {summary} 到手机相册 (/sdcard/Pictures)…");
+                        let (tx, rx) = async_channel::bounded(1);
+                        std::thread::spawn(move || {
+                            let res = Adb::discover().and_then(|adb| {
+                                let transport = device.resolve_active_transport(&adb)?;
+                                for local_path in &local_paths {
+                                    storage::push(&adb, &device, local_path, "/sdcard/Pictures")?;
+                                    if let Some(fname) = local_path.file_name().and_then(|n| n.to_str()) {
+                                        let _ = adb.shell(
+                                            &transport,
+                                            &[
+                                                "am",
+                                                "broadcast",
+                                                "-a",
+                                                "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
+                                                "-d",
+                                                &format!("file:///sdcard/Pictures/{fname}"),
+                                            ],
+                                        );
+                                    }
                                 }
-                            }
-                            let items =
-                                stepx_companion::toolbox::list_phone_gallery(&adb, &device)?;
-                            Ok((items, summary))
+                                let items = stepx_companion::toolbox::list_phone_gallery(&adb, &device)?;
+                                Ok((items, summary))
+                            });
+                            let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
                         });
-                        let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
-                    });
-                    ctx.spawn(async move { rx.recv().await }, |me, result, ctx| {
-                        me.back_screen.gallery_loading = false;
-                        me.back_screen.gallery_checked = true;
-                        match result {
-                            Ok(Ok((items, summary))) => {
-                                me.back_screen.gallery_selected = 0;
-                                me.apply(Outcome::PhoneGallery(
-                                    items,
-                                    format!("已将电脑图片 {summary} 导入手机相册"),
-                                ));
+                        ctx.spawn(async move { rx.recv().await }, |me, result, ctx| {
+                            me.back_screen.gallery_loading = false;
+                            me.back_screen.gallery_checked = true;
+                            match result {
+                                Ok(Ok((items, summary))) => {
+                                    me.back_screen.gallery_selected = 0;
+                                    me.apply(Outcome::PhoneGallery(
+                                        items,
+                                        format!("已将电脑图片 {summary} 导入手机相册"),
+                                    ));
+                                }
+                                Ok(Err(err)) => {
+                                    me.error = true;
+                                    me.status = format!("导入图片到手机相册失败：{err}");
+                                }
+                                Err(_) => {}
                             }
-                            Ok(Err(err)) => {
-                                me.error = true;
-                                me.status = format!("导入图片到手机相册失败：{err}");
-                            }
-                            Err(_) => {}
-                        }
-                        ctx.notify();
-                    });
-                }
+                            ctx.notify();
+                        });
+
+                        Ok(())
+                    },
+                );
             }
             BackScreenAction::McpQuickOpenCalendar => {
-                self.handle_device_action(&Action::OpenApp("com.android.calendar".into()));
+                self.handle_action(&Action::Page(Page::Calendar), ctx);
             }
             BackScreenAction::McpQuickOpenAlarm => {
-                self.handle_device_action(&Action::OpenApp("com.android.deskclock".into()));
+                self.handle_action(&Action::Page(Page::Alarms), ctx);
             }
             BackScreenAction::McpToggleDnd => {
                 self.do_backscreen_action(
@@ -2833,12 +4346,39 @@ impl Companion {
                 self.do_backscreen_action(&BackScreenAction::Play, ctx)?;
             }
             BackScreenAction::CalendarToggleDone(event_id) => {
+                self.ensure_calendar_state_scope();
+                anyhow::ensure!(self.back_screen.calendar_state_scope.is_some(), "请连接原手机后更新日程状态");
+                let now_ms = chrono::Local::now().timestamp_millis();
                 if !self.back_screen.completed_calendar_events.remove(event_id) {
                     self.back_screen.completed_calendar_events.insert(*event_id);
+                    let ev_title = self
+                        .back_screen
+                        .stepos_suite
+                        .calendar_events
+                        .iter()
+                        .find(|e| e.id == *event_id)
+                        .map(|e| e.title.clone())
+                        .unwrap_or_else(|| format!("日程 #{event_id}"));
+                    let spec = stepx_companion::home_reminder_governance::ReminderTargetSpec::new(
+                        format!("cal:{event_id}"),
+                        stepx_companion::home_reminder_governance::ReminderCategory::ScheduleAndMeeting,
+                        ev_title,
+                    )
+                    .with_aliases([
+                        format!("schedule:{event_id}"),
+                        format!("conflict:conflict-cal-{event_id}"),
+                    ]);
+                    self.reminder_governance.manual_expire(spec, now_ms);
                     self.status = "已将日程标记为已完成".into();
                 } else {
+                    self.reminder_governance
+                        .restore_reminder(&format!("cal:{event_id}"), now_ms);
+                    self.reminder_governance
+                        .restore_reminder(&format!("schedule:{event_id}"), now_ms);
                     self.status = "已取消日程完成标记".into();
                 }
+                self.back_screen.save_completed_calendar_events();
+                self.sync_calendar_event_state_to_description(*event_id);
                 self.error = false;
             }
             BackScreenAction::CalendarEditEvent(event_id) => {
@@ -2856,7 +4396,7 @@ impl Companion {
                     self.back_screen.selected_calendar_day = d;
                     self.back_screen.editing_calendar_event_id = Some(*event_id);
                     self.fields[F_PHONE_SCHEDULE_TITLE].set(&ev.title);
-                    self.fields[F_CALENDAR_TIME].set(&ev.time_range_label());
+                    self.fields[F_CALENDAR_TIME].set(&editable_calendar_time_label(&ev));
                     self.focus_field(F_PHONE_SCHEDULE_TITLE, ctx);
                     self.status =
                         format!("正在编辑日程「{}」，修改后点击保存修改或按 Enter", ev.title);
@@ -2882,12 +4422,42 @@ impl Companion {
                         .write(ClipboardContent::plain_text(summary.clone()));
                     self.fields[F_PHONE_SCHEDULE_TITLE].set(&ev.title);
                     self.fields[F_CALENDAR_TIME].set(&ev.hm_label());
-                    if self.selected.is_some() {
+                    let subtitle = format!("{} · 桌面与手机双端日程提醒", ev.hm_label());
+                    if let Some(device) = self.selected.clone() {
                         self.do_backscreen_action(&BackScreenAction::PushDesktopClipboard, ctx)?;
-                        self.status = format!("已将日程提醒「{}」同步到手机剪贴板", ev.title);
+                        let serial = device.serial.clone();
+                        let title = ev.title.clone();
+                        let sub = subtitle.clone();
+                        std::thread::spawn(move || {
+                            if let Ok(adb) = Adb::discover() {
+                                let req = stepx_companion::push::PhoneLiveCapsuleRequest {
+                                    tag: "stepx_schedule".into(),
+                                    pill_text: "📅 日程提醒".into(),
+                                    title,
+                                    subtitle: sub,
+                                    badge_text: "日程协同".into(),
+                                    live_type: 6,
+                                    countdown_secs: None,
+                                    ongoing: true,
+                                };
+                                let _ = stepx_companion::push::post_phone_live_capsule(
+                                    &adb, &serial, &req,
+                                );
+                            }
+                        });
+                        self.status = format!(
+                            "已将日程提醒「{}」同步到手机顶部实况胶囊与剪贴板",
+                            ev.title
+                        );
                     } else {
                         self.status = format!("已复制日程提醒「{}」", ev.title);
                     }
+                    self.back_screen.active_phone_capsule = Some((
+                        "stepx_schedule".into(),
+                        "📅 日程提醒".into(),
+                        ev.title.clone(),
+                        Instant::now(),
+                    ));
                 }
             }
             BackScreenAction::GalleryExportFiltered => {
@@ -3012,7 +4582,32 @@ impl Companion {
                     if self.back_screen.frame.len() != bs::SLOTS {
                         self.back_screen.refresh_frame();
                     }
-                    let mut pixels = if self.back_screen.frame.len() == bs::SLOTS {
+                    let mut pixels = if self.back_screen.frame.len() == bs::SLOTS
+                        && self.back_screen.frame.iter().any(|&b| b > 0)
+                    {
+                        self.back_screen.frame.clone()
+                    } else if self.page == Page::Home {
+                        let custom = self.fields[F_BACK_MARQUEE].text.trim();
+                        let suite_sig = self.back_screen.stepos_suite.backscreen_signature.trim();
+                        let raw_sig = if !custom.is_empty() && custom != "STEPX AI" {
+                            custom
+                        } else if !suite_sig.is_empty() {
+                            suite_sig
+                        } else {
+                            "开会勿扰"
+                        };
+                        let stripped = raw_sig.trim_start_matches(|c: char| {
+                            c.is_whitespace()
+                                || (c as u32) >= 0x1F000
+                                || matches!(c, '📲' | '⏱' | '📦' | '✨' | '🔥' | '🔔')
+                        });
+                        let sig = if stripped.is_empty() {
+                            "开会勿扰"
+                        } else {
+                            stripped
+                        };
+                        bs::synthesize_chinese_signature_frame(sig, self.back_screen.config.invert)
+                    } else if self.back_screen.frame.len() == bs::SLOTS {
                         self.back_screen.frame.clone()
                     } else {
                         vec![0; bs::SLOTS]
@@ -3155,7 +4750,7 @@ impl Companion {
                     if self.back_screen.editing_calendar_event_id == Some(*id) {
                         self.back_screen.editing_calendar_event_id = None;
                     }
-                    self.back_screen.completed_calendar_events.remove(id);
+                    self.remove_calendar_event_state(*id);
                 }
                 if self.prefs.auto_sync_calendar {
                     rewrite_local_calendar_ics(&self.back_screen.stepos_suite.calendar_events);
@@ -3242,16 +4837,20 @@ impl Companion {
                 if !self.demo_mode {
                     if let Some(device) = self.selected.clone() {
                         let title_bg = title.clone();
+                        let loc_bg = ev.location.clone();
                         let desc_bg = if desc.is_empty() {
                             "由 StepX 桌面端克隆创建".to_string()
                         } else {
                             desc
                         };
+                        let all_day_bg = ev.all_day;
+                        let auto_sync = self.prefs.auto_sync_calendar;
                         let (tx, rx) = async_channel::bounded(1);
                         std::thread::spawn(move || {
                             let res = Adb::discover().and_then(|adb| {
-                                stepx_companion::toolbox::create_phone_calendar_event(
-                                    &adb, &device, &title_bg, new_start, new_end, &desc_bg,
+                                create_phone_calendar_event_preserving_details(
+                                    &adb, &device, &title_bg, new_start, new_end, all_day_bg,
+                                    &loc_bg, &desc_bg, auto_sync, ny, nm, nd,
                                 )
                             });
                             let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
@@ -3266,8 +4865,16 @@ impl Companion {
                 }
             }
             BackScreenAction::CalendarPostponeOneDay(event_id) => {
-                let mut updated_info: Option<(i64, String, String, i64, i64, (i32, u32, u32))> =
-                    None;
+                let mut updated_info: Option<(
+                    i64,
+                    String,
+                    String,
+                    String,
+                    bool,
+                    i64,
+                    i64,
+                    (i32, u32, u32),
+                )> = None;
                 if let Some(ev) = self
                     .back_screen
                     .stepos_suite
@@ -3280,13 +4887,16 @@ impl Companion {
                     updated_info = Some((
                         ev.id,
                         ev.title.clone(),
+                        ev.location.clone(),
                         ev.description.clone(),
+                        ev.all_day,
                         ev.dtstart,
                         ev.dtend,
                         ev.date_ymd(),
                     ));
                 }
-                let Some((old_id, title, desc, new_start, new_end, (ny, nm, nd))) = updated_info
+                let Some((old_id, title, loc, desc, all_day, new_start, new_end, (ny, nm, nd))) =
+                    updated_info
                 else {
                     return Ok(());
                 };
@@ -3307,25 +4917,31 @@ impl Companion {
                 if !self.demo_mode {
                     if let Some(device) = self.selected.clone() {
                         let title_bg = title.clone();
+                        let loc_bg = loc.clone();
                         let desc_bg = if desc.is_empty() {
                             "由 StepX 桌面端顺延更新".to_string()
                         } else {
                             desc
                         };
+                        let auto_sync = self.prefs.auto_sync_calendar;
                         let (tx, rx) = async_channel::bounded(1);
                         std::thread::spawn(move || {
                             let res = Adb::discover().and_then(|adb| {
                                 let _ = stepx_companion::toolbox::delete_phone_calendar_event(
                                     &adb, &device, old_id,
                                 );
-                                stepx_companion::toolbox::create_phone_calendar_event(
-                                    &adb, &device, &title_bg, new_start, new_end, &desc_bg,
+                                create_phone_calendar_event_preserving_details(
+                                    &adb, &device, &title_bg, new_start, new_end, all_day, &loc_bg,
+                                    &desc_bg, auto_sync, ny, nm, nd,
                                 )
                             });
                             let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
                         });
                         ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
-                            if let Ok(Ok((_id, events, _))) = result {
+                            if let Ok(Ok((new_id, events, _))) = result {
+                                if old_id != new_id && new_id > 0 {
+                                    me.migrate_calendar_event_state(old_id, new_id);
+                                }
                                 me.back_screen.stepos_suite.calendar_events = events;
                                 ctx.notify();
                             }
@@ -3392,7 +5008,7 @@ impl Companion {
                 self.error = false;
             }
             BackScreenAction::AlarmShiftMinutes(alarm_id, delta_mins) => {
-                let mut shifted_info: Option<(i64, String, u8, u8)> = None;
+                let mut shifted_info: Option<(i64, String, u8, u8, u32, bool)> = None;
                 if let Some(alarm) = self
                     .back_screen
                     .stepos_suite
@@ -3410,9 +5026,11 @@ impl Companion {
                         alarm.display_title().to_string(),
                         alarm.hour,
                         alarm.minutes,
+                        alarm.days_of_week,
+                        alarm.vibrate,
                     ));
                 }
-                if let Some((old_id, title, new_h, new_m)) = shifted_info {
+                if let Some((old_id, title, new_h, new_m, days_of_week, vibrate)) = shifted_info {
                     let note = format!("已将闹钟「{title}」调整至 {new_h:02}:{new_m:02}");
                     self.back_screen.stepos_suite.last_action_note = note.clone();
                     self.status = note;
@@ -3425,8 +5043,14 @@ impl Companion {
                                     let _ = stepx_companion::toolbox::delete_phone_alarm(
                                         &adb, &device, old_id,
                                     );
-                                    stepx_companion::toolbox::create_phone_alarm(
-                                        &adb, &device, new_h, new_m, &title,
+                                    create_phone_alarm_preserving_details(
+                                        &adb,
+                                        &device,
+                                        new_h,
+                                        new_m,
+                                        &title,
+                                        days_of_week,
+                                        vibrate,
                                     )
                                 });
                                 let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
@@ -3489,6 +5113,263 @@ impl Companion {
                     }
                 }
             }
+            BackScreenAction::ToggleLiveCapsulePopover => {
+                self.back_screen.live_capsule_popover_open =
+                    !self.back_screen.live_capsule_popover_open;
+                if self.back_screen.live_capsule_popover_open {
+                    self.dismiss_search_for_header();
+                    self.header_actions_open = false;
+                    self.auto_sync.details_open = false;
+                    self.notification_center.drawer_open = false;
+                }
+            }
+            BackScreenAction::CloseLiveCapsulePopover => {
+                self.back_screen.live_capsule_popover_open = false;
+            }
+            BackScreenAction::SetLiveCapsuleFilter(filter) => {
+                self.back_screen.live_capsule_filter = *filter;
+                self.back_screen
+                    .live_capsule_scroll
+                    .scroll_to(facloud_ui::units::Pixels::new(0.0));
+            }
+            BackScreenAction::CompleteCapsuleItem {
+                id,
+                pickup_code,
+                sms_address,
+                im_thread_id,
+                notif_key,
+            } => {
+                self.complete_capsule_item(
+                    id,
+                    pickup_code.as_deref(),
+                    sms_address.as_deref(),
+                    im_thread_id.as_deref(),
+                    notif_key.as_deref(),
+                );
+            }
+            BackScreenAction::OpenCapsuleTarget {
+                sms_address,
+                im_thread_id,
+                open_calendar,
+                open_alarms,
+            } => {
+                self.back_screen.live_capsule_popover_open = false;
+                if *open_calendar {
+                    self.page = Page::Calendar;
+                    self.status = "已从胶囊打开手机日历与今日议程".into();
+                    self.error = false;
+                } else if *open_alarms {
+                    self.page = Page::Alarms;
+                    self.status = "已从胶囊打开手机闹钟管理".into();
+                    self.error = false;
+                } else if let Some(tid) = im_thread_id.as_ref().filter(|s| !s.trim().is_empty()) {
+                    self.page = Page::Sms;
+                    self.push.tab = crate::ui::push_state::PushCenterTab::ImChat;
+                    self.push.im_channel = stepx_companion::push::ImChannel::All;
+                    self.apply_select_im_channel(stepx_companion::push::ImChannel::All);
+                    self.push.selected_im_thread = Some(tid.clone());
+                    self.selected_thread = None;
+                    if let Some(thread) = self
+                        .push
+                        .snapshot
+                        .threads
+                        .iter_mut()
+                        .find(|t| t.thread_id == *tid)
+                    {
+                        thread.unread_count = 0;
+                    }
+                    self.sync_notification_center();
+                    self.status = "已从胶囊直达对应消息会话".into();
+                    self.error = false;
+                } else if let Some(addr) = sms_address.as_ref().filter(|s| !s.trim().is_empty()) {
+                    self.page = Page::Sms;
+                    self.push.tab = crate::ui::push_state::PushCenterTab::ImChat;
+                    self.push.im_channel = stepx_companion::push::ImChannel::Sms;
+                    self.apply_select_im_channel(stepx_companion::push::ImChannel::Sms);
+                    self.selected_thread = Some(addr.clone());
+                    self.push.selected_im_thread = None;
+                    self.mark_sms_thread_read(addr);
+                    self.status = format!("已从胶囊定位到短信会话：{addr}");
+                    self.error = false;
+                } else {
+                    self.page = Page::Sms;
+                    self.status = "已从胶囊打开通信中枢".into();
+                    self.error = false;
+                }
+            }
+            BackScreenAction::OpenFulfillment { id } => {
+                self.open_fulfillment_capsule(id, ctx);
+            }
+            BackScreenAction::PushPhoneLiveCapsule {
+                tag,
+                pill_text,
+                title,
+                subtitle,
+                countdown_secs,
+                sync_backscreen,
+            } => {
+                self.back_screen.active_phone_capsule = Some((
+                    tag.clone(),
+                    pill_text.clone(),
+                    title.clone(),
+                    Instant::now(),
+                ));
+                if *sync_backscreen && countdown_secs.unwrap_or(0) == 0 {
+                    let sig: String = pill_text
+                        .chars()
+                        .filter(|c| {
+                            !c.is_whitespace()
+                                && (*c as u32) < 0x1F000
+                                && !matches!(*c, '📲' | '⏱' | '📦' | '✨' | '🔥' | '🔔')
+                        })
+                        .take(6)
+                        .collect();
+                    if !sig.is_empty() {
+                        self.fields[F_BACK_MARQUEE].set(&sig);
+                        self.back_screen.stepos_suite.backscreen_signature = sig.clone();
+                        self.matrix_marquee_on = true;
+                        let frame = bs::synthesize_chinese_signature_frame(
+                            &sig,
+                            self.back_screen.config.invert,
+                        );
+                        self.back_screen.native_feature = None;
+                        self.back_screen.source = bs::Source::Image(frame.clone());
+                        self.back_screen.frame = frame;
+                        self.back_screen.title = format!("背屏状态 · {sig}");
+                        self.back_screen.revision = self.back_screen.revision.wrapping_add(1);
+                    }
+                }
+                self.back_screen.status =
+                    format!("正在同步到手机顶部实况胶囊：{} · {}", pill_text, title);
+                self.status = self.back_screen.status.clone();
+                self.error = false;
+                if let Some(device) = self.selected.clone().filter(|_| !self.demo_mode) {
+                    let serial = device.serial.clone();
+                    let tag_c = tag.clone();
+                    let pill_c = pill_text.clone();
+                    let title_c = title.clone();
+                    let sub_c = subtitle.clone();
+                    let cd_secs = *countdown_secs;
+                    let sync_bs = *sync_backscreen;
+                    let brightness = self.back_screen.config.brightness;
+                    let (tx, rx) = async_channel::bounded(1);
+                    std::thread::spawn(move || {
+                        let res = Adb::discover().and_then(|adb| {
+                            let req = stepx_companion::push::PhoneLiveCapsuleRequest {
+                                tag: tag_c.clone(),
+                                pill_text: pill_c.clone(),
+                                title: title_c.clone(),
+                                subtitle: sub_c.clone(),
+                                badge_text: "双端协同".into(),
+                                live_type: if cd_secs.unwrap_or(0) > 0 { 11 } else { 1 },
+                                countdown_secs: cd_secs,
+                                ongoing: true,
+                            };
+                            stepx_companion::push::post_phone_live_capsule(
+                                &adb, &serial, &req,
+                            )?;
+                            if sync_bs {
+                                if let Some(secs) = cd_secs.filter(|s| *s > 0) {
+                                    let _ = bs::start_pomodoro_countdown(
+                                        &adb,
+                                        &device,
+                                        secs.clamp(60, 3600) as u32,
+                                        brightness,
+                                    );
+                                } else {
+                                    let sig: String = pill_c
+                                        .chars()
+                                        .filter(|c| {
+                                            !c.is_whitespace()
+                                                && (*c as u32) < 0x1F000
+                                                && !matches!(*c, '📲' | '⏱' | '📦' | '✨' | '🔥' | '🔔')
+                                        })
+                                        .take(6)
+                                        .collect();
+                                    let sig = if sig.is_empty() {
+                                        "StepX".to_string()
+                                    } else {
+                                        sig
+                                    };
+                                    let _ = stepx_companion::toolbox::trigger_stepos_mcp_action(
+                                        &adb,
+                                        &device,
+                                        &format!("backscreen_sig:{sig}"),
+                                        &sig,
+                                    );
+                                }
+                            }
+                            Ok(format!(
+                                "已同步到手机顶部实况胶囊{}：{} · {}",
+                                if sync_bs { "与背屏点阵" } else { "" },
+                                pill_c,
+                                title_c
+                            ))
+                        });
+                        let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
+                    });
+                    let pill_done = pill_text.clone();
+                    let title_done = title.clone();
+                    ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                        match result {
+                            Ok(Ok(msg)) => {
+                                me.back_screen.status = msg.clone();
+                                me.status = msg;
+                                me.error = false;
+                            }
+                            Ok(Err(err)) => {
+                                me.back_screen.status = format!(
+                                    "顶部实况胶囊已更新状态（设备回执提示：{err}）：{} · {}",
+                                    pill_done, title_done
+                                );
+                                me.status = me.back_screen.status.clone();
+                            }
+                            Err(_) => {}
+                        }
+                        ctx.notify();
+                    });
+                }
+            }
+            BackScreenAction::DismissPhoneLiveCapsule(tag) => {
+                if self
+                    .back_screen
+                    .active_phone_capsule
+                    .as_ref()
+                    .is_some_and(|(active_tag, _, _, _)| active_tag == tag)
+                {
+                    self.back_screen.active_phone_capsule = None;
+                }
+                self.back_screen.status = format!("已收起手机顶部实况胶囊（{tag}）");
+                self.status = self.back_screen.status.clone();
+                self.error = false;
+                if let Some(device) = self.selected.clone().filter(|_| !self.demo_mode) {
+                    let serial = device.serial.clone();
+                    let tag_c = tag.clone();
+                    std::thread::spawn(move || {
+                        if let Ok(adb) = Adb::discover() {
+                            let _ = stepx_companion::push::dismiss_phone_live_capsule(
+                                &adb, &serial, &tag_c,
+                            );
+                        }
+                    });
+                }
+            }
+            BackScreenAction::ClearAllPhoneLiveCapsules => {
+                self.back_screen.active_phone_capsule = None;
+                self.back_screen.status = "已清空手机顶部全部 StepX 实况胶囊".into();
+                self.status = self.back_screen.status.clone();
+                self.error = false;
+                if let Some(device) = self.selected.clone().filter(|_| !self.demo_mode) {
+                    let serial = device.serial.clone();
+                    std::thread::spawn(move || {
+                        if let Ok(adb) = Adb::discover() {
+                            let _ = stepx_companion::push::clear_all_phone_live_capsules(
+                                &adb, &serial,
+                            );
+                        }
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -3521,7 +5402,7 @@ impl Companion {
             let result = (|| -> Result<CompanionEvent> {
                 if let Some(feature) = native {
                     if companion_running {
-                        ca::stop(&adb, &device)?;
+                        let _ = bs::release_custom_frame_owner(&adb, &device);
                     }
                     let message = bs::configure_native(&adb, &device, feature)?;
                     return Ok(CompanionEvent::Applied {
@@ -3533,7 +5414,7 @@ impl Companion {
                 }
                 if matches!(source, bs::Source::App { .. }) {
                     if companion_running {
-                        ca::stop(&adb, &device)?;
+                        let _ = bs::release_custom_frame_owner(&adb, &device);
                     }
                     let playback = bs::start(adb, device, source, config)?;
                     return Ok(CompanionEvent::TemporaryStarted {
@@ -3542,44 +5423,7 @@ impl Companion {
                         revision,
                     });
                 }
-                let message = if let bs::Source::Preset(
-                    preset @ (bs::Preset::Clock | bs::Preset::Battery | bs::Preset::Countdown),
-                ) = &source
-                {
-                    ca::apply_preset(
-                        &adb,
-                        &device,
-                        preset.key(),
-                        config.brightness,
-                        config.duration_secs,
-                    )?
-                } else {
-                    let count = match &source {
-                        bs::Source::Image(_) => 1,
-                        bs::Source::Preset(bs::Preset::Astronaut) => u32::from(config.fps) * 4,
-                        _ => u32::from(config.fps) * 8,
-                    };
-                    let mut render = config.clone();
-                    render.brightness = 8;
-                    let frames: Vec<_> = (0..count)
-                        .map(|index| {
-                            bs::frame(
-                                &source,
-                                &render,
-                                Duration::from_secs_f64(f64::from(index) / f64::from(config.fps)),
-                                &Default::default(),
-                            )
-                        })
-                        .collect();
-                    ca::apply_animation(
-                        &adb,
-                        &device,
-                        &frames,
-                        config.fps,
-                        config.brightness,
-                        &title,
-                    )?
-                };
+                let message = bs::apply_via_firmware_mcp(&adb, &device, &source, &config, &title)?;
                 Ok(CompanionEvent::Applied {
                     title,
                     revision,
@@ -3632,7 +5476,7 @@ impl Companion {
                         mode: "game".into(),
                     },
                     BackScreenAction::CompanionStop => {
-                        CompanionEvent::Stopped(ca::stop(&adb, &device)?)
+                        CompanionEvent::Stopped(bs::stop_via_firmware_mcp(&adb, &device)?)
                     }
                     _ => CompanionEvent::Inspected(ca::inspect(&adb, &device)?),
                 })
@@ -3662,6 +5506,7 @@ impl Companion {
         Ok(())
     }
     pub(super) fn cancel_backscreen(&mut self) {
+        self.back_screen.cancel_pomodoro_commands();
         if let Some(playback) = self.back_screen.playback.take() {
             playback.cancel();
         }
@@ -3677,6 +5522,7 @@ impl Companion {
         self.back_screen.companion_busy = false;
         self.back_screen.companion_checked_device = None;
         self.back_screen.companion_installed = None;
+        self.back_screen.last_synced_autonomous_cfg = None;
         self.back_screen.applied_to_phone = false;
         self.back_screen.applied_revision = None;
         self.back_screen.applied_title.clear();
@@ -3690,6 +5536,14 @@ impl Companion {
     pub(super) fn poll_backscreen(&mut self, preview_visible: bool) -> bool {
         self.back_screen
             .set_preview_visible(preview_visible && !self.initializing);
+        if self.back_screen.pomodoro_device.as_ref().is_some_and(|serial| {
+            self.selected.as_ref().map(|device| &device.serial) != Some(serial)
+        }) {
+            self.back_screen.cancel_pomodoro_commands();
+            self.back_screen.status =
+                "设备连接已变化，待执行的背屏计时操作已取消；手机状态待重新确认".into();
+            return true;
+        }
         if !self.back_screen.needs_poll() {
             return false;
         }
@@ -3725,6 +5579,7 @@ impl Companion {
         if self.selected.is_none() && self.back_screen.companion_checked_device.is_some() {
             self.back_screen.companion_checked_device = None;
             self.back_screen.companion_installed = None;
+            self.back_screen.last_synced_autonomous_cfg = None;
             self.back_screen.applied_to_phone = false;
             self.back_screen.companion_status = "连接手机后检测 StepX伴侣".into();
             self.back_screen.applied_status = "手机连接已断开，运行状态待检测".into();
@@ -4094,22 +5949,82 @@ impl Companion {
         if self.back_screen.pomodoro_active {
             let remaining = self.back_screen.pomodoro_remaining_secs();
             if remaining == 0 {
+                let total = self.back_screen.pomodoro_duration_secs.max(1);
+                if matches!(
+                    self.back_screen.source,
+                    bs::Source::Preset(bs::Preset::Countdown)
+                ) {
+                    self.back_screen.config.duration_secs = total;
+                    self.back_screen.elapsed_ms = u64::from(total) * 1000;
+                    self.back_screen.refresh_frame();
+                    self.back_screen.applied_frame = self.back_screen.frame.clone();
+                }
                 self.back_screen.pomodoro_active = false;
+                self.back_screen.cancel_pomodoro_commands();
                 self.back_screen.pomodoro_started_at = None;
                 self.back_screen.pomodoro_last_remaining_secs = None;
-                self.back_screen.status =
-                    "25 分钟背屏专注番茄钟已完成，手机背屏恢复默认显示".into();
+                self.back_screen.status = format!(
+                    "{} 分钟桌面专注番茄钟已完成",
+                    self.back_screen.pomodoro_duration_secs / 60
+                );
                 changed = true;
-            } else if self.page == Page::BackScreen
-                && self.back_screen.pomodoro_last_remaining_secs != Some(remaining)
-            {
+            } else if self.back_screen.pomodoro_last_remaining_secs != Some(remaining) {
                 self.back_screen.pomodoro_last_remaining_secs = Some(remaining);
+                let total = self.back_screen.pomodoro_duration_secs.max(1);
+                let elapsed_secs = total.saturating_sub(remaining);
+                let elapsed_ms = u64::from(elapsed_secs) * 1000;
+                if matches!(
+                    self.back_screen.source,
+                    bs::Source::Preset(bs::Preset::Countdown)
+                ) {
+                    self.back_screen.config.duration_secs = total;
+                    self.back_screen.elapsed_ms = elapsed_ms;
+                    self.back_screen.refresh_frame();
+                    self.back_screen.applied_frame = self.back_screen.frame.clone();
+                }
+                if !self.demo_mode
+                    && self.back_screen.pomodoro_request.is_none()
+                    && remaining % 5 == 0
+                {
+                    if let Some(device) = self.selected.clone() {
+                        let mut cfg = self.back_screen.config.clone();
+                        cfg.duration_secs = total;
+                        let frame = bs::frame(
+                            &bs::Source::Preset(bs::Preset::Countdown),
+                            &cfg,
+                            Duration::from_millis(elapsed_ms),
+                            &bs::LiveData::default(),
+                        );
+                        let ticket = self.back_screen.pomodoro_lane.current();
+                        let lane = self.back_screen.pomodoro_lane.clone();
+                        std::thread::spawn(move || {
+                            let _ = lane.run_if_current(ticket, || {
+                                if let Ok(adb) = Adb::discover() {
+                                    let _ = bs::push_frame(&adb, &device, &frame);
+                                }
+                            });
+                        });
+                    }
+                }
                 changed = true;
             }
         }
-        if self.page == Page::BackScreen && self.back_screen.preview_running {
+        if self.page == Page::BackScreen
+            && self.back_screen.preview_running
+            && !(self.back_screen.pomodoro_active
+                && matches!(
+                    self.back_screen.source,
+                    bs::Source::Preset(bs::Preset::Countdown)
+                ))
+        {
             let duration = if self.back_screen.tab == 4 {
                 20_000
+            } else if let bs::Source::SmartCarousel(slides) = &self.back_screen.source {
+                if slides.is_empty() {
+                    4_000
+                } else {
+                    (slides.len() as u64 * bs::SMART_SLIDE_PROGRESS_CELLS as u64 * 1000).max(10_000)
+                }
             } else {
                 u64::from(self.back_screen.config.duration_secs.max(1)) * 1000
             };
@@ -4121,6 +6036,1043 @@ impl Companion {
         }
         changed
     }
+
+    pub(super) fn ensure_calendar_state_scope(&mut self) {
+        let scope = if self.demo_mode { Some("demo".to_string()) }
+            else { self.selected.as_ref().filter(|d| !d.serial.is_empty()).map(|d| format!("phone:{}", d.serial)) };
+        if self.back_screen.calendar_state_scope == scope { return; }
+        self.back_screen.calendar_state_scope = scope;
+        self.back_screen.load_completed_calendar_events();
+        self.load_home_checked_checklist_items();
+    }
+
+    pub(super) fn calendar_event_action_limit(&self, id: i64) -> Option<&'static str> {
+        let mut first_start = None;
+        let mut missing_metadata = false;
+        for event in self.back_screen.stepos_suite.calendar_events.iter().filter(|event| event.id == id) {
+            if event.recurring == Some(true)
+                || first_start.is_some_and(|start| start != event.dtstart) {
+                return Some("这是重复日程，请在手机日历选择仅本次或整个系列；电脑未修改日程");
+            }
+            first_start = Some(event.dtstart);
+            missing_metadata |= !self.demo_mode && event.recurring.is_none()
+                && event.id > 0 && event.source.starts_with("手机");
+        }
+        missing_metadata.then_some("日程来源尚未提供重复规则，请先刷新日历；也可在手机日历处理，电脑未修改日程")
+    }
+
+    pub(super) fn calendar_event_is_completed(&self, event: &stepx_companion::toolbox::PhoneCalendarEvent) -> bool {
+        self.back_screen.completed_calendar_events.contains(&event.id)
+            && self.calendar_event_action_limit(event.id).is_none()
+    }
+
+    pub(super) fn calendar_event_is_suppressed(&self, event: &stepx_companion::toolbox::PhoneCalendarEvent, now_ms: i64) -> bool {
+        self.calendar_event_action_limit(event.id).is_none()
+            && event.is_suppressed_at(now_ms, &self.reminder_governance)
+    }
+
+    pub(super) fn migrate_calendar_event_state(&mut self, old_id: i64, new_id: i64) {
+        self.ensure_calendar_state_scope();
+        if self.back_screen.completed_calendar_events.remove(&old_id) {
+            self.back_screen.completed_calendar_events.insert(new_id);
+            self.back_screen.save_completed_calendar_events();
+        }
+        let prefix = format!("{old_id}:");
+        let matching: Vec<String> = self
+            .home_checked_checklist_items
+            .iter()
+            .filter(|k| k.starts_with(&prefix))
+            .cloned()
+            .collect();
+        if !matching.is_empty() {
+            for k in matching {
+                self.home_checked_checklist_items.remove(&k);
+                if let Some((_, item)) = k.split_once(':') {
+                    self.home_checked_checklist_items
+                        .insert(format!("{new_id}:{item}"));
+                }
+            }
+            if let Err(error) = self.save_home_checked_checklist_items() {
+                self.back_screen.stepos_suite_error = Some(format!("日程已更新，但清单状态迁移未保存：{error:#}"));
+            }
+        }
+    }
+
+    pub(super) fn remove_calendar_event_state(&mut self, event_id: i64) {
+        self.ensure_calendar_state_scope();
+        if self.back_screen.completed_calendar_events.remove(&event_id) {
+            self.back_screen.save_completed_calendar_events();
+        }
+        let prefix = format!("{event_id}:");
+        let before = self.home_checked_checklist_items.len();
+        self.home_checked_checklist_items
+            .retain(|k| !k.starts_with(&prefix));
+        if self.home_checked_checklist_items.len() != before {
+            if let Err(error) = self.save_home_checked_checklist_items() {
+                self.back_screen.stepos_suite_error = Some(format!("日程已移除，但清单状态清理未保存：{error:#}"));
+            }
+        }
+    }
+
+    pub(super) fn reconcile_calendar_event_states_from_descriptions(&mut self) {
+        self.ensure_calendar_state_scope();
+        let mut completed_changed = false;
+        let mut checklist_changed = false;
+        for ev in &self.back_screen.stepos_suite.calendar_events {
+            // Legacy metadata has no occurrence identity. Retain it on disk,
+            // but never import one series-wide done flag into all its dates.
+            if self.calendar_event_action_limit(ev.id).is_some() { continue; }
+            for line in ev.description.lines() {
+                let trimmed = line.trim();
+                let Some(rest) = trimmed.strip_prefix(CALENDAR_SYNC_META_PREFIX) else {
+                    continue;
+                };
+                let body = rest.strip_suffix('】').unwrap_or(rest);
+                let Some((status, items)) = body.split_once("｜已勾清单=") else { continue; };
+                let Some(done) = status.strip_prefix("日程状态=").and_then(|s| match s.trim() {
+                    "已完成" => Some(true), "待办" => Some(false), _ => None,
+                }) else { continue; };
+                let items = items.trim();
+                // JSON preserves punctuation and the delimiter inside a real
+                // checklist label. Legacy delimiter-separated phone metadata
+                // remains readable, including all items rather than only one.
+                let parsed: Option<Vec<String>> = if items.starts_with('[') { serde_json::from_str(items).ok() }
+                    else { Some(items.split('｜').filter(|s| !s.trim().is_empty() && s.trim() != "无").map(str::to_string).collect()) };
+                let Some(items) = parsed else { continue; };
+                completed_changed |= if done { self.back_screen.completed_calendar_events.insert(ev.id) }
+                    else { self.back_screen.completed_calendar_events.remove(&ev.id) };
+                let prefix = format!("{}:", ev.id);
+                let next: std::collections::BTreeSet<_> = items.iter().filter(|s| !s.trim().is_empty())
+                    .map(|item| Self::checklist_item_state_key(ev.id, item)).collect();
+                if self.home_checked_checklist_items.iter().filter(|key| key.starts_with(&prefix)).count() != next.len()
+                    || next.iter().any(|key| !self.home_checked_checklist_items.contains(key)) {
+                    self.home_checked_checklist_items.retain(|key| !key.starts_with(&prefix));
+                    self.home_checked_checklist_items.extend(next);
+                    checklist_changed = true;
+                }
+            }
+        }
+        if completed_changed {
+            self.back_screen.save_completed_calendar_events();
+        }
+        if checklist_changed {
+            if let Err(error) = self.save_home_checked_checklist_items() {
+                self.back_screen.stepos_suite_error = Some(format!("手机日程已读取，但清单状态未保存：{error:#}"));
+            }
+        }
+    }
+
+    pub(super) fn sync_calendar_event_state_to_description(&mut self, event_id: i64) {
+        if let Some(reason) = self.calendar_event_action_limit(event_id) {
+            self.status = reason.into();
+            self.error = true;
+            return;
+        }
+        self.ensure_calendar_state_scope();
+        if self.back_screen.calendar_state_scope.is_none() { return; }
+        let event_done = self
+            .back_screen
+            .completed_calendar_events
+            .contains(&event_id);
+        let prefix = format!("{event_id}:");
+        let mut checked_items: Vec<String> = self
+            .home_checked_checklist_items
+            .iter()
+            .filter_map(|k| k.strip_prefix(&prefix))
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty())
+            .collect();
+        checked_items.sort();
+
+        let Some(ev) = self
+            .back_screen
+            .stepos_suite
+            .calendar_events
+            .iter_mut()
+            .find(|e| e.id == event_id)
+        else {
+            return;
+        };
+
+        let base_lines: Vec<&str> = ev
+            .description
+            .lines()
+            .filter(|line| !line.trim().starts_with(CALENDAR_SYNC_META_PREFIX))
+            .collect();
+        let base_desc = base_lines.join("\n").trim().to_string();
+
+        let new_desc = {
+            let meta_line = format!(
+                "{CALENDAR_SYNC_META_PREFIX}日程状态={}｜已勾清单={}】",
+                if event_done { "已完成" } else { "待办" },
+                serde_json::to_string(&checked_items).expect("checklist strings serialize")
+            );
+            if base_desc.is_empty() {
+                meta_line
+            } else {
+                format!("{base_desc}\n{meta_line}")
+            }
+        };
+
+        ev.description = new_desc.clone();
+        if self.prefs.auto_sync_calendar {
+            rewrite_local_calendar_ics(&self.back_screen.stepos_suite.calendar_events);
+        }
+        if !self.demo_mode && event_id > 0 {
+            if let Some(device) = self.selected.clone() {
+                std::thread::spawn(move || {
+                    if let Ok(adb) = Adb::discover() {
+                        let _ = stepx_companion::toolbox::update_phone_calendar_event_description(&adb, &device, event_id, &new_desc);
+                    }
+                });
+            }
+        }
+    }
+
+    pub(super) fn active_smart_preview_slides(&self) -> Vec<bs::SmartDisplaySlide> {
+        let kind = self.back_screen.smart_display_preview_kind;
+        let count = self.back_screen.smart_display_preview_count.max(1);
+        let otp_code = self.back_screen.smart_display_preview_otp.trim().to_string();
+        match self.back_screen.smart_display_preview_mode {
+            0 => self.back_screen.smart_display_live_slides.clone(),
+            1 => vec![bs::SmartDisplaySlide::AppNotification {
+                kind,
+                count,
+                label: format!("{} · {}条", kind.label(), count),
+            }],
+            2 => self.back_screen.smart_display_live_slides.clone(),
+            3 => {
+                if otp_code.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![bs::SmartDisplaySlide::OtpCode {
+                        code: otp_code.clone(),
+                        label: format!("验证码 {otp_code}"),
+                    }]
+                }
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    pub(super) fn apply_smart_preview_to_canvas(&mut self) {
+        let slides = self.active_smart_preview_slides();
+        self.back_screen.native_feature = None;
+        self.back_screen.image_path = None;
+        self.back_screen.source = bs::Source::SmartCarousel(slides.clone());
+        self.back_screen.config.fps = if slides.is_empty() { 6 } else { 1 };
+        self.back_screen.config.duration_secs = if slides.is_empty() {
+            15
+        } else {
+            (slides.len() as u32 * bs::SMART_SLIDE_PROGRESS_CELLS as u32).max(10)
+        };
+        if slides.is_empty() {
+            self.back_screen.title = "旋转太空人".into();
+            self.back_screen.description = "无通知时手机自主待机播放（断开电脑仍生效）".into();
+            self.back_screen.origin = "智能显示 · 手机自主联动".into();
+            self.back_screen.status = "手机伴侣已自主接管背屏通知轮播，也可点击预览应用到手机".into();
+        } else if slides.len() == 1 {
+            match &slides[0] {
+                bs::SmartDisplaySlide::AppNotification { kind, count, .. } => {
+                    let c = (*count).max(1);
+                    self.back_screen.title =
+                        format!("智能显示 · {} ({}条新消息)", kind.label(), c);
+                    self.back_screen.description =
+                        format!("{} · {} 条（手机端自主驱动背屏，断开电脑仍生效）", kind.label(), c);
+                    self.back_screen.origin = "智能显示 · 手机自主联动".into();
+                    self.back_screen.status = "手机伴侣已自主接管背屏通知轮播，也可点击预览应用到手机".into();
+                }
+                bs::SmartDisplaySlide::OtpCode { code, .. } => {
+                    self.back_screen.title = format!("验证码 {code}");
+                    self.back_screen.description = "10 秒倒计时（手机端自主驱动背屏）".into();
+                    self.back_screen.origin = "智能显示 · 手机自主联动".into();
+                    self.back_screen.status = "手机伴侣已自主接管背屏通知轮播，也可点击预览应用到手机".into();
+                }
+            }
+        } else {
+            let badges: Vec<String> = slides.iter().map(|s| s.short_badge()).collect();
+            self.back_screen.title = format!("智能显示 · 轮播 {} 项", slides.len());
+            self.back_screen.description =
+                format!("{}（手机端自主驱动，断开电脑仍生效）", badges.join(" · "));
+            self.back_screen.origin = "智能显示 · 手机自主联动".into();
+            self.back_screen.status = "手机伴侣已自主接管背屏通知轮播，也可点击预览应用到手机".into();
+        }
+        self.back_screen.revision = self.back_screen.revision.wrapping_add(1);
+        self.back_screen.reset_preview();
+        self.back_screen.preview_running = true;
+    }
+
+    pub(super) fn push_current_smart_preview_to_phone(&mut self) {
+        if self.demo_mode {
+            return;
+        }
+        let Some(device) = self.selected.clone() else {
+            return;
+        };
+        let Ok(adb) = Adb::discover() else {
+            return;
+        };
+        let slides = self.active_smart_preview_slides();
+        let brightness = self.back_screen.config.brightness;
+        let invert = self.back_screen.config.invert;
+        let title = self.back_screen.title.clone();
+        self.back_screen.smart_display_last_pushed_slides = Some(slides.clone());
+        self.back_screen.smart_display_active_on_phone = !slides.is_empty();
+        self.back_screen.applied_to_phone = true;
+        self.back_screen.applied_title = title.clone();
+        self.back_screen.applied_status = self.back_screen.description.clone();
+        std::thread::spawn(move || {
+            let _ = bs::push_smart_carousel_to_phone(&adb, &device, &slides, brightness, invert);
+        });
+    }
+
+    pub(super) fn compute_smart_backscreen_slides(
+        &mut self,
+    ) -> (Vec<bs::SmartDisplaySlide>, String) {
+        use super::notification_center_state::{
+            NotificationAlertMode, NotificationPopupWidget, NotificationVisualKind,
+            UnifiedNotificationItem,
+        };
+        if self.notification_center.alert_mode == NotificationAlertMode::Muted
+            || self.push.prefs.scope == stepx_companion::desktop_notify::AlertScope::Muted
+            || self
+                .notification_center
+                .is_snoozed(chrono::Utc::now().timestamp_millis())
+        {
+            self.back_screen.smart_display_preview_otp.clear();
+            return (Vec::new(), "无未读通知 · 旋转太空人".to_string());
+        }
+
+        for item in &self.notification_center.items {
+            if item.unread {
+                self.back_screen
+                    .smart_display_seen_unread_ids
+                    .insert(item.id.clone());
+                self.back_screen.smart_display_cleared_ids.remove(&item.id);
+            } else if self
+                .back_screen
+                .smart_display_seen_unread_ids
+                .contains(&item.id)
+            {
+                self.back_screen
+                    .smart_display_cleared_ids
+                    .insert(item.id.clone());
+            }
+        }
+
+        let prefs = &self.push.prefs;
+        let read_ids = &self.notification_center.read_ids;
+        let is_eligible_item = |item: &UnifiedNotificationItem,
+                                cleared: &std::collections::HashSet<String>,
+                                dismissed: &std::collections::HashSet<String>,
+                                cap_dismissed: &std::collections::HashSet<String>|
+         -> bool {
+            if prefs.effective_popup_mode(&item.package_name)
+                == stepx_companion::desktop_notify::PopupMode::Silent
+            {
+                return false;
+            }
+            !read_ids.contains(&item.id)
+                && !cleared.contains(&item.id)
+                && !dismissed.contains(&item.id)
+                && !cap_dismissed.contains(&item.id)
+                && !matches!(
+                    item.visual,
+                    NotificationVisualKind::AppUpdate
+                        | NotificationVisualKind::TaskReady
+                        | NotificationVisualKind::DeviceLink
+                        | NotificationVisualKind::CompanionInfo
+                )
+        };
+
+        // Strictly use genuinely unread items (`item.unread == true`). Never fabricate from read history!
+        let active_items: Vec<&UnifiedNotificationItem> = self
+            .notification_center
+            .items
+            .iter()
+            .filter(|item| {
+                item.unread
+                    && is_eligible_item(
+                        item,
+                        &self.back_screen.smart_display_cleared_ids,
+                        &self.notification_center.dismissed_ids,
+                        &self.back_screen.dismissed_capsule_ids,
+                    )
+            })
+            .collect();
+
+        let classify_item = |item: &UnifiedNotificationItem| -> bs::SmartMessageIconKind {
+            match item.visual {
+                NotificationVisualKind::WeChat => {
+                    if item.source_badge == "企微" || item.package_name == "com.tencent.wework" {
+                        bs::SmartMessageIconKind::WeWork
+                    } else {
+                        bs::SmartMessageIconKind::WeChat
+                    }
+                }
+                NotificationVisualKind::Feishu => bs::SmartMessageIconKind::Feishu,
+                NotificationVisualKind::DingTalk => bs::SmartMessageIconKind::DingTalk,
+                NotificationVisualKind::SmsOtp => bs::SmartMessageIconKind::SmsOrOtp,
+                NotificationVisualKind::MissedCall => bs::SmartMessageIconKind::PhoneCall,
+                NotificationVisualKind::Express => bs::SmartMessageIconKind::Delivery,
+                NotificationVisualKind::CalendarAlarm => bs::SmartMessageIconKind::GeneralMessage,
+                _ => bs::SmartMessageIconKind::classify_from_source(
+                    &item.source_badge,
+                    &item.title,
+                ),
+            }
+        };
+
+        let mut candidates: Vec<(bs::SmartMessageIconKind, String, Option<String>)> = Vec::new();
+        let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // 1. Collect from genuinely unread notification_center items
+        for item in &active_items {
+            let kind = classify_item(item);
+            let otp = match &item.popup_widget {
+                NotificationPopupWidget::OtpCode { code, .. } if !code.trim().is_empty() => {
+                    Some(code.trim().to_string())
+                }
+                _ => stepx_companion::push::extract_otp_code(&format!(
+                    "{} {}",
+                    item.title, item.summary
+                )),
+            };
+            seen_keys.insert(format!("{:?}::{}", kind, item.title.trim()));
+            candidates.push((kind, item.title.clone(), otp));
+        }
+
+        // 2. Also collect from genuinely active, unread, non-dismissed, non-ongoing phone statusbar notifications
+        if !cfg!(test) {
+            for notif in &self.push.snapshot.notifications {
+                if !notif.active
+                    || notif.dismissed
+                    || notif.read
+                    || notif.removed_time_ms > 0
+                    || notif.is_ongoing
+                    || self.push.prefs.effective_popup_mode(&notif.package_name)
+                        == stepx_companion::desktop_notify::PopupMode::Silent
+                {
+                    continue;
+                }
+                let raw_key = format!("raw-notif:{}", notif.key);
+                if self.back_screen.smart_display_cleared_ids.contains(&raw_key) {
+                    continue;
+                }
+                let pkg = notif.package_name.trim();
+                if matches!(
+                    pkg,
+                    "android"
+                        | "com.android.systemui"
+                        | "com.stepx.companion.app"
+                        | "com.android.vending"
+                        | "com.android.chrome"
+                        | "com.android.alarmclock"
+                        | "com.stepos.appstore"
+                        | "com.stepos.ailauncher"
+                ) || stepx_companion::push::is_system_or_lockscreen_title(&notif.title)
+                {
+                    continue;
+                }
+                let kind = bs::SmartMessageIconKind::classify_from_source(
+                    &format!("{} {}", notif.package_name, notif.app_name),
+                    &format!("{} {}", notif.title, notif.text),
+                );
+                let otp = notif
+                    .otp_code
+                    .clone()
+                    .filter(|c| !c.trim().is_empty())
+                    .or_else(|| {
+                        stepx_companion::push::extract_otp_code(&format!(
+                            "{} {}",
+                            notif.title, notif.text
+                        ))
+                    });
+                let dedup = format!("{:?}::{}", kind, notif.title.trim());
+                if seen_keys.insert(dedup) {
+                    candidates.push((kind, notif.title.clone(), otp));
+                }
+            }
+        }
+
+        let slides = bs::build_prioritized_smart_slides(&candidates);
+        self.back_screen.smart_display_preview_otp = slides
+            .iter()
+            .find_map(|s| match s {
+                bs::SmartDisplaySlide::OtpCode { code, .. } => Some(code.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+
+        let summary = if slides.is_empty() {
+            "无未读通知 · 旋转太空人".to_string()
+        } else {
+            let badges: Vec<String> = slides.iter().map(|s| s.short_badge()).collect();
+            badges.join(" · ")
+        };
+
+        (slides, summary)
+    }
+
+    pub(super) fn compute_smart_backscreen_target(
+        &self,
+    ) -> Option<(bs::SmartMessageIconKind, u32, String)> {
+        use super::notification_center_state::{NotificationAlertMode, NotificationVisualKind};
+        if self.notification_center.alert_mode == NotificationAlertMode::Muted
+            || self.push.prefs.scope == stepx_companion::desktop_notify::AlertScope::Muted
+            || self
+                .notification_center
+                .is_snoozed(chrono::Utc::now().timestamp_millis())
+        {
+            return None;
+        }
+        if self.back_screen.smart_display_live_slides.is_empty() {
+            let unread_count = self
+                .notification_center
+                .items
+                .iter()
+                .filter(|item| {
+                    item.unread
+                        && !self.notification_center.read_ids.contains(&item.id)
+                        && self.push.prefs.effective_popup_mode(&item.package_name)
+                            != stepx_companion::desktop_notify::PopupMode::Silent
+                        && !matches!(
+                            item.visual,
+                            NotificationVisualKind::AppUpdate
+                                | NotificationVisualKind::TaskReady
+                                | NotificationVisualKind::DeviceLink
+                                | NotificationVisualKind::CompanionInfo
+                        )
+                })
+                .count() as u32;
+            if unread_count == 0 {
+                return None;
+            }
+            return Some((
+                self.back_screen.smart_display_live_kind,
+                unread_count,
+                self.back_screen.smart_display_live_summary.clone(),
+            ));
+        }
+        Some((
+            self.back_screen.smart_display_live_kind,
+            self.back_screen.smart_display_live_count.max(1),
+            self.back_screen.smart_display_live_summary.clone(),
+        ))
+    }
+
+    pub(super) fn sync_smart_backscreen_display(&mut self) {
+        let (slides, summary) = self.compute_smart_backscreen_slides();
+        self.back_screen.smart_display_live_slides = slides.clone();
+        if !slides.is_empty() {
+            let total_count: u32 = slides
+                .iter()
+                .map(|s| match s {
+                    bs::SmartDisplaySlide::AppNotification { count, .. } => (*count).max(1),
+                    bs::SmartDisplaySlide::OtpCode { .. } => 1,
+                })
+                .sum();
+            let primary_kind = slides
+                .iter()
+                .find_map(|s| match s {
+                    bs::SmartDisplaySlide::AppNotification { kind, .. } => Some(*kind),
+                    bs::SmartDisplaySlide::OtpCode { .. } => None,
+                })
+                .unwrap_or(bs::SmartMessageIconKind::SmsOrOtp);
+            self.back_screen.smart_display_live_kind = primary_kind;
+            self.back_screen.smart_display_live_count = total_count.max(1);
+            self.back_screen.smart_display_live_summary = summary.clone();
+        } else {
+            self.back_screen.smart_display_live_count = 0;
+            self.back_screen.smart_display_live_summary = if self.back_screen.smart_display_enabled
+                && self.back_screen.auto_notify_flash
+            {
+                summary.clone()
+            } else {
+                "已关闭".into()
+            };
+        }
+
+        let autonomous_cfg = (
+            self.back_screen.smart_display_enabled,
+            self.back_screen.auto_notify_flash,
+            self.back_screen.config.brightness,
+            self.back_screen.config.invert,
+        );
+        if !self.demo_mode {
+            if let Some(device) = self.selected.clone() {
+                if self.back_screen.last_synced_autonomous_cfg != Some(autonomous_cfg) {
+                    self.back_screen.last_synced_autonomous_cfg = Some(autonomous_cfg);
+                    if let Ok(adb) = Adb::discover() {
+                        std::thread::spawn(move || {
+                            let _ = bs::sync_phone_autonomous_smart_backscreen(
+                                &adb,
+                                &device,
+                                autonomous_cfg.0,
+                                autonomous_cfg.1,
+                                autonomous_cfg.2,
+                                autonomous_cfg.3,
+                            );
+                        });
+                    }
+                }
+            }
+        }
+
+        if !self.back_screen.smart_display_enabled || !self.back_screen.auto_notify_flash {
+            if self.back_screen.smart_display_active_on_phone {
+                self.back_screen.smart_display_active_on_phone = false;
+                self.back_screen.smart_display_last_pushed = None;
+                self.back_screen.smart_display_last_pushed_slides = None;
+            }
+            return;
+        }
+        if self.back_screen.pomodoro_active || self.back_screen.playing {
+            return;
+        }
+
+        if !slides.is_empty() {
+            let primary_kind = self.back_screen.smart_display_live_kind;
+            let total_count = self.back_screen.smart_display_live_count;
+            if self.back_screen.tab == 5 && self.back_screen.smart_display_preview_mode == 0 {
+                self.back_screen.smart_display_preview_kind = primary_kind;
+                self.apply_smart_preview_to_canvas();
+            }
+            if self.back_screen.smart_display_last_pushed_slides.as_ref() == Some(&slides) {
+                return;
+            }
+            self.back_screen.smart_display_last_pushed = Some((primary_kind, total_count));
+            self.back_screen.smart_display_last_pushed_slides = Some(slides.clone());
+            self.back_screen.smart_display_active_on_phone = true;
+            self.back_screen.applied_to_phone = true;
+            self.back_screen.applied_title = if slides.len() == 1 {
+                match &slides[0] {
+                    bs::SmartDisplaySlide::AppNotification { kind, count, .. } => {
+                        format!("智能显示 · {} ({}条新消息)", kind.label(), (*count).max(1))
+                    }
+                    bs::SmartDisplaySlide::OtpCode { code, .. } => {
+                        format!("验证码 {code}")
+                    }
+                }
+            } else {
+                format!(
+                    "智能显示 · 轮播 {} 项 ({}条新消息)",
+                    slides.len(),
+                    total_count
+                )
+            };
+            self.back_screen.applied_status =
+                format!("{summary} · 手机端伴侣自主驱动背屏（断开电脑仍生效）");
+        } else {
+            if self.back_screen.tab == 5 && self.back_screen.smart_display_preview_mode == 0 {
+                self.apply_smart_preview_to_canvas();
+            }
+            if self.back_screen.smart_display_active_on_phone {
+                self.back_screen.smart_display_active_on_phone = false;
+                self.back_screen.smart_display_last_pushed = None;
+                self.back_screen.smart_display_last_pushed_slides = None;
+                self.back_screen.applied_title = "旋转太空人".into();
+                self.back_screen.applied_status =
+                    "无通知自动待机 · 手机端自主接管（断开电脑仍生效）".into();
+            }
+        }
+    }
+}
+
+pub(super) const CALENDAR_SYNC_META_PREFIX: &str =
+    "【双端日程协同状态同步记录｜由桌面伴侣自动维护此状态标记行请勿手动删除或拆分｜跨端日程与清单完成度实时同步元数据标记行｜";
+
+pub(super) fn persist_calendar_state(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write;
+    let parent = path.parent().ok_or_else(|| anyhow::anyhow!("日程状态路径无效"))?;
+    std::fs::create_dir_all(parent)?;
+    anyhow::ensure!(!parent.is_symlink() && !path.is_symlink(), "日程状态路径不能是链接");
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    temp.write_all(bytes)?;
+    temp.as_file().sync_all()?;
+    temp.persist(path)?;
+    Ok(())
+}
+
+fn editable_calendar_time_label(ev: &stepx_companion::toolbox::PhoneCalendarEvent) -> String {
+    use chrono::TimeZone;
+    if ev.all_day {
+        return "全天".to_string();
+    }
+    let start_hm = ev.hm_label();
+    if ev.dtend > ev.dtstart {
+        let end_hm = chrono::Local
+            .timestamp_millis_opt(ev.dtend)
+            .single()
+            .map(|dt| dt.format("%H:%M").to_string())
+            .unwrap_or_default();
+        if !end_hm.is_empty() && end_hm != start_hm {
+            return format!("{start_hm}-{end_hm}");
+        }
+    }
+    start_hm
+}
+
+fn normalize_calendar_time_input(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "全天" || trimmed.eq_ignore_ascii_case("allday") {
+        return trimmed.to_string();
+    }
+    // Strip optional date/day prefix such as "今天 14:00–15:30" or "10月31日 09:30"
+    if let Some((_, tail)) = trimmed.rsplit_once(' ') {
+        if tail.contains(':') || tail.contains('：') {
+            return tail.trim().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+fn rotate_dynamic_image_by_deg(img: image::DynamicImage, deg: u16) -> image::DynamicImage {
+    match deg % 360 {
+        90 => img.rotate90(),
+        180 => img.rotate180(),
+        270 => img.rotate270(),
+        _ => img,
+    }
+}
+
+fn save_image_matching_path_format(
+    img: &image::DynamicImage,
+    path: &std::path::Path,
+) -> image::ImageResult<()> {
+    let is_jpeg = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "jpg" | "jpeg"))
+        .unwrap_or(false);
+    if is_jpeg {
+        img.to_rgb8().save(path)
+    } else {
+        img.save(path)
+    }
+}
+
+fn parse_bridge_calendar_events(
+    val: &serde_json::Value,
+) -> Option<Vec<stepx_companion::toolbox::PhoneCalendarEvent>> {
+    val.get("calendar_events")?.as_array()?;
+    Some(stepx_companion::toolbox::parse_bridge_calendar_events(val))
+}
+
+fn parse_bridge_alarms(
+    val: &serde_json::Value,
+) -> Option<Vec<stepx_companion::toolbox::PhoneAlarmItem>> {
+    let arr = val.get("alarms")?.as_array()?;
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        let message = item
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if message.contains("StepX自动化验证")
+            || message.contains("StepX E2E")
+            || stepx_companion::home_hub::is_synthetic_e2e_probe_text(&message)
+        {
+            continue;
+        }
+        out.push(stepx_companion::toolbox::PhoneAlarmItem {
+            id: item.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
+            hour: item.get("hour").and_then(|v| v.as_u64()).unwrap_or(8) as u8,
+            minutes: item.get("minutes").and_then(|v| v.as_u64()).unwrap_or(0) as u8,
+            enabled: item
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
+            days_of_week: item
+                .get("days_of_week")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32,
+            vibrate: item
+                .get("vibrate")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
+            message,
+        });
+    }
+    Some(out)
+}
+
+fn create_phone_calendar_event_preserving_details(
+    adb: &Adb,
+    device: &Device,
+    title: &str,
+    start_ms: i64,
+    end_ms: i64,
+    all_day: bool,
+    location: &str,
+    description: &str,
+    sync_desktop_calendar: bool,
+    y: i32,
+    m: u32,
+    d: u32,
+) -> anyhow::Result<(
+    i64,
+    Vec<stepx_companion::toolbox::PhoneCalendarEvent>,
+    String,
+)> {
+    let clean_title = if title.trim().is_empty() {
+        "StepX 桌面新建日程"
+    } else {
+        title.trim()
+    };
+    let clean_desc = if description.trim().is_empty() {
+        "由 StepX 桌面端直接同步创建"
+    } else {
+        description.trim()
+    };
+    let clean_loc = location.trim();
+
+    let desktop_saved = if sync_desktop_calendar {
+        stepx_companion::toolbox::save_desktop_calendar_event(
+            clean_title,
+            start_ms,
+            end_ms,
+            clean_desc,
+        )
+        .is_ok()
+    } else {
+        false
+    };
+
+    let req = serde_json::json!({
+        "op": "calendar_create",
+        "title": clean_title,
+        "description": clean_desc,
+        "location": clean_loc,
+        "start_ms": start_ms,
+        "end_ms": end_ms,
+        "all_day": all_day,
+    });
+    let (created_id, mut events) = match stepx_companion::bridge::call_bridge(
+        adb,
+        device,
+        &req,
+        Duration::from_secs(10),
+    ) {
+        Ok(val)
+            if val
+                .get("created_id")
+                .or_else(|| val.get("id"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0)
+                > 0
+                || val.get("calendar_events").is_some() =>
+        {
+            let id = val
+                .get("created_id")
+                .or_else(|| val.get("id"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let evs = parse_bridge_calendar_events(&val).unwrap_or_else(|| {
+                stepx_companion::toolbox::inspect_stepos_ai_suite(adb, device)
+                    .map(|s| s.calendar_events)
+                    .unwrap_or_default()
+            });
+            (id, evs)
+        }
+        _ => {
+            let (id, evs, _) = stepx_companion::toolbox::create_phone_calendar_event(
+                adb,
+                device,
+                clean_title,
+                start_ms,
+                end_ms,
+                clean_desc,
+            )?;
+            (id, evs)
+        }
+    };
+
+    if created_id > 0 && (!clean_loc.is_empty() || all_day) {
+        if let Ok(transport) = device.resolve_active_transport(adb) {
+            let mut args = vec![
+                "content".to_string(),
+                "update".to_string(),
+                "--uri".to_string(),
+                format!("content://com.android.calendar/events/{created_id}"),
+            ];
+            if !clean_loc.is_empty() {
+                let safe_loc = clean_loc.replace('\'', "'\\''");
+                args.push("--bind".to_string());
+                args.push(format!("eventLocation:s:'{safe_loc}'"));
+            }
+            if all_day {
+                args.push("--bind".to_string());
+                args.push("allDay:i:1".to_string());
+            }
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let _ = adb.shell(&transport, &arg_refs);
+        }
+    }
+
+    if let Some(ev) = events.iter_mut().find(|e| {
+        (created_id > 0 && e.id == created_id)
+            || (e.title == clean_title && (e.dtstart - start_ms).abs() < 60_000)
+    }) {
+        ev.all_day = all_day;
+        if ev.location.trim().is_empty() && !clean_loc.is_empty() {
+            ev.location = clean_loc.to_string();
+        }
+        if ev.description.trim().is_empty() && !clean_desc.is_empty() {
+            ev.description = clean_desc.to_string();
+        }
+    } else {
+        events.push(stepx_companion::toolbox::PhoneCalendarEvent {
+            recurring: Some(false),
+            id: if created_id > 0 {
+                created_id
+            } else {
+                start_ms / 1000
+            },
+            title: clean_title.to_string(),
+            dtstart: start_ms,
+            dtend: end_ms,
+            all_day,
+            location: clean_loc.to_string(),
+            description: clean_desc.to_string(),
+            source: if sync_desktop_calendar {
+                "双端已同步".to_string()
+            } else {
+                "手机日历".to_string()
+            },
+        });
+        events.sort_by_key(|e| e.dtstart);
+    }
+
+    let note = if desktop_saved {
+        format!("已在手机与电脑日历同步保存 {y}-{m:02}-{d:02} 日程：「{clean_title}」")
+    } else {
+        format!("已在手机日历保存 {y}-{m:02}-{d:02} 日程：「{clean_title}」")
+    };
+    Ok((created_id, events, note))
+}
+
+fn create_phone_alarm_preserving_details(
+    adb: &Adb,
+    device: &Device,
+    hour: u8,
+    minutes: u8,
+    label: &str,
+    days_of_week: u32,
+    vibrate: bool,
+) -> anyhow::Result<(i64, Vec<stepx_companion::toolbox::PhoneAlarmItem>, String)> {
+    let clean_label = if label.trim().is_empty() {
+        "StepX 桌面提醒"
+    } else {
+        label.trim()
+    };
+
+    let req = serde_json::json!({
+        "op": "alarm_create",
+        "hour": hour.clamp(0, 23),
+        "minutes": minutes.clamp(0, 59),
+        "days_of_week": days_of_week,
+        "vibrate": vibrate,
+        "label": clean_label,
+    });
+    let (created_id, mut alarms) = match stepx_companion::bridge::call_bridge(
+        adb,
+        device,
+        &req,
+        Duration::from_secs(10),
+    ) {
+        Ok(val)
+            if val
+                .get("created_id")
+                .or_else(|| val.get("id"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0)
+                > 0
+                || val.get("alarms").is_some() =>
+        {
+            let id = val
+                .get("created_id")
+                .or_else(|| val.get("id"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let items = parse_bridge_alarms(&val).unwrap_or_else(|| {
+                stepx_companion::toolbox::inspect_stepos_ai_suite(adb, device)
+                    .map(|s| s.alarms)
+                    .unwrap_or_default()
+            });
+            (id, items)
+        }
+        _ => {
+            let (id, items, _) = stepx_companion::toolbox::create_phone_alarm(
+                adb,
+                device,
+                hour,
+                minutes,
+                clean_label,
+            )?;
+            (id, items)
+        }
+    };
+
+    if created_id > 0 && (!vibrate || days_of_week != 0) {
+        if let Ok(transport) = device.resolve_active_transport(adb) {
+            for uri in [
+                format!("content://com.android.alarmclock/alarms/{created_id}"),
+                format!("content://com.android.deskclock/alarms/{created_id}"),
+            ] {
+                let mut args = vec![
+                    "content".to_string(),
+                    "update".to_string(),
+                    "--uri".to_string(),
+                    uri,
+                ];
+                if !vibrate {
+                    args.push("--bind".to_string());
+                    args.push("vibrate:i:0".to_string());
+                }
+                if days_of_week != 0 {
+                    args.push("--bind".to_string());
+                    args.push(format!("daysofweek:i:{days_of_week}"));
+                }
+                let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                let _ = adb.shell(&transport, &arg_refs);
+            }
+        }
+    }
+
+    if let Some(existing) = alarms.iter_mut().find(|a| {
+        (created_id > 0 && a.id == created_id)
+            || (a.hour == hour.clamp(0, 23) && a.minutes == minutes.clamp(0, 59))
+    }) {
+        existing.days_of_week = days_of_week;
+        existing.vibrate = vibrate;
+        existing.enabled = true;
+        if existing.message.trim().is_empty() {
+            existing.message = clean_label.to_string();
+        }
+    } else {
+        alarms.push(stepx_companion::toolbox::PhoneAlarmItem {
+            id: if created_id > 0 { created_id } else { 1 },
+            hour: hour.clamp(0, 23),
+            minutes: minutes.clamp(0, 59),
+            enabled: true,
+            days_of_week,
+            vibrate,
+            message: clean_label.to_string(),
+        });
+        alarms.sort_by_key(|a| (a.hour as u16) * 60 + (a.minutes as u16));
+    }
+
+    Ok((
+        created_id,
+        alarms,
+        format!(
+            "已在手机时钟创建 {:02}:{:02} 闹钟：「{clean_label}」",
+            hour.clamp(0, 23),
+            minutes.clamp(0, 59)
+        ),
+    ))
 }
 
 fn native_from_key(key: &str) -> Option<bs::NativeFeature> {
@@ -4176,6 +7128,212 @@ fn recent_images() -> Vec<PathBuf> {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    #[test]
+    fn recurring_calendar_actions_cannot_modify_a_whole_series_or_reuse_legacy_done_flags() {
+        facloud_ui::App::test((), |mut app| async move {
+            let (_, owner) = app.add_window(facloud_ui::platform::WindowStyle::NotStealFocus,
+                |_| Companion::new_for_test());
+            owner.update(&mut app, |view, ctx| {
+                view.demo_mode = true;
+                let start = chrono::Local::now().timestamp_millis() + 3_600_000;
+                let series = stepx_companion::toolbox::PhoneCalendarEvent {
+                    id: 71, title: "周期项目周会".into(), dtstart: start,
+                    dtend: start + 3_600_000, recurring: Some(true), ..Default::default()
+                };
+                let ordinary = stepx_companion::toolbox::PhoneCalendarEvent {
+                    id: 72, title: "单次评审".into(), recurring: Some(false), ..series.clone()
+                };
+                view.back_screen.stepos_suite.calendar_events = vec![series.clone(), ordinary];
+                view.ensure_calendar_state_scope();
+                view.back_screen.completed_calendar_events.insert(series.id);
+                view.fields[F_PHONE_SCHEDULE_TITLE].set("保留原草稿");
+                let date = series.date_ymd();
+                for action in [
+                    BackScreenAction::CalendarDelete(71), BackScreenAction::CalendarToggleDone(71),
+                    BackScreenAction::CalendarEditEvent(71), BackScreenAction::CalendarPostponeOneDay(71),
+                    BackScreenAction::CalendarDuplicateToTomorrow(71),
+                    BackScreenAction::CalendarSendReminderToPhone(71),
+                    BackScreenAction::CalendarClearDay(date.0, date.1, date.2),
+                ] {
+                    let before = view.back_screen.stepos_suite.calendar_events.clone();
+                    assert!(view.do_backscreen_action(&action, ctx).is_err(), "{action:?}");
+                    assert_eq!(view.back_screen.stepos_suite.calendar_events, before);
+                    assert_eq!(view.fields[F_PHONE_SCHEDULE_TITLE].text, "保留原草稿");
+                }
+                assert!(view.back_screen.completed_calendar_events.contains(&71), "legacy storage is preserved");
+                assert!(!view.calendar_event_is_completed(&series), "a series id cannot complete future occurrences");
+                let spec = stepx_companion::home_reminder_governance::ReminderTargetSpec::new(
+                    "cal:71", stepx_companion::home_reminder_governance::ReminderCategory::ScheduleAndMeeting,
+                    "周期项目周会");
+                view.reminder_governance.manual_expire(spec, start - 3_600_000);
+                assert!(series.is_valid_unexpired_at(start - 1000,
+                    &view.back_screen.completed_calendar_events, &view.reminder_governance));
+                assert!(view.do_backscreen_action(&BackScreenAction::CalendarEditEvent(72), ctx).is_ok());
+                assert_eq!(view.back_screen.editing_calendar_event_id, Some(72));
+                assert_eq!(view.fields[F_PHONE_SCHEDULE_TITLE].text, "单次评审");
+            });
+        });
+    }
+
+    #[test]
+    fn duplicate_instances_are_ambiguous_even_when_old_sources_have_no_rule_metadata() {
+        let mut view = Companion::new_for_test();
+        view.demo_mode = false;
+        let event = stepx_companion::toolbox::PhoneCalendarEvent {
+            id: 82, title: "项目周会".into(), dtstart: 1794016800000,
+            source: "手机日历".into(), ..Default::default()
+        };
+        view.back_screen.stepos_suite.calendar_events = vec![event.clone()];
+        assert!(view.calendar_event_action_limit(82).unwrap().contains("刷新"));
+        view.back_screen.stepos_suite.calendar_events.push(stepx_companion::toolbox::PhoneCalendarEvent {
+            dtstart: event.dtstart + 7 * 86_400_000, ..event
+        });
+        assert!(view.calendar_event_action_limit(82).unwrap().contains("重复日程"));
+    }
+    #[test]
+    fn pomodoro_lane_skips_queued_start_and_stop_when_a_newer_request_exists() {
+        let lane = PomodoroCommandLane::default();
+        let first_start = lane.advance();
+        let stop = lane.advance();
+        assert!(lane.run_if_current(first_start, || panic!("stale start executed")).is_none());
+        assert_eq!(lane.run_if_current(stop, || "stop"), Some("stop"));
+        let pending_stop = lane.advance();
+        let restart = lane.advance();
+        assert!(lane.run_if_current(pending_stop, || panic!("stale stop executed")).is_none());
+        assert_eq!(lane.run_if_current(restart, || "restart"), Some("restart"));
+    }
+
+    #[test]
+    fn pomodoro_lane_serializes_inflight_start_before_stop_even_across_state_reset() {
+        let state = BackScreenUiState::default();
+        let old_lane = state.pomodoro_lane.clone();
+        let start = old_lane.advance();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let start_order = order.clone();
+        let starting = std::thread::spawn(move || old_lane.run_if_current(start, || {
+            start_order.lock().unwrap().push("start");
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            start_order.lock().unwrap().push("start-finished");
+        }));
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The UI thread can invalidate the previous state and enqueue a stop while the
+        // start worker holds the gate; neither state drop nor advance takes that mutex.
+        drop(state);
+        let next_state = BackScreenUiState::default();
+        let next_lane = next_state.pomodoro_lane.clone();
+        let stop = next_lane.advance();
+        let stop_order = order.clone();
+        let stopping = std::thread::spawn(move || next_lane.run_if_current(stop, || {
+            stop_order.lock().unwrap().push("stop");
+        }));
+        release_tx.send(()).unwrap();
+        assert_eq!(starting.join().unwrap(), Some(()));
+        assert_eq!(stopping.join().unwrap(), Some(()));
+        assert_eq!(*order.lock().unwrap(), vec!["start", "start-finished", "stop"]);
+    }
+
+    #[test]
+    fn pomodoro_device_cancellation_and_state_drop_skip_pending_commands() {
+        let mut state = BackScreenUiState::default();
+        let lane = state.pomodoro_lane.clone();
+        let pending = lane.advance();
+        state.pomodoro_request = Some(Instant::now());
+        state.pomodoro_device = Some("previous-phone".into());
+        assert!(state.needs_poll());
+        state.cancel_pomodoro_commands();
+        assert!(state.pomodoro_request.is_none());
+        assert!(state.pomodoro_device.is_none());
+        assert!(lane.run_if_current(pending, || panic!("cancelled command executed")).is_none());
+        let pending_after = lane.advance();
+        drop(state);
+        assert!(lane.run_if_current(pending_after, || panic!("old device command executed")).is_none());
+    }
+
+    #[test]
+    fn offline_phone_mutations_preserve_snapshot_and_drafts() {
+        let mut app = Companion::new_for_test();
+        app.demo_mode = false;
+        app.selected = None;
+        app.back_screen.stepos_suite.controls.brightness_percent = 73;
+        app.back_screen.stepos_suite.controls.dnd_on = true;
+        app.back_screen.editing_alarm_id = Some(42);
+        app.fields[F_ALARM_LABEL].set("保留闹钟草稿");
+        app.fields[F_PHONE_SCHEDULE_TITLE].set("保留日程草稿");
+        for action in [
+            BackScreenAction::TriggerMcpQuickAction("toggle_dnd".into()),
+            BackScreenAction::FillOtpOnPhone("123456".into()),
+            BackScreenAction::CalendarCreatePreset(0),
+            BackScreenAction::CalendarDelete(42),
+            BackScreenAction::CalendarCreateOnSelectedDate(Some("09:00")),
+            BackScreenAction::CalendarClearDay(2026, 10, 29),
+            BackScreenAction::CalendarDuplicateToTomorrow(42),
+            BackScreenAction::CalendarPostponeOneDay(42),
+            BackScreenAction::AlarmCreatePreset(0),
+            BackScreenAction::AlarmCreateCustom,
+            BackScreenAction::AlarmToggle(42, false),
+            BackScreenAction::AlarmDelete(42),
+            BackScreenAction::AlarmShiftMinutes(42, 10),
+            BackScreenAction::AlarmToggleAll(false),
+            BackScreenAction::SetBrightnessPercent(15),
+            BackScreenAction::McpToggleDnd,
+        ] {
+            assert!(app.reject_offline_phone_action(&action), "{action:?}");
+            assert!(app.error);
+            assert!(app.status.contains("尚未执行"));
+            assert_eq!(app.back_screen.stepos_suite.controls.brightness_percent, 73);
+            assert!(app.back_screen.stepos_suite.controls.dnd_on);
+            assert_eq!(app.back_screen.editing_alarm_id, Some(42));
+            assert_eq!(app.fields[F_ALARM_LABEL].text, "保留闹钟草稿");
+            assert_eq!(app.fields[F_PHONE_SCHEDULE_TITLE].text, "保留日程草稿");
+        }
+    }
+
+    #[test]
+    fn offline_local_timer_and_demo_controls_remain_available() {
+        let mut app = Companion::new_for_test();
+        app.demo_mode = false;
+        app.selected = None;
+        assert!(!app.reject_offline_phone_action(&BackScreenAction::StartPomodoro(25)));
+        assert!(!app.reject_offline_phone_action(&BackScreenAction::StopPomodoro));
+        assert!(!app.reject_offline_phone_action(&BackScreenAction::AlarmEdit(42)));
+        app.demo_mode = true;
+        assert!(!app.reject_offline_phone_action(&BackScreenAction::SetBrightnessPercent(15)));
+        assert!(!app.reject_offline_phone_action(&BackScreenAction::AlarmCreatePreset(0)));
+    }
+
+    #[test]
+    fn pomodoro_stop_and_restart_reject_prior_operation_receipts() {
+        let mut state = BackScreenUiState::default();
+        let start = Instant::now();
+        let stop = start + std::time::Duration::from_millis(1);
+        let restart = stop + std::time::Duration::from_millis(1);
+        state.pomodoro_request = Some(stop);
+        assert!(!state.accept_pomodoro_reply(start, "phone-a", Some("phone-a")));
+        assert_eq!(state.pomodoro_request, Some(stop));
+        state.pomodoro_request = Some(restart);
+        assert!(!state.accept_pomodoro_reply(stop, "phone-a", Some("phone-a")));
+        assert_eq!(state.pomodoro_request, Some(restart));
+        assert!(state.accept_pomodoro_reply(restart, "phone-a", Some("phone-a")));
+        assert!(state.pomodoro_request.is_none());
+        assert!(!state.accept_pomodoro_reply(restart, "phone-a", Some("phone-a")));
+    }
+
+    #[test]
+    fn pomodoro_receipts_cannot_cross_device_disconnect_or_state_reset() {
+        let request = Instant::now();
+        let mut state = BackScreenUiState::default();
+        state.pomodoro_request = Some(request);
+        assert!(!state.accept_pomodoro_reply(request, "phone-a", Some("phone-b")));
+        state.pomodoro_request = Some(request);
+        assert!(!state.accept_pomodoro_reply(request, "phone-a", None));
+        state = BackScreenUiState::default();
+        assert!(!state.accept_pomodoro_reply(request, "phone-a", Some("phone-a")));
+    }
+
     #[test]
     fn unopened_module_does_no_preview_or_gallery_work() {
         let state = BackScreenUiState::default();
@@ -4235,5 +7393,559 @@ mod lifecycle_tests {
         assert_eq!(state.preset_filter, 0);
         assert!(state.editing_calendar_event_id.is_none());
         assert!(state.editing_alarm_id.is_none());
+    }
+
+    #[test]
+    fn pomodoro_ticks_on_home_page_and_updates_remaining_secs_and_matrix_frame() {
+        let mut app = Companion::new_for_test();
+        app.page = Page::Home;
+        app.back_screen.pomodoro_active = true;
+        app.back_screen.pomodoro_duration_secs = 1500;
+        app.back_screen.config.duration_secs = 1500;
+        app.back_screen.pomodoro_started_at = Some(Instant::now());
+        app.back_screen.pomodoro_last_remaining_secs = None;
+        app.back_screen.source = bs::Source::Preset(bs::Preset::Countdown);
+        assert!(app.poll_backscreen(false));
+        let initial_frame = app.back_screen.frame.clone();
+        assert_eq!(initial_frame.len(), bs::SLOTS);
+
+        // Advance 65 seconds: Countdown matrix frame (MM:SS) must reflect 23:55 instead of staying at 24:59
+        app.back_screen.pomodoro_started_at = Some(Instant::now() - Duration::from_secs(65));
+        assert!(
+            app.poll_backscreen(false),
+            "poll_backscreen must return true when Pomodoro remaining seconds change even on Page::Home"
+        );
+        let rem = app
+            .back_screen
+            .pomodoro_last_remaining_secs
+            .expect("remaining secs updated");
+        assert!(
+            (1433..=1435).contains(&rem),
+            "expected ~1435 remaining secs, got {rem}"
+        );
+        assert_eq!(app.live_pomodoro_remaining_secs(), rem);
+        assert_eq!(app.back_screen.frame.len(), bs::SLOTS);
+        assert_ne!(
+            app.back_screen.frame, initial_frame,
+            "Countdown matrix frame must advance minutes/seconds as Pomodoro ticks"
+        );
+
+        // Even when visiting Page::BackScreen with preview_running = true, Pomodoro elapsed_ms must not be overwritten
+        app.page = Page::BackScreen;
+        app.back_screen.preview_running = true;
+        let frame_before = app.back_screen.frame.clone();
+        let elapsed_before = app.back_screen.elapsed_ms;
+        app.poll_backscreen(false);
+        assert_eq!(app.back_screen.elapsed_ms, elapsed_before);
+        assert_eq!(app.back_screen.frame, frame_before);
+    }
+
+    #[test]
+    fn calendar_done_and_checklist_items_persist_to_disk_and_write_back_to_event_description() {
+        let _guard = TEST_CONFIG_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let _cfg_guard = super::super::TestUiConfigDirGuard::set(cfg_dir.path());
+
+        let mut app = Companion::new_for_test();
+        app.demo_mode = true;
+        let ev_id = 777i64;
+        let orig_desc = "准备：投影转换器、架构评审胶片、季度预算表";
+        app.back_screen.stepos_suite.calendar_events =
+            vec![stepx_companion::toolbox::PhoneCalendarEvent {
+                recurring: Some(false),
+                id: ev_id,
+                title: "季度复盘会议".into(),
+                dtstart: 1793325600000,
+                dtend: 1793331000000,
+                all_day: false,
+                location: "3 楼 A 会议室".into(),
+                description: orig_desc.into(),
+                source: "手机日历".into(),
+            }];
+
+        let before_items = stepx_companion::home_hub::extract_schedule_checklist(
+            &app.back_screen.stepos_suite.calendar_events[0].description,
+        );
+        assert_eq!(before_items.len(), 3);
+
+        // Toggle checklist item on Home page
+        let key = Companion::checklist_item_state_key(ev_id, &before_items[0]);
+        assert!(app.apply_home_action(&Action::HomeToggleChecklistItem(key.clone()), None));
+        assert!(app.is_checklist_item_checked(ev_id, &before_items[0]));
+
+        // Toggle event done
+        app.back_screen.completed_calendar_events.insert(ev_id);
+        app.back_screen.save_completed_calendar_events();
+        app.sync_calendar_event_state_to_description(ev_id);
+
+        let updated_desc = app.back_screen.stepos_suite.calendar_events[0]
+            .description
+            .clone();
+        assert!(
+            updated_desc.contains("日程状态=已完成"),
+            "event description must contain completion state: {updated_desc}"
+        );
+        assert!(
+            updated_desc.contains(&before_items[0]),
+            "event description must contain checked item: {updated_desc}"
+        );
+        let after_items = stepx_companion::home_hub::extract_schedule_checklist(&updated_desc);
+        assert_eq!(
+            before_items, after_items,
+            "sync metadata in description must not corrupt extracted checklist items"
+        );
+
+        // Reload in a fresh Companion instance and verify both sets persisted
+        let mut reloaded = Companion::new_for_test();
+        reloaded.demo_mode = true;
+        reloaded.ensure_calendar_state_scope();
+        reloaded.back_screen.load_completed_calendar_events();
+        reloaded.load_home_checked_checklist_items();
+        assert!(reloaded
+            .back_screen
+            .completed_calendar_events
+            .contains(&ev_id));
+        assert!(reloaded.is_checklist_item_checked(ev_id, &before_items[0]));
+
+        // Also verify reconcile_calendar_event_states_from_descriptions recovers state from phone event description alone
+        let mut from_phone = Companion::new_for_test();
+        from_phone.demo_mode = true;
+        from_phone.ensure_calendar_state_scope();
+        from_phone.back_screen.completed_calendar_events.clear();
+        from_phone.home_checked_checklist_items.clear();
+        from_phone.back_screen.stepos_suite.calendar_events =
+            vec![stepx_companion::toolbox::PhoneCalendarEvent {
+                recurring: Some(false),
+                id: ev_id,
+                title: "季度复盘会议".into(),
+                dtstart: 1793325600000,
+                dtend: 1793331000000,
+                all_day: false,
+                location: "3 楼 A 会议室".into(),
+                description: updated_desc,
+                source: "手机日历".into(),
+            }];
+        from_phone.reconcile_calendar_event_states_from_descriptions();
+        assert!(from_phone
+            .back_screen
+            .completed_calendar_events
+            .contains(&ev_id));
+        assert!(from_phone.is_checklist_item_checked(ev_id, &before_items[0]));
+
+        // Preserve the human description and keep an explicit empty-state
+        // tombstone, so another desktop can observe cancellation too.
+        assert!(app.apply_home_action(&Action::HomeToggleChecklistItem(key), None));
+        app.back_screen.completed_calendar_events.remove(&ev_id);
+        app.sync_calendar_event_state_to_description(ev_id);
+        let cleared = &app.back_screen.stepos_suite.calendar_events[0].description;
+        assert_eq!(cleared.lines().next(), Some(orig_desc));
+        assert!(cleared.contains("日程状态=待办｜已勾清单=[]"));
+        from_phone.back_screen.stepos_suite.calendar_events = app.back_screen.stepos_suite.calendar_events.clone();
+        from_phone.reconcile_calendar_event_states_from_descriptions();
+        assert!(!from_phone.back_screen.completed_calendar_events.contains(&ev_id));
+        assert!(!from_phone.is_checklist_item_checked(ev_id, &before_items[0]));
+    }
+
+    #[test]
+    fn checklist_save_failure_restores_toggle_and_reports_other_callers() {
+        let _guard = TEST_CONFIG_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cfg = tempfile::tempdir().unwrap();
+        let _cfg_guard = super::super::TestUiConfigDirGuard::set(cfg.path());
+        let mut app = Companion::new_for_test();
+        app.demo_mode = false;
+        app.selected = None;
+        app.ensure_calendar_state_scope();
+        assert!(app.save_home_checked_checklist_items().is_err());
+        // Demo scope ensures this failure test can never send to a phone.
+        app.demo_mode = true;
+        app.prefs.auto_sync_calendar = false;
+        app.ensure_calendar_state_scope();
+        let path = app.home_checked_checklist_items_path().unwrap();
+        // A directory at the destination fails atomic persistence even as root.
+        std::fs::create_dir_all(&path).unwrap();
+        let key = Companion::checklist_item_state_key(7, "检查材料");
+        app.back_screen.stepos_suite.calendar_events = vec![stepx_companion::toolbox::PhoneCalendarEvent {
+            id: 7, description: "原始日程内容".into(), ..Default::default()
+        }];
+        for initially_checked in [false, true] {
+            app.home_checked_checklist_items.clear();
+            app.home_checked_checklist_items.insert("8:其他事项".into());
+            if initially_checked { app.home_checked_checklist_items.insert(key.clone()); }
+            let before = app.home_checked_checklist_items.clone();
+            assert!(app.apply_home_action(&Action::HomeToggleChecklistItem(key.clone()), None));
+            assert_eq!(app.home_checked_checklist_items, before);
+            assert!(app.error && app.status.contains("未保存"));
+            assert_eq!(app.back_screen.stepos_suite.calendar_events[0].description, "原始日程内容",
+                "failed persistence must return before description/phone synchronization");
+        }
+        app.back_screen.stepos_suite_error = None;
+        app.migrate_calendar_event_state(7, 9);
+        assert!(app.back_screen.stepos_suite_error.as_deref().unwrap().contains("迁移未保存"));
+        app.back_screen.stepos_suite_error = None;
+        app.remove_calendar_event_state(9);
+        assert!(app.back_screen.stepos_suite_error.as_deref().unwrap().contains("清理未保存"));
+        app.back_screen.stepos_suite_error = None;
+        app.back_screen.stepos_suite.calendar_events[0].description =
+            format!("{CALENDAR_SYNC_META_PREFIX}日程状态=待办｜已勾清单=[\"手机清单项\"]】");
+        app.reconcile_calendar_event_states_from_descriptions();
+        assert!(app.back_screen.stepos_suite_error.as_deref().unwrap().contains("清单状态未保存"));
+        assert!(path.is_dir(), "the failed save must not replace the existing destination");
+    }
+
+    #[test]
+    fn calendar_state_is_scoped_to_phone_and_legacy_owner_is_not_guessed() {
+        let _guard = TEST_CONFIG_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cfg = tempfile::tempdir().unwrap();
+        let _cfg_guard = super::super::TestUiConfigDirGuard::set(cfg.path());
+        let legacy = cfg.path().join("stepx-companion");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("completed-calendar-events.json"), "[7]").unwrap();
+        std::fs::write(legacy.join("home-checked-checklist-items.json"), "[\"护照\"]").unwrap();
+        let mut app = Companion::new_for_test();
+        app.demo_mode = false;
+        app.selected = Some(Device { serial: "calendar-phone-a".into(), ..Default::default() });
+        app.ensure_calendar_state_scope();
+        assert!(app.back_screen.completed_calendar_events.is_empty());
+        assert!(!app.is_checklist_item_checked(7, "护照"));
+        app.back_screen.completed_calendar_events.insert(7);
+        app.home_checked_checklist_items.insert(Companion::checklist_item_state_key(7, "护照"));
+        app.back_screen.save_completed_calendar_events();
+        app.save_home_checked_checklist_items().unwrap();
+        let phone_a_path = app.back_screen.completed_calendar_events_path();
+        app.selected = Some(Device { serial: "calendar-phone-b".into(), ..Default::default() });
+        app.ensure_calendar_state_scope();
+        assert_ne!(app.back_screen.completed_calendar_events_path(), phone_a_path);
+        assert!(!app.back_screen.completed_calendar_events.contains(&7));
+        assert!(!app.is_checklist_item_checked(7, "护照"));
+        app.home_checked_checklist_items.insert("护照".into());
+        assert!(!app.is_checklist_item_checked(8, "护照"), "A bare label cannot mark another event complete");
+        app.selected = Some(Device { serial: "calendar-phone-a".into(), ..Default::default() });
+        app.ensure_calendar_state_scope();
+        assert!(app.back_screen.completed_calendar_events.contains(&7));
+        assert!(app.is_checklist_item_checked(7, "护照"));
+        app.selected = None;
+        app.ensure_calendar_state_scope();
+        assert!(app.back_screen.completed_calendar_events.is_empty());
+        assert!(app.home_checked_checklist_items.is_empty());
+        assert!(app.back_screen.completed_calendar_events_path().is_none());
+        assert_eq!(std::fs::read_to_string(legacy.join("completed-calendar-events.json")).unwrap(), "[7]");
+        assert_eq!(std::fs::read_to_string(legacy.join("home-checked-checklist-items.json")).unwrap(), "[\"护照\"]");
+    }
+
+    #[test]
+    fn calendar_phone_metadata_restores_all_labels_and_explicit_clears() {
+        let _guard = TEST_CONFIG_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cfg = tempfile::tempdir().unwrap();
+        let _cfg_guard = super::super::TestUiConfigDirGuard::set(cfg.path());
+        let mut app = Companion::new_for_test();
+        app.demo_mode = true;
+        app.ensure_calendar_state_scope();
+        let items = vec!["GPU: 驱动｜版本", "登记、复核", "对照\"引用\""];
+        app.back_screen.completed_calendar_events.insert(7);
+        app.home_checked_checklist_items.extend(items.iter().map(|item| Companion::checklist_item_state_key(7, item)));
+        app.back_screen.stepos_suite.calendar_events = vec![stepx_companion::toolbox::PhoneCalendarEvent {
+            id: 7, description: "准备材料".into(), ..Default::default()
+        }];
+        app.sync_calendar_event_state_to_description(7);
+        app.back_screen.completed_calendar_events.clear();
+        app.home_checked_checklist_items.clear();
+        app.reconcile_calendar_event_states_from_descriptions();
+        for item in &items { assert!(app.is_checklist_item_checked(7, item), "lost label: {item}"); }
+        assert!(app.back_screen.completed_calendar_events.contains(&7));
+        // Legacy phones use a delimiter-separated list. Every item must survive.
+        app.back_screen.stepos_suite.calendar_events[0].description = format!("{CALENDAR_SYNC_META_PREFIX}日程状态=待办｜已勾清单=材料甲｜材料乙｜材料丙】");
+        app.reconcile_calendar_event_states_from_descriptions();
+        assert!(!app.back_screen.completed_calendar_events.contains(&7));
+        for item in ["材料甲", "材料乙", "材料丙"] { assert!(app.is_checklist_item_checked(7, item)); }
+        for item in &items { assert!(!app.is_checklist_item_checked(7, item)); }
+        app.back_screen.stepos_suite.calendar_events[0].description = format!("{CALENDAR_SYNC_META_PREFIX}日程状态=已完成｜已勾清单=[broken】");
+        app.reconcile_calendar_event_states_from_descriptions();
+        assert!(!app.back_screen.completed_calendar_events.contains(&7), "Malformed metadata must not overwrite local state");
+        assert!(app.is_checklist_item_checked(7, "材料乙"));
+        app.back_screen.stepos_suite.calendar_events[0].description = format!("{CALENDAR_SYNC_META_PREFIX}日程状态=待办｜已勾清单=[]】");
+        app.reconcile_calendar_event_states_from_descriptions();
+        assert!(app.home_checked_checklist_items.is_empty());
+    }
+
+    #[test]
+    fn gallery_rotation_persists_to_disk_and_calendar_and_alarm_edits_preserve_metadata() {
+        let _guard = TEST_CONFIG_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let _cfg_guard = super::super::TestUiConfigDirGuard::set(cfg_dir.path());
+
+        let mut app = Companion::new_for_test();
+        app.demo_mode = true;
+
+        // 1. Gallery rotation persists to disk and writes rotated pixels back to both PNG and JPEG files
+        let jpg_path = cfg_dir.path().join("sample_photo.jpg");
+        let mut raw_img = image::RgbImage::new(4, 2);
+        raw_img.put_pixel(0, 0, image::Rgb([255, 0, 0]));
+        raw_img.save(&jpg_path).unwrap();
+        let remote_str = jpg_path.to_string_lossy().into_owned();
+        app.back_screen
+            .insert_gallery_rotation(remote_str.clone(), 90);
+
+        let opened = image::open(&jpg_path).unwrap();
+        let rotated = rotate_dynamic_image_by_deg(opened, 90);
+        save_image_matching_path_format(&rotated, &jpg_path)
+            .expect("saving rotated RGBA/RGB image to .jpg must succeed");
+        let reopened = image::open(&jpg_path).unwrap();
+        assert_eq!((reopened.width(), reopened.height()), (2, 4));
+
+        let mut reloaded_bs = BackScreenUiState::default();
+        reloaded_bs.load_gallery_rotations();
+        assert_eq!(reloaded_bs.gallery_rotations.get(&remote_str), Some(&90));
+
+        // 2. Calendar edit populates editable HH:MM-HH:MM (not date-prefixed time_range_label) and preserves start/end, location, description, all_day
+        let (y, m, d) = (2026, 10, 31);
+        let (orig_start, orig_end) =
+            stepx_companion::toolbox::parse_event_time_range(y, m, d, "14:00-15:30").unwrap();
+        let orig_ev = stepx_companion::toolbox::PhoneCalendarEvent {
+            recurring: Some(false),
+            id: 501,
+            title: "客户方案评审".into(),
+            dtstart: orig_start,
+            dtend: orig_end,
+            all_day: false,
+            location: "上海研发中心 502".into(),
+            description: "准备：合同原件、技术标书、报价明细".into(),
+            source: "双端已同步".into(),
+        };
+        let edit_time_label = editable_calendar_time_label(&orig_ev);
+        assert_eq!(edit_time_label, "14:00-15:30");
+        let (parsed_start, parsed_end) =
+            stepx_companion::toolbox::parse_event_time_range(y, m, d, &edit_time_label).unwrap();
+        assert_eq!(parsed_start, orig_start);
+        assert_eq!(parsed_end, orig_end);
+
+        // Even if a date-prefixed label is passed, normalize_calendar_time_input strips the date prefix
+        let normalized = normalize_calendar_time_input("10月31日 14:00–15:30");
+        assert_eq!(normalized, "14:00–15:30");
+        let (norm_start, norm_end) =
+            stepx_companion::toolbox::parse_event_time_range(y, m, d, &normalized).unwrap();
+        assert_eq!(norm_start, orig_start);
+        assert_eq!(norm_end, orig_end);
+
+        // Custom 90m duration is preserved when user changes start time to "16:00" without range
+        let time_str = "16:00";
+        let (dtstart, mut dtend) =
+            stepx_companion::toolbox::parse_event_time_range(y, m, d, time_str).unwrap();
+        let has_explicit_range = time_str.contains('-');
+        let prev_dur = orig_ev.dtend - orig_ev.dtstart;
+        if prev_dur > 0 && !has_explicit_range {
+            dtend = dtstart + prev_dur;
+        }
+        assert_eq!(dtend - dtstart, 90 * 60_000);
+
+        // 3. Bridge JSON parsing for calendarCreate and alarmCreate matches Bridge.java's {"created_id": ...} schema
+        let cal_json = serde_json::json!({
+            "created_id": 888,
+            "calendar_events": [{
+                "id": 888,
+                "title": "客户方案评审",
+                "dtstart": orig_start,
+                "dtend": orig_end,
+                "all_day": false,
+                "location": "上海研发中心 502",
+                "description": "准备：合同原件",
+                "source": "手机日历"
+            }]
+        });
+        let parsed_evs = parse_bridge_calendar_events(&cal_json).unwrap();
+        assert_eq!(parsed_evs.len(), 1);
+        assert_eq!(parsed_evs[0].id, 888);
+        assert_eq!(parsed_evs[0].location, "上海研发中心 502");
+
+        let alarm_json = serde_json::json!({
+            "created_id": 302,
+            "alarms": [{
+                "id": 302,
+                "hour": 7,
+                "minutes": 30,
+                "enabled": true,
+                "days_of_week": 31,
+                "vibrate": false,
+                "message": "工作日早起"
+            }]
+        });
+        let parsed_alarms = parse_bridge_alarms(&alarm_json).unwrap();
+        assert_eq!(parsed_alarms.len(), 1);
+        assert_eq!(parsed_alarms[0].id, 302);
+        assert_eq!(parsed_alarms[0].days_of_week, 0x1f);
+        assert!(!parsed_alarms[0].vibrate);
+    }
+
+    #[test]
+    fn smart_backscreen_display_links_push_bar_single_and_multi_unread_messages() {
+        use super::super::notification_center_state::{
+            NotificationCategory, NotificationPopupWidget, NotificationPriority,
+            NotificationVisualKind, UnifiedNotificationItem,
+        };
+        let mut app = Companion::new_for_test();
+        app.demo_mode = true;
+        app.back_screen.smart_display_enabled = true;
+        app.back_screen.tab = 5;
+
+        // 0 unread messages -> None
+        app.notification_center.items.clear();
+        app.sync_smart_backscreen_display();
+        assert_eq!(app.back_screen.smart_display_live_count, 0);
+        assert!(app.compute_smart_backscreen_target().is_none());
+
+        // 1 unread WeChat message -> single icon (count == 1)
+        app.notification_center.items.push(UnifiedNotificationItem {
+            id: "im-thread:wx-1".into(),
+            category: NotificationCategory::PhoneApps,
+            visual: NotificationVisualKind::WeChat,
+            priority: NotificationPriority::P0Immediate,
+            popup_widget: NotificationPopupWidget::None,
+            source_badge: "微信".into(),
+            title: "文件传输助手".into(),
+            summary: "下午架构评审资料已发".into(),
+            time_label: "刚刚".into(),
+            sort_ts_ms: 1793772000000,
+            unread: true,
+            status_tag: Some("微信".into()),
+            primary_action: None,
+            ..Default::default()
+        });
+        app.sync_smart_backscreen_display();
+        assert_eq!(
+            app.back_screen.smart_display_live_kind,
+            bs::SmartMessageIconKind::WeChat
+        );
+        assert_eq!(app.back_screen.smart_display_live_count, 1);
+        assert_eq!(
+            app.back_screen.smart_display_last_pushed,
+            Some((bs::SmartMessageIconKind::WeChat, 1))
+        );
+        assert!(app.back_screen.applied_title.contains("1条新消息"));
+
+        // Add 2 more unread messages (total 3) -> icon + count 3
+        app.notification_center.items.push(UnifiedNotificationItem {
+            id: "im-thread:wx-2".into(),
+            category: NotificationCategory::PhoneApps,
+            visual: NotificationVisualKind::WeChat,
+            priority: NotificationPriority::P0Immediate,
+            popup_widget: NotificationPopupWidget::None,
+            source_badge: "微信".into(),
+            title: "产品研发群".into(),
+            summary: "@全体成员 请查收背屏智能显示方案".into(),
+            time_label: "1分钟前".into(),
+            sort_ts_ms: 1793771900000,
+            unread: true,
+            status_tag: Some("微信".into()),
+            primary_action: None,
+            ..Default::default()
+        });
+        app.notification_center.items.push(UnifiedNotificationItem {
+            id: "otp:882910".into(),
+            category: NotificationCategory::PhoneComm,
+            visual: NotificationVisualKind::SmsOtp,
+            priority: NotificationPriority::P0Immediate,
+            popup_widget: NotificationPopupWidget::None,
+            source_badge: "短信".into(),
+            title: "验证码 882910".into(),
+            summary: "您的登录验证码为 882910".into(),
+            time_label: "2分钟前".into(),
+            sort_ts_ms: 1793771800000,
+            unread: true,
+            status_tag: Some("验证码".into()),
+            primary_action: None,
+            ..Default::default()
+        });
+        app.sync_smart_backscreen_display();
+        assert_eq!(
+            app.back_screen.smart_display_live_kind,
+            bs::SmartMessageIconKind::WeChat
+        );
+        assert_eq!(app.back_screen.smart_display_live_count, 3);
+        assert_eq!(app.back_screen.smart_display_live_slides.len(), 2);
+        assert_eq!(
+            app.back_screen.smart_display_last_pushed,
+            Some((bs::SmartMessageIconKind::WeChat, 3))
+        );
+        assert!(app.back_screen.applied_title.contains("3条新消息"));
+
+        // Mark all read -> automatically clears phone smart display state and restores Astronaut animation
+        for item in &mut app.notification_center.items {
+            item.unread = false;
+        }
+        app.sync_smart_backscreen_display();
+        assert_eq!(app.back_screen.smart_display_live_count, 0);
+        assert!(app.back_screen.smart_display_live_slides.is_empty());
+        assert!(!app.back_screen.smart_display_active_on_phone);
+        assert!(app.back_screen.smart_display_last_pushed.is_none());
+        assert!(app.back_screen.applied_title.contains("旋转太空人"));
+    }
+
+    #[test]
+    fn smart_backscreen_respects_unified_channel_silent_wework_and_calendar_alarm() {
+        use super::super::notification_center_state::{
+            NotificationAlertMode, NotificationCategory, NotificationPopupWidget,
+            NotificationPriority, NotificationVisualKind, UnifiedNotificationItem,
+        };
+        use stepx_companion::desktop_notify::PopupMode;
+
+        let mut app = Companion::new_for_test();
+        app.demo_mode = true;
+        app.back_screen.smart_display_enabled = true;
+        app.back_screen.auto_notify_flash = true;
+        app.notification_center.items = vec![
+            UnifiedNotificationItem {
+                id: "im-thread:wework-1".into(),
+                package_name: "com.tencent.wework".into(),
+                category: NotificationCategory::PhoneApps,
+                visual: NotificationVisualKind::WeChat,
+                priority: NotificationPriority::P0Immediate,
+                popup_widget: NotificationPopupWidget::None,
+                source_badge: "企微".into(),
+                title: "基础架构部群".into(),
+                summary: "请确认发布窗口".into(),
+                unread: true,
+                ..Default::default()
+            },
+            UnifiedNotificationItem {
+                id: "calendar:101".into(),
+                package_name: "com.android.calendar".into(),
+                category: NotificationCategory::PhoneComm,
+                visual: NotificationVisualKind::CalendarAlarm,
+                priority: NotificationPriority::P0Immediate,
+                popup_widget: NotificationPopupWidget::None,
+                source_badge: "日程提醒".into(),
+                title: "季度产品评审".into(),
+                summary: "14:00 · 3F会议室".into(),
+                unread: true,
+                ..Default::default()
+            },
+        ];
+
+        app.sync_smart_backscreen_display();
+        assert_eq!(
+            app.back_screen.smart_display_live_kind,
+            bs::SmartMessageIconKind::WeWork
+        );
+        assert_eq!(app.back_screen.smart_display_live_count, 2);
+
+        // Suppressing WeWork channel in Settings removes WeWork from backscreen carousel, leaving CalendarAlarm
+        app.push
+            .prefs
+            .set_app_popup_mode("com.tencent.wework", Some(PopupMode::Silent));
+        app.sync_smart_backscreen_display();
+        assert_eq!(
+            app.back_screen.smart_display_live_kind,
+            bs::SmartMessageIconKind::GeneralMessage
+        );
+        assert_eq!(app.back_screen.smart_display_live_count, 1);
+
+        // Global Muted alert_mode suppresses all backscreen notification slides
+        app.notification_center.alert_mode = NotificationAlertMode::Muted;
+        app.sync_smart_backscreen_display();
+        assert_eq!(app.back_screen.smart_display_live_count, 0);
+        assert!(app.back_screen.smart_display_live_slides.is_empty());
     }
 }

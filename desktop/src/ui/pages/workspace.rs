@@ -44,6 +44,13 @@ impl Companion {
         let side = !self.workspace.history;
         let entries = [
             (
+                "projects",
+                "我的作品",
+                UiIcon::Apps,
+                W::Menu(4),
+                side && self.workspace.panel == 4,
+            ),
+            (
                 "history",
                 "会话记录",
                 UiIcon::Clock,
@@ -53,7 +60,7 @@ impl Companion {
             (
                 "memory",
                 "个人记忆",
-                UiIcon::Star,
+                UiIcon::Sparkles,
                 W::Menu(9),
                 side && matches!(self.workspace.panel, 7 | 8 | 9),
             ),
@@ -74,7 +81,7 @@ impl Companion {
         ];
         let mut items = Vec::new();
         for (id, label, icon, action, active) in entries {
-            if !more_open && !active {
+            if !more_open && !active && id != "projects" {
                 continue;
             }
             let mut actions = Vec::new();
@@ -143,7 +150,8 @@ impl Companion {
             .is_some_and(|t| !t.turns.is_empty() || t.session.is_some() || !t.outputs.is_empty())
             || self.workspace.proposal.is_some()
             || self.amoo_ui.gui_running
-            || self.amoo_ui.gui_paused;
+            || self.amoo_ui.gui_paused
+            || self.amoo_ui.gui_unconfirmed;
         let mut column = Flex::column()
             .with_main_axis_size(MainAxisSize::Max)
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch);
@@ -152,11 +160,19 @@ impl Companion {
                 .map(|t| amoo_display::session_title(&t.title))
                 .unwrap_or_else(|| "新对话".into())
         } else {
-            "新对话 · Amoo 智能助手".into()
+            String::new()
         };
         column = column.with_child(self.workspace_thread_bar(&title, compact));
-        if started {
-            let content = self.workspace_thread();
+        // A compact/short window must always keep Send outside the scrolling
+        // welcome content, including the very first message and its attachments.
+        if started || compact || self.workspace.viewport.y() < 700. {
+            let content = if started {
+                self.workspace_thread()
+            } else {
+                Container::new(self.workspace_greeting(compact))
+                    .with_vertical_padding(S4)
+                    .finish()
+            };
             column = column.with_child(
                 Expanded::new(
                     1.,
@@ -172,9 +188,20 @@ impl Companion {
                 )
                 .finish(),
             );
+            let composer_block = if !super::super::workspace_state::is_verification_harness() {
+                self.vstack(
+                    S2,
+                    vec![
+                        self.amoo_message_composer(compact, false),
+                        self.workspace_doctor_quick_pills(),
+                    ],
+                )
+            } else {
+                self.amoo_message_composer(compact, false)
+            };
             column = column.with_child(
                 Container::new(self.workspace_column(
-                    self.amoo_message_composer(compact, false),
+                    composer_block,
                     compact,
                     "workspace-chat-input",
                 ))
@@ -218,48 +245,29 @@ impl Companion {
     }
     fn workspace_thread_bar(&self, title: &str, compact: bool) -> El {
         let p = self.p();
-        let right = self.workspace_connection_badge();
-        self.workspace_column(
-            Container::new(self.between(
-                self.line_w(
-                    Self::truncate_chars(title, if compact { 20 } else { 32 }),
-                    SUBHEAD,
-                    p.text,
-                    Weight::Semibold,
-                ),
-                right,
+        let inner = if title.trim().is_empty() {
+            ConstrainedBox::new(Empty::new().finish())
+                .with_height(S2)
+                .finish()
+        } else {
+            Container::new(self.line_w(
+                Self::truncate_chars(title, if compact { 20 } else { 32 }),
+                SUBHEAD,
+                p.text,
+                Weight::Semibold,
             ))
             .with_vertical_padding(if compact && self.workspace.viewport.y() < 520. {
                 S2
             } else {
                 S3
             })
-            .finish(),
-            compact,
-            "workspace-chat-heading",
-        )
+            .finish()
+        };
+        self.workspace_column(inner, compact, "workspace-chat-heading")
     }
     fn workspace_welcome(&self, compact: bool) -> El {
-        let p = self.p();
         let mut content = vec![
-            self.vstack(
-                S2,
-                vec![
-                    Align::new(self.line_w(
-                        "你好，需要我做什么？",
-                        if compact { 24. } else { 30. },
-                        p.text,
-                        Weight::Semibold,
-                    ))
-                    .finish(),
-                    Align::new(self.text(
-                        "直接输入需求按 Enter 发送，或点击下方场景卡片自动填入示例（支持手机对话、生成 Office 文档、制作小游戏、实时操控手机与背屏点阵）",
-                        if compact { CAPTION } else { BODY },
-                        p.text2,
-                    ))
-                    .finish(),
-                ],
-            ),
+            self.workspace_greeting(compact),
             self.amoo_message_composer(compact, false),
         ];
         if !super::super::workspace_state::is_verification_harness() {
@@ -285,6 +293,31 @@ impl Companion {
                 .finish(),
             compact,
             "workspace-chat-welcome",
+        )
+    }
+    fn workspace_greeting(&self, compact: bool) -> El {
+        let p = self.p();
+        self.vstack(
+            S2,
+            vec![
+                Align::new(self.line_w(
+                    "你好，需要我做什么？",
+                    if compact { 20. } else { 30. },
+                    p.text,
+                    Weight::Semibold,
+                ))
+                .finish(),
+                Align::new(self.text(
+                    if compact {
+                        "直接聊天，也可添加图片和文件。"
+                    } else {
+                        "聊想法、处理资料，或做一个手机里能用的小工具。"
+                    },
+                    if compact { CAPTION } else { BODY },
+                    p.text2,
+                ))
+                .finish(),
+            ],
         )
     }
     fn workspace_welcome_suggestions(&self, compact: bool) -> El {
@@ -327,7 +360,7 @@ impl Companion {
                 "帮我设计一个手机背屏点阵图案并发送到背屏",
             ),
         ];
-        let mut chips: Vec<El> = scenarios
+        let chips: Vec<El> = scenarios
             .into_iter()
             .map(|(scenario_id, id, label, icon, prefix)| {
                 let active = !draft_trimmed.is_empty() && draft_trimmed.starts_with(prefix);
@@ -341,52 +374,43 @@ impl Companion {
                 )
             })
             .collect();
-        chips.push(self.chip(
-            "workspace-suggest-phone",
-            "操作手机",
-            Some(UiIcon::Smartphone),
-            vec![Action::AmooUi(AmooUiAction::GuiMode(true))],
-            self.amoo_ui.screen_mode,
-            false,
-        ));
-        let quick_row = Align::new(self.wrap(chips)).finish();
         if compact {
-            return quick_row;
+            return Align::new(self.wrap(chips)).finish();
         }
         let guides: [(&str, UiIcon, &str, &str, Action); 5] = [
             (
                 "guide-chat",
                 UiIcon::Chat,
-                "手机对话与查信息",
-                "直接提问或查天气、日程、手机信息",
+                "问答",
+                "提问、查天气或日程",
                 Action::Workspace(W::Intent(Intent::Chat)),
             ),
             (
                 "guide-files",
                 UiIcon::File,
-                "生成 PPT / Word / 表格",
-                "输入主题自动生成本机可编辑文档",
+                "做 PPT",
+                "生成 PPT、文档、表格",
                 Action::Workspace(W::QuickScenario(2)),
             ),
             (
                 "guide-app",
                 UiIcon::Play,
-                "制作小游戏 / 网页应用",
-                "一句话生成可试玩、可发手机的应用",
+                "做小游戏",
+                "可试玩的小应用",
                 Action::Workspace(W::QuickScenario(0)),
             ),
             (
                 "guide-gui",
                 UiIcon::Smartphone,
-                "实时操作手机屏幕",
-                "投屏接管手机，AI 自动点击滑动",
+                "操作手机",
+                "自动点击和滑动",
                 Action::AmooUi(AmooUiAction::GuiMode(true)),
             ),
             (
                 "guide-screen",
                 UiIcon::Sparkles,
-                "手机背屏像素点阵",
-                "输入图案描述生成并推送到背屏",
+                "背屏图案",
+                "生成并推送到背屏",
                 Action::Workspace(W::QuickScenario(5)),
             ),
         ];
@@ -401,7 +425,7 @@ impl Companion {
                             self.hstack(
                                 S1 + 2.,
                                 vec![
-                                    self.ui_icon(icon, 15., p.accent),
+                                    self.content_icon(icon, 15., p.accent),
                                     Expanded::new(
                                         1.,
                                         self.line_w(title, CAPTION, p.text, Weight::Semibold),
@@ -416,35 +440,157 @@ impl Companion {
                     None,
                     None,
                 );
-                ConstrainedBox::new(card).with_width(168.).finish()
+                ConstrainedBox::new(card).with_width(142.).finish()
             })
             .collect();
         self.vstack(
             S3,
             vec![
-                quick_row,
-                self.vstack(
-                    S2,
-                    vec![
-                        Align::new(self.line_w(
-                            "Amoo 5 大用法速览",
-                            MICRO,
-                            p.text3,
-                            Weight::Semibold,
-                        ))
-                        .finish(),
-                        Align::new(self.wrap(guide_cards)).finish(),
-                    ],
-                ),
+                Align::new(self.wrap(guide_cards)).finish(),
+                self.workspace_doctor_quick_pills(),
             ],
         )
+    }
+    fn workspace_doctor_quick_pills(&self) -> El {
+        let pills = vec![
+            self.chip(
+                "amoo-doctor-google-btn",
+                "Google Play 安装向导",
+                None,
+                vec![Action::RunDoctorHarness {
+                    topic: stepx_companion::doctor_harness::DoctorTopic::GooglePlayGuide,
+                    query: "google play 安装不了，不会用".into(),
+                }],
+                false,
+                false,
+            ),
+            self.chip(
+                "amoo-doctor-companion-btn",
+                "伴侣连接自愈",
+                None,
+                vec![Action::RunDoctorHarness {
+                    topic: stepx_companion::doctor_harness::DoctorTopic::CompanionSelfHeal,
+                    query: "手机连不上，伴侣权限掉了怎么办".into(),
+                }],
+                false,
+                false,
+            ),
+            self.chip(
+                "amoo-doctor-pc-btn",
+                "电脑体检与清缓存",
+                None,
+                vec![Action::RunDoctorHarness {
+                    topic: stepx_companion::doctor_harness::DoctorTopic::PcTroubleshoot,
+                    query: "清理电脑缓存，处理电脑的小问题".into(),
+                }],
+                false,
+                false,
+            ),
+        ];
+        Align::new(self.wrap(pills)).finish()
+    }
+    fn render_doctor_harness_card(
+        &self,
+        report: &stepx_companion::doctor_harness::DoctorReport,
+    ) -> El {
+        use stepx_companion::doctor_harness::StepState;
+        let p = self.p();
+        let pill_badge =
+            |label: &str, fg: facloud_ui::color::ColorU, bg: facloud_ui::color::ColorU| -> El {
+                Container::new(self.line_w(label, MICRO, fg, Weight::Medium))
+                    .with_horizontal_padding(8.)
+                    .with_vertical_padding(2.)
+                    .with_background_color(bg)
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_TAG)))
+                    .finish()
+            };
+
+        let header = self.between(
+            self.line_w(report.topic.label(), SUBHEAD, p.text, Weight::Semibold),
+            pill_badge(
+                if self.doctor_running {
+                    "检测中…"
+                } else {
+                    &report.model_label
+                },
+                p.accent,
+                p.accent_soft,
+            ),
+        );
+
+        let mut step_rows = Vec::with_capacity(report.steps.len());
+        for step in &report.steps {
+            let (badge_fg, badge_bg) = match step.state {
+                StepState::Pass => (p.success, p.success_soft),
+                StepState::ActionRequired => (p.warning, p.warning_soft),
+                StepState::Info => (p.accent, p.accent_soft),
+            };
+            let right_btn = if let Some(act) = step.action {
+                self.button(
+                    format!("amoo-doctor-step-{}-btn", step.index),
+                    act.label(),
+                    Action::ExecuteDoctorQuickAction(act),
+                    if step.state == StepState::ActionRequired {
+                        Btn::Primary
+                    } else {
+                        Btn::Secondary
+                    },
+                )
+            } else {
+                Empty::new().finish()
+            };
+            let step_el = Container::new(self.between(
+                self.hstack(
+                    S2,
+                    vec![
+                        self.line_w(&step.title, CAPTION, p.text, Weight::Medium),
+                        pill_badge(&step.badge, badge_fg, badge_bg),
+                        self.line(&step.detail, MICRO, p.text2),
+                    ],
+                ),
+                right_btn,
+            ))
+            .with_horizontal_padding(S2 + 2.)
+            .with_vertical_padding(S1 + 2.)
+            .with_background_color(p.sidebar)
+            .with_border(Border::all(1.).with_border_color(p.border))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_LG)))
+            .finish();
+            step_rows.push(step_el);
+        }
+
+        let mut action_buttons = Vec::new();
+        for (idx, act) in report.recommended_actions.iter().enumerate() {
+            action_buttons.push(self.button(
+                format!("amoo-doctor-rec-{idx}-btn"),
+                act.label(),
+                Action::ExecuteDoctorQuickAction(*act),
+                if idx == 0 {
+                    Btn::Primary
+                } else {
+                    Btn::Secondary
+                },
+            ));
+        }
+
+        let mut items = vec![header, self.vstack(S1 + 2., step_rows)];
+        if !action_buttons.is_empty() {
+            items.push(self.wrap(action_buttons));
+        }
+
+        Container::new(self.vstack(S2, items))
+            .with_uniform_padding(S3)
+            .with_background_color(p.bg)
+            .with_border(Border::all(1.).with_border_color(p.border))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_PANEL)))
+            .finish()
     }
     fn workspace_error_banner(&self, error: &str) -> Box<dyn Element> {
         let p = self.p();
         Container::new(self.hstack(
             S2,
             vec![
-                self.ui_icon(UiIcon::Info, 16., p.danger),
+                self.content_icon(UiIcon::Info, 16., p.danger),
                 Expanded::new(1., self.text(error, CAPTION, p.danger)).finish(),
                 self.chip(
                     "workspace-dismiss-error",
@@ -462,26 +608,6 @@ impl Companion {
         .with_border(Border::all(1.).with_border_color(lerp_color(p.border, p.danger, 0.35)))
         .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
         .finish()
-    }
-    fn workspace_connection_badge(&self) -> El {
-        let p = self.p();
-        let online = self.selected.is_some() || self.amoo_gateway_online || self.demo_mode;
-        let color = if online { p.success } else { p.text3 };
-        self.hstack(
-            S1 + 2.,
-            vec![
-                self.dot(color),
-                self.line(
-                    if online {
-                        "手机已连接"
-                    } else {
-                        "手机未连接"
-                    },
-                    CAPTION,
-                    color,
-                ),
-            ],
-        )
     }
     fn workspace_left_sidebar(&self) -> El {
         let p = self.p();
@@ -506,45 +632,6 @@ impl Companion {
             ),
         )
         .finish();
-        let footer = Container::new(
-            Flex::row()
-                .with_main_axis_size(MainAxisSize::Max)
-                .with_spacing(S1)
-                .with_child(
-                    Expanded::new(
-                        1.,
-                        self.ws_button(
-                            "left-model",
-                            "模型与账号",
-                            UiIcon::Cpu,
-                            W::Menu(1),
-                            if matches!(self.workspace.panel, 1 | 5) {
-                                Btn::Secondary
-                            } else {
-                                Btn::Ghost
-                            },
-                        ),
-                    )
-                    .finish(),
-                )
-                .with_child(
-                    Expanded::new(
-                        1.,
-                        self.button_icon(
-                            "workspace-left-gui",
-                            "手机操控",
-                            UiIcon::Smartphone,
-                            Action::AmooUi(AmooUiAction::GuiMode(true)),
-                            Btn::Ghost,
-                        ),
-                    )
-                    .finish(),
-                )
-                .finish(),
-        )
-        .with_padding_top(S2)
-        .with_border(Border::top(1.).with_border_color(p.border))
-        .finish();
         self.fixed_w(
             260.,
             Container::new(
@@ -555,7 +642,6 @@ impl Companion {
                     .with_child(header)
                     .with_child(search)
                     .with_child(list)
-                    .with_child(footer)
                     .finish(),
             )
             .with_horizontal_padding(S2)
@@ -584,10 +670,47 @@ impl Companion {
                             .any(|turn| turn.text.to_lowercase().contains(&q)))
             })
             .collect::<Vec<_>>();
-        tasks.sort_by_key(|t| std::cmp::Reverse(t.updated));
+        tasks.sort_by_key(|t| (!t.pinned, std::cmp::Reverse(t.updated)));
+            let active_phone_sessions: std::collections::HashSet<&str> = self
+                .workspace
+                .journal
+                .tasks
+                .iter()
+                .filter(|t| self.workspace_visible(t))
+                .filter_map(|t| t.session.as_deref())
+                .collect();
+            let mut phone_sessions: Vec<(usize, _)> = self
+                .amoo_sessions
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| {
+                    !self.workspace.deleted_sessions.contains(&s.session_key)
+                        && !active_phone_sessions.contains(s.session_key.as_str())
+                        && (q.is_empty()
+                            || s.title.to_lowercase().contains(&q)
+                            || amoo_display::session_title(&s.title)
+                                .to_lowercase()
+                                .contains(&q))
+                })
+                .collect();
+            phone_sessions.sort_by_key(|(i, s)| {
+                (
+                    !self
+                        .workspace
+                        .journal
+                        .pinned_sessions
+                        .contains(&s.session_key),
+                    *i,
+                )
+            });
+        let task_count = tasks.len();
+        let total = task_count+phone_sessions.len();
+        let page_key = format!("workspace-history:{q}");
+        let range = if max >= 100 {self.list_page_range(&page_key,total,30)} else {0..total.min(max)};
         let mut rows = tasks
             .into_iter()
-            .take(max)
+            .skip(range.start)
+            .take(range.len())
             .map(|t| {
                 let selected = self.workspace.active.as_ref() == Some(&t.id);
                 let icon = if !t.outputs.is_empty() {
@@ -597,55 +720,62 @@ impl Companion {
                 } else {
                     UiIcon::Chat
                 };
-                let subtitle = if !t.outputs.is_empty() {
-                    format!("{} 个成果", t.outputs.len())
+                let mut subtitle = if !t.outputs.is_empty() {
+                    format!("{} 个成果", t.current_output_indices().len())
                 } else if t.session.is_some() {
-                    if !t.draft.is_empty() {
-                        "手机会话 · 有草稿".into()
-                    } else {
-                        "手机会话".into()
-                    }
-                } else if !t.draft.is_empty() {
-                    "有草稿".into()
+                    "手机会话".into()
                 } else {
                     "继续对话".into()
                 };
+                if !t.draft.trim().is_empty() || !t.attachments.is_empty() {
+                    subtitle = if t.turns.is_empty() && t.session.is_none() && t.outputs.is_empty()
+                    {
+                        "有草稿".into()
+                    } else {
+                        format!("{subtitle} · 有草稿")
+                    };
+                }
                 let label = amoo_display::session_title(&t.title);
+                let row_key = format!("row:workspace-recent-{}", t.id);
+                let del_key = format!("iconact:workspace-delete-{}", t.id);
+                let show_actions = self.is_hovered_any(&[&row_key, &del_key]);
+                let mut row_children = vec![
+                    self.content_icon(icon, 16., if selected { p.accent } else { p.text2 }),
+                    Expanded::new(
+                        1.,
+                        self.vstack(
+                            S1,
+                            vec![
+                                self.line_w(
+                                    label,
+                                    BODY,
+                                    p.text,
+                                    if selected {
+                                        Weight::Semibold
+                                    } else {
+                                        Weight::Medium
+                                    },
+                                ),
+                                self.line(subtitle, MICRO, p.text3),
+                            ],
+                        ),
+                    )
+                    .finish(),
+                ];
+                if show_actions {
+                    row_children.push(self.icon_action(
+                        format!("workspace-delete-{}", t.id),
+                        "删除对话",
+                        UiIcon::Trash,
+                        vec![Action::Workspace(W::Delete(t.id.clone()))],
+                        false,
+                    ));
+                } else if t.pinned {
+                    row_children.push(self.content_icon(UiIcon::Pin, 12., p.accent));
+                }
                 self.list_row_with_menu(
                     format!("workspace-recent-{}", t.id),
-                    self.hstack(
-                        S2,
-                        vec![
-                            self.ui_icon(icon, 16., if selected { p.accent } else { p.text2 }),
-                            Expanded::new(
-                                1.,
-                                self.vstack(
-                                    S1,
-                                    vec![
-                                        self.line_w(
-                                            label,
-                                            BODY,
-                                            p.text,
-                                            if selected {
-                                                Weight::Semibold
-                                            } else {
-                                                Weight::Medium
-                                            },
-                                        ),
-                                        self.line(subtitle, MICRO, p.text3),
-                                    ],
-                                ),
-                            )
-                            .finish(),
-                            self.icon_action(
-                                format!("workspace-delete-{}", t.id),
-                                "删除对话",
-                                UiIcon::Trash,
-                                vec![Action::Workspace(W::Delete(t.id.clone()))],
-                                false,
-                            ),
-                        ],
-                    ),
+                    self.hstack(S2, row_children),
                     selected,
                     Some(Action::Workspace(W::Select(t.id.clone()))),
                     None,
@@ -657,54 +787,48 @@ impl Companion {
                 )
             })
             .collect::<Vec<_>>();
-        if rows.len() < max {
-            for (i, s) in self
-                .amoo_sessions
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| {
-                    !self.workspace.deleted_sessions.contains(&s.session_key)
-                        && (q.is_empty()
-                            || s.title.to_lowercase().contains(&q)
-                            || amoo_display::session_title(&s.title)
-                                .to_lowercase()
-                                .contains(&q))
-                        && !self.workspace.journal.tasks.iter().any(|t| {
-                            self.workspace_visible(t) && t.session.as_ref() == Some(&s.session_key)
-                        })
-                })
-                .take(max - rows.len())
-            {
+        if rows.len() < range.len() {
+            for (i, s) in phone_sessions.into_iter().skip(range.start.saturating_sub(task_count)).take(range.len() - rows.len()) {
                 let label = amoo_display::session_title(&s.title);
+                let pinned = self
+                    .workspace
+                    .journal
+                    .pinned_sessions
+                    .contains(&s.session_key);
+                let row_key = format!("row:workspace-phone-session-{i}");
+                let del_key = format!("iconact:workspace-delete-phone-{i}");
+                let show_actions = self.is_hovered_any(&[&row_key, &del_key]);
+                let mut row_children = vec![
+                    self.content_icon(UiIcon::Smartphone, 16., p.text2),
+                    Expanded::new(
+                        1.,
+                        self.vstack(
+                            S1,
+                            vec![
+                                self.line_w(label, BODY, p.text, Weight::Medium),
+                                self.line("手机会话", MICRO, p.text3),
+                            ],
+                        ),
+                    )
+                    .finish(),
+                ];
+                if show_actions {
+                    row_children.push(self.icon_action(
+                        format!("workspace-delete-phone-{i}"),
+                        "删除对话",
+                        UiIcon::Trash,
+                        vec![Action::Workspace(W::Delete(format!(
+                            "phone:{}",
+                            s.session_key
+                        )))],
+                        false,
+                    ));
+                } else if pinned {
+                    row_children.push(self.content_icon(UiIcon::Pin, 12., p.accent));
+                }
                 rows.push(self.list_row_with_menu(
                     format!("workspace-phone-session-{i}"),
-                    self.hstack(
-                        S2,
-                        vec![
-                            self.ui_icon(UiIcon::Smartphone, 16., p.text2),
-                            Expanded::new(
-                                1.,
-                                self.vstack(
-                                    S1,
-                                    vec![
-                                        self.line_w(label, BODY, p.text, Weight::Medium),
-                                        self.line("手机会话", MICRO, p.text3),
-                                    ],
-                                ),
-                            )
-                            .finish(),
-                            self.icon_action(
-                                format!("workspace-delete-phone-{i}"),
-                                "删除对话",
-                                UiIcon::Trash,
-                                vec![Action::Workspace(W::Delete(format!(
-                                    "phone:{}",
-                                    s.session_key
-                                )))],
-                                false,
-                            ),
-                        ],
-                    ),
+                    self.hstack(S2, row_children),
                     false,
                     Some(Action::Workspace(W::PhoneSession(i))),
                     None,
@@ -716,6 +840,7 @@ impl Companion {
                 ));
             }
         }
+        if max >= 100 && total > 30 { rows.push(self.list_page_controls(&page_key,total,30)); }
         if rows.is_empty() {
             rows.push(
                 Container::new(
@@ -762,7 +887,11 @@ impl Companion {
                 {
                     rows.push(self.amoo_conversation());
                 } else {
-                    for (i, item) in sess.items.iter().enumerate() {
+                    let page_key = format!("workspace-phone-transcript:{}",sess.session_key);
+                    let newest = self.list_page_range(&page_key,sess.items.len(),60);
+                    let visible = sess.items.len()-newest.end..sess.items.len()-newest.start;
+                    rows.push(self.list_page_controls(&page_key,sess.items.len(),60));
+                    for (i, item) in sess.items.iter().enumerate().skip(visible.start).take(visible.len()) {
                         match item {
                             AmooChatItem::UserText { text, .. } => {
                                 rows.push(self.context_target(
@@ -779,17 +908,76 @@ impl Companion {
                             AmooChatItem::AssistantRich {
                                 text: Some(text), ..
                             } if !text.trim().is_empty() => {
+                                let motion_key = format!("ws-phone-reply-{}-{i}", sess.session_key);
+                                let is_last = i + 1 == sess.items.len();
+                                let animate = !self.animations_disabled()
+                                    && self.selected_text.is_none()
+                                    && self.context_menu.is_none()
+                                    && is_last
+                                    && (self.amoo_pending_reply.contains_key(&sess.session_key)
+                                        || self.reply_motion.live.contains(&sess.session_key)
+                                        || self.reply_motion.is_key_active(&motion_key));
+                                let (visible_md, bloom_schedule) = self
+                                    .reply_motion
+                                    .borrow_mut()
+                                    .bloom_schedule(&motion_key, text, animate);
+                                let retry_text_for_menu =
+                                    super::super::amoo_display::retry_prompt(&sess.items, i);
+                                let ctx_key = format!("ctx:ws-phone-assistant-{i}");
+                                let copy_key = format!("ws-phone-copy-{}-{i}", sess.session_key);
+                                let speech_id = format!("ws-phone-speech:{}:{i}", sess.session_key);
+                                let quote_key = format!("ws-phone-quote-{}-{i}", sess.session_key);
+                                let retry_key = format!("ws-phone-retry-{}-{i}", sess.session_key);
+                                let show_actions = is_last
+                                    || self.is_hovered_any(&[
+                                        &ctx_key, &copy_key, &speech_id, &quote_key, &retry_key,
+                                    ]);
+                                let actions = if show_actions {
+                                    let mut acts = vec![
+                                        self.amoo_action_icon(
+                                            copy_key,
+                                            "复制回复",
+                                            UiIcon::Copy,
+                                            Action::CopyText(text.clone(), "已复制".into()),
+                                        ),
+                                        self.speech_icon(speech_id, text.clone()),
+                                        self.amoo_action_icon(
+                                            quote_key,
+                                            "引用这段继续问",
+                                            UiIcon::Chat,
+                                            Action::Workspace(W::QuoteTurn(text.clone())),
+                                        ),
+                                    ];
+                                    if let Some(ref retry_prompt_text) = retry_text_for_menu {
+                                        acts.push(self.amoo_action_icon(
+                                            retry_key,
+                                            "重新生成",
+                                            UiIcon::Retry,
+                                            Action::AmooRetryMessage {
+                                                session_key: sess.session_key.clone(),
+                                                text: retry_prompt_text.clone(),
+                                            },
+                                        ));
+                                    }
+                                    acts
+                                } else {
+                                    Vec::new()
+                                };
                                 rows.push(self.context_target(
                                     format!("ws-phone-assistant-{i}"),
                                     crate::ui::context_menu::Target::ChatMessage {
                                         assistant: true,
                                         text: text.clone(),
                                         session_key: Some(sess.session_key.clone()),
-                                        retry_text: None,
+                                        retry_text: retry_text_for_menu,
                                     },
                                     self.chat_assistant_bubble(
-                                        self.work_rich_text(text, &format!("ws-phone-reply-{i}")),
-                                        Vec::new(),
+                                        self.work_rich_text_bloom(
+                                            visible_md,
+                                            &format!("ws-phone-reply-{i}"),
+                                            bloom_schedule,
+                                        ),
+                                        actions,
                                     ),
                                 ));
                             }
@@ -802,7 +990,20 @@ impl Companion {
                 }
             } else {
                 let last_user = task.turns.iter().rposition(|t| t.user);
-                for (i, turn) in task.turns.iter().enumerate() {
+                let task_streaming = self
+                    .workspace
+                    .running
+                    .as_ref()
+                    .is_some_and(|r| r.task == task.id)
+                    || task.session.as_ref().is_some_and(|k| {
+                        self.amoo_pending_reply.contains_key(k)
+                            || self.reply_motion.live.contains(k)
+                    });
+                let page_key = format!("workspace-transcript:{}",task.id);
+                let newest = self.list_page_range(&page_key,task.turns.len(),60);
+                let visible = task.turns.len()-newest.end..task.turns.len()-newest.start;
+                rows.push(self.list_page_controls(&page_key,task.turns.len(),60));
+                for (i, turn) in task.turns.iter().enumerate().skip(visible.start).take(visible.len()) {
                     if !turn.user
                         && stepx_companion::amoo_workspace::is_unconfirmed_placeholder(&turn.text)
                     {
@@ -829,31 +1030,50 @@ impl Companion {
                             rows.push(bubble);
                         }
                     } else {
-                        let bubble = self.chat_assistant_bubble(
-                            self.work_rich_text(
-                                &turn.text,
-                                &format!("workspace-turn-{}-{i}", task.id),
-                            ),
+                        let motion_key = format!("workspace-turn-{}-{i}", task.id);
+                        let is_last = i + 1 == task.turns.len();
+                        let animate = !self.animations_disabled()
+                            && self.selected_text.is_none()
+                            && self.context_menu.is_none()
+                            && is_last
+                            && (task_streaming || self.reply_motion.is_key_active(&motion_key));
+                        let (visible_md, bloom_schedule) = self
+                            .reply_motion
+                            .borrow_mut()
+                            .bloom_schedule(&motion_key, &turn.text, animate);
+                        let ctx_key = format!("ctx:ws-ai-msg-{i}");
+                        let copy_key = format!("workspace-turn-copy-{}-{i}", task.id);
+                        let retry_key = format!("workspace-turn-retry-{}-{i}", task.id);
+                        let quote_key = format!("workspace-turn-quote-{}-{i}", task.id);
+                        let show_actions = is_last
+                            || self.is_hovered_any(&[&ctx_key, &copy_key, &retry_key, &quote_key]);
+                        let actions = if show_actions {
                             vec![
                                 self.amoo_action_icon(
-                                    format!("workspace-turn-copy-{}-{i}", task.id),
+                                    copy_key,
                                     "复制",
                                     UiIcon::Copy,
                                     Action::CopyText(turn.text.clone(), "已复制".into()),
                                 ),
                                 self.amoo_action_icon(
-                                    format!("workspace-turn-retry-{}-{i}", task.id),
+                                    retry_key,
                                     "重新生成",
                                     UiIcon::Retry,
                                     Action::Workspace(W::Retry),
                                 ),
                                 self.amoo_action_icon(
-                                    format!("workspace-turn-quote-{}-{i}", task.id),
+                                    quote_key,
                                     "引用这段继续问",
                                     UiIcon::Chat,
                                     Action::Workspace(W::QuoteTurn(turn.text.clone())),
                                 ),
-                            ],
+                            ]
+                        } else {
+                            Vec::new()
+                        };
+                        let bubble = self.chat_assistant_bubble(
+                            self.work_rich_text_bloom(visible_md, &motion_key, bloom_schedule),
+                            actions,
                         );
                         rows.push(self.context_target(
                             format!("ws-ai-msg-{i}"),
@@ -888,11 +1108,55 @@ impl Companion {
                 rows.push(self.turn_progress(task, false, false, false));
             }
             // Results follow the latest reply as inline cards.
-            for (i, o) in task.outputs.iter().enumerate() {
-                rows.push(self.result_card(task, i, o));
+            let latest = task.current_output_indices();
+            let output_page_key = format!("workspace-current-outputs:{}",task.id);
+            let range = self.list_page_range(&output_page_key,latest.len(),20);
+            rows.push(self.list_page_controls(&output_page_key,latest.len(),20));
+            for &i in latest.iter().skip(range.start).take(range.len()) {
+                rows.push(self.result_card(task, i, &task.outputs[i]));
+            }
+            let previous = task.outputs.len() - latest.len();
+            if previous > 0 {
+                let key = format!("workspace-previous-builds-{}", task.id);
+                let expanded = self.amoo_expanded_tool_records.contains(&key);
+                rows.push(self.link_muted(
+                    "workspace-previous-builds",
+                    if expanded {
+                        format!("收起 {previous} 个早期版本")
+                    } else {
+                        format!("查看 {previous} 个早期版本与修复记录")
+                    },
+                    Action::AmooToggleToolRecords(key),
+                ));
+                if expanded {
+                    let page_key = format!("workspace-previous-outputs:{}",task.id);
+                    let range = self.list_page_range(&page_key,previous,20);
+                    rows.push(self.list_page_controls(&page_key,previous,20));
+                    for (i, o) in task
+                        .outputs
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| !latest.contains(i))
+                        .skip(range.start).take(range.len())
+                    {
+                        rows.push(self.result_card(task, i, o));
+                    }
+                }
             }
             if active_progress {
                 rows.push(self.turn_progress(task, running, failed, unconfirmed_only));
+            }
+            let matches_doctor_query =
+                stepx_companion::amoo_route::detect_doctor_or_google_guide_query(&task.title)
+                    .is_some()
+                    || task.turns.iter().any(|t| {
+                        stepx_companion::amoo_route::detect_doctor_or_google_guide_query(&t.text)
+                            .is_some()
+                    });
+            if matches_doctor_query || self.doctor_running {
+                if let Some(ref report) = self.doctor_report {
+                    rows.push(self.render_doctor_harness_card(report));
+                }
             }
         }
         if let Some(proposal) = &self.workspace.proposal {
@@ -929,7 +1193,7 @@ impl Companion {
             children.push(self.hstack(2., actions));
         }
         let badge = ConstrainedBox::new(
-            Container::new(Align::new(self.ui_icon(UiIcon::Star, 15., p.accent)).finish())
+            Container::new(Align::new(self.content_icon(UiIcon::Sparkles, 15., p.accent)).finish())
                 .with_background_color(p.surface)
                 .with_border(Border::all(1.).with_border_color(p.border))
                 .with_corner_radius(CornerRadius::with_all(Radius::Pixels(14.)))
@@ -967,7 +1231,7 @@ impl Companion {
                 Container::new(self.hstack(
                     S1 + 2.,
                     vec![
-                        self.ui_icon(UiIcon::Bolt, 12., p.accent),
+                        self.content_icon(UiIcon::Bolt, 12., p.accent),
                         self.line(format!("已自动识别为：{note}"), CAPTION, p.text2),
                         self.line("·", CAPTION, p.text3),
                         self.link_muted(
@@ -989,7 +1253,7 @@ impl Companion {
         )
     }
     /// Plain one-line status of the current run, with elapsed seconds.
-    fn run_status_line(&self) -> String {
+    pub(in super::super) fn run_status_line(&self) -> String {
         let Some(run) = &self.workspace.running else {
             return "正在处理…".into();
         };
@@ -1092,7 +1356,10 @@ impl Companion {
         } else if unconfirmed_only {
             ("还没收到手机的结果".to_string(), p.warning)
         } else if failed {
-            ("没有完成".to_string(), p.warning)
+            (if task.note.contains("未确认发送") || task.note.contains("发送结果未能确认")
+                || task.note.contains("尚未确认 Amoo 是否收到") {
+                "发送未确认 · 草稿已保留"
+            } else { "未完成 · 查看原因后重试" }.to_string(), p.warning)
         } else {
             ("已完成".to_string(), p.text3)
         };
@@ -1104,19 +1371,8 @@ impl Companion {
                 self.line("", MICRO, p.text3)
             },
         ));
-        if running {
-            let total = task.steps.len().max(1) as f32;
-            let done = task.steps.iter().filter(|s| s.phase == Phase::Done).count() as f32;
-            let within = self
-                .workspace
-                .running
-                .as_ref()
-                .map(|r| 1. - (-(r.started_at.elapsed().as_secs_f32()) / 45.).exp())
-                .unwrap_or(0.)
-                .min(0.9);
-            let pct = (((done + within) / total) * 100.).clamp(3., 97.) as u8;
-            rows.push(self.progress(Some(pct), p.accent));
-        }
+        // Models provide no completion percentage: use actual stages and elapsed
+        // time above, with activity animation in the fixed footer.
         if expanded {
             let mut details = Vec::new();
             for step in &task.steps {
@@ -1277,7 +1533,7 @@ impl Companion {
         let p = self.p();
         let is_selected = self.workspace.selected_output == Some(i);
         let mut row_items = vec![
-            self.ui_icon(icon, 20., p.accent),
+            self.content_icon(icon, 20., p.accent),
             Expanded::new(
                 1.,
                 self.vstack(
@@ -1425,10 +1681,14 @@ impl Companion {
                 .count();
             Some((passed, checks.len()))
         });
-        let passed = artifact.is_some_and(|a| a.passed) || o.kind.contains("已检查");
+        let passed = artifact.is_some_and(|a| a.passed);
         let meta = match (checks, artifact) {
-            (Some((ok, total)), _) if total > 0 => format!("检查通过 {ok}/{total}"),
-            (_, Some(_)) if passed => "已检查，可以运行".to_string(),
+            (Some((ok, total)), _) if total > 0 && passed => format!("检查通过 {ok}/{total}"),
+            (Some((ok, total)), _) if total > 0 => format!("通过 {ok}/{total} 项，仍需修复"),
+            (_, Some(a)) if a.id.starts_with("starter-") && !passed => {
+                "内置示例 · 本机尚未验收".into()
+            }
+            (_, Some(_)) if passed => "自动检查通过，可预览确认".to_string(),
             (_, Some(_)) => "检查没通过，可以让我继续修".to_string(),
             _ => "小应用 · 可在电脑运行，也能装到手机".to_string(),
         };
@@ -1589,6 +1849,16 @@ impl Companion {
                 more,
             ]),
         ];
+        if task.steps.iter().any(|s| s.executor == Executor::Image) {
+            rows.insert(
+                2,
+                self.text(
+                    "原图已缓存到电脑；原厂服务可能附加 AI 生成标识，以图片预览为准。",
+                    MICRO,
+                    p.text3,
+                ),
+            );
+        }
         if more_open {
             let mut extra = vec![self.ws_button(
                 &format!("output-reveal-{i}"),
@@ -1785,11 +2055,14 @@ impl Companion {
         )
     }
     pub(in super::super) fn workspace_gui_pip_card(&self) -> Option<El> {
-        if !self.amoo_ui.gui_running && !self.amoo_ui.gui_paused {
+        let approval_pending = self.amoo_ui.gui_unconfirmed;
+        if !self.amoo_ui.gui_running && !self.amoo_ui.gui_paused && !approval_pending {
             return None;
         }
         let p = self.p();
-        let (badge_label, badge_fg, badge_bg) = if self.amoo_ui.gui_paused {
+        let (badge_label, badge_fg, badge_bg) = if approval_pending {
+            ("待批准确认", p.warning, p.warning_soft)
+        } else if self.amoo_ui.gui_paused {
             ("已暂停，你可以接手", p.warning, p.warning_soft)
         } else if self.amoo_ui.gui_running {
             ("执行中", p.success_text, p.success_soft)
@@ -1800,8 +2073,10 @@ impl Companion {
             self.hstack(
                 S2,
                 vec![
-                    self.ui_icon(UiIcon::Smartphone, 18., p.text),
-                    self.heading(if self.amoo_ui.gui_paused {
+                    self.content_icon(UiIcon::Smartphone, 18., p.text),
+                    self.heading(if approval_pending {
+                        "操作待确认"
+                    } else if self.amoo_ui.gui_paused {
                         "已暂停操作手机"
                     } else {
                         "正在操作手机"
@@ -1842,7 +2117,21 @@ impl Companion {
                 .finish(),
             );
         }
-        content.push(self.wrap(vec![
+        let mut pip_btns = vec![
+            self.button_icon(
+                "workspace-gui-pip-observe",
+                "观测屏幕",
+                UiIcon::Refresh,
+                Action::AmooUi(AmooUiAction::GuiRefreshScreen),
+                Btn::Secondary,
+            ),
+            self.button_icon(
+                "workspace-gui-pip-step",
+                "单步执行",
+                UiIcon::Play,
+                Action::AmooUi(AmooUiAction::GuiRefresh),
+                Btn::Secondary,
+            ),
             self.button_icon(
                 "workspace-gui-pip-pause",
                 if self.amoo_ui.gui_paused {
@@ -1872,7 +2161,24 @@ impl Companion {
                 Action::AmooUi(AmooUiAction::GuiMode(true)),
                 Btn::Primary,
             ),
-        ]));
+        ];
+        if approval_pending {
+            pip_btns.push(self.button_icon(
+                "workspace-gui-pip-approve",
+                "批准执行",
+                UiIcon::Check,
+                Action::AmooConfirmSafety(true),
+                Btn::Primary,
+            ));
+            pip_btns.push(self.button_icon(
+                "workspace-gui-pip-reject",
+                "拒绝",
+                UiIcon::Close,
+                Action::AmooConfirmSafety(false),
+                Btn::Danger,
+            ));
+        }
+        content.push(self.wrap(pip_btns));
         Some(self.panel(content))
     }
     fn workspace_history(&self) -> El {
@@ -1957,34 +2263,291 @@ impl Companion {
     }
     fn workspace_models(&self) -> El {
         let p = self.p();
+        let catalog = self.work.catalog.as_ref();
+        let model_count = catalog.map(|c| c.models.len()).unwrap_or(0);
+        let skill_count = catalog.map(|c| c.skills.len()).unwrap_or(0);
+        let selected_model = self.work.selected_model.as_deref();
+        let summary_text = workspace_model_summary(
+            selected_model,
+            model_count,
+            skill_count,
+            catalog.map(|c| c.gateway_version.as_str()).unwrap_or(""),
+        );
+
+        let mut model_chips = vec![self.button(
+            "workspace-model-auto",
+            "自动选择（推荐）",
+            Action::Work(WorkAction::SelectModel(None)),
+            if selected_model.is_none() {
+                Btn::Primary
+            } else {
+                Btn::Secondary
+            },
+        )];
+        if let Some(cat) = catalog {
+            for (idx, m) in cat.models.iter().take(6).enumerate() {
+                let active = selected_model == Some(m.id.as_str())
+                    || (selected_model.is_none() && m.current);
+                let label = if m.name.trim().is_empty() {
+                    m.id.clone()
+                } else {
+                    m.name.clone()
+                };
+                model_chips.push(self.button(
+                    format!("workspace-model-pick-{idx}"),
+                    label,
+                    Action::Work(WorkAction::SelectModel(Some(m.id.clone()))),
+                    if active { Btn::Primary } else { Btn::Secondary },
+                ));
+            }
+        }
+
+        let approval_pending = self.amoo_ui.gui_unconfirmed;
+        let gui_status = workspace_gui_control_state(
+            self.amoo_ui.gui_running,
+            self.amoo_ui.gui_paused,
+            approval_pending,
+        );
+
+        let mut gui_buttons = vec![
+            self.button_icon(
+                "workspace-gui-observe",
+                "观测屏幕",
+                UiIcon::Refresh,
+                Action::AmooUi(AmooUiAction::GuiRefreshScreen),
+                Btn::Secondary,
+            ),
+            self.button_icon(
+                "workspace-gui-step",
+                "单步执行",
+                UiIcon::Play,
+                Action::AmooUi(AmooUiAction::GuiRefresh),
+                Btn::Secondary,
+            ),
+            self.button_icon(
+                "workspace-gui-pause-resume",
+                if self.amoo_ui.gui_paused {
+                    "继续"
+                } else {
+                    "暂停"
+                },
+                if self.amoo_ui.gui_paused {
+                    UiIcon::Play
+                } else {
+                    UiIcon::Pause
+                },
+                Action::AmooUi(AmooUiAction::GuiPauseResume),
+                Btn::Secondary,
+            ),
+            self.button_icon(
+                "workspace-gui-stop",
+                "停止",
+                UiIcon::Close,
+                Action::AmooUi(AmooUiAction::GuiStopWaiting),
+                Btn::Secondary,
+            ),
+            self.button_icon(
+                "workspace-gui-approve",
+                "批准执行",
+                UiIcon::Check,
+                Action::AmooConfirmSafety(true),
+                if approval_pending {
+                    Btn::Primary
+                } else {
+                    Btn::Secondary
+                },
+            ),
+            self.button_icon(
+                "workspace-gui-reject",
+                "拒绝",
+                UiIcon::Close,
+                Action::AmooConfirmSafety(false),
+                if approval_pending {
+                    Btn::Danger
+                } else {
+                    Btn::Ghost
+                },
+            ),
+        ];
+        if !self.amoo_ui.screen_mode {
+            gui_buttons.push(self.button_icon(
+                "workspace-gui-enter-screen",
+                "进入手机操控视图",
+                UiIcon::Smartphone,
+                Action::AmooUi(AmooUiAction::GuiMode(true)),
+                Btn::Ghost,
+            ));
+        }
+
         self.vstack(
             S4,
             vec![
                 self.panel(vec![
-                    self.hstack(
-                        S2,
-                        vec![
-                            self.ui_icon(UiIcon::Smartphone, 20., p.text),
-                            self.heading("手机 Amoo"),
-                        ],
+                    self.between(
+                        self.hstack(
+                            S2,
+                            vec![
+                                self.content_icon(UiIcon::Smartphone, 20., p.text),
+                                self.heading("手机 Amoo 与模型能力中心"),
+                            ],
+                        ),
+                        self.pill_badge(
+                            format!("模型 {model_count} · 技能 {skill_count}"),
+                            p.accent,
+                            p.accent_soft,
+                        ),
+                    ),
+                    self.text(&summary_text, BODY, p.text2),
+                    self.wrap(model_chips),
+                    self.wrap(vec![
+                        self.button_icon(
+                            "workspace-open-capabilities",
+                            "打开能力与技能目录",
+                            UiIcon::Sparkles,
+                            Action::Work(WorkAction::Capabilities),
+                            Btn::Primary,
+                        ),
+                        self.button(
+                            "workspace-open-work-page",
+                            "前往能力中心页",
+                            Action::Page(Page::Work),
+                            Btn::Secondary,
+                        ),
+                        self.button(
+                            "workspace-verify-models",
+                            "校验模型可用性",
+                            Action::Work(WorkAction::VerifyModels),
+                            Btn::Secondary,
+                        ),
+                        self.button(
+                            "workspace-usage",
+                            "查看账号与用量",
+                            Action::Page(Page::Account),
+                            Btn::Ghost,
+                        ),
+                    ]),
+                ]),
+                self.panel(vec![
+                    self.between(
+                        self.hstack(
+                            S2,
+                            vec![
+                                self.content_icon(UiIcon::Connect, 20., p.text),
+                                self.heading("OpenClaw 网关与技能管理"),
+                            ],
+                        ),
+                        self.pill_badge(
+                            if self.amoo_bg_keepalive {
+                                "后台保活已开启"
+                            } else {
+                                "按需唤醒"
+                            },
+                            if self.amoo_bg_keepalive {
+                                p.success_text
+                            } else {
+                                p.text2
+                            },
+                            if self.amoo_bg_keepalive {
+                                p.success_soft
+                            } else {
+                                p.surface
+                            },
+                        ),
                     ),
                     self.text(
-                        "聊天、看图、做文件和生成图片都用手机账号，模型由手机自动选择。",
-                        BODY,
+                        "直接在当前工作区刷新手机端 OpenClaw 网关、同步宿主技能包，或切换后台常驻唤醒锁：",
+                        CAPTION,
                         p.text2,
                     ),
-                    self.button(
-                        "workspace-usage",
-                        "查看账号与用量",
-                        Action::Page(Page::Account),
-                        Btn::Ghost,
+                    self.wrap(vec![
+                        self.button_icon(
+                            "workspace-gw-refresh",
+                            "刷新会话与网关",
+                            UiIcon::Refresh,
+                            Action::AmooSnapshot,
+                            Btn::Secondary,
+                        ),
+                        self.button(
+                            "workspace-sync-host-skills",
+                            "导入电脑技能",
+                            Action::Work(WorkAction::ImportDesktopSkill),
+                            Btn::Secondary,
+                        ),
+                        self.button(
+                            "workspace-manage-skills",
+                            "管理手机技能",
+                            Action::AmooToggleSkillManage,
+                            Btn::Secondary,
+                        ),
+                        self.button(
+                            "workspace-start-gateway",
+                            "启动手机网关",
+                            Action::CompanionBackground(true),
+                            Btn::Secondary,
+                        ),
+                        self.button(
+                            "workspace-restart-gateway",
+                            "重连 Amoo 网关",
+                            Action::Amoo,
+                            Btn::Secondary,
+                        ),
+                        self.button(
+                            "workspace-toggle-wakelock",
+                            if self.amoo_bg_keepalive {
+                                "关闭后台唤醒锁"
+                            } else {
+                                "开启后台唤醒锁"
+                            },
+                            Action::AmooToggleBgKeepAlive,
+                            Btn::Ghost,
+                        ),
+                        self.button(
+                            "workspace-open-voice-settings",
+                            "语音唤醒设置",
+                            Action::AmooOpenVoiceSettings,
+                            Btn::Ghost,
+                        ),
+                    ]),
+                ]),
+                self.panel(vec![
+                    self.between(
+                        self.hstack(
+                            S2,
+                            vec![
+                                self.content_icon(UiIcon::Smartphone, 20., p.text),
+                                self.heading("GUI Agent 实时观测与安全审批"),
+                            ],
+                        ),
+                        self.pill_badge(
+                            gui_status,
+                            if approval_pending || self.amoo_ui.gui_paused {
+                                p.warning
+                            } else if self.amoo_ui.gui_running {
+                                p.success_text
+                            } else {
+                                p.text2
+                            },
+                            if approval_pending || self.amoo_ui.gui_paused {
+                                p.warning_soft
+                            } else if self.amoo_ui.gui_running {
+                                p.success_soft
+                            } else {
+                                p.surface
+                            },
+                        ),
                     ),
+                    self.text(
+                        "支持随时观测手机实时画面、单步检查、暂停/继续或终止操作；遇到敏感权限与支付动作时可在此直接批准或拒绝。",
+                        CAPTION,
+                        p.text2,
+                    ),
+                    self.wrap(gui_buttons),
                 ]),
                 self.panel(vec![
                     self.hstack(
                         S2,
                         vec![
-                            self.ui_icon(UiIcon::Cpu, 20., p.text),
+                            self.content_icon(UiIcon::Cpu, 20., p.text),
                             self.heading("自己的模型服务（可选）"),
                         ],
                     ),
@@ -2039,7 +2602,10 @@ impl Companion {
             if !task.outputs.is_empty() {
                 rows.push(self.divider());
                 rows.push(self.heading("继续使用已有成果"));
-                for (i, o) in task.outputs.iter().enumerate() {
+                let page_key = format!("workspace-attach-outputs:{}",task.id);
+                let range = self.list_page_range(&page_key,task.outputs.len(),20);
+                rows.push(self.list_page_controls(&page_key,task.outputs.len(),20));
+                for (i, o) in task.outputs.iter().enumerate().skip(range.start).take(range.len()) {
                     rows.push(self.ws_button(
                         &format!("attach-output-{i}"),
                         &o.name,
@@ -2102,21 +2668,37 @@ impl Companion {
                         p.success,
                     ));
                     for (i, item) in web.items.iter().enumerate().take(60) {
-                        rows.push(self.panel(vec![
-                            self.line_w(&item.name, BODY, p.text, Weight::Medium),
-                            self.text(
-                                format!("{} · {}", item.category, item.description),
-                                CAPTION,
-                                p.text2,
+                        rows.push(self.hover_panel_interactive(
+                            format!("ws-proj-web-{i}"),
+                            self.vstack(
+                                S2,
+                                vec![
+                                    self.line_w(&item.name, BODY, p.text, Weight::Medium),
+                                    self.text(
+                                        format!("{} · {}", item.category, item.description),
+                                        CAPTION,
+                                        p.text2,
+                                    ),
+                                    self.ws_button(
+                                        &format!("open-project-{i}"),
+                                        "继续编辑",
+                                        UiIcon::ExternalLink,
+                                        W::OpenProject(i),
+                                        Btn::Secondary,
+                                    ),
+                                ],
                             ),
-                            self.ws_button(
-                                &format!("open-project-{i}"),
-                                "继续编辑",
-                                UiIcon::ExternalLink,
-                                W::OpenProject(i),
-                                Btn::Secondary,
-                            ),
-                        ]));
+                            Some(Action::Workspace(W::OpenProject(i))),
+                            None,
+                            Some(crate::ui::context_menu::Target::StudioWork(
+                                crate::ui::context_menu::StudioWorkTarget::CloudProject {
+                                    source: 0,
+                                    idx: i,
+                                    url: item.editor().unwrap_or_default(),
+                                    title: item.name.clone(),
+                                },
+                            )),
+                        ));
                     }
                 } else {
                     rows.push(self.text(
@@ -2164,20 +2746,36 @@ impl Companion {
                         ));
                     } else {
                         for (i, item) in cloud.items.iter().enumerate().take(40) {
-                            rows.push(self.panel(vec![
-                                self.between(
-                                    self.line_w(&item.name, BODY, p.text, Weight::Medium),
-                                    self.pill_badge(&item.category, p.accent, p.surface),
+                            rows.push(self.hover_panel_interactive(
+                                format!("ws-proj-cloud-{i}"),
+                                self.vstack(
+                                    S2,
+                                    vec![
+                                        self.between(
+                                            self.line_w(&item.name, BODY, p.text, Weight::Medium),
+                                            self.pill_badge(&item.category, p.accent, p.surface),
+                                        ),
+                                        self.text(&item.description, CAPTION, p.text2),
+                                        self.button_icon(
+                                            format!("workspace-studio-use-phone-{i}"),
+                                            "在手机使用",
+                                            UiIcon::Smartphone,
+                                            Action::Studio(StudioAction::UsePhone(i)),
+                                            Btn::Secondary,
+                                        ),
+                                    ],
                                 ),
-                                self.text(&item.description, CAPTION, p.text2),
-                                self.button_icon(
-                                    format!("workspace-studio-use-phone-{i}"),
-                                    "在手机使用",
-                                    UiIcon::Smartphone,
-                                    Action::Studio(StudioAction::UsePhone(i)),
-                                    Btn::Secondary,
-                                ),
-                            ]));
+                                Some(Action::Studio(StudioAction::UsePhone(i))),
+                                None,
+                                Some(crate::ui::context_menu::Target::StudioWork(
+                                    crate::ui::context_menu::StudioWorkTarget::CloudProject {
+                                        source: 1,
+                                        idx: i,
+                                        url: item.url.clone(),
+                                        title: item.name.clone(),
+                                    },
+                                )),
+                            ));
                         }
                     }
                 } else {
@@ -2223,59 +2821,93 @@ impl Companion {
                 if !self.studio_lab.artifacts.is_empty() {
                     rows.push(self.heading("我做过的应用"));
                     for (i, a) in self.studio_lab.artifacts.iter().enumerate().take(24) {
-                        rows.push(self.panel(vec![
-                            self.between(
-                                self.line_w(&a.name, BODY, p.text, Weight::Medium),
-                                self.pill_badge(
-                                    if a.passed {
-                                        "已检查"
-                                    } else {
-                                        "需要修复"
-                                    },
-                                    if a.passed { p.success } else { p.warning },
-                                    p.surface,
-                                ),
+                        rows.push(self.hover_panel_interactive(
+                            format!("ws-proj-lab-{i}"),
+                            self.vstack(
+                                S2,
+                                vec![
+                                    self.between(
+                                        self.line_w(&a.name, BODY, p.text, Weight::Medium),
+                                        self.pill_badge(
+                                            if a.passed {
+                                                "已检查"
+                                            } else {
+                                                "需要修复"
+                                            },
+                                            if a.passed { p.success } else { p.warning },
+                                            p.surface,
+                                        ),
+                                    ),
+                                    self.text(&a.summary, CAPTION, p.text2),
+                                    self.wrap(vec![
+                                        self.ws_button(
+                                            &format!("lab-select-{}", a.id),
+                                            "查看",
+                                            UiIcon::Apps,
+                                            W::SelectLab(a.id.clone()),
+                                            Btn::Secondary,
+                                        ),
+                                        self.ws_button(
+                                            &format!("lab-preview-{}", a.id),
+                                            "运行预览",
+                                            UiIcon::Monitor,
+                                            W::StudioPreviewArtifact(i),
+                                            Btn::Ghost,
+                                        ),
+                                        self.ws_button(
+                                            &format!("lab-phone-{}", a.id),
+                                            "发送到手机",
+                                            UiIcon::Smartphone,
+                                            W::StudioDeliverArtifact(i),
+                                            Btn::Ghost,
+                                        ),
+                                    ]),
+                                ],
                             ),
-                            self.text(&a.summary, CAPTION, p.text2),
-                            self.wrap(vec![
-                                self.ws_button(
-                                    &format!("lab-select-{}", a.id),
-                                    "查看",
-                                    UiIcon::Apps,
-                                    W::SelectLab(a.id.clone()),
-                                    Btn::Secondary,
-                                ),
-                                self.ws_button(
-                                    &format!("lab-preview-{}", a.id),
-                                    "运行预览",
-                                    UiIcon::Monitor,
-                                    W::StudioPreviewArtifact(i),
-                                    Btn::Ghost,
-                                ),
-                                self.ws_button(
-                                    &format!("lab-phone-{}", a.id),
-                                    "发送到手机",
-                                    UiIcon::Smartphone,
-                                    W::StudioDeliverArtifact(i),
-                                    Btn::Ghost,
-                                ),
-                            ]),
-                        ]));
+                            Some(Action::Workspace(W::SelectLab(a.id.clone()))),
+                            Some(Action::Workspace(W::StudioPreviewArtifact(i))),
+                            Some(crate::ui::context_menu::Target::StudioWork(
+                                crate::ui::context_menu::StudioWorkTarget::LocalArtifact {
+                                    round_idx: i,
+                                    path: a.html_path.clone(),
+                                    title: a.name.clone(),
+                                },
+                            )),
+                        ));
                     }
                 }
                 if !self.studio.works.is_empty() {
                     rows.push(self.heading("手机上已装的作品"));
                     for (i, w) in self.studio.works.iter().enumerate().take(20) {
-                        rows.push(self.panel(vec![
-                            self.line_w(&w.name, BODY, p.text, Weight::Medium),
-                            self.text(format!("{} · {}", w.category, w.updated), CAPTION, p.text2),
-                            self.button(
-                                format!("workspace-studio-open-local-{i}"),
-                                "选择并同步",
-                                Action::Studio(StudioAction::Select(i)),
-                                Btn::Secondary,
+                        rows.push(self.hover_panel_interactive(
+                            format!("ws-proj-saved-{i}"),
+                            self.vstack(
+                                S2,
+                                vec![
+                                    self.line_w(&w.name, BODY, p.text, Weight::Medium),
+                                    self.text(
+                                        format!("{} · {}", w.category, w.updated),
+                                        CAPTION,
+                                        p.text2,
+                                    ),
+                                    self.button(
+                                        format!("workspace-studio-open-local-{i}"),
+                                        "选择并同步",
+                                        Action::Studio(StudioAction::Select(i)),
+                                        Btn::Secondary,
+                                    ),
+                                ],
                             ),
-                        ]));
+                            Some(Action::Studio(StudioAction::Select(i))),
+                            None,
+                            Some(crate::ui::context_menu::Target::StudioWork(
+                                crate::ui::context_menu::StudioWorkTarget::SavedWork {
+                                    idx: i,
+                                    url: w.url.clone(),
+                                    title: w.name.clone(),
+                                },
+                            )),
+                        ));
                     }
                 }
             }
@@ -2328,7 +2960,7 @@ impl Companion {
                     self.ws_button(
                         &format!("memory-cat-{cat}"),
                         label,
-                        UiIcon::Star,
+                        UiIcon::Sparkles,
                         W::MemoryCategory(cat),
                         if active_cat == cat {
                             Btn::Primary
@@ -2378,9 +3010,8 @@ impl Companion {
                 ),
             ]),
         ];
-        let mut shown_memories = 0usize;
-        for (idx, mem) in self.amoo_memories.iter().enumerate() {
-            let matches_cat = match active_cat {
+        let matching_memories: Vec<_> = self.amoo_memories.iter().enumerate().filter(|(_,mem)| {
+            match active_cat {
                 1 => mem.sub.contains("关于我") || mem.sub.contains("画像"),
                 2 => {
                     mem.sub.contains("偏好")
@@ -2393,11 +3024,13 @@ impl Companion {
                         || mem.title.contains("提醒")
                 }
                 _ => true,
-            };
-            if !matches_cat {
-                continue;
             }
-            shown_memories += 1;
+        }).collect();
+        let shown_memories = matching_memories.len();
+        let page_key = format!("workspace-memories:{active_cat}");
+        let range = self.list_page_range(&page_key,shown_memories,20);
+        memory_rows.push(self.list_page_controls(&page_key,shown_memories,20));
+        for &(idx, mem) in &matching_memories[range] {
             memory_rows.push(self.panel(vec![
                 self.line_w(&mem.title, BODY, p.text, Weight::Medium),
                 self.text(&mem.sub, CAPTION, p.text2),
@@ -2405,7 +3038,7 @@ impl Companion {
                     self.ws_button(
                         &format!("memory-inject-{idx}"),
                         "带入当前对话",
-                        UiIcon::Star,
+                        UiIcon::Sparkles,
                         W::UseMemory(mem.title.clone()),
                         Btn::Secondary,
                     ),
@@ -2436,27 +3069,23 @@ impl Companion {
             ),
             self.line("角色定位", MICRO, p.text3),
             self.wrap(
-                [
-                    (0, "Amoo 全能助手"),
-                    (1, "桌面交付伙伴"),
-                    (2, "办公协同专员"),
-                    (3, "研发架构专家"),
-                ]
-                .into_iter()
-                .map(|(idx, label)| {
-                    self.ws_button(
-                        &format!("persona-role-{idx}"),
-                        label,
-                        UiIcon::Star,
-                        W::SelectAgentRole(idx),
-                        if self.amoo_agent_idx == idx {
-                            Btn::Primary
-                        } else {
-                            Btn::Secondary
-                        },
-                    )
-                })
-                .collect(),
+                self.amoo_agents
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, label)| {
+                        self.ws_button(
+                            &format!("persona-role-{idx}"),
+                            label,
+                            UiIcon::Sparkles,
+                            W::SelectAgentRole(idx),
+                            if self.amoo_agent_idx == idx {
+                                Btn::Primary
+                            } else {
+                                Btn::Secondary
+                            },
+                        )
+                    })
+                    .collect(),
             ),
             self.line("沟通风格", MICRO, p.text3),
             self.wrap(
@@ -2503,6 +3132,8 @@ impl Companion {
                 rows.push(self.pill_badge(
                     if a.passed {
                         "已检查"
+                    } else if a.id.starts_with("starter-") {
+                        "内置示例 · 尚未验收"
                     } else {
                         "需要修复"
                     },
@@ -2553,7 +3184,7 @@ impl Companion {
                                 rows.push(self.hstack(
                                     S2,
                                     vec![
-                                            self.ui_icon(
+                                            self.content_icon(
                                                 if pass { UiIcon::Check } else { UiIcon::Info },
                                                 14.,
                                                 if pass { p.success } else { p.warning },
@@ -2808,7 +3439,9 @@ impl Companion {
                     Action::StudioLab(StudioLabAction::CloudModels),
                     Btn::Secondary,
                 ));
-                for m in &self.studio_lab.cloud_models {
+                let range = self.list_page_range("workspace-cloud-models",self.studio_lab.cloud_models.len(),40);
+                rows.push(self.list_page_controls("workspace-cloud-models",self.studio_lab.cloud_models.len(),40));
+                for m in self.studio_lab.cloud_models.iter().skip(range.start).take(range.len()) {
                     let id = format!("workspace-cloud-model-{}", m.id);
                     let action = Action::StudioLab(StudioLabAction::CloudModel(m.id.clone()));
                     rows.push(if self.studio_lab.cloud_model.as_ref() == Some(&m.id) {
@@ -2893,3 +3526,68 @@ fn proposal_step_label(executor: Executor) -> &'static str {
 
 /// Toggle key (in `amoo_expanded_tool_records`) for the header "…" menu.
 const HEADER_MORE_KEY: &str = "workspace-header-more";
+
+pub(crate) fn workspace_model_summary(
+    selected_model: Option<&str>,
+    model_count: usize,
+    skill_count: usize,
+    gateway_version: &str,
+) -> String {
+    let model_label = match selected_model.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(m) => format!("当前指定模型：{m}"),
+        None => "聊天、看图、做文件和生成图片默认由手机自动选择最优模型".to_string(),
+    };
+    let gw_label = if gateway_version.trim().is_empty() {
+        format!("已发现 {model_count} 款模型 · {skill_count} 项技能")
+    } else {
+        format!(
+            "OpenClaw {} · 已发现 {model_count} 款模型 · {skill_count} 项技能",
+            gateway_version.trim()
+        )
+    };
+    format!("{model_label}（{gw_label}）。")
+}
+
+pub(crate) fn workspace_gui_control_state(
+    gui_running: bool,
+    gui_paused: bool,
+    approval_pending: bool,
+) -> &'static str {
+    if approval_pending {
+        "待安全批准"
+    } else if gui_paused {
+        "已暂停"
+    } else if gui_running {
+        "执行中"
+    } else {
+        "就绪待命"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{workspace_gui_control_state, workspace_model_summary};
+
+    #[test]
+    fn workspace_model_summary_formats_auto_and_explicit_model_with_gateway_info() {
+        let auto_summary = workspace_model_summary(None, 4, 12, "v1.4.2");
+        assert!(auto_summary.contains("自动选择最优模型"));
+        assert!(auto_summary.contains("OpenClaw v1.4.2"));
+        assert!(auto_summary.contains("4 款模型"));
+        assert!(auto_summary.contains("12 项技能"));
+
+        let explicit_summary = workspace_model_summary(Some("step-2-mini"), 3, 8, "");
+        assert!(explicit_summary.contains("当前指定模型：step-2-mini"));
+        assert!(explicit_summary.contains("3 款模型"));
+        assert!(explicit_summary.contains("8 项技能"));
+    }
+
+    #[test]
+    fn workspace_gui_control_state_prioritizes_approval_and_pause_states() {
+        assert_eq!(workspace_gui_control_state(false, false, false), "就绪待命");
+        assert_eq!(workspace_gui_control_state(true, false, false), "执行中");
+        assert_eq!(workspace_gui_control_state(true, true, false), "已暂停");
+        assert_eq!(workspace_gui_control_state(true, false, true), "待安全批准");
+        assert_eq!(workspace_gui_control_state(false, true, true), "待安全批准");
+    }
+}

@@ -1,4 +1,5 @@
 //! 文件处理页（Page::Work）的状态与执行编排。所有手机请求都使用当前选中的设备。
+use stepx_companion::file_dialog::DialogKind;
 use super::*;
 use anyhow::Context;
 use facloud_ui::TypedActionView;
@@ -1169,14 +1170,30 @@ impl Companion {
                     .workspace
                     .clone()
                     .ok_or_else(|| anyhow::anyhow!("请先选择工作文件夹"))?;
-                if let Some(path) = native_dialog::FileDialog::new()
-                    .set_title("选择包含 SKILL.md 的工作流程文件夹")
-                    .show_open_single_dir()?
-                {
-                    let skill = work::import_skill(&root, &path)?;
-                    self.work.status = format!("已导入工作流程 {}，桌面任务可读取使用", skill.name);
-                    self.work_files()?;
-                }
+                self.choose_path(
+                    stepx_companion::file_dialog::FileDialog::new()
+                        .set_title("选择包含 SKILL.md 的工作流程文件夹"),
+                    DialogKind::OpenFolder,
+                    move |app, path, _ctx| {
+                        let result = app.with_work_session(|app| {
+                            anyhow::ensure!(
+                                !app.work.running && app.work.workspace.as_ref() == Some(&root),
+                                "工作目录已变化，请重新选择工作流程"
+                            );
+                            let skill = work::import_skill(&root, &path)?;
+                            app.work.status = format!("已导入工作流程 {}，桌面任务可读取使用", skill.name);
+                            app.work_files()?;
+                            Ok(())
+                        });
+                        if let Err(error) = &result {
+                            app.work.error = Some(format!("{error:#}"));
+                        } else if !app.busy {
+                            app.status = app.work.status.clone();
+                            app.error = false;
+                        }
+                        result
+                    },
+                );
             }
             WorkAction::UsePhoneSkill(key) => {
                 anyhow::ensure!(!self.busy && !self.work.running, "请等待当前操作完成");
@@ -1217,20 +1234,34 @@ impl Companion {
                     !self.busy && !self.work.running,
                     "工作进行中，请先停止桌面执行再切换文件夹"
                 );
-                if let Some(path) = native_dialog::FileDialog::new()
-                    .set_title("选择工作文件夹")
-                    .show_open_single_dir()?
-                {
-                    let path = path.canonicalize()?;
-                    self.work.workspace = Some(path);
-                    self.remember_work_directory()?;
-                    self.work.local_preview = None;
-                    self.work.local_preview_loading = None;
-                    self.work.local_preview_error = None;
-                    self.work_files()?;
-                    self.work.status =
-                        "已选择工作文件夹；桌面任务仅在该目录内读取和生成文件".into();
-                }
+                self.choose_path(
+                    stepx_companion::file_dialog::FileDialog::new().set_title("选择工作文件夹"),
+                    DialogKind::OpenFolder,
+                    move |app, path, _ctx| {
+                        let result = app.with_work_session(|app| {
+                            anyhow::ensure!(
+                                !app.busy && !app.work.running,
+                                "工作已开始，请停止执行后重新选择文件夹"
+                            );
+                            let path = path.canonicalize()?;
+                            app.work.workspace = Some(path);
+                            app.remember_work_directory()?;
+                            app.work.local_preview = None;
+                            app.work.local_preview_loading = None;
+                            app.work.local_preview_error = None;
+                            app.work_files()?;
+                            app.work.status = "已选择工作文件夹；桌面任务仅在该目录内读取和生成文件".into();
+                            Ok(())
+                        });
+                        if let Err(error) = &result {
+                            app.work.error = Some(format!("{error:#}"));
+                        } else if !app.busy {
+                            app.status = app.work.status.clone();
+                            app.error = false;
+                        }
+                        result
+                    },
+                );
             }
             WorkAction::RefreshFiles => self.work_files()?,
             WorkAction::ToggleAttachMenu => {
@@ -1247,7 +1278,7 @@ impl Companion {
                 }
                 self.work.attach_menu_open = false;
                 let images_only = matches!(action, WorkAction::AttachImages);
-                let dialog = native_dialog::FileDialog::new().set_title(if images_only {
+                let dialog = stepx_companion::file_dialog::FileDialog::new().set_title(if images_only {
                     "上传本地图片"
                 } else {
                     "添加文档与附件"
@@ -1257,35 +1288,57 @@ impl Companion {
                 } else {
                     dialog
                 };
-                let selected = dialog.show_open_multiple_file()?;
-                if !selected.is_empty() {
-                    anyhow::ensure!(
-                        self.work.attachments.len() + selected.len() <= 8,
-                        "最多添加 8 个附件，请减少选择数量"
-                    );
-                    if self.work.mode != 1 {
-                        let mut all = self.work.attachments.clone();
-                        all.extend(selected.iter().cloned());
-                        amoo_media::prepare_attachments(&all)?;
-                    }
-                    for path in selected {
-                        let local = if self.work.mode == 1 {
-                            let root =
-                                self.work.workspace.as_ref().context("请先选择工作文件夹")?;
-                            let file = work::import_file(root, &path)?;
-                            root.join(file.relative_path)
-                        } else {
-                            let path = path.canonicalize()?;
-                            anyhow::ensure!(path.is_file(), "请选择文件作为附件");
-                            path
-                        };
-                        if !self.work.attachments.contains(&local) {
-                            self.work.attachments.push(local);
+                let expected_workspace = self.work.workspace.clone();
+                let expected_mode = self.work.mode;
+                let expected_task = self.workspace.active.clone();
+                let expected_session = self.work.session_key.clone();
+                self.choose_paths(dialog, DialogKind::OpenFiles, move |app, selected, _| {
+                    let result = app.with_work_session(|app| {
+                        anyhow::ensure!(
+                            !app.busy
+                                && !app.work.running
+                                && app.work.workspace == expected_workspace
+                                && app.work.mode == expected_mode
+                                && app.workspace.active == expected_task
+                                && app.work.session_key == expected_session,
+                            "当前任务或工作目录已变化，请重新选择附件；已有草稿保留"
+                        );
+                        anyhow::ensure!(
+                            app.work.attachments.len() + selected.len() <= 8,
+                            "最多添加 8 个附件，请减少选择数量"
+                        );
+                        if app.work.mode != 1 {
+                            let mut all = app.work.attachments.clone();
+                            all.extend(selected.iter().cloned());
+                            amoo_media::prepare_attachments(&all)?;
                         }
+                        for path in selected {
+                            let local = if app.work.mode == 1 {
+                                let root = app.work.workspace.as_ref().context("请先选择工作文件夹")?;
+                                let file = work::import_file(root, &path)?;
+                                root.join(file.relative_path)
+                            } else {
+                                let path = path.canonicalize()?;
+                                anyhow::ensure!(path.is_file(), "请选择文件作为附件");
+                                path
+                            };
+                            if !app.work.attachments.contains(&local) {
+                                app.work.attachments.push(local);
+                            }
+                        }
+                        app.work_files()?;
+                        app.work.status = "附件已加入草稿，发送后交给 Amoo 处理".into();
+
+                        Ok(())
+                    });
+                    if let Err(error) = &result {
+                        app.work.error = Some(format!("{error:#}"));
+                    } else if !app.busy {
+                        app.status = app.work.status.clone();
+                        app.error = false;
                     }
-                    self.work_files()?;
-                    self.work.status = "附件已加入草稿，发送后交给 Amoo 处理".into();
-                }
+                    result
+                });
             }
             WorkAction::RemoveAttachment(index) => {
                 anyhow::ensure!(!self.busy && !self.work.running, "任务进行中，附件已经提交");
@@ -1647,67 +1700,81 @@ impl Companion {
                     .and_then(|s| s.to_str())
                     .filter(|s| !s.is_empty())
                     .unwrap_or("Amoo附件");
-                if let Some(path) = native_dialog::FileDialog::new()
-                    .set_title("保存 Amoo 附件")
-                    .set_filename(filename)
-                    .set_location(&stepx_companion::settings::downloads())
-                    .show_save_single_file()?
-                {
-                    anyhow::ensure!(!path.exists(), "该文件已存在，请选择新名称保存");
-                    let attachment = stepx_companion::openclaw::RealAttachment {
-                        name: name.clone(),
-                        kind: kind.clone(),
-                        mime: mime.clone(),
-                        url: url.clone(),
-                        ..Default::default()
-                    };
-                    let cached = self.work.image_previews.get(url).cloned();
-                    let scope = self.amoo_ui.account_scope.clone();
-                    let identity = self.work.preview_identities.get(url).cloned();
-                    self.with_device("正在保存手机附件…", move |adb, device| {
-                        if let Some(expected) = scope.as_ref() {
-                            anyhow::ensure!(
-                                stepx_companion::amoo_usage::account_scope(adb, &device)?.as_ref()
-                                    == Some(expected),
-                                "手机账号已变化，请重新同步后保存附件"
-                            );
-                        }
-                        let persistent = preview_cache::root().zip(scope);
-                        let stored = persistent.as_ref().and_then(|(root, scope)| {
-                            preview_cache::load_with_identity(
-                                root,
-                                scope,
-                                &attachment.url,
-                                identity.as_deref(),
-                            )
-                        });
-                        let bytes = if let Some(source) = stored.or(cached.filter(|p| p.is_file()))
-                        {
-                            let mut input = std::fs::File::open(source)?;
-                            let mut output = std::fs::OpenOptions::new()
-                                .write(true)
-                                .create_new(true)
-                                .open(&path)?;
-                            std::io::copy(&mut input, &mut output)?
-                        } else {
-                            let file =
-                                amoo_media::download_artifact(adb, &device, &attachment, &path)?;
-                            if attachment.kind == "image" || attachment.mime.starts_with("image/") {
-                                if let Some((root, scope)) = persistent.as_ref() {
-                                    let _ = preview_cache::save_with_identity(
+                let attachment = stepx_companion::openclaw::RealAttachment {
+                    name: name.clone(),
+                    kind: kind.clone(),
+                    mime: mime.clone(),
+                    url: url.clone(),
+                    ..Default::default()
+                };
+                let cached = self.work.image_previews.get(url).cloned();
+                let scope = self.amoo_ui.account_scope.clone();
+                let identity = self.work.preview_identities.get(url).cloned();
+                let expected_device = self.selected.as_ref().map(|d| d.serial.clone());
+                self.choose_path(
+                    stepx_companion::file_dialog::FileDialog::new()
+                        .set_title("保存 Amoo 附件")
+                        .set_filename(filename)
+                        .set_location(&stepx_companion::settings::downloads()),
+                    DialogKind::SaveFile,
+                    move |app, path, _| {
+                        let result = app.with_work_session(|app| {
+                            app.ensure_file_dialog_device(&expected_device)?;
+                            anyhow::ensure!(!app.busy, "当前操作尚未完成，请重新保存附件");
+                            anyhow::ensure!(!path.exists(), "该文件已存在，请选择新名称保存");
+                            app.with_device("正在保存手机附件…", move |adb, device| {
+                                if let Some(expected) = scope.as_ref() {
+                                    anyhow::ensure!(
+                                        stepx_companion::amoo_usage::account_scope(adb, &device)?.as_ref()
+                                            == Some(expected),
+                                        "手机账号已变化，请重新同步后保存附件"
+                                    );
+                                }
+                                let persistent = preview_cache::root().zip(scope);
+                                let stored = persistent.as_ref().and_then(|(root, scope)| {
+                                    preview_cache::load_with_identity(
                                         root,
                                         scope,
                                         &attachment.url,
-                                        &file.path,
                                         identity.as_deref(),
-                                    );
-                                }
-                            }
-                            file.bytes
-                        };
-                        Ok(Outcome::Work(WorkOutcome::AttachmentSaved { path, bytes }))
-                    });
-                }
+                                    )
+                                });
+                                let bytes = if let Some(source) = stored.or(cached.filter(|p| p.is_file())) {
+                                    let mut input = std::fs::File::open(source)?;
+                                    let mut output = std::fs::OpenOptions::new()
+                                        .write(true)
+                                        .create_new(true)
+                                        .open(&path)?;
+                                    std::io::copy(&mut input, &mut output)?
+                                } else {
+                                    let file = amoo_media::download_artifact(adb, &device, &attachment, &path)?;
+                                    if attachment.kind == "image" || attachment.mime.starts_with("image/") {
+                                        if let Some((root, scope)) = persistent.as_ref() {
+                                            let _ = preview_cache::save_with_identity(
+                                                root,
+                                                scope,
+                                                &attachment.url,
+                                                &file.path,
+                                                identity.as_deref(),
+                                            );
+                                        }
+                                    }
+                                    file.bytes
+                                };
+                                Ok(Outcome::Work(WorkOutcome::AttachmentSaved { path, bytes }))
+                            });
+
+                            Ok(())
+                        });
+                        if let Err(error) = &result {
+                            app.work.error = Some(format!("{error:#}"));
+                        } else if !app.busy {
+                            app.status = app.work.status.clone();
+                            app.error = false;
+                        }
+                        result
+                    },
+                );
             }
             WorkAction::OpenPreview(url) => {
                 if !self.work.image_previews.contains_key(url)
@@ -1908,29 +1975,43 @@ impl Companion {
                     .file_name()
                     .and_then(|s| s.to_str())
                     .unwrap_or("Amoo工作成果");
-                if let Some(destination) = native_dialog::FileDialog::new()
-                    .set_title("导出工作成果")
-                    .set_filename(filename)
-                    .set_location(&stepx_companion::settings::downloads())
-                    .show_save_single_file()?
-                {
-                    let source = preview.path.clone();
-                    let root = self.work.workspace.clone();
-                    self.submit("正在导出工作成果…", move |_| {
-                        validate_open_path(root.as_deref(), &source)?;
-                        let mut input = std::fs::File::open(&source)?;
-                        let mut output = std::fs::OpenOptions::new()
-                            .write(true)
-                            .create_new(true)
-                            .open(&destination)
-                            .context("目标文件已存在或无法写入，请使用新名称")?;
-                        let bytes = std::io::copy(&mut input, &mut output)?;
-                        Ok(Outcome::Work(WorkOutcome::AttachmentSaved {
-                            path: destination,
-                            bytes,
-                        }))
-                    });
-                }
+                let source = preview.path.clone();
+                let root = self.work.workspace.clone();
+                self.choose_path(
+                    stepx_companion::file_dialog::FileDialog::new()
+                        .set_title("导出工作成果")
+                        .set_filename(filename)
+                        .set_location(&stepx_companion::settings::downloads()),
+                    DialogKind::SaveFile,
+                    move |app, destination, _| {
+                        let result = app.with_work_session(|app| {
+                            anyhow::ensure!(!app.busy, "当前操作尚未完成，请重新导出文件");
+                            app.submit("正在导出工作成果…", move |_| {
+                                validate_open_path(root.as_deref(), &source)?;
+                                let mut input = std::fs::File::open(&source)?;
+                                let mut output = std::fs::OpenOptions::new()
+                                    .write(true)
+                                    .create_new(true)
+                                    .open(&destination)
+                                    .context("目标文件已存在或无法写入，请使用新名称")?;
+                                let bytes = std::io::copy(&mut input, &mut output)?;
+                                Ok(Outcome::Work(WorkOutcome::AttachmentSaved {
+                                    path: destination,
+                                    bytes,
+                                }))
+                            });
+
+                            Ok(())
+                        });
+                        if let Err(error) = &result {
+                            app.work.error = Some(format!("{error:#}"));
+                        } else if !app.busy {
+                            app.status = app.work.status.clone();
+                            app.error = false;
+                        }
+                        result
+                    },
+                );
             }
             WorkAction::InstallSkill { key, install_id } => {
                 anyhow::ensure!(!self.busy && !self.work.running, "请等待当前操作完成");
@@ -2045,7 +2126,9 @@ impl Companion {
             self.work.running = true;
             self.work.events.clear();
             self.work.artifacts.clear();
-            self.work.status = if self.selected.is_some() {
+            self.work.status = if work::has_local_model_backend() {
+                "正在启动桌面协作，使用明确选择的独立 API…".into()
+            } else if self.selected.is_some() {
                 "正在启动桌面协作，使用手机模型处理工作文件…".into()
             } else {
                 "正在启动桌面协作，使用本地配置模型处理工作文件…".into()

@@ -17,7 +17,7 @@ use std::{
 };
 
 const MAX_FRAME: usize = 16 * 1024 * 1024;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 const AMOO_CONTEXT_TTL: Duration = Duration::from_secs(60);
 const LIVE_DEVICE_CONTEXT_MARKER: &str = "\n\n[StepX 真机实时硬件、电子三包保修与电池健康档案";
 
@@ -67,10 +67,8 @@ fn format_live_device_telemetry_block(raw: &str, device: &Device) -> Option<Stri
         let prefix = format!("{key}=");
         raw.lines()
             .find_map(|line| line.trim().strip_prefix(&prefix))
-            .map(str::trim)
-            .filter(|v| !v.is_empty() && !v.eq_ignore_ascii_case("null"))
-            .unwrap_or("")
-            .to_string()
+            .map(crate::bridge::clean_nullable_field)
+            .unwrap_or_default()
     };
     let non_empty = |primary: String, fallback: &str| -> String {
         if primary.is_empty() {
@@ -119,29 +117,10 @@ fn format_live_device_telemetry_block(raw: &str, device: &Device) -> Option<Stri
     );
 
     let soh = non_empty(kv("SOH"), "未读取");
-    let normalize_mah = |val: String, default_mah: &str| -> String {
-        if let Ok(n) = val.trim().parse::<u64>() {
-            if n > 100_000 {
-                return (n / 1000).to_string();
-            } else if n > 0 {
-                return n.to_string();
-            }
-        }
-        default_mah.to_string()
-    };
-    let design_cap = normalize_mah(kv("DESIGN_CAP"), "未读取");
-    let charge_cnt = normalize_mah(kv("CHARGE_CNT"), "未读取");
-
-    let cycle_line = kv("CYCLE_LINE");
-    let cycle_count = cycle_line
-        .split_once("android.os.extra.CYCLE_COUNT=")
-        .map(|(_, rest)| {
-            rest.chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect::<String>()
-        })
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "未读取".to_string());
+    let design_cap = crate::device::format_mah_value(&kv("DESIGN_CAP"), "未读取");
+    let charge_cnt = crate::device::format_mah_value(&kv("CHARGE_CNT"), "未读取");
+    let cycle_count =
+        crate::device::extract_cycle_count(&kv("CYCLE_LINE")).unwrap_or_else(|| "未读取".to_string());
 
     let batt_val = |key: &str| -> String {
         raw.lines()
@@ -200,16 +179,8 @@ fn format_live_device_telemetry_block(raw: &str, device: &Device) -> Option<Stri
                         .unwrap_or("")
                 })
                 .unwrap_or("");
-            let val = line
-                .split_once("mValue=")
-                .map(|(_, r)| {
-                    r.split(|c: char| c == ',' || c == '}' || c.is_whitespace())
-                        .next()
-                        .unwrap_or("")
-                })
-                .and_then(|v| v.parse::<f32>().ok());
             if !name.is_empty() {
-                if let Some(v) = val {
+                if let Some(v) = crate::device::parse_thermal_mvalue(line) {
                     thermal_parts.push(format!("{name}: {v:.1} °C"));
                 }
             }
@@ -261,7 +232,13 @@ echo "---BATTERY---"
 dumpsys battery 2>/dev/null || true
 echo "---THERMAL---"
 dumpsys thermalservice 2>/dev/null | grep -E 'mName=(cpu-0-0|gpuss-0|nsp-0|skin-therm)' | head -n 6 || true"#;
-    let raw = adb.script(&device.transport, script).ok()?;
+    let raw = adb
+        .script(&device.transport, script)
+        .or_else(|_| {
+            let active = device.resolve_active_transport(adb)?;
+            adb.script(&active, script)
+        })
+        .ok()?;
     format_live_device_telemetry_block(&raw, device)
 }
 
@@ -293,6 +270,13 @@ fn amoo_context_cache_key(device: &Device) -> String {
     amoo_context_cache_key_for(&device.serial, &device.transport)
 }
 
+pub fn invalidate_amoo_context_cache(device: &Device) {
+    let key = amoo_context_cache_key(device);
+    if let Ok(mut guard) = amoo_context_cache().lock() {
+        guard.remove(&key);
+    }
+}
+
 fn get_cached_amoo_context_at(key: &str, now: Instant) -> Option<Value> {
     let mut guard = amoo_context_cache().lock().ok()?;
     if let Some((cached_at, val)) = guard.get(key) {
@@ -310,18 +294,27 @@ fn put_cached_amoo_context_at(key: String, now: Instant, val: Value) {
     }
 }
 
-fn cached_amoo_context(adb: &Adb, device: &Device) -> Result<Value> {
+pub fn cached_amoo_context(adb: &Adb, device: &Device) -> Result<Value> {
     let key = amoo_context_cache_key(device);
     let now = Instant::now();
     if let Some(cached) = get_cached_amoo_context_at(&key, now) {
         return Ok(cached);
     }
-    let val = crate::bridge::call_bridge(
+    let req = json!({"op":"amoo_context"});
+    let val = crate::bridge::call_bridge_on_transport(
         adb,
-        device,
-        &json!({"op":"amoo_context"}),
+        &device.transport,
+        &req,
         Duration::from_secs(10),
-    )?;
+    )
+    .or_else(|e| {
+        let active = device.resolve_active_transport(adb)?;
+        if active == device.transport {
+            Err(e)
+        } else {
+            crate::bridge::call_bridge_on_transport(adb, &active, &req, Duration::from_secs(10))
+        }
+    })?;
     put_cached_amoo_context_at(key, Instant::now(), val.clone());
     Ok(val)
 }
@@ -345,7 +338,7 @@ fn local_gui_frame(id: &str, app_name: &str, task: &str) -> Result<Value> {
             "_meta":{"dataClass":"private"},
             "params":{"method":"gui_agent","timeoutMs":600000,
                 "invokeParamsJson":serde_json::to_string(&json!({"method":"gui_agent",
-                    "params":{"app_name":app_name.trim(),"task":task.trim()}}))?}
+                    "params":{"gui_agent_param":{"app_name":app_name.trim(),"task":task.trim()}}}))?}
         }}),
     )
 }
@@ -443,15 +436,26 @@ fn extract_content(value: &Value) -> Option<String> {
 }
 
 pub fn parse_stream_event(frame: &Value) -> Option<StreamDelta> {
-    if frame.get("type").and_then(Value::as_str) != Some("event") {
-        return None;
-    }
-    let event = string(frame, &["event"]);
+    let (event, payload) = match frame.get("type").and_then(Value::as_str) {
+        Some("event") => (
+            string(frame, &["event"]),
+            frame.get("payload").unwrap_or(frame),
+        ),
+        Some("req") if frame.get("method").and_then(Value::as_str) == Some("node.event") => {
+            let params = frame.get("params")?;
+            (
+                string(params, &["event"]),
+                params.get("payload").unwrap_or(params),
+            )
+        }
+        _ => return None,
+    };
     let supported = matches!(
         event,
         "chat"
             | "chat.delta"
             | "chat.message"
+            | "session.message"
             | "agent"
             | "agent.event"
             | "tool"
@@ -462,6 +466,7 @@ pub fn parse_stream_event(frame: &Value) -> Option<StreamDelta> {
             | "message"
             | "message.delta"
     ) || event.starts_with("chat.")
+        || event.starts_with("session.message")
         || event.starts_with("agent.")
         || event.starts_with("tool.")
         || event.starts_with("run.")
@@ -469,14 +474,26 @@ pub fn parse_stream_event(frame: &Value) -> Option<StreamDelta> {
     if !supported {
         return None;
     }
+    let role = payload.get("role").and_then(Value::as_str).unwrap_or("");
+    if !role.is_empty() && !matches!(role, "assistant" | "tool") {
+        return None;
+    }
+    let is_tool_role = role == "tool";
 
-    let payload = frame.get("payload").unwrap_or(frame);
     let data = payload.get("data").filter(|v| v.is_object());
+    let metadata = payload.get("metadata").filter(|v| v.is_object());
 
     let raw_session_key = string(
         payload,
         &["sessionKey", "session_key", "sessionId", "session_id"],
     );
+    let raw_session_key = if raw_session_key.is_empty() {
+        metadata
+            .map(|m| string(m, &["sessionKey", "session_key", "sessionId", "session_id"]))
+            .unwrap_or("")
+    } else {
+        raw_session_key
+    };
     let raw_session_key = if raw_session_key.is_empty() {
         string(
             frame,
@@ -492,6 +509,13 @@ pub fn parse_stream_event(frame: &Value) -> Option<StreamDelta> {
 
     let run_id = {
         let r = string(payload, &["runId", "run_id", "id"]);
+        let r = if r.is_empty() {
+            metadata
+                .map(|m| string(m, &["runId", "run_id", "id"]))
+                .unwrap_or("")
+        } else {
+            r
+        };
         if r.is_empty() {
             string(frame, &["runId", "run_id"]).to_string()
         } else {
@@ -499,12 +523,16 @@ pub fn parse_stream_event(frame: &Value) -> Option<StreamDelta> {
         }
     };
 
-    let mut delta_text = string(
-        payload,
-        &["delta", "textDelta", "contentDelta", "deltaText"],
-    )
-    .to_string();
-    if delta_text.is_empty() {
+    let mut delta_text = if is_tool_role {
+        String::new()
+    } else {
+        string(
+            payload,
+            &["delta", "textDelta", "contentDelta", "deltaText"],
+        )
+        .to_string()
+    };
+    if !is_tool_role && delta_text.is_empty() {
         if let Some(delta_obj) = payload.get("delta").filter(|v| v.is_object()) {
             delta_text =
                 string(delta_obj, &["text", "content", "textDelta", "contentDelta"]).to_string();
@@ -515,36 +543,48 @@ pub fn parse_stream_event(frame: &Value) -> Option<StreamDelta> {
             }
         }
     }
-    if delta_text.is_empty() {
+    if !is_tool_role && delta_text.is_empty() {
         if let Some(d) = data {
             delta_text = string(d, &["delta", "textDelta", "contentDelta", "text"]).to_string();
         }
     }
 
-    let full_text = extract_content(&payload["text"])
-        .or_else(|| extract_content(&payload["content"]))
-        .or_else(|| {
-            payload.get("message").and_then(|m| {
-                extract_content(&m["text"]).or_else(|| extract_content(&m["content"]))
+    let full_text = if is_tool_role {
+        String::new()
+    } else {
+        extract_content(&payload["text"])
+            .or_else(|| extract_content(&payload["content"]))
+            .or_else(|| {
+                payload.get("message").and_then(|m| {
+                    extract_content(&m["text"]).or_else(|| extract_content(&m["content"]))
+                })
             })
-        })
-        .unwrap_or_default();
+            .unwrap_or_default()
+    };
 
-    let mut thinking_text =
-        string(payload, &["thinking", "reasoning", "thinkingDelta"]).to_string();
-    if thinking_text.is_empty() {
+    let mut thinking_text = if is_tool_role {
+        String::new()
+    } else {
+        string(payload, &["thinking", "reasoning", "thinkingDelta"]).to_string()
+    };
+    if !is_tool_role && thinking_text.is_empty() {
         if let Some(delta_obj) = payload.get("delta").filter(|v| v.is_object()) {
             thinking_text = string(delta_obj, &["thinking", "reasoning"]).to_string();
         }
     }
-    if thinking_text.is_empty() {
+    if !is_tool_role && thinking_text.is_empty() {
         if let Some(msg_obj) = payload.get("message").filter(|v| v.is_object()) {
             thinking_text = string(msg_obj, &["thinking", "reasoning"]).to_string();
         }
     }
-    if thinking_text.is_empty() {
+    if !is_tool_role && thinking_text.is_empty() {
         if let Some(d) = data {
             thinking_text = string(d, &["thinking", "reasoning"]).to_string();
+        }
+    }
+    if !is_tool_role && thinking_text.is_empty() {
+        if let Some(m) = metadata {
+            thinking_text = string(m, &["thinking", "reasoning"]).to_string();
         }
     }
 
@@ -557,36 +597,70 @@ pub fn parse_stream_event(frame: &Value) -> Option<StreamDelta> {
     } else {
         state
     };
-    let finished = payload["done"].as_bool() == Some(true)
-        || payload["finished"].as_bool() == Some(true)
-        || payload["final"].as_bool() == Some(true)
-        || matches!(
-            state.to_ascii_lowercase().as_str(),
-            "done"
-                | "completed"
-                | "finished"
-                | "final"
-                | "error"
-                | "aborted"
-                | "stop"
-                | "end_turn"
-                | "cancelled"
-        );
+    let state = if state.is_empty() {
+        metadata
+            .map(|m| {
+                string(
+                    m,
+                    &[
+                        "lifecyclePhase",
+                        "stopReason",
+                        "stop_reason",
+                        "state",
+                        "status",
+                    ],
+                )
+            })
+            .unwrap_or("")
+    } else {
+        state
+    };
+    let state_lower = state.to_ascii_lowercase();
+    let has_tool_calls = payload
+        .get("toolCalls")
+        .and_then(Value::as_array)
+        .is_some_and(|a| !a.is_empty());
+    let is_tool_step_state = matches!(
+        state_lower.as_str(),
+        "tool_use" | "tool_calls" | "tool" | "calling_tool" | "running" | "streaming"
+    );
+    let streaming_ended_turn = metadata.and_then(|m| m["streaming"].as_bool()) == Some(false)
+        && !is_tool_step_state
+        && !(has_tool_calls
+            && delta_text.is_empty()
+            && full_text.is_empty()
+            && state_lower != "turn_done");
+    let finished = !is_tool_role
+        && (payload["done"].as_bool() == Some(true)
+            || payload["finished"].as_bool() == Some(true)
+            || payload["final"].as_bool() == Some(true)
+            || streaming_ended_turn
+            || matches!(
+                state_lower.as_str(),
+                "done"
+                    | "turn_done"
+                    | "completed"
+                    | "finished"
+                    | "final"
+                    | "error"
+                    | "aborted"
+                    | "stop"
+                    | "end_turn"
+                    | "cancelled"
+            ));
 
-    let is_tool_event = event == "tool"
+    let is_tool_event = is_tool_role
+        || event == "tool"
         || event.contains("tool")
         || matches!(
-            state.to_ascii_lowercase().as_str(),
+            state_lower.as_str(),
             "tool_use" | "tool_calls" | "tool" | "calling_tool"
         )
         || payload["stream"].as_str() == Some("tool")
         || payload.get("tool").is_some()
         || payload.get("toolName").is_some()
         || payload.get("tool_name").is_some()
-        || payload
-            .get("toolCalls")
-            .and_then(Value::as_array)
-            .is_some_and(|a| !a.is_empty());
+        || has_tool_calls;
 
     let mut tool_name = string(payload, &["tool", "toolName", "tool_name"]).to_string();
     if tool_name.is_empty() {
@@ -600,6 +674,11 @@ pub fn parse_stream_event(frame: &Value) -> Option<StreamDelta> {
     if tool_name.is_empty() {
         if let Some(d) = data {
             tool_name = string(d, &["tool", "toolName", "tool_name", "name"]).to_string();
+        }
+    }
+    if tool_name.is_empty() {
+        if let Some(m) = metadata {
+            tool_name = string(m, &["tool", "toolName", "tool_name", "name"]).to_string();
         }
     }
     if tool_name.is_empty() {
@@ -659,40 +738,134 @@ pub fn parse_stream_event(frame: &Value) -> Option<StreamDelta> {
     })
 }
 
+const CLOUD_TIMEOUT_MESSAGE: &str =
+    "Amoo 云连接已中断或超时；请检查手机网络及小工具中的伴侣后台协作状态，未确认发送的草稿与附件已保留";
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StepclawStatus {
+    pub chat_status: String,
+    pub chat_reason: String,
+    pub upstream_status: String,
+    pub upstream_reason: String,
+}
+
+impl StepclawStatus {
+    pub(crate) fn is_upstream_screen_off(&self) -> bool {
+        self.upstream_status == "unavailable" && self.upstream_reason == "screen_off"
+    }
+
+    pub(crate) fn is_chat_unavailable(&self) -> bool {
+        self.chat_status == "unavailable" || self.upstream_status == "unavailable"
+    }
+
+    pub(crate) fn is_chat_available(&self) -> bool {
+        self.chat_status == "available" && self.upstream_status != "unavailable"
+    }
+}
+
+pub(crate) fn parse_stepclaw_status_change(frame: &Value) -> Option<StepclawStatus> {
+    let payload = match frame.get("type").and_then(Value::as_str) {
+        Some("req")
+            if frame.get("method").and_then(Value::as_str) == Some("node.event")
+                && frame
+                    .get("params")
+                    .and_then(|p| p.get("event"))
+                    .and_then(Value::as_str)
+                    == Some("stepclaw.status.change") =>
+        {
+            frame.get("params")?.get("payload")?
+        }
+        Some("event")
+            if frame.get("event").and_then(Value::as_str) == Some("stepclaw.status.change") =>
+        {
+            frame.get("payload")?
+        }
+        _ => return None,
+    };
+    let resources = payload.get("resources")?;
+    Some(StepclawStatus {
+        chat_status: string(&resources["chat"], &["status"]).to_string(),
+        chat_reason: string(&resources["chat"], &["reason"]).to_string(),
+        upstream_status: string(&resources["upstream"], &["status"]).to_string(),
+        upstream_reason: string(&resources["upstream"], &["reason"]).to_string(),
+    })
+}
+
 pub struct AgentBus {
     _lease: Option<crate::amoo_background::Lease>,
     stream: TcpStream,
-    _forward: Forward,
+    adb: Adb,
     device: Device,
+    port: u16,
+    task: bool,
+    stream_tainted: bool,
+    has_completed_rpc: bool,
+    last_status: Option<StepclawStatus>,
     pub version: String,
     pending_events: Vec<StreamDelta>,
 }
 
-struct Forward {
-    adb: Adb,
-    serial: String,
-    port: String,
-}
-impl Drop for Forward {
-    fn drop(&mut self) {
-        let _ = self.adb.run_timeout(
-            &["-s", &self.serial, "forward", "--remove", &self.port],
-            Duration::from_secs(3),
-        );
+fn write_all_clean(stream: &mut TcpStream, mut bytes: &[u8], err_msg: &str) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !bytes.is_empty() {
+        match stream.write(bytes) {
+            Ok(0) => bail!("{err_msg}"),
+            Ok(n) => bytes = &bytes[n..],
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    ErrorKind::WouldBlock | ErrorKind::TimedOut
+                ) =>
+            {
+                if Instant::now() >= deadline {
+                    bail!("{err_msg}");
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => bail!("{err_msg}"),
+        }
     }
+    Ok(())
+}
+
+fn write_frame(stream: &mut TcpStream, body: &[u8], err_msg: &str) -> Result<()> {
+    let mut frame = Vec::with_capacity(4 + body.len());
+    frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    frame.extend_from_slice(body);
+    write_all_clean(stream, &frame, err_msg)
 }
 
 fn read_exact_until(stream: &mut TcpStream, mut bytes: &mut [u8], deadline: Instant) -> Result<()> {
     while !bytes.is_empty() {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .context("Amoo 后台响应超时")?;
-        stream.set_read_timeout(Some(remaining.max(Duration::from_millis(1))))?;
-        let count = stream.read(bytes).context("Amoo 云连接已中断或超时；请检查手机网络及小工具中的伴侣后台协作状态，未确认发送的草稿与附件已保留")?;
-        if count == 0 {
-            bail!("Amoo 后台连接已关闭");
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            bail!("{CLOUD_TIMEOUT_MESSAGE}");
+        };
+        if stream
+            .set_read_timeout(Some(
+                remaining
+                    .min(Duration::from_millis(250))
+                    .max(Duration::from_millis(1)),
+            ))
+            .is_err()
+        {
+            bail!("{CLOUD_TIMEOUT_MESSAGE}");
         }
-        bytes = &mut bytes[count..];
+        match stream.read(bytes) {
+            Ok(0) => bail!("Amoo 后台连接已关闭"),
+            Ok(count) => bytes = &mut bytes[count..],
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                ) =>
+            {
+                if Instant::now() >= deadline {
+                    bail!("{CLOUD_TIMEOUT_MESSAGE}");
+                }
+            }
+            Err(_) => bail!("{CLOUD_TIMEOUT_MESSAGE}"),
+        }
     }
     Ok(())
 }
@@ -748,6 +921,64 @@ fn local_image_upload_frame(id: &str, paths: &[String]) -> Result<Value> {
     )
 }
 
+fn update_deadline_for_status(
+    task: bool,
+    has_lease: bool,
+    timeout: Duration,
+    call_started: Instant,
+    status: &StepclawStatus,
+    deadline: &mut Instant,
+    extended_for_wake: &mut bool,
+    extended_on_available: &mut bool,
+) {
+    if !task {
+        if status.is_upstream_screen_off() {
+            *deadline = (*deadline).min(Instant::now() + Duration::from_millis(1200));
+        } else {
+            *deadline = (*deadline).max(call_started + timeout);
+        }
+        return;
+    }
+    if status.is_upstream_screen_off() && !has_lease {
+        *deadline = (*deadline).min(Instant::now() + Duration::from_secs(3));
+        return;
+    }
+    *deadline = (*deadline).max(call_started + timeout);
+    if status.is_chat_unavailable() {
+        if timeout >= REQUEST_TIMEOUT {
+            let hard_cap = call_started + Duration::from_secs(90);
+            if status.is_upstream_screen_off() {
+                if !*extended_for_wake {
+                    *extended_for_wake = true;
+                    *deadline = (*deadline)
+                        .max(Instant::now() + Duration::from_secs(35))
+                        .min(hard_cap);
+                }
+            } else {
+                // Companion wake has transitioned upstream out of screen_off (e.g.
+                // into "cloud claw offline" while openclaw-cloud mTLS reconnects).
+                // Refresh the wake window even if an earlier screen_off event
+                // already set extended_for_wake.
+                *extended_for_wake = true;
+                *deadline = (*deadline)
+                    .max(Instant::now() + Duration::from_secs(45))
+                    .min(hard_cap);
+            }
+        }
+    } else if status.is_chat_available() {
+        if *extended_for_wake && !*extended_on_available {
+            *extended_on_available = true;
+            *deadline = (*deadline).max(Instant::now() + timeout);
+        }
+    }
+}
+
+fn hello_request_params() -> Value {
+    json!({"minProtocol":3,"maxProtocol":3,"role":"channel",
+    "client":{"id":format!("stepx-desktop-{:016x}",rand::random::<u64>()),
+        "displayName":"StepX Desktop","version":"1.0.0","platform":"linux"}})
+}
+
 impl AgentBus {
     pub fn connect(adb: &Adb, device: &Device) -> Result<Self> {
         Self::connect_mode(adb, device, true)
@@ -759,63 +990,143 @@ impl AgentBus {
     }
 
     fn connect_mode(adb: &Adb, device: &Device, task: bool) -> Result<Self> {
-        device.verify(adb)?;
+        let mut device = device.clone();
+        device.transport = device.resolve_active_transport(adb)?;
+        let device = &device;
         let lease = if task {
             crate::amoo_background::Lease::acquire(adb, device)?
         } else {
             None
         };
-        let port: u16 = adb
-            .run(&[
-                "-s",
-                &device.transport,
-                "forward",
-                "tcp:0",
-                "localabstract:agentbus",
-            ])?
-            .trim()
-            .parse()
-            .context("无法建立 Amoo 后台连接")?;
-        let forward = Forward {
-            adb: adb.clone(),
-            serial: device.transport.clone(),
-            port: format!("tcp:{port}"),
-        };
-        let stream =
-            TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), Duration::from_secs(3))
-                .context("无法连接 Amoo 后台服务，请检查手机连接")?;
+        let (stream, port, was_cached) = adb
+            .connect_forwarded_tcp(&device.transport, "localabstract:agentbus", Duration::from_secs(3))
+            .context("无法连接 Amoo 后台服务，请检查手机连接")?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
         let mut bus = Self {
             _lease: lease,
             stream,
-            _forward: forward,
+            adb: adb.clone(),
             device: device.clone(),
+            port,
+            task,
+            stream_tainted: false,
+            has_completed_rpc: false,
+            last_status: None,
             version: String::new(),
             pending_events: Vec::new(),
         };
-        let hello = bus
-            .call_with_timeout(
-                "connect",
-                json!({"minProtocol":3,"maxProtocol":3,"role":"channel",
-            "client":{"id":format!("stepx-desktop-{:016x}",rand::random::<u64>()),
-                "displayName":"StepX Desktop","version":"1.0.0","platform":"linux"}}),
-                if task {
-                    REQUEST_TIMEOUT
-                } else {
-                    Duration::from_secs(3)
-                },
-            )
-            .with_context(|| crate::amoo_background::connection_failure_message(adb, device))?;
-        if hello["protocol"] != 3 {
-            bail!("当前 Amoo 后台协议不受支持");
-        }
-        bus.version = hello["server"]["version"].as_str().unwrap_or("").into();
+        bus.perform_handshake(was_cached)?;
         if let Some(lease) = bus._lease.as_ref() {
             // This acknowledges only the real protocol handshake. Task completion
             // continues to require its matching native reply and final run state.
             let _ = lease.mark_connected();
         }
         Ok(bus)
+    }
+
+    fn perform_handshake(&mut self, was_cached: bool) -> Result<()> {
+        let hello_timeout = if self.task {
+            REQUEST_TIMEOUT
+        } else {
+            Duration::from_secs(3)
+        };
+        let first_hello_timeout = if was_cached {
+            hello_timeout.min(Duration::from_secs(3))
+        } else {
+            hello_timeout
+        };
+        let hello = match self.call_with_timeout("connect", hello_request_params(), first_hello_timeout) {
+            Ok(h) => h,
+            Err(_) if was_cached => {
+                self.adb.invalidate_forwarded_tcp(
+                    &self.device.transport,
+                    "localabstract:agentbus",
+                    Some(self.port),
+                );
+                if let Ok(active) = self.device.resolve_active_transport(&self.adb) {
+                    if active != self.device.transport {
+                        self.adb
+                            .invalidate_forwards_for_transport(&self.device.transport);
+                        self.device.transport = active;
+                    }
+                }
+                let (fresh_stream, fresh_port, _) = self
+                    .adb
+                    .connect_forwarded_tcp(
+                        &self.device.transport,
+                        "localabstract:agentbus",
+                        Duration::from_secs(3),
+                    )
+                    .context("无法连接 Amoo 后台服务，请检查手机连接")?;
+                fresh_stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+                self.port = fresh_port;
+                self.stream = fresh_stream;
+                self.stream_tainted = false;
+                self.has_completed_rpc = false;
+                self.last_status = None;
+                self.pending_events.clear();
+                self.call_with_timeout("connect", hello_request_params(), hello_timeout)
+                    .map_err(|e| {
+                        self.adb.invalidate_forwarded_tcp(
+                            &self.device.transport,
+                            "localabstract:agentbus",
+                            Some(self.port),
+                        );
+                        e
+                    })
+                    .with_context(|| {
+                        crate::amoo_background::connection_failure_message(&self.adb, &self.device)
+                    })?
+            }
+            Err(e) => {
+                self.adb.invalidate_forwarded_tcp(
+                    &self.device.transport,
+                    "localabstract:agentbus",
+                    Some(self.port),
+                );
+                return Err(e).with_context(|| {
+                    crate::amoo_background::connection_failure_message(&self.adb, &self.device)
+                });
+            }
+        };
+        if hello["protocol"] != 3 {
+            self.adb.invalidate_forwarded_tcp(
+                &self.device.transport,
+                "localabstract:agentbus",
+                Some(self.port),
+            );
+            bail!("当前 Amoo 后台协议不受支持");
+        }
+        self.version = hello["server"]["version"].as_str().unwrap_or("").into();
+        self.stream_tainted = false;
+        self.has_completed_rpc = false;
+        Ok(())
+    }
+
+    fn reconnect_stream(&mut self) -> Result<()> {
+        if let Ok(active) = self.device.resolve_active_transport(&self.adb) {
+            if active != self.device.transport {
+                self.adb
+                    .invalidate_forwards_for_transport(&self.device.transport);
+                self.device.transport = active;
+            }
+        }
+        let (stream, port, was_cached) = self
+            .adb
+            .connect_forwarded_tcp(
+                &self.device.transport,
+                "localabstract:agentbus",
+                Duration::from_secs(3),
+            )
+            .context("无法连接 Amoo 后台服务，请检查手机连接")?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        self.stream = stream;
+        self.port = port;
+        self.stream_tainted = false;
+        self.has_completed_rpc = false;
+        self.last_status = None;
+        self.pending_events.clear();
+        self.perform_handshake(was_cached)
     }
 
     pub fn call(&mut self, method: &str, params: Value) -> Result<Value> {
@@ -826,21 +1137,36 @@ impl AgentBus {
     /// Keep the API limited to selected images already staged by StepX; it is not
     /// a general command transport or a cloud-account node selector.
     pub fn upload_local_images(&mut self, paths: &[String]) -> Result<Value> {
+        if self.stream_tainted {
+            self.reconnect_stream()?;
+        }
         let id = format!("stepx-upload-{:032x}", rand::random::<u128>());
         let body = serde_json::to_vec(&local_image_upload_frame(&id, paths)?)?;
         if body.len() > MAX_FRAME {
             bail!("图片上传请求过大");
         }
-        self.stream.write_all(&(body.len() as u32).to_be_bytes())?;
-        self.stream.write_all(&body)?;
+        if let Err(err) = write_frame(
+            &mut self.stream,
+            &body,
+            "手机本机图片上传未确认完成；附件已保留，请勿重复提交",
+        ) {
+            self.stream_tainted = true;
+            return Err(err);
+        }
         let deadline = Instant::now() + Duration::from_secs(115);
         loop {
-            let response = read_frame(&mut self.stream, deadline)
-                .context("手机本机图片上传未确认完成；附件已保留，请勿重复提交")?;
-            if response.get("type").and_then(Value::as_str) == Some("event") {
-                if let Some(delta) = parse_stream_event(&response) {
-                    self.pending_events.push(delta);
+            let response = match read_frame(&mut self.stream, deadline) {
+                Ok(frame) => frame,
+                Err(err) => {
+                    self.stream_tainted = true;
+                    return Err(err).context("手机本机图片上传未确认完成；附件已保留，请勿重复提交");
                 }
+            };
+            if let Some(status) = parse_stepclaw_status_change(&response) {
+                self.last_status = Some(status);
+            }
+            if let Some(delta) = parse_stream_event(&response) {
+                self.pending_events.push(delta);
             }
             if response["type"] != "req"
                 || response["method"] != "node.invoke.result"
@@ -862,6 +1188,7 @@ impl AgentBus {
                     .unwrap_or("UNKNOWN");
                 bail!("手机本机图片上传失败（{code}），图片尚未交给 Amoo");
             }
+            self.has_completed_rpc = true;
             return Ok(result.clone());
         }
     }
@@ -880,6 +1207,25 @@ impl AgentBus {
             LocalInvokeEnd::Reply(value) => Ok(value),
             _ => bail!("手机屏幕操作能力暂未返回，尚未执行任何操作"),
         }
+    }
+
+    /// Direct native ability invocation. Unlike cloud RPC this must never replay
+    /// after a partial write, lost reply or timeout: the phone may have executed it.
+    pub(crate) fn invoke_local_ability(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        cancel: &AtomicBool,
+    ) -> Result<LocalInvokeResult> {
+        let id = format!("stepx-native-{:032x}", rand::random::<u128>());
+        let timeout_ms = timeout.as_millis().min(600_000) as u64;
+        let frame = json!({"type":"event","event":"node.invoke.request","payload":{
+            "id":id,"command":"ability.call","idempotencyKey":id,"timeoutMs":timeout_ms,
+            "_meta":{"dataClass":"private"},"params":{"method":method,"timeoutMs":timeout_ms,
+            "invokeParamsJson":serde_json::to_string(&json!({"method":method,"params":params}))?}
+        }});
+        self.local_gui_exchange(id, frame, timeout, cancel)
     }
 
     pub(crate) fn invoke_local_gui(
@@ -910,14 +1256,16 @@ impl AgentBus {
                 end: LocalInvokeEnd::WaitCancelled,
             });
         }
+        if self.stream_tainted && self.reconnect_stream().is_err() {
+            return Ok(LocalInvokeResult {
+                id,
+                end: LocalInvokeEnd::Disconnected,
+            });
+        }
         let deadline = Instant::now() + timeout;
         // A partial write is ambiguous: never classify it as safe to resubmit.
-        if self
-            .stream
-            .write_all(&(body.len() as u32).to_be_bytes())
-            .is_err()
-            || self.stream.write_all(&body).is_err()
-        {
+        if write_frame(&mut self.stream, &body, "手机屏幕操作连接已断开").is_err() {
+            self.stream_tainted = true;
             return Ok(LocalInvokeResult {
                 id,
                 end: LocalInvokeEnd::Disconnected,
@@ -926,22 +1274,27 @@ impl AgentBus {
         loop {
             match read_local_frame(&mut self.stream, deadline, cancel) {
                 LocalInvokeEnd::Reply(response) => {
-                    if response.get("type").and_then(Value::as_str) == Some("event") {
-                        if let Some(delta) = parse_stream_event(&response) {
-                            self.pending_events.push(delta);
-                        }
+                    if let Some(status) = parse_stepclaw_status_change(&response) {
+                        self.last_status = Some(status);
+                    }
+                    if let Some(delta) = parse_stream_event(&response) {
+                        self.pending_events.push(delta);
                     }
                     if response["type"] == "req"
                         && response["method"] == "node.invoke.result"
                         && response["params"]["id"].as_str() == Some(&id)
                     {
+                        self.has_completed_rpc = true;
                         return Ok(LocalInvokeResult {
                             id,
                             end: LocalInvokeEnd::Reply(response["params"].clone()),
                         });
                     }
                 }
-                end => return Ok(LocalInvokeResult { id, end }),
+                end => {
+                    self.stream_tainted = true;
+                    return Ok(LocalInvokeResult { id, end });
+                }
             }
         }
     }
@@ -953,48 +1306,235 @@ impl AgentBus {
         params: Value,
         timeout: Duration,
     ) -> Result<Value> {
-        // AgentBus multiplexes clients upstream; IDs must remain unique across reconnects.
-        let id = format!("stepx-{:032x}", rand::random::<u128>());
-        let body =
-            serde_json::to_vec(&json!({"type":"req","id":id,"method":method,"params":params}))?;
-        if body.len() > MAX_FRAME {
-            bail!("Amoo 请求过大");
+        if method != "connect" && self.stream_tainted {
+            self.reconnect_stream()?;
         }
-        self.stream.write_all(&(body.len() as u32).to_be_bytes())?;
-        self.stream.write_all(&body)?;
-        let deadline = Instant::now() + timeout;
+        let can_retry_stale_warm_stream = method != "connect" && self.has_completed_rpc;
+        let mut retried_warm_stream = false;
         loop {
-            let response = read_frame(&mut self.stream, deadline)?;
-            if response.get("type").and_then(Value::as_str) == Some("event") {
+            // AgentBus multiplexes clients upstream; IDs must remain unique across reconnects.
+            let id = format!("stepx-{:032x}", rand::random::<u128>());
+            let body = serde_json::to_vec(
+                &json!({"type":"req","id":id,"method":method,"params":params}),
+            )?;
+            if body.len() > MAX_FRAME {
+                bail!("Amoo 请求过大");
+            }
+            if let Err(err) = write_frame(&mut self.stream, &body, CLOUD_TIMEOUT_MESSAGE) {
+                self.stream_tainted = true;
+                if method != "connect" && self.port != 0 {
+                    self.adb.invalidate_forwarded_tcp(
+                        &self.device.transport,
+                        "localabstract:agentbus",
+                        Some(self.port),
+                    );
+                }
+                if can_retry_stale_warm_stream && !retried_warm_stream {
+                    retried_warm_stream = true;
+                    if self.reconnect_stream().is_ok() {
+                        continue;
+                    }
+                }
+                return Err(err);
+            }
+            let call_started = Instant::now();
+            let mut deadline = call_started + timeout;
+            let has_lease = self._lease.is_some();
+            let mut extended_for_wake = false;
+            let mut extended_on_available = false;
+            if method != "connect" {
+                if let Some(ref status) = self.last_status {
+                    update_deadline_for_status(
+                        self.task,
+                        has_lease,
+                        timeout,
+                        call_started,
+                        status,
+                        &mut deadline,
+                        &mut extended_for_wake,
+                        &mut extended_on_available,
+                    );
+                }
+            }
+            let mut frames_read_for_call = 0usize;
+            let result = loop {
+                let response = match read_frame(&mut self.stream, deadline) {
+                    Ok(frame) => {
+                        frames_read_for_call += 1;
+                        frame
+                    }
+                    Err(err) => {
+                        self.stream_tainted = true;
+                        let is_eof = err.to_string().contains("连接已关闭");
+                        if method != "connect" && self.port != 0 && is_eof {
+                            self.adb.invalidate_forwarded_tcp(
+                                &self.device.transport,
+                                "localabstract:agentbus",
+                                Some(self.port),
+                            );
+                        }
+                        break Err((err, is_eof && frames_read_for_call == 0));
+                    }
+                };
+                if let Some(status) = parse_stepclaw_status_change(&response) {
+                    if method != "connect" {
+                        update_deadline_for_status(
+                            self.task,
+                            has_lease,
+                            timeout,
+                            call_started,
+                            &status,
+                            &mut deadline,
+                            &mut extended_for_wake,
+                            &mut extended_on_available,
+                        );
+                    }
+                    self.last_status = Some(status);
+                }
                 if let Some(delta) = parse_stream_event(&response) {
                     self.pending_events.push(delta);
                 }
+                if response["id"].as_str() != Some(&id) {
+                    continue;
+                }
+                if response["ok"].as_bool() != Some(true) {
+                    let code = response["error"]["code"].as_str().unwrap_or("UNKNOWN");
+                    let message = response["error"]["message"]
+                        .as_str()
+                        .unwrap_or("请求未被接受");
+                    break Err((
+                        anyhow::anyhow!("Amoo 后台请求失败（{code}）：{message}"),
+                        false,
+                    ));
+                }
+                if response["payload"]["ok"].as_bool() == Some(false) {
+                    break Err((anyhow::anyhow!("Amoo 后台未完成请求"), false));
+                }
+                let payload = response
+                    .get("payload")
+                    .cloned()
+                    .context("Amoo 后台响应缺少 payload");
+                break match payload {
+                    Ok(val) => Ok(val),
+                    Err(err) => Err((err, false)),
+                };
+            };
+            match result {
+                Ok(val) => {
+                    if method != "connect" {
+                        self.has_completed_rpc = true;
+                    }
+                    return Ok(val);
+                }
+                Err((err, immediate_eof)) => {
+                    if immediate_eof && can_retry_stale_warm_stream && !retried_warm_stream {
+                        retried_warm_stream = true;
+                        if self.reconnect_stream().is_ok() {
+                            continue;
+                        }
+                    }
+                    return Err(err);
+                }
             }
-            if response["id"].as_str() != Some(&id) {
-                continue;
-            }
-            if response["ok"].as_bool() != Some(true) {
-                let code = response["error"]["code"].as_str().unwrap_or("UNKNOWN");
-                let message = response["error"]["message"]
-                    .as_str()
-                    .unwrap_or("请求未被接受");
-                bail!("Amoo 后台请求失败（{code}）：{message}");
-            }
-            if response["payload"]["ok"].as_bool() == Some(false) {
-                bail!("Amoo 后台未完成请求");
-            }
-            return response
-                .get("payload")
-                .cloned()
-                .context("Amoo 后台响应缺少 payload");
         }
     }
 
     pub fn poll_stream_events(&mut self, wait: Duration) -> Result<Vec<StreamDelta>> {
         let mut out = std::mem::take(&mut self.pending_events);
-        let polled = poll_stream_events_from_stream(&mut self.stream, wait, !out.is_empty())?;
-        out.extend(polled);
-        Ok(out)
+        match poll_stream_events_and_status_from_stream(&mut self.stream, wait, !out.is_empty()) {
+            Ok((polled, latest_status, saw_eof)) => {
+                if let Some(status) = latest_status {
+                    self.last_status = Some(status);
+                }
+                if saw_eof {
+                    self.stream_tainted = true;
+                }
+                out.extend(polled);
+                Ok(out)
+            }
+            Err(err) => {
+                self.stream_tainted = true;
+                Err(err)
+            }
+        }
+    }
+
+    /// Read-only background collection uses bounded, interruptible waits. Drop
+    /// this connection after an error: cancellation may interrupt a frame.
+    pub(crate) fn call_cancellable(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        cancel: &AtomicBool,
+    ) -> Result<Value> {
+        if cancel.load(Ordering::Relaxed) {
+            bail!("已停止读取手机上下文");
+        }
+        if self.stream_tainted {
+            self.reconnect_stream()?;
+        }
+        let id = format!("stepx-context-{:032x}", rand::random::<u128>());
+        let body = serde_json::to_vec(
+            &json!({"type":"req","id":id,"method":method,"params":params}),
+        )?;
+        if body.len() > MAX_FRAME {
+            bail!("手机上下文读取请求过大");
+        }
+        let call_started = Instant::now();
+        let mut deadline = call_started + timeout;
+        if !self.task
+            && self
+                .last_status
+                .as_ref()
+                .is_some_and(StepclawStatus::is_upstream_screen_off)
+        {
+            deadline = deadline.min(Instant::now() + Duration::from_millis(800));
+        }
+        self.stream.set_write_timeout(Some(timeout))?;
+        if let Err(err) = write_frame(&mut self.stream, &body, "手机上下文连接已断开") {
+            self.stream_tainted = true;
+            return Err(err);
+        }
+        loop {
+            let response = match read_local_frame(&mut self.stream, deadline, cancel) {
+                LocalInvokeEnd::Reply(value) => value,
+                LocalInvokeEnd::WaitCancelled => {
+                    self.stream_tainted = true;
+                    bail!("已停止读取手机上下文");
+                }
+                LocalInvokeEnd::TimedOut => {
+                    self.stream_tainted = true;
+                    bail!("读取手机上下文超时");
+                }
+                LocalInvokeEnd::Disconnected => {
+                    self.stream_tainted = true;
+                    bail!("手机上下文连接已断开");
+                }
+            };
+            if let Some(status) = parse_stepclaw_status_change(&response) {
+                if !self.task {
+                    if status.is_upstream_screen_off() {
+                        deadline = deadline.min(Instant::now() + Duration::from_millis(800));
+                    } else {
+                        deadline = deadline.max(call_started + timeout);
+                    }
+                }
+                self.last_status = Some(status);
+            }
+            if response["id"].as_str() != Some(&id) {
+                // This dedicated read connection does not need chat/tool events.
+                continue;
+            }
+            if response["ok"].as_bool() != Some(true)
+                || response["payload"]["ok"].as_bool() == Some(false)
+            {
+                // Do not expose server error bodies that may contain source text.
+                bail!("手机暂未提供这部分上下文");
+            }
+            self.has_completed_rpc = true;
+            return response.get("payload").cloned().context("手机上下文响应不完整");
+        }
     }
 
     pub fn snapshot(&mut self, selected: Option<&str>) -> Result<RealAmooData> {
@@ -1007,7 +1547,7 @@ impl AgentBus {
         pending: &[String],
     ) -> Result<RealAmooData> {
         let snapshot_started = Instant::now();
-        let scope_before_res = crate::amoo_usage::account_scope(&self._forward.adb, &self.device);
+        let scope_before_res = crate::amoo_usage::account_scope(&self.adb, &self.device);
         let scope_before = scope_before_res.as_ref().ok().cloned().flatten();
         let payload = self.call("sessions.list", json!({"limit":100}))?;
         let rows = payload["sessions"]
@@ -1080,7 +1620,7 @@ impl AgentBus {
             if scope_before_res.is_ok() && snapshot_started.elapsed() < Duration::from_secs(5) {
                 data.account_scope.clone()
             } else {
-                crate::amoo_usage::account_scope(&self._forward.adb, &self.device)
+                crate::amoo_usage::account_scope(&self.adb, &self.device)
                     .ok()
                     .flatten()
             };
@@ -1213,10 +1753,38 @@ impl AgentBus {
         text: &str,
         attachments: &[Value],
     ) -> Result<PendingReply> {
+        self.send_inner(key, text, attachments, true)
+    }
+
+    /// GUI observations already contain their bounded context. Hardware words
+    /// inside a screenshot or goal must not add unrelated device identifiers.
+    pub(crate) fn send_observation(
+        &mut self,
+        key: &str,
+        text: &str,
+        attachments: &[Value],
+    ) -> Result<PendingReply> {
+        self.send_inner(key, text, attachments, false)
+    }
+
+    /// Sends desktop-generated text verbatim. Unlike [`Self::send`], this never appends
+    /// device identifiers (serial / ASN / CMIIT) even if the text happens to contain
+    /// hardware keywords, so aggregated notification context cannot trigger telemetry.
+    pub fn send_verbatim(&mut self, key: &str, text: &str) -> Result<PendingReply> {
+        self.send_inner(key, text, &[], false)
+    }
+
+    fn send_inner(
+        &mut self,
+        key: &str,
+        text: &str,
+        attachments: &[Value],
+        allow_telemetry: bool,
+    ) -> Result<PendingReply> {
         if key.is_empty() || text.trim().is_empty() {
             bail!("请先创建会话并输入消息");
         }
-        let mut context = cached_amoo_context(&self._forward.adb, &self.device)?;
+        let mut context = cached_amoo_context(&self.adb, &self.device)?;
         let run_id = format!("stepx-{:032x}", rand::random::<u128>());
         context
             .as_object_mut()
@@ -1226,8 +1794,8 @@ impl AgentBus {
         context["msg_id"] = json!(&run_id);
         context["channelMessageId"] = json!(&run_id);
         context["trace_id"] = json!(format!("tr-{run_id}"));
-        let outbound_text = if should_inject_device_telemetry(text) {
-            enrich_prompt_with_live_device_telemetry(&self._forward.adb, &self.device, text)
+        let outbound_text = if allow_telemetry && should_inject_device_telemetry(text) {
+            enrich_prompt_with_live_device_telemetry(&self.adb, &self.device, text)
         } else {
             text.to_string()
         };
@@ -1329,22 +1897,43 @@ impl PendingReply {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn poll_stream_events_from_stream(
     stream: &mut TcpStream,
     wait: Duration,
     already_have_events: bool,
 ) -> Result<Vec<StreamDelta>> {
+    let (deltas, _, _) =
+        poll_stream_events_and_status_from_stream(stream, wait, already_have_events)?;
+    Ok(deltas)
+}
+
+fn poll_stream_events_and_status_from_stream(
+    stream: &mut TcpStream,
+    wait: Duration,
+    already_have_events: bool,
+) -> Result<(Vec<StreamDelta>, Option<StepclawStatus>, bool)> {
     let mut out = Vec::new();
+    let mut latest_status = None;
+    let mut saw_eof = false;
     for _ in 0..16 {
         let first_wait = if out.is_empty() && !already_have_events {
             wait.max(Duration::from_millis(5))
         } else {
             Duration::from_millis(5)
         };
-        stream.set_read_timeout(Some(first_wait))?;
+        if stream.set_read_timeout(Some(first_wait)).is_err() {
+            bail!("{CLOUD_TIMEOUT_MESSAGE}");
+        }
         let mut header = [0u8; 4];
         match stream.read(&mut header[..1]) {
-            Ok(0) => bail!("Amoo 后台连接已关闭"),
+            Ok(0) => {
+                if out.is_empty() && !already_have_events {
+                    bail!("Amoo 后台连接已关闭");
+                }
+                saw_eof = true;
+                break;
+            }
             Ok(1) => {}
             Ok(_) => unreachable!(),
             Err(err)
@@ -1356,7 +1945,7 @@ pub(crate) fn poll_stream_events_from_stream(
                 break;
             }
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(err) => return Err(err.into()),
+            Err(_) => bail!("{CLOUD_TIMEOUT_MESSAGE}"),
         }
         let frame_deadline = Instant::now() + Duration::from_secs(5);
         read_exact_until(stream, &mut header[1..], frame_deadline)?;
@@ -1367,12 +1956,15 @@ pub(crate) fn poll_stream_events_from_stream(
         let mut body = vec![0u8; size];
         read_exact_until(stream, &mut body, frame_deadline)?;
         if let Ok(frame) = serde_json::from_slice::<Value>(&body) {
+            if let Some(status) = parse_stepclaw_status_change(&frame) {
+                latest_status = Some(status);
+            }
             if let Some(delta) = parse_stream_event(&frame) {
                 out.push(delta);
             }
         }
     }
-    Ok(out)
+    Ok((out, latest_status, saw_eof))
 }
 
 pub fn is_terminal(reason: &str) -> bool {
@@ -1898,8 +2490,8 @@ mod tests {
         assert_eq!(payload["timeoutMs"], 600000);
         let args: Value =
             serde_json::from_str(payload["params"]["invokeParamsJson"].as_str().unwrap()).unwrap();
-        assert_eq!(args["params"]["app_name"], "设置");
-        assert_eq!(args["params"].as_object().unwrap().len(), 2);
+        assert_eq!(args["params"]["gui_agent_param"]["app_name"], "设置");
+        assert_eq!(args["params"].as_object().unwrap().len(), 1);
         assert!(local_gui_frame("id", "", "查看版本").is_err());
         assert!(local_gui_frame("id", "设置\u{0}", "查看版本").is_err());
         assert!(local_gui_frame("id", "设置", &"a".repeat(12001)).is_err());
@@ -2584,4 +3176,818 @@ CYCLE_LINE=Bundle[{android.os.extra.CYCLE_COUNT=15}]
         assert!(!block.contains("16 GB"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn agentbus_observe_recovers_from_stale_cached_port_on_handshake_failure() {
+        use std::net::TcpListener;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_adb = dir.path().join("adb");
+        let port_file = dir.path().join("port.txt");
+        let calls_log = dir.path().join("calls.log");
+
+        let stale_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stale_port = stale_listener.local_addr().unwrap().port();
+        let fresh_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let fresh_port = fresh_listener.local_addr().unwrap().port();
+
+        std::fs::write(&port_file, format!("{stale_port}\n")).unwrap();
+
+        let script = format!(
+            r#"#!/usr/bin/env sh
+echo "$*" >> "{calls}"
+case "$*" in
+  *"getprop"*ro.serialno*)
+    echo "AGENTBUS_STALE_SERIAL_AMOO_UNIT"
+    exit 0
+    ;;
+  *"forward tcp:0 localabstract:agentbus"*)
+    cat "{port}"
+    exit 0
+    ;;
+  *"forward --remove"*)
+    exit 0
+    ;;
+esac
+exit 0
+"#,
+            calls = calls_log.display(),
+            port = port_file.display()
+        );
+        std::fs::write(&fake_adb, script).unwrap();
+        std::fs::set_permissions(&fake_adb, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let adb = Adb { path: fake_adb };
+        let device = Device {
+            transport: "AGENTBUS_STALE_SERIAL_AMOO_UNIT".into(),
+            serial: "AGENTBUS_STALE_SERIAL_AMOO_UNIT".into(),
+            model: "PZ261A-AMOO-UNIT".into(),
+            android: "16".into(),
+            product: "pandora".into(),
+        };
+
+        // Prime FORWARD_POOL with stale_port, then switch port_file to fresh_port.
+        let (primed_stream, primed_port, was_cached) = adb
+            .connect_forwarded_tcp(
+                "AGENTBUS_STALE_SERIAL_AMOO_UNIT",
+                "localabstract:agentbus",
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(primed_port, stale_port);
+        assert!(!was_cached);
+        drop(primed_stream);
+        let _ = stale_listener.accept();
+        std::fs::write(&port_file, format!("{fresh_port}\n")).unwrap();
+
+        // Stale listener accepts cached TCP stream and closes immediately (simulating dead remote daemon/reused port).
+        let stale_handle = std::thread::spawn(move || {
+            if let Ok((stream, _)) = stale_listener.accept() {
+                drop(stream);
+            }
+        });
+
+        // Fresh listener reads connect request frame and replies with protocol 3 hello.
+        let fresh_handle = std::thread::spawn(move || {
+            let (mut stream, _) = fresh_listener.accept().unwrap();
+            let req = read_frame(&mut stream, Instant::now() + Duration::from_secs(2)).unwrap();
+            assert_eq!(req["method"], "connect");
+            let id = req["id"].as_str().unwrap().to_string();
+            let resp = serde_json::to_vec(&json!({
+                "type": "res",
+                "id": id,
+                "ok": true,
+                "payload": {
+                    "protocol": 3,
+                    "server": { "version": "stepclaw-stale-recovered" }
+                }
+            }))
+            .unwrap();
+            stream.write_all(&(resp.len() as u32).to_be_bytes()).unwrap();
+            stream.write_all(&resp).unwrap();
+        });
+
+        let bus = AgentBus::observe(&adb, &device)
+            .expect("AgentBus::observe must evict stale cached port and reconnect on fresh port");
+        assert_eq!(bus.version, "stepclaw-stale-recovered");
+        stale_handle.join().unwrap();
+        fresh_handle.join().unwrap();
+
+        let calls = std::fs::read_to_string(&calls_log).unwrap_or_default();
+        assert!(
+            calls.contains(&format!("forward --remove tcp:{stale_port}")),
+            "stale port must be removed via forward --remove: {calls}"
+        );
+        adb.invalidate_forwarded_tcp(
+            "AGENTBUS_STALE_SERIAL_AMOO_UNIT",
+            "localabstract:agentbus",
+            None,
+        );
+    }
+
+    #[test]
+    fn read_frame_timeout_never_leaks_os_error_11_and_survives_chunked_delivery() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            // First test: write a frame in two halves separated by 320ms (across a 250ms read slice)
+            let payload = serde_json::to_vec(&json!({"ok": true, "step": 1})).unwrap();
+            let mut framed = Vec::new();
+            framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            framed.extend_from_slice(&payload);
+            s.write_all(&framed[..3]).unwrap();
+            std::thread::sleep(Duration::from_millis(320));
+            s.write_all(&framed[3..]).unwrap();
+
+            // Second test: hold connection silent past client deadline
+            std::thread::sleep(Duration::from_millis(250));
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        let val = read_frame(&mut client, Instant::now() + Duration::from_secs(2))
+            .expect("chunked frame across 250ms read slices must succeed");
+        assert_eq!(val["step"], 1);
+
+        let err = read_frame(&mut client, Instant::now() + Duration::from_millis(80))
+            .expect_err("silent stream must time out at deadline");
+        let rendered = format!("{err:#}");
+        assert_eq!(rendered, CLOUD_TIMEOUT_MESSAGE);
+        assert!(
+            !rendered.contains("os error 11") && !rendered.contains("Resource temporarily unavailable"),
+            "rendered error must not leak raw EAGAIN/os error 11: {rendered}"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn parse_stream_event_supports_node_event_session_message_and_turn_done() {
+        let streaming_frame = json!({
+            "type": "req",
+            "method": "node.event",
+            "params": {
+                "event": "session.message",
+                "payload": {
+                    "sessionId": "agent:main:desktop-s1",
+                    "text": "上海今天晴",
+                    "role": "assistant",
+                    "replyTo": "c1",
+                    "toolCalls": [{"name": "web_search"}],
+                    "delta": "上海今天晴",
+                    "metadata": {
+                        "runId": "stepx-run-123",
+                        "streaming": true
+                    }
+                }
+            }
+        });
+        let delta = parse_stream_event(&streaming_frame).expect("must parse node.event session.message");
+        assert_eq!(delta.session_key, "agent:main:desktop-s1");
+        assert_eq!(delta.run_id, "stepx-run-123");
+        assert_eq!(delta.delta_text, "上海今天晴");
+        assert_eq!(delta.full_text, "上海今天晴");
+        assert_eq!(delta.tool_status.as_deref(), Some("正在调用工具：联网搜索"));
+        assert!(!delta.finished);
+
+        let done_frame = json!({
+            "type": "req",
+            "method": "node.event",
+            "params": {
+                "event": "session.message",
+                "payload": {
+                    "sessionId": "agent:main:desktop-s1",
+                    "text": "上海今天晴，气温 22°C。",
+                    "role": "assistant",
+                    "replyTo": "c1",
+                    "toolCalls": [],
+                    "metadata": {
+                        "runId": "stepx-run-123",
+                        "streaming": false,
+                        "lifecyclePhase": "turn_done"
+                    }
+                }
+            }
+        });
+        let done = parse_stream_event(&done_frame).expect("must parse turn_done frame");
+        assert_eq!(done.session_key, "agent:main:desktop-s1");
+        assert_eq!(done.run_id, "stepx-run-123");
+        assert_eq!(done.full_text, "上海今天晴，气温 22°C。");
+        assert!(done.finished);
+
+        let user_echo = json!({
+            "type": "req",
+            "method": "node.event",
+            "params": {
+                "event": "session.message",
+                "payload": {
+                    "sessionId": "agent:main:desktop-s1",
+                    "text": "上海天气",
+                    "role": "user"
+                }
+            }
+        });
+        assert!(parse_stream_event(&user_echo).is_none());
+    }
+
+    #[test]
+    fn stepclaw_status_change_parsing_and_deadline_transitions() {
+        let screen_off_frame = json!({
+            "type": "req",
+            "id": "evt-1",
+            "method": "node.event",
+            "params": {
+                "event": "stepclaw.status.change",
+                "payload": {
+                    "version": 2,
+                    "resources": {
+                        "service": {"status": "available"},
+                        "chat": {"status": "unavailable", "reason": "no cloud gateway online"},
+                        "upstream": {"status": "unavailable", "reason": "screen_off"}
+                    }
+                }
+            }
+        });
+        let st_off = parse_stepclaw_status_change(&screen_off_frame).unwrap();
+        assert!(st_off.is_upstream_screen_off());
+        assert!(st_off.is_chat_unavailable());
+        assert!(!st_off.is_chat_available());
+
+        let waking_frame = json!({
+            "type": "req",
+            "id": "evt-2",
+            "method": "node.event",
+            "params": {
+                "event": "stepclaw.status.change",
+                "payload": {
+                    "version": 2,
+                    "resources": {
+                        "chat": {"status": "unavailable", "reason": "no cloud gateway online"},
+                        "upstream": {"status": "unavailable", "reason": "cloud claw offline"}
+                    }
+                }
+            }
+        });
+        let st_waking = parse_stepclaw_status_change(&waking_frame).unwrap();
+        assert!(!st_waking.is_upstream_screen_off());
+        assert!(st_waking.is_chat_unavailable());
+
+        let online_frame = json!({
+            "type": "req",
+            "id": "evt-3",
+            "method": "node.event",
+            "params": {
+                "event": "stepclaw.status.change",
+                "payload": {
+                    "version": 2,
+                    "resources": {
+                        "chat": {"status": "available"},
+                        "upstream": {"status": "available", "reason": "screen_on"}
+                    }
+                }
+            }
+        });
+        let st_online = parse_stepclaw_status_change(&online_frame).unwrap();
+        assert!(st_online.is_chat_available());
+        assert!(!st_online.is_chat_unavailable());
+
+        // 1. Observe mode caps deadline to <= ~1.2s on screen_off, and restores on waking
+        let start = Instant::now();
+        let mut deadline = start + REQUEST_TIMEOUT;
+        let mut ext_wake = false;
+        let mut ext_avail = false;
+        update_deadline_for_status(
+            false,
+            false,
+            REQUEST_TIMEOUT,
+            start,
+            &st_off,
+            &mut deadline,
+            &mut ext_wake,
+            &mut ext_avail,
+        );
+        assert!(deadline.duration_since(start) <= Duration::from_millis(1500));
+
+        update_deadline_for_status(
+            false,
+            false,
+            REQUEST_TIMEOUT,
+            start,
+            &st_waking,
+            &mut deadline,
+            &mut ext_wake,
+            &mut ext_avail,
+        );
+        assert!(deadline >= start + REQUEST_TIMEOUT);
+
+        // 2. Task mode without lease caps screen_off to ~3s, then extends to 30s on waking, then resets on available
+        let mut task_deadline = start + REQUEST_TIMEOUT;
+        let mut task_ext_wake = false;
+        let mut task_ext_avail = false;
+        update_deadline_for_status(
+            true,
+            false,
+            REQUEST_TIMEOUT,
+            start,
+            &st_off,
+            &mut task_deadline,
+            &mut task_ext_wake,
+            &mut task_ext_avail,
+        );
+        assert!(task_deadline.duration_since(start) <= Duration::from_millis(3300));
+        assert!(!task_ext_wake);
+
+        update_deadline_for_status(
+            true,
+            false,
+            REQUEST_TIMEOUT,
+            start,
+            &st_waking,
+            &mut task_deadline,
+            &mut task_ext_wake,
+            &mut task_ext_avail,
+        );
+        assert!(task_ext_wake);
+        assert!(task_deadline >= start + Duration::from_secs(29));
+
+        update_deadline_for_status(
+            true,
+            false,
+            REQUEST_TIMEOUT,
+            start,
+            &st_online,
+            &mut task_deadline,
+            &mut task_ext_wake,
+            &mut task_ext_avail,
+        );
+        assert!(task_ext_avail);
+
+        // 3. Task mode with lease refreshes wake deadline when transitioning from screen_off to cloud claw offline
+        let mut leased_deadline = start + REQUEST_TIMEOUT;
+        let mut leased_ext_wake = false;
+        let mut leased_ext_avail = false;
+        update_deadline_for_status(
+            true,
+            true,
+            REQUEST_TIMEOUT,
+            start,
+            &st_off,
+            &mut leased_deadline,
+            &mut leased_ext_wake,
+            &mut leased_ext_avail,
+        );
+        assert!(leased_ext_wake);
+        // Simulate 15s elapsed during OFF_SETTLE_MS before CloudWake triggers cloud claw offline
+        leased_deadline = Instant::now() + Duration::from_secs(5);
+        update_deadline_for_status(
+            true,
+            true,
+            REQUEST_TIMEOUT,
+            start,
+            &st_waking,
+            &mut leased_deadline,
+            &mut leased_ext_wake,
+            &mut leased_ext_avail,
+        );
+        assert!(leased_deadline >= Instant::now() + Duration::from_secs(44));
+
+        // 4. Short-timeout task call (< REQUEST_TIMEOUT) restores deadline once no longer screen_off
+        let short_timeout = Duration::from_secs(6);
+        let mut short_deadline = start + short_timeout;
+        let mut short_ext_wake = false;
+        let mut short_ext_avail = false;
+        update_deadline_for_status(
+            true,
+            false,
+            short_timeout,
+            start,
+            &st_off,
+            &mut short_deadline,
+            &mut short_ext_wake,
+            &mut short_ext_avail,
+        );
+        assert!(short_deadline.duration_since(start) <= Duration::from_millis(3300));
+        update_deadline_for_status(
+            true,
+            false,
+            short_timeout,
+            start,
+            &st_waking,
+            &mut short_deadline,
+            &mut short_ext_wake,
+            &mut short_ext_avail,
+        );
+        assert!(short_deadline >= start + short_timeout);
+    }
+
+    #[test]
+    fn parse_stream_event_filters_tool_result_text_and_keeps_intermediate_tool_calls_unfinished() {
+        // 1. Intermediate assistant tool-calling frame (streaming=false, stopReason=TOOL_CALLS) must NOT be marked finished
+        let assistant_tool_call = json!({
+            "type": "req",
+            "id": "evt-tc-1",
+            "method": "node.event",
+            "params": {
+                "event": "session.message",
+                "payload": {
+                    "sessionId": "agent:main:stepx-1",
+                    "role": "assistant",
+                    "text": "",
+                    "stopReason": "TOOL_CALLS",
+                    "toolCalls": [{"name": "web_search"}],
+                    "metadata": {"runId": "run-1", "streaming": false}
+                }
+            }
+        });
+        let d1 = parse_stream_event(&assistant_tool_call).expect("assistant tool call event");
+        assert!(d1.tool_status.as_deref().unwrap_or("").contains("联网搜索"));
+        assert_eq!(d1.full_text, "");
+        assert!(!d1.finished, "intermediate TOOL_CALLS step must not mark stream finished");
+
+        // 2. Tool result frame (role="tool", streaming=false) must NOT overwrite assistant text or mark finished
+        let tool_result = json!({
+            "type": "req",
+            "id": "evt-tc-2",
+            "method": "node.event",
+            "params": {
+                "event": "session.message",
+                "payload": {
+                    "sessionId": "agent:main:stepx-1",
+                    "role": "tool",
+                    "text": "{\"raw_tool_json\": 12345}",
+                    "delta": "{\"raw_tool_json\": 12345}",
+                    "metadata": {"runId": "run-1", "streaming": false, "toolName": "web_search"}
+                }
+            }
+        });
+        let d2 = parse_stream_event(&tool_result).expect("tool result event");
+        assert!(d2.tool_status.as_deref().unwrap_or("").contains("联网搜索"));
+        assert_eq!(d2.full_text, "", "tool role output must not leak into assistant full_text");
+        assert_eq!(d2.delta_text, "", "tool role output must not leak into assistant delta_text");
+        assert!(!d2.finished, "tool role frame must not mark assistant reply finished");
+
+        // 3. System frame must be ignored
+        let system_frame = json!({
+            "type": "req",
+            "method": "node.event",
+            "params": {
+                "event": "session.message",
+                "payload": {
+                    "sessionId": "agent:main:stepx-1",
+                    "role": "system",
+                    "text": "system prompt",
+                    "metadata": {"runId": "run-1", "streaming": false}
+                }
+            }
+        });
+        assert!(parse_stream_event(&system_frame).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agentbus_reconnects_cleanly_after_mid_session_timeout_and_idle_eof() {
+        use std::net::TcpListener;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_adb = dir.path().join("adb");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let script = format!(
+            r#"#!/usr/bin/env sh
+case "$*" in
+  *"getprop"*ro.serialno*)
+    echo "AGENTBUS_RECONNECT_SERIAL"
+    exit 0
+    ;;
+  *"forward tcp:0 localabstract:agentbus"*)
+    echo "{port}"
+    exit 0
+    ;;
+  *"forward --remove"*)
+    exit 0
+    ;;
+esac
+exit 0
+"#
+        );
+        std::fs::write(&fake_adb, script).unwrap();
+        std::fs::set_permissions(&fake_adb, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let adb = Adb { path: fake_adb };
+        let device = Device {
+            transport: "AGENTBUS_RECONNECT_SERIAL".into(),
+            serial: "AGENTBUS_RECONNECT_SERIAL".into(),
+            model: "PZ261A".into(),
+            android: "16".into(),
+            product: "pandora".into(),
+        };
+        put_cached_amoo_context_at(
+            "AGENTBUS_RECONNECT_SERIAL".into(),
+            Instant::now(),
+            json!({"ok": true, "brand": "stepos", "model": "PZ261A"}),
+        );
+
+        let server = std::thread::spawn(move || {
+            let send = |stream: &mut TcpStream, val: Value| {
+                let bytes = serde_json::to_vec(&val).unwrap();
+                stream.write_all(&(bytes.len() as u32).to_be_bytes()).unwrap();
+                stream.write_all(&bytes).unwrap();
+            };
+
+            // Connection 1: handshake succeeds, then first RPC ("sessions.list") times out without reply
+            let (mut s1, _) = listener.accept().unwrap();
+            let c1 = read_frame(&mut s1, Instant::now() + Duration::from_secs(2)).unwrap();
+            assert_eq!(c1["method"], "connect");
+            send(
+                &mut s1,
+                json!({
+                    "type": "hello-ok",
+                    "id": c1["id"],
+                    "ok": true,
+                    "payload": {"protocol": 3, "server": {"id": "agentbus", "version": "1.0.0"}}
+                }),
+            );
+            let timed_out_req = read_frame(&mut s1, Instant::now() + Duration::from_secs(2)).unwrap();
+            assert_eq!(timed_out_req["method"], "sessions.list");
+            // Do not reply on s1 so client times out after 100ms
+
+            // Connection 2: client automatically reconnects for next RPC ("chat.send"), then server closes s2 (idle EOF)
+            let (mut s2, _) = listener.accept().unwrap();
+            let c2 = read_frame(&mut s2, Instant::now() + Duration::from_secs(2)).unwrap();
+            assert_eq!(c2["method"], "connect");
+            send(
+                &mut s2,
+                json!({
+                    "type": "hello-ok",
+                    "id": c2["id"],
+                    "ok": true,
+                    "payload": {"protocol": 3, "server": {"id": "agentbus", "version": "1.0.0"}}
+                }),
+            );
+            let send_req = read_frame(&mut s2, Instant::now() + Duration::from_secs(2)).unwrap();
+            assert_eq!(send_req["method"], "chat.send");
+            send(
+                &mut s2,
+                json!({
+                    "type": "res",
+                    "id": send_req["id"],
+                    "ok": true,
+                    "payload": {"runId": "run-after-timeout", "status": "started"}
+                }),
+            );
+            drop(s2);
+
+            // Connection 3: client sees EOF on warm s2 during "sessions.delete" and transparently reconnects
+            let (mut s3, _) = listener.accept().unwrap();
+            let c3 = read_frame(&mut s3, Instant::now() + Duration::from_secs(2)).unwrap();
+            assert_eq!(c3["method"], "connect");
+            send(
+                &mut s3,
+                json!({
+                    "type": "hello-ok",
+                    "id": c3["id"],
+                    "ok": true,
+                    "payload": {"protocol": 3, "server": {"id": "agentbus", "version": "1.0.0"}}
+                }),
+            );
+            let del_req = read_frame(&mut s3, Instant::now() + Duration::from_secs(2)).unwrap();
+            assert_eq!(del_req["method"], "sessions.delete");
+            send(
+                &mut s3,
+                json!({
+                    "type": "res",
+                    "id": del_req["id"],
+                    "ok": true,
+                    "payload": {"ok": true}
+                }),
+            );
+        });
+
+        let mut bus = AgentBus::connect(&adb, &device).expect("AgentBus::connect");
+        // 1. First call times out
+        let err = bus
+            .call_with_timeout("sessions.list", json!({"limit": 10}), Duration::from_millis(100))
+            .expect_err("sessions.list should time out");
+        assert!(err.to_string().contains("超时"));
+
+        // 2. Subsequent call on the same AgentBus automatically reconnects to a fresh stream and succeeds
+        let receipt = bus
+            .send("agent:main:stepx-1", "继续发送")
+            .expect("send after timeout should auto-reconnect and succeed");
+        assert_eq!(receipt.run_id, "run-after-timeout");
+
+        // 3. Subsequent call on warm bus whose socket closed with EOF transparently reconnects and succeeds
+        bus.call("sessions.delete", json!({"key": "agent:main:stepx-1"}))
+            .expect("delete after warm socket EOF should auto-reconnect and succeed");
+
+        server.join().unwrap();
+        adb.invalidate_forwarded_tcp("AGENTBUS_RECONNECT_SERIAL", "localabstract:agentbus", None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agentbus_end_to_end_status_change_and_node_event_streaming() {
+        use std::net::TcpListener;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_adb = dir.path().join("adb");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let script = format!(
+            r#"#!/usr/bin/env sh
+case "$*" in
+  *"getprop"*ro.serialno*)
+    echo "AGENTBUS_E2E_SERIAL"
+    exit 0
+    ;;
+  *"forward tcp:0 localabstract:agentbus"*)
+    echo "{port}"
+    exit 0
+    ;;
+  *"forward --remove"*)
+    exit 0
+    ;;
+esac
+exit 0
+"#
+        );
+        std::fs::write(&fake_adb, script).unwrap();
+        std::fs::set_permissions(&fake_adb, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let adb = Adb { path: fake_adb };
+        let device = Device {
+            transport: "AGENTBUS_E2E_SERIAL".into(),
+            serial: "AGENTBUS_E2E_SERIAL".into(),
+            model: "PZ261A".into(),
+            android: "16".into(),
+            product: "pandora".into(),
+        };
+        put_cached_amoo_context_at(
+            "AGENTBUS_E2E_SERIAL".into(),
+            Instant::now(),
+            json!({"ok": true, "brand": "stepos", "model": "PZ261A"}),
+        );
+
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let send = |stream: &mut TcpStream, val: Value| {
+                let bytes = serde_json::to_vec(&val).unwrap();
+                stream.write_all(&(bytes.len() as u32).to_be_bytes()).unwrap();
+                stream.write_all(&bytes).unwrap();
+            };
+
+            // 1. Handshake
+            let connect_req = read_frame(&mut s, Instant::now() + Duration::from_secs(2)).unwrap();
+            assert_eq!(connect_req["method"], "connect");
+            send(
+                &mut s,
+                json!({
+                    "type": "hello-ok",
+                    "id": connect_req["id"],
+                    "ok": true,
+                    "payload": {"protocol": 3, "server": {"id": "agentbus", "version": "1.0.0"}}
+                }),
+            );
+
+            // Push initial screen_off status, then waking, then available before replying to sessions.reset
+            send(
+                &mut s,
+                json!({
+                    "type": "req",
+                    "id": "evt-1",
+                    "method": "node.event",
+                    "params": {
+                        "event": "stepclaw.status.change",
+                        "payload": {
+                            "version": 2,
+                            "resources": {
+                                "chat": {"status": "unavailable", "reason": "no cloud gateway online"},
+                                "upstream": {"status": "unavailable", "reason": "screen_off"}
+                            }
+                        }
+                    }
+                }),
+            );
+
+            let reset_req = read_frame(&mut s, Instant::now() + Duration::from_secs(2)).unwrap();
+            assert_eq!(reset_req["method"], "sessions.reset");
+            let session_key = reset_req["params"]["key"].as_str().unwrap().to_string();
+
+            send(
+                &mut s,
+                json!({
+                    "type": "req",
+                    "id": "evt-2",
+                    "method": "node.event",
+                    "params": {
+                        "event": "stepclaw.status.change",
+                        "payload": {
+                            "version": 2,
+                            "resources": {
+                                "chat": {"status": "unavailable", "reason": "no cloud gateway online"},
+                                "upstream": {"status": "unavailable", "reason": "cloud claw offline"}
+                            }
+                        }
+                    }
+                }),
+            );
+            send(
+                &mut s,
+                json!({
+                    "type": "req",
+                    "id": "evt-3",
+                    "method": "node.event",
+                    "params": {
+                        "event": "stepclaw.status.change",
+                        "payload": {
+                            "version": 2,
+                            "resources": {
+                                "chat": {"status": "available"},
+                                "upstream": {"status": "available", "reason": "screen_on"}
+                            }
+                        }
+                    }
+                }),
+            );
+            send(
+                &mut s,
+                json!({
+                    "type": "res",
+                    "id": reset_req["id"],
+                    "ok": true,
+                    "payload": {"ok": true, "key": session_key}
+                }),
+            );
+
+            // 2. chat.send + node.event session.message streaming
+            let send_req = read_frame(&mut s, Instant::now() + Duration::from_secs(2)).unwrap();
+            assert_eq!(send_req["method"], "chat.send");
+            send(
+                &mut s,
+                json!({
+                    "type": "res",
+                    "id": send_req["id"],
+                    "ok": true,
+                    "payload": {"runId": "stepx-run-e2e", "status": "started"}
+                }),
+            );
+            send(
+                &mut s,
+                json!({
+                    "type": "req",
+                    "method": "node.event",
+                    "params": {
+                        "event": "session.message",
+                        "payload": {
+                            "sessionId": session_key,
+                            "text": "后台连接成功",
+                            "role": "assistant",
+                            "delta": "后台连接成功",
+                            "metadata": {"runId": "stepx-run-e2e", "streaming": true}
+                        }
+                    }
+                }),
+            );
+            send(
+                &mut s,
+                json!({
+                    "type": "req",
+                    "method": "node.event",
+                    "params": {
+                        "event": "session.message",
+                        "payload": {
+                            "sessionId": session_key,
+                            "text": "后台连接成功",
+                            "role": "assistant",
+                            "metadata": {"runId": "stepx-run-e2e", "streaming": false, "lifecyclePhase": "turn_done"}
+                        }
+                    }
+                }),
+            );
+        });
+
+        let mut bus = AgentBus::connect(&adb, &device).expect("AgentBus::connect");
+        let key = bus.create_session().expect("create_session across status change");
+        let receipt = bus.send(&key, "上海天气").expect("bus.send");
+        assert_eq!(receipt.run_id, "stepx-run-e2e");
+
+        let deltas = bus
+            .poll_stream_events(Duration::from_millis(100))
+            .expect("poll_stream_events");
+        assert_eq!(deltas.len(), 2);
+        assert_eq!(deltas[0].delta_text, "后台连接成功");
+        assert!(!deltas[0].finished);
+        assert_eq!(deltas[1].full_text, "后台连接成功");
+        assert!(deltas[1].finished);
+
+        server.join().unwrap();
+        adb.invalidate_forwarded_tcp("AGENTBUS_E2E_SERIAL", "localabstract:agentbus", None);
+    }
 }

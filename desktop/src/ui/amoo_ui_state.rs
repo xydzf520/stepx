@@ -1,4 +1,5 @@
 //! Shared Amoo attachment drafts, phone album picker and verified usage presentation.
+use stepx_companion::file_dialog::DialogKind;
 use super::{icons::UiIcon, theme::*, widgets::*, *};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -68,6 +69,11 @@ pub(super) enum AmooUiOutcome {
     AlbumFile(tempfile::TempDir, PathBuf),
     Usage(amoo_usage::AccountUsageSnapshot),
 }
+enum UsageSyncEvent {
+    Scope(Option<String>),
+    Done(std::result::Result<amoo_usage::AccountUsageSnapshot, String>),
+}
+
 #[derive(Default)]
 pub(super) struct AmooUiState {
     pub snapshot_generation: u64,
@@ -108,7 +114,7 @@ pub(super) struct AmooUiState {
     pub usage_loading: bool,
     pub usage_error: Option<String>,
     pub usage_attempted: bool,
-    usage_rx: Option<mpsc::Receiver<std::result::Result<amoo_usage::AccountUsageSnapshot, String>>>,
+    usage_rx: Option<mpsc::Receiver<UsageSyncEvent>>,
     coverage_partial: bool,
     sessions_read: usize,
 }
@@ -116,7 +122,7 @@ pub(super) struct AmooUiState {
 impl Companion {
     pub(super) fn choose_amoo_attachments(&mut self, images_only: bool) {
         self.amoo_plus_open = false;
-        let mut dialog = native_dialog::FileDialog::new().set_title(if images_only {
+        let mut dialog = stepx_companion::file_dialog::FileDialog::new().set_title(if images_only {
             "添加图片给 Amoo"
         } else {
             "添加文档与附件给 Amoo"
@@ -128,23 +134,34 @@ impl Companion {
         let fixtures = super::compact_live_check::attachment_selection(images_only);
         #[cfg(not(feature = "ui-capture"))]
         let fixtures: Option<Vec<PathBuf>> = None;
-        let selection = match fixtures {
-            Some(paths) => Ok(paths),
-            None => dialog.show_open_multiple_file(),
-        };
-        match selection {
-            Ok(paths) if !paths.is_empty() => {
-                if let Err(error) = self.add_amoo_paths(&paths) {
-                    self.status = format!("{error:#}");
-                    self.error = true;
-                }
-            }
-            Err(error) => {
-                self.status = format!("无法打开文件选择器：{error}");
+        if let Some(paths) = fixtures {
+            if let Err(error) = self.add_amoo_paths(&paths) {
+                self.status = format!("{error:#}");
                 self.error = true;
             }
-            _ => {}
+            return;
         }
+        let expected_task = self.workspace.active.clone();
+        let expected_session = self
+            .amoo_sessions
+            .get(self.amoo_session_idx)
+            .map(|s| s.session_key.clone());
+        let expected_scope = self.amoo_ui.account_scope.clone();
+        let expected_device = self.selected.as_ref().map(|d| d.serial.clone());
+        self.choose_paths(dialog, DialogKind::OpenFiles, move |app, paths, _| {
+            app.ensure_file_dialog_device(&expected_device)?;
+            anyhow::ensure!(
+                app.workspace.active == expected_task
+                    && app
+                        .amoo_sessions
+                        .get(app.amoo_session_idx)
+                        .map(|s| s.session_key.clone())
+                        == expected_session
+                    && app.amoo_ui.account_scope == expected_scope,
+                "当前会话已变化，请在目标会话中重新选择附件；已有草稿保留"
+            );
+            app.add_amoo_paths(&paths)
+        });
     }
 
     pub(super) fn add_amoo_paths(&mut self, paths: &[PathBuf]) -> Result<()> {
@@ -209,7 +226,8 @@ impl Companion {
         let session = self
             .amoo_sessions
             .get(self.amoo_session_idx)
-            .map(|s| s.session_key.clone());
+            .map(|s| s.session_key.clone())
+            .or_else(|| self.workspace_task().and_then(|t| t.session.clone()));
         if session
             .as_ref()
             .is_some_and(|key| self.amoo_pending_reply.contains_key(key))
@@ -232,24 +250,34 @@ impl Companion {
         }
         // Ordinary chat uses the official installed skill and native ability tool calls.
         self.with_device(
-            "正在上传附件并发送给 Amoo…",
+            if paths.is_empty() { "正在发送给 Amoo…" } else { "正在上传附件并发送给 Amoo…" },
             move |adb, device| {
-                let mut bus = amoo::AgentBus::connect(adb, &device)?;
-                let key = match session {
-                    Some(key) => key,
-                    None => bus.create_session()?,
-                };
                 let prompt = if draft.is_empty() {
                     "请查看并分析这些附件。"
                 } else {
                     &draft
                 };
-                let mut receipt = if paths.is_empty() {
-                    bus.send(&key, prompt)?
-                } else {
-                    amoo_media::send_files(adb, &device, &key, prompt, &paths)?
-                };
-                receipt.text = prompt.to_string();
+                let receipt = send_amoo_with_transient_retry(
+                    session,
+                    prompt,
+                    Duration::from_millis(350),
+                    |existing_key| {
+                        let mut bus = amoo::AgentBus::connect(adb, &device)?;
+                        let key = match existing_key {
+                            Some(key) => key,
+                            None => bus.create_session()?,
+                        };
+                        Ok((bus, key))
+                    },
+                    |bus, key, text| {
+                        if paths.is_empty() {
+                            bus.send(key, text)
+                        } else {
+                            amoo_media::send_files(adb, &device, key, text, &paths)
+                        }
+                    },
+                    |bus, key| bus.snapshot(Some(key)),
+                ).map_err(|error| error.context(stepx_companion::amoo_background::task_failure_hint(adb, &device)))?;
                 Ok(Outcome::AmooUi(AmooUiOutcome::DraftSent {
                     receipt,
                     draft,
@@ -358,7 +386,7 @@ impl Companion {
                 if !self.amoo_ui.gui_running && !self.amoo_ui.gui_unconfirmed {
                     self.amoo_ui.gui_desktop = *desktop;
                     self.amoo_ui.gui_message = if *desktop {
-                        "智能操控模式：基础指令（点亮、截图、提字、打开应用、点击按钮）秒级直达；复杂多步操作自动调用视觉模型规划执行。"
+                        "优先使用手机原生 MCP；复杂操作按 AI 来源规划。选择手机账号时沿用 Amoo 登录态，由 MCP 逐步执行，请保持桌面连接。"
                     } else {
                         "手机原生执行模式：直接调用手机系统内置接口执行。"
                     }.into();
@@ -394,6 +422,15 @@ impl Companion {
             }
             AmooUiAction::GuiEnableTools => {
                 self.with_device("正在检查伴侣看屏服务…", |adb, device| {
+                    if stepx_companion::model_source::prefers_phone()? {
+                        stepx_companion::companion_gui::enable(adb, &device)?;
+                        let mut native = stepx_companion::native_mcp::Client::connect(adb, &device)?;
+                        native.call("stepx_gui_control", serde_json::json!({"op":"status"}))?;
+                        anyhow::ensure!(stepx_companion::amoo_usage::account_scope_fresh(adb, &device)?.is_some(), "请先在手机登录 Amoo 账号");
+                        return Ok(Outcome::AmooUi(AmooUiOutcome::GuiControlled(
+                            "手机账号与 MCP 操控服务已就绪；无需独立密钥，执行时请保持桌面连接。".into()
+                        )));
+                    }
                     let state = stepx_companion::companion_gui::call(
                         adb,
                         &device,
@@ -618,26 +655,25 @@ impl Companion {
                     .and_then(|s| s.to_str())
                     .filter(|s| !s.is_empty())
                     .unwrap_or("Amoo附件");
-                match native_dialog::FileDialog::new()
-                    .set_title("保存手机附件")
-                    .set_filename(filename)
-                    .set_location(&stepx_companion::settings::downloads())
-                    .show_save_single_file()
-                {
-                    Ok(Some(output)) => {
-                        let path = path.clone();
-                        self.with_device("正在下载手机附件…", move |adb, device| {
+                let path = path.clone();
+                let expected_device = self.selected.as_ref().map(|d| d.serial.clone());
+                self.choose_path(
+                    stepx_companion::file_dialog::FileDialog::new()
+                        .set_title("保存手机附件")
+                        .set_filename(filename)
+                        .set_location(&stepx_companion::settings::downloads()),
+                    DialogKind::SaveFile,
+                    move |app, output, _| {
+                        app.ensure_file_dialog_device(&expected_device)?;
+                        anyhow::ensure!(!app.busy, "当前操作尚未完成，请重新保存附件");
+                        app.with_device("正在下载手机附件…", move |adb, device| {
                             adb.shell(&device.transport, &["test", "-f", &path])?;
                             storage::pull(adb, &device, &path, &output)?;
                             Ok(Outcome::Notice(format!("附件已保存：{}", output.display())))
                         });
-                    }
-                    Err(error) => {
-                        self.status = format!("无法选择保存位置：{error}");
-                        self.error = true;
-                    }
-                    _ => {}
-                }
+                        Ok(())
+                    },
+                );
             }
             AmooUiAction::RefreshUsage => self.start_account_usage_sync(),
         }
@@ -869,8 +905,7 @@ impl Companion {
                         .map(|t| t.elapsed().as_millis() as u64)
                         .unwrap_or(0),
                 });
-                self.amoo_ui.gui_unconfirmed =
-                    !self.amoo_ui.gui_desktop && gui_requires_confirmation(result.state);
+                self.amoo_ui.gui_unconfirmed = gui_requires_confirmation(result.state);
                 if self.amoo_ui.gui_discard_result {
                     self.amoo_ui.gui_discard_result = false;
                     self.amoo_ui.gui_started = None;
@@ -937,12 +972,30 @@ impl Companion {
                     }
                 }
                 let key = receipt.key.clone();
-                if !self.amoo_sessions.iter().any(|s| s.session_key == key) {
+                if let Some(existing_session) =
+                    self.amoo_sessions.iter_mut().find(|s| s.session_key == key)
+                {
+                    if existing_session.items.last().is_some_and(|item| {
+                        matches!(
+                            item,
+                            AmooChatItem::UserText { text, .. }
+                                if text.trim() == receipt.text.trim()
+                        )
+                    }) {
+                        existing_session.items.pop();
+                    }
+                } else {
+                    let initial_title = self
+                        .workspace_task()
+                        .map(|t| t.title.trim())
+                        .filter(|t| !t.is_empty())
+                        .unwrap_or("新对话")
+                        .to_string();
                     self.amoo_sessions.insert(
                         0,
                         AmooSessionItem {
                             session_key: key.clone(),
-                            title: "新对话".into(),
+                            title: initial_title,
                             agent: "Amoo 助手".into(),
                             status: "等待回复".into(),
                             status_kind: 1,
@@ -953,6 +1006,15 @@ impl Companion {
                     self.amoo_session_idx = 0;
                 }
                 self.apply(Outcome::AmooSent(receipt));
+                for task in &mut self.workspace.journal.tasks {
+                    if task.session.as_deref() == Some(key.as_str())
+                        && task.draft.trim() == draft.trim()
+                    {
+                        task.draft.clear();
+                        task.attachments.clear();
+                    }
+                }
+                self.workspace_persist();
                 if let Some(session) = self.amoo_sessions.iter_mut().find(|s| s.session_key == key)
                 {
                     if let Some(AmooChatItem::UserText { attachment, .. }) =
@@ -1057,7 +1119,10 @@ impl Companion {
                 Btn::Ghost,
             ));
         }
-        for (index, entry) in self.amoo_ui.album_entries.iter().enumerate() {
+        let page_key = format!("amoo-album:{path}");
+        let range = self.list_page_range(&page_key, self.amoo_ui.album_entries.len(), 40);
+        rows.push(self.list_page_controls(&page_key, self.amoo_ui.album_entries.len(), 40));
+        for (index, entry) in self.amoo_ui.album_entries.iter().enumerate().skip(range.start).take(range.len()) {
             rows.push(self.between(
                 self.lead(
                     S2,
@@ -1182,6 +1247,9 @@ impl Companion {
             }
         }
         self.amoo_ui.last_updated = Some(chrono::Local::now().format("%H:%M:%S").to_string());
+        if !real.sessions.is_empty() || !self.amoo_ui.messages.is_empty() {
+            self.amoo_ui.usage_error = None;
+        }
         if changed {
             self.amoo_ui.save_usage();
         }
@@ -1256,7 +1324,7 @@ impl Companion {
         if self.amoo_ui.usage_loading || self.demo_mode {
             return;
         }
-        let Some(device) = self.selected.clone() else {
+        let Some(mut device) = self.selected.clone() else {
             return;
         };
         let (tx, rx) = mpsc::channel();
@@ -1268,31 +1336,68 @@ impl Companion {
         // Changing devices drops the receiver with AmooUiState; stale results cannot apply.
         std::thread::spawn(move || {
             let result = Adb::discover()
-                .and_then(|adb| amoo_usage::fetch_account_usage(&adb, &device))
+                .and_then(|adb| {
+                    if let Ok(active) = device.resolve_active_transport(&adb) {
+                        device.transport = active;
+                    }
+                    if let Ok(scope) = amoo_usage::account_scope(&adb, &device) {
+                        let _ = tx.send(UsageSyncEvent::Scope(scope));
+                    }
+                    amoo_usage::fetch_account_usage(&adb, &device)
+                })
                 .map_err(|error| format!("{error:#}"));
-            let _ = tx.send(result);
+            let _ = tx.send(UsageSyncEvent::Done(result));
         });
     }
 
     pub(super) fn poll_account_usage_sync(&mut self) -> bool {
-        let result = match self.amoo_ui.usage_rx.as_ref().map(|rx| rx.try_recv()) {
-            Some(Ok(result)) => result,
-            Some(Err(mpsc::TryRecvError::Disconnected)) => Err("用量同步已中断，请重试".into()),
-            _ => return false,
-        };
-        self.amoo_ui.usage_rx = None;
-        self.amoo_ui.usage_loading = false;
-        match result {
-            Ok(snapshot) => {
-                let status = self.status.clone();
-                self.apply_amoo_ui(AmooUiOutcome::Usage(snapshot));
-                if self.busy {
-                    self.status = status;
+        let mut changed = false;
+        while let Some(event) = self.amoo_ui.usage_rx.as_ref().map(|rx| rx.try_recv()) {
+            match event {
+                Ok(UsageSyncEvent::Scope(scope)) => {
+                    if self.amoo_ui.account_scope != scope {
+                        self.amoo_ui.account_scope = scope;
+                        self.auto_sync.context_triggered_for_cycle = false;
+                        self.handle_context_action(&super::context_state::ContextAction::Refresh);
+                        changed = true;
+                    }
                 }
+                Ok(UsageSyncEvent::Done(result)) => {
+                    self.amoo_ui.usage_rx = None;
+                    self.amoo_ui.usage_loading = false;
+                    match result {
+                        Ok(snapshot) => {
+                            let status = self.status.clone();
+                            self.apply_amoo_ui(AmooUiOutcome::Usage(snapshot));
+                            if self.busy {
+                                self.status = status;
+                            }
+                        }
+                        Err(error) => {
+                            if self.amoo_ui.messages.is_empty() && !self.amoo_gateway_online {
+                                let clean_err = error
+                                    .replace("；请检查手机网络及小工具中的伴侣后台协作状态，未确认发送的草稿与附件已保留", "")
+                                    .replace("，未确认发送的草稿与附件已保留", "");
+                                self.amoo_ui.usage_error = Some(clean_err);
+                            } else {
+                                self.amoo_ui.usage_error = None;
+                            }
+                        }
+                    }
+                    return true;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.amoo_ui.usage_rx = None;
+                    self.amoo_ui.usage_loading = false;
+                    if self.amoo_ui.messages.is_empty() && !self.amoo_gateway_online {
+                        self.amoo_ui.usage_error = Some("用量同步已中断，请重试".into());
+                    }
+                    return true;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
             }
-            Err(error) => self.amoo_ui.usage_error = Some(error),
         }
-        true
+        changed
     }
 
     #[cfg(feature = "ui-capture")]
@@ -1347,18 +1452,16 @@ impl Companion {
             );
         }
         let hint = if self.selected.is_none() {
-            "连接手机后自动同步 Amoo 账号用量。".to_string()
+            "未连接手机".to_string()
         } else if self.amoo_ui.usage_loading {
-            "正在读取手机账号用量，你可以继续使用其他功能…".into()
+            "同步中…".into()
         } else if let Some(error) = &self.amoo_ui.usage_error {
             format!("同步未完成：{error}")
         } else if let Some(time) = &self.amoo_ui.last_updated {
-            format!(
-                "同步于 {time} · {} 个会话 · 仅统计已读取历史，非账号全部消费。",
-                self.amoo_ui.messages.len()
-            )
+            let hm: String = time.chars().take(5).collect();
+            format!("{hm} 同步")
         } else {
-            "仅统计已同步消息；手机接口未返回账号总额度与剩余额度。".into()
+            "未同步".into()
         };
         self.panel(vec![
             self.between(
@@ -1514,7 +1617,7 @@ impl AmooUiState {
         }
         changed
     }
-    fn set_account_scope(&mut self, scope: Option<String>) {
+    pub(super) fn set_account_scope(&mut self, scope: Option<String>) {
         if self.account_scope == scope {
             if scope.is_none() {
                 self.messages.clear();
@@ -1773,6 +1876,313 @@ mod tests {
             GuiRunState::WaitingCancelled
         );
     }
+
+    #[test]
+    fn uncertain_send_is_not_repeated_when_history_cannot_be_verified() {
+        for history_error in [true, false] {
+            let mut calls = 0;
+            let result = send_amoo_with_transient_retry(
+                Some("test-session".into()), "草稿", Duration::ZERO,
+                |key| Ok(((), key.unwrap())),
+                |_, _, _| { calls += 1; anyhow::bail!("Connection reset by peer") },
+                |_, _| if history_error { anyhow::bail!("history timed out") }
+                    else { Ok(RealAmooData::default()) },
+            );
+            assert!(result.unwrap_err().to_string().contains("尚未确认"));
+            assert_eq!(calls, 1, "an unverified receipt must not cause duplicate delivery");
+        }
+    }
+
+    #[test]
+    fn transient_amoo_send_error_detection_and_draft_sent_clears_bound_task_draft() {
+        assert!(is_transient_amoo_send_error(
+            "Amoo 云连接已中断或超时；请检查手机网络及小工具中的伴侣后台协作状态，未确认发送的草稿与附件已保留: Resource temporarily unavailable (os error 11)"
+        ));
+        assert!(is_transient_amoo_send_error("Connection reset by peer"));
+        assert!(!is_transient_amoo_send_error("Amoo 未接受此消息，输入内容已保留"));
+
+        let mut app = Companion::new_for_test();
+        let mut task = stepx_companion::amoo_workspace::Task::new(None, None);
+        task.title = "上海天气".into();
+        task.draft = "上海天气".into();
+        task.steps = vec![stepx_companion::amoo_workspace::Step {
+            executor: stepx_companion::amoo_workspace::Executor::Phone,
+            phase: stepx_companion::amoo_workspace::Phase::Running,
+            note: String::new(),
+        }];
+        let task_id = task.id.clone();
+        app.workspace.journal.tasks.push(task);
+        app.workspace.active = Some(task_id.clone());
+        app.workspace.running = Some(super::super::workspace_state::ActiveRun {
+            task: task_id.clone(),
+            step: 0,
+            executor: stepx_companion::amoo_workspace::Executor::Phone,
+            accepted: false,
+            started_at: Instant::now(),
+        });
+        app.fields[F_AMOO].set("上海天气");
+
+        app.apply_amoo_ui(AmooUiOutcome::DraftSent {
+            receipt: amoo::PendingReply {
+                key: "agent:main:shanghai-weather".into(),
+                text: "上海天气".into(),
+                run_id: "run-sh-1".into(),
+            },
+            draft: "上海天气".into(),
+            attachments: vec![],
+        });
+
+        assert!(app.fields[F_AMOO].text.is_empty());
+        let updated = app.workspace_task().unwrap();
+        assert_eq!(
+            updated.session.as_deref(),
+            Some("agent:main:shanghai-weather")
+        );
+        assert!(updated.draft.is_empty());
+
+        // Sending again on the same session when UserText is already at the tail of items
+        // replaces it in-place instead of pushing a duplicate UserText bubble.
+        app.apply_amoo_ui(AmooUiOutcome::DraftSent {
+            receipt: amoo::PendingReply {
+                key: "agent:main:shanghai-weather".into(),
+                text: "上海天气".into(),
+                run_id: "run-sh-2".into(),
+            },
+            draft: "上海天气".into(),
+            attachments: vec![],
+        });
+        let session = app
+            .amoo_sessions
+            .iter()
+            .find(|s| s.session_key == "agent:main:shanghai-weather")
+            .unwrap();
+        let user_bubbles = session
+            .items
+            .iter()
+            .filter(|i| matches!(i, AmooChatItem::UserText { text, .. } if text == "上海天气"))
+            .count();
+        assert_eq!(
+            user_bubbles, 1,
+            "DraftSent on retry must not duplicate UserText bubble in amoo_sessions"
+        );
+    }
+
+    #[test]
+    fn send_amoo_with_transient_retry_handles_eagain_and_avoids_stale_turn_false_positive() {
+        use stepx_companion::openclaw::{RealAmooData, RealChatMessage, RealSessionInfo};
+
+        // Case 1: Transient os error 11 on connect_and_key, then transient os error 11 on send_once
+        // when the session already has an OLD settled turn with the same prompt "上海天气".
+        // A readable old/completed turn is not proof this new send was rejected.
+        // Keep the draft and never issue another request with a new idempotency key.
+        let mut connect_calls = 0usize;
+        let mut send_calls = 0usize;
+        let receipt = send_amoo_with_transient_retry(
+            Some("agent:main:existing".into()),
+            "上海天气",
+            Duration::ZERO,
+            |existing| {
+                connect_calls += 1;
+                if connect_calls == 1 {
+                    anyhow::bail!("Resource temporarily unavailable (os error 11)");
+                }
+                Ok(((), existing.unwrap_or_else(|| "agent:main:new".into())))
+            },
+            |_bus, key, text| {
+                send_calls += 1;
+                if send_calls == 1 {
+                    anyhow::bail!(
+                        "Amoo 云连接已中断或超时: Resource temporarily unavailable (os error 11)"
+                    );
+                }
+                Ok(amoo::PendingReply {
+                    key: key.into(),
+                    text: text.into(),
+                    run_id: "run-new-2".into(),
+                })
+            },
+            |_bus, key| {
+                Ok(RealAmooData {
+                    sessions: vec![RealSessionInfo {
+                        key: key.into(),
+                        history_loaded: true,
+                        messages: vec![
+                            RealChatMessage {
+                                message_id: "m1".into(),
+                                role: "user".into(),
+                                text: "上海天气".into(),
+                                timestamp_ms: 1000,
+                                run_id: "run-old-1".into(),
+                                stop_reason: String::new(),
+                                is_error: false,
+                                error_message: None,
+                                ..Default::default()
+                            },
+                            RealChatMessage {
+                                message_id: "m2".into(),
+                                role: "assistant".into(),
+                                text: "上次错误回复".into(),
+                                timestamp_ms: 1001,
+                                run_id: "run-old-1".into(),
+                                stop_reason: "error".into(),
+                                is_error: true,
+                                error_message: Some("上次连接超时".into()),
+                                ..Default::default()
+                            },
+                        ],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                })
+            },
+        )
+        .expect_err("ambiguous send must retain draft instead of repeating the request");
+
+        assert_eq!(connect_calls, 3);
+        assert_eq!(
+            send_calls, 1,
+            "a settled or lagging history cannot authorize a second send"
+        );
+        assert!(receipt.to_string().contains("尚未确认"));
+
+        // Case 2: Transient error after phone already accepted the new user turn (no settled assistant reply after it)
+        // -> must recover PendingReply from snapshot without calling send_once a second time.
+        let mut send_calls_accepted = 0usize;
+        let recovered = send_amoo_with_transient_retry(
+            Some("agent:main:existing".into()),
+            "上海天气",
+            Duration::ZERO,
+            |existing| Ok(((), existing.unwrap())),
+            |_bus, _key, _text| {
+                send_calls_accepted += 1;
+                anyhow::bail!("Resource temporarily unavailable (os error 11)")
+            },
+            |_bus, key| {
+                Ok(RealAmooData {
+                    sessions: vec![RealSessionInfo {
+                        key: key.into(),
+                        history_loaded: true,
+                        messages: vec![RealChatMessage {
+                            message_id: "m3".into(),
+                            role: "user".into(),
+                            text: "上海天气".into(),
+                            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+                            run_id: "run-accepted-on-phone".into(),
+                            stop_reason: String::new(),
+                            is_error: false,
+                            error_message: None,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                })
+            },
+        )
+        .expect("should recover accepted PendingReply from snapshot");
+
+        assert_eq!(
+            send_calls_accepted, 1,
+            "must not double-send when snapshot confirms phone accepted the turn"
+        );
+        assert_eq!(recovered.run_id, "run-accepted-on-phone");
+    }
+}
+
+pub(super) fn recover_accepted_pending_reply(
+    snap: stepx_companion::openclaw::RealAmooData,
+    key: &str,
+    prompt: &str,
+    send_started_ms: i64,
+) -> Option<amoo::PendingReply> {
+    let sess = snap.sessions.into_iter().find(|s| s.key == key)?;
+    let last_user_idx = sess.messages.iter().rposition(|m| m.role == "user")?;
+    let user_msg = &sess.messages[last_user_idx];
+    let trimmed = prompt.trim();
+    if user_msg.timestamp_ms < send_started_ms
+        || user_msg.run_id.trim().is_empty()
+        || (user_msg.text.trim() != trimmed && !user_msg.text.contains(trimmed))
+    {
+        return None;
+    }
+    let after_user = &sess.messages[last_user_idx + 1..];
+    let already_settled = after_user.iter().any(|m| {
+        m.role == "assistant"
+            && (m.is_error
+                || amoo::is_terminal(&m.stop_reason)
+                || !m.attachments.is_empty()
+                || (m.stop_reason.trim().is_empty() && !m.text.trim().is_empty()))
+    });
+    if already_settled {
+        return None;
+    }
+    Some(amoo::PendingReply {
+        key: key.to_string(),
+        text: prompt.to_string(),
+        run_id: user_msg.run_id.clone(),
+    })
+}
+
+pub(super) fn send_amoo_with_transient_retry<B, ConnectFn, SendFn, SnapshotFn>(
+    session: Option<String>,
+    prompt: &str,
+    retry_delay: Duration,
+    mut connect_and_key: ConnectFn,
+    mut send_once: SendFn,
+    mut snapshot_session: SnapshotFn,
+) -> Result<amoo::PendingReply>
+where
+    ConnectFn: FnMut(Option<String>) -> Result<(B, String)>,
+    SendFn: FnMut(&mut B, &str, &str) -> Result<amoo::PendingReply>,
+    SnapshotFn: FnMut(&mut B, &str) -> Result<stepx_companion::openclaw::RealAmooData>,
+{
+    let (mut bus, key) = match connect_and_key(session.clone()) {
+        Ok(pair) => pair,
+        Err(err) if is_transient_amoo_send_error(&format!("{err:#}")) => {
+            if !retry_delay.is_zero() {
+                std::thread::sleep(retry_delay);
+            }
+            connect_and_key(session)?
+        }
+        Err(err) => return Err(err),
+    };
+    let send_started_ms = chrono::Utc::now().timestamp_millis();
+    let mut receipt = match send_once(&mut bus, &key, prompt) {
+        Ok(r) => r,
+        Err(err) if is_transient_amoo_send_error(&format!("{err:#}")) => {
+            if !retry_delay.is_zero() {
+                std::thread::sleep(retry_delay);
+            }
+            let (mut retry_bus, _) = connect_and_key(Some(key.clone()))?;
+            // A timeout does not prove rejection. If history cannot be read,
+            // preserve the draft and report uncertainty instead of sending twice.
+            let snapshot = snapshot_session(&mut retry_bus, &key)
+                .map_err(|check| anyhow::anyhow!("尚未确认 Amoo 是否收到消息，草稿已保留；请刷新会话后再决定是否重试。发送：{err:#}；核对：{check:#}"))?;
+            anyhow::ensure!(snapshot.sessions.iter().any(|s| s.key == key && s.history_loaded),
+                "尚未确认 Amoo 是否收到消息，草稿已保留；会话历史未读到，请刷新会话后再决定是否重试");
+            let already_accepted = recover_accepted_pending_reply(snapshot, &key, prompt, send_started_ms);
+            match already_accepted {
+                Some(recovered) => recovered,
+                None => anyhow::bail!("尚未确认 Amoo 是否收到本次消息，草稿已保留；请刷新会话核对后再决定是否重试"),
+            }
+        }
+        Err(err) => return Err(err),
+    };
+    receipt.text = prompt.to_string();
+    Ok(receipt)
+}
+
+pub(super) fn is_transient_amoo_send_error(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("os error 11")
+        || lower.contains("resource temporarily unavailable")
+        || lower.contains("would block")
+        || lower.contains("timed out")
+        || lower.contains("connection reset")
+        || lower.contains("broken pipe")
+        || lower.contains("unexpected eof")
+        || err.contains("连接已中断或超时")
+        || err.contains("后台连接已关闭")
 }
 
 fn measured_usage(mut metrics: UsageMetrics, elapsed_ms: u64) -> UsageMetrics {

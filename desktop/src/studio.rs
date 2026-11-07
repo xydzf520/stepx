@@ -478,6 +478,128 @@ fn sync_cloud_with(mut call: impl FnMut(Value) -> Result<Value>) -> Result<Cloud
     Ok(library)
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OfficialGuiSkillStatus {
+    pub scope: String,
+    pub candidate_id: String,
+    pub candidate_name: String,
+    pub candidate_version: String,
+    pub installed: bool,
+}
+
+pub fn new_gui_skill_request_id() -> String {
+    let raw = rand::random::<u128>();
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        (raw >> 96) as u32,
+        ((raw >> 80) & 0xffff) as u16,
+        ((raw >> 64) & 0xffff) as u16,
+        ((raw >> 48) & 0xffff) as u16,
+        (raw & 0xffff_ffff_ffff) as u64,
+    )
+}
+
+pub fn parse_gui_skill_status(value: &Value) -> Result<OfficialGuiSkillStatus> {
+    let scope = value["scope"]
+        .as_str()
+        .context("手机账号标识缺失")?
+        .to_owned();
+    ensure!(
+        scope.len() == 64 && scope.bytes().all(|b| b.is_ascii_hexdigit()),
+        "手机账号标识无效"
+    );
+    let candidate = &value["candidate"];
+    let candidate_id = candidate["id"].as_str().unwrap_or_default().to_owned();
+    let candidate_name = candidate["name"].as_str().unwrap_or_default().to_owned();
+    let candidate_version = candidate["version"].as_str().unwrap_or_default().to_owned();
+    let install_failed = value.get("install").is_some_and(|ack| {
+        ack["code"].as_i64() != Some(0) || ack["http"].as_i64().unwrap_or(200) != 200
+    });
+    let installed_skills = value["installedState"]["skills"]
+        .as_array()
+        .or_else(|| value["after"]["skills"].as_array());
+    let installed = !install_failed
+        && (installed_skills.is_some_and(|skills| {
+            skills.iter().any(|s| {
+                let sid = s["id"].as_str().unwrap_or("");
+                let sname = s["name"].as_str().unwrap_or("");
+                let sver = s["installVersion"]
+                    .as_str()
+                    .filter(|v| !v.is_empty())
+                    .or_else(|| s["version"].as_str().filter(|v| !v.is_empty()));
+                let version_matches = match sver {
+                    Some(v) if !candidate_version.is_empty() => v == candidate_version,
+                    _ => true,
+                };
+                let identity_matches = (!candidate_id.is_empty() && sid == candidate_id)
+                    || (!candidate_name.is_empty() && sname == candidate_name)
+                    || sname.contains("GUI")
+                    || sname.contains("手机屏幕");
+                identity_matches && version_matches
+            })
+        }) || candidate["installed"].as_i64().unwrap_or(0) > 0);
+    Ok(OfficialGuiSkillStatus {
+        scope,
+        candidate_id,
+        candidate_name,
+        candidate_version,
+        installed,
+    })
+}
+
+pub fn gui_skill_status(adb: &Adb, device: &Device) -> Result<OfficialGuiSkillStatus> {
+    let raw = phone_call(adb, device, json!({"op": "gui-skill-status"}))?;
+    parse_gui_skill_status(&raw)
+}
+
+pub fn gui_skill_install_with(
+    mut call: impl FnMut(Value) -> Result<Value>,
+) -> Result<OfficialGuiSkillStatus> {
+    let status_val = call(json!({"op": "gui-skill-status"}))?;
+    let status = parse_gui_skill_status(&status_val)?;
+    if status.installed {
+        return Ok(status);
+    }
+    ensure!(
+        !status.candidate_id.is_empty() && !status.candidate_version.is_empty(),
+        "官方技能市场未找到可安装的手机屏幕操控技能候选包"
+    );
+    let request_id = new_gui_skill_request_id();
+    let install_val = call(json!({
+        "op": "gui-skill-install",
+        "scope": status.scope,
+        "version": status.candidate_version,
+        "testing": true,
+        "requestId": request_id,
+    }))?;
+    if let Some(ack) = install_val.get("install") {
+        let code = ack["code"].as_i64().unwrap_or(-1);
+        let http = ack["http"].as_i64().unwrap_or(200);
+        ensure!(
+            code == 0 && http == 200,
+            "官方技能安装未完成（HTTP {http}，代码 {code}）：{}",
+            ack["message"].as_str().unwrap_or("未确认安装成功")
+        );
+    }
+    let mut after = parse_gui_skill_status(&install_val)?;
+    ensure!(
+        after.scope == status.scope,
+        "手机账号已变化，未确认技能安装结果"
+    );
+    if install_val["install"]["code"].as_i64() == Some(0)
+        && install_val["install"]["http"].as_i64().unwrap_or(200) == 200
+    {
+        after.installed = true;
+    }
+    ensure!(after.installed, "官方技能市场安装未生效");
+    Ok(after)
+}
+
+pub fn gui_skill_install(adb: &Adb, device: &Device) -> Result<OfficialGuiSkillStatus> {
+    device.verify(adb)?;
+    gui_skill_install_with(|request| phone_call_unverified(adb, device, request))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -595,5 +717,105 @@ mod tests {
         std::fs::write(&path, b"broken").unwrap();
         assert!(save_at(&path, b).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"broken");
+    }
+
+    #[test]
+    fn gui_skill_status_and_install_with_studio_provider_schema() {
+        let scope = "f".repeat(64);
+        let mut ops = Vec::new();
+        let installed = gui_skill_install_with(|q| {
+            let op = q["op"].as_str().unwrap_or("").to_string();
+            ops.push(op.clone());
+            if op == "gui-skill-status" {
+                Ok(json!({
+                    "ok": true,
+                    "scope": scope,
+                    "candidate": {
+                        "id": "802",
+                        "name": "stepx_gui_official",
+                        "version": "1.2.0",
+                        "installed": 0
+                    },
+                    "installedState": {
+                        "http": 200,
+                        "code": 0,
+                        "skills": [{"id": "802", "name": "stepx_gui_official", "version": "1.0.0"}]
+                    }
+                }))
+            } else {
+                assert_eq!(op, "gui-skill-install");
+                assert_eq!(q["scope"], scope);
+                assert_eq!(q["version"], "1.2.0");
+                assert_eq!(q["testing"], true);
+                let req_id = q["requestId"].as_str().unwrap();
+                let parts: Vec<&str> = req_id.split('-').collect();
+                assert_eq!(
+                    parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+                    vec![8, 4, 4, 4, 12],
+                    "requestId must match OfficialGuiSkillPolicy UUID format: {req_id}"
+                );
+                assert!(parts
+                    .iter()
+                    .all(|p| p.bytes().all(|b| b.is_ascii_hexdigit())));
+                Ok(json!({
+                    "ok": true,
+                    "scope": scope,
+                    "candidate": {
+                        "id": "802",
+                        "name": "stepx_gui_official",
+                        "version": "1.2.0",
+                        "installed": 1
+                    },
+                    "install": { "http": 200, "code": 0 },
+                    "after": {
+                        "http": 200,
+                        "code": 0,
+                        "skills": [{"id": "802", "name": "stepx_gui_official", "version": "1.2.0"}]
+                    }
+                }))
+            }
+        })
+        .unwrap();
+
+        assert_eq!(ops, vec!["gui-skill-status", "gui-skill-install"]);
+        assert!(installed.installed);
+        assert_eq!(installed.candidate_id, "802");
+        assert_eq!(installed.candidate_version, "1.2.0");
+
+        // Reject when candidate.version is empty
+        let empty_version_err = gui_skill_install_with(|_| {
+            Ok(json!({
+                "ok": true,
+                "scope": scope,
+                "candidate": { "id": "802", "name": "stepx_gui_official", "version": "", "installed": 0 },
+                "installedState": { "http": 200, "code": 0, "skills": [] }
+            }))
+        });
+        assert!(empty_version_err.is_err());
+
+        // Reject when install.code is non-zero even if after.skills still lists a stale skill
+        let failed_install_err = gui_skill_install_with(|q| {
+            if q["op"] == "gui-skill-status" {
+                Ok(json!({
+                    "ok": true,
+                    "scope": scope,
+                    "candidate": { "id": "802", "name": "stepx_gui_official", "version": "1.2.0", "installed": 0 },
+                    "installedState": { "http": 200, "code": 0, "skills": [] }
+                }))
+            } else {
+                Ok(json!({
+                    "ok": false,
+                    "scope": scope,
+                    "candidate": { "id": "802", "name": "stepx_gui_official", "version": "1.2.0", "installed": 0 },
+                    "install": { "http": 500, "code": -1, "message": "server error" },
+                    "after": {
+                        "http": 200,
+                        "code": 0,
+                        "skills": [{"id": "802", "name": "stepx_gui_official", "version": "1.0.0"}]
+                    }
+                }))
+            }
+        });
+        assert!(failed_install_err.is_err());
     }
 }

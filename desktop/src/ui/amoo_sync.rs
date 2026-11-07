@@ -103,15 +103,15 @@ impl SyncWorker {
                         bus = Some(if use_task_connect {
                             (true, amoo::AgentBus::connect(&adb, &device)?)
                         } else {
-                            match amoo::AgentBus::observe(&adb, &device) {
-                                Ok(observed) => (false, observed),
-                                Err(_) => (true, amoo::AgentBus::connect(&adb, &device)?),
-                            }
+                            (false, amoo::AgentBus::observe(&adb, &device)?)
                         });
                     }
                     let active_bus = &mut bus.as_mut().unwrap().1;
-                    let data = active_bus
+                    let mut data = active_bus
                         .snapshot_with_pending(request.key.as_deref(), &request.pending)?;
+                    let owned=stepx_companion::inference_sessions::known(&stepx_companion::inference_sessions::default_context_root(),&device.serial,data.account_scope.as_deref())?;
+                    data.sessions.retain(|session|!owned.contains(&session.key));
+                    if data.selected_session.as_ref().is_some_and(|key|owned.contains(key)) {data.selected_session=None;}
                     if let Ok(deltas) = active_bus.poll_stream_events(Duration::from_millis(5)) {
                         if !deltas.is_empty() {
                             let _ = delta_tx.send(deltas);
@@ -119,13 +119,9 @@ impl SyncWorker {
                     }
                     Ok(data)
                 };
-                let result = match try_snapshot(request.task, false) {
-                    Ok(data) => Ok(data),
-                    Err(_) if !request.task => try_snapshot(true, true),
-                    Err(err) => Err(err),
-                }
-                .map_err(|e| format!("{e:#}"));
-                if result.is_err() {
+                let result = try_snapshot(request.task, false)
+                    .map_err(|e| format!("{e:#}"));
+                if result.is_err() || bus.as_ref().is_some_and(|(task, _)| *task) {
                     bus = None;
                 }
                 if std::env::var_os("STEPX_PERF_TRACE").is_some() {
@@ -337,8 +333,10 @@ impl Companion {
         }
 
         let mut updated_text: Option<String> = None;
+        let mut session_motion: Option<(String, usize, String, String)> = None;
         if let Some(idx) = session_idx {
             let session = &mut self.amoo_sessions[idx];
+            let sess_key = session.session_key.clone();
             let needs_new_item = !matches!(
                 session.items.last(),
                 Some(AmooChatItem::AssistantRich { .. })
@@ -355,6 +353,7 @@ impl Companion {
                     time_label: "实时".into(),
                 });
             }
+            let item_idx = session.items.len().saturating_sub(1);
             if let Some(AmooChatItem::AssistantRich {
                 thinking_steps,
                 tools_summary,
@@ -371,6 +370,7 @@ impl Companion {
                     *tools_summary = tool.clone();
                 }
                 let text_buf = text.get_or_insert_with(String::new);
+                let old_raw = text_buf.clone();
                 if !delta.full_text.is_empty() {
                     *text_buf = stepx_companion::amoo_gui_chat::display_text(&delta.full_text);
                 } else if !delta.delta_text.is_empty() {
@@ -382,6 +382,11 @@ impl Companion {
                 }
                 if !text_buf.trim().is_empty() {
                     updated_text = Some(text_buf.clone());
+                    let before = stepx_companion::work_protocol::display_text(&old_raw, false)
+                        .unwrap_or_default();
+                    let after = stepx_companion::work_protocol::display_text(text_buf, false)
+                        .unwrap_or_default();
+                    session_motion = Some((sess_key, item_idx, before, after));
                 }
             }
         } else if !delta.full_text.is_empty() {
@@ -392,6 +397,7 @@ impl Companion {
             updated_text = Some(delta.delta_text.clone());
         }
 
+        let mut turn_motion: Option<(String, usize, String, String)> = None;
         if let Some(live_text) = updated_text {
             let running_task_id = self
                 .workspace
@@ -406,20 +412,44 @@ impl Companion {
                     running_task_id.as_deref() == Some(t.id.as_str())
                 }
             }) {
+                let task_id = task.id.clone();
                 if task.turns.last().is_some_and(|t| !t.user) {
+                    let turn_idx = task.turns.len().saturating_sub(1);
                     if let Some(last) = task.turns.last_mut() {
+                        let old_turn = last.text.clone();
                         if !delta.full_text.is_empty() || live_text.len() >= last.text.len() {
                             last.text = live_text;
                         } else if !last.text.ends_with(&live_text) {
                             last.text.push_str(&live_text);
                         }
+                        turn_motion = Some((task_id, turn_idx, old_turn, last.text.clone()));
                     }
                 } else {
+                    let turn_idx = task.turns.len();
+                    turn_motion = Some((task_id, turn_idx, String::new(), live_text.clone()));
                     task.turns.push(stepx_companion::amoo_workspace::Turn {
+                        at_ms: Some(chrono::Utc::now().timestamp_millis()),
                         user: false,
                         text: live_text,
                     });
                 }
+            }
+        }
+
+        if !self.settings.value.reduced_motion && !self.settings.hidden {
+            if !resolved_session_key.is_empty() {
+                self.reply_motion.live.insert(resolved_session_key);
+            }
+            if let Some((sess_key, item_idx, before, after)) = session_motion {
+                self.reply_motion.track(sess_key, item_idx, &before, &after);
+            }
+            if let Some((task_id, turn_idx, old_turn, new_turn)) = turn_motion {
+                self.reply_motion.sync_delta(
+                    &format!("workspace-turn-{task_id}-{turn_idx}"),
+                    &old_turn,
+                    &new_turn,
+                    true,
+                );
             }
         }
 
@@ -481,7 +511,10 @@ impl Companion {
             return changed;
         }
         match result {
-            Ok(None) => return changed,
+            Ok(None) => {
+                self.mark_auto_sync_domain_synced(AutoSyncDomain::AmooAndTasks);
+                return changed;
+            }
             Ok(Some(data)) => {
                 let live_items: Vec<(String, AmooChatItem)> = self
                     .amoo_sessions
@@ -498,6 +531,9 @@ impl Companion {
                         })
                     })
                     .collect();
+                let prev_task_turns = self
+                    .workspace_task()
+                    .map(|t| (t.id.clone(), t.turns.clone()));
                 let msg = if self.busy {
                     String::new()
                 } else {
@@ -511,11 +547,49 @@ impl Companion {
                             .iter_mut()
                             .find(|s| s.session_key == session_key)
                         {
-                            if !matches!(
-                                session.items.last(),
-                                Some(AmooChatItem::AssistantRich { .. })
-                            ) {
-                                session.items.push(live_item);
+                            match (session.items.last_mut(), &live_item) {
+                                (
+                                    Some(AmooChatItem::AssistantRich { text: snap_txt, .. }),
+                                    AmooChatItem::AssistantRich {
+                                        text: Some(live_txt),
+                                        ..
+                                    },
+                                ) => {
+                                    let snap_str = snap_txt.as_deref().unwrap_or("");
+                                    if live_txt.len() > snap_str.len()
+                                        && live_txt.starts_with(snap_str)
+                                    {
+                                        *snap_txt = Some(live_txt.clone());
+                                    }
+                                }
+                                _ => {
+                                    session.items.push(live_item);
+                                }
+                            }
+                        }
+                    }
+                }
+                if !self.settings.value.reduced_motion && !self.settings.hidden {
+                    if let (Some((prev_id, prev_turns)), Some(task)) =
+                        (prev_task_turns, self.workspace_task())
+                    {
+                        if prev_id == task.id {
+                            for (i, turn) in task.turns.iter().enumerate() {
+                                if !turn.user && !turn.text.trim().is_empty() {
+                                    let old_text = prev_turns
+                                        .get(i)
+                                        .filter(|t| !t.user)
+                                        .map(|t| t.text.as_str())
+                                        .unwrap_or("");
+                                    if old_text != turn.text {
+                                        self.reply_motion.sync_delta(
+                                            &format!("workspace-turn-{}-{i}", task.id),
+                                            old_text,
+                                            &turn.text,
+                                            true,
+                                        );
+                                    }
+                                }
                             }
                         }
                     }

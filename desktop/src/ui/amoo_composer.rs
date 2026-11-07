@@ -491,7 +491,7 @@ impl Companion {
         } else {
             "Enter 发送"
         };
-        let mut actions = Vec::new();
+        let mut actions = vec![self.voice_input_button(F_AMOO)];
         if !phone_mode {
             actions.push(self.composer_icon(
                 "amoo-composer-attach",

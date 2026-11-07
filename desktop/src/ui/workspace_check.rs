@@ -162,7 +162,7 @@ impl Companion {
                     6=>{self.handle_action(&action(W::Menu(2)),ctx);},
                     7=>{assert_eq!(self.push.shell_mode,ShellMode::MiniAi);capture(ctx,dir.join("04-compact-resources.png"));self.handle_action(&action(W::ClosePanel),ctx);self.set_compact_mode(ShellMode::Full,ctx);},
                     8=>{
-                        let mut task=Task::new(None,None);task.title="销售复盘与汇报 · 布局测试".into();task.workspace=Some(dir.clone());task.turns=vec![Turn{user:true,text:"核对销售数据，整理结果表。".into()},Turn{user:false,text:"已核对两项数据，合计 **300**。结果已保存在电脑，可继续提问或发送到手机。".into()}];task.steps=vec![Step{executor:Executor::Files,phase:Phase::Done,note:"本地 UI 测试样例".into()}];task.add_output(Output{path:dir.join("sales.csv"),name:"核对结果.csv".into(),kind:"表格".into(),lab_id:None});let id=task.id.clone();self.workspace.journal.tasks.push(task);self.handle_action(&action(W::Select(id)),ctx);self.handle_action(&action(W::Preview(0)),ctx);
+                        let mut task=Task::new(None,None);task.title="销售复盘与汇报 · 布局测试".into();task.workspace=Some(dir.clone());task.turns=vec![Turn{at_ms:None,user:true,text:"核对销售数据，整理结果表。".into()},Turn{at_ms:None,user:false,text:"已核对两项数据，合计 **300**。结果已保存在电脑，可继续提问或发送到手机。".into()}];task.steps=vec![Step{executor:Executor::Files,phase:Phase::Done,note:"本地 UI 测试样例".into()}];task.add_output(Output{path:dir.join("sales.csv"),name:"核对结果.csv".into(),kind:"表格".into(),lab_id:None});let id=task.id.clone();self.workspace.journal.tasks.push(task);self.handle_action(&action(W::Select(id)),ctx);self.handle_action(&action(W::Preview(0)),ctx);
                     },
                     9=>capture(ctx,dir.join("05-results.png")),
                     10=>{self.set_compact_mode(ShellMode::MiniAi,ctx);},

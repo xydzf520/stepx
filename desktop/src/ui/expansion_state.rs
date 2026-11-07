@@ -1,3 +1,4 @@
+use stepx_companion::file_dialog::DialogKind;
 use super::*;
 use serde_json::{json, Value};
 use stepx_companion::storage_expansion::{self as expansion, Command, Config, Snapshot, Worker};
@@ -155,7 +156,7 @@ impl Companion {
             .as_ref()
             .zip(self.expansion.worker.as_ref())
             .is_some_and(|(d, w)| d.serial == w.serial && d.transport == w.transport);
-        if !self.demo_mode && !matches {
+        if !self.is_demo_device() && !matches {
             let different = self
                 .selected
                 .as_ref()
@@ -364,17 +365,18 @@ impl Companion {
                     self.expansion.confirm = false;
                 }
                 ExpansionAction::Folder => {
-                    if let Some(p) = native_dialog::FileDialog::new()
-                        .set_title("选择扩容文件保存位置")
-                        .show_open_single_dir()?
-                    {
-                        self.expansion.draft_folder =
-                            Some(stepx_companion::settings::choose_directory(&p)?);
-                        self.expansion.preview = None;
-                        self.expansion.preview_pending = None;
-                        self.expansion.preview_error.clear();
-                        self.expansion.feedback = "保存位置尚未应用，请确认规则后保存".into();
-                    }
+                    self.choose_path(
+                        stepx_companion::file_dialog::FileDialog::new().set_title("选择扩容文件保存位置"),
+                        DialogKind::OpenFolder,
+                        |app, p, _| {
+                            app.expansion.draft_folder = Some(stepx_companion::settings::choose_directory(&p)?);
+                            app.expansion.preview = None;
+                            app.expansion.preview_pending = None;
+                            app.expansion.preview_error.clear();
+                            app.expansion.feedback = "保存位置尚未应用，请确认规则后保存".into();
+                            Ok(())
+                        },
+                    );
                 }
                 ExpansionAction::OpenFolder => {
                     let base = if self.expansion.settings {
@@ -409,83 +411,90 @@ impl Companion {
                         .folder
                         .clone()
                         .ok_or_else(|| anyhow::anyhow!("未设置电脑扩容目录"))?;
-                    let picked = native_dialog::FileDialog::new()
-                        .set_title("选择要归档到电脑扩容库的文件")
-                        .show_open_multiple_file()?;
-                    if !picked.is_empty() {
-                        let vault = base.join("StepX Storage");
-                        let mut imported = 0usize;
-                        let now_ms = chrono::Utc::now().timestamp_millis();
-                        let today_label =
-                            format!("{} · 今天", chrono::Local::now().format("%Y-%m-%d"));
-                        for src in picked {
-                            if !src.is_file() {
-                                continue;
+                    let expected_device = self.selected.as_ref().map(|d| d.serial.clone());
+                    self.choose_paths(
+                        stepx_companion::file_dialog::FileDialog::new().set_title("选择要归档到电脑扩容库的文件"),
+                        DialogKind::OpenFiles,
+                        move |app, picked, _| {
+                            app.ensure_file_dialog_device(&expected_device)?;
+                            anyhow::ensure!(
+                                app.expansion.config.folder.as_ref() == Some(&base),
+                                "电脑扩容目录已变化，请重新选择文件"
+                            );
+                            let vault = base.join("StepX Storage");
+                            let mut imported = 0usize;
+                            let now_ms = chrono::Utc::now().timestamp_millis();
+                            let today_label = format!("{} · 今天", chrono::Local::now().format("%Y-%m-%d"));
+                            for src in picked {
+                                if !src.is_file() {
+                                    continue;
+                                }
+                                let Some(name) = src
+                                    .file_name()
+                                    .and_then(|s| s.to_str())
+                                    .map(|s| s.to_string())
+                                else {
+                                    continue;
+                                };
+                                let ext = src
+                                    .extension()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or("")
+                                    .to_ascii_lowercase();
+                                let (kind, sub_folder, rel_prefix) = if matches!(
+                                    ext.as_str(),
+                                    "jpg" | "jpeg" | "png" | "webp" | "gif" | "heic" | "bmp" | "dng"
+                                ) {
+                                    ("photos", "照片与视频", "Pictures")
+                                } else if matches!(
+                                    ext.as_str(),
+                                    "mp4" | "mov" | "mkv" | "avi" | "webm" | "3gp" | "flv"
+                                ) {
+                                    ("videos", "照片与视频", "Movies")
+                                } else if matches!(
+                                    ext.as_str(),
+                                    "mp3" | "wav" | "flac" | "m4a" | "aac" | "ogg" | "opus" | "amr"
+                                ) {
+                                    ("audio", "录音与音频", "Music")
+                                } else {
+                                    ("documents", "社交与文档", "Documents")
+                                };
+                                let dest_dir = vault.join(sub_folder);
+                                let _ = std::fs::create_dir_all(&dest_dir);
+                                let dest_file = dest_dir.join(&name);
+                                if src != dest_file {
+                                    let _ = std::fs::copy(&src, &dest_file);
+                                }
+                                let size = std::fs::metadata(&dest_file)
+                                    .or_else(|_| std::fs::metadata(&src))
+                                    .map(|m| m.len())
+                                    .unwrap_or(0);
+                                let id = format!("local-{}-{imported}", now_ms as u64);
+                                let entry = json!({
+                                    "id": id,
+                                    "name": name,
+                                    "path": format!("{rel_prefix}/{name}"),
+                                    "kind": kind,
+                                    "state": "archived",
+                                    "size": size,
+                                    "modified": now_ms,
+                                    "mtimeMs": now_ms,
+                                    "archivedAt": now_ms,
+                                    "archivedAtMs": now_ms,
+                                    "dateGroup": today_label,
+                                    "localPath": dest_file.to_string_lossy().to_string(),
+                                });
+                                app.expansion.snapshot.files.insert(0, entry);
+                                imported += 1;
                             }
-                            let Some(name) = src
-                                .file_name()
-                                .and_then(|s| s.to_str())
-                                .map(|s| s.to_string())
-                            else {
-                                continue;
-                            };
-                            let ext = src
-                                .extension()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("")
-                                .to_ascii_lowercase();
-                            let (kind, sub_folder, rel_prefix) = if matches!(
-                                ext.as_str(),
-                                "jpg" | "jpeg" | "png" | "webp" | "gif" | "heic" | "bmp" | "dng"
-                            ) {
-                                ("photos", "照片与视频", "Pictures")
-                            } else if matches!(
-                                ext.as_str(),
-                                "mp4" | "mov" | "mkv" | "avi" | "webm" | "3gp" | "flv"
-                            ) {
-                                ("videos", "照片与视频", "Movies")
-                            } else if matches!(
-                                ext.as_str(),
-                                "mp3" | "wav" | "flac" | "m4a" | "aac" | "ogg" | "opus" | "amr"
-                            ) {
-                                ("audio", "录音与音频", "Music")
-                            } else {
-                                ("documents", "社交与文档", "Documents")
-                            };
-                            let dest_dir = vault.join(sub_folder);
-                            let _ = std::fs::create_dir_all(&dest_dir);
-                            let dest_file = dest_dir.join(&name);
-                            if src != dest_file {
-                                let _ = std::fs::copy(&src, &dest_file);
+                            if imported > 0 {
+                                app.expansion.feedback = format!("已手动归档 {imported} 个文件到电脑扩容库");
+                                app.record_notice("存储扩容", app.expansion.feedback.clone());
                             }
-                            let size = std::fs::metadata(&dest_file)
-                                .or_else(|_| std::fs::metadata(&src))
-                                .map(|m| m.len())
-                                .unwrap_or(0);
-                            let id = format!("local-{}-{imported}", now_ms as u64);
-                            let entry = json!({
-                                "id": id,
-                                "name": name,
-                                "path": format!("{rel_prefix}/{name}"),
-                                "kind": kind,
-                                "state": "archived",
-                                "size": size,
-                                "modified": now_ms,
-                                "mtimeMs": now_ms,
-                                "archivedAt": now_ms,
-                                "archivedAtMs": now_ms,
-                                "dateGroup": today_label,
-                                "localPath": dest_file.to_string_lossy().to_string(),
-                            });
-                            self.expansion.snapshot.files.insert(0, entry);
-                            imported += 1;
-                        }
-                        if imported > 0 {
-                            self.expansion.feedback =
-                                format!("已手动归档 {imported} 个文件到电脑扩容库");
-                            self.record_notice("存储扩容", self.expansion.feedback.clone());
-                        }
-                    }
+
+                            Ok(())
+                        },
+                    );
                 }
                 ExpansionAction::Type(k) => {
                     anyhow::ensure!(

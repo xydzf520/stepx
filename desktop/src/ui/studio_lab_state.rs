@@ -1,9 +1,14 @@
 use super::*;
+use anyhow::Context;
 use std::sync::atomic::Ordering;
-use stepx_companion::{studio_delivery, studio_lab};
+use stepx_companion::{model_source, studio_delivery, studio_lab};
 
 #[derive(Clone, Debug)]
 pub(super) enum StudioLabAction {
+    Source(model_source::Source),
+    CheckPhoneConnection,
+    ProbePhoneText,
+    CancelPhoneTextProbe,
     Protocol(u8),
     Save,
     Test,
@@ -52,6 +57,8 @@ impl StudioLabAction {
                     | Models
                     | ClearKey
                     | ApplyProviderPreset(_)
+                    | Source(_)
+                    | ProbePhoneText
             )
         {
             return false;
@@ -59,7 +66,7 @@ impl StudioLabAction {
         !busy
             || matches!(
                 self,
-                Stop | Select(_)
+                Stop | CancelPhoneTextProbe | Select(_)
                     | HistoryPage(_)
                     | ToggleReport
                     | Protocol(_)
@@ -71,6 +78,9 @@ impl StudioLabAction {
     }
 }
 pub(super) enum StudioLabOutcome {
+    Source(Result<model_source::Preferences, String>),
+    PhoneConnection(String, Result<String, String>),
+    PhoneTextProbe(u64,String,String,Result<stepx_companion::home_ai::InferenceMeta,String>),
     Loaded(Result<(studio_lab::PublicConfig, Vec<studio_lab::LabArtifact>), String>),
     Config(Result<studio_lab::PublicConfig, String>),
     Test(
@@ -107,6 +117,12 @@ pub(super) struct CloudFeedback {
     pub error: Option<String>,
 }
 pub(super) struct StudioLabUiState {
+    pub model_source: model_source::Source,
+    pub model_source_error: Option<String>,
+    pub phone_connection_note: Option<(String, Result<String, String>)>,
+    pub phone_probe_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    pub phone_probe_request: u64,
+    pub phone_probe_note: Option<(String,String,Result<stepx_companion::home_ai::InferenceMeta,String>)>,
     pub loaded: bool,
     pub config: studio_lab::PublicConfig,
     pub protocol: u8,
@@ -137,6 +153,10 @@ pub(super) struct StudioLabUiState {
 }
 impl Default for StudioLabUiState {
     fn default() -> Self {
+        let (model_source, model_source_error) = match model_source::load() {
+            Ok(preferences) => (preferences.source, None),
+            Err(error) => (model_source::Source::PhoneAccount, Some(error.to_string())),
+        };
         let config = studio_lab::load_config().unwrap_or_default();
         let protocol = u8::from(config.protocol == "anthropic");
         let artifacts = studio_lab::list_artifacts().unwrap_or_default();
@@ -145,6 +165,10 @@ impl Default for StudioLabUiState {
             .first()
             .and_then(|a| studio_lab::read_report(a).ok().map(|r| (a.id.clone(), r)));
         Self {
+            model_source,
+            model_source_error,
+            phone_connection_note: None,
+            phone_probe_cancel: None,phone_probe_request:0,phone_probe_note: None,
             loaded: !artifacts.is_empty(),
             config,
             protocol,
@@ -211,6 +235,22 @@ pub(super) const LAB_TEMPLATES: [(&str, &str); 8] = [
 ];
 
 impl Companion {
+    pub(super) fn studio_lab_uses_phone(&self) -> bool {
+        self.studio_lab.model_source == model_source::Source::PhoneAccount
+    }
+    pub(super) fn studio_lab_phone_connection_label(&self) -> String {
+        match self.selected.as_ref() {
+            Some(device) => format!(
+                "当前手机：{} · 连接可检查",
+                if stepx_companion::adb::is_wireless_transport(&device.active_transport_cached()) {
+                    "无线"
+                } else {
+                    "USB"
+                }
+            ),
+            None => "当前未连接手机".into(),
+        }
+    }
     pub(super) fn studio_lab_phone_note(&self) -> Option<&Result<String, String>> {
         self.studio_lab.phone_feedback.get(&(
             self.selected.as_ref()?.serial.clone(),
@@ -324,7 +364,7 @@ impl Companion {
                     // Only the terminal event releases the handle: dropping a live
                     // handle cancels its worker, even when an earlier round passed.
                     self.studio_lab.handle = None;
-                    self.studio_lab.status = "作品已完成，本机自动检查通过".into();
+                    self.studio_lab.status = "作品已生成，所列自动检查通过，可预览确认".into();
                     self.workspace_finish(
                         stepx_companion::amoo_workspace::Phase::Done,
                         self.studio_lab.status.clone(),
@@ -459,6 +499,12 @@ impl Companion {
         self.studio_lab.report_error = None;
     }
     fn studio_lab_store_action(&mut self, kind: u8) {
+        if self.studio_lab_uses_phone() {
+            self.studio_lab.error = Some(
+                "请先明确选择独立 API，再保存或测试其配置；手机模式不会自动调用独立 API".into(),
+            );
+            return;
+        }
         let endpoint = self.fields[F_LAB_ENDPOINT].text.clone();
         let model = self.fields[F_LAB_MODEL].text.clone();
         let mut key = self.fields[F_LAB_KEY].text.clone();
@@ -509,8 +555,21 @@ impl Companion {
         if self.studio_lab.handle.is_some() {
             return true;
         }
-        let use_phone = !self.studio_lab.config.has_key;
-        if !use_phone && (self.studio_lab.config.model.is_empty() || self.studio_lab_config_dirty())
+        let source = match model_source::load() {
+            Ok(preferences) => preferences.source,
+            Err(error) => {
+                self.studio_lab.model_source_error = Some(error.to_string());
+                self.studio_lab.error =
+                    Some("请先在模型设置中重新选择来源，本次未调用任何模型".into());
+                return true;
+            }
+        };
+        self.studio_lab.model_source = source;
+        let use_phone = source == model_source::Source::PhoneAccount;
+        if !use_phone
+            && (!self.studio_lab.config.has_key
+                || self.studio_lab.config.model.is_empty()
+                || self.studio_lab_config_dirty())
         {
             self.studio_lab.error = Some("需要先填写模型服务".into());
             return true;
@@ -521,7 +580,7 @@ impl Companion {
         }
         self.studio_lab.last_prompt = prompt.clone();
         self.studio_lab.events.clear();
-        self.studio_lab.status = "正在连接模型，开始创作…".into();
+        self.studio_lab.status = format!("正在使用{}开始创作…", source.label());
         let phone = if use_phone {
             match self.selected.clone().zip(Adb::discover().ok()) {
                 Some((device, adb)) => Some((adb, device)),
@@ -557,6 +616,71 @@ impl Companion {
         self.studio_lab.error = None;
         self.error = false;
         match action {
+            A::Source(source) => {
+                let source = *source;
+                self.submit("正在保存模型来源…", move |_| {
+                    Ok(Outcome::StudioLab(StudioLabOutcome::Source(
+                        model_source::save(source).map_err(|error| error.to_string()),
+                    )))
+                });
+            }
+            A::ProbePhoneText => {
+                if self.context.productivity_generation_running() || self.productivity_is_busy() {
+                    self.studio_lab.error=Some("请等待当前生成完成或先停止，再验证手机通道".into());return;
+                }
+                if !self.studio_lab_uses_phone() {self.studio_lab.error=Some("请先选择手机账号来源".into());return;}
+                let Some(device)=self.selected.clone() else {self.studio_lab.error=Some("请通过USB或无线连接原手机".into());return;};
+                let Some(account)=self.amoo_ui.account_scope.clone() else {self.studio_lab.error=Some("请先等待手机账号核对完成，或打开账号页刷新".into());return;};
+                if self.studio_lab.phone_probe_cancel.is_some() {return;}
+                let cancel=std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                self.studio_lab.phone_probe_cancel=Some(cancel.clone());self.studio_lab.phone_probe_note=None;
+                self.studio_lab.phone_probe_request=self.studio_lab.phone_probe_request.wrapping_add(1);
+                let request=self.studio_lab.phone_probe_request;
+                self.submit("正在核对手机账号与通道，通过后至多请求一次手机模型…",move|adb| {
+                    let result=(||->anyhow::Result<stepx_companion::home_ai::InferenceMeta> {
+                        anyhow::ensure!(stepx_companion::amoo_usage::account_scope_fresh(adb,&device)?.as_deref()==Some(account.as_str()),
+                            "手机账号已变化，未开始模型验证");
+                        let generated=stepx_companion::home_ai::probe_phone_automatic_json_recorded(adb,&device,
+                            "仅返回一个完整JSON对象：{\"ok\":true}。本次只验证纯文本响应，不调用工具，不创建文件或任务。",&cancel,&mut |_|Ok(()))?;
+                        anyhow::ensure!(!cancel.load(Ordering::Acquire),"通道验证已取消，不会自动重发");
+                        anyhow::ensure!(stepx_companion::amoo_usage::account_scope_fresh(adb,&device)?.as_deref()==Some(account.as_str()),
+                            "手机账号已变化，未采用验证结果");
+                        generated.inference.context("模型未返回可核验的手机调用凭证")
+                    })().map_err(|error|error.to_string());
+                    Ok(Outcome::StudioLab(StudioLabOutcome::PhoneTextProbe(request,device.serial,account,result)))
+                });
+            }
+            A::CancelPhoneTextProbe => {
+                if let Some(cancel)=self.studio_lab.phone_probe_cancel.take() {cancel.store(true,Ordering::Release);}
+                self.studio_lab.phone_probe_request=self.studio_lab.phone_probe_request.wrapping_add(1);
+                self.studio_lab.status="已请求停止验证等待；不会自动重发模型请求".into();
+            }
+            A::CheckPhoneConnection => {
+                let Some(device) = self.selected.clone() else {
+                    self.studio_lab.error = Some("请先通过 USB 或无线连接手机".into());
+                    return;
+                };
+                self.studio_lab.phone_connection_note = None;
+                self.submit("正在核对手机连接，不调用模型…", move |adb| {
+                    let result = (|| -> anyhow::Result<String> {
+                        device.verify(adb)?;
+                        let transport = device.resolve_active_transport(adb)?;
+                        Ok(format!(
+                            "上次检查：{}连接与手机身份已核对；尚未测试模型响应",
+                            if stepx_companion::adb::is_wireless_transport(&transport) {
+                                "无线"
+                            } else {
+                                "USB"
+                            }
+                        ))
+                    })()
+                    .map_err(|error| error.to_string());
+                    Ok(Outcome::StudioLab(StudioLabOutcome::PhoneConnection(
+                        device.serial,
+                        result,
+                    )))
+                });
+            }
             A::Protocol(v) => {
                 self.studio_lab.protocol = (*v).min(1);
                 self.trigger_subtab_switch();
@@ -951,11 +1075,42 @@ impl Companion {
             self.studio_lab.protocol = u8::from(config.protocol == "anthropic");
         }
         self.studio_lab.config = config;
+        self.refresh_context_model_capabilities();
     }
     pub(super) fn apply_studio_lab(&mut self, outcome: StudioLabOutcome) {
         use StudioLabOutcome as O;
         let mut error = None;
         match outcome {
+            O::Source(result) => match result {
+                Ok(preferences) => {
+                    self.studio_lab.model_source = preferences.source;
+                    self.refresh_context_model_capabilities();
+                    self.studio_lab.model_source_error = None;
+                    self.studio_lab.model_note = Some(format!(
+                        "已选择{}；已停止旧来源的未完成生成，来源切换不会调用模型；后台生成需按当前账号重新确认",
+                        preferences.source.label()
+                    ));
+                }
+                Err(note) => self.studio_lab.model_source_error = Some(note),
+            },
+            O::PhoneTextProbe(request,serial,account,result) => {
+                if request!=self.studio_lab.phone_probe_request {return;}
+                self.studio_lab.phone_probe_cancel=None;
+                if self.selected.as_ref().is_some_and(|device|device.serial==serial)
+                    && self.amoo_ui.account_scope.as_deref()==Some(account.as_str()) && self.studio_lab_uses_phone() {
+                    if result.is_ok() {self.recheck_context_model_capabilities();}
+                    self.studio_lab.phone_probe_note=Some((serial,account,result));
+                }
+            }
+            O::PhoneConnection(serial, result) => {
+                if self
+                    .selected
+                    .as_ref()
+                    .is_some_and(|device| device.serial == serial)
+                {
+                    self.studio_lab.phone_connection_note = Some((serial, result));
+                }
+            }
             O::Loaded(result) => match result {
                 Ok((config, artifacts)) => {
                     self.fields[F_LAB_ENDPOINT].set(&config.endpoint);
@@ -1212,6 +1367,8 @@ mod interaction_tests {
             StudioLabAction::Iterate,
             StudioLabAction::Save,
             StudioLabAction::ClearKey,
+            StudioLabAction::Source(model_source::Source::PhoneAccount),
+            StudioLabAction::Source(model_source::Source::IndependentApi),
         ] {
             assert!(!action.available(false, true), "{action:?}");
             assert!(action.available(false, false), "{action:?}");
