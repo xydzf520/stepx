@@ -46,6 +46,16 @@ def subprocess_options():
     return {'creationflags': subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {}
 
 
+def optional_tool_home():
+    """A user profile is optional when locating bundled or PATH-based tools."""
+    try:
+        return Path.home()
+    except (RuntimeError, OSError):
+        # Windows service/test environments may omit USERPROFILE and HOMEDRIVE.
+        # Do not invent a writable user-data location; only skip SDK/JDK hints.
+        return None
+
+
 def adb_executable():
     if os.environ.get('STEPX_ADB'):
         return os.environ['STEPX_ADB']
@@ -57,13 +67,15 @@ def adb_executable():
     for key in ('ANDROID_SDK_ROOT', 'ANDROID_HOME'):
         if os.environ.get(key):
             candidates.append(Path(os.environ[key]) / 'platform-tools' / executable)
-    candidates += [
-        Path.home() / 'Android/Sdk/platform-tools' / executable,
-        Path.home() / 'Library/Android/sdk/platform-tools/adb',
-    ]
     for candidate in candidates:
         if candidate.is_file():
             return str(candidate)
+    home = optional_tool_home()
+    if home is not None:
+        for sdk in ('Android/Sdk', 'Library/Android/sdk'):
+            candidate = home / sdk / 'platform-tools' / executable
+            if candidate.is_file():
+                return str(candidate)
     return shutil.which('adb') or 'adb'
 
 
@@ -72,8 +84,10 @@ def java_environment():
     candidates = [Path(env['STEPX_JDK'])] if env.get('STEPX_JDK') else []
     candidates.append(ROOT / 'runtime/java')
     if env.get('JAVA_HOME'): candidates.append(Path(env['JAVA_HOME']))
-    candidates += [Path.home()/'.local/opt/android-studio/jbr',
-                   Path('/opt/android-studio/jbr'), Path('/Applications/Android Studio.app/Contents/jbr/Contents/Home'),
+    home = optional_tool_home()
+    if home is not None:
+        candidates.append(home / '.local/opt/android-studio/jbr')
+    candidates += [Path('/opt/android-studio/jbr'), Path('/Applications/Android Studio.app/Contents/jbr/Contents/Home'),
                    Path('/usr/lib/jvm/default-java'), Path('/usr/lib/jvm/java-21-openjdk-amd64'),
                    Path('/usr/lib/jvm/java-17-openjdk-amd64'), Path('/opt/homebrew/opt/openjdk')]
     executable = 'java.exe' if os.name == 'nt' else 'java'
@@ -94,7 +108,8 @@ def build_tools():
             base = Path(os.environ[key]) / 'build-tools'
             if base.is_dir():
                 yield from sorted((p for p in base.iterdir() if p.is_dir()), reverse=True)
-    bases = [Path.home()/'Android/Sdk', Path.home()/'Library/Android/sdk']
+    home = optional_tool_home()
+    bases = [home / 'Android/Sdk', home / 'Library/Android/sdk'] if home is not None else []
     if os.environ.get('LOCALAPPDATA'):
         bases.append(Path(os.environ['LOCALAPPDATA'])/'Android/Sdk')
     for sdk in bases:

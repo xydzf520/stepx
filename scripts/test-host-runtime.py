@@ -13,7 +13,7 @@ import types
 import unittest
 from unittest.mock import patch
 
-from host_runtime import adb_executable, java_environment, migrate_legacy_state, user_state_root
+from host_runtime import adb_executable, build_tools, java_environment, migrate_legacy_state, sdk_tool, user_state_root
 
 
 class HostRuntimeTests(unittest.TestCase):
@@ -25,13 +25,54 @@ class HostRuntimeTests(unittest.TestCase):
             local_adb = root / '.tools/bin' / exe
             local_adb.parent.mkdir(parents=True)
             local_adb.touch()
-            with patch('host_runtime.ROOT', root), patch.dict(os.environ, {}, clear=True):
+            with patch('host_runtime.ROOT', root), patch.dict(os.environ, {}, clear=True), \
+                 patch('pathlib.Path.home', side_effect=AssertionError('Bundled ADB needs no user profile')):
                 self.assertEqual(adb_executable(), str(local_adb))
                 packaged_adb.parent.mkdir(parents=True)
                 packaged_adb.touch()
                 self.assertEqual(adb_executable(), str(packaged_adb))
             with patch('host_runtime.ROOT', root), patch.dict(os.environ, {'STEPX_ADB': '/custom/adb'}, clear=True):
                 self.assertEqual(adb_executable(), '/custom/adb')
+
+    def test_adb_sdk_and_path_fallback_without_user_profile(self):
+        exe = 'adb.exe' if os.name == 'nt' else 'adb'
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            sdk_adb = root / 'sdk/platform-tools' / exe
+            sdk_adb.parent.mkdir(parents=True)
+            sdk_adb.touch()
+            with patch('host_runtime.ROOT', root), patch.dict(os.environ, {'ANDROID_SDK_ROOT': str(root / 'sdk')}, clear=True), \
+                 patch('pathlib.Path.home', side_effect=AssertionError('Explicit SDK needs no user profile')):
+                self.assertEqual(adb_executable(), str(sdk_adb))
+            with patch('host_runtime.ROOT', root), patch.dict(os.environ, {}, clear=True), \
+                 patch('pathlib.Path.home', side_effect=RuntimeError('Could not determine home directory.')), \
+                 patch('shutil.which', return_value=str(root / 'path' / exe)):
+                self.assertEqual(adb_executable(), str(root / 'path' / exe))
+            with patch('host_runtime.ROOT', root), patch.dict(os.environ, {}, clear=True), \
+                 patch('pathlib.Path.home', side_effect=RuntimeError('Could not determine home directory.')), \
+                 patch('shutil.which', return_value=None):
+                self.assertEqual(adb_executable(), 'adb')
+
+    def test_bundled_java_without_user_profile(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundled = root / 'runtime/java'
+            (bundled / 'bin').mkdir(parents=True)
+            (bundled / 'bin' / ('java.exe' if os.name == 'nt' else 'java')).touch()
+            with patch('host_runtime.ROOT', root), patch.dict(os.environ, {}, clear=True), \
+                 patch('pathlib.Path.home', side_effect=RuntimeError('Could not determine home directory.')):
+                environment = java_environment()
+                self.assertEqual(environment['JAVA_HOME'], str(bundled))
+                self.assertEqual(environment['PATH'].split(os.pathsep)[0], str(bundled / 'bin'))
+
+    def test_sdk_tool_fallback_without_user_profile(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with patch('host_runtime.ROOT', root), patch.dict(os.environ, {}, clear=True), \
+                 patch('pathlib.Path.home', side_effect=RuntimeError('Could not determine home directory.')), \
+                 patch('shutil.which', return_value=str(root / 'aapt2')):
+                self.assertEqual(list(build_tools()), [root / 'runtime/android-build-tools', root / '.tools/android-build-tools'])
+                self.assertEqual(sdk_tool('aapt2'), str(root / 'aapt2'))
 
     def test_bundled_java_takes_precedence_over_system_java_home(self):
         with tempfile.TemporaryDirectory() as temp:
