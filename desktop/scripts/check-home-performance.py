@@ -39,6 +39,9 @@ REGRESSION_RATIO = 1.25
 REGRESSION_FLOOR_US = 250.0
 ISOLATION_PROTOCOL = "one-companion-idle-workers-v1"
 FIXTURE_ENVIRONMENT = "temporary-state-offline-helpers-v1"
+# /proc wchan exposes kernel-version-dependent symbols rather than a stable ABI.
+# Keep the whitelist aligned with the Rust probe; unknown/hidden channels fail.
+FUTEX_WAIT_CHANNELS = {"futex_do_wait", "futex_wait_queue", "futex_wait_queue_me"}
 
 
 def key(row):
@@ -57,7 +60,7 @@ def validate_probe(probe):
             or isolation["workers_before"] != isolation.get("workers_after")):
         raise ValueError("Missing or invalid idle-worker isolation evidence")
     for worker in isolation["workers_before"].values():
-        if (worker.get("state") != "S" or worker.get("wait") != "futex_do_wait"
+        if (worker.get("state") != "S" or worker.get("wait") not in FUTEX_WAIT_CHANNELS
                 or not isinstance(worker.get("cpu_ticks"), int) or worker["cpu_ticks"] < 0):
             raise ValueError("A background worker was active during the measurement window")
     if probe.get("metric") != "home_view_tree_build_and_drop_us":
@@ -206,17 +209,35 @@ def self_test():
     assert not gate(noisy, {"cases": rows})[0]
     active = copy.deepcopy(probe)
     active["isolation"]["workers_after"] = {"1": {"cpu_ticks": 1, "state": "R", "wait": "0"}}
+    invalid_workers = []
+    for wait in sorted(FUTEX_WAIT_CHANNELS):
+        parked = copy.deepcopy(probe)
+        parked["isolation"]["workers_before"] = {"1": {"cpu_ticks": 7, "state": "S", "wait": wait}}
+        parked["isolation"]["workers_after"] = copy.deepcopy(parked["isolation"]["workers_before"])
+        validate_probe(parked)
+        running = copy.deepcopy(parked)
+        running["isolation"]["workers_before"]["1"]["state"] = "R"
+        running["isolation"]["workers_after"]["1"]["state"] = "R"
+        invalid_workers.append(running)
+        consumed_cpu = copy.deepcopy(parked)
+        consumed_cpu["isolation"]["workers_after"]["1"]["cpu_ticks"] += 1
+        invalid_workers.append(consumed_cpu)
+    for wait in ("0", "schedule", "futex_unknown"):
+        unknown = copy.deepcopy(probe)
+        unknown["isolation"]["workers_before"] = {"1": {"cpu_ticks": 7, "state": "S", "wait": wait}}
+        unknown["isolation"]["workers_after"] = copy.deepcopy(unknown["isolation"]["workers_before"])
+        invalid_workers.append(unknown)
     for invalid in ({**probe, "debug_assertions": True}, {**probe, "background_quiesced": False},
                     {**probe, "isolation": {}}, active,
                     {**probe, "cases": []},
-                    {**probe, "cases": cases + [cases[0]]}):
+                    {**probe, "cases": cases + [cases[0]]}, *invalid_workers):
         try:
             validate_probe(invalid)
         except ValueError:
             pass
         else:
             raise AssertionError("Invalid/empty/debug measurements must not pass")
-    print("Performance gate checks passed: budget, baseline, noise, completeness, release profile")
+    print("Performance gate checks passed: budget, baseline, noise, completeness, release profile, idle-worker evidence")
 
 
 def main():

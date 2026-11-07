@@ -4170,7 +4170,11 @@ fn home_release_frame_budget_regression() {
         workers
     };
     let parked = |workers: &std::collections::BTreeMap<String, WorkerSample>| {
-        workers.values().all(|w| w.state == "S" && w.wait == "futex_do_wait")
+        // /proc wchan exposes kernel-version-dependent function names, not a stable ABI.
+        // Accept only known sleeping futex helpers; unchanged ticks and inventory are
+        // still checked before/after sampling, and unknown/hidden wait channels fail.
+        workers.values().all(|w| w.state == "S" && matches!(w.wait.as_str(),
+            "futex_do_wait" | "futex_wait_queue" | "futex_wait_queue_me"))
     };
     let mut app = Companion::new_for_test();
     app.demo_mode = false;
