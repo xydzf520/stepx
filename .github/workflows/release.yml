@@ -10,6 +10,7 @@ env:
   # Package paths and regression fixtures include Chinese on every platform.
   PYTHONUTF8: '1'
   PYTHONIOENCODING: utf-8
+  PYTHONDONTWRITEBYTECODE: '1'
 concurrency:
   group: desktop-release-${{ github.ref }}
   cancel-in-progress: false
@@ -28,6 +29,7 @@ jobs:
           PY
       - name: Release story and public source checks
         run: |
+          python3 -m unittest discover -s scripts/tests -p test_public_release_policy.py
           python3 scripts/check-release-notes.py
           python3 scripts/check-public-release.py --source .
   build:
@@ -83,6 +85,8 @@ jobs:
         shell: bash
         run: echo "RUSTFLAGS=--remap-path-prefix=$GITHUB_WORKSPACE=/stepx-source" >> "$GITHUB_ENV"
       - name: Core tests
+        # Live third-party store probes are explicit integration checks; native
+        # storage, TCP framing and local download fixtures remain blocking gates.
         run: cargo test --locked --manifest-path desktop/Cargo.toml --no-default-features --lib --test contracts
       - name: Desktop state and interaction tests
         run: cargo test --locked --manifest-path desktop/Cargo.toml --bin stepx-companion
