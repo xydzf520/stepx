@@ -8,6 +8,7 @@ import hashlib
 import json
 import re
 from pathlib import Path, PurePosixPath
+from windows_crt import CRT_DLLS, CRT_MANIFEST, verify_manifest
 
 MANIFEST = 'scripts/release-resources.json'
 MEDIA = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico', '.mp4', '.h264'}
@@ -134,6 +135,15 @@ def audit_bundle(root: Path) -> list[str]:
         'handoff/google-play-stepx/target.json', 'handoff/google-play-stepx/target.example.json',
         'release-resources.sha256.json', 'stepx-companion', 'stepx-companion.exe', 'StepX.icns'}
     issues = []
+    if (root / 'stepx-companion.exe').is_file():
+        try:
+            # Generated Windows runtime inputs are a narrow, verified allowlist;
+            # an arbitrary loose DLL is never an approved product resource.
+            crt = verify_manifest(root / 'stepx-companion.exe')
+            allowed.update(set(crt['files']) & CRT_DLLS)
+            allowed.add(CRT_MANIFEST)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            issues.append('Windows app-local CRT verification failed: ' + type(exc).__name__)
     for path in root.rglob('*'):
         rel = path.relative_to(root).as_posix()
         if path.is_symlink():

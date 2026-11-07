@@ -1,8 +1,8 @@
-# Third-Party Notices / 第三方开源组件说明
+# Third-Party Notices / 第三方组件说明
 
-StepX Companion 的项目源码按 [`AGPL-3.0-only`](LICENSE) 发布。项目在构建、运行或移动端协作适配中使用或集成了以下第三方开源软件与组件，各组件均遵循其原始开源许可证条款。
+StepX Companion 的项目源码按 [`AGPL-3.0-only`](LICENSE) 发布。项目使用或集成的第三方组件遵循各自原始许可证；下文另行标明 Windows 运行库等专有可再分发组件，不将其标为 AGPL 或开源软件。
 
-StepX Companion source code is released under [`AGPL-3.0-only`](LICENSE). This project incorporates, links to, or interacts at runtime with the following third-party open-source components, each governed by its respective license.
+StepX Companion source code is released under [`AGPL-3.0-only`](LICENSE). Third-party components remain governed by their own licenses. Proprietary redistributable components, including the Windows runtime below, are identified separately and are not relicensed under the project's license.
 
 ---
 
@@ -36,6 +36,14 @@ StepX Companion source code is released under [`AGPL-3.0-only`](LICENSE). This p
 
 - **scrcpy & adb**: 作为外部子进程工具调用，遵循 Apache License 2.0。源码仓库不直接修改其内部实现；发布包随附运行时工具时保留其各自的 `NOTICE` 与许可证文件。
 - **openh264**: Copyright (c) 2013, Cisco Systems, All rights reserved. 按 BSD 2-Clause "Simplified" License 授权使用。
+
+### Microsoft Visual C++ Runtime（仅 Windows / Windows only）
+
+Windows 安装包在主程序同目录附带其实际需要的 Microsoft Visual C++ x64 发行版运行库，避免要求用户另装开发工具。版权归 Microsoft Corporation 所有；这些 DLL 是专有的可再分发运行库，按适用的 Visual Studio 软件许可条款及 [Visual Studio 2022 Distributable Code / REDIST List](https://learn.microsoft.com/en-us/visualstudio/releases/2022/redistribution) 分发，不适用本项目 AGPL 许可证。REDIST List 允许从 Visual Studio 的 `VC/Redist` 子目录分发指定运行库，明确排除 `debug_nonredist`。
+
+构建仅从当前 Visual Studio 安装对应的 `VC/Redist/MSVC/<version>/x64/Microsoft.VC*.CRT` 发行目录复制原样 DLL，不从任意 PATH、系统目录、第三方软件或调试目录收集文件。具体文件、版本、SHA-256、相对来源路径及依赖闭包记录在 Windows 包根目录的 `windows-crt.json`。仅实际导入的文件及其递归依赖随包分发；不会复制整个 Visual Studio 安装。
+
+The Windows package includes only the unmodified x64 release CRT DLLs required by the main executable, deployed app-locally. Copyright Microsoft Corporation. These proprietary redistributable runtime libraries are governed by the applicable Visual Studio license terms and Microsoft REDIST List above, not by the StepX source license. The package's `windows-crt.json` records the exact runtime files, versions, hashes, relative Visual Studio source and dependency closure. Debug/non-redistributable files are excluded. Windows 10/11 operating-system libraries are provided by Windows and are not copied into the package.
 
 ---
 

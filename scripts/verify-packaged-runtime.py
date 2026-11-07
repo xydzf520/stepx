@@ -5,6 +5,7 @@ import importlib.util, os, shutil, struct, subprocess, tempfile
 from pathlib import Path
 root=Path(sys.argv[1]).resolve()
 from public_release_policy import audit_bundle
+from windows_crt import relocate_crt, verify_manifest
 privacy_issues = audit_bundle(root)
 if privacy_issues:
     raise RuntimeError('Package privacy preflight failed:\n' + '\n'.join(privacy_issues))
@@ -67,9 +68,15 @@ print('Packaged signer, Unicode paths, imports and file lock: PASS')
 """
     binary_root=root.parent/'MacOS' if root.name=='Resources' else root
     binary_name='stepx-companion.exe' if os.name=='nt' else 'stepx-companion'
+    if os.name=='nt':
+        verify_manifest(binary_root/binary_name)
     # Exercise actual Contents/MacOS -> Contents/Resources resolution as shipped.
     run_checked([str(binary_root/binary_name),'--check-runtime'],env,45)
     shutil.copy2(binary_root/binary_name,copy/binary_name)
+    if os.name=='nt':
+        relocate_crt(binary_root/binary_name, copy)
+        verify_manifest(copy/binary_name)
+        print('App-local Visual C++ dependency closure, checksums and Unicode relocation: PASS', flush=True)
     run_checked([str(copy/binary_name),'--check-runtime'],env,45)
     adb=copy/'tools/bin'/('adb.exe' if os.name=='nt' else 'adb')
     run_checked([str(adb),'version'],env,15)

@@ -84,13 +84,16 @@
     "scripts/test-studio-lab.py",
     "scripts/test_companion_apk.py",
     "scripts/tests/test_public_release_policy.py",
+    "scripts/tests/test_windows_crt.py",
     "scripts/verify-packaged-runtime.py",
-    "scripts/verify-storage-tools.py"
+    "scripts/verify-storage-tools.py",
+    "scripts/windows_crt.py"
   ],
   "public_docs": [
     "docs/BUILDING.md",
     "docs/DESKTOP_UPDATES.md",
     "docs/GETTING_STARTED.md",
+    "docs/PERFORMANCE.md",
     "docs/RELEASE_NOTES.md",
     "docs/RELEASE_NOTES_GUIDELINES.md",
     "docs/SHARE_0_2_177.md",
@@ -422,7 +425,8 @@
     "scripts/studio-lab-runtime.py",
     "scripts/test-host-runtime.py",
     "scripts/test_companion_apk.py",
-    "scripts/verify-packaged-runtime.py"
+    "scripts/verify-packaged-runtime.py",
+    "scripts/windows_crt.py"
   ],
   "reviewed_media_sha256": {
     "04775fef84a54afd8e157c82d9f6be474ba7a815cd715a1bc56bec898e0f2295": {
@@ -739,14 +743,15 @@
     }
   ],
   "package_documents": [
+    "CHANGELOG.md",
     "LICENSE",
     "NOTICE",
-    "THIRD_PARTY_NOTICES.md",
     "README.md",
-    "CHANGELOG.md",
+    "THIRD_PARTY_NOTICES.md",
     "docs/BUILDING.md",
-    "docs/GETTING_STARTED.md",
     "docs/DESKTOP_UPDATES.md",
+    "docs/GETTING_STARTED.md",
+    "docs/PERFORMANCE.md",
     "docs/RELEASE_NOTES.md",
     "licenses/FaCloud-LICENSE-AGPL",
     "licenses/FaCloud-LICENSE-MIT",

@@ -4,6 +4,7 @@ import argparse, hashlib, os, platform, plistlib, posixpath, re, shutil, subproc
 from pathlib import Path
 sys.dont_write_bytecode = True
 from public_release_policy import audit_bundle, content_problems, manifest, runtime_plan, safe_read
+from windows_crt import package_windows_crt, verify_manifest
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS = {
@@ -113,6 +114,9 @@ def main():
         else:binary_dir=resource_dir=base
         binary_name='stepx-companion'+('.exe' if windows else '')
         shutil.copy2(ROOT/'desktop'/'target'/'release'/binary_name,binary_dir/binary_name)
+        if windows:
+            crt = package_windows_crt(binary_dir/binary_name)
+            print('App-local Visual C++ runtime:', ', '.join(crt['files']) or 'not required', flush=True)
         subprocess.run([sys.executable,'-B',str(ROOT/'scripts/stage-release-resources.py'),str(ROOT),str(resource_dir)],check=True,env=verification_environment())
         for rel,data in documents.items():
             target=resource_dir/rel;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(data)
@@ -138,6 +142,7 @@ def main():
             subprocess.run(['codesign','--verify','--deep','--strict',str(base/'StepX Companion.app')],check=True)
         issues=audit_bundle(resource_dir)
         if issues: raise RuntimeError('Package privacy verification failed:\n'+'\n'.join(issues))
+        if windows: verify_manifest(binary_dir/binary_name)
         if a.platform.startswith('linux'):
             output=dist/(name+'.tar.gz')
             with tarfile.open(output,'w:gz') as t:t.add(base,arcname=name)
