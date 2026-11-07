@@ -119,8 +119,8 @@ fn format_live_device_telemetry_block(raw: &str, device: &Device) -> Option<Stri
     let soh = non_empty(kv("SOH"), "未读取");
     let design_cap = crate::device::format_mah_value(&kv("DESIGN_CAP"), "未读取");
     let charge_cnt = crate::device::format_mah_value(&kv("CHARGE_CNT"), "未读取");
-    let cycle_count =
-        crate::device::extract_cycle_count(&kv("CYCLE_LINE")).unwrap_or_else(|| "未读取".to_string());
+    let cycle_count = crate::device::extract_cycle_count(&kv("CYCLE_LINE"))
+        .unwrap_or_else(|| "未读取".to_string());
 
     let batt_val = |key: &str| -> String {
         raw.lines()
@@ -812,12 +812,7 @@ fn write_all_clean(stream: &mut TcpStream, mut bytes: &[u8], err_msg: &str) -> R
             Ok(0) => bail!("{err_msg}"),
             Ok(n) => bytes = &bytes[n..],
             Err(err) if err.kind() == ErrorKind::Interrupted => continue,
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    ErrorKind::WouldBlock | ErrorKind::TimedOut
-                ) =>
-            {
+            Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
                 if Instant::now() >= deadline {
                     bail!("{err_msg}");
                 }
@@ -836,7 +831,16 @@ fn write_frame(stream: &mut TcpStream, body: &[u8], err_msg: &str) -> Result<()>
     write_all_clean(stream, &frame, err_msg)
 }
 
-fn read_exact_until(stream: &mut TcpStream, mut bytes: &mut [u8], deadline: Instant) -> Result<()> {
+fn read_exact_until(stream: &mut TcpStream, bytes: &mut [u8], deadline: Instant) -> Result<()> {
+    read_exact_until_with_progress(stream, bytes, deadline, &mut false)
+}
+
+fn read_exact_until_with_progress(
+    stream: &mut TcpStream,
+    mut bytes: &mut [u8],
+    deadline: Instant,
+    received_bytes: &mut bool,
+) -> Result<()> {
     while !bytes.is_empty() {
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
             bail!("{CLOUD_TIMEOUT_MESSAGE}");
@@ -853,7 +857,10 @@ fn read_exact_until(stream: &mut TcpStream, mut bytes: &mut [u8], deadline: Inst
         }
         match stream.read(bytes) {
             Ok(0) => bail!("Amoo 后台连接已关闭"),
-            Ok(count) => bytes = &mut bytes[count..],
+            Ok(count) => {
+                *received_bytes = true;
+                bytes = &mut bytes[count..];
+            }
             Err(err)
                 if matches!(
                     err.kind(),
@@ -871,14 +878,22 @@ fn read_exact_until(stream: &mut TcpStream, mut bytes: &mut [u8], deadline: Inst
 }
 
 fn read_frame(stream: &mut TcpStream, deadline: Instant) -> Result<Value> {
+    read_frame_with_progress(stream, deadline, &mut false)
+}
+
+fn read_frame_with_progress(
+    stream: &mut TcpStream,
+    deadline: Instant,
+    received_bytes: &mut bool,
+) -> Result<Value> {
     let mut header = [0; 4];
-    read_exact_until(stream, &mut header, deadline)?;
+    read_exact_until_with_progress(stream, &mut header, deadline, received_bytes)?;
     let size = u32::from_be_bytes(header) as usize;
     if size == 0 || size > MAX_FRAME {
         bail!("Amoo 后台返回了无效的数据帧长度");
     }
     let mut body = vec![0; size];
-    read_exact_until(stream, &mut body, deadline)?;
+    read_exact_until_with_progress(stream, &mut body, deadline, received_bytes)?;
     serde_json::from_slice(&body).context("Amoo 后台返回了无效的 JSON 数据")
 }
 
@@ -999,7 +1014,11 @@ impl AgentBus {
             None
         };
         let (stream, port, was_cached) = adb
-            .connect_forwarded_tcp(&device.transport, "localabstract:agentbus", Duration::from_secs(3))
+            .connect_forwarded_tcp(
+                &device.transport,
+                "localabstract:agentbus",
+                Duration::from_secs(3),
+            )
             .context("无法连接 Amoo 后台服务，请检查手机连接")?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
         let mut bus = Self {
@@ -1035,60 +1054,64 @@ impl AgentBus {
         } else {
             hello_timeout
         };
-        let hello = match self.call_with_timeout("connect", hello_request_params(), first_hello_timeout) {
-            Ok(h) => h,
-            Err(_) if was_cached => {
-                self.adb.invalidate_forwarded_tcp(
-                    &self.device.transport,
-                    "localabstract:agentbus",
-                    Some(self.port),
-                );
-                if let Ok(active) = self.device.resolve_active_transport(&self.adb) {
-                    if active != self.device.transport {
-                        self.adb
-                            .invalidate_forwards_for_transport(&self.device.transport);
-                        self.device.transport = active;
-                    }
-                }
-                let (fresh_stream, fresh_port, _) = self
-                    .adb
-                    .connect_forwarded_tcp(
+        let hello =
+            match self.call_with_timeout("connect", hello_request_params(), first_hello_timeout) {
+                Ok(h) => h,
+                Err(_) if was_cached => {
+                    self.adb.invalidate_forwarded_tcp(
                         &self.device.transport,
                         "localabstract:agentbus",
-                        Duration::from_secs(3),
-                    )
-                    .context("无法连接 Amoo 后台服务，请检查手机连接")?;
-                fresh_stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-                self.port = fresh_port;
-                self.stream = fresh_stream;
-                self.stream_tainted = false;
-                self.has_completed_rpc = false;
-                self.last_status = None;
-                self.pending_events.clear();
-                self.call_with_timeout("connect", hello_request_params(), hello_timeout)
-                    .map_err(|e| {
-                        self.adb.invalidate_forwarded_tcp(
+                        Some(self.port),
+                    );
+                    if let Ok(active) = self.device.resolve_active_transport(&self.adb) {
+                        if active != self.device.transport {
+                            self.adb
+                                .invalidate_forwards_for_transport(&self.device.transport);
+                            self.device.transport = active;
+                        }
+                    }
+                    let (fresh_stream, fresh_port, _) = self
+                        .adb
+                        .connect_forwarded_tcp(
                             &self.device.transport,
                             "localabstract:agentbus",
-                            Some(self.port),
-                        );
-                        e
-                    })
-                    .with_context(|| {
+                            Duration::from_secs(3),
+                        )
+                        .context("无法连接 Amoo 后台服务，请检查手机连接")?;
+                    fresh_stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+                    self.port = fresh_port;
+                    self.stream = fresh_stream;
+                    self.stream_tainted = false;
+                    self.has_completed_rpc = false;
+                    self.last_status = None;
+                    self.pending_events.clear();
+                    self.call_with_timeout("connect", hello_request_params(), hello_timeout)
+                        .map_err(|e| {
+                            self.adb.invalidate_forwarded_tcp(
+                                &self.device.transport,
+                                "localabstract:agentbus",
+                                Some(self.port),
+                            );
+                            e
+                        })
+                        .with_context(|| {
+                            crate::amoo_background::connection_failure_message(
+                                &self.adb,
+                                &self.device,
+                            )
+                        })?
+                }
+                Err(e) => {
+                    self.adb.invalidate_forwarded_tcp(
+                        &self.device.transport,
+                        "localabstract:agentbus",
+                        Some(self.port),
+                    );
+                    return Err(e).with_context(|| {
                         crate::amoo_background::connection_failure_message(&self.adb, &self.device)
-                    })?
-            }
-            Err(e) => {
-                self.adb.invalidate_forwarded_tcp(
-                    &self.device.transport,
-                    "localabstract:agentbus",
-                    Some(self.port),
-                );
-                return Err(e).with_context(|| {
-                    crate::amoo_background::connection_failure_message(&self.adb, &self.device)
-                });
-            }
-        };
+                    });
+                }
+            };
         if hello["protocol"] != 3 {
             self.adb.invalidate_forwarded_tcp(
                 &self.device.transport,
@@ -1159,7 +1182,8 @@ impl AgentBus {
                 Ok(frame) => frame,
                 Err(err) => {
                     self.stream_tainted = true;
-                    return Err(err).context("手机本机图片上传未确认完成；附件已保留，请勿重复提交");
+                    return Err(err)
+                        .context("手机本机图片上传未确认完成；附件已保留，请勿重复提交");
                 }
             };
             if let Some(status) = parse_stepclaw_status_change(&response) {
@@ -1314,9 +1338,8 @@ impl AgentBus {
         loop {
             // AgentBus multiplexes clients upstream; IDs must remain unique across reconnects.
             let id = format!("stepx-{:032x}", rand::random::<u128>());
-            let body = serde_json::to_vec(
-                &json!({"type":"req","id":id,"method":method,"params":params}),
-            )?;
+            let body =
+                serde_json::to_vec(&json!({"type":"req","id":id,"method":method,"params":params}))?;
             if body.len() > MAX_FRAME {
                 bail!("Amoo 请求过大");
             }
@@ -1356,13 +1379,14 @@ impl AgentBus {
                     );
                 }
             }
-            let mut frames_read_for_call = 0usize;
+            let mut received_response_bytes = false;
             let result = loop {
-                let response = match read_frame(&mut self.stream, deadline) {
-                    Ok(frame) => {
-                        frames_read_for_call += 1;
-                        frame
-                    }
+                let response = match read_frame_with_progress(
+                    &mut self.stream,
+                    deadline,
+                    &mut received_response_bytes,
+                ) {
+                    Ok(frame) => frame,
                     Err(err) => {
                         self.stream_tainted = true;
                         let is_eof = err.to_string().contains("连接已关闭");
@@ -1373,7 +1397,9 @@ impl AgentBus {
                                 Some(self.port),
                             );
                         }
-                        break Err((err, is_eof && frames_read_for_call == 0));
+                        // A partial header or body is already a response. Its lost
+                        // remainder does not prove that replaying the RPC is safe.
+                        break Err((err, is_eof && !received_response_bytes));
                     }
                 };
                 if let Some(status) = parse_stepclaw_status_change(&response) {
@@ -1475,9 +1501,8 @@ impl AgentBus {
             self.reconnect_stream()?;
         }
         let id = format!("stepx-context-{:032x}", rand::random::<u128>());
-        let body = serde_json::to_vec(
-            &json!({"type":"req","id":id,"method":method,"params":params}),
-        )?;
+        let body =
+            serde_json::to_vec(&json!({"type":"req","id":id,"method":method,"params":params}))?;
         if body.len() > MAX_FRAME {
             bail!("手机上下文读取请求过大");
         }
@@ -1533,7 +1558,10 @@ impl AgentBus {
                 bail!("手机暂未提供这部分上下文");
             }
             self.has_completed_rpc = true;
-            return response.get("payload").cloned().context("手机上下文响应不完整");
+            return response
+                .get("payload")
+                .cloned()
+                .context("手机上下文响应不完整");
         }
     }
 
@@ -3167,7 +3195,13 @@ CYCLE_LINE=Bundle[{android.os.extra.CYCLE_COUNT=15}]
     }
     #[test]
     fn missing_telemetry_never_implies_warranty_or_sensor_values() {
-        let device = Device { transport: "test".into(), serial: String::new(), model: String::new(), android: String::new(), product: String::new() };
+        let device = Device {
+            transport: "test".into(),
+            serial: String::new(),
+            model: String::new(),
+            android: String::new(),
+            product: String::new(),
+        };
         let block = format_live_device_telemetry_block("SOH=\nDESIGN_CAP=\n", &device).unwrap();
         assert!(block.contains("健康度 (SOH) 未读取"));
         assert!(block.contains("无法确认是否在保"));
@@ -3264,7 +3298,9 @@ exit 0
                 }
             }))
             .unwrap();
-            stream.write_all(&(resp.len() as u32).to_be_bytes()).unwrap();
+            stream
+                .write_all(&(resp.len() as u32).to_be_bytes())
+                .unwrap();
             stream.write_all(&resp).unwrap();
         });
 
@@ -3292,6 +3328,7 @@ exit 0
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        let (timed_out, wait_for_timeout) = std::sync::mpsc::channel();
 
         let server = std::thread::spawn(move || {
             let (mut s, _) = listener.accept().unwrap();
@@ -3304,8 +3341,11 @@ exit 0
             std::thread::sleep(Duration::from_millis(320));
             s.write_all(&framed[3..]).unwrap();
 
-            // Second test: hold connection silent past client deadline
-            std::thread::sleep(Duration::from_millis(250));
+            // Keep the connection open until the client actually observed its
+            // timeout. A fixed sleep races slow CI schedulers and can become EOF.
+            wait_for_timeout
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
         });
 
         let mut client = TcpStream::connect(addr).unwrap();
@@ -3318,9 +3358,11 @@ exit 0
         let rendered = format!("{err:#}");
         assert_eq!(rendered, CLOUD_TIMEOUT_MESSAGE);
         assert!(
-            !rendered.contains("os error 11") && !rendered.contains("Resource temporarily unavailable"),
+            !rendered.contains("os error 11")
+                && !rendered.contains("Resource temporarily unavailable"),
             "rendered error must not leak raw EAGAIN/os error 11: {rendered}"
         );
+        timed_out.send(()).unwrap();
         server.join().unwrap();
     }
 
@@ -3345,7 +3387,8 @@ exit 0
                 }
             }
         });
-        let delta = parse_stream_event(&streaming_frame).expect("must parse node.event session.message");
+        let delta =
+            parse_stream_event(&streaming_frame).expect("must parse node.event session.message");
         assert_eq!(delta.session_key, "agent:main:desktop-s1");
         assert_eq!(delta.run_id, "stepx-run-123");
         assert_eq!(delta.delta_text, "上海今天晴");
@@ -3605,7 +3648,10 @@ exit 0
         let d1 = parse_stream_event(&assistant_tool_call).expect("assistant tool call event");
         assert!(d1.tool_status.as_deref().unwrap_or("").contains("联网搜索"));
         assert_eq!(d1.full_text, "");
-        assert!(!d1.finished, "intermediate TOOL_CALLS step must not mark stream finished");
+        assert!(
+            !d1.finished,
+            "intermediate TOOL_CALLS step must not mark stream finished"
+        );
 
         // 2. Tool result frame (role="tool", streaming=false) must NOT overwrite assistant text or mark finished
         let tool_result = json!({
@@ -3625,9 +3671,18 @@ exit 0
         });
         let d2 = parse_stream_event(&tool_result).expect("tool result event");
         assert!(d2.tool_status.as_deref().unwrap_or("").contains("联网搜索"));
-        assert_eq!(d2.full_text, "", "tool role output must not leak into assistant full_text");
-        assert_eq!(d2.delta_text, "", "tool role output must not leak into assistant delta_text");
-        assert!(!d2.finished, "tool role frame must not mark assistant reply finished");
+        assert_eq!(
+            d2.full_text, "",
+            "tool role output must not leak into assistant full_text"
+        );
+        assert_eq!(
+            d2.delta_text, "",
+            "tool role output must not leak into assistant delta_text"
+        );
+        assert!(
+            !d2.finished,
+            "tool role frame must not mark assistant reply finished"
+        );
 
         // 3. System frame must be ignored
         let system_frame = json!({
@@ -3649,6 +3704,23 @@ exit 0
     #[cfg(unix)]
     #[test]
     fn agentbus_reconnects_cleanly_after_mid_session_timeout_and_idle_eof() {
+        check_agentbus_timeout_and_warm_eof(None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agentbus_does_not_replay_mutation_after_partial_response_header_eof() {
+        check_agentbus_timeout_and_warm_eof(Some(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agentbus_does_not_replay_mutation_after_partial_response_body_eof() {
+        check_agentbus_timeout_and_warm_eof(Some(6));
+    }
+
+    #[cfg(unix)]
+    fn check_agentbus_timeout_and_warm_eof(partial_reply_bytes: Option<usize>) {
         use std::net::TcpListener;
         use std::os::unix::fs::PermissionsExt;
 
@@ -3656,12 +3728,16 @@ exit 0
         let fake_adb = dir.path().join("adb");
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
+        // Each run has an independent cached forward/context, including when
+        // these regression cases execute in parallel.
+        let serial = format!("AGENTBUS_RECONNECT_SERIAL_{port}");
+        let (call_finished, wait_for_call) = std::sync::mpsc::channel();
 
         let script = format!(
             r#"#!/usr/bin/env sh
 case "$*" in
   *"getprop"*ro.serialno*)
-    echo "AGENTBUS_RECONNECT_SERIAL"
+    echo "{serial}"
     exit 0
     ;;
   *"forward tcp:0 localabstract:agentbus"*)
@@ -3680,14 +3756,14 @@ exit 0
 
         let adb = Adb { path: fake_adb };
         let device = Device {
-            transport: "AGENTBUS_RECONNECT_SERIAL".into(),
-            serial: "AGENTBUS_RECONNECT_SERIAL".into(),
+            transport: serial.clone(),
+            serial: serial.clone(),
             model: "PZ261A".into(),
             android: "16".into(),
             product: "pandora".into(),
         };
         put_cached_amoo_context_at(
-            "AGENTBUS_RECONNECT_SERIAL".into(),
+            serial.clone(),
             Instant::now(),
             json!({"ok": true, "brand": "stepos", "model": "PZ261A"}),
         );
@@ -3695,7 +3771,9 @@ exit 0
         let server = std::thread::spawn(move || {
             let send = |stream: &mut TcpStream, val: Value| {
                 let bytes = serde_json::to_vec(&val).unwrap();
-                stream.write_all(&(bytes.len() as u32).to_be_bytes()).unwrap();
+                stream
+                    .write_all(&(bytes.len() as u32).to_be_bytes())
+                    .unwrap();
                 stream.write_all(&bytes).unwrap();
             };
 
@@ -3712,11 +3790,12 @@ exit 0
                     "payload": {"protocol": 3, "server": {"id": "agentbus", "version": "1.0.0"}}
                 }),
             );
-            let timed_out_req = read_frame(&mut s1, Instant::now() + Duration::from_secs(2)).unwrap();
+            let timed_out_req =
+                read_frame(&mut s1, Instant::now() + Duration::from_secs(2)).unwrap();
             assert_eq!(timed_out_req["method"], "sessions.list");
             // Do not reply on s1 so client times out after 100ms
 
-            // Connection 2: client automatically reconnects for next RPC ("chat.send"), then server closes s2 (idle EOF)
+            // Connection 2: client automatically reconnects for the next RPC.
             let (mut s2, _) = listener.accept().unwrap();
             let c2 = read_frame(&mut s2, Instant::now() + Duration::from_secs(2)).unwrap();
             assert_eq!(c2["method"], "connect");
@@ -3740,7 +3819,32 @@ exit 0
                     "payload": {"runId": "run-after-timeout", "status": "started"}
                 }),
             );
-            drop(s2);
+            if let Some(prefix_len) = partial_reply_bytes {
+                let request = read_frame(&mut s2, Instant::now() + Duration::from_secs(2)).unwrap();
+                assert_eq!(request["method"], "sessions.delete");
+                let payload = serde_json::to_vec(&json!({
+                    "type": "res", "id": request["id"], "ok": true,
+                    "payload": {"ok": true}
+                }))
+                .unwrap();
+                let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
+                frame.extend_from_slice(&payload);
+                s2.write_all(&frame[..prefix_len]).unwrap();
+                s2.shutdown(std::net::Shutdown::Write).unwrap();
+                wait_for_call.recv_timeout(Duration::from_secs(10)).unwrap();
+                listener.set_nonblocking(true).unwrap();
+                assert_eq!(
+                    listener.accept().unwrap_err().kind(),
+                    ErrorKind::WouldBlock,
+                    "partial responses must not trigger a reconnect or replay"
+                );
+                return;
+            }
+
+            // Explicit FIN with the receive half retained models an idle EOF.
+            // drop(s2) could race the client's next write, discard unread bytes,
+            // and become RST on BSD/macOS instead of the intended orderly EOF.
+            s2.shutdown(std::net::Shutdown::Write).unwrap();
 
             // Connection 3: client sees EOF on warm s2 during "sessions.delete" and transparently reconnects
             let (mut s3, _) = listener.accept().unwrap();
@@ -3755,6 +3859,7 @@ exit 0
                     "payload": {"protocol": 3, "server": {"id": "agentbus", "version": "1.0.0"}}
                 }),
             );
+            drop(s2);
             let del_req = read_frame(&mut s3, Instant::now() + Duration::from_secs(2)).unwrap();
             assert_eq!(del_req["method"], "sessions.delete");
             send(
@@ -3771,7 +3876,11 @@ exit 0
         let mut bus = AgentBus::connect(&adb, &device).expect("AgentBus::connect");
         // 1. First call times out
         let err = bus
-            .call_with_timeout("sessions.list", json!({"limit": 10}), Duration::from_millis(100))
+            .call_with_timeout(
+                "sessions.list",
+                json!({"limit": 10}),
+                Duration::from_millis(100),
+            )
             .expect_err("sessions.list should time out");
         assert!(err.to_string().contains("超时"));
 
@@ -3782,11 +3891,25 @@ exit 0
         assert_eq!(receipt.run_id, "run-after-timeout");
 
         // 3. Subsequent call on warm bus whose socket closed with EOF transparently reconnects and succeeds
-        bus.call("sessions.delete", json!({"key": "agent:main:stepx-1"}))
-            .expect("delete after warm socket EOF should auto-reconnect and succeed");
+        let deletion = bus.call_with_timeout(
+            "sessions.delete",
+            json!({"key": "agent:main:stepx-1"}),
+            Duration::from_secs(2),
+        );
+        if partial_reply_bytes.is_some() {
+            let error = deletion.expect_err("an incomplete response cannot confirm deletion");
+            assert!(error.to_string().contains("连接已关闭"));
+            assert!(
+                bus.stream_tainted,
+                "the next operation must use a fresh stream"
+            );
+            call_finished.send(()).unwrap();
+        } else {
+            deletion.expect("delete after warm socket EOF should auto-reconnect and succeed");
+        }
 
         server.join().unwrap();
-        adb.invalidate_forwarded_tcp("AGENTBUS_RECONNECT_SERIAL", "localabstract:agentbus", None);
+        adb.invalidate_forwarded_tcp(&serial, "localabstract:agentbus", None);
     }
 
     #[cfg(unix)]
@@ -3839,7 +3962,9 @@ exit 0
             let (mut s, _) = listener.accept().unwrap();
             let send = |stream: &mut TcpStream, val: Value| {
                 let bytes = serde_json::to_vec(&val).unwrap();
-                stream.write_all(&(bytes.len() as u32).to_be_bytes()).unwrap();
+                stream
+                    .write_all(&(bytes.len() as u32).to_be_bytes())
+                    .unwrap();
                 stream.write_all(&bytes).unwrap();
             };
 
@@ -3974,7 +4099,9 @@ exit 0
         });
 
         let mut bus = AgentBus::connect(&adb, &device).expect("AgentBus::connect");
-        let key = bus.create_session().expect("create_session across status change");
+        let key = bus
+            .create_session()
+            .expect("create_session across status change");
         let receipt = bus.send(&key, "上海天气").expect("bus.send");
         assert_eq!(receipt.run_id, "stepx-run-e2e");
 
