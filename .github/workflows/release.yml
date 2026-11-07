@@ -30,7 +30,7 @@ jobs:
           PY
       - name: Release story and public source checks
         run: |
-          python3 -m unittest discover -s scripts/tests -p test_public_release_policy.py
+          python3 -m unittest discover -s scripts/tests -p 'test_*.py'
           python3 scripts/check-release-notes.py
           python3 scripts/check-public-release.py --source .
   build:
@@ -116,8 +116,6 @@ jobs:
           path: dist/*
           if-no-files-found: error
   publish:
-    # Hold publication while the Windows app-local runtime audit is completed.
-    if: ${{ false }}
     needs: [metadata, build]
     runs-on: ubuntu-24.04
     permissions:
