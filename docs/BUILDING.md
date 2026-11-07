@@ -6,11 +6,11 @@
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y build-essential pkg-config clang libclang-dev libssl-dev libfontconfig1-dev libfreetype-dev libxkbcommon-dev libwayland-dev libxcb1-dev libx11-dev libxi-dev libxcursor-dev libxrandr-dev libgl1-mesa-dev
+sudo apt-get install -y build-essential pkg-config clang libclang-dev libssl-dev libfontconfig1-dev libfreetype-dev libxkbcommon-dev libwayland-dev libxcb1-dev libx11-dev libxi-dev libxcursor-dev libxrandr-dev libgl1-mesa-dev libdbus-1-dev
 cargo build --release --locked --manifest-path desktop/Cargo.toml
 ```
 
-需要支持 Vulkan/OpenGL 的图形环境。其他 Linux 发行版可能需要对应动态库；便携包不是静态链接的 AppImage。
+需要支持 Vulkan/OpenGL 的图形环境。其他 Linux 发行版可能需要对应动态库；便携包不是静态链接的 AppImage。正式 Linux 包在 Ubuntu 24.04 上构建，以 glibc 2.39 为基线；较新发行版本机构建的二进制可能要求更新的 glibc，不能直接作为该兼容基线的发布包。
 
 ## macOS
 
@@ -32,10 +32,10 @@ python3 -m unittest discover -s desktop/tests -p 'test_*.py'
 ## 发布包
 
 ```bash
-python3 scripts/package-release.py --platform linux-x86_64 --version 0.2.25
+python3 scripts/package-release.py --platform linux-x86_64 --version 0.2.177
 ```
 
-平台可选 `linux-x86_64`、`macos-arm64`、`macos-x86_64`、`windows-x86_64`。脚本验证官方 scrcpy 工具包的 SHA256，将可执行文件与运行资源封装到 `dist/`。通过 `.github/workflows/release.yml` 的手动运行构建全部平台；先生成草稿 Release，检查产物后再发布。
+平台可选 `linux-x86_64`、`macos-arm64`、`macos-x86_64`、`windows-x86_64`。版本号应与 `desktop/Cargo.toml` 一致。脚本验证官方 scrcpy 工具包的 SHA256，将可执行文件与运行资源封装到 `dist/`。通过 `.github/workflows/release.yml` 的手动运行，或向 main 提交版本 / 工作流变更，构建全部平台；源码检查、四个平台的测试、构建和打包检查全部通过后自动发布 GitHub Release，附安装包、校验文件、伴侣 APK 和两段介绍视频。任一平台失败会阻止发布；流程不会覆盖已经正式发布的同名版本。
 
 ## Android
 
@@ -50,3 +50,7 @@ Android 源码位于 `desktop/companion-app`，以及 bridge、权限与后台�
 APK 包名通过 Android 官方 apksig 的解析器读取，签名仍用 apksigner 验证；发布包不依赖原生 aapt，也不要求 Apple Silicon 用户为该流程安装 Rosetta。
 
 应用生成验收使用已安装的 Chrome / Edge / Chromium 独立临时会话，不读取个人浏览器配置。CI 通过 `python scripts/ci-platform-smoke.py` 验证浏览器键入、点击、结果与隔离策略。
+
+### 应用商店联网验收
+
+默认回归使用内置目录与本机 HTTP 夹具，验证搜索一致性、去重、下载中断与续传。第三方商店目录、华为下载地址和真实 APK 下载属于显式联网验收，避免将外部服务的临时变化误判为本地构建失败。可在隔离的用户配置与缓存目录中运行 `cargo test --locked --manifest-path desktop/Cargo.toml --no-default-features --lib app_store::tests::test_live_ -- --ignored --test-threads=1`；其中 APK 验收会下载超过 100 MB 的数据并需要 Android 签名校验工具。联网失败应单独记录，不能据此宣称对应商店已验证可用。

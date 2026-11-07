@@ -153,6 +153,28 @@ class PublicationBoundaryTests(unittest.TestCase):
         self.assertEqual(before, after)
         self.assertFalse(inherited.exists())
 
+    def test_packaged_documents_keep_local_files_and_pin_omitted_resources(self):
+        source = ('[安装](GETTING_STARTED.md#usb)\n'
+                  '[视频](videos/产品介绍.mp4 "演示")\n'
+                  '![截图](images/home.png)\n'
+                  '[指南](<../desktop/neo-agent-adapter/README.md#使用>)\n'
+                  '[索引][guide]\n[guide]: STORAGE_EXPANSION.md#内容\n'
+                  '[远程](https://example.com/docs) [本页](#目的)\n'
+                  '```md\n[示例](examples/local.md)\n```\n')
+        result = package.package_document('docs/RELEASE_NOTES.md', source.encode(), '1.2.3',
+                                          {'docs/GETTING_STARTED.md'}).decode()
+        self.assertIn('[安装](GETTING_STARTED.md#usb)', result)
+        self.assertIn('releases/download/v1.2.3/%E4%BA%A7%E5%93%81%E4%BB%8B%E7%BB%8D.mp4 "演示"', result)
+        self.assertIn('![截图](https://raw.githubusercontent.com/xydzf520/stepx/v1.2.3/docs/images/home.png)', result)
+        self.assertIn('<https://github.com/xydzf520/stepx/blob/v1.2.3/desktop/neo-agent-adapter/README.md#使用>', result)
+        self.assertIn('[guide]: https://github.com/xydzf520/stepx/blob/v1.2.3/docs/STORAGE_EXPANSION.md#内容', result)
+        self.assertIn('[远程](https://example.com/docs) [本页](#目的)', result)
+        self.assertIn('```md\n[示例](examples/local.md)\n```', result)
+
+    def test_packaged_document_cannot_link_outside_repository(self):
+        with self.assertRaisesRegex(ValueError, 'leaves the source tree'):
+            package.package_document('README.md', b'[private](../private.txt)', '1.2.3', set())
+
 
 if __name__ == '__main__':
     unittest.main()

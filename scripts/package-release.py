@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Build a portable package from the native release binary and verified upstream tools."""
-import argparse, hashlib, os, platform, plistlib, shutil, subprocess, sys, tarfile, tempfile, urllib.request, zipfile
+import argparse, hashlib, os, platform, plistlib, posixpath, re, shutil, subprocess, sys, tarfile, tempfile, urllib.parse, urllib.request, zipfile
 from pathlib import Path
 sys.dont_write_bytecode = True
 from public_release_policy import audit_bundle, content_problems, manifest, runtime_plan, safe_read
@@ -27,6 +27,54 @@ def verify_runtime(python, resources):
                     str(ROOT/'scripts/verify-packaged-runtime.py'), str(resources)],
                    check=True, env=verification_environment(), timeout=180)
 
+def package_document(rel, data, version, packaged_paths):
+    """Keep bundled links local; pin omitted documentation/media to this release.
+
+    The repository README is also shipped offline. Its screenshots, longer
+    guides and separately downloadable videos must not become dead local links.
+    Source documentation stays unchanged; only the new package copy is rendered.
+    """
+    if not rel.lower().endswith('.md'):
+        return data
+    tag = urllib.parse.quote('v' + version, safe='')
+
+    def destination(value):
+        angled = value.startswith('<') and value.endswith('>')
+        raw = value[1:-1] if angled else value
+        parts = urllib.parse.urlsplit(raw)
+        if parts.scheme or parts.netloc or not parts.path or parts.path.startswith('/'):
+            return value
+        resolved = posixpath.normpath(posixpath.join(
+            posixpath.dirname(rel), urllib.parse.unquote(parts.path)))
+        if resolved in packaged_paths:
+            return value
+        if resolved == '..' or resolved.startswith('../'):
+            raise ValueError(f'{rel}: documentation link leaves the source tree')
+        encoded = urllib.parse.quote(resolved, safe='/')
+        if resolved.startswith('docs/videos/') and resolved.lower().endswith('.mp4'):
+            url = ('https://github.com/xydzf520/stepx/releases/download/' + tag +
+                   '/' + urllib.parse.quote(posixpath.basename(resolved), safe=''))
+        elif resolved.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg')):
+            url = 'https://raw.githubusercontent.com/xydzf520/stepx/' + tag + '/' + encoded
+        else:
+            url = 'https://github.com/xydzf520/stepx/blob/' + tag + '/' + encoded
+        if parts.query:
+            url += '?' + parts.query
+        if parts.fragment:
+            url += '#' + parts.fragment
+        return '<' + url + '>' if angled else url
+
+    # Preserve labels, optional titles and reference-link syntax. Do not rewrite
+    # examples inside fenced code blocks.
+    inline = re.compile(r'(!?\[[^\]\n]*\]\()(<[^>\n]+>|[^\s)]+)')
+    reference = re.compile(r'^(\[[^\]\n]+\]:[ \t]*)(<[^>\n]+>|[^\s]+)', re.MULTILINE)
+    chunks = re.split(r'(^[ \t]*```[^\n]*\n.*?^[ \t]*```[^\n]*$|^[ \t]*~~~[^\n]*\n.*?^[ \t]*~~~[^\n]*$)',
+                      data.decode('utf-8'), flags=re.MULTILINE | re.DOTALL)
+    for index in range(0, len(chunks), 2):
+        for pattern in (inline, reference):
+            chunks[index] = pattern.sub(lambda m: m[1] + destination(m[2]), chunks[index])
+    return ''.join(chunks).encode('utf-8')
+
 def main():
     p=argparse.ArgumentParser();p.add_argument('--platform',choices=TOOLS,required=True);p.add_argument('--version',required=True);a=p.parse_args()
     if not all(c.isalnum() or c in '.-_' for c in a.version):p.error('Invalid version')
@@ -37,10 +85,13 @@ def main():
     host_arch={'AMD64':'x86_64','aarch64':'arm64'}.get(platform.machine(),platform.machine())
     if a.platform != f'{host_os}-{host_arch}': p.error('Use a native runner for the requested platform; cross-built packages cannot be runtime-verified here')
     policy=manifest(ROOT)
-    runtime_plan(ROOT)  # fail closed before staging any resource
+    resources = runtime_plan(ROOT)  # fail closed before staging any resource
     documents={rel:safe_read(ROOT,rel) for rel in policy['package_documents']}
     issues=[issue for rel,data in documents.items() for issue in content_problems(rel,data,policy)]
     if issues: raise RuntimeError('\n'.join(issues))
+    packaged_paths = set(resources) | set(documents)
+    documents = {rel: package_document(rel, data, a.version, packaged_paths)
+                 for rel, data in documents.items()}
     dist=ROOT/'dist';dist.mkdir(exist_ok=True)
     name=f'StepX-Companion-{a.version}-{a.platform}'
     with tempfile.TemporaryDirectory(prefix='stepx-package-') as td:
