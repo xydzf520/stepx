@@ -118,6 +118,10 @@ impl platform::WindowManager for WindowManager {
         // no-op for tests
     }
 
+    fn show_window_without_focus(&self, _window_id: WindowId) {
+        // no-op for tests
+    }
+
     fn hide_app(&self) {
         // no-op for tests
     }

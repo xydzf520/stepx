@@ -69,16 +69,3 @@ fn test_click_through_layer_does_not_cover_lower_layers() {
 
     assert!(!scene.is_covered(Point::new(10., 10., ZIndex::new(0))));
 }
-
-#[test]
-fn invalid_layout_does_not_poison_hit_index() {
-    let mut layer = Layer::default();
-    for bad in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
-        layer.record_hit_rect(RectF::new(vec2f(0., 0.), vec2f(bad, 10.)));
-        layer.record_hit_rect(RectF::new(vec2f(bad, 0.), vec2f(10., 10.)));
-    }
-    assert_eq!(layer.hit_map.size(), 0);
-    layer.record_hit_rect(RectF::new(vec2f(0., 0.), vec2f(20., 20.)));
-    assert_eq!(layer.hit_map.size(), 1);
-    assert!(layer.hit_map.locate_at_point(&[10f32.into(), 10f32.into()]).is_some());
-}

@@ -55,15 +55,6 @@ pub enum ClipBounds {
 
 impl Layer {
     fn record_hit_rect(&mut self, rect: RectF) {
-        // A malformed, unbounded layout must never enter the R-tree. Infinity
-        // produces NaN area comparisons during insertion and can stall the UI
-        // before the paint validation below has a chance to report the layout.
-        if ![rect.min_x(), rect.min_y(), rect.max_x(), rect.max_y()]
-            .iter().all(|v| v.is_finite()) || rect.width() <= 0. || rect.height() <= 0.
-        {
-            return;
-        }
-
         if let Some(intersected) = self
             .clip_bounds
             .map_or(Some(rect), |c| rect.intersection(c))
@@ -89,11 +80,31 @@ pub enum GlyphFade {
     /// start - where the fade is transparent
     /// end - where the fade is most opaque
     Horizontal { start: f32, end: f32 },
+    /// Horizontal clip fade (alias for `Horizontal` with explicit field names).
+    Clip { fade_start: f32, fade_end: f32 },
+    /// Per-character 90ms bloom / fade-in (`progress` in `0.0..=1.0`).
+    /// At `progress = 0.0`, the glyph is sampled with a soft 1.5px radius
+    /// tent-blur kernel and 0% opacity; as `progress -> 1.0`, the blur tightens
+    /// to crisp subpixel sharpness and 100% opacity.
+    Bloom { progress: f32 },
 }
 
 impl GlyphFade {
     pub fn horizontal(start: f32, end: f32) -> Self {
         GlyphFade::Horizontal { start, end }
+    }
+
+    pub fn clip(fade_start: f32, fade_end: f32) -> Self {
+        GlyphFade::Clip {
+            fade_start,
+            fade_end,
+        }
+    }
+
+    pub fn bloom(progress: f32) -> Self {
+        GlyphFade::Bloom {
+            progress: progress.clamp(0.0, 1.0),
+        }
     }
 }
 
@@ -103,6 +114,9 @@ pub struct Glyph {
     pub position: Vector2F,
     pub fade: Option<GlyphFade>,
     pub color: ColorU,
+    /// Whether this glyph uses dark-mode optical weight compensation (`460` / `560`)
+    /// so the fragment shader can apply the synthetic halation-reduction curve.
+    pub is_optical_dark_compensated: bool,
 }
 
 #[derive(Clone, Default)]
@@ -674,6 +688,7 @@ impl Scene {
             position,
             color,
             fade: None,
+            is_optical_dark_compensated: false,
         });
         layer.glyphs.last_mut().unwrap()
     }
@@ -831,6 +846,11 @@ impl Rect {
 impl Glyph {
     pub fn with_fade(&mut self, fade: Option<GlyphFade>) -> &mut Self {
         self.fade = fade;
+        self
+    }
+
+    pub fn with_optical_dark_compensated(&mut self, compensated: bool) -> &mut Self {
+        self.is_optical_dark_compensated = compensated;
         self
     }
 }

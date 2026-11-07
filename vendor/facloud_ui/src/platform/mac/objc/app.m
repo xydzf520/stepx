@@ -92,6 +92,8 @@ void *unregisterGlobalHotkey(NSUInteger key, NSUInteger modifiers) {
 
 NSRect screenFrame() { return [[NSScreen mainScreen] frame]; }
 
+NSRect screenVisibleFrame() { return [[NSScreen mainScreen] visibleFrame]; }
+
 NSUInteger activeScreenId() {
     return [[[[NSScreen mainScreen] deviceDescription] objectForKey:@"NSScreenNumber"]
         unsignedIntegerValue];

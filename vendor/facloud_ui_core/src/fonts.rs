@@ -3,6 +3,7 @@ mod external_fallback;
 mod metrics;
 mod text_layout_system;
 
+pub use crate::text_layout::GlyphBloomSchedule;
 pub use text_layout_system::TextLayoutSystem;
 
 use std::hash::Hash;
@@ -40,7 +41,12 @@ pub enum Weight {
     Light,
     #[default]
     Normal,
+    /// Dark-mode retinal-irradiation-compensated Medium (`460` vs standard `500`).
+    /// Prevents light-on-dark strokes from blooming and appearing overly bold.
+    MediumOpticalDark,
     Medium,
+    /// Dark-mode retinal-irradiation-compensated Semibold (`560` vs standard `600`).
+    SemiboldOpticalDark,
     Semibold,
     Bold,
     ExtraBold,
@@ -48,8 +54,46 @@ pub enum Weight {
 }
 
 impl Weight {
+    #[allow(non_upper_case_globals)]
+    pub const Regular: Self = Self::Normal;
+
     pub fn is_normal(&self) -> bool {
         matches!(self, Self::Normal)
+    }
+
+    pub const fn to_css_weight(self) -> u16 {
+        match self {
+            Weight::Thin => 100,
+            Weight::ExtraLight => 200,
+            Weight::Light => 300,
+            Weight::Normal => 400,
+            Weight::MediumOpticalDark => 460,
+            Weight::Medium => 500,
+            Weight::SemiboldOpticalDark => 560,
+            Weight::Semibold => 600,
+            Weight::Bold => 700,
+            Weight::ExtraBold => 800,
+            Weight::Black => 900,
+        }
+    }
+
+    /// Returns the dark-mode optical-irradiation-compensated weight equivalent:
+    /// `Medium (500) -> MediumOpticalDark (460)`, `Semibold (600) -> SemiboldOpticalDark (560)`.
+    pub const fn optical_dark(self) -> Self {
+        match self {
+            Weight::Medium => Weight::MediumOpticalDark,
+            Weight::Semibold => Weight::SemiboldOpticalDark,
+            other => other,
+        }
+    }
+
+    /// Returns `true` if this weight is an optical dark-mode compensated weight
+    /// (`MediumOpticalDark` or `SemiboldOpticalDark`).
+    pub const fn is_optical_dark_compensated(self) -> bool {
+        matches!(
+            self,
+            Weight::MediumOpticalDark | Weight::SemiboldOpticalDark
+        )
     }
 
     pub fn from_custom_weight(custom_weight: Option<CustomWeight>) -> Weight {
@@ -75,8 +119,8 @@ impl Weight {
             Weight::ExtraLight => Some(CustomWeight::ExtraLight),
             Weight::Light => Some(CustomWeight::Light),
             Weight::Normal => None,
-            Weight::Medium => Some(CustomWeight::Medium),
-            Weight::Semibold => Some(CustomWeight::Semibold),
+            Weight::MediumOpticalDark | Weight::Medium => Some(CustomWeight::Medium),
+            Weight::SemiboldOpticalDark | Weight::Semibold => Some(CustomWeight::Semibold),
             Weight::Bold => Some(CustomWeight::Bold),
             Weight::ExtraBold => Some(CustomWeight::ExtraBold),
             Weight::Black => Some(CustomWeight::Black),
@@ -98,7 +142,9 @@ impl std::fmt::Display for Weight {
             Weight::ExtraLight => write!(f, "ExtraLight"),
             Weight::Light => write!(f, "Light"),
             Weight::Normal => write!(f, "Normal"),
+            Weight::MediumOpticalDark => write!(f, "MediumOpticalDark"),
             Weight::Medium => write!(f, "Medium"),
+            Weight::SemiboldOpticalDark => write!(f, "SemiboldOpticalDark"),
             Weight::Semibold => write!(f, "Semibold"),
             Weight::Bold => write!(f, "Bold"),
             Weight::ExtraBold => write!(f, "ExtraBold"),
@@ -118,8 +164,14 @@ impl CustomWeightConversion for CustomWeight {
             (CustomWeight::Thin, Weight::Thin)
                 | (CustomWeight::ExtraLight, Weight::ExtraLight)
                 | (CustomWeight::Light, Weight::Light)
-                | (CustomWeight::Medium, Weight::Medium)
-                | (CustomWeight::Semibold, Weight::Semibold)
+                | (
+                    CustomWeight::Medium,
+                    Weight::Medium | Weight::MediumOpticalDark
+                )
+                | (
+                    CustomWeight::Semibold,
+                    Weight::Semibold | Weight::SemiboldOpticalDark
+                )
                 | (CustomWeight::Bold, Weight::Bold)
                 | (CustomWeight::ExtraBold, Weight::ExtraBold)
                 | (CustomWeight::Black, Weight::Black)
@@ -243,6 +295,15 @@ impl Properties {
         self.weight = weight;
         self
     }
+
+    /// Compensates font weight for dark-mode retinal irradiation (`500 -> 460`, `600 -> 560`)
+    /// when `is_dark` is `true`.
+    pub fn with_optical_dark_weight(mut self, is_dark: bool) -> Self {
+        if is_dark {
+            self.weight = self.weight.optical_dark();
+        }
+        self
+    }
 }
 
 impl Cache {
@@ -347,6 +408,11 @@ impl Cache {
                 *entry.insert(font)
             }
         }
+    }
+
+    /// Returns the requested [`Properties`] (style and weight) associated with `font`, if known.
+    pub fn font_properties(&self, font: FontId) -> Option<Properties> {
+        self.font_properties.get(&font).map(|entry| *entry)
     }
 
     pub fn line_height(&self, font_size: f32, line_height_ratio: f32) -> f32 {

@@ -109,6 +109,10 @@ impl WindowManager {
             .show_window_and_focus_app(window_id, WindowFocusBehavior::default())
     }
 
+    pub fn show_window_without_focus(&self, window_id: WindowId) {
+        self.platform.show_window_without_focus(window_id)
+    }
+
     pub fn activate_app(&self) -> Option<WindowId> {
         self.platform.activate_app(self.frontmost_window_id())
     }
@@ -153,6 +157,10 @@ impl WindowManager {
     // all user's screens. So the active screen may not have a origin of (0, 0).
     pub fn active_display_bounds(&self) -> geometry::rect::RectF {
         self.platform.active_display_bounds()
+    }
+
+    pub fn active_display_workarea_bounds(&self) -> geometry::rect::RectF {
+        self.platform.active_display_workarea_bounds()
     }
 
     pub fn active_display_id(&self) -> DisplayId {

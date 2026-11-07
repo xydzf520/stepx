@@ -21,7 +21,7 @@ use anyhow::Error;
 use crate::rendering::OnGPUDeviceSelected;
 use derivative::Derivative;
 use futures_util::future::BoxFuture;
-use pathfinder_geometry::rect::RectF;
+use pathfinder_geometry::{rect::RectF, vector::Vector2F};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::rc::Rc;
@@ -159,7 +159,7 @@ struct GlobalShortcut {
     args: Box<dyn Any>,
 }
 
-#[derive(Default, Derivative)]
+#[derive(Derivative)]
 #[derivative(Debug)]
 pub struct AddWindowOptions {
     pub background_blur_radius_pixels: Option<u8>,
@@ -179,6 +179,29 @@ pub struct AddWindowOptions {
     /// platforms except X11 Linux. See docs on the "WM_CLASS" property:
     /// https://www.x.org/docs/ICCCM/icccm.pdf
     pub window_instance: Option<String>,
+    pub min_inner_size: Option<Vector2F>,
+    pub skip_taskbar: bool,
+    pub focus_on_show: bool,
+}
+
+impl Default for AddWindowOptions {
+    fn default() -> Self {
+        Self {
+            background_blur_radius_pixels: None,
+            background_blur_texture: false,
+            window_style: WindowStyle::default(),
+            window_bounds: WindowBounds::default(),
+            title: None,
+            fullscreen_state: FullscreenState::default(),
+            anchor_new_windows_from_closed_position:
+                NextNewWindowsHasThisWindowsBoundsUponClose::default(),
+            on_gpu_driver_selected: None,
+            window_instance: None,
+            min_inner_size: None,
+            skip_taskbar: false,
+            focus_on_show: true,
+        }
+    }
 }
 
 #[derive(Debug, Default)]

@@ -1,7 +1,7 @@
 use super::app::create_native_platform_modal;
 use super::keycode::{modifier_code, Keycode};
 use super::utils::nsstring_as_str;
-use super::{app, make_nsstring, clipboard::Clipboard, Window};
+use super::{app, make_nsstring, Clipboard, Window};
 use anyhow::Result;
 use cocoa::base::{BOOL, NO, YES};
 use cocoa::foundation::NSUInteger;

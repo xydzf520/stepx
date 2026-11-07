@@ -51,6 +51,8 @@ struct GlyphFragmentData
     float fade_alpha;
     float4 color;
     bool is_emoji;
+    float fade_start;
+    float fade_end;
 };
 
 
@@ -364,7 +366,11 @@ glyph_vertex_shader(
     float fade_dist = pixel_pos.x - fmin(glyph->fade_start, glyph->fade_end);
 
     float fade_alpha;
-    if (glyph->fade_end < glyph->fade_start) { // left-to-right case
+    if (glyph->fade_end <= -1.5) {
+      float p = clamp(glyph->fade_start, 0.0f, 1.0f);
+      float inv = 1.0f - p;
+      fade_alpha = 1.0f - inv * inv * inv;
+    } else if (glyph->fade_end < glyph->fade_start) { // left-to-right case
       fade_alpha = fade_dist / fade_width;
     } else { // right-to-left case
       fade_alpha = 1 - fade_dist / fade_width;
@@ -382,6 +388,8 @@ glyph_vertex_shader(
     out.fade_alpha = fade_alpha;
     out.color = glyph->color;
     out.is_emoji = glyph->is_emoji;
+    out.fade_start = glyph->fade_start;
+    out.fade_end = glyph->fade_end;
     return out;
 }
 
@@ -391,7 +399,26 @@ fragment float4 glyph_fragment_shader(
 ) {
     // Sample the texture to obtain a color.
     constexpr sampler texture_sampler (mag_filter::linear, min_filter::linear);
-    const float4 color_sample = float4(color_texture.sample(texture_sampler, in.texture_coordinate));
+    float4 color_sample;
+    if (in.fade_end <= -1.5) {
+        float p = clamp(in.fade_start, 0.0f, 1.0f);
+        float radius_px = (1.0f - p) * (1.0f - p) * 1.5f;
+        if (radius_px > 0.02f) {
+            float2 atlas_dims = float2(color_texture.get_width(), color_texture.get_height());
+            float2 texel = 1.0f / max(atlas_dims, float2(1.0f, 1.0f));
+            float2 d = texel * radius_px;
+            float4 c0 = float4(color_texture.sample(texture_sampler, in.texture_coordinate));
+            float4 c1 = float4(color_texture.sample(texture_sampler, in.texture_coordinate + float2( d.x,  0.0f)));
+            float4 c2 = float4(color_texture.sample(texture_sampler, in.texture_coordinate + float2(-d.x,  0.0f)));
+            float4 c3 = float4(color_texture.sample(texture_sampler, in.texture_coordinate + float2( 0.0f,  d.y)));
+            float4 c4 = float4(color_texture.sample(texture_sampler, in.texture_coordinate + float2( 0.0f, -d.y)));
+            color_sample = c0 * 0.40f + (c1 + c2 + c3 + c4) * 0.15f;
+        } else {
+            color_sample = float4(color_texture.sample(texture_sampler, in.texture_coordinate));
+        }
+    } else {
+        color_sample = float4(color_texture.sample(texture_sampler, in.texture_coordinate));
+    }
     // Use the input color for non-emoji, and the sampled color for emoji.
     float4 color = mix(in.color, color_sample, float(in.is_emoji));
     // Multiply alpha by the sampled color's red channel for non-emoji.

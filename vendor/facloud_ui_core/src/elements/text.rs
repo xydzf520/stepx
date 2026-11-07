@@ -9,9 +9,10 @@ use crate::event::ModifiersState;
 use crate::platform::{Cursor, LineStyle};
 use crate::text::word_boundaries::WordBoundariesPolicy;
 use crate::text::{IsRect, SelectionDirection, SelectionType, TextBuffer};
+pub use crate::text_layout::GlyphBloomSchedule;
 use crate::text_layout::{
-    ClipConfig, ComputeBaselinePositionFn, Line, StyleAndFont, TextFrame, TextStyle,
-    DEFAULT_TOP_BOTTOM_RATIO,
+    ClipConfig, ComputeBaselinePositionFn, Line, PaintStyleOverride, StyleAndFont, TextFrame,
+    TextStyle, DEFAULT_TOP_BOTTOM_RATIO,
 };
 use crate::text_selection_utils::{
     calculate_tick_width, create_newline_tick_rect, selection_crosses_newline_row_based,
@@ -74,6 +75,7 @@ impl LaidOutText {
     fn paint(
         &self,
         bounds: RectF,
+        style_overrides: &PaintStyleOverride,
         default_color: ColorU,
         scene: &mut Scene,
         font_cache: &FontCache,
@@ -84,40 +86,28 @@ impl LaidOutText {
                 if let Some(compute_baseline_position_fn) = compute_baseline_position_fn {
                     line.paint_with_baseline_position(
                         bounds,
-                        &Default::default(),
+                        style_overrides,
                         default_color,
                         font_cache,
                         scene,
                         compute_baseline_position_fn,
                     )
                 } else {
-                    line.paint(
-                        bounds,
-                        &Default::default(),
-                        default_color,
-                        font_cache,
-                        scene,
-                    )
+                    line.paint(bounds, style_overrides, default_color, font_cache, scene)
                 }
             }
             LaidOutText::Frame(frame) => {
                 if let Some(compute_baseline_position_fn) = compute_baseline_position_fn {
                     frame.paint_with_baseline_position(
                         bounds,
-                        &Default::default(),
+                        style_overrides,
                         default_color,
                         scene,
                         font_cache,
                         compute_baseline_position_fn,
                     )
                 } else {
-                    frame.paint(
-                        bounds,
-                        &Default::default(),
-                        default_color,
-                        scene,
-                        font_cache,
-                    )
+                    frame.paint(bounds, style_overrides, default_color, scene, font_cache)
                 }
             }
             LaidOutText::None => {}
@@ -151,6 +141,8 @@ pub struct Text {
     saved_char_positions: Vec<SavedCharPositionIds>,
     /// Optional override on the baseline position computation.
     compute_baseline_position_fn: Option<ComputeBaselinePositionFn>,
+    /// Optional per-character 90ms bloom / fade-in schedule for streaming text.
+    bloom_schedule: Option<GlyphBloomSchedule>,
     /// Whether the text is selectable when rendered as a descendant of a [`SelectableArea`].
     is_selectable: bool,
     #[cfg(debug_assertions)]
@@ -296,6 +288,7 @@ impl Text {
             hover_handlers: vec![],
             saved_char_positions: vec![],
             compute_baseline_position_fn: None,
+            bloom_schedule: None,
             is_selectable: true,
             #[cfg(debug_assertions)]
             constructor_location: Some(std::panic::Location::caller()),
@@ -568,6 +561,19 @@ impl Text {
 
     pub fn with_style(mut self, font_properties: Properties) -> Self {
         self.font_properties = font_properties;
+        self
+    }
+
+    /// Compensates font weight for dark-mode retinal irradiation (`500 -> 460`, `600 -> 560`)
+    /// when `is_dark` is `true`.
+    pub fn with_optical_dark_weight(mut self, is_dark: bool) -> Self {
+        self.font_properties = self.font_properties.with_optical_dark_weight(is_dark);
+        self
+    }
+
+    /// Configures per-character 90ms bloom / fade-in for streaming text output.
+    pub fn with_glyph_bloom(mut self, schedule: Option<GlyphBloomSchedule>) -> Self {
+        self.bloom_schedule = schedule;
         self
     }
 
@@ -1059,8 +1065,10 @@ impl Element for Text {
                 char_bounding_box,
             );
         }
+        let style_overrides = PaintStyleOverride::default().with_bloom_schedule(self.bloom_schedule);
         self.laid_out_text.paint(
             bounds,
+            &style_overrides,
             self.text_color,
             ctx.scene,
             app.font_cache(),

@@ -109,6 +109,9 @@ pub struct WindowOptions {
     /// See docs on the "WM_CLASS" property:
     /// https://www.x.org/docs/ICCCM/icccm.pdf
     pub window_instance: Option<String>,
+    pub min_inner_size: Option<Vector2F>,
+    pub skip_taskbar: bool,
+    pub focus_on_show: bool,
 }
 
 impl std::fmt::Debug for WindowOptions {
@@ -126,6 +129,9 @@ impl std::fmt::Debug for WindowOptions {
             .field("gpu_power_preference", &self.gpu_power_preference)
             .field("backend_preference", &self.backend_preference)
             .field("window_instance", &self.window_instance)
+            .field("min_inner_size", &self.min_inner_size)
+            .field("skip_taskbar", &self.skip_taskbar)
+            .field("focus_on_show", &self.focus_on_show)
             .finish()
     }
 }
@@ -149,6 +155,10 @@ pub enum WindowStyle {
     /// Position the window at exact bounds and show it, but don't make it key (no focus steal).
     /// Used for drag preview windows that should appear but not interrupt the drag.
     PositionedNoFocus,
+
+    /// A floating always-on-top notification toast window that does not steal OS focus,
+    /// skips the taskbar/dock, and is non-resizable.
+    PopupToast,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
@@ -590,6 +600,7 @@ pub trait WindowManager {
     /// a platform that allows the app to run without any open windows.
     fn activate_app(&self, last_active_window: Option<WindowId>) -> Option<WindowId>;
     fn show_window_and_focus_app(&self, window_id: WindowId, behavior: WindowFocusBehavior);
+    fn show_window_without_focus(&self, _window_id: WindowId) {}
     fn hide_app(&self);
     fn hide_window(&self, window_id: WindowId);
     fn set_window_bounds(&self, window_id: WindowId, bound: RectF);
@@ -611,6 +622,10 @@ pub trait WindowManager {
 
     /// Returns the display bound for the current active display.
     fn active_display_bounds(&self) -> geometry::rect::RectF;
+    /// Returns the workarea bound (excluding taskbar/dock/panel) for the current active display.
+    fn active_display_workarea_bounds(&self) -> geometry::rect::RectF {
+        self.active_display_bounds()
+    }
     /// Returns the unique identifier for the current active display.
     fn active_display_id(&self) -> DisplayId;
     fn display_count(&self) -> usize;

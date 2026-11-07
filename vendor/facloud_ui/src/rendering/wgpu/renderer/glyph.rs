@@ -177,8 +177,15 @@ impl Pipeline {
             ) {
                 Ok(Some(gto)) => {
                     let (fade_start, fade_end) = match &glyph.fade {
-                        None => (&0.0, &-1.0),
-                        Some(GlyphFade::Horizontal { start, end }) => (start, end),
+                        None => (0.0, -1.0),
+                        Some(GlyphFade::Horizontal { start, end }) => {
+                            (start * scale_factor, end * scale_factor)
+                        }
+                        Some(GlyphFade::Clip {
+                            fade_start,
+                            fade_end,
+                        }) => (fade_start * scale_factor, fade_end * scale_factor),
+                        Some(GlyphFade::Bloom { progress }) => (progress.clamp(0.0, 1.0), -2.0),
                     };
 
                     // Adjust the horizontal position by the subpixel alignment
@@ -197,11 +204,12 @@ impl Pipeline {
                             gto.allocated_region.pixel_region.size().to_f32(),
                         ),
                         gto.allocated_region.uv_region,
-                        fade_start * scale_factor,
-                        fade_end * scale_factor,
+                        fade_start,
+                        fade_end,
                         glyph.color,
                         gto.is_emoji,
-                    );
+                    )
+                    .with_optical_dark_compensated(glyph.is_optical_dark_compensated);
 
                     texture_to_glyph
                         .entry(gto.texture_id)
@@ -335,6 +343,15 @@ mod shaders {
             }
         }
 
+        pub(super) fn with_optical_dark_compensated(mut self, compensated: bool) -> Self {
+            if compensated {
+                self.is_emoji |= 2;
+            } else {
+                self.is_emoji &= !2;
+            }
+            self
+        }
+
         pub(super) fn desc() -> wgpu::VertexBufferLayout<'static> {
             use std::mem;
 
@@ -444,8 +461,22 @@ mod shaders {
         fn glyph_shader_keeps_color_glyph_atlas_samples_untinted() {
             let shader = include_str!("../shaders/glyph_shader.wgsl");
 
-            assert!(shader.contains("mix(in.color, tex_color, f32(in.is_emoji))"));
-            assert!(shader.contains("color.a *= max(contrasted, f32(in.is_emoji))"));
+            assert!(shader.contains("mix(in.color, tex_color, f32(is_emoji_flag))"));
+            assert!(shader.contains("color.a *= max(contrasted, f32(is_emoji_flag))"));
+        }
+
+        #[test]
+        fn glyph_instance_data_packs_optical_dark_compensation_bit() {
+            let bounds = RectF::new(Vector2F::new(1.0, 2.0), Vector2F::new(3.0, 4.0));
+            let uv_bounds = RectF::new(Vector2F::new(0.1, 0.2), Vector2F::new(0.3, 0.4));
+            let foreground_color = ColorU::new(240, 240, 240, 255);
+
+            let comp = GlyphInstanceData::new(bounds, uv_bounds, 0.5, -2.0, foreground_color, false)
+                .with_optical_dark_compensated(true);
+            assert_eq!(comp.is_emoji & 1, 0);
+            assert_ne!(comp.is_emoji & 2, 0);
+            assert_eq!(comp.fade_start, 0.5);
+            assert_eq!(comp.fade_end, -2.0);
         }
     }
 }

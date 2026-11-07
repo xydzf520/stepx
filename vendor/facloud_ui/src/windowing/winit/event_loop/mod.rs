@@ -37,7 +37,6 @@ use crate::platform::{
 use crate::r#async::Timer;
 use crate::rendering::wgpu::renderer;
 use crate::windowing::winit::app::RequestPermissionsCallback;
-use crate::windowing::winit::window::MIN_WINDOW_SIZE;
 use crate::Event::{ClearMarkedText, SetMarkedText, TypedCharacters};
 use crate::{AppContext, WindowId};
 
@@ -931,15 +930,17 @@ impl EventLoop {
                 // display, changing a display from extended to mirrored, and the like. We work
                 // around that by listening for [`WindowEvent::ScaleFactorChanged`] and changing
                 // the size back up to the minimum dimensions.
+                let winit_window = downcast_window(window.as_ref());
+                let min_window_size = winit_window.min_window_size();
                 let size = window.as_ctx().size();
                 let mut size = LogicalSize::new(size.x() as f64, size.y() as f64);
                 let mut request_new_size = false;
-                if size.width < MIN_WINDOW_SIZE.width {
-                    size.width = MIN_WINDOW_SIZE.width;
+                if size.width < min_window_size.width {
+                    size.width = min_window_size.width;
                     request_new_size = true;
                 }
-                if size.height < MIN_WINDOW_SIZE.height {
-                    size.height = MIN_WINDOW_SIZE.height;
+                if size.height < min_window_size.height {
+                    size.height = min_window_size.height;
                     request_new_size = true;
                 }
                 if request_new_size {
@@ -1527,7 +1528,7 @@ impl EventLoop {
                 .read(|ctx| ctx.windows().platform_window(window_id))
             {
                 downcast_window(window.as_ref())
-                    .release_renderer();
+                    .drop_renderer(Box::new(window_target.owned_display_handle()));
             }
         }
 
@@ -1732,10 +1733,14 @@ impl EventLoop {
             } = event
             {
                 // The WASM "window" does not support dragging or maximization.
+                let is_popup_toast =
+                    winit_window.style() == crate::platform::WindowStyle::PopupToast;
                 let titlebar_height = winit_window.titlebar_height();
-                if position.y() < titlebar_height && !cfg!(target_family = "wasm") {
-                    // Double-clicking the titlebar does maximize/restore.
-                    if click_count >= 2 {
+                if (is_popup_toast || position.y() < titlebar_height)
+                    && !cfg!(target_family = "wasm")
+                {
+                    // Double-clicking the titlebar does maximize/restore (except for PopupToast).
+                    if click_count >= 2 && !is_popup_toast {
                         window.toggle_maximized();
                     } else if window_state.last_touch_purpose.is_none() {
                         // Single-click drag moves the window. Skip for touch events as

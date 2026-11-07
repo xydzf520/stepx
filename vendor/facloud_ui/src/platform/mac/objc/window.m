@@ -652,6 +652,17 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
     [self makeKeyAndOrderFront:nil];
 }
 
+- (void)configurePopupToastPanel {
+    self.level = NSFloatingWindowLevel;
+    self.collectionBehavior =
+        (self.collectionBehavior | NSWindowCollectionBehaviorCanJoinAllSpaces |
+         NSWindowCollectionBehaviorFullScreenAuxiliary);
+    [self setFloatingPanel:YES];
+    [self setHidesOnDeactivate:NO];
+    [self setBecomesKeyOnlyIfNeeded:YES];
+    [self setMovable:NO];
+}
+
 // Note this returns a retained object ("create" rule).
 + (WarpPanel *)createWithContentRect:(NSRect)contentRect
                          metalDevice:(id)metalDevice
@@ -1008,6 +1019,13 @@ void hide_window(WarpWindow<WarpWindowProtocol> *window) {
 
     // Order out removes window from the screen but still maintains the NSWindow object.
     [window orderOut:nil];
+}
+
+void show_window_without_focus(WarpWindow<WarpWindowProtocol> *window) {
+    if ([window isMiniaturized]) {
+        [window deminiaturize:nil];
+    }
+    [window orderFrontRegardless];
 }
 
 void set_window_title(id window, NSString *title) {

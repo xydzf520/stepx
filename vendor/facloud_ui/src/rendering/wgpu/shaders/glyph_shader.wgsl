@@ -52,6 +52,8 @@ struct GlyphVertexShaderOutput {
     @location(3) fade_alpha: f32,
     @location(4) color: vec4<f32>,
     @location(5) is_emoji: i32,
+    @location(6) fade_start: f32,
+    @location(7) fade_end: f32,
 }
 
 @vertex
@@ -83,7 +85,13 @@ fn vs_main(
     var fade_dist: f32 = pixel_pos.x - min(glyph.fade_start, glyph.fade_end);
 
     var fade_alpha: f32;
-    if glyph.fade_end < glyph.fade_start { // left-to-right case
+    if glyph.fade_end <= -1.5 {
+        // Bloom mode: fade_start encodes bloom progress in [0.0, 1.0].
+        let p = clamp(glyph.fade_start, 0.0, 1.0);
+        // Smooth cubic ease-out for opacity: 1 - (1 - p)^3
+        let inv = 1.0 - p;
+        fade_alpha = 1.0 - inv * inv * inv;
+    } else if glyph.fade_end < glyph.fade_start { // left-to-right case
         fade_alpha = fade_dist / fade_width;
     } else { // right-to-left case
         fade_alpha = 1. - fade_dist / fade_width;
@@ -101,22 +109,47 @@ fn vs_main(
     out.fade_alpha = fade_alpha;
     out.color = glyph.color;
     out.is_emoji = glyph.is_emoji;
+    out.fade_start = glyph.fade_start;
+    out.fade_end = glyph.fade_end;
     return out;
 }
 
 @fragment
 fn fs_main(in: GlyphVertexShaderOutput) -> @location(0) vec4<f32> {
-    // Sample the texture to obtain a color.
-    var tex_color: vec4<f32> = textureSample(glyphAtlasTexture, glyphAtlasSampler, in.texture_coordinate);
-    // is_emoji is the atlas color-glyph switch. Use the input color for
+    let is_emoji_flag = in.is_emoji & 1;
+    let is_optical_dark_comp = (in.is_emoji & 2) != 0;
+
+    let atlas_dims = vec2<f32>(textureDimensions(glyphAtlasTexture));
+    let texel = 1.0 / max(atlas_dims, vec2<f32>(1.0, 1.0));
+    let is_bloom = in.fade_end <= -1.5;
+    let bloom_p = select(1.0, clamp(in.fade_start, 0.0, 1.0), is_bloom);
+    let radius_px = (1.0 - bloom_p) * (1.0 - bloom_p) * 1.5;
+    let d = texel * radius_px;
+
+    // Sample the 5-tap tent kernel in uniform control flow for WGSL derivative uniformity.
+    let c0 = textureSample(glyphAtlasTexture, glyphAtlasSampler, in.texture_coordinate);
+    let c1 = textureSample(glyphAtlasTexture, glyphAtlasSampler, in.texture_coordinate + vec2<f32>( d.x,  0.0));
+    let c2 = textureSample(glyphAtlasTexture, glyphAtlasSampler, in.texture_coordinate + vec2<f32>(-d.x,  0.0));
+    let c3 = textureSample(glyphAtlasTexture, glyphAtlasSampler, in.texture_coordinate + vec2<f32>( 0.0,  d.y));
+    let c4 = textureSample(glyphAtlasTexture, glyphAtlasSampler, in.texture_coordinate + vec2<f32>( 0.0, -d.y));
+    let blurred = c0 * 0.40 + (c1 + c2 + c3 + c4) * 0.15;
+    var tex_color: vec4<f32> = select(c0, blurred, is_bloom && radius_px > 0.02);
+
+    // is_emoji_flag is the atlas color-glyph switch. Use the input color for
     // monochrome glyph masks, and preserve sampled RGBA for emoji/color glyphs.
-    var color: vec4<f32> = mix(in.color, tex_color, f32(in.is_emoji));
+    var color: vec4<f32> = mix(in.color, tex_color, f32(is_emoji_flag));
 
     // Scale contrast boost by text brightness:
-    // light text (white=1) gets full boost; dark text (black=0) gets none.
-    let k = glyph_color_brightness(color.rgb);
-    let contrasted = enhance_contrast(tex_color.r, k);
-    color.a *= max(contrasted, f32(in.is_emoji));
+    // light text (white=1) gets boost; dark text (black=0) gets none.
+    // For dark-mode optical weight compensation (460 / 560) and high-luminance
+    // light-on-dark glyphs, apply halation reduction so strokes stay crisp.
+    let luma = glyph_color_brightness(color.rgb);
+    let halation_comp = smoothstep(0.55, 0.95, luma) * 0.22;
+    let base_k = max(luma - halation_comp, 0.0);
+    let weight_comp_k = select(base_k, base_k * 0.76, is_optical_dark_comp);
+    let k_crisp = mix(weight_comp_k * 0.35, weight_comp_k, bloom_p);
+    let contrasted = enhance_contrast(tex_color.r, k_crisp);
+    color.a *= max(contrasted, f32(is_emoji_flag));
 
     // Apply the fade.
     color.a *= saturate(in.fade_alpha);

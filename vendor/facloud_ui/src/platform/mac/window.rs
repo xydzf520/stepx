@@ -52,6 +52,7 @@ use std::{slice, str};
 
 extern "C" {
     fn screenFrame() -> NSRect;
+    fn screenVisibleFrame() -> NSRect;
     fn activeScreenId() -> NSUInteger;
 }
 
@@ -142,6 +143,10 @@ impl platform::WindowManager for WindowManager {
         }
     }
 
+    fn show_window_without_focus(&self, window_id: WindowId) {
+        Window::show_window_without_focus(window_id)
+    }
+
     fn hide_window(&self, window_id: WindowId) {
         Window::hide_window(window_id)
     }
@@ -181,6 +186,27 @@ impl platform::WindowManager for WindowManager {
             transform_origin_from_frame_coord_to_rect_coord(point, size),
             size,
         )
+    }
+
+    fn active_display_workarea_bounds(&self) -> RectF {
+        let rect = unsafe { screenVisibleFrame() };
+        if rect.size.width > 0.0 && rect.size.height > 0.0 {
+            let point = Vector2F::new(rect.origin.x as f32, rect.origin.y as f32);
+            let size = Vector2F::new(rect.size.width as f32, rect.size.height as f32);
+            RectF::new(
+                transform_origin_from_frame_coord_to_rect_coord(point, size),
+                size,
+            )
+        } else {
+            let full = self.active_display_bounds();
+            let top_inset = 28.0;
+            let bottom_inset = 64.0;
+            let height = (full.height() - top_inset - bottom_inset).max(200.0);
+            RectF::new(
+                Vector2F::new(full.origin_x(), full.origin_y() + top_inset),
+                Vector2F::new(full.width(), height),
+            )
+        }
     }
 
     fn active_display_id(&self) -> DisplayId {
@@ -315,6 +341,10 @@ impl platform::WindowManager for IntegrationTestWindowManager {
             .show_window_and_focus_app(window_id, behavior)
     }
 
+    fn show_window_without_focus(&self, window_id: WindowId) {
+        self.window_manager.show_window_without_focus(window_id)
+    }
+
     fn hide_app(&self) {
         self.window_manager.hide_app()
     }
@@ -346,6 +376,10 @@ impl platform::WindowManager for IntegrationTestWindowManager {
 
     fn active_display_bounds(&self) -> RectF {
         self.window_manager.active_display_bounds()
+    }
+
+    fn active_display_workarea_bounds(&self) -> RectF {
+        self.window_manager.active_display_workarea_bounds()
     }
 
     fn active_display_id(&self) -> DisplayId {
@@ -447,6 +481,7 @@ extern "C" {
     fn hide_app();
     fn activate_app();
     fn show_window_and_focus_app(window: id, bringToFront: BOOL);
+    fn show_window_without_focus(window: id);
     fn hide_window(window: id);
     fn position_and_order_front(window: id);
     fn position_at_given_location(window: id, origin: NSPoint);
@@ -556,6 +591,20 @@ impl Window {
                     let _: () = msg_send![panel, positionPinnedPanel];
                     panel
                 }
+                WindowStyle::PopupToast => {
+                    let panel: id = create_warp_nspanel(
+                        frame,
+                        metal_device_ptr,
+                        options.hide_title_bar as BOOL,
+                        options
+                            .background_blur_radius_pixels
+                            .unwrap_or(DEFAULT_WINDOW_BACKGROUND_BLUR_RADIUS),
+                        test_mode as BOOL,
+                    );
+
+                    let _: () = msg_send![panel, configurePopupToastPanel];
+                    panel
+                }
                 _ => create_warp_nswindow(
                     frame,
                     metal_device_ptr,
@@ -610,25 +659,33 @@ impl Window {
             // Set the initial scale properly.
             warp_view_did_change_backing_properties(&*native_view, true);
 
-            match options.style {
-                WindowStyle::Normal | WindowStyle::Pin => {
-                    match options.bounds {
-                        WindowBounds::ExactPosition(_) => {
-                            // If specfied, we should set the window to the exact position.
-                            // Note that the final position could be different from the set one as the original
-                            // frame may no longer exist (e.g. user unplugs the monitor).
-                            position_at_given_location(native_window, frame.origin)
-                        }
-                        WindowBounds::ExactSize(_) | WindowBounds::Default => {
-                            // Otherwise we put it in the center of the window or cascade from the previous window.
-                            position_and_order_front(native_window)
+            if options.style == WindowStyle::PopupToast {
+                window_state.set_window_buttons(false);
+            }
+
+            if options.style == WindowStyle::PopupToast || !options.focus_on_show {
+                order_front_without_focus(native_window, frame.origin);
+            } else {
+                match options.style {
+                    WindowStyle::Normal | WindowStyle::Pin => {
+                        match options.bounds {
+                            WindowBounds::ExactPosition(_) => {
+                                // If specfied, we should set the window to the exact position.
+                                // Note that the final position could be different from the set one as the original
+                                // frame may no longer exist (e.g. user unplugs the monitor).
+                                position_at_given_location(native_window, frame.origin)
+                            }
+                            WindowBounds::ExactSize(_) | WindowBounds::Default => {
+                                // Otherwise we put it in the center of the window or cascade from the previous window.
+                                position_and_order_front(native_window)
+                            }
                         }
                     }
-                }
-                WindowStyle::Cascade => position_and_order_front(native_window),
-                WindowStyle::NotStealFocus => (),
-                WindowStyle::PositionedNoFocus => {
-                    order_front_without_focus(native_window, frame.origin)
+                    WindowStyle::Cascade => position_and_order_front(native_window),
+                    WindowStyle::NotStealFocus => (),
+                    WindowStyle::PositionedNoFocus | WindowStyle::PopupToast => {
+                        order_front_without_focus(native_window, frame.origin)
+                    }
                 }
             }
 
@@ -838,6 +895,14 @@ impl Window {
         unsafe {
             if let Some(window) = Self::find_window_with_id(window_id) {
                 show_window_and_focus_app(window, bring_to_front as BOOL);
+            }
+        }
+    }
+
+    pub fn show_window_without_focus(window_id: WindowId) {
+        unsafe {
+            if let Some(window) = Self::find_window_with_id(window_id) {
+                show_window_without_focus(window);
             }
         }
     }

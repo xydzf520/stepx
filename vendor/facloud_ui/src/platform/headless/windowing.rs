@@ -49,9 +49,18 @@ impl facloud_ui_core::platform::WindowManager for WindowManager {
         window_options: WindowOptions,
         callbacks: WindowCallbacks,
     ) -> Result<()> {
+        let should_focus = window_options.focus_on_show
+            && !matches!(
+                window_options.style,
+                platform::WindowStyle::NotStealFocus
+                    | platform::WindowStyle::PositionedNoFocus
+                    | platform::WindowStyle::PopupToast
+            );
         let window = Rc::new(Window::new(window_options, callbacks));
         self.windows.insert(window_id, window);
-        self.set_active_window(Some(window_id));
+        if should_focus || self.active_window.borrow().is_none() {
+            self.set_active_window(Some(window_id));
+        }
         Ok(())
     }
 

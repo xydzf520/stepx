@@ -13,7 +13,10 @@ use crate::text::{
     char_slice, count_chars_up_to_byte, BlockHeaderSize, IsRect, SelectionDirection, SelectionType,
     TextBuffer,
 };
-use crate::text_layout::{ClipConfig, TextAlignment, DEFAULT_TOP_BOTTOM_RATIO};
+pub use crate::text_layout::GlyphBloomSchedule;
+use crate::text_layout::{
+    ClipConfig, PaintStyleOverride, TextAlignment, DEFAULT_TOP_BOTTOM_RATIO,
+};
 use crate::Event;
 use crate::{
     elements::{Axis, Point},
@@ -167,6 +170,8 @@ pub struct FormattedTextElement {
     is_mouse_interaction_disabled: bool,
     disable_text_wrapping: bool,
     clip_config: Option<ClipConfig>,
+    bloom_schedule: Option<GlyphBloomSchedule>,
+    optical_dark_compensated: bool,
     #[cfg(debug_assertions)]
     /// Captures the location of the constructor call site. This is used for debugging purposes.
     constructor_location: Option<&'static std::panic::Location<'static>>,
@@ -205,6 +210,8 @@ impl FormattedTextElement {
             is_mouse_interaction_disabled: false,
             disable_text_wrapping: false,
             clip_config: None,
+            bloom_schedule: None,
+            optical_dark_compensated: false,
             #[cfg(debug_assertions)]
             constructor_location: Some(std::panic::Location::caller()),
         }
@@ -315,6 +322,9 @@ impl FormattedTextElement {
     }
 
     pub fn with_weight(mut self, weight: Weight) -> Self {
+        if weight.is_optical_dark_compensated() {
+            self.optical_dark_compensated = true;
+        }
         let ft = Arc::make_mut(&mut self.formatted_text);
         let lines = std::mem::take(&mut ft.lines);
         ft.lines = lines
@@ -324,6 +334,19 @@ impl FormattedTextElement {
                 line
             })
             .collect();
+        self
+    }
+
+    /// Compensates font weights (`Medium` / `Semibold`) for dark-mode retinal irradiation
+    /// (`500 -> 460`, `600 -> 560`) when `is_dark` is `true`.
+    pub fn with_optical_dark_weight(mut self, is_dark: bool) -> Self {
+        self.optical_dark_compensated = is_dark;
+        self
+    }
+
+    /// Configures per-character 90ms bloom / fade-in for streaming text output.
+    pub fn with_glyph_bloom(mut self, schedule: Option<GlyphBloomSchedule>) -> Self {
+        self.bloom_schedule = schedule;
         self
     }
 
@@ -1792,6 +1815,12 @@ impl Element for FormattedTextElement {
 
                         if inline.styles.weight.is_some() {
                             style.weight = Weight::from_custom_weight(inline.styles.weight);
+                            if self.optical_dark_compensated {
+                                style.weight = style.weight.optical_dark();
+                            }
+                        }
+                        if style.weight.is_optical_dark_compensated() {
+                            text_style = text_style.with_optical_dark_compensated(true);
                         }
                         if inline.styles.italic {
                             style.style = Style::Italic;
@@ -2097,6 +2126,7 @@ impl Element for FormattedTextElement {
         }
 
         // Add indent by moving origin point of the frame.
+        let mut bloom_char_offset = 0usize;
         for laid_out_frame in &mut self.laid_out_text {
             // Get the x-offset for this laid out frame.
             let x_offset = laid_out_frame.calculate_x_offset(
@@ -2170,13 +2200,23 @@ impl Element for FormattedTextElement {
             };
 
             if let Some(frame) = frame {
+                let style_overrides = PaintStyleOverride::default()
+                    .with_bloom_schedule(self.bloom_schedule)
+                    .with_bloom_char_offset(bloom_char_offset);
                 frame.paint(
                     bounds,
-                    &Default::default(),
+                    &style_overrides,
                     self.text_color,
                     ctx.scene,
                     ctx.font_cache,
                 );
+                let frame_glyph_count: usize = frame
+                    .lines()
+                    .iter()
+                    .flat_map(|line| line.runs.iter())
+                    .map(|run| run.glyphs.len())
+                    .sum();
+                bloom_char_offset += frame_glyph_count;
             }
             mut_origin += vec2f(0., frame_height);
         }

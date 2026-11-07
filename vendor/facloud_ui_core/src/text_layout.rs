@@ -365,16 +365,62 @@ impl<'a> Borrow<dyn CacheKey + 'a> for CacheKeyValue {
     }
 }
 
+/// Schedule for per-character 90ms "bloom / fade-in" during streaming text output.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GlyphBloomSchedule {
+    /// Character index where the latest streaming chunk begins.
+    /// All characters before `reveal_start_char` are fully settled (`progress = 1.0`).
+    pub reveal_start_char: usize,
+    /// Elapsed milliseconds since this chunk began streaming.
+    pub elapsed_ms: f32,
+    /// Per-character stagger in milliseconds (default `6.0` ms/char).
+    pub stagger_ms: f32,
+    /// Bloom duration per character in milliseconds (default `90.0` ms).
+    pub duration_ms: f32,
+}
+
+impl Default for GlyphBloomSchedule {
+    fn default() -> Self {
+        Self {
+            reveal_start_char: 0,
+            elapsed_ms: 0.0,
+            stagger_ms: 6.0,
+            duration_ms: 90.0,
+        }
+    }
+}
+
+impl GlyphBloomSchedule {
+    pub fn new(reveal_start_char: usize, elapsed_ms: f32) -> Self {
+        Self {
+            reveal_start_char,
+            elapsed_ms,
+            ..Self::default()
+        }
+    }
+
+    pub fn progress_for_char(&self, char_idx: usize) -> f32 {
+        if char_idx < self.reveal_start_char {
+            return 1.0;
+        }
+        let local_idx = (char_idx - self.reveal_start_char) as f32;
+        let char_elapsed = self.elapsed_ms - local_idx * self.stagger_ms;
+        (char_elapsed / self.duration_ms.max(1.0)).clamp(0.0, 1.0)
+    }
+}
+
 /// A style override that is applied on paint time without relaying out the text line/frame.
 ///
 /// This should be used with caution since the overrides is applied on the character-level
 /// but the character indices might not map to the laid out glyphs 1-1 when there is presence of
 /// ligatures. To give an example, if a text frame has the content "[fi]nal" with fi laid out one
 /// ligature, trying to apply color on only the first character "f" will cause "fi" to be colored.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct PaintStyleOverride {
     color: RangeMap<usize, ColorU>,
     underline: RangeMap<usize, ColorU>,
+    pub bloom_schedule: Option<GlyphBloomSchedule>,
+    pub bloom_char_offset: usize,
 }
 
 impl PaintStyleOverride {
@@ -385,6 +431,16 @@ impl PaintStyleOverride {
 
     pub fn with_underline(mut self, underline_override: RangeMap<usize, ColorU>) -> Self {
         self.underline = underline_override;
+        self
+    }
+
+    pub fn with_bloom_schedule(mut self, bloom_schedule: Option<GlyphBloomSchedule>) -> Self {
+        self.bloom_schedule = bloom_schedule;
+        self
+    }
+
+    pub fn with_bloom_char_offset(mut self, bloom_char_offset: usize) -> Self {
+        self.bloom_char_offset = bloom_char_offset;
         self
     }
 }
@@ -574,6 +630,8 @@ pub struct TextStyle {
     pub underline_color: Option<ColorU>,
     // Unique id for each hyperlink in a frame, used to group parts of a hyperlink together if a hyperlink is soft-wrapped.
     pub hyperlink_id: Option<i32>,
+    /// Whether this span uses dark-mode optical weight compensation (`460` / `560`).
+    pub optical_dark_compensated: bool,
 }
 
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
@@ -621,7 +679,13 @@ impl TextStyle {
             show_strikethrough: false,
             underline_color: None,
             hyperlink_id: None,
+            optical_dark_compensated: self.optical_dark_compensated,
         }
+    }
+
+    pub fn with_optical_dark_compensated(mut self, optical_dark_compensated: bool) -> Self {
+        self.optical_dark_compensated = optical_dark_compensated;
+        self
     }
 
     pub fn with_foreground_color(mut self, foreground_color: ColorU) -> Self {
@@ -849,11 +913,20 @@ impl TextFrame {
         scene: &mut Scene,
         font_cache: &FontCache,
     ) {
+        let mut char_cursor = style_overrides.bloom_char_offset;
         for (index, line) in self.lines.iter().enumerate() {
             let origin =
                 bounds.origin() + vec2f(self.line_x_offset(line), index as f32 * line.height());
             let bounds = RectF::from_points(origin, bounds.lower_right());
-            line.paint(bounds, style_overrides, default_color, font_cache, scene);
+            line.paint_internal(
+                bounds,
+                style_overrides,
+                default_color,
+                font_cache,
+                scene,
+                &default_compute_baseline_position_fn(),
+                &mut char_cursor,
+            );
         }
     }
 
@@ -877,6 +950,7 @@ impl TextFrame {
         font_cache: &FontCache,
         baseline_position_fn: &ComputeBaselinePositionFn,
     ) {
+        let mut char_cursor = style_overrides.bloom_char_offset;
         for (index, line) in self.lines.iter().enumerate() {
             let origin = bounds.origin()
                 + vec2f(
@@ -884,13 +958,14 @@ impl TextFrame {
                     index as f32 * font_cache.line_height(line.font_size, line.line_height_ratio),
                 );
             let bounds = RectF::from_points(origin, bounds.lower_right());
-            line.paint_with_baseline_position(
+            line.paint_internal(
                 bounds,
                 style_overrides,
                 default_color,
                 font_cache,
                 scene,
                 baseline_position_fn,
+                &mut char_cursor,
             );
         }
     }
@@ -1287,6 +1362,7 @@ impl Line {
         font_cache: &FontCache,
         scene: &mut Scene,
     ) {
+        let mut char_cursor = style_overrides.bloom_char_offset;
         self.paint_internal(
             bounds,
             style_overrides,
@@ -1294,6 +1370,7 @@ impl Line {
             font_cache,
             scene,
             &default_compute_baseline_position_fn(),
+            &mut char_cursor,
         )
     }
 
@@ -1308,6 +1385,7 @@ impl Line {
         scene: &mut Scene,
         baseline_position_fn: &ComputeBaselinePositionFn,
     ) {
+        let mut char_cursor = style_overrides.bloom_char_offset;
         self.paint_internal(
             bounds,
             style_overrides,
@@ -1315,9 +1393,11 @@ impl Line {
             font_cache,
             scene,
             baseline_position_fn,
+            &mut char_cursor,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn paint_internal(
         &self,
         bounds: RectF,
@@ -1326,6 +1406,7 @@ impl Line {
         font_cache: &FontCache,
         scene: &mut Scene,
         baseline_position_fn: &ComputeBaselinePositionFn,
+        char_cursor: &mut usize,
     ) {
         let origin = bounds.origin();
         let available_width = bounds.width();
@@ -1417,6 +1498,11 @@ impl Line {
         };
 
         'runs: for run in run_iter {
+            let is_optical_dark = run.styles.optical_dark_compensated
+                || font_cache
+                    .font_properties(run.font_id)
+                    .is_some_and(|props| props.weight.is_optical_dark_compensated());
+
             let mut glyph_color = default_color;
             // We define foreground_color to overwrite syntax_color since the
             // foreground color was likely set explicitly somewhere (by the user
@@ -1436,6 +1522,8 @@ impl Line {
             let mut should_stop_after_run = false;
             for glyph in glyph_iter {
                 let index = glyph.index;
+                let char_idx = *char_cursor;
+                *char_cursor += 1;
                 let override_color = style_overrides.color.get(&index).cloned();
 
                 // If we've started truncating in ellipsis mode, draw the ellipsis and stop painting glyphs.
@@ -1452,13 +1540,15 @@ impl Line {
                         };
                         let ellipsis_origin = line_origin + vec2f(ellipsis_x, 0.);
 
-                        scene.draw_glyph(
-                            ellipsis_origin,
-                            glyph_id,
-                            font_id,
-                            self.font_size,
-                            default_color,
-                        );
+                        scene
+                            .draw_glyph(
+                                ellipsis_origin,
+                                glyph_id,
+                                font_id,
+                                self.font_size,
+                                default_color,
+                            )
+                            .with_optical_dark_compensated(is_optical_dark);
                     }
                     break 'runs;
                 }
@@ -1471,6 +1561,19 @@ impl Line {
                     break;
                 }
                 remaining_width -= glyph.width;
+
+                let glyph_fade = if let Some(schedule) = &style_overrides.bloom_schedule {
+                    let progress = schedule.progress_for_char(char_idx);
+                    if progress <= 0.0 {
+                        continue;
+                    } else if progress < 1.0 {
+                        Some(GlyphFade::Bloom { progress })
+                    } else {
+                        fade
+                    }
+                } else {
+                    fade
+                };
 
                 let glyph_origin = if is_start_clipping {
                     line_origin + vec2f(remaining_width, glyph.position_along_baseline.y())
@@ -1486,7 +1589,8 @@ impl Line {
                         self.font_size,
                         override_color.unwrap_or(glyph_color),
                     )
-                    .with_fade(fade);
+                    .with_fade(glyph_fade)
+                    .with_optical_dark_compensated(is_optical_dark);
 
                 // Draw the underline under the tag (e.g. for a hyperlink).
                 if let Some(underline_color) = style_overrides

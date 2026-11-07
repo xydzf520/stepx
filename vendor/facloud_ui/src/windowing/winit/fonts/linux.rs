@@ -353,7 +353,11 @@ fn to_fontconfig_weight(weight: Weight) -> c_int {
         Weight::ExtraLight => FC_WEIGHT_EXTRALIGHT,
         Weight::Light => FC_WEIGHT_LIGHT,
         Weight::Normal => FC_WEIGHT_NORMAL,
+        // Fontconfig weight scale: NORMAL (400) = 80, MEDIUM (500) = 100, DEMIBOLD/SEMIBOLD (600) = 180.
+        // Interpolate 460 -> 92 and 560 -> 148.
+        Weight::MediumOpticalDark => 92,
         Weight::Medium => FC_WEIGHT_MEDIUM,
+        Weight::SemiboldOpticalDark => 148,
         Weight::Semibold => FC_WEIGHT_SEMIBOLD,
         Weight::Bold => FC_WEIGHT_BOLD,
         Weight::ExtraBold => FC_WEIGHT_EXTRABOLD,

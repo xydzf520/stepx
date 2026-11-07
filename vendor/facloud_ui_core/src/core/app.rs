@@ -2406,7 +2406,14 @@ impl AppContext {
             anchor_new_windows_from_closed_position,
             on_gpu_driver_selected: on_gpu_driver_reported,
             window_instance,
+            min_inner_size,
+            skip_taskbar,
+            focus_on_show,
         } = add_window_options;
+
+        let is_popup_toast = window_style == WindowStyle::PopupToast;
+        let skip_taskbar = skip_taskbar || is_popup_toast;
+        let focus_on_show = if is_popup_toast { false } else { focus_on_show };
 
         let window_id = window_id.unwrap_or_else(WindowId::new);
 
@@ -2435,6 +2442,9 @@ impl AppContext {
             backend_preference: self.rendering_config.backend_preference,
             on_gpu_device_info_reported: on_gpu_driver_reported.unwrap_or(Box::new(|_| {})),
             window_instance,
+            min_inner_size,
+            skip_taskbar,
+            focus_on_show,
         };
 
         let callbacks = WindowCallbacks {
@@ -2581,7 +2591,13 @@ impl AppContext {
         // Create the root view after adding the window but before registering an invalidation callback.
         // This ensures that a platform window is always available to user view code.
         let root_view_id = build_window_data(window_id, self);
-        self.focus(window_id, root_view_id);
+        if (window_style == WindowStyle::PopupToast || !focus_on_show) && self.windows.len() > 1 {
+            if let Some(window) = self.windows.get_mut(&window_id) {
+                window.focused_view = Some(root_view_id);
+            }
+        } else {
+            self.focus(window_id, root_view_id);
+        }
 
         match window_result {
             Err(err) => {

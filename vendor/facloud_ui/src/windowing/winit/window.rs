@@ -82,6 +82,20 @@ cfg_if::cfg_if! {
     }
 }
 
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
+pub(in crate::windowing::winit) fn effective_min_window_size(
+    style: WindowStyle,
+    min_inner_size: Option<Vector2F>,
+) -> LogicalSize<f64> {
+    if let Some(sz) = min_inner_size {
+        LogicalSize::new(sz.x() as f64, sz.y() as f64)
+    } else if matches!(style, WindowStyle::PopupToast | WindowStyle::Pin) {
+        LogicalSize::new(120.0, 36.0)
+    } else {
+        MIN_WINDOW_SIZE
+    }
+}
+
 lazy_static! {
     static ref DEFAULT_WINDOW_SIZE: Vector2F = Vector2F::new(1280., 800.);
 }
@@ -144,12 +158,22 @@ impl platform::WindowManager for WindowManager {
         window_options: WindowOptions,
         callbacks: WindowCallbacks,
     ) -> Result<()> {
+        let style = window_options.style;
+        let min_inner_size = window_options.min_inner_size;
+        let focus_on_show = window_options.focus_on_show;
         self.event_loop_proxy.send_event(CustomEvent::OpenWindow {
             window_id,
             window_options,
         })?;
-        self.windows
-            .insert(window_id, Rc::new(super::window::Window::new(callbacks)));
+        self.windows.insert(
+            window_id,
+            Rc::new(super::window::Window::new_with_options(
+                callbacks,
+                style,
+                min_inner_size,
+                focus_on_show,
+            )),
+        );
         Ok(())
     }
 
@@ -196,6 +220,10 @@ impl platform::WindowManager for WindowManager {
 
         // We want to loop through all windows and stack each one on top of other windows.
         for (id, window) in &self.windows {
+            if window.style() == WindowStyle::PopupToast || !window.is_visible() {
+                continue;
+            }
+
             // We want to be sure that the window which ends up with the focus in the end is the
             // "frontmost" window, or the one which was most recently active/focused. Therefore,
             // the last active window needs to be focused last. So, skip that window in this loop.
@@ -211,8 +239,10 @@ impl platform::WindowManager for WindowManager {
         // focus.
         if let Some(window_id) = last_active_window {
             if let Some(window) = self.windows.get(&window_id) {
-                window.focus();
-                next_active_window = Some(window_id);
+                if window.style() != WindowStyle::PopupToast && window.is_visible() {
+                    window.focus();
+                    next_active_window = Some(window_id);
+                }
             }
         }
 
@@ -223,6 +253,12 @@ impl platform::WindowManager for WindowManager {
         debug_assert!(matches!(behavior, WindowFocusBehavior::BringToFront));
         if let Some(window) = self.windows.get(&window_id) {
             window.focus();
+        }
+    }
+
+    fn show_window_without_focus(&self, window_id: WindowId) {
+        if let Some(window) = self.windows.get(&window_id) {
+            window.show_without_focus();
         }
     }
 
@@ -294,13 +330,52 @@ impl platform::WindowManager for WindowManager {
                         }
                     })
                     .map(|(_, monitor_bounds)| x11::physical_bounds_to_rect(&monitor_bounds, self.get_x11_backing_scale_factor()))
+                    .or_else(|| {
+                        self.windows
+                            .values()
+                            .find_map(|w| {
+                                w.inner.borrow().as_ref().and_then(|inner| {
+                                    inner
+                                        .window
+                                        .current_monitor()
+                                        .or_else(|| inner.window.primary_monitor())
+                                })
+                            })
+                            .map(|monitor| get_monitor_logical_bounds(&monitor))
+                    })
                     .unwrap_or(RectF::new(Vector2F::zero(), *DEFAULT_WINDOW_SIZE))
             } else if #[cfg(windows)] {
-                self.get_active_monitor_logical_bounds().unwrap_or(RectF::new(Vector2F::zero(), *DEFAULT_WINDOW_SIZE))
+                self.get_active_monitor_logical_bounds()
+                    .or_else(|_| {
+                        self.windows
+                            .values()
+                            .find_map(|w| {
+                                w.inner.borrow().as_ref().and_then(|inner| {
+                                    inner
+                                        .window
+                                        .current_monitor()
+                                        .or_else(|| inner.window.primary_monitor())
+                                })
+                            })
+                            .map(|monitor| get_monitor_logical_bounds(&monitor))
+                            .ok_or_else(|| anyhow::anyhow!("no monitor found"))
+                    })
+                    .unwrap_or(RectF::new(Vector2F::zero(), *DEFAULT_WINDOW_SIZE))
             } else {
                 RectF::new(Vector2F::zero(), *DEFAULT_WINDOW_SIZE)
             }
         }
+    }
+
+    fn active_display_workarea_bounds(&self) -> RectF {
+        let full = self.active_display_bounds();
+        let bottom_inset = 48.0;
+        let top_inset = if cfg!(target_os = "linux") { 32.0 } else { 0.0 };
+        let height = (full.height() - top_inset - bottom_inset).max(200.0);
+        RectF::new(
+            Vector2F::new(full.origin_x(), full.origin_y() + top_inset),
+            Vector2F::new(full.width(), height),
+        )
     }
 
     fn active_display_id(&self) -> DisplayId {
@@ -461,7 +536,12 @@ impl platform::WindowManager for IntegrationTestWindowManager {
         window_options: WindowOptions,
         callbacks: WindowCallbacks,
     ) -> Result<()> {
-        let window_will_be_focused = window_options.style != platform::WindowStyle::NotStealFocus;
+        let window_will_be_focused = !matches!(
+            window_options.style,
+            platform::WindowStyle::NotStealFocus
+                | platform::WindowStyle::PopupToast
+                | platform::WindowStyle::PositionedNoFocus
+        ) && window_options.focus_on_show;
         self.window_manager
             .open_window(window_id, window_options, callbacks)?;
         if window_will_be_focused {
@@ -510,6 +590,10 @@ impl platform::WindowManager for IntegrationTestWindowManager {
         app_state.window_id_stack.push(window_id);
     }
 
+    fn show_window_without_focus(&self, window_id: WindowId) {
+        self.window_manager.show_window_without_focus(window_id);
+    }
+
     fn hide_app(&self) {
         self.window_manager.hide_app();
     }
@@ -555,6 +639,10 @@ impl platform::WindowManager for IntegrationTestWindowManager {
         self.window_manager.active_display_bounds()
     }
 
+    fn active_display_workarea_bounds(&self) -> geometry::rect::RectF {
+        self.window_manager.active_display_workarea_bounds()
+    }
+
     fn active_display_id(&self) -> DisplayId {
         self.window_manager.active_display_id()
     }
@@ -587,7 +675,7 @@ impl platform::WindowManager for IntegrationTestWindowManager {
 fn window_level_for_style(style: WindowStyle) -> WindowLevel {
     match style {
         WindowStyle::NotStealFocus => WindowLevel::AlwaysOnBottom,
-        WindowStyle::Pin => WindowLevel::AlwaysOnTop,
+        WindowStyle::Pin | WindowStyle::PopupToast => WindowLevel::AlwaysOnTop,
         _ => WindowLevel::Normal,
     }
 }
@@ -654,16 +742,35 @@ pub(super) struct Window {
     /// invisible title bar insofar as it triggers window dragging when clicked-and-dragged, or
     /// maximize/restore when double-clicked.
     titlebar_height: Cell<f32>,
+    style: Cell<WindowStyle>,
+    min_inner_size: Cell<Option<Vector2F>>,
     capture_callback: RefCell<Option<FrameCaptureCallback>>,
 }
 
 impl Window {
+    #[allow(dead_code)]
     pub fn new(callbacks: WindowCallbacks) -> Self {
+        Self::new_with_options(callbacks, WindowStyle::Normal, None, true)
+    }
+
+    pub fn new_with_options(
+        callbacks: WindowCallbacks,
+        style: WindowStyle,
+        min_inner_size: Option<Vector2F>,
+        focus_on_show: bool,
+    ) -> Self {
+        let initial_titlebar_height = if style == WindowStyle::PopupToast || !focus_on_show {
+            0.0
+        } else {
+            DEFAULT_TITLEBAR_HEIGHT
+        };
         Self {
             callbacks,
             inner: Default::default(),
             scene: Default::default(),
-            titlebar_height: Cell::new(DEFAULT_TITLEBAR_HEIGHT),
+            titlebar_height: Cell::new(initial_titlebar_height),
+            style: Cell::new(style),
+            min_inner_size: Cell::new(min_inner_size),
             capture_callback: RefCell::new(None),
         }
     }
@@ -681,6 +788,14 @@ impl Window {
         self.titlebar_height.get()
     }
 
+    pub fn style(&self) -> WindowStyle {
+        self.style.get()
+    }
+
+    pub fn min_window_size(&self) -> LogicalSize<f64> {
+        effective_min_window_size(self.style.get(), self.min_inner_size.get())
+    }
+
     pub fn open_window(
         &self,
         window_target: &ActiveEventLoop,
@@ -690,6 +805,12 @@ impl Window {
         tiling_window_manager: bool,
         downrank_non_nvidia_vulkan_adapters: bool,
     ) -> Result<winit::window::WindowId> {
+        self.style.set(window_options.style);
+        self.min_inner_size.set(window_options.min_inner_size);
+        if window_options.style == WindowStyle::PopupToast || !window_options.focus_on_show {
+            self.titlebar_height.set(0.0);
+        }
+
         let window = create_window(
             window_target,
             &window_options,
@@ -851,7 +972,7 @@ impl Window {
 
     /// Drops the window's renderer and all associated resources.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub fn release_renderer(&self) {
+    pub fn drop_renderer(&self, display_handle: Box<dyn wgpu::wgt::WgpuHasDisplayHandle>) {
         let mut inner = self.inner.borrow_mut();
         let Some(inner) = inner.as_mut() else {
             log::warn!("Tried to drop a window's renderer before it had been fully initialized");
@@ -860,11 +981,6 @@ impl Window {
 
         let _ = inner.rendering_resources.take();
 
-    }
-
-    /// Device recovery needs a fresh instance; permanently closing one window does not.
-    pub fn drop_renderer(&self, display_handle: Box<dyn wgpu::wgt::WgpuHasDisplayHandle>) {
-        self.release_renderer();
         // Forceably drop and recreate our cached `wgpu::Instance` after dropping the renderer.
         // Without this, certain NVIDIA drivers deadlock upon recreating the resources with the
         // existing `Instance`.
@@ -932,17 +1048,18 @@ impl Window {
             return;
         };
 
-        // Windows are not drag-resizable when maximized.
-        let drag_resize_direction = if inner.window.is_maximized() {
-            None
-        } else {
-            let scale_factor = inner.window.scale_factor();
-            Self::drag_resize_direction_at_position(
-                inner.physical_size().to_logical(scale_factor),
-                position,
-                DRAG_RESIZE_MARGIN,
-            )
-        };
+        // Windows are not drag-resizable when maximized or when styled as a popup toast.
+        let drag_resize_direction =
+            if inner.window.is_maximized() || self.style.get() == WindowStyle::PopupToast {
+                None
+            } else {
+                let scale_factor = inner.window.scale_factor();
+                Self::drag_resize_direction_at_position(
+                    inner.physical_size().to_logical(scale_factor),
+                    position,
+                    DRAG_RESIZE_MARGIN,
+                )
+            };
 
         if let Some(resize_direction) = &drag_resize_direction {
             inner
@@ -1110,6 +1227,15 @@ impl Window {
         }
     }
 
+    pub fn show_without_focus(&self) {
+        if let Some(Inner { window, level, .. }) = self.inner.borrow().as_ref() {
+            if !window.is_visible().unwrap_or(true) {
+                window.set_visible(true);
+            }
+            window.set_window_level(*level);
+        }
+    }
+
     /// Sets whether or not the window is visible.
     ///
     /// The definition of "visibility" depends on the platform. On X11 this is referring to the
@@ -1240,19 +1366,18 @@ fn create_window(
     tiling_window_manager: bool,
 ) -> Result<winit::window::Window> {
     let decorations = !window_options.hide_title_bar;
-    // Pinned utility palettes (such as a vertical device-control rail) need
-    // their requested narrow width in production, not the main-window minimum.
-    let minimum = if window_options.style == WindowStyle::Pin {
-        LogicalSize::new(88., 160.)
-    } else {
-        MIN_WINDOW_SIZE
-    };
+    let min_inner_size =
+        effective_min_window_size(window_options.style, window_options.min_inner_size);
 
     let mut window_attributes = winit::window::WindowAttributes::default()
-        .with_min_inner_size(minimum)
+        .with_min_inner_size(min_inner_size)
         .with_decorations(decorations)
         .with_window_level(window_level_for_style(window_options.style))
         .with_transparent(true);
+
+    if window_options.style == WindowStyle::PopupToast || !window_options.focus_on_show {
+        window_attributes = window_attributes.with_active(false).with_resizable(false);
+    }
 
     if let Some(title) = &window_options.title {
         window_attributes.title = title.to_owned();
@@ -1302,6 +1427,14 @@ fn create_window(
         let icon = winit::window::Icon::from_resource(IDI_ICON, None);
         window_attributes.window_icon = icon.as_ref().ok().cloned();
         window_attributes = window_attributes.with_taskbar_icon(icon.ok());
+        if window_options.skip_taskbar
+            || matches!(
+                window_options.style,
+                WindowStyle::Pin | WindowStyle::PopupToast
+            )
+        {
+            window_attributes = window_attributes.with_skip_taskbar(true);
+        }
 
         // This is to make sure the bounds the caller is requesting intersects with any of the
         // monitors. We only do this on Windows b/c Windows happily renders a window outside of any
@@ -1322,7 +1455,11 @@ fn create_window(
         }
     }
 
-    let (size, origin) = if tiling_window_manager && window_options.style != WindowStyle::Pin {
+    let (size, origin) = if tiling_window_manager
+        && !matches!(
+            window_options.style,
+            WindowStyle::Pin | WindowStyle::PopupToast
+        ) {
         (None, None)
     } else {
         match window_bounds {
@@ -1369,18 +1506,24 @@ fn create_window(
     }
 
     #[cfg(target_os = "linux")]
-    if let Some(window_class) = _window_class.as_deref() {
+    {
         use winit::platform::x11::{WindowAttributesExtX11, WindowType};
 
-        window_attributes = window_attributes.with_name(
-            window_class,
-            window_options
-                .window_instance
-                .as_deref()
-                .unwrap_or(window_class),
-        );
+        if let Some(window_class) = _window_class.as_deref() {
+            window_attributes = window_attributes.with_name(
+                window_class,
+                window_options
+                    .window_instance
+                    .as_deref()
+                    .unwrap_or(window_class),
+            );
+        }
 
-        if tiling_window_manager && window_options.style == WindowStyle::Pin {
+        // X11 ignores with_active(false). Toasts must declare their native type
+        // before mapping, or the WM may activate them and interrupt another editor.
+        if window_options.style == WindowStyle::PopupToast {
+            window_attributes = window_attributes.with_x11_window_type(vec![WindowType::Notification]);
+        } else if tiling_window_manager && window_options.style == WindowStyle::Pin {
             window_attributes = window_attributes.with_x11_window_type(vec![WindowType::Dialog]);
         }
     }
@@ -1416,7 +1559,13 @@ fn create_window(
 
             // When launching a window from windows file explorer, it isn't given focus. We're considering
             // this a winit quirk and forcing it to be focused.
-            if window_options.style != WindowStyle::NotStealFocus {
+            if !matches!(
+                window_options.style,
+                WindowStyle::NotStealFocus
+                    | WindowStyle::PopupToast
+                    | WindowStyle::PositionedNoFocus
+            ) && window_options.focus_on_show
+            {
                 window.focus_window();
             }
 
@@ -1689,7 +1838,7 @@ impl PhysicalSizeExt for PhysicalSize<u32> {
     }
 }
 
-#[cfg(windows)]
+#[cfg(not(target_family = "wasm"))]
 fn get_monitor_logical_bounds(monitor: &MonitorHandle) -> RectF {
     let scale_factor = monitor.scale_factor();
     let logical_size = monitor.size().to_logical(scale_factor);

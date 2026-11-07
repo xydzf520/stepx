@@ -602,17 +602,18 @@ impl TextLayoutSystem {
             );
             total_height += line.height();
 
-            // We add 1 to the last caret position here to skip the newline character.
-            // Since we're working with separate lines within a text frame, there is guaranteed
-            // to be a newline to skip at the end of each iteration of the loop.
-            // The only exception is on the last iteration; in that case, we don't use this
-            // value later anyway.
-            line_glyph_start_index = line
-                .caret_positions
-                .last()
-                .map(|position| position.last_offset)
-                .unwrap_or(line_glyph_start_index)
-                + 1;
+            // We add 1 to the last caret position here to skip the newline character
+            // when advancing to the next paragraph. Wrapped lines within the same
+            // paragraph (`has_trailing_newline == false`) already have `glyph.start`
+            // byte offsets relative to the start of the paragraph.
+            if has_trailing_newline {
+                line_glyph_start_index = line
+                    .caret_positions
+                    .last()
+                    .map(|position| position.last_offset)
+                    .unwrap_or(line_glyph_start_index)
+                    + 1;
+            }
 
             // TODO(alokedesai): Properly clip multi-line text using the same strategy we use on mac.
             // See https://github.com/warpdotdev/warp-internal/blob/91dfe429074c6129a6b5c1c57c55c1daf6d274a9/ui/src/platform/mac/text_layout.rs#L318-L359.
@@ -659,6 +660,9 @@ impl TextLayoutSystem {
         let mut caret_positions = vec![];
         let mut chars_with_missing_glyphs = vec![];
         let mut last_glyph_offset: usize = 0;
+        let line_byte_start_index = str_index_map
+            .byte_index(line_glyph_start_index)
+            .unwrap_or(0);
 
         run_builder.reserve_capacity(layout_line.glyphs.len());
         for glyph in layout_line.glyphs {
@@ -667,12 +671,12 @@ impl TextLayoutSystem {
             // not work for certain ligatures
             if glyph.w > 0.0 {
                 let start_offset = str_index_map
-                    .char_index(line_glyph_start_index + glyph.start)
+                    .char_index(line_byte_start_index + glyph.start)
                     .unwrap_or(0);
                 let last_offset = str_index_map
-                    .char_index(line_glyph_start_index + glyph.end)
+                    .char_index(line_byte_start_index + glyph.end)
                     .unwrap_or_else(|| str_index_map.num_chars())
-                    - 1;
+                    .saturating_sub(1);
                 caret_positions.push(CaretPosition {
                     position_in_line: glyph.x,
                     start_offset,
@@ -767,7 +771,15 @@ impl TextLayoutSystem {
                 continue;
             };
 
-            let style_index = text_styles_map.insert(style_and_font.style);
+            let mut span_style = style_and_font.style;
+            if style_and_font
+                .properties
+                .weight
+                .is_optical_dark_compensated()
+            {
+                span_style.optical_dark_compensated = true;
+            }
+            let style_index = text_styles_map.insert(span_style);
 
             attrs_list.add_span(
                 start_byte_index..end_byte_index,
@@ -1079,7 +1091,7 @@ impl platform::TextLayoutSystem for TextLayoutSystem {
                 tab_width,
             );
 
-            let layout_lines = shape_line.layout(
+            let mut layout_lines = shape_line.layout(
                 line_style.font_size,
                 Some(max_width),
                 Wrap::WordOrGlyph,
@@ -1087,6 +1099,7 @@ impl platform::TextLayoutSystem for TextLayoutSystem {
                 first_line_head_indent,
                 None,
             );
+            rebalance_orphan_last_line(paragraph, &mut layout_lines, max_width, line_style.font_size);
             let layout_line_count = layout_lines.len();
             layout_lines
                 .into_iter()
@@ -1137,17 +1150,8 @@ impl TextLayoutSystem {
                     .get(&family_id)
                     .expect("Font family must exist");
 
-                let weight = match properties.weight {
-                    Weight::Thin => fontdb::Weight::THIN,
-                    Weight::ExtraLight => fontdb::Weight::EXTRA_LIGHT,
-                    Weight::Light => fontdb::Weight::LIGHT,
-                    Weight::Normal => fontdb::Weight::NORMAL,
-                    Weight::Medium => fontdb::Weight::MEDIUM,
-                    Weight::Semibold => fontdb::Weight::SEMIBOLD,
-                    Weight::Bold => fontdb::Weight::BOLD,
-                    Weight::ExtraBold => fontdb::Weight::EXTRA_BOLD,
-                    Weight::Black => fontdb::Weight::BLACK,
-                };
+                let weight =
+                    fontdb::Weight(font_weight_to_cosmic_text(properties.weight).0);
                 let style = match properties.style {
                     Style::Normal => fontdb::Style::Normal,
                     Style::Italic => fontdb::Style::Italic,
@@ -1288,6 +1292,412 @@ impl GlyphIdExt for owned_ttf_parser::GlyphId {
     }
 }
 
+fn font_weight_to_cosmic_text(weight: Weight) -> cosmic_text::Weight {
+    match weight {
+        Weight::Thin => cosmic_text::Weight::THIN,
+        Weight::ExtraLight => cosmic_text::Weight::EXTRA_LIGHT,
+        Weight::Light => cosmic_text::Weight::LIGHT,
+        Weight::Normal => cosmic_text::Weight::NORMAL,
+        Weight::MediumOpticalDark => cosmic_text::Weight(460),
+        Weight::Medium => cosmic_text::Weight::MEDIUM,
+        Weight::SemiboldOpticalDark => cosmic_text::Weight(560),
+        Weight::Semibold => cosmic_text::Weight::SEMIBOLD,
+        Weight::Bold => cosmic_text::Weight::BOLD,
+        Weight::ExtraBold => cosmic_text::Weight::EXTRA_BOLD,
+        Weight::Black => cosmic_text::Weight::BLACK,
+    }
+}
+
+/// Prevents "orphan" last lines (e.g., a single CJK character + period `"了。"`, or a single
+/// short 1–3 letter English word) by pulling 1 word or 1 CJK character from the end of the
+/// penultimate line onto the start of the last line whenever space permits.
+fn rebalance_orphan_last_line(
+    paragraph: &str,
+    layout_lines: &mut [LayoutLine],
+    max_width: f32,
+    font_size: f32,
+) {
+    if layout_lines.len() < 2 || !max_width.is_finite() || max_width < font_size * 6.0 {
+        return;
+    }
+
+    let n = layout_lines.len();
+    let (head, tail) = layout_lines.split_at_mut(n - 1);
+    let prev = &mut head[n - 2];
+    let last = &mut tail[0];
+
+    if last.glyphs.is_empty() || prev.glyphs.len() < 3 {
+        return;
+    }
+
+    // Extract the substring of the last line to inspect its characters.
+    let last_start_byte = last.glyphs.first().map(|g| g.start).unwrap_or(0);
+    let last_end_byte = last.glyphs.last().map(|g| g.end).unwrap_or(0);
+    let last_slice = paragraph.get(last_start_byte..last_end_byte).unwrap_or("");
+
+    let is_cjk_or_punct = |c: char| -> bool {
+        matches!(
+            c as u32,
+            0x3000..=0x303F
+                | 0x3400..=0x4DBF
+                | 0x4E00..=0x9FFF
+                | 0xF900..=0xFAFF
+                | 0xFF00..=0xFFEF
+        )
+    };
+    let is_closing_punct = |c: char| -> bool {
+        matches!(
+            c,
+            '。' | '，'
+                | '、'
+                | '！'
+                | '？'
+                | '；'
+                | '：'
+                | '”'
+                | '’'
+                | '）'
+                | '】'
+                | '》'
+                | '.'
+                | ','
+                | '!'
+                | '?'
+                | ';'
+                | ':'
+                | ')'
+                | ']'
+        )
+    };
+
+    let chars: Vec<char> = last_slice.chars().filter(|c| !c.is_whitespace()).collect();
+    if chars.is_empty() {
+        return;
+    }
+
+    let non_punct_count = chars.iter().filter(|&&c| !is_closing_punct(c)).count();
+    let has_cjk = chars.iter().any(|&c| is_cjk_or_punct(c));
+
+    // Orphan criteria:
+    // - CJK: at most 1 non-punctuation character (e.g. "了", "了。", "吗？")
+    // - Latin/ASCII: single short word of <= 4 visible characters OR width < font_size * 2.2
+    let is_orphan = if has_cjk {
+        non_punct_count <= 1 && chars.len() <= 3
+    } else {
+        let word_count = last_slice.split_whitespace().count();
+        word_count <= 1 && (non_punct_count <= 3 || last.w < font_size * 2.2)
+    };
+
+    if !is_orphan {
+        return;
+    }
+
+    // Determine how many trailing glyphs to pull from `prev`:
+    // - If `prev` ends with a CJK glyph, pull 1 glyph (1 CJK character).
+    // - If `prev` ends with Latin/ASCII, pull the last word (back to the last whitespace in `prev`,
+    //   up to 8 glyphs, leaving at least 2 glyphs on `prev`).
+    let prev_len = prev.glyphs.len();
+    let last_prev_glyph = &prev.glyphs[prev_len - 1];
+    let last_prev_str = paragraph
+        .get(last_prev_glyph.start..last_prev_glyph.end)
+        .unwrap_or("");
+    let prev_ends_cjk = last_prev_str.chars().any(is_cjk_or_punct);
+
+    let pull_count = if prev_ends_cjk {
+        1usize
+    } else {
+        // Walk backwards from the end of `prev.glyphs`, skipping any trailing whitespace glyphs,
+        // then collecting the last word's glyphs.
+        let mut idx = prev_len;
+        while idx > 0 {
+            let g = &prev.glyphs[idx - 1];
+            let s = paragraph.get(g.start..g.end).unwrap_or("");
+            if s.chars().all(|c| c.is_whitespace()) {
+                idx -= 1;
+            } else {
+                break;
+            }
+        }
+        let word_end = idx;
+        while idx > 0 {
+            let g = &prev.glyphs[idx - 1];
+            let s = paragraph.get(g.start..g.end).unwrap_or("");
+            if s.chars().any(|c| c.is_whitespace()) || is_cjk_or_punct(s.chars().next().unwrap_or(' '))
+            {
+                break;
+            }
+            idx -= 1;
+        }
+        let word_glyphs = word_end.saturating_sub(idx);
+        if word_glyphs == 0 || word_glyphs > 10 || idx < 2 {
+            return;
+        }
+        // Pull from `idx` to `prev_len` (includes any trailing space cosmic-text left on `prev`).
+        prev_len - idx
+    };
+
+    if pull_count == 0 || prev_len <= pull_count + 1 {
+        return;
+    }
+
+    let split_at = prev_len - pull_count;
+    let pulled_width: f32 = prev.glyphs[split_at..].iter().map(|g| g.w).sum();
+    // Add a small space allowance when pulling a Latin word onto a Latin orphan line
+    let space_gap = if !prev_ends_cjk && !has_cjk {
+        font_size * 0.28
+    } else {
+        0.0
+    };
+
+    if last.w + pulled_width + space_gap > max_width {
+        return;
+    }
+
+    let mut pulled: Vec<LayoutGlyph> = prev.glyphs.drain(split_at..).collect();
+    // Strip any trailing whitespace glyph from `prev` and from `pulled`
+    while let Some(g) = prev.glyphs.last() {
+        let s = paragraph.get(g.start..g.end).unwrap_or("");
+        if s.chars().all(|c| c.is_whitespace()) {
+            prev.glyphs.pop();
+        } else {
+            break;
+        }
+    }
+    while let Some(g) = pulled.last() {
+        let s = paragraph.get(g.start..g.end).unwrap_or("");
+        if s.chars().all(|c| c.is_whitespace()) {
+            pulled.pop();
+        } else {
+            break;
+        }
+    }
+
+    if pulled.is_empty() {
+        return;
+    }
+
+    // Recompute x positions for `pulled` at the start of `last`, then shift existing `last.glyphs` right.
+    let mut cursor_x = 0.0f32;
+    for g in &mut pulled {
+        g.x = cursor_x;
+        cursor_x += g.w;
+    }
+    cursor_x += space_gap;
+
+    for g in &mut last.glyphs {
+        g.x += cursor_x;
+    }
+
+    pulled.append(&mut last.glyphs);
+    last.glyphs = pulled;
+
+    prev.w = prev
+        .glyphs
+        .last()
+        .map(|g| g.x + g.w)
+        .unwrap_or(0.0);
+    last.w = last
+        .glyphs
+        .last()
+        .map(|g| g.x + g.w)
+        .unwrap_or(0.0);
+}
+
 #[cfg(test)]
 #[path = "text_layout_tests.rs"]
 mod layout_tests;
+
+#[cfg(test)]
+mod micro_craft_tests {
+    use super::*;
+    use crate::elements::DEFAULT_UI_LINE_HEIGHT_RATIO;
+    use crate::fonts::{collect_glyph_indices, init_fonts};
+    use crate::platform::FontDB as _;
+    use crate::text_layout::{GlyphBloomSchedule, TextStyle, DEFAULT_TOP_BOTTOM_RATIO};
+
+    fn template_glyph() -> LayoutGlyph {
+        let (font_db, roboto) = init_fonts();
+        let text = "A";
+        let style_runs = [(
+            0..1,
+            StyleAndFont::new(roboto, Properties::default(), TextStyle::new()),
+        )];
+        let mut text_styles_map = TextStylesMap::new();
+        let str_index_map = StrIndexMap::new(text);
+        let attrs_list = font_db.text_layout_system.build_attrs_list(
+            text,
+            &style_runs,
+            &mut text_styles_map,
+            &str_index_map,
+        );
+        let mut font_store = font_db.text_layout_system.font_store.write();
+        let shape_line = ShapeLine::new(
+            font_store.deref_mut(),
+            text,
+            &attrs_list,
+            Shaping::Advanced,
+            4,
+        );
+        let lines = shape_line.layout(16.0, None, Wrap::None, None, None, None);
+        lines[0].glyphs[0].clone()
+    }
+
+    fn make_mock_glyph(template: &LayoutGlyph, start: usize, end: usize, x: f32, w: f32) -> LayoutGlyph {
+        let mut g = template.clone();
+        g.start = start;
+        g.end = end;
+        g.x = x;
+        g.w = w;
+        g
+    }
+
+    fn build_layout_line_for_range(
+        template: &LayoutGlyph,
+        paragraph: &str,
+        char_range: Range<usize>,
+        advance: f32,
+    ) -> LayoutLine {
+        let char_indices: Vec<(usize, char)> = paragraph.char_indices().collect();
+        let mut glyphs = Vec::new();
+        let mut x = 0.0f32;
+        for idx in char_range {
+            let (start, ch) = char_indices[idx];
+            let end = start + ch.len_utf8();
+            let w = if ch.is_ascii() { advance * 0.55 } else { advance };
+            glyphs.push(make_mock_glyph(template, start, end, x, w));
+            x += w;
+        }
+        LayoutLine {
+            w: x,
+            max_ascent: 12.0,
+            max_descent: 4.0,
+            glyphs,
+            line_height_opt: None,
+        }
+    }
+
+    fn line_text<'a>(paragraph: &'a str, line: &LayoutLine) -> &'a str {
+        let start = line.glyphs.first().map(|g| g.start).unwrap_or(0);
+        let end = line.glyphs.last().map(|g| g.end).unwrap_or(0);
+        &paragraph[start..end]
+    }
+
+    #[test]
+    fn test_orphan_rebalance_cjk_single_char() {
+        let tmpl = template_glyph();
+        let paragraph = "这是一段用于测试孤字预防的中文最后一个字";
+        let total_chars = paragraph.chars().count();
+        // Line 0 has all chars except the last one ("字"), Line 1 has only "字".
+        let mut lines = vec![
+            build_layout_line_for_range(&tmpl, paragraph, 0..(total_chars - 1), 16.0),
+            build_layout_line_for_range(&tmpl, paragraph, (total_chars - 1)..total_chars, 16.0),
+        ];
+        rebalance_orphan_last_line(paragraph, &mut lines, 320.0, 16.0);
+        assert_eq!(line_text(paragraph, &lines[1]), "个字");
+        assert!(line_text(paragraph, &lines[0]).ends_with("最后一"));
+    }
+
+    #[test]
+    fn test_orphan_rebalance_cjk_char_with_period() {
+        let tmpl = template_glyph();
+        let paragraph = "整个流式排版和渲染微工艺已经全部完成了。";
+        let total_chars = paragraph.chars().count();
+        // Line 0 ends before "了。", Line 1 has orphan "了。".
+        let mut lines = vec![
+            build_layout_line_for_range(&tmpl, paragraph, 0..(total_chars - 2), 16.0),
+            build_layout_line_for_range(&tmpl, paragraph, (total_chars - 2)..total_chars, 16.0),
+        ];
+        rebalance_orphan_last_line(paragraph, &mut lines, 320.0, 16.0);
+        assert_eq!(line_text(paragraph, &lines[1]), "成了。");
+        assert!(line_text(paragraph, &lines[0]).ends_with("完"));
+    }
+
+    #[test]
+    fn test_orphan_rebalance_english_short_word() {
+        let tmpl = template_glyph();
+        let paragraph = "Claude Desktop builds a remarkably smooth UI";
+        // Split before "UI": Line 0 = "Claude Desktop builds a remarkably smooth ", Line 1 = "UI"
+        let split_char = paragraph.chars().count() - 2;
+        let mut lines = vec![
+            build_layout_line_for_range(&tmpl, paragraph, 0..split_char, 16.0),
+            build_layout_line_for_range(
+                &tmpl,
+                paragraph,
+                split_char..paragraph.chars().count(),
+                16.0,
+            ),
+        ];
+        rebalance_orphan_last_line(paragraph, &mut lines, 400.0, 16.0);
+        assert_eq!(line_text(paragraph, &lines[1]), "smooth UI");
+        assert_eq!(
+            line_text(paragraph, &lines[0]),
+            "Claude Desktop builds a remarkably"
+        );
+
+        // Also verify end-to-end via layout_text with bundled Roboto font:
+        let (font_db, roboto) = init_fonts();
+        let line_style = LineStyle {
+            font_size: 16.0,
+            line_height_ratio: DEFAULT_UI_LINE_HEIGHT_RATIO,
+            baseline_ratio: DEFAULT_TOP_BOTTOM_RATIO,
+            fixed_width_tab_size: None,
+        };
+        let style_runs = [(
+            0..paragraph.chars().count(),
+            StyleAndFont::new(roboto, Properties::default(), TextStyle::new()),
+        )];
+        // Measure full single-line width so we can pick a max_width that would normally orphan "UI".
+        let full_line = font_db.text_layout_system().layout_line(
+            paragraph,
+            line_style,
+            &style_runs,
+            f32::MAX,
+            ClipConfig::default(),
+        );
+        let narrow_width = full_line.width - 4.0;
+        let frame = font_db.text_layout_system().layout_text(
+            paragraph,
+            line_style,
+            &style_runs,
+            narrow_width,
+            f32::MAX,
+            TextAlignment::Left,
+            None,
+        );
+        let indices = collect_glyph_indices(&frame);
+        assert_eq!(indices.len(), 2);
+        // Last line must have more than just the 2 glyphs of "UI" (it pulled "smooth" too).
+        assert!(indices[1].len() >= 8, "expected 'smooth UI' on last line, got {:?}", indices[1]);
+    }
+
+    #[test]
+    fn test_optical_dark_weights_and_bloom_schedule() {
+        assert_eq!(Weight::Medium.optical_dark(), Weight::MediumOpticalDark);
+        assert_eq!(Weight::Semibold.optical_dark(), Weight::SemiboldOpticalDark);
+        assert_eq!(Weight::MediumOpticalDark.to_css_weight(), 460);
+        assert_eq!(Weight::SemiboldOpticalDark.to_css_weight(), 560);
+        assert_eq!(
+            font_weight_to_cosmic_text(Weight::MediumOpticalDark),
+            cosmic_text::Weight(460)
+        );
+        assert_eq!(
+            font_weight_to_cosmic_text(Weight::SemiboldOpticalDark),
+            cosmic_text::Weight(560)
+        );
+
+        let props = Properties::default()
+            .weight(Weight::Medium)
+            .with_optical_dark_weight(true);
+        assert!(props.weight.is_optical_dark_compensated());
+
+        let schedule = GlyphBloomSchedule {
+            reveal_start_char: 10,
+            elapsed_ms: 45.0,
+            stagger_ms: 6.0,
+            duration_ms: 90.0,
+        };
+        assert_eq!(schedule.progress_for_char(5), 1.0);
+        assert!((schedule.progress_for_char(10) - 0.5).abs() < 1e-5);
+        assert_eq!(schedule.progress_for_char(20), 0.0);
+    }
+}
