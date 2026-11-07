@@ -13,7 +13,8 @@ env:
   PYTHONDONTWRITEBYTECODE: '1'
 concurrency:
   group: desktop-release-${{ github.ref }}
-  cancel-in-progress: false
+  # A newer release fix supersedes in-flight packages from the previous head.
+  cancel-in-progress: true
 jobs:
   metadata:
     runs-on: ubuntu-24.04
@@ -115,6 +116,8 @@ jobs:
           path: dist/*
           if-no-files-found: error
   publish:
+    # Hold publication while the Windows app-local runtime audit is completed.
+    if: ${{ false }}
     needs: [metadata, build]
     runs-on: ubuntu-24.04
     permissions:
@@ -130,6 +133,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
         run: |
+          CURRENT_HEAD=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          test "$CURRENT_HEAD" = "$GITHUB_SHA" || { echo 'Refusing to publish superseded source'; exit 1; }
           cp desktop/assets/stepx-companion.apk dist/StepX-companion.apk
           cp docs/videos/*.mp4 dist/
           (cd dist && sha256sum StepX-companion.apk *.mp4 > media-sha256.txt)
