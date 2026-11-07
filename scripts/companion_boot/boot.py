@@ -9,32 +9,19 @@ config=json.load(open(BASE+'/config.json'))
 host='/proc/self/fd/'+str(rootfd)
 boot=open(host+'/proc/sys/kernel/random/boot_id').read().strip()
 identity=boot
-def current_system_pid():
-    # The Ubuntu parent cannot read Android task names under SELinux. The
-    # preceding Google worker has already resolved its PID inside Android.
-    prior=json.load(open('/var/lib/stepx-gms/last.json'))
-    pid=prior.get('target_pid',0)
-    if prior.get('identity')!=boot or prior.get('status')!='success' or not pid:
-        raise RuntimeError('Google boot restoration has no current verified process')
-    return pid
-target_at_start=current_system_pid()
 def save(value):
     value.update(identity=identity,boot_id=boot,unix_time=int(time.time()),version=2)
     p=STATE+'/last.new'
     fd=os.open(p,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
     with os.fdopen(fd,'w') as stream:json.dump(value,stream);stream.flush();os.fsync(stream.fileno())
     os.replace(p,STATE+'/last.json')
-try:
-    old=json.load(open(STATE+'/last.json'))
-    # One native attempt per system service lifetime. An error requires explicit repair.
-    if old.get('boot_id')==boot:
-        # Do not loop after native faults. A successful but stale process receipt
-        # can be restored once for a new system_server without a full phone reboot.
-        if old.get('status')!='success' or old.get('target_pid')==target_at_start:os._exit(0)
-except (OSError,ValueError):pass
+try:old=json.load(open(STATE+'/last.json'))
+except (OSError,ValueError):old={}
+# A native failure is never automatically retried in the same boot.
+if old.get('boot_id')==boot and old.get('status') in ('started','failed'):os._exit(0)
 payload=open(BASE+'/grant.py').read()
 if hashlib.sha256(payload.encode()).hexdigest()!=config['grant_sha256']:raise RuntimeError('Boot payload integrity mismatch')
-save({'status':'started','scope':'companion_boot_v1','target_pid':target_at_start})
+save({'status':'started','scope':'companion_boot_v1','target_pid':0})
 shared=mmap.mmap(-1,256*1024,flags=mmap.MAP_SHARED|mmap.MAP_ANONYMOUS)
 lib=ctypes.CDLL(None,use_errno=True)
 json.dumps({});hashlib.sha256(b'');base64.b64decode('AA==')
@@ -58,11 +45,19 @@ if child==0:
             except OSError:pass
         if len(candidates)!=1:raise RuntimeError('No unique Android service after entering host context')
         target=candidates[0];out['target_pid']=target
+        # Resolve inside Android instead of depending on a Google boot receipt.
+        if old.get('boot_id')==boot and old.get('status')=='success' and old.get('target_pid')==target:
+            out.update(old);out['already_restored']=True
+            raise SystemExit()
+        build=subprocess.check_output(['/system/bin/getprop','ro.build.fingerprint'],text=True,timeout=3).strip()
+        if build!=config['fingerprint']:raise RuntimeError('Firmware changed; adapter must be re-evaluated')
         os.environ['STEPX_SYSTEM_SERVER_PID']=str(target)
         exec(compile(payload,'companion-fixed-boot-grant','exec'),globals())
         result=json.loads(out.get('java_result','{}'))
-        if result.get('status')!='success' or not result.get('all_granted') or not result.get('boot_pairing_started') or not out.get('detached'):raise RuntimeError(result.get('error','Boot grant read-back failed'))
+        monitor=result.get('companion_update',{})
+        if result.get('status')!='success' or not result.get('all_granted') or not result.get('boot_pairing_started') or not out.get('detached') or monitor.get('update_monitor') is not True or monitor.get('package')!=config['package'] or monitor.get('uid')!=config['uid']:raise RuntimeError(result.get('error','Boot grant read-back failed'))
         out['grant']=result
+        out['package_update_recovery']=True
         out['background_exempt']=result.get('runtime',{}).get('background_exempt') is True
         if not out['background_exempt']:raise RuntimeError('Background exemption read-back failed')
         # Check from Android's system domain: Ubuntu cannot stat Android tasks.
@@ -72,6 +67,7 @@ if child==0:
                 raise RuntimeError('Android service restarted after restoration')
         out['stability_verified']=True
         out['status']='success'
+    except SystemExit:pass
     except BaseException as error:out.update(status='failed',error=repr(error))
     finally:
         signal.alarm(0)

@@ -24,6 +24,10 @@ spec.loader.exec_module(permissions)
 AGENTBUS = 'com.stepos.agentbus'
 AGENTBUS_APK = '/system/priv-app/AgentBus/AgentBus.apk'
 AGENTBUS_SHA256 = '50a1bbd6af20d1cceff335e2336cff04e08d3718cf4cad581a86954c354f2a48'
+ALLOWED_AGENTBUS_SHA256S = (
+    AGENTBUS_SHA256,
+    'e89a65e1a153e87fdec850caffe9a19db4ed70244754e847e0c512c540a902f8',
+)
 SOCKET = 'stepx-amoo-lease-v1'
 STATE = Path(os.environ.get('XDG_STATE_HOME', Path.home() / '.local/state')) / 'stepx-companion/amoo-background'
 
@@ -53,7 +57,7 @@ def inspect(apk):
     if paths != ['package:' + AGENTBUS_APK]:
         raise RuntimeError('Unsupported AgentBus package location')
     digest = permissions.shell('sha256sum', AGENTBUS_APK).split()[0]
-    if digest != AGENTBUS_SHA256:
+    if digest not in ALLOWED_AGENTBUS_SHA256S:
         raise RuntimeError('Native AgentBus version changed; review its ABI before adaptation')
     identity = process_identity()
     sockets = permissions.shell('cat', '/proc/net/unix')
@@ -111,7 +115,7 @@ LEASE_UID={uid!r}
 LEASE_PID={identity['pid']!r}
 LEASE_START={identity['start_ticks']!r}
 LEASE_APK={AGENTBUS_APK!r}
-LEASE_APK_SHA256={AGENTBUS_SHA256!r}
+LEASE_APK_SHA256={identity.get('agentbus_sha256', AGENTBUS_SHA256)!r}
 '''
     code = prefix + source
     compile(code, 'stepx-amoo-background-worker', 'exec')

@@ -13,10 +13,26 @@ import types
 import unittest
 from unittest.mock import patch
 
-from host_runtime import java_environment, migrate_legacy_state, user_state_root
+from host_runtime import adb_executable, java_environment, migrate_legacy_state, user_state_root
 
 
 class HostRuntimeTests(unittest.TestCase):
+    def test_adb_executable_precedence(self):
+        exe = 'adb.exe' if os.name == 'nt' else 'adb'
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            packaged_adb = root / 'tools/bin' / exe
+            local_adb = root / '.tools/bin' / exe
+            local_adb.parent.mkdir(parents=True)
+            local_adb.touch()
+            with patch('host_runtime.ROOT', root), patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(adb_executable(), str(local_adb))
+                packaged_adb.parent.mkdir(parents=True)
+                packaged_adb.touch()
+                self.assertEqual(adb_executable(), str(packaged_adb))
+            with patch('host_runtime.ROOT', root), patch.dict(os.environ, {'STEPX_ADB': '/custom/adb'}, clear=True):
+                self.assertEqual(adb_executable(), '/custom/adb')
+
     def test_bundled_java_takes_precedence_over_system_java_home(self):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);bundled=root/'runtime/java';external=root/'other-java'

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Build a portable package from the native release binary and verified upstream tools."""
-import argparse, hashlib, os, plistlib, shutil, subprocess, tarfile, tempfile, urllib.request, zipfile
+import argparse, hashlib, os, platform, plistlib, shutil, subprocess, sys, tarfile, tempfile, urllib.request, zipfile
 from pathlib import Path
+from public_release_policy import audit_bundle, content_problems, manifest, runtime_plan, safe_read
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS = {
@@ -17,6 +18,14 @@ def main():
     import tomllib
     if tomllib.loads((ROOT/'desktop/Cargo.toml').read_text())['package']['version']!=a.version: p.error('Package version must match Cargo.toml')
     windows=a.platform.startswith('windows');mac=a.platform.startswith('macos')
+    host_os={'Darwin':'macos','Windows':'windows','Linux':'linux'}.get(platform.system())
+    host_arch={'AMD64':'x86_64','aarch64':'arm64'}.get(platform.machine(),platform.machine())
+    if a.platform != f'{host_os}-{host_arch}': p.error('Use a native runner for the requested platform; cross-built packages cannot be runtime-verified here')
+    policy=manifest(ROOT)
+    runtime_plan(ROOT)  # fail closed before staging any resource
+    documents={rel:safe_read(ROOT,rel) for rel in policy['package_documents']}
+    issues=[issue for rel,data in documents.items() for issue in content_problems(rel,data,policy)]
+    if issues: raise RuntimeError('\n'.join(issues))
     dist=ROOT/'dist';dist.mkdir(exist_ok=True)
     name=f'StepX-Companion-{a.version}-{a.platform}'
     with tempfile.TemporaryDirectory(prefix='stepx-package-') as td:
@@ -38,13 +47,9 @@ def main():
         else:binary_dir=resource_dir=base
         binary_name='stepx-companion'+('.exe' if windows else '')
         shutil.copy2(ROOT/'desktop'/'target'/'release'/binary_name,binary_dir/binary_name)
-        for folder in ['scripts','handoff']:
-            shutil.copytree(ROOT/folder,resource_dir/folder,ignore=shutil.ignore_patterns('__pycache__','*.pyc'))
-        shutil.copytree(ROOT/'desktop/assets',resource_dir/'desktop/assets')
-        shutil.copytree(ROOT/'licenses',resource_dir/'licenses')
-        for file in ['LICENSE','NOTICE','THIRD_PARTY_NOTICES.md','README.md','CHANGELOG.md']:
-            shutil.copy2(ROOT/file,resource_dir/file)
-        shutil.copytree(ROOT/'docs',resource_dir/'docs')
+        subprocess.run([sys.executable,str(ROOT/'scripts/stage-release-resources.py'),str(ROOT),str(resource_dir)],check=True)
+        for rel,data in documents.items():
+            target=resource_dir/rel;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(data)
         filename,digest=TOOLS[a.platform];download=stage/filename
         urllib.request.urlretrieve('https://github.com/Genymobile/scrcpy/releases/download/v5.0.1/'+filename,download)
         if hashlib.sha256(download.read_bytes()).hexdigest()!=digest:raise RuntimeError('Tool archive SHA256 mismatch')
@@ -55,7 +60,7 @@ def main():
             with tarfile.open(download) as t:t.extractall(unpack,filter='data')
         roots=list(unpack.iterdir());source=roots[0] if len(roots)==1 and roots[0].is_dir() else unpack
         tools_dir=resource_dir/'tools/bin';shutil.copytree(source,tools_dir)
-        subprocess.run([__import__('sys').executable,str(ROOT/'scripts/package-runtime.py'),str(resource_dir),*(['--windows'] if windows else [])],check=True)
+        subprocess.run([sys.executable,str(ROOT/'scripts/package-runtime.py'),str(resource_dir),*(['--windows'] if windows else [])],check=True)
         tool_env=os.environ.copy();tool_env['LD_LIBRARY_PATH']=str(tools_dir)+os.pathsep+tool_env.get('LD_LIBRARY_PATH','')
         for executable,arg in [(binary_dir/binary_name,'--version'),(tools_dir/('adb.exe' if windows else 'adb'),'version'),(tools_dir/('scrcpy.exe' if windows else 'scrcpy'),'--version')]:
             subprocess.run([str(executable),arg],check=True,env=tool_env,timeout=30)
@@ -65,6 +70,8 @@ def main():
             subprocess.run(['codesign','--force','--deep','--sign','-',str(base/'StepX Companion.app')],check=True)
             subprocess.run([str(binary_dir/binary_name),'--check-runtime'],check=True,timeout=45)
             subprocess.run(['codesign','--verify','--deep','--strict',str(base/'StepX Companion.app')],check=True)
+        issues=audit_bundle(resource_dir)
+        if issues: raise RuntimeError('Package privacy verification failed:\n'+'\n'.join(issues))
         if a.platform.startswith('linux'):
             output=dist/(name+'.tar.gz')
             with tarfile.open(output,'w:gz') as t:t.add(base,arcname=name)

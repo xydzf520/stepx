@@ -1,0 +1,43 @@
+{
+  "serial": "",
+  "fingerprint": "StepX/pandora/pandora:16/BQ2A.260122.002-BP2A.250705.008/172:user/release-keys",
+  "fingerprints": [
+    "StepX/pandora/pandora:16/BQ2A.260122.002-BP2A.250705.008/172:user/release-keys",
+    "StepX/pandora/pandora:16/BQ2A.260122.002-BP2A.250705.008/12:user/release-keys"
+  ],
+  "sdk": "36",
+  "abi": "arm64-v8a",
+  "stock_sha256": "5cfe5a88a97eca424bd4922fe813e0cc553adad0e8623105311ec1514022152f",
+  "native_hashes": {
+    "/apex/com.android.runtime/lib64/bionic/libc.so": "76a754389a8242328cec7c1fed868289a27eb843d49175e1e0ada83f9b60f6da",
+    "/apex/com.android.art/lib64/libart.so": "5d6a675fc9931595266623b7b682ec5c513128739f8194b64db289b3fddb0836"
+  },
+  "archive": {
+    "name": "MindTheGapps-16.0.0-arm64-20261021_084306.zip",
+    "url": "https://github.com/MindTheGapps/16.0.0-arm64/releases/download/MindTheGapps-16.0.0-arm64-20261021_084306/MindTheGapps-16.0.0-arm64-20261021_084306.zip",
+    "sha256": "7c3110cb07f448c5df776bcb81a0439f007649885ecc1953edb4b03c9a20daf3"
+  },
+  "apks": [
+    {
+      "package": "com.google.android.gms",
+      "filename": "com.google.android.gms@mtg16-20261021.apk",
+      "zip_path": "system/product/priv-app/GmsCore/GmsCore.apk",
+      "sha256": "7e8da09f20d490af64f3432ffa0b82fd035546e54bc6c7b9ac6650edbe8533b3",
+      "signer_sha256": "5f2391277b1dbd489000467e4c2fa6af802430080457dce2f618992e9dfb5402"
+    },
+    {
+      "package": "com.android.vending",
+      "filename": "com.android.vending@mtg16-20261021.apk",
+      "zip_path": "system/product/priv-app/Phonesky/Phonesky.apk",
+      "sha256": "8ee254546102d2a6accf269abe62869c54b098e1ba54fd538a47d2f79b9991d2",
+      "signer_sha256": "7ce83c1b71f3d572fed04c8d40c5cb10ff75e6d87d9df6fbd53f0468c2905053"
+    },
+    {
+      "package": "com.google.android.gsf",
+      "filename": "com.google.android.gsf@mtg16-20261021.apk",
+      "zip_path": "system/system_ext/priv-app/GoogleServicesFramework/GoogleServicesFramework.apk",
+      "sha256": "41c0d547ac1466e87ccf783e36192cacbda0f6010128327a2503b4330dc8b534",
+      "signer_sha256": "7ce83c1b71f3d572fed04c8d40c5cb10ff75e6d87d9df6fbd53f0468c2905053"
+    }
+  ]
+}

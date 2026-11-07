@@ -1,3 +1,4 @@
+from common import baseline_matches, DEVICE_KEY
 #!/usr/bin/env python3
 """Explicit workflow steps; invoking --help or preflight never installs anything."""
 import argparse
@@ -26,8 +27,20 @@ def preflight():
         'selinux': shell('getenforce'),
         'google_packages': {p: bool(shell('pm', 'list', 'packages', '--user', '0', p)) for p in PACKAGES},
     }
+    result['resume_install'] = resumable_install()
     print(json.dumps(result, indent=2))
     return result
+
+
+def resumable_install():
+    try:
+        baseline=json.loads((STATE/'baseline.json').read_text())
+        receipt=json.loads((STATE/'install-progress.json').read_text())
+        return (baseline_matches(baseline) and receipt.get('serial')==DEVICE_KEY
+                and receipt.get('fingerprint')==CONFIG['fingerprint']
+                and not any(p in baseline.get('packages',[]) for p in PACKAGES)
+                and not (STATE/'boot-install.json').exists())
+    except (OSError,ValueError): return False
 
 
 def fetch(archive=None):
@@ -64,13 +77,18 @@ def check_apks():
 def prepare():
     current = preflight()
     assert current['user_unlocked'], 'Unlock the phone first'
+    if (STATE/'baseline.json').exists():
+        assert resumable_install(), '现有安装基线需要核对，未覆盖备份或账号数据'
+        assert sha256(STATE/'ubuntu_zygote.stock')==CONFIG['stock_sha256'], '原启动文件备份校验失败'
+        print('Resuming the same verified installation; original baseline retained.')
+        return
     assert not any(current['google_packages'].values()), 'Google packages already exist; use maintenance workflow'
     all_packages = shell('pm', 'list', 'packages', '-u')
     assert all('package:' + p + '\n' not in all_packages + '\n' for p in PACKAGES), 'Prior Google package state exists'
     assert re.findall(r'UserInfo\{(\d+):', shell('pm', 'list', 'users')) == ['0'], 'Only user 0 was validated'
     init_state()
     assert not (STATE / 'baseline.json').exists(), 'Do not overwrite an existing baseline'
-    baseline = {'serial': ADB[-1], 'fingerprint': CONFIG['fingerprint'],
+    baseline = {'serial': DEVICE_KEY, 'fingerprint': CONFIG['fingerprint'],
                 'packages': [x.removeprefix('package:') for x in shell('pm', 'list', 'packages').splitlines()],
                 'google_core': shell('settings', 'get', 'global', 'cn_gms_core'),
                 'autofill': shell('settings', 'get', 'secure', 'autofill_service'),
@@ -95,6 +113,7 @@ print(json.dumps(r))
     for path, encoded in proof['files'].items():
         private_write(STATE / ('before-' + path.rsplit('/', 1)[-1]), base64.b64decode(encoded))
     save_json('baseline.json', baseline)
+    save_json('install-progress.json', {'serial':DEVICE_KEY,'fingerprint':CONFIG['fingerprint'],'completed':[]})
     print('Original launcher and package/permission metadata saved privately. No Google APK installed yet.')
 
 
@@ -102,17 +121,29 @@ def install_apks():
     guard(native=True)
     baseline = json.loads((STATE / 'baseline.json').read_text())
     assert baseline['fingerprint'] == CONFIG['fingerprint']
-    assert baseline.get('serial', CONFIG['serial']) == ADB[-1], 'Wrong device baseline'
+    assert baseline_matches(baseline), 'Wrong device baseline'
     assert all(p not in baseline['packages'] for p in PACKAGES)
-    assert all(not shell('pm', 'list', 'packages', '--user', '0', p) for p in PACKAGES), 'Do not overwrite an existing installation'
+    assert resumable_install(), '缺少本次安装记录；未覆盖已有 Google 组件'
     check_apks()
     for package in PACKAGES:
         meta = next(x for x in CONFIG['apks'] if x['package'] == package)
+        if shell('pm','list','packages','--user','0',package):
+            paths=shell('pm','path','--user','0',package).splitlines()
+            assert len(paths)==1 and paths[0].startswith('package:/data/app/'), '已有 Google 组件位置不同，未覆盖'
+            current=shell('sha256sum',paths[0][8:]).split()[0]
+            assert current==meta['sha256'], '已有 Google 组件版本不同，已保留；请使用检测/修复'
+            print('Preserved verified installed package: '+package,flush=True)
+            continue
         # These provider packages must be discoverable by clients that assume a
         # preinstalled GMS stack. This does not mark them SYSTEM/PRIVILEGED.
         result = run(ADB + ['install', '--user', '0', '--force-queryable', str(DOWNLOADS / meta['filename'])], timeout=180)
         assert 'Success' in result.stdout, 'Installation not confirmed: ' + package
-        print('Installed ' + package, flush=True)
+        paths=shell('pm','path','--user','0',package).splitlines()
+        assert len(paths)==1 and paths[0].startswith('package:/data/app/') and shell('sha256sum',paths[0][8:]).split()[0]==meta['sha256'], 'Installed APK read-back mismatch'
+        receipt=json.loads((STATE/'install-progress.json').read_text())
+        receipt['completed']=list(dict.fromkeys(receipt.get('completed',[])+[package]))
+        save_json('install-progress.json',receipt)
+        print('Installed and verified ' + package, flush=True)
     shell('settings', 'put', 'global', 'cn_gms_core', '1')
     for package in PACKAGES:
         shell('pm', 'grant', package, 'android.permission.INTERACT_ACROSS_USERS')
@@ -273,7 +304,7 @@ def adopt(source):
     baseline = json.loads((origin / 'baseline.json').read_text())
     install = json.loads((origin / 'boot-install.json').read_text())
     assert baseline['fingerprint'] == CONFIG['fingerprint']
-    assert baseline.get('serial', CONFIG['serial']) == ADB[-1], 'Backup belongs to a different device'
+    assert baseline_matches(baseline), 'Backup belongs to a different device'
     assert sha256(origin / 'ubuntu_zygote.stock') == CONFIG['stock_sha256'] == install['original_sha256']
     current = root_json("import hashlib,json;print(json.dumps({'sha':hashlib.sha256(open('/usr/local/bin/ubuntu_zygote','rb').read()).hexdigest()}))")
     assert current['sha'] == install['launcher_sha256'], 'Installed launcher differs from recovery metadata'
@@ -287,7 +318,7 @@ def recover_metadata():
     guard(native=True)
     baseline = json.loads((STATE / 'baseline.json').read_text())
     assert baseline['fingerprint'] == CONFIG['fingerprint']
-    assert baseline.get('serial', CONFIG['serial']) == ADB[-1]
+    assert baseline_matches(baseline)
     assert sha256(STATE / 'ubuntu_zygote.stock') == CONFIG['stock_sha256']
     assert not (STATE / 'boot-install.json').exists(), 'Existing recovery metadata must be reviewed, not overwritten'
     expected = {p.name: sha256(p) for p in (ROOT / 'module').glob('*.py')}

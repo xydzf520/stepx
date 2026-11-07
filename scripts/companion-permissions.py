@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = Path(os.environ.get('STEPX_GOOGLE_HOME', ROOT / 'handoff/google-play-stepx')).resolve()
 sys.path.insert(0, str(WORKFLOW / 'tools'))
 import common
-from common import ADB, CONFIG, guard, root_json, shell
+from common import ADB, ALLOWED_FINGERPRINTS, CONFIG, guard, root_json, shell
 from host_runtime import file_lock, sdk_tool, sdk_command, java_environment, subprocess_options
 from companion_apk import ensure_update_preserves_runtime, signer_digests
 from companion_loader import adapt as adapt_native_loader
@@ -37,7 +37,7 @@ WAKE_OWNER = 'com.stepos.pushservice'
 WAKE_SCOPE = 'wake_permission_v1'
 AUTHORIZED_SERIAL = os.environ.get('STEPX_SERIAL') or os.environ.get('STEPX_DEVICE_SERIAL') or CONFIG.get('serial', '')
 LOADER_SHA256 = '279305289749acada3f9951c816d7e9f00367dce4331d4396c04554e4685fbf8'
-WORKER_SHA256 = '71be97798c805fc803b8eef47f9188aadd0c17f23a2b12ac607e8fa242ed188a'
+WORKER_SHA256 = '30612b56e23f914f7672863adceffc72fd643ce69d1d1b08fccd9057cd09fdb0'
 STATE = Path(os.environ.get('XDG_STATE_HOME', Path.home() / '.local/state')) / 'stepx-companion/permissions'
 
 
@@ -197,7 +197,7 @@ def finish_install():
         return {'status': 'unchanged', 'package': PACKAGE, 'restore_required': False}
     baseline = json.loads(path.read_text())
     allowed_serials = {s for s in (device_key(), ADB[-1], os.environ.get('STEPX_DEVICE_SERIAL', '')) if s}
-    if baseline.get('package') != PACKAGE or baseline.get('key') != INSTALL_KEY or baseline.get('serial') not in allowed_serials or baseline.get('fingerprint') != CONFIG['fingerprint'] or baseline.get('temporary') != INSTALL_VALUE:
+    if baseline.get('package') != PACKAGE or baseline.get('key') != INSTALL_KEY or baseline.get('serial') not in allowed_serials or baseline.get('fingerprint') not in ALLOWED_FINGERPRINTS or baseline.get('temporary') != INSTALL_VALUE:
         raise RuntimeError('USB installation recovery baseline mismatch')
     previous = baseline.get('previous')
     if previous is not None and (not isinstance(previous, str) or len(previous) > 512):
@@ -223,7 +223,7 @@ def baseline_path(cert, uid):
 
 
 def validate_baseline(prior, cert, uid):
-    if prior and (prior.get('signer') != cert or prior.get('fingerprint') != CONFIG['fingerprint'] or prior.get('uid') != uid):
+    if prior and (prior.get('signer') != cert or prior.get('fingerprint') not in ALLOWED_FINGERPRINTS or prior.get('uid') != uid):
         raise RuntimeError('Companion permission baseline or UID mismatch')
 
 
@@ -260,7 +260,10 @@ def runtime_identity(cert, uid):
     pid = shell('pidof', 'system_server')
     if not re.fullmatch(r'[0-9a-f-]{36}', boot) or not re.fullmatch(r'[1-9][0-9]*', pid):
         raise RuntimeError('Unable to verify the current OEM freezer runtime')
-    identity = {'serial': device_key(), 'fingerprint': CONFIG['fingerprint'], 'package': PACKAGE,
+    actual_fp = shell('getprop', 'ro.build.fingerprint')
+    if actual_fp not in ALLOWED_FINGERPRINTS:
+        raise RuntimeError('Unsupported firmware for OEM freezer runtime')
+    identity = {'serial': device_key(), 'fingerprint': actual_fp, 'package': PACKAGE,
                 'signer': cert, 'uid': uid, 'boot_id': boot, 'system_server_pid': int(pid)}
     key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:24]
     return identity, STATE / ('runtime-' + key + '.json')
@@ -575,7 +578,7 @@ def inject(cert, grant, restore_flags, expected_uid):
         raise RuntimeError('Native loader changed; review the companion adapter before reuse')
     source = adapt_native_loader(source)
     dex = (ROOT / 'desktop/assets/stepx-companion-permissions.dex').read_bytes()
-    if not dex.startswith(b'dex\n') or len(dex) > 64 * 1024:
+    if not dex.startswith(b'dex\n') or len(dex) > 128 * 1024:
         raise RuntimeError('Invalid companion permission DEX')
     source, count = re.subn(r'dex=base64\.b64decode\([^\n]+?\);dexp=',
         'dex=base64.b64decode(COMPANION_DEX);dexp=', source)
@@ -654,7 +657,7 @@ def inject_connection(cert, operation, before_flags, expected_uid):
         raise RuntimeError('Native loader changed; review the connection permission adapter')
     source = adapt_native_loader(source)
     dex = (ROOT / 'desktop/assets/stepx-companion-permissions.dex').read_bytes()
-    if not dex.startswith(b'dex\n') or len(dex) > 64 * 1024:
+    if not dex.startswith(b'dex\n') or len(dex) > 128 * 1024:
         raise RuntimeError('Invalid companion permission DEX')
     source, count = re.subn(r'dex=base64\.b64decode\([^\n]+?\);dexp=',
         'dex=base64.b64decode(CONNECTION_DEX);dexp=', source)
@@ -779,7 +782,7 @@ def inject_wake(cert, operation, before_flags, expected_uid):
         raise RuntimeError('Native loader changed; review the wake permission adapter')
     source = adapt_native_loader(source)
     dex = (ROOT / 'desktop/assets/stepx-companion-permissions.dex').read_bytes()
-    if not dex.startswith(b'dex\n') or len(dex) > 64 * 1024:
+    if not dex.startswith(b'dex\n') or len(dex) > 128 * 1024:
         raise RuntimeError('Invalid companion permission DEX')
     source, count = re.subn(r'dex=base64\.b64decode\([^\n]+?\);dexp=',
         'dex=base64.b64decode(WAKE_DEX);dexp=', source)

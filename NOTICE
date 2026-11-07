@@ -1,4 +1,72 @@
-StepX Companion — community desktop application, 2026.
-AGPL-3.0-only, except separately licensed third-party components and reserved brand assets.
-See THIRD_PARTY_NOTICES.md and licenses/ for retained upstream notices.
-Corresponding source: https://github.com/xydzf520/stepx
+StepX Companion — Legal Notice & Disclaimers / 项目声明与免责说明
+===================================================================
+
+1. Project & License / 项目与开源许可
+-------------------------------------
+Project Name / 项目名称: StepX Companion
+Source License / 源码许可证: GNU Affero General Public License v3.0 only (SPDX: AGPL-3.0-only)
+
+Copyright (c) 2026 StepX Companion Contributors.
+
+StepX Companion source code is licensed under the GNU Affero General Public
+License Version 3 only (AGPL-3.0-only). See the root `LICENSE` file for the
+full license text and `THIRD_PARTY_NOTICES.md` for third-party component
+attributions and licenses.
+
+StepX Companion 项目源码按 GNU Affero 通用公共许可证第 3 版（仅限 v3，SPDX 标识符：
+`AGPL-3.0-only`）发布。完整许可证文本见根目录 `LICENSE` 文件，第三方组件与依赖的版权
+及许可说明见 `THIRD_PARTY_NOTICES.md`。
+
+
+2. Non-Affiliation & Trademark Disclaimer / 非官方隶属与商标声明
+----------------------------------------------------------------
+StepX Companion is an independent, community-developed companion client designed
+for STEPX Neo / PZ261A devices. This project is NOT affiliated with, sponsored
+by, authorized by, or endorsed by STEPX, StepFun, Amoo, Google, or any of their
+affiliates or subsidiaries.
+
+All third-party product names, brands, logos, trademarks, service marks, and
+original manufacturer assets (including but not limited to "STEPX", "STEPX Neo",
+"Amoo", "Android", "Google", and "Google Play") are the property of their
+respective owners. Use of these names in documentation or user interfaces is
+solely for identification and compatibility description. The open-source license
+of this repository does NOT grant any trademark rights, brand licenses, or
+implied endorsements.
+
+StepX Companion 是面向 STEPX Neo / PZ261A 用户的独立社区开发伴侣客户端，与 STEPX、
+阶跃星辰（StepFun）、Amoo、Google 或其关联方不存在任何官方隶属、授权、赞助或背书关系。
+
+仓库及文档中提及的品牌、产品名称、标志、商标及原厂素材权利均归各自原权利人所有，仅用
+于说明设备兼容性与功能适配范围；本项目的源码开源许可不授予任何商标权、品牌使用权或官
+方背书。
+
+
+3. Scope, Redistribution & Boundary Disclaimer / 分发范围与边界声明
+-------------------------------------------------------------------
+- No Proprietary Google APKs Bundled / 不分发专有 Google APK：
+  Public distributions and source repositories of StepX Companion do NOT bundle
+  or redistribute proprietary Google Mobile Services (GMS) or Google Play APKs.
+  Any installation workflow fetches packages from designated upstream sources
+  and verifies cryptographic integrity locally. Installing GMS components does
+  not grant Google Play Protect / device attestation certification to
+  uncertified hardware.
+  公开仓库与发布包均不内置或再分发专有 Google / GMS APK；相关安装辅助仅从指定上游来
+  源获取并校验完整性，且不能为未获认证的机型授予 Google 设备认证。
+
+- No Unlicensed Upstream Execution Engines Bundled / 不包含未授权上游执行引擎：
+  Public distributions and standard companion APKs include only StepX Companion's
+  own IPC adapter layer and build scripts (`desktop/neo-agent-adapter/`), and do
+  NOT bundle or redistribute unlicensed upstream GUI Agent execution engines
+  (such as Neo Agent Touch binaries or upstream sources).
+  公开仓库与标准公开伴侣 APK 仅包含独立编写的适配层与构建脚本（见
+  `desktop/neo-agent-adapter/`），不内置或再分发许可尚未明确的上游 GUI Agent 执行引
+  擎或 APK。
+
+- User Data & Experimental Capabilities / 用户数据与实验性能力边界：
+  This repository contains no account credentials, private keys, personal device
+  backups, or private chat logs. System maintenance, permission provisioning,
+  and experimental device workflows are executed locally under explicit user
+  confirmation and are provided on an "AS IS" basis without warranty.
+  本仓库不包含任何账号密钥、个人手机备份或私有聊天记录。系统维护、权限配置及实验性设
+  备功能均需用户本人明确确认后在本机执行，按“原样（AS IS）”提供，不附带任何明示或默示
+  担保。

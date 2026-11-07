@@ -20,9 +20,16 @@ public final class ApkIdentity {
     }
     private static String metadata(byte[] manifest, String name) throws Exception {
         List<String> components = new ArrayList<>();
+        long versionCode = -1;
         AndroidBinXmlParser parser = new AndroidBinXmlParser(ByteBuffer.wrap(manifest));
         for (int event = parser.getEventType(); event != AndroidBinXmlParser.EVENT_END_DOCUMENT; event = parser.next()) {
-            if (event != AndroidBinXmlParser.EVENT_START_ELEMENT || parser.getDepth() != 3) continue;
+            if (event != AndroidBinXmlParser.EVENT_START_ELEMENT) continue;
+            if (parser.getDepth() == 1 && parser.getName().equals("manifest")) {
+                for (int i = 0; i < parser.getAttributeCount(); i++)
+                    if ("http://schemas.android.com/apk/res/android".equals(parser.getAttributeNamespace(i)) && "versionCode".equals(parser.getAttributeName(i)))
+                        versionCode = Integer.toUnsignedLong(parser.getAttributeIntValue(i));
+            }
+            if (parser.getDepth() != 3) continue;
             String type = parser.getName();
             if (!(type.equals("service") || type.equals("provider") || type.equals("activity"))) continue;
             StringBuilder item = new StringBuilder("{\"type\":").append(quote(type));
@@ -38,7 +45,7 @@ public final class ApkIdentity {
             }
             components.add(item.append('}').toString());
         }
-        return "{\"package\":" + quote(name) + ",\"components\":[" + String.join(",", components) + "]}";
+        return "{\"package\":" + quote(name) + ",\"versionCode\":" + versionCode + ",\"components\":[" + String.join(",", components) + "]}";
     }
     public static void main(String[] args) throws Exception {
         if (args.length < 1 || args.length > 2 || args.length == 2 && !args[1].equals("--manifest"))

@@ -25,7 +25,7 @@ def run(args, timeout=30):
 def signer_digests(proof):
     # Android build-tools 37 labels signers by signing scheme; older tools use Signer #1.
     return {value.lower() for value in re.findall(
-        r'^(?:Signer #\d+|V\d+(?:\.\d+)? Signer(?: #\d+)?):? certificate SHA-256 digest: ([a-fA-F0-9]{64})$',
+        r'^(?:Signer #\d+|Signer \([^)]+\)|V\d+(?:\.\d+)? Signer(?: #\d+)?|V\d+(?:\.\d+)? Signer \([^)]+\)):? certificate SHA-256 digest: ([a-fA-F0-9]{64})$',
         proof, re.M)}
 
 
@@ -50,9 +50,9 @@ def apk_identity(path):
     package = apk_package(path)
     proof = run(sdk_command('apksigner') + ['verify', '--print-certs', path])
     certs = signer_digests(proof)
-    if len(certs) != 1:
+    if not certs:
         raise RuntimeError('APK 必须具有一个可验证的签名')
-    return package, next(iter(certs))
+    return package, sorted(certs)[0]
 
 
 def apk_manifest(path):
@@ -84,7 +84,22 @@ def apk_manifest(path):
         if text: active[attr.group(1)] = text.group(1)
         elif attr.group(1) == 'enabled' and '(type 0x12)' in raw:
             active['enabled'] = not raw.strip().endswith('0x0')
-    return {'package':package, 'components':result}
+    code = re.search(r'android:versionCode(?:\([^)]*\))?=\(type 0x10\)(0x[0-9a-fA-F]+)', xml)
+    return {'package':package, 'components':result, 'versionCode':int(code.group(1),16) if code else -1}
+
+
+def installation_choice(candidate, installed):
+    """A repair must never remove an embedded engine or downgrade an installed APK."""
+    if candidate.get('package') != PACKAGE or installed and installed.get('package') != PACKAGE:
+        raise RuntimeError('伴侣安装包身份不匹配')
+    if not installed: return 'candidate', ''
+    if has_embedded_engine(installed) and not embedded_runtime(candidate):
+        return 'installed', '已保留手机内置 GUI Agent 的完整版本；本次只修复服务与权限。'
+    a, b = candidate.get('versionCode', -1), installed.get('versionCode', -1)
+    if not isinstance(a, int) or not isinstance(b, int) or min(a,b) < 0:
+        raise RuntimeError('无法核对伴侣版本，请使用完整新版客户端')
+    if a < b: return 'installed', '手机伴侣版本更新，已保留；本次只修复服务与权限。'
+    return 'candidate', ''
 
 
 def embedded_runtime(manifest):

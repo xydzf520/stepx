@@ -1825,17 +1825,22 @@ def _tool(name, environment):
 
 def build_ota_probe(scratch):
     """Compile the read-only firmware probe when no prebuilt dex is available."""
-    jdk = os.environ.get("STEPX_JDK")
-    candidates = [jdk] if jdk else list(JDK_CANDIDATES)
+    jdk = os.environ.get("STEPX_JDK") or os.environ.get("JAVA_HOME")
+    candidates = ([jdk] if jdk else []) + list(JDK_CANDIDATES)
     javac = next((Path(root) / "bin" / "javac" for root in candidates
-                  if (Path(root) / "bin" / "javac").is_file()), None)
+                  if root and (Path(root) / "bin" / "javac").is_file()), None)
     if javac is None:
         found = shutil.which("javac")
         javac = Path(found) if found else None
     if javac is None:
         return None
-    sdk = os.environ.get("ANDROID_SDK_ROOT") or os.environ.get("ANDROID_HOME")
+    sdk = (os.environ.get("ANDROID_SDK_ROOT")
+           or os.environ.get("ANDROID_HOME")
+           or str(Path.home() / "Android" / "Sdk"))
     android_jar = Path(sdk) / "platforms" / "android-36" / "android.jar" if sdk else None
+    if android_jar is None or not android_jar.is_file():
+        jars = sorted((Path(sdk) / "platforms").glob("android-*/android.jar"), reverse=True) if sdk else []
+        android_jar = jars[0] if jars else None
     if android_jar is None or not android_jar.is_file():
         return None
     r8 = Path(sdk) / "cmdline-tools" / "latest" / "lib" / "r8.jar"
@@ -1892,14 +1897,12 @@ def probe_firmware(device):
                                   "classes.dex，也无法用 JDK + d8 重新构建。")
                 return result
             dex = built
-        if not library.is_file():
-            result["note"] = "缺少 research/ota-probe/libupgrade.so，探针无法加载更新器原生库。"
-            return result
         try:
             device.shell("rm", "-rf", OTA_REMOTE, OTA_LIBDIR)
             device.shell("mkdir", "-p", OTA_REMOTE, OTA_LIBDIR)
             device.raw("push", str(dex), f"{OTA_REMOTE}/classes.dex", timeout=120)
-            device.raw("push", str(library), f"{OTA_LIBDIR}/libupgrade.so", timeout=120)
+            if library.is_file():
+                device.raw("push", str(library), f"{OTA_LIBDIR}/libupgrade.so", timeout=120)
         except ProbeError as error:
             result["note"] = f"无法把探针送到手机：{error}"
             return result

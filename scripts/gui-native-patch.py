@@ -23,8 +23,12 @@ spec.loader.exec_module(permissions)
 ABILITY = 'com.stepos.ability'
 ABILITY_APK = '/system/priv-app/ability/ability.apk'
 ABILITY_SHA256 = 'c9f56f3078df96d8d726422b1c622a1c19fe8c7dec8cadd8537d9a6ecf513ac4'
+ALLOWED_ABILITY_SHA256S = (
+    ABILITY_SHA256,
+    'a7dbeaa721c13836bbb3990026af6c3d66bf164afc4c73f70bd453aa119fbca8',
+)
 SOCKET = 'stepx-native-gui-v1'
-PROBE_DEX_SHA256 = '2a53e3d0707e43bbf7851f4a93e092f327f26c115adde04dcc3d3d88077f8a38'
+PROBE_DEX_SHA256 = 'e8e73c221a7278a78ebcbb6dea71675e63879467914f0b7eb594db3462fec160'
 STATE = Path(os.environ.get('XDG_STATE_HOME', Path.home() / '.local/state')) / 'stepx-companion/native-gui'
 
 
@@ -53,7 +57,7 @@ def inspect(apk):
     if paths != ['package:' + ABILITY_APK]:
         raise RuntimeError('Unsupported Ability package location')
     digest = permissions.shell('sha256sum', ABILITY_APK).split()[0]
-    if digest != ABILITY_SHA256:
+    if digest not in ALLOWED_ABILITY_SHA256S:
         raise RuntimeError('Native Ability version changed; review its ABI before adaptation')
     identity = process_identity()
     sockets = permissions.shell('cat', '/proc/net/unix')
@@ -123,7 +127,7 @@ LEASE_PID={identity['pid']!r}
 LEASE_START={identity['start_ticks']!r}
 LEASE_BOOT={identity['boot_id']!r}
 LEASE_APK={ABILITY_APK!r}
-LEASE_APK_SHA256={ABILITY_SHA256!r}
+LEASE_APK_SHA256={identity.get('ability_sha256', ABILITY_SHA256)!r}
 '''
     code = 'import re\n' + prefix + source
     compile(code, 'stepx-amoo-background-worker', 'exec')

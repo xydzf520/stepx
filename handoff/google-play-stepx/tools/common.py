@@ -9,16 +9,34 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
-CONFIG = json.loads((ROOT / 'target.json').read_text())
-SERIAL = os.environ.get('STEPX_SERIAL') or os.environ.get('STEPX_DEVICE_SERIAL') or CONFIG.get('serial', '')
-DEVICE_SERIAL = os.environ.get('STEPX_DEVICE_SERIAL', '')
-ADB = [os.environ.get('STEPX_ADB', shutil.which('adb') or 'adb'), '-s', SERIAL]
-
-
 sys.path.insert(0, str(ROOT.parents[1] / 'scripts'))
 from host_runtime import sdk_tool, sdk_command, subprocess_options, user_state_root, migrate_legacy_state
 
-STATE = user_state_root() / 'google-play/state'
+
+def _resolve_adb():
+    env_adb = os.environ.get('STEPX_ADB')
+    if env_adb:
+        return env_adb
+    adb_name = 'adb.exe' if os.name == 'nt' else 'adb'
+    for rel in ('tools/bin', '.tools/bin'):
+        candidate = ROOT.parents[1] / rel / adb_name
+        if candidate.is_file():
+            return str(candidate)
+    return shutil.which('adb') or 'adb'
+
+
+CONFIG = json.loads((ROOT / 'target.json').read_text())
+ALLOWED_FINGERPRINTS = tuple(dict.fromkeys(CONFIG.get('fingerprints') or [
+    CONFIG['fingerprint'],
+    'StepX/pandora/pandora:16/BQ2A.260122.002-BP2A.250705.008/12:user/release-keys',
+    'StepX/pandora/pandora:16/BQ2A.260122.002-BP2A.250705.008/172:user/release-keys',
+]))
+SERIAL = os.environ.get('STEPX_SERIAL') or os.environ.get('STEPX_DEVICE_SERIAL') or CONFIG.get('serial', '')
+DEVICE_SERIAL = os.environ.get('STEPX_DEVICE_SERIAL', '')
+ADB = [_resolve_adb(), '-s', SERIAL]
+
+DEVICE_KEY = DEVICE_SERIAL or (SERIAL if ':' not in SERIAL and '._adb-' not in SERIAL else '')
+STATE = user_state_root() / 'google-play/devices' / hashlib.sha256(DEVICE_KEY.encode()).hexdigest()[:24] / 'state'
 DOWNLOADS = user_state_root() / 'google-play/downloads'
 
 
@@ -44,9 +62,13 @@ def guard(native=False):
     if run(ADB + ['get-state']).stdout.strip() != 'device':
         raise RuntimeError('手机连接未授权或已离线，请重新连接')
     if shell('getprop', 'ro.serialno') != expected:
+        if not os.environ.get('STEPX_SERIAL') and not os.environ.get('STEPX_DEVICE_SERIAL'):
+            raise RuntimeError('连接的手机与已选设备不一致，请重新选择设备（命令行运行请设置环境变量 STEPX_SERIAL=<设备序列号>）')
         raise RuntimeError('连接的手机与已选设备不一致，请重新选择设备')
-    assert shell('getprop', 'ro.build.fingerprint') == CONFIG['fingerprint'], 'Unsupported firmware'
-    assert shell('getprop', 'ro.build.version.sdk') == CONFIG['sdk'], 'Unsupported SDK'
+    actual_fp = shell('getprop', 'ro.build.fingerprint')
+    assert actual_fp in ALLOWED_FINGERPRINTS, f"Unsupported firmware: {actual_fp} (expected {ALLOWED_FINGERPRINTS})"
+    actual_sdk = shell('getprop', 'ro.build.version.sdk')
+    assert actual_sdk == CONFIG['sdk'], f"Unsupported SDK: {actual_sdk} (expected {CONFIG['sdk']})"
     assert shell('getprop', 'ro.product.cpu.abilist') == CONFIG['abi'], 'Unsupported ABI'
     assert shell('getenforce') == 'Enforcing', 'Unexpected SELinux state'
     if native:
@@ -56,9 +78,19 @@ def guard(native=False):
 
 
 def init_state():
-    migrate_legacy_state(ROOT / 'state', STATE)
+    # Recovery evidence belongs to a hardware identity, not an IP/ADB port.
+    for legacy in (user_state_root() / 'google-play/state', ROOT / 'state'):
+        if STATE.exists(): break
+        try: baseline = json.loads((legacy / 'baseline.json').read_text())
+        except (OSError,ValueError): continue
+        if baseline.get('serial') in (DEVICE_KEY, SERIAL) and DEVICE_KEY:
+            migrate_legacy_state(legacy, STATE)
     STATE.mkdir(parents=True, mode=0o700, exist_ok=True)
     STATE.chmod(0o700)
+
+
+def baseline_matches(value):
+    return bool(DEVICE_KEY) and value.get('serial') in (DEVICE_KEY, SERIAL) and value.get('fingerprint') in ALLOWED_FINGERPRINTS
 
 
 def private_write(path, data):

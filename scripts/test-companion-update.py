@@ -4,12 +4,15 @@ import copy
 import importlib.util
 from pathlib import Path
 import tempfile
+import subprocess
 import unittest
 from unittest.mock import patch
 import companion_apk as apk
 
 spec = importlib.util.spec_from_file_location('companion_permissions', Path(__file__).with_name('companion-permissions.py'))
 permissions = importlib.util.module_from_spec(spec); spec.loader.exec_module(permissions)
+plan_spec = importlib.util.spec_from_file_location('companion_install_plan', Path(__file__).with_name('companion-install-plan.py'))
+install_plan = importlib.util.module_from_spec(plan_spec); plan_spec.loader.exec_module(install_plan)
 
 
 def manifest(embedded=False):
@@ -23,7 +26,72 @@ def manifest(embedded=False):
     return value
 
 
+class ReplacementFirmwareTests(unittest.TestCase):
+    def device_patches(self, serial='NEW_PHONE', fingerprint='StepX/pandora/new-firmware', model='PZ261A', sdk='36'):
+        values = {'ro.serialno': serial, 'ro.product.model': model,
+                  'ro.product.device': 'pandora' if model == 'PZ261A' else 'other',
+                  'ro.build.version.sdk': sdk, 'ro.build.fingerprint': fingerprint}
+        def shell(*args):
+            self.assertEqual(args[0], 'getprop')
+            return values[args[1]]
+        for mock in (patch.object(install_plan.p, 'ADB', ['adb', '-s', '192.0.2.8:43001']),
+                     patch.dict(install_plan.os.environ, {'STEPX_DEVICE_SERIAL': 'NEW_PHONE'}),
+                     patch.object(install_plan.p, 'run', return_value='device'),
+                     patch.object(install_plan.p, 'shell', side_effect=shell)):
+            mock.start(); self.addCleanup(mock.stop)
+
+    def test_new_firmware_first_install_does_not_use_privileged_adapter(self):
+        self.device_patches()
+        with tempfile.TemporaryDirectory() as folder:
+            candidate = Path(folder)/'candidate.apk'; candidate.write_bytes(b'signed fixture')
+            trusted = Path(folder)/'trusted.apk'; trusted.write_bytes(b'signed fixture')
+            selected = Path(folder)/'selected.apk'
+            with patch.object(install_plan.p, 'guard', side_effect=AssertionError('must not adapt firmware')), \
+                 patch.object(install_plan.p, 'root_json', side_effect=AssertionError('must not use root')), \
+                 patch.object(install_plan, 'apk_identity', return_value=(apk.PACKAGE, 'signer')), \
+                 patch.object(install_plan, 'apk_manifest', return_value=manifest()), \
+                 patch.object(install_plan, 'package_paths', return_value=[]):
+                result = install_plan.plan(candidate, trusted, selected)
+            self.assertTrue(result['needs_install'])
+            self.assertFalse(result['system_adaptation_supported'])
+            self.assertEqual(selected.read_bytes(), candidate.read_bytes())
+
+    def test_known_firmware_still_selects_guarded_system_adaptation(self):
+        self.device_patches(fingerprint=install_plan.p.ALLOWED_FINGERPRINTS[0])
+        self.assertTrue(install_plan.installation_device()['system_adaptation_supported'])
+
+    def test_reused_wireless_address_for_another_phone_is_rejected(self):
+        self.device_patches(serial='OLD_PHONE')
+        with self.assertRaisesRegex(RuntimeError, '不一致'):
+            install_plan.installation_device()
+
+    def test_unknown_firmware_does_not_bypass_apk_signer(self):
+        self.device_patches()
+        with patch.object(install_plan, 'apk_identity', side_effect=[(apk.PACKAGE,'bad'),(apk.PACKAGE,'good')]), \
+             patch.object(install_plan, 'package_paths') as paths:
+            with self.assertRaisesRegex(RuntimeError, '签名不一致'):
+                install_plan.plan(Path('candidate'), Path('trusted'), Path('selected'))
+            paths.assert_not_called()
+
+    def test_non_stepx_phone_is_rejected(self):
+        self.device_patches(model='Other')
+        with self.assertRaisesRegex(RuntimeError, '不是已支持'):
+            install_plan.installation_device()
+
+    def test_old_android_is_rejected(self):
+        self.device_patches(sdk='32')
+        with self.assertRaisesRegex(RuntimeError, 'Android 13'):
+            install_plan.installation_device()
+
+
 class PreservationTests(unittest.TestCase):
+    def test_absent_android_package_is_a_first_install(self):
+        with patch.object(install_plan.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1, '', '')):
+            self.assertEqual(install_plan.package_paths(), [])
+    def test_transport_failure_is_not_treated_as_missing_package(self):
+        with patch.object(install_plan.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1, '', 'device offline')):
+            with self.assertRaisesRegex(RuntimeError, '无法核对'):
+                install_plan.package_paths()
     def test_generic_package_reader_does_not_apply_companion_size_limit(self):
         with tempfile.TemporaryDirectory() as temp:
             candidate = Path(temp) / 'large-app.apk'

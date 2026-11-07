@@ -124,6 +124,8 @@ def main():
     queries = root.find('queries')
     ET.SubElement(queries, 'package', {ANDROID+'name':'com.stepx.companion.app'})
     ET.SubElement(app, 'provider', {ANDROID+'name':'.CompanionBridgeProvider', ANDROID+'authorities':PACKAGE+'.control', ANDROID+'exported':'true'})
+    service = ET.SubElement(app, 'service', {ANDROID+'name':'.CompanionMdiService', ANDROID+'exported':'false', ANDROID+'foregroundServiceType':'specialUse'})
+    ET.SubElement(service,'property',{ANDROID+'name':'android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE',ANDROID+'value':'Explicit user-started virtual-screen task with pause and stop controls; no unattended restart.'})
     manifest.write(stage / 'AndroidManifest.xml', encoding='utf-8', xml_declaration=True)
     adapter = ROOT / 'desktop/neo-agent-adapter'
     for path in (adapter / 'src').rglob('*.java'):
@@ -168,6 +170,7 @@ def main():
     run([java,'-cp',str(out/'classes')+os.pathsep+str(out/'tests'),PACKAGE+'.CompanionModelPolicyTest'])
     run([java,'-cp',str(out/'classes')+os.pathsep+str(out/'tests'),PACKAGE+'.CompanionSearchTargetTest'])
     run([java,'-cp',str(out/'classes')+os.pathsep+str(out/'tests'),PACKAGE+'.CompanionCompletionRulesTest'])
+    run([java,'-cp',str(out/'classes')+os.pathsep+str(out/'tests'),PACKAGE+'.CompanionMdiCoordinatesTest'])
     if args.embedded:
         host_tests = list((stage/'companion-tests').glob('*.java'))
         classpath = os.pathsep.join(map(str,[out/'classes',android,*dependencies]))

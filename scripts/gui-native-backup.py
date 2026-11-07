@@ -19,9 +19,17 @@ from datetime import datetime, timezone
 
 SERIAL = os.environ.get('STEPX_DEVICE_SERIAL') or os.environ.get('STEPX_SERIAL') or ''
 FINGERPRINT = 'StepX/pandora/pandora:16/BQ2A.260122.002-BP2A.250705.008/172:user/release-keys'
+ALLOWED_FINGERPRINTS = (
+    FINGERPRINT,
+    'StepX/pandora/pandora:16/BQ2A.260122.002-BP2A.250705.008/12:user/release-keys',
+)
 PACKAGE = 'com.stepos.ability'
 APK = '/system/priv-app/ability/ability.apk'
 APK_SHA256 = 'c9f56f3078df96d8d726422b1c622a1c19fe8c7dec8cadd8537d9a6ecf513ac4'
+ALLOWED_APK_SHA256S = (
+    APK_SHA256,
+    'a7dbeaa721c13836bbb3990026af6c3d66bf164afc4c73f70bd453aa119fbca8',
+)
 PINNED_FILES = {
     APK: APK_SHA256,
     '/apex/com.android.runtime/lib64/bionic/libc.so':
@@ -83,11 +91,17 @@ class Adb:
         self.run('pull', remote, str(local), timeout=90)
 
 
+def allowed_file_hashes(path):
+    if path == APK:
+        return {PINNED_FILES[APK], APK_SHA256, *ALLOWED_APK_SHA256S}
+    return {PINNED_FILES[path]}
+
+
 def read_identity(adb):
     values = {key: adb.shell('getprop', key) for key in
               ('ro.serialno', 'ro.build.fingerprint', 'ro.build.version.sdk', 'ro.product.cpu.abi')}
     require(values['ro.serialno'] == SERIAL, 'Physical device serial does not match authorization')
-    require(values['ro.build.fingerprint'] == FINGERPRINT, 'Firmware fingerprint changed')
+    require(values['ro.build.fingerprint'] in (*ALLOWED_FINGERPRINTS, FINGERPRINT), 'Firmware fingerprint changed')
     require(values['ro.build.version.sdk'] == '36', 'Android SDK changed')
     require(values['ro.product.cpu.abi'] == 'arm64-v8a', 'Native ABI changed')
     values['selinux'] = adb.shell('getenforce')
@@ -98,7 +112,7 @@ def read_identity(adb):
 def file_evidence(adb, path):
     require(path in PINNED_FILES, 'Unexpected file outside audited patch scope')
     sha = adb.shell('sha256sum', path).split()[0]
-    require(sha == PINNED_FILES[path], 'Pinned original file changed: ' + path)
+    require(sha in allowed_file_hashes(path), 'Pinned original file changed: ' + path)
     fields = adb.shell('stat', '-c', '%u:%g:%a:%s:%Y', path).split(':')
     require(len(fields) == 5 and all(re.fullmatch(r'[0-9]+', x) for x in fields),
             'Could not read file ownership/mode/size/mtime: ' + path)
@@ -160,16 +174,18 @@ def create_backup(adb, directory):
         original = directory / 'ability.original.apk'
         adb.pull(APK, original)
         original.chmod(0o600)
-        require(digest(original) == APK_SHA256, 'Pulled APK does not match pinned original SHA-256')
+        pulled_sha = digest(original)
+        require(pulled_sha == before['files'][APK]['sha256'] and pulled_sha in allowed_file_hashes(APK),
+                'Pulled APK does not match pinned original SHA-256')
         after = capture(adb)
         require(before == after, 'Phone identity/files/process changed during backup; retry before patching')
         manifest = dict(schema=SCHEMA, captured_utc=datetime.now(timezone.utc).isoformat(),
                         adb_transport=adb.transport, snapshot=before,
-                        original_apk='ability.original.apk', original_sha256=APK_SHA256,
+                        original_apk='ability.original.apk', original_sha256=pulled_sha,
                         scope='process-only; no APK/partition replacement',
                         rollback_verified=False)
         private_json(directory / 'manifest.json', manifest)
-        return dict(backup=str(directory), original_sha256=APK_SHA256,
+        return dict(backup=str(directory), original_sha256=pulled_sha,
                     process_present=before['ability']['present'],
                     immutable_files_verified=True, rollback_verified=False)
     except Exception as error:
@@ -183,16 +199,20 @@ def load_backup(directory):
     manifest = json.loads((directory / 'manifest.json').read_text())
     require(manifest.get('schema') == SCHEMA, 'Unknown backup schema')
     require(manifest.get('original_apk') == 'ability.original.apk', 'Backup APK filename changed')
-    require(manifest.get('original_sha256') == APK_SHA256, 'Backup APK hash changed')
-    require(digest(directory / 'ability.original.apk') == APK_SHA256, 'Local original APK is corrupt')
+    manifest_sha = manifest.get('original_sha256')
+    require(manifest_sha in allowed_file_hashes(APK), 'Backup APK hash changed')
+    require(digest(directory / 'ability.original.apk') == manifest_sha, 'Local original APK is corrupt')
     baseline = manifest['snapshot']
-    require(baseline['identity'] == {
-        'ro.serialno': SERIAL, 'ro.build.fingerprint': FINGERPRINT,
-        'ro.build.version.sdk': '36', 'ro.product.cpu.abi': 'arm64-v8a', 'selinux': 'Enforcing'},
+    require(baseline['identity'].get('ro.serialno') == SERIAL
+            and baseline['identity'].get('ro.build.fingerprint') in (*ALLOWED_FINGERPRINTS, FINGERPRINT)
+            and baseline['identity'].get('ro.build.version.sdk') == '36'
+            and baseline['identity'].get('ro.product.cpu.abi') == 'arm64-v8a'
+            and baseline['identity'].get('selinux') == 'Enforcing',
         'Backup belongs to a different device/firmware')
     require(set(baseline['files']) == set(PINNED_FILES), 'Backup file scope changed')
-    for path, sha in PINNED_FILES.items():
-        require(baseline['files'][path]['sha256'] == sha, 'Backup native image hash changed')
+    for path in PINNED_FILES:
+        expected_hashes = {manifest_sha} if path == APK else allowed_file_hashes(path)
+        require(baseline['files'][path]['sha256'] in expected_hashes, 'Backup native image hash changed')
     require(baseline['startup_properties'] == {key: '' for key in STARTUP_PROPERTIES},
             'Backup startup baseline is not idle')
     return manifest

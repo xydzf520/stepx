@@ -55,9 +55,12 @@ def build_runtime(root, windows):
             '-d',str(classes),str(helper)],check=True)
         subprocess.run([str(java/'bin'/('jar.exe' if windows else 'jar')),
             '--create','--file',str(target/'lib/apk-identity.jar'),'-C',str(classes),'.'],check=True)
-    subprocess.run([str(java/'bin'/('jlink.exe' if windows else 'jlink')),
-        '--add-modules','java.base,java.logging,java.naming,java.xml,java.security.jgss,jdk.crypto.ec',
-        '--strip-debug','--no-header-files','--no-man-pages','--output',str(runtime/'java')],check=True)
+    if (java/'jmods').is_dir():
+        subprocess.run([str(java/'bin'/('jlink.exe' if windows else 'jlink')),
+            '--add-modules','java.base,java.logging,java.naming,java.xml,java.security.jgss,jdk.crypto.ec',
+            '--strip-debug','--no-header-files','--no-man-pages','--output',str(runtime/'java')],check=True)
+    else:
+        raise RuntimeError('Packaging requires a JDK with jmods/jlink; arbitrary JAVA_HOME trees are never copied into releases')
     if windows:enable_windows_utf8_launcher(runtime/'java/bin/java.exe')
     if windows:
         with tempfile.TemporaryDirectory() as directory:
@@ -84,6 +87,10 @@ subprocess.Popen = QuietPopen
             archive=Path(directory)/'python.tar.gz';urllib.request.urlretrieve(url,archive)
             if hashlib.sha256(archive.read_bytes()).hexdigest()!=digest:raise RuntimeError('Python digest mismatch')
             with tarfile.open(archive) as t:t.extractall(runtime,filter='data')
+    # Upstream distributions can include bytecode caches. Rebuildable caches
+    # are not release data; only prune this newly constructed temporary tree.
+    for cache in (runtime/'python').rglob('__pycache__'):
+        shutil.rmtree(cache)
     return runtime
 
 def bundle(root, windows):

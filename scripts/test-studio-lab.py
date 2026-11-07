@@ -38,12 +38,33 @@ class StructureTests(unittest.TestCase):
         with patch('sys.stdin',io.StringIO('{"text":""}\n')),contextlib.redirect_stdout(io.StringIO()),self.assertRaises(lab.Failure):
             lab.complete({'protocol':'phone'},'rules','task')
 
+    def test_review_uses_only_requirements_and_contract_not_implementation(self):
+        bad=[dict(c) for c in CHECKS];bad[3]['expected']='99 项'
+        response=json.dumps({'checks':CHECKS,'notes':['添加一项后的数量应为 1。']})
+        with patch.object(lab,'complete',return_value=(response,{})) as model:
+            reviewed,record=lab.review_checks({'protocol':'phone'},'创建待办清单',bad)
+        self.assertEqual(reviewed[3]['expected'],'1 项')
+        self.assertEqual(model.call_args.args[0]['_purpose'],'acceptance_review')
+        self.assertNotIn('<html',model.call_args.args[2])
+        self.assertFalse(record['implementation_visible'])
+        with patch.object(lab,'complete',return_value=('looks good',{})),self.assertRaises(lab.Failure):
+            lab.review_checks({},'创建待办清单',bad)
+
     def test_raw_html_and_metadata_blocks_do_not_need_html_json_escaping(self):
         text='```html\n'+HTML+'\n```\n```json\n'+json.dumps(dict(name='轻记',checks=CHECKS))+'\n```'
         program=lab.parse_program(text)
         self.assertEqual(program['html'],HTML)
         self.assertEqual(program['name'],'轻记')
         with self.assertRaises(lab.Failure): lab.parse_program(text+'\nunexpected prose')
+    def test_missing_or_invalid_function_checks_require_repair(self):
+        for text in [HTML, '```html\n'+HTML+'\n```',
+                     '```html\n'+HTML+'\n```\n```json\n'+json.dumps({'name':'test','checks':[]})+'\n```']:
+            with self.assertRaises(lab.Failure): lab.parse_program(text)
+        roots=[{'action':'key','value':'Tab'},
+               {'action':'assert_count','selector':'html','expected':1},
+               {'action':'assert_count','selector':'body','expected':1}]
+        with self.assertRaises(lab.Failure): lab.validate_checks(roots)
+
     def test_generated_pass_flag_has_no_effect(self):
         result=lab.parse_program(json.dumps(dict(name='test',html=HTML,checks=CHECKS,passed=True)))
         self.assertNotIn('passed',result)
@@ -128,6 +149,8 @@ class BrowserTests(unittest.TestCase):
         calls=[]
         original=lab.complete
         def fake_model(config, system, prompt, small=False):
+            if config.get('_purpose')=='acceptance_review':
+                return json.dumps({'checks':CHECKS,'notes':[]}),{}
             calls.append(prompt)
             html=HTML if len(calls)>1 else HTML.replace("document.querySelector('#items').append(li);", "")
             checks=[dict(c) for c in CHECKS]
@@ -153,6 +176,41 @@ class BrowserTests(unittest.TestCase):
         result=lab.verify(self.browser,dict(html=html,checks=CHECKS),self.root)
         self.assertFalse(result['passed'])
         self.assertFalse(next(x for x in result['checks'] if x['label']=='离线运行')['passed'])
+
+    def test_wrong_model_expectation_is_reviewed_before_repairing_correct_code(self):
+        wrong=[dict(c) for c in CHECKS];wrong[3]['expected']='99 项'
+        def model(config, system, prompt, small=False):
+            if config.get('_purpose')=='acceptance_review':
+                return json.dumps({'checks':CHECKS,'notes':['一次添加应为 1 项，不能为 99 项。']}),{}
+            return json.dumps(dict(name='待办清单',html=HTML,checks=wrong)),{}
+        output=io.StringIO()
+        with patch.object(lab,'complete',model),contextlib.redirect_stdout(output):
+            lab.generate(dict(root=str(self.root),config={},prompt='制作待办清单',browser=self.browser))
+        events=[json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(events[-1]['event'],'complete')
+        self.assertFalse((self.root/'round-2').exists())
+        self.assertEqual((self.root/'round-1/index.html').read_text(),HTML)
+        report=json.loads((self.root/'round-1/report.json').read_text())
+        self.assertTrue(report['passed'])
+        self.assertTrue(report['acceptance_review']['notes'])
+
+    def test_unit_oracle_rejects_reversed_conversion_despite_model_expectations(self):
+        checks=lab.deterministic_checks('制作厘米和英寸互转工具')
+        html='''<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head><body><h1>单位换算验收</h1><label>厘米<input data-unit="cm"></label><label>英寸<input data-unit="in"></label><p data-conversion-feedback>请输入数值</p><script>const cm=document.querySelector('[data-unit="cm"]'),inch=document.querySelector('[data-unit="in"]'),tip=document.querySelector('p');for(const [a,b,f] of [[cm,inch,1/2.54],[inch,cm,2.54]])a.oninput=()=>{const n=Number(a.value);if(!a.value.trim()||!Number.isFinite(n)){b.value='';tip.textContent='请输入有效数字';return}b.value=String(n*f);tip.textContent='换算完成'};</script></body></html>'''
+        result=lab.verify(self.browser,dict(html=html,checks=checks),self.root)
+        self.assertTrue(result['passed'],result)
+        broken=html.replace('[inch,cm,2.54]','[inch,cm,1/2.54]')
+        broken_root=self.root/'broken';broken_root.mkdir()
+        result=lab.verify(self.browser,dict(html=broken,checks=checks),broken_root)
+        self.assertFalse(result['passed'])
+        self.assertTrue(any('6.4516' in c['label'] and not c['passed'] for c in result['checks']))
+
+    def test_text_oracle_and_browser_input_keep_replacement_and_insertion_distinct(self):
+        html='''<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head><body><h1>文本统计验收</h1><textarea id="text" data-text-stat-input></textarea><span data-stat="characters">0</span><span data-stat="lines">0</span><script>const t=document.querySelector('textarea');t.oninput=()=>{document.querySelector('[data-stat="characters"]').textContent=Array.from(t.value).length;document.querySelector('[data-stat="lines"]').textContent=t.value?t.value.split('\\n').length:0};</script></body></html>'''
+        checks=lab.deterministic_checks('制作文本统计工具，计算字符数和行数')
+        checks += [dict(action='type',selector='#text',value='hello'),dict(action='key',selector='#text',value='Enter'),dict(action='insert',selector='#text',value='中文'),dict(action='assert_value',selector='#text',expected='hello\n中文')]
+        result=lab.verify(self.browser,dict(html=html,checks=checks),self.root)
+        self.assertTrue(result['passed'],result)
     def test_reload_retains_saved_tasks(self):
         restore="const saved=localStorage.getItem('last');if(saved){const li=document.createElement('li');li.textContent=saved;document.querySelector('#items').append(li);document.querySelector('#total').textContent='1 项'};"
         html=HTML.replace('<script>','<script>'+restore)

@@ -11,11 +11,8 @@ $InstallDir = if ($env:STEPX_INSTALL_DIR) { $env:STEPX_INSTALL_DIR } else { Join
 New-Item -ItemType Directory -Force -Path $InstallDir, (Join-Path $InstallDir "tools") | Out-Null
 Copy-Item "target\debug\stepx-companion.exe" (Join-Path $InstallDir "stepx-companion.exe") -Force
 
-foreach ($Folder in @("scripts", "handoff")) {
-    Copy-Item (Join-Path $Root $Folder) $InstallDir -Recurse -Force
-}
-New-Item -ItemType Directory -Force -Path (Join-Path $InstallDir "desktop") | Out-Null
-Copy-Item (Join-Path $Root "desktop\assets") (Join-Path $InstallDir "desktop") -Recurse -Force
+python (Join-Path $Root "scripts\stage-release-resources.py") $Root $InstallDir
+if ($LASTEXITCODE -ne 0) { throw "Release resources failed privacy validation" }
 if (-not (Test-Path (Join-Path $Root ".tools\bin\adb.exe"))) { & (Join-Path $Root "scripts\setup-desktop-tools.ps1") }
 python (Join-Path $Root "scripts\package-runtime.py") $InstallDir --windows
 if ($LASTEXITCODE -ne 0) { throw "Runtime packaging failed; use the complete release ZIP instead." }

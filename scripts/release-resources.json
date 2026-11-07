@@ -1,0 +1,771 @@
+{
+  "schema": 1,
+  "description": "Explicit publication and installed-resource inputs; never enumerate handoff, docs, or assets from the developer working directory during packaging. Newly added files require review. Media approvals are content-addressed so unchanged release screenshots can be reused.",
+  "public_scripts": [
+    "scripts/amoo-background.py",
+    "scripts/apply-ui-window-compat.py",
+    "scripts/build-amoo-background.sh",
+    "scripts/build-android-bridge.sh",
+    "scripts/build-companion-app.sh",
+    "scripts/build-companion-permissions.sh",
+    "scripts/build-native-gui-display-recovery.sh",
+    "scripts/build-native-gui-display-snapshot.sh",
+    "scripts/build-native-gui-isolated-probe.sh",
+    "scripts/build-native-gui-readiness.sh",
+    "scripts/build-native-gui-task-host.sh",
+    "scripts/build-native-gui-task.sh",
+    "scripts/build-native-gui.sh",
+    "scripts/build-ota-probe.sh",
+    "scripts/check-public-release.py",
+    "scripts/check-release-notes.py",
+    "scripts/ci-platform-smoke.py",
+    "scripts/companion-boot.py",
+    "scripts/companion-install-plan.py",
+    "scripts/companion-permissions.py",
+    "scripts/companion-power.py",
+    "scripts/companion-system.py",
+    "scripts/companion_apk.py",
+    "scripts/companion_boot/boot.py",
+    "scripts/companion_boot/chain.py",
+    "scripts/companion_boot/launcher.py",
+    "scripts/companion_loader.py",
+    "scripts/configure-phone-gui-model.py",
+    "scripts/firmware-profiles/pandora-12-mcp.json",
+    "scripts/firmware-profiles/pandora-172-mcp.json",
+    "scripts/google-play-compat.py",
+    "scripts/google_play_compat_db.py",
+    "scripts/google_play_compat_files.py",
+    "scripts/google_play_compat_snapshot.py",
+    "scripts/google_play_compat_store_cache.py",
+    "scripts/google_play_compat_store_db.py",
+    "scripts/gui-native-backup.py",
+    "scripts/gui-native-crash-recovery.py",
+    "scripts/gui-native-display-recovery.py",
+    "scripts/gui-native-display-snapshot.py",
+    "scripts/gui-native-host-storage.py",
+    "scripts/gui-native-isolated-probe.py",
+    "scripts/gui-native-model-preferences.py",
+    "scripts/gui-native-patch.py",
+    "scripts/gui-native-readiness.py",
+    "scripts/gui-native-rollback.py",
+    "scripts/gui-native-task-host.py",
+    "scripts/host_runtime.py",
+    "scripts/install-desktop.ps1",
+    "scripts/install-desktop.sh",
+    "scripts/neo-agent-install.py",
+    "scripts/neo-agent-touch/build.py",
+    "scripts/neo-agent-touch/embedded.py",
+    "scripts/neo-agent-touch/instrument.py",
+    "scripts/neo-agent-touch/test_embedded.py",
+    "scripts/package-release.py",
+    "scripts/package-runtime.py",
+    "scripts/play_protect_certification.py",
+    "scripts/prepare-release-media.py",
+    "scripts/probe-phone-offline-speech.py",
+    "scripts/prune-rust-target.sh",
+    "scripts/public_release_policy.py",
+    "scripts/release-resources.json",
+    "scripts/run-desktop.ps1",
+    "scripts/run-desktop.sh",
+    "scripts/runtime/ApkIdentity.java",
+    "scripts/setup-desktop-tools.ps1",
+    "scripts/setup-desktop-tools.py",
+    "scripts/setup-desktop-tools.sh",
+    "scripts/setup-material-asr.py",
+    "scripts/stage-release-resources.py",
+    "scripts/studio-lab-runtime.py",
+    "scripts/sync-public-repo.py",
+    "scripts/test-companion-boot.py",
+    "scripts/test-companion-loader.py",
+    "scripts/test-companion-reconnect.py",
+    "scripts/test-companion-update.py",
+    "scripts/test-host-runtime.py",
+    "scripts/test-neo-agent-install.py",
+    "scripts/test-studio-lab.py",
+    "scripts/test_companion_apk.py",
+    "scripts/tests/test_public_release_policy.py",
+    "scripts/verify-packaged-runtime.py",
+    "scripts/verify-storage-tools.py"
+  ],
+  "public_docs": [
+    "docs/BUILDING.md",
+    "docs/DESKTOP_UPDATES.md",
+    "docs/GETTING_STARTED.md",
+    "docs/RELEASE_NOTES.md",
+    "docs/RELEASE_NOTES_GUIDELINES.md",
+    "docs/SHARE_0_2_177.md",
+    "docs/STORAGE_EXPANSION.md",
+    "docs/STUDIO_INTEGRATION.md"
+  ],
+  "runtime_files": [
+    "desktop/assets/amoo_desktop_icon.png",
+    "desktop/assets/amoo_desktop_icon.source.txt",
+    "desktop/assets/amoo_icon.png",
+    "desktop/assets/amoo_icon.source.txt",
+    "desktop/assets/amoo_tti_portrait.png",
+    "desktop/assets/connection-guide/allow-usb.png",
+    "desktop/assets/connection-guide/build-number.png",
+    "desktop/assets/connection-guide/sources.json",
+    "desktop/assets/connection-guide/usb-debugging.png",
+    "desktop/assets/connection-guide/wireless-setting.png",
+    "desktop/assets/icons/Activity.svg",
+    "desktop/assets/icons/AlertTriangle.svg",
+    "desktop/assets/icons/Apps.svg",
+    "desktop/assets/icons/Archive.svg",
+    "desktop/assets/icons/ArrowDown.svg",
+    "desktop/assets/icons/ArrowLeft.svg",
+    "desktop/assets/icons/ArrowRight.svg",
+    "desktop/assets/icons/ArrowUp.svg",
+    "desktop/assets/icons/Attach.svg",
+    "desktop/assets/icons/Backspace.svg",
+    "desktop/assets/icons/Ban.svg",
+    "desktop/assets/icons/Battery.svg",
+    "desktop/assets/icons/BatteryCharging.svg",
+    "desktop/assets/icons/BatteryEmpty.svg",
+    "desktop/assets/icons/BatteryFull.svg",
+    "desktop/assets/icons/BatteryHalf.svg",
+    "desktop/assets/icons/BatteryLow.svg",
+    "desktop/assets/icons/BatteryPlugged.svg",
+    "desktop/assets/icons/Bell.svg",
+    "desktop/assets/icons/BellOff.svg",
+    "desktop/assets/icons/Bluetooth.svg",
+    "desktop/assets/icons/Bolt.svg",
+    "desktop/assets/icons/Briefcase.svg",
+    "desktop/assets/icons/Calendar.svg",
+    "desktop/assets/icons/Camera.svg",
+    "desktop/assets/icons/Cat.svg",
+    "desktop/assets/icons/Chart.svg",
+    "desktop/assets/icons/Chat.svg",
+    "desktop/assets/icons/Check.svg",
+    "desktop/assets/icons/CheckAll.svg",
+    "desktop/assets/icons/ChevronDown.svg",
+    "desktop/assets/icons/ChevronLeft.svg",
+    "desktop/assets/icons/ChevronRight.svg",
+    "desktop/assets/icons/ChevronUp.svg",
+    "desktop/assets/icons/Clipboard.svg",
+    "desktop/assets/icons/Clock.svg",
+    "desktop/assets/icons/Close.svg",
+    "desktop/assets/icons/CloudRain.svg",
+    "desktop/assets/icons/Code.svg",
+    "desktop/assets/icons/Coffee.svg",
+    "desktop/assets/icons/Connect.svg",
+    "desktop/assets/icons/Contrast.svg",
+    "desktop/assets/icons/Copy.svg",
+    "desktop/assets/icons/Cpu.svg",
+    "desktop/assets/icons/CreditCard.svg",
+    "desktop/assets/icons/Download.svg",
+    "desktop/assets/icons/Edit.svg",
+    "desktop/assets/icons/ExternalLink.svg",
+    "desktop/assets/icons/File.svg",
+    "desktop/assets/icons/FilePdf.svg",
+    "desktop/assets/icons/Flip.svg",
+    "desktop/assets/icons/Folder.svg",
+    "desktop/assets/icons/Gift.svg",
+    "desktop/assets/icons/GithubStar.svg",
+    "desktop/assets/icons/Heart.svg",
+    "desktop/assets/icons/Home.svg",
+    "desktop/assets/icons/Image.svg",
+    "desktop/assets/icons/Info.svg",
+    "desktop/assets/icons/Key.svg",
+    "desktop/assets/icons/Keyboard.svg",
+    "desktop/assets/icons/Lightbulb.svg",
+    "desktop/assets/icons/Lock.svg",
+    "desktop/assets/icons/Matrix.svg",
+    "desktop/assets/icons/Maximize.svg",
+    "desktop/assets/icons/Menu.svg",
+    "desktop/assets/icons/MessageCircle.svg",
+    "desktop/assets/icons/Mic.svg",
+    "desktop/assets/icons/Minus.svg",
+    "desktop/assets/icons/Monitor.svg",
+    "desktop/assets/icons/MoreHorizontal.svg",
+    "desktop/assets/icons/Music.svg",
+    "desktop/assets/icons/Mute.svg",
+    "desktop/assets/icons/Package.svg",
+    "desktop/assets/icons/Pause.svg",
+    "desktop/assets/icons/Phone.svg",
+    "desktop/assets/icons/PhoneOff.svg",
+    "desktop/assets/icons/Pin.svg",
+    "desktop/assets/icons/Play.svg",
+    "desktop/assets/icons/Plus.svg",
+    "desktop/assets/icons/Presentation.svg",
+    "desktop/assets/icons/Refresh.svg",
+    "desktop/assets/icons/Reply.svg",
+    "desktop/assets/icons/Restore.svg",
+    "desktop/assets/icons/Retry.svg",
+    "desktop/assets/icons/ScanText.svg",
+    "desktop/assets/icons/Search.svg",
+    "desktop/assets/icons/Send.svg",
+    "desktop/assets/icons/Settings.svg",
+    "desktop/assets/icons/Shield.svg",
+    "desktop/assets/icons/Smartphone.svg",
+    "desktop/assets/icons/Smile.svg",
+    "desktop/assets/icons/Sms.svg",
+    "desktop/assets/icons/Sparkles.svg",
+    "desktop/assets/icons/Speaker.svg",
+    "desktop/assets/icons/Spreadsheet.svg",
+    "desktop/assets/icons/Square.svg",
+    "desktop/assets/icons/Star.svg",
+    "desktop/assets/icons/Storage.svg",
+    "desktop/assets/icons/Sun.svg",
+    "desktop/assets/icons/Temperature.svg",
+    "desktop/assets/icons/Tools.svg",
+    "desktop/assets/icons/Trash.svg",
+    "desktop/assets/icons/Unlock.svg",
+    "desktop/assets/icons/Upload.svg",
+    "desktop/assets/icons/Usb.svg",
+    "desktop/assets/icons/User.svg",
+    "desktop/assets/icons/Users.svg",
+    "desktop/assets/icons/Video.svg",
+    "desktop/assets/icons/Wave.svg",
+    "desktop/assets/icons/Wifi.svg",
+    "desktop/assets/neo_front_frame.png",
+    "desktop/assets/neo_rear_housing.png",
+    "desktop/assets/qr_group.png",
+    "desktop/assets/qr_personal.png",
+    "desktop/assets/release-notes/0.2.168.json",
+    "desktop/assets/release-notes/0.2.168/agent.png",
+    "desktop/assets/release-notes/0.2.168/files.png",
+    "desktop/assets/release-notes/0.2.168/home.png",
+    "desktop/assets/release-notes/0.2.168/messages.png",
+    "desktop/assets/release-notes/0.2.168/phone.png",
+    "desktop/assets/release-notes/0.2.168/search.png",
+    "desktop/assets/release-notes/0.2.168/sources.json",
+    "desktop/assets/release-notes/0.2.169.json",
+    "desktop/assets/release-notes/0.2.169/agent.png",
+    "desktop/assets/release-notes/0.2.169/files.png",
+    "desktop/assets/release-notes/0.2.169/home.png",
+    "desktop/assets/release-notes/0.2.169/messages.png",
+    "desktop/assets/release-notes/0.2.169/phone.png",
+    "desktop/assets/release-notes/0.2.169/search.png",
+    "desktop/assets/release-notes/0.2.169/sources.json",
+    "desktop/assets/release-notes/0.2.169/tour.mp4",
+    "desktop/assets/release-notes/0.2.170.json",
+    "desktop/assets/release-notes/0.2.170/agent.png",
+    "desktop/assets/release-notes/0.2.170/capsule.png",
+    "desktop/assets/release-notes/0.2.170/connection.png",
+    "desktop/assets/release-notes/0.2.170/files.png",
+    "desktop/assets/release-notes/0.2.170/home.png",
+    "desktop/assets/release-notes/0.2.170/messages.png",
+    "desktop/assets/release-notes/0.2.170/phone.png",
+    "desktop/assets/release-notes/0.2.170/search.png",
+    "desktop/assets/release-notes/0.2.170/sources.json",
+    "desktop/assets/release-notes/0.2.170/tools.png",
+    "desktop/assets/release-notes/0.2.170/tour.h264",
+    "desktop/assets/release-notes/0.2.170/tour.mp4",
+    "desktop/assets/release-notes/0.2.171.json",
+    "desktop/assets/release-notes/0.2.171/agent.png",
+    "desktop/assets/release-notes/0.2.171/capsule.png",
+    "desktop/assets/release-notes/0.2.171/connection.png",
+    "desktop/assets/release-notes/0.2.171/files.png",
+    "desktop/assets/release-notes/0.2.171/home.png",
+    "desktop/assets/release-notes/0.2.171/messages.png",
+    "desktop/assets/release-notes/0.2.171/phone.png",
+    "desktop/assets/release-notes/0.2.171/search.png",
+    "desktop/assets/release-notes/0.2.171/sources.json",
+    "desktop/assets/release-notes/0.2.171/tools.png",
+    "desktop/assets/release-notes/0.2.171/tour.h264",
+    "desktop/assets/release-notes/0.2.171/tour.mp4",
+    "desktop/assets/release-notes/0.2.172.json",
+    "desktop/assets/release-notes/0.2.172/agent.png",
+    "desktop/assets/release-notes/0.2.172/capsule.png",
+    "desktop/assets/release-notes/0.2.172/connection.png",
+    "desktop/assets/release-notes/0.2.172/files.png",
+    "desktop/assets/release-notes/0.2.172/home.png",
+    "desktop/assets/release-notes/0.2.172/messages.png",
+    "desktop/assets/release-notes/0.2.172/phone.png",
+    "desktop/assets/release-notes/0.2.172/search.png",
+    "desktop/assets/release-notes/0.2.172/sources.json",
+    "desktop/assets/release-notes/0.2.172/tools.png",
+    "desktop/assets/release-notes/0.2.172/tour.h264",
+    "desktop/assets/release-notes/0.2.172/tour.mp4",
+    "desktop/assets/release-notes/0.2.173.json",
+    "desktop/assets/release-notes/0.2.173/agent.png",
+    "desktop/assets/release-notes/0.2.173/capsule.png",
+    "desktop/assets/release-notes/0.2.173/connection.png",
+    "desktop/assets/release-notes/0.2.173/files.png",
+    "desktop/assets/release-notes/0.2.173/home.png",
+    "desktop/assets/release-notes/0.2.173/messages.png",
+    "desktop/assets/release-notes/0.2.173/phone.png",
+    "desktop/assets/release-notes/0.2.173/search.png",
+    "desktop/assets/release-notes/0.2.173/sources.json",
+    "desktop/assets/release-notes/0.2.173/tools.png",
+    "desktop/assets/release-notes/0.2.173/tour.h264",
+    "desktop/assets/release-notes/0.2.173/tour.mp4",
+    "desktop/assets/release-notes/0.2.174.json",
+    "desktop/assets/release-notes/0.2.174/agent.png",
+    "desktop/assets/release-notes/0.2.174/capsule.png",
+    "desktop/assets/release-notes/0.2.174/connection.png",
+    "desktop/assets/release-notes/0.2.174/files.png",
+    "desktop/assets/release-notes/0.2.174/home.png",
+    "desktop/assets/release-notes/0.2.174/messages.png",
+    "desktop/assets/release-notes/0.2.174/phone.png",
+    "desktop/assets/release-notes/0.2.174/search.png",
+    "desktop/assets/release-notes/0.2.174/sources.json",
+    "desktop/assets/release-notes/0.2.174/tools.png",
+    "desktop/assets/release-notes/0.2.174/tour.h264",
+    "desktop/assets/release-notes/0.2.174/tour.mp4",
+    "desktop/assets/release-notes/0.2.175.json",
+    "desktop/assets/release-notes/0.2.175/agent.png",
+    "desktop/assets/release-notes/0.2.175/capsule.png",
+    "desktop/assets/release-notes/0.2.175/connection.png",
+    "desktop/assets/release-notes/0.2.175/files.png",
+    "desktop/assets/release-notes/0.2.175/home.png",
+    "desktop/assets/release-notes/0.2.175/messages.png",
+    "desktop/assets/release-notes/0.2.175/phone.png",
+    "desktop/assets/release-notes/0.2.175/search.png",
+    "desktop/assets/release-notes/0.2.175/sources.json",
+    "desktop/assets/release-notes/0.2.175/tools.png",
+    "desktop/assets/release-notes/0.2.175/tour.h264",
+    "desktop/assets/release-notes/0.2.175/tour.mp4",
+    "desktop/assets/release-notes/0.2.176.json",
+    "desktop/assets/release-notes/0.2.176/agent.png",
+    "desktop/assets/release-notes/0.2.176/capsule.png",
+    "desktop/assets/release-notes/0.2.176/connection.png",
+    "desktop/assets/release-notes/0.2.176/files.png",
+    "desktop/assets/release-notes/0.2.176/home.png",
+    "desktop/assets/release-notes/0.2.176/messages.png",
+    "desktop/assets/release-notes/0.2.176/phone.png",
+    "desktop/assets/release-notes/0.2.176/search.png",
+    "desktop/assets/release-notes/0.2.176/sources.json",
+    "desktop/assets/release-notes/0.2.176/tools.png",
+    "desktop/assets/release-notes/0.2.176/tour.h264",
+    "desktop/assets/release-notes/0.2.176/tour.mp4",
+    "desktop/assets/release-notes/0.2.177.json",
+    "desktop/assets/release-notes/0.2.177/agent.png",
+    "desktop/assets/release-notes/0.2.177/capsule.png",
+    "desktop/assets/release-notes/0.2.177/connection.png",
+    "desktop/assets/release-notes/0.2.177/files.png",
+    "desktop/assets/release-notes/0.2.177/home.png",
+    "desktop/assets/release-notes/0.2.177/messages.png",
+    "desktop/assets/release-notes/0.2.177/phone.png",
+    "desktop/assets/release-notes/0.2.177/search.png",
+    "desktop/assets/release-notes/0.2.177/sources.json",
+    "desktop/assets/release-notes/0.2.177/tools.png",
+    "desktop/assets/release-notes/0.2.177/tour.h264",
+    "desktop/assets/release-notes/0.2.177/tour.mp4",
+    "desktop/assets/stepx-amoo-background.dex",
+    "desktop/assets/stepx-background-gui-skill.md",
+    "desktop/assets/stepx-bridge.jar",
+    "desktop/assets/stepx-companion-permissions.dex",
+    "desktop/assets/stepx-companion.apk",
+    "desktop/assets/stepx-companion.svg",
+    "desktop/assets/stepx-native-gui-isolated-probe.dex",
+    "desktop/assets/stepx-native-gui-readiness.dex",
+    "desktop/assets/stepx-native-gui-task.dex",
+    "desktop/assets/stepx-native-gui.dex",
+    "desktop/assets/stepx-ota.jar",
+    "desktop/assets/stepx_companion.rc",
+    "desktop/assets/stepx_companion_icon.ico",
+    "desktop/assets/stepx_companion_icon.png",
+    "desktop/assets/stepx_home_screen.png",
+    "desktop/assets/studio-package-build.cjs",
+    "desktop/assets/studio-package-preview.cjs",
+    "handoff/google-play-stepx/module/boot.py",
+    "handoff/google-play-stepx/module/inject.py",
+    "handoff/google-play-stepx/module/launcher.py",
+    "handoff/google-play-stepx/tools/build_payload.py",
+    "handoff/google-play-stepx/tools/certification.py",
+    "handoff/google-play-stepx/tools/common.py",
+    "handoff/google-play-stepx/tools/compatibility.py",
+    "handoff/google-play-stepx/tools/gateway.py",
+    "handoff/google-play-stepx/tools/health.py",
+    "handoff/google-play-stepx/tools/install_adapter.py",
+    "handoff/google-play-stepx/tools/manage.py",
+    "handoff/google-play-stepx/tools/package_state.py",
+    "handoff/google-play-stepx/tools/rollback.py",
+    "handoff/google-play-stepx/tools/rollback_apps.py",
+    "handoff/google-play-stepx/tools/root_bridge.py",
+    "handoff/google-play-stepx/tools/root_worker.py",
+    "handoff/google-play-stepx/tools/snapshot.py",
+    "handoff/google-play-stepx/tools/snapshot_tail.py.txt",
+    "scripts/amoo-background.py",
+    "scripts/companion-boot.py",
+    "scripts/companion-install-plan.py",
+    "scripts/companion-permissions.py",
+    "scripts/companion-power.py",
+    "scripts/companion-system.py",
+    "scripts/companion_apk.py",
+    "scripts/companion_boot/boot.py",
+    "scripts/companion_boot/chain.py",
+    "scripts/companion_boot/launcher.py",
+    "scripts/companion_loader.py",
+    "scripts/configure-phone-gui-model.py",
+    "scripts/firmware-profiles/pandora-12-mcp.json",
+    "scripts/firmware-profiles/pandora-172-mcp.json",
+    "scripts/google-play-compat.py",
+    "scripts/google_play_compat_db.py",
+    "scripts/google_play_compat_files.py",
+    "scripts/google_play_compat_snapshot.py",
+    "scripts/google_play_compat_store_cache.py",
+    "scripts/google_play_compat_store_db.py",
+    "scripts/gui-native-backup.py",
+    "scripts/gui-native-crash-recovery.py",
+    "scripts/gui-native-display-recovery.py",
+    "scripts/gui-native-display-snapshot.py",
+    "scripts/gui-native-host-storage.py",
+    "scripts/gui-native-isolated-probe.py",
+    "scripts/gui-native-model-preferences.py",
+    "scripts/gui-native-patch.py",
+    "scripts/gui-native-readiness.py",
+    "scripts/gui-native-rollback.py",
+    "scripts/gui-native-task-host.py",
+    "scripts/host_runtime.py",
+    "scripts/neo-agent-install.py",
+    "scripts/neo-agent-touch/build.py",
+    "scripts/neo-agent-touch/embedded.py",
+    "scripts/neo-agent-touch/instrument.py",
+    "scripts/package-runtime.py",
+    "scripts/play_protect_certification.py",
+    "scripts/public_release_policy.py",
+    "scripts/release-resources.json",
+    "scripts/stage-release-resources.py",
+    "scripts/studio-lab-runtime.py",
+    "scripts/test-host-runtime.py",
+    "scripts/test_companion_apk.py",
+    "scripts/verify-packaged-runtime.py"
+  ],
+  "reviewed_media_sha256": {
+    "04775fef84a54afd8e157c82d9f6be474ba7a815cd715a1bc56bec898e0f2295": {
+      "example": "desktop/assets/amoo_desktop_icon.png",
+      "review": "Reviewed product artwork, authorized contact QR, official Android guide or isolated demo capture"
+    },
+    "8c87ce371a0c02924af186256e892359a2cd1f77e50129437c75a6ae793cc62e": {
+      "example": "desktop/assets/amoo_icon.png",
+      "review": "Reviewed product artwork, authorized contact QR, official Android guide or isolated demo capture"
+    },
+    "03b9948badfe8f441a2f0be4fe09a61403d4e0a6072e5c7ace23e653af49fa72": {
+      "example": "desktop/assets/amoo_tti_portrait.png",
+      "review": "Reviewed product artwork, authorized contact QR, official Android guide or isolated demo capture"
+    },
+    "b8b1d575f1b6decdd101128ab847c69228fce60c5b9f4158f85aafee7279346e": {
+      "example": "desktop/assets/connection-guide/allow-usb.png",
+      "review": "Reviewed product artwork, authorized contact QR, official Android guide or isolated demo capture"
+    },
+    "91e95efcfdbb08d31060af26f06b84ef1b847c80acd841a67f8e9562a6515ea1": {
+      "example": "desktop/assets/connection-guide/build-number.png",
+      "review": "Reviewed product artwork, authorized contact QR, official Android guide or isolated demo capture"
+    },
+    "6eec809e6e91f230eb7157fcb2a0ec7604e3900c3c13b0899726fb4135e5a6dc": {
+      "example": "desktop/assets/connection-guide/usb-debugging.png",
+      "review": "Reviewed product artwork, authorized contact QR, official Android guide or isolated demo capture"
+    },
+    "9fc0597d1e6eebf594af5843a3d3e12a6b30ea75e26b5618d81a5ba4ff03b072": {
+      "example": "desktop/assets/connection-guide/wireless-setting.png",
+      "review": "Reviewed product artwork, authorized contact QR, official Android guide or isolated demo capture"
+    },
+    "abc843d60ad1baf9acac570b0743b61fee279da72e409fe3d89e2f9510ab3046": {
+      "example": "desktop/assets/neo_front_frame.png",
+      "review": "Reviewed product artwork, authorized contact QR, official Android guide or isolated demo capture"
+    },
+    "d91e22d873e22a56f409d494ae06f2582279c21aa2ce42715e9e96b7f52acc01": {
+      "example": "desktop/assets/neo_rear_housing.png",
+      "review": "Reviewed product artwork, authorized contact QR, official Android guide or isolated demo capture"
+    },
+    "2cc36dba8eee6e18e2014a89740803cec40f67f6e1fc8ce32d7285d91af3cfcb": {
+      "example": "desktop/assets/qr_group.png",
+      "review": "Reviewed product artwork, authorized contact QR, official Android guide or isolated demo capture"
+    },
+    "69179f41ce6d55b243d72c31c87fb19c6429786dbd4cf020cb28e4e1f6b35770": {
+      "example": "desktop/assets/qr_personal.png",
+      "review": "Reviewed product artwork, authorized contact QR, official Android guide or isolated demo capture"
+    },
+    "708f2a28f99a5146f402ea5991baef23001830ca36e51793278074dd582902ad": {
+      "example": "desktop/assets/release-notes/0.2.176/agent.png",
+      "review": "Reviewed product artwork, authorized contact QR, official Android guide or isolated demo capture"
+    },
+    "d23c9c843218e5856dcfc0ae77c2a7b3a96c300c132765795c10cd20aa3e56c8": {
+      "example": "desktop/assets/release-notes/0.2.169/files.png",
+      "review": "Reviewed product artwork, authorized contact QR, official Android guide or isolated demo capture"
+    },
+    "83305e821155927cc4b90b308bcf08336e0269e97ca4fb9c0b5fb1ea7a947b39": {
+      "example": "desktop/assets/release-notes/0.2.174/home.png",
+      "review": "Reviewed product artwork, authorized contact QR, official Android guide or isolated demo capture"
+    },
+    "61600160b903dcdf137cb81bac24f26325556761754a37f43f7eac15293f419f": {
+      "example": "desktop/assets/release-notes/0.2.176/messages.png",
+      "review": "Reviewed product artwork, authorized contact QR, official Android guide or isolated demo capture"
+    },
+    "0ec2c3f128affb96edeff2a4f48e7d6049e89f0779d77127a13b46eb7c779034": {
+      "example": "desktop/assets/release-notes/0.2.176/phone.png",
+      "review": "Reviewed product artwork, authorized contact QR, official Android guide or isolated demo capture"
+    },
+    "0a76f57b3855fb0623e559b49b20b33010fca240a1abc50fa098b78eff98373c": {
+      "example": "desktop/assets/release-notes/0.2.169/search.png",
+      "review": "Reviewed product artwork, authorized contact QR, official Android guide or isolated demo capture"
+    },
+    "68ad6cb772146a3e0b719a661709cce89b2050814c4993b8a4124bceb08c6ea3": {
+      "example": "desktop/assets/release-notes/0.2.169/tour.mp4",
+      "review": "Reviewed product artwork, authorized contact QR, official Android guide or isolated demo capture"
+    },
+    "3879f66c8d66b6a68a8741689b9b817a93192631398edc90d0c54dbc5b293668": {
+      "example": "desktop/assets/release-notes/0.2.176/capsule.png",
+      "review": "Reviewed product artwork, authorized contact QR, official Android guide or isolated demo capture"
+    },
+    "5f6dc52ac3141965d0d0e0eb5f460002e2cfa66375484a3a784b4259925d66bb": {
+      "example": "desktop/assets/release-notes/0.2.176/connection.png",
+      "review": "Reviewed product artwork, authorized contact QR, official Android guide or isolated demo capture"
+    },
+    "5dcbc845f182f59f8cfdbfe912e64ef0a6d84de43354a4d8f8c9045166e09f2b": {
+      "example": "desktop/assets/release-notes/0.2.176/files.png",
+      "review": "Reviewed product artwork, authorized contact QR, official Android guide or isolated demo capture"
+    },
+    "52161bcea866b88b3f2ea3d6d4aeee4960c236742423e8edca117aaf54b6b9f7": {
+      "example": "desktop/assets/release-notes/0.2.176/search.png",
+      "review": "Reviewed product artwork, authorized contact QR, official Android guide or isolated demo capture"
+    },
+    "4a3bb277a6abf1c8b5576c4d761c7c258f1075f8119b16e209348dfdc520234f": {
+      "example": "desktop/assets/release-notes/0.2.176/tools.png",
+      "review": "Reviewed product artwork, authorized contact QR, official Android guide or isolated demo capture"
+    },
+    "6d4ca297c15db35393c526c7af651cb46ac37f0d0dc2d478013bb1b1a5e263f9": {
+      "example": "desktop/assets/release-notes/0.2.176/tour.h264",
+      "review": "Reviewed product artwork, authorized contact QR, official Android guide or isolated demo capture"
+    },
+    "c7b0df18a992865357a0f690da5bad929f6bea8f994f53e0f3c6f82c3297f18b": {
+      "example": "desktop/assets/release-notes/0.2.176/tour.mp4",
+      "review": "Reviewed product artwork, authorized contact QR, official Android guide or isolated demo capture"
+    },
+    "8735d6accc9123eaca2e1397d909549492568a9cbe99eab691821003828519cb": {
+      "example": "desktop/assets/release-notes/0.2.175/home.png",
+      "review": "Reviewed product artwork, authorized contact QR, official Android guide or isolated demo capture"
+    },
+    "6b1e25c8728ae572c9f6442304c19bb3e5c978e17a65d4ca60685036f5f2fbe2": {
+      "example": "desktop/assets/release-notes/0.2.176/home.png",
+      "review": "Reviewed product artwork, authorized contact QR, official Android guide or isolated demo capture"
+    },
+    "6bd17403c2233f7985c6fec8b72af3067dc81571d3befefcc48aee04bf90786a": {
+      "example": "desktop/assets/stepx_companion_icon.ico",
+      "review": "Reviewed product artwork, authorized contact QR, official Android guide or isolated demo capture"
+    },
+    "4385bb6ee1e31aa6a963d2e9e27a5974ec6e4cde74a8dcf1353fa27e2779a0c4": {
+      "example": "desktop/assets/stepx_companion_icon.png",
+      "review": "Reviewed product artwork, authorized contact QR, official Android guide or isolated demo capture"
+    },
+    "19b09089dae236bf7ddef7c4e0874ce83daab825d8f163180adda143e9d9d2b7": {
+      "example": "desktop/assets/stepx_home_screen.png",
+      "review": "Reviewed product artwork, authorized contact QR, official Android guide or isolated demo capture"
+    },
+    "1ed82efb6b23d9d3234cdb3bfde38d4f4c46598ba6d3d9c6fd671355963b4c8b": {
+      "representative": "docs/images/update-video-0.2.59.jpg",
+      "review": "2026-11-08: parent visually reviewed the 21 existing public screenshots/covers; dependency media reviewed as number/rain/logo/pixel animation fixtures. No new personal device data."
+    },
+    "516f1e41907658834e98afe4496627d6f3e23116baaaee46a7ed5a1685bc5293": {
+      "representative": "docs/images/backscreen-game.png",
+      "review": "2026-11-08: parent visually reviewed the 21 existing public screenshots/covers; dependency media reviewed as number/rain/logo/pixel animation fixtures. No new personal device data."
+    },
+    "f3f632bb8ded868bfdada0e8d2ac7adcc9439c5578251a9ede5f1e6f39eb2cb6": {
+      "representative": "docs/images/overview-0.2.59.png",
+      "review": "2026-11-08: parent visually reviewed the 21 existing public screenshots/covers; dependency media reviewed as number/rain/logo/pixel animation fixtures. No new personal device data."
+    },
+    "f00fd3b60ff18f068abbd989c9336cfeb7c3dde3f127d87447d9c99824db72c1": {
+      "representative": "docs/images/about.png",
+      "review": "2026-11-08: parent visually reviewed the 21 existing public screenshots/covers; dependency media reviewed as number/rain/logo/pixel animation fixtures. No new personal device data."
+    },
+    "953922488028ef5e767c303169c9756ee93e1d705a85623d698651c8f490d96e": {
+      "representative": "docs/images/work.png",
+      "review": "2026-11-08: parent visually reviewed the 21 existing public screenshots/covers; dependency media reviewed as number/rain/logo/pixel animation fixtures. No new personal device data."
+    },
+    "9c0fe5e668b10425d08d305ace99fc158c22b9b36f20acaa06fa81559eddc85c": {
+      "representative": "docs/images/app-store-0.2.59.png",
+      "review": "2026-11-08: parent visually reviewed the 21 existing public screenshots/covers; dependency media reviewed as number/rain/logo/pixel animation fixtures. No new personal device data."
+    },
+    "31c8a0f5b3550579adf2f35fafb545f37aa1d9e2b0959449c9d7c021f632da35": {
+      "representative": "docs/images/amoo-0.2.50.png",
+      "review": "2026-11-08: parent visually reviewed the 21 existing public screenshots/covers; dependency media reviewed as number/rain/logo/pixel animation fixtures. No new personal device data."
+    },
+    "02566a171fb3012faff891c324669db8400dd0c6ccedfaece410183d482cc687": {
+      "representative": "docs/images/overview-0.2.50.png",
+      "review": "2026-11-08: parent visually reviewed the 21 existing public screenshots/covers; dependency media reviewed as number/rain/logo/pixel animation fixtures. No new personal device data."
+    },
+    "6335df471a5302ccc6160ecc1edeeda2e7b45b5e40e105a7a20c41630a6ba6a7": {
+      "representative": "docs/images/connect.png",
+      "review": "2026-11-08: parent visually reviewed the 21 existing public screenshots/covers; dependency media reviewed as number/rain/logo/pixel animation fixtures. No new personal device data."
+    },
+    "7b14737861df56dff7d8f8d8ad6a6ab1c6bb143cecaf088aeb9eae6757f31cc1": {
+      "representative": "docs/images/amoo.png",
+      "review": "2026-11-08: parent visually reviewed the 21 existing public screenshots/covers; dependency media reviewed as number/rain/logo/pixel animation fixtures. No new personal device data."
+    },
+    "dc2adf2cfbb4c5aab52822b0e8d93c0fe9cb3c6ff03eeea61b6713744e4909e2": {
+      "representative": "docs/images/backscreen.png",
+      "review": "2026-11-08: parent visually reviewed the 21 existing public screenshots/covers; dependency media reviewed as number/rain/logo/pixel animation fixtures. No new personal device data."
+    },
+    "563d29bf31f00bbce09702721b749fd373b51c207b50f7d608ddda9a20be2a15": {
+      "representative": "docs/images/gallery-0.2.50.png",
+      "review": "2026-11-08: parent visually reviewed the 21 existing public screenshots/covers; dependency media reviewed as number/rain/logo/pixel animation fixtures. No new personal device data."
+    },
+    "2f47a2ecc31a27a03216d24dd923eb2d755cd9772421d8aa6a152494725bc4c0": {
+      "representative": "docs/images/mirror-sidebar.png",
+      "review": "2026-11-08: parent visually reviewed the 21 existing public screenshots/covers; dependency media reviewed as number/rain/logo/pixel animation fixtures. No new personal device data."
+    },
+    "513a4e6435469a9e127e59d8b84f582b8be4cedc18a0f483c00ff512c7bd4fc6": {
+      "representative": "docs/images/update-0.2.25-cover.jpg",
+      "review": "2026-11-08: parent visually reviewed the 21 existing public screenshots/covers; dependency media reviewed as number/rain/logo/pixel animation fixtures. No new personal device data."
+    },
+    "178c77e49528418be1bf30495bfbc18c85ad5563e781f6c4a9a95a4544218493": {
+      "representative": "docs/images/amoo-task-results.png",
+      "review": "2026-11-08: parent visually reviewed the 21 existing public screenshots/covers; dependency media reviewed as number/rain/logo/pixel animation fixtures. No new personal device data."
+    },
+    "22714db39954cf4b2d1856fb856afc40d386fd5f52a7f206d303d9a02bc7e2f1": {
+      "representative": "docs/images/update-0.2.50-cover.jpg",
+      "review": "2026-11-08: parent visually reviewed the 21 existing public screenshots/covers; dependency media reviewed as number/rain/logo/pixel animation fixtures. No new personal device data."
+    },
+    "f8e43c33b6243a16111b15571529bcb180a5e943f0d2e78d4909e4ebd349d6c0": {
+      "representative": "docs/images/lan-cast-0.2.59.png",
+      "review": "2026-11-08: parent visually reviewed the 21 existing public screenshots/covers; dependency media reviewed as number/rain/logo/pixel animation fixtures. No new personal device data."
+    },
+    "038356ef6a6619654f50635812cb8ef3b159bddc553c3c58f83bea591b695ea4": {
+      "representative": "docs/images/adb-guide.png",
+      "review": "2026-11-08: parent visually reviewed the 21 existing public screenshots/covers; dependency media reviewed as number/rain/logo/pixel animation fixtures. No new personal device data."
+    },
+    "9e6bc9df1c2e618d663000a7f45393d5c0de3c0efec6ae3c973470bb08a1d76b": {
+      "representative": "docs/images/tools.png",
+      "review": "2026-11-08: parent visually reviewed the 21 existing public screenshots/covers; dependency media reviewed as number/rain/logo/pixel animation fixtures. No new personal device data."
+    },
+    "41acded710169b89ab366832a21298b7abc7bfe6b8ea250c6189ce4ae58becf7": {
+      "representative": "docs/images/overview.png",
+      "review": "2026-11-08: parent visually reviewed the 21 existing public screenshots/covers; dependency media reviewed as number/rain/logo/pixel animation fixtures. No new personal device data."
+    },
+    "d58c8617e8430689253a37ee499c3397f33c91d15dbdf306212732e887d32a3d": {
+      "representative": "docs/images/backscreen-0.2.50.png",
+      "review": "2026-11-08: parent visually reviewed the 21 existing public screenshots/covers; dependency media reviewed as number/rain/logo/pixel animation fixtures. No new personal device data."
+    },
+    "4039eafc84e957d78ed9f91b6e9580bb3ad7e9e2525c0af5fe96d963dec11904": {
+      "representative": "vendor/facloud_ui/examples/assets/numbers-1000ms.gif",
+      "review": "2026-11-08: parent visually reviewed the 21 existing public screenshots/covers; dependency media reviewed as number/rain/logo/pixel animation fixtures. No new personal device data."
+    },
+    "213ffc4567c9cbbcf0f02647da4d6d2b7ed27b344eb56b13c31b0d393162c60d": {
+      "representative": "vendor/facloud_ui/examples/assets/rustyrain.gif",
+      "review": "2026-11-08: parent visually reviewed the 21 existing public screenshots/covers; dependency media reviewed as number/rain/logo/pixel animation fixtures. No new personal device data."
+    },
+    "21c94d5f2b1374ee58b97ffb854dc622945af3a577bfe63669cc6491793d2dcc": {
+      "representative": "vendor/facloud_ui/examples/assets/numbers-750ms.gif",
+      "review": "2026-11-08: parent visually reviewed the 21 existing public screenshots/covers; dependency media reviewed as number/rain/logo/pixel animation fixtures. No new personal device data."
+    },
+    "a024dca4d77eb20a62f43ba3d85328596ba13f004c60838fc2570a8fae13e946": {
+      "representative": "vendor/facloud_ui_core/test_data/local.png",
+      "review": "2026-11-08: parent visually reviewed the 21 existing public screenshots/covers; dependency media reviewed as number/rain/logo/pixel animation fixtures. No new personal device data."
+    },
+    "ec4d9bbc153509050b56fad9975a902183e8f3498c79b1d9db9d8670c2cc7763": {
+      "representative": "vendor/facloud_ui_core/test_data/animated.webp",
+      "review": "2026-11-08: parent visually reviewed the 21 existing public screenshots/covers; dependency media reviewed as number/rain/logo/pixel animation fixtures. No new personal device data."
+    },
+    "70023187f1ef6f31ab6887cc28b3744f093941629adab9af3801b1d2547f4765": {
+      "example": "docs/videos/StepX-0.2.60-to-0.2.177-contact-sheet.jpg",
+      "review": "Reviewed isolated native-client demo frames, final video contact sheets, popup sequence and authorized author/contact end cards; no live chats or call recordings."
+    },
+    "fe9e32d810d0d333e23ee0718039c1b475104e720b3fa9ba17765f57181b4efc": {
+      "example": "docs/videos/StepX-0.2.60-to-0.2.177.mp4",
+      "review": "Reviewed isolated native-client demo frames, final video contact sheets, popup sequence and authorized author/contact end cards; no live chats or call recordings."
+    },
+    "7cef45a076e84676ed4cf43f9d2d5440a15917a7e117917e2bcf91f762c71520": {
+      "example": "docs/videos/StepX-product-0.2.177-contact-sheet.jpg",
+      "review": "Reviewed isolated native-client demo frames, final video contact sheets, popup sequence and authorized author/contact end cards; no live chats or call recordings."
+    },
+    "812e12bf7304e3cbf221abcea5e330e4e30869a8797dc05c25164b9a97448e56": {
+      "example": "docs/videos/StepX-product-0.2.177.mp4",
+      "review": "Reviewed isolated native-client demo frames, final video contact sheets, popup sequence and authorized author/contact end cards; no live chats or call recordings."
+    },
+    "46c57cc84e02d9c64533e7352c6684b56bf17e82a3b5aac57020c804cd9df3cf": {
+      "example": "docs/videos/popup-sequence.jpg",
+      "review": "Reviewed isolated native-client demo frames, final video contact sheets, popup sequence and authorized author/contact end cards; no live chats or call recordings."
+    }
+  },
+  "reviewed_text_fixtures": [
+    {
+      "path": "desktop/src/doctor_harness.rs",
+      "pattern": "credential URL",
+      "sha256": "f8c7f2987069485166a19282090fd6bfda8b12c5ccf46c99846068ed92369f32",
+      "reason": "Literal redaction unit test / explanatory placeholder, no service credential"
+    },
+    {
+      "path": "desktop/src/doctor_harness.rs",
+      "pattern": "credential URL",
+      "sha256": "a14e4bf7ce29fb6c816f16b23aa21f4fc824fc4ca85df27d0ab75b555e310fca",
+      "reason": "Literal redaction unit test / explanatory placeholder, no service credential"
+    },
+    {
+      "path": "vendor/facloud_ui_core/src/clipboard_utils_tests.rs",
+      "pattern": "developer home",
+      "sha256": "6bd14500c4889c7671ab35db09b22c508c2806c68eec68dee032b5f8c961c35d",
+      "review": "Published dependency path/clipboard unit-test fixture; keep distinct home paths to preserve assertions."
+    },
+    {
+      "path": "vendor/facloud_ui/src/windowing/winit/linux/clipboard_tests.rs",
+      "pattern": "developer home",
+      "sha256": "768d8e132161678a3434401db0b60a6497856a93891b95d7852d3b79f6fae087",
+      "review": "Published dependency path/clipboard unit-test fixture; keep distinct home paths to preserve assertions."
+    },
+    {
+      "path": "vendor/facloud_util/src/path_test.rs",
+      "pattern": "developer home",
+      "sha256": "f0f1a8897143a5d7816e0daf53980bae770f9ba5911594fff5886c5c64865fac",
+      "review": "Published dependency path/clipboard unit-test fixture; keep distinct home paths to preserve assertions."
+    },
+    {
+      "path": "vendor/facloud_util/src/path_test.rs",
+      "pattern": "developer home",
+      "sha256": "09adf2a74acae2053873f7856e4a2b007c5e590d9eb78ebce6737edddd44005a",
+      "review": "Published dependency path/clipboard unit-test fixture; keep distinct home paths to preserve assertions."
+    },
+    {
+      "path": "vendor/facloud_util/src/path_test.rs",
+      "pattern": "developer home",
+      "sha256": "a176de7deaf9fd455b08172b19b6fad1317e9d491f0da42572e798298689c8a0",
+      "review": "Published dependency path/clipboard unit-test fixture; keep distinct home paths to preserve assertions."
+    },
+    {
+      "path": "vendor/facloud_util/src/path_test.rs",
+      "pattern": "developer home",
+      "sha256": "768d8e132161678a3434401db0b60a6497856a93891b95d7852d3b79f6fae087",
+      "review": "Published dependency path/clipboard unit-test fixture; keep distinct home paths to preserve assertions."
+    },
+    {
+      "path": "vendor/facloud_util/src/path_test.rs",
+      "pattern": "developer home",
+      "sha256": "3c588ab04f957f7564b76da5d5fbad0b8480c70dc32afccb62b68ff53ca665bf",
+      "review": "Published dependency path/clipboard unit-test fixture; keep distinct home paths to preserve assertions."
+    },
+    {
+      "path": "vendor/facloud_util/src/path.rs",
+      "pattern": "developer home",
+      "sha256": "a176de7deaf9fd455b08172b19b6fad1317e9d491f0da42572e798298689c8a0",
+      "review": "Published dependency path/clipboard unit-test fixture; keep distinct home paths to preserve assertions."
+    },
+    {
+      "path": "vendor/facloud_util/src/standardized_path_tests.rs",
+      "pattern": "developer home",
+      "sha256": "768d8e132161678a3434401db0b60a6497856a93891b95d7852d3b79f6fae087",
+      "review": "Published dependency path/clipboard unit-test fixture; keep distinct home paths to preserve assertions."
+    }
+  ],
+  "package_documents": [
+    "LICENSE",
+    "NOTICE",
+    "THIRD_PARTY_NOTICES.md",
+    "README.md",
+    "CHANGELOG.md",
+    "docs/BUILDING.md",
+    "docs/GETTING_STARTED.md",
+    "docs/DESKTOP_UPDATES.md",
+    "docs/RELEASE_NOTES.md",
+    "licenses/FaCloud-LICENSE-AGPL",
+    "licenses/FaCloud-LICENSE-MIT",
+    "licenses/FaCloud-LICENSES.md",
+    "licenses/FaCloud-NOTICE"
+  ],
+  "public_files": [
+    "desktop/scripts/test-file-dialog-macos.cjs",
+    "desktop/scripts/verify-macos-file-dialogs.py",
+    "docs/videos/README.md",
+    "docs/videos/StepX-0.2.60-to-0.2.177-contact-sheet.jpg",
+    "docs/videos/StepX-0.2.60-to-0.2.177-qa.json",
+    "docs/videos/StepX-0.2.60-to-0.2.177.mp4",
+    "docs/videos/StepX-0.2.60-to-0.2.177.srt",
+    "docs/videos/StepX-product-0.2.177-contact-sheet.jpg",
+    "docs/videos/StepX-product-0.2.177-qa.json",
+    "docs/videos/StepX-product-0.2.177.mp4",
+    "docs/videos/StepX-product-0.2.177.srt",
+    "docs/videos/popup-sequence.jpg",
+    "docs/videos/storyboard.json"
+  ]
+}

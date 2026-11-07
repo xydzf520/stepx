@@ -2,7 +2,7 @@ import sys
 import subprocess,pathlib,json,base64,xml.etree.ElementTree as ET
 from common import ROOT, ADB as A, STATE as B, guard, init_state
 import argparse
-argparse.ArgumentParser(description='Read persistent GMS package state without changing package settings.').parse_args()
+parser=argparse.ArgumentParser(description='Read persistent GMS package state without changing package settings.');parser.add_argument('--save-first',action='store_true');args=parser.parse_args()
 guard();init_state()
 lines=subprocess.check_output(A+['shell','ps','-A','-o','PID,PPID,NAME'],text=True).splitlines();parent=next(int(l.split()[0]) for l in lines if l.split()[-1]=='openclaw_env' and l.split()[1]=='1')
 code='import base64,json,os\nh='+repr('/proc/'+str(parent)+'/root')+';p=h+"/data/user/0/com.google.android.gms";s=os.stat(p);print(json.dumps({"inode":s.st_ino,"uid":s.st_uid,"label":os.getxattr(p,"security.selinux").decode().strip(chr(0)),"abx":base64.b64encode(open(h+"/data/system/packages.xml","rb").read()).decode()}))'
@@ -13,3 +13,9 @@ x=subprocess.check_output(A+['exec-out','cat','/data/local/tmp/stepx-gms-current
 (B/'package-state-current.json').write_text(json.dumps(d,indent=2));(B/'package-state-current.json').chmod(0o600);print(json.dumps(d,indent=2))
 assert int(d['persistent_package']['publicFlags'])&1==0,'Persistent SYSTEM flag must stay clear'
 assert int(d['persistent_package']['privateFlags'])&8==0,'Persistent PRIVILEGED flag must stay clear'
+
+if args.save_first:
+ first=B/'package-before-first-reboot.json'
+ if not first.exists():
+  with first.open('x',encoding='utf-8') as f:json.dump(d,f,indent=2)
+  first.chmod(0o600)

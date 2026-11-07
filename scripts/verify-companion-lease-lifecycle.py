@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Real-phone lease lifecycle acceptance. Written for root coordination; never auto-run.
 
-Only ZYPZ261A01M692000LP, no chats, models, account data or arbitrary intents.
+Only STEPXTEST8DB89E4B8927, no chats, models, account data or arbitrary intents.
 Default requires the phone already noninteractive, and leaves it noninteractive.
 --screen-epochs adds true wake/sleep transitions. It never unlocks/dismisses the
 keyguard or changes lock/security settings; all checks work behind the keyguard.

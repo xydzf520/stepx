@@ -1,3 +1,4 @@
+from common import baseline_matches, DEVICE_KEY
 import sys
 #!/usr/bin/env python3
 """恢复原厂 StepClaw 启动器并移除本次 GMS 安装；会删除本次 Google 本地数据。"""
@@ -10,7 +11,7 @@ parser.add_argument('--keep-apps', action='store_true')
 args = parser.parse_args()
 guard()
 BASELINE = json.loads((HERE / 'baseline.json').read_text())
-assert BASELINE.get('serial', CONFIG.get('serial', '')) == ADB[-1], 'Wrong device baseline'
+assert baseline_matches(BASELINE), 'Wrong device baseline'
 INSTALL = json.loads((HERE / 'boot-install.json').read_text())
 assert subprocess.check_output(ADB + ['shell', 'getprop', 'ro.build.fingerprint'], text=True).strip() == BASELINE['fingerprint'], '设备固件已变化，停止自动回退'
 code = '''import os,json,hashlib,shutil,fcntl,stat

@@ -12,6 +12,8 @@ Supports:
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import pathlib
 import re
@@ -19,6 +21,8 @@ import shutil
 import stat
 import sys
 from typing import Dict, List, Set, Tuple
+
+from public_release_policy import manifest, safe_read, content_problems, generic_target
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 PUBLIC_ROOT = ROOT / "releases" / "stepx-public"
@@ -48,6 +52,10 @@ ALLOWLIST_FILES: Tuple[str, ...] = (
     "desktop/DESIGN.md",
     "desktop/companion-app/AndroidManifest.xml",
     "desktop/companion-app/README.md",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "THIRD_PARTY_NOTICES.md",
     "CHANGELOG.md",
 )
 
@@ -220,71 +228,98 @@ def desensitize_script(rel_path: str, content: str) -> str:
 
 def should_skip_path(path: pathlib.Path) -> bool:
     for part in path.parts:
-        if part in {"__pycache__", ".git", ".DS_Store", "target", ".runtime"}:
+        if part in {"__pycache__", ".git", ".DS_Store", "target", ".runtime", ".build", "build", ".gradle"}:
             return True
     if path.suffix == ".pyc":
         return True
     return False
 
 
-def collect_sync_plan() -> Dict[str, Tuple[bytes, int]]:
-    """Return mapping of relative path -> (transformed_bytes, file_mode)."""
-    plan: Dict[str, Tuple[bytes, int]] = {}
+def fixture_placeholders(rel: str, text: str) -> str:
+    """Deterministic public fixtures, preserving equality and test relationships.
 
+    Device execution targets are fixed in source to explicit env vars. Remaining
+    serials are parser/demo fixtures and never identify a public user's phone.
+    Original developer evidence is untouched.
+    """
+    text = re.sub(r'ZYPZ261A[0-9A-Z]{8,}', lambda m: 'STEPXTEST' + hashlib.sha256(m[0].encode()).hexdigest()[:12].upper(), text)
+    # Keep synthetic cross-platform fixtures and preserve the OS path family.
+    # Match both the bare home input and a joined expected path consistently.
+    fixture_users = {'stepx-user', 'example', 'macuser', 'user', 'test', 'testuser',
+        'alice', 'bob', 'john', 'admin', 'blue', 'aloke', 'demo'}
+    def public_home(match):
+        family, user = match.group(1), match.group(2)
+        return match[0] if user in fixture_users else f'/{family}/stepx-user'
+    text = re.sub(r'''/(home|Users)/([A-Za-z0-9_.-]+)(?=/|["'\s]|$)''', public_home, text)
+    # Known developer LAN endpoint fixtures only; retain private-address semantics.
+    text = text.replace('10.0.1.177', '10.0.0.42').replace('10.0.1.200', '10.0.0.43')
+    return text
+
+
+def collect_sync_plan() -> Dict[str, Tuple[bytes, int]]:
+    """Build and validate the complete transformed plan before writing anything."""
+    policy = manifest(ROOT)
+    plan = {}
+    paths = set(ALLOWLIST_FILES) | set(policy['public_scripts']) | set(policy['public_docs']) | set(policy.get('public_files', []))
+    paths.update({'.gitignore', 'handoff/google-play-stepx/target.example.json'})
     for rel_dir in ALLOWLIST_DIRS:
         src_dir = ROOT / rel_dir
         if not src_dir.is_dir():
-            raise FileNotFoundError(f"Missing allowlisted directory: {src_dir}")
-        for path in sorted(src_dir.rglob("*")):
-            if not path.is_file() or should_skip_path(path):
-                continue
-            rel = path.relative_to(ROOT).as_posix()
-            plan[rel] = (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
-
-    for rel_file in ALLOWLIST_FILES:
-        src_file = ROOT / rel_file
-        if not src_file.is_file():
-            raise FileNotFoundError(f"Missing allowlisted file: {src_file}")
-        mode = stat.S_IMODE(src_file.stat().st_mode)
-        if rel_file == "desktop/Cargo.toml":
-            rewritten = rewrite_cargo_toml(src_file.read_text(encoding="utf-8"))
-            if 'license = "AGPL-3.0-only"' not in rewritten:
-                raise RuntimeError("Cargo.toml license rewrite failed")
-            if "../vendor/facloud_ui" not in rewritten or "../vendor/markdown_parser" not in rewritten:
-                raise RuntimeError("Cargo.toml vendor path rewrite failed")
-            plan[rel_file] = (rewritten.encode("utf-8"), mode)
+            raise FileNotFoundError(f'Missing allowlisted directory: {rel_dir}')
+        for path in sorted(src_dir.rglob('*')):
+            if path.is_file() and not should_skip_path(path):
+                paths.add(path.relative_to(ROOT).as_posix())
+    allowed_code_suffixes = {'.rs', '.toml', '.lock', '.java', '.kt', '.xml', '.json', '.srt',
+        '.md', '.txt', '.py', '.sh', '.ps1', '.js', '.cjs', '.mjs', '.svg', '.rc',
+        '.dex', '.jar', '.apk', '.aar', '.so', '.ttf', '.otf', '.pro', '.gradle'}
+    allowed_code_suffixes.update({'.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico', '.mp4', '.h264'})
+    for rel in sorted(paths):
+        path = ROOT / rel
+        if path.suffix and path.suffix.lower() not in allowed_code_suffixes and rel != '.gitignore':
+            raise ValueError(f'{rel}: unknown file type in source allowlist')
+        data = safe_read(ROOT, rel)
+        try:
+            text = data.decode('utf-8')
+        except UnicodeDecodeError:
+            pass
         else:
-            plan[rel_file] = (src_file.read_bytes(), mode)
-
-    # Collect scripts/
-    scripts_dir = ROOT / "scripts"
-    for path in sorted(scripts_dir.rglob("*")):
+            if rel == 'desktop/Cargo.toml':
+                text = rewrite_cargo_toml(text)
+            if rel.startswith('scripts/'):
+                text = desensitize_script(rel, text)
+            # The policy/manifest contain literal scanner expressions and reviewed
+            # media hashes; these are not fixture text and must remain byte exact.
+            if rel not in {'scripts/public_release_policy.py', 'scripts/release-resources.json', 'scripts/sync-public-repo.py'}:
+                text = fixture_placeholders(rel, text)
+            data = text.encode('utf-8')
+        issues = content_problems(rel, data, policy)
+        if issues:
+            raise ValueError('\n'.join(issues))
+        plan[rel] = (data, stat.S_IMODE(path.stat().st_mode))
+    plan['handoff/google-play-stepx/target.json'] = (generic_target(ROOT), 0o644)
+    # Existing public documentation is retained. Remove developer machine
+    # identifiers from its current tree without touching the original checkout,
+    # author/contact details or Git history. Vendor parser fixtures are audited
+    # separately so different users/paths continue to exercise distinct cases.
+    for path in sorted(PUBLIC_ROOT.rglob('*')):
         if not path.is_file() or should_skip_path(path):
             continue
-        rel_in_scripts = path.relative_to(scripts_dir).as_posix()
-        if rel_in_scripts in EXCLUDED_SCRIPTS:
+        rel = path.relative_to(PUBLIC_ROOT).as_posix()
+        if rel in plan or rel.startswith(('vendor/', '.github/')):
             continue
-        rel = path.relative_to(ROOT).as_posix()
-        mode = stat.S_IMODE(path.stat().st_mode)
-        if path.suffix in {".py", ".sh", ".ps1"}:
-            text = path.read_text(encoding="utf-8")
-            text = desensitize_script(rel, text)
-            plan[rel] = (text.encode("utf-8"), mode)
-        else:
-            plan[rel] = (path.read_bytes(), mode)
-
-    # Collect docs/ (excluding internal design/ and device-specific diagnosis notes)
-    docs_dir = ROOT / "docs"
-    for path in sorted(docs_dir.rglob("*")):
-        if not path.is_file() or should_skip_path(path):
+        if path.suffix.lower() not in {'.md', '.txt', '.rs', '.py', '.sh', '.ps1', '.json', '.toml', '.js', '.cjs'}:
             continue
-        rel_in_docs = path.relative_to(docs_dir).as_posix()
-        if rel_in_docs.startswith("design/") or rel_in_docs in EXCLUDED_DOCS:
+        data = safe_read(PUBLIC_ROOT, rel)
+        try:
+            text = data.decode('utf-8')
+        except UnicodeDecodeError:
             continue
-        rel = path.relative_to(ROOT).as_posix()
-        mode = stat.S_IMODE(path.stat().st_mode)
-        plan[rel] = (path.read_bytes(), mode)
-
+        updated = fixture_placeholders(rel, desensitize_script(rel, text)).encode('utf-8')
+        if updated != data:
+            issues = content_problems(rel, updated, policy)
+            if issues:
+                raise ValueError('\n'.join(issues))
+            plan[rel] = (updated, stat.S_IMODE(path.stat().st_mode))
     return plan
 
 
@@ -311,7 +346,7 @@ def scan_public_repo(plan: Dict[str, Tuple[bytes, int]]) -> List[str]:
             continue
         findings.extend(scan_bytes_for_secrets(f"[staged] {rel}", data))
 
-    # 2. Scan existing files in releases/stepx-public
+    # 2. Scan existing files not replaced by the fully validated plan
     if PUBLIC_ROOT.is_dir():
         for path in sorted(PUBLIC_ROOT.rglob("*")):
             if not path.is_file() or should_skip_path(path):
@@ -319,7 +354,8 @@ def scan_public_repo(plan: Dict[str, Tuple[bytes, int]]) -> List[str]:
             if path.suffix.lower() in BINARY_EXTENSIONS:
                 continue
             rel = path.relative_to(PUBLIC_ROOT).as_posix()
-            findings.extend(scan_bytes_for_secrets(rel, path.read_bytes()))
+            if rel not in plan:
+                findings.extend(scan_bytes_for_secrets(rel, path.read_bytes()))
 
     return findings
 
@@ -328,6 +364,11 @@ def execute_sync(plan: Dict[str, Tuple[bytes, int]], check_only: bool) -> Tuple[
     added = 0
     modified = 0
     unchanged = 0
+
+    for rel in plan:
+        dest = PUBLIC_ROOT / rel
+        if any(p.is_symlink() for p in [dest, *dest.parents] if p != PUBLIC_ROOT.parent):
+            raise ValueError(f'{rel}: publication destination contains a symlink')
 
     for rel, (data, mode) in sorted(plan.items()):
         dest = PUBLIC_ROOT / rel
@@ -376,8 +417,12 @@ def main() -> int:
         print(f"ERROR: Failed to build sync plan: {exc}", file=sys.stderr)
         return 1
 
-    added, modified, unchanged = execute_sync(plan, check_only=args.check)
     findings = scan_public_repo(plan)
+    if findings:
+        print('ERROR: Privacy preflight failed before any file was written:', file=sys.stderr)
+        print('\n'.join(findings), file=sys.stderr)
+        return 2
+    added, modified, unchanged = execute_sync(plan, check_only=args.check)
 
     mode_str = "CHECK (dry-run)" if args.check else "SYNC"
     print(
@@ -395,7 +440,7 @@ def main() -> int:
             print(f"  - {item}", file=sys.stderr)
         return 2
 
-    print("[SECURITY] Secret scan passed (0 matches for ghp_, sk-, PRIVATE KEY).")
+    print("[SECURITY] Preflight passed: private paths, credentials, device fixtures and reviewed media. Existing Git history is unchanged.")
     return 0
 
 

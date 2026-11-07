@@ -1,15 +1,37 @@
-name: Build desktop releases
+name: Build and publish desktop release
 on:
+  push:
+    branches: [main]
+    paths: ['desktop/Cargo.toml', '.github/workflows/release.yml']
   workflow_dispatch:
-    inputs:
-      version:
-        description: Release version (without v)
-        required: true
-        default: '0.2.59'
 permissions:
   contents: read
+env:
+  # Package paths and regression fixtures include Chinese on every platform.
+  PYTHONUTF8: '1'
+  PYTHONIOENCODING: utf-8
+concurrency:
+  group: desktop-release-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
+  metadata:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import tomllib
+          print('version=' + tomllib.load(open('desktop/Cargo.toml', 'rb'))['package']['version'])
+          PY
+      - name: Release story and public source checks
+        run: |
+          python3 scripts/check-release-notes.py
+          python3 scripts/check-public-release.py --source .
   build:
+    needs: metadata
     name: ${{ matrix.platform }}
     strategy:
       fail-fast: false
@@ -24,13 +46,20 @@ jobs:
           - os: windows-2022
             platform: windows-x86_64
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 75
+    timeout-minutes: 100
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Native macOS file-dialog script regression
+        # Runs the shipped JXA source with a mocked Standard Additions host on
+        # every runner; it must not open an interactive picker during CI.
+        run: node desktop/scripts/test-file-dialog-macos.cjs
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -45,11 +74,14 @@ jobs:
           workspaces: desktop
       - name: Linux dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y pkg-config clang libclang-dev libssl-dev libfontconfig1-dev libfreetype-dev libxkbcommon-dev libwayland-dev libxcb1-dev libx11-dev libxi-dev libxcursor-dev libxrandr-dev libgl1-mesa-dev
+        run: sudo apt-get -o Acquire::Retries=2 update && sudo apt-get -o Acquire::Retries=2 install -y pkg-config clang libclang-dev libssl-dev libfontconfig1-dev libfreetype-dev libxkbcommon-dev libwayland-dev libxcb1-dev libx11-dev libxi-dev libxcursor-dev libxrandr-dev libgl1-mesa-dev libdbus-1-dev
       - name: Windows libclang
         if: runner.os == 'Windows'
         shell: pwsh
         run: '"LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV'
+      - name: Remove build machine paths from artifacts
+        shell: bash
+        run: echo "RUSTFLAGS=--remap-path-prefix=$GITHUB_WORKSPACE=/stepx-source" >> "$GITHUB_ENV"
       - name: Core tests
         run: cargo test --locked --manifest-path desktop/Cargo.toml --no-default-features --lib --test contracts
       - name: Desktop state and interaction tests
@@ -59,14 +91,14 @@ jobs:
       - name: Build
         run: cargo build --release --locked --manifest-path desktop/Cargo.toml
       - name: Package and smoke test
-        run: python scripts/package-release.py --platform ${{ matrix.platform }} --version ${{ inputs.version }}
+        run: python scripts/package-release.py --platform ${{ matrix.platform }} --version ${{ needs.metadata.outputs.version }}
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.platform }}
           path: dist/*
           if-no-files-found: error
-  draft-release:
-    needs: build
+  publish:
+    needs: [metadata, build]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -76,17 +108,18 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - name: Create draft with all platforms
+      - name: Publish verified packages and videos
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_VERSION: ${{ inputs.version }}
+          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
         run: |
           cp desktop/assets/stepx-companion.apk dist/StepX-companion.apk
-          (cd dist && sha256sum StepX-companion.apk > StepX-companion.apk.sha256)
+          cp docs/videos/*.mp4 dist/
+          (cd dist && sha256sum StepX-companion.apk *.mp4 > media-sha256.txt)
           if gh release view "v$RELEASE_VERSION" --json isDraft > /tmp/stepx-release.json 2>/dev/null; then
             test "$(jq -r .isDraft /tmp/stepx-release.json)" = true || { echo 'Refusing to replace a published release'; exit 1; }
             gh release upload "v$RELEASE_VERSION" dist/* --clobber
-            gh release edit "v$RELEASE_VERSION" --target "$GITHUB_SHA" --notes-file docs/RELEASE_NOTES.md
+            gh release edit "v$RELEASE_VERSION" --target "$GITHUB_SHA" --notes-file docs/RELEASE_NOTES.md --draft=false
           else
-            gh release create "v$RELEASE_VERSION" dist/* --target "$GITHUB_SHA" --draft --title "StepX Companion $RELEASE_VERSION · 应用商店、局域网投屏与可靠性修复" --notes-file docs/RELEASE_NOTES.md
+            gh release create "v$RELEASE_VERSION" dist/* --target "$GITHUB_SHA" --title "StepX Companion $RELEASE_VERSION · 人在哪里，哪里就是中心" --notes-file docs/RELEASE_NOTES.md
           fi

@@ -76,6 +76,9 @@ fi
 "$TASK_JDK/bin/java" -cp "$TASK_OUT/classes:$TASK_OUT/tests:$TASK_API" com.stepx.companion.app.StudioWebPolicyTest
 "$TASK_JDK/bin/java" -cp "$TASK_OUT/classes:$TASK_OUT/tests:$TASK_API" com.stepx.companion.app.StudioLocalPolicyTest
 "$TASK_JDK/bin/java" -cp "$TASK_OUT/classes:$TASK_OUT/tests:$TASK_API" com.stepx.companion.app.ImPushCatalogTest
+"$TASK_JDK/bin/java" -cp "$TASK_OUT/classes:$TASK_OUT/tests" com.stepx.companion.app.ContextProvenanceTest
+"$TASK_JDK/bin/java" -cp "$TASK_OUT/classes:$TASK_OUT/tests" com.stepx.companion.app.DesktopWorkPolicyTest
+"$TASK_JDK/bin/java" -cp "$TASK_OUT/classes:$TASK_OUT/tests:$TASK_API" com.stepx.companion.app.TransferPreviewTest
 "$TASK_JDK/bin/jar" cf "$TASK_OUT/classes.jar" -C "$TASK_OUT/classes" com/stepx/companion/app
 "$TASK_JDK/bin/java" -cp "$TASK_SDK/cmdline-tools/latest/lib/r8.jar" com.android.tools.r8.D8 --release --min-api 33 --lib "$TASK_API" --output "$TASK_OUT/dex" "$TASK_OUT/classes.jar" "$TASK_ZXING"
 python3 - "$TASK_OUT/unsigned.apk" "$TASK_OUT/dex/classes.dex" <<'PY'

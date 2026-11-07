@@ -7,6 +7,7 @@ import contextlib
 import hashlib
 import http.server
 import json
+import math
 import os
 from pathlib import Path
 import queue
@@ -145,7 +146,8 @@ def stream_complete(config, suffix, payload):
 
 def complete(config, system, prompt, small=False):
     if config['protocol'] == 'phone':
-        emit('model_request', system=system, prompt=prompt)
+        meta = {'purpose':'acceptance_review'} if config.get('_purpose') == 'acceptance_review' else {}
+        emit('model_request', system=system, prompt=prompt, **meta)
         line = sys.stdin.readline(MAX_RESPONSE + 1)
         if not line or len(line) > MAX_RESPONSE:
             raise Failure('手机模型响应通道中断或结果过大')
@@ -194,11 +196,64 @@ def complete(config, system, prompt, small=False):
 SYSTEM = '''You build usable offline HTML mini-apps and games for StepX Companion, desktop and Android WebView.
 Return exactly TWO fenced blocks and no surrounding prose. First an ```html block containing the complete standalone <!DOCTYPE html> document, then a ```json block containing {"name":"short name","checks":[...]}. Do not put HTML inside a JSON string: output raw HTML in its own block. Keep code concise.
 No external resources, npm, network, navigation, forms submitting to servers, permissions or eval. All CSS/JS inline, images inline SVG/data URLs. Produce a polished, coherent visual design with readable type, clear spacing, touch targets, useful empty states and keyboard support. Use semantic accessible controls with stable IDs. Include a viewport meta tag; support 390px and 1280px widths. Render user text with textContent, never inject input into innerHTML. Do not leave TODO, mock buttons or claim external data.
-Implement the user's requested workflow fully within this offline scope. State unavailable external features in the app.
+Implement the user's requested workflow fully within this offline scope. State unavailable external features in the app. Keep user data on reload when requested. Show empty/invalid input feedback. Games need clear rules, a start/restart flow and visible scores or turn state. Avoid long fixed-height layouts or horizontal overflow; controls must be reachable at 390px width. Honor reduced-motion preference and pause animation/timers when appropriate. Do not silently remove a requested feature to pass validation.
+For centimeters/inches conversion, expose two live editable inputs with data-unit="cm" and data-unit="in". An inch is exactly 2.54 centimeters. Conversion must work in BOTH directions; empty/invalid input clears the opposite result and gives visible feedback in an element with data-conversion-feedback. The harness supplies independent numeric expectations for this feature; do not change the unit definition to satisfy your own generated tests.
+For text-statistics apps, expose the textarea as data-text-stat-input and numeric outputs as data-stat="characters" and data-stat="lines". Characters count Unicode code points including spaces/newlines; empty text has zero lines. Preserve normal text editing: select-all then type REPLACES text, typing at a caret inserts; never intercept replacements to append old text.
 checks is 3 to 24 declarative real browser steps: {"label":"purpose","action":"click|type|key|reload|wait|assert_text|assert_value|assert_count|assert_storage|assert_canvas","selector":"CSS selector","value":"input/key/storage key","expected":"expected string or number","ms":300}.
 Click/type use actual browser input; key is Enter/Tab/Space/Escape/ArrowLeft/ArrowRight/ArrowUp/ArrowDown/Backspace. reload refreshes the page in the same origin, allowing verification of localStorage persistence; wait maximum 1500ms. assert_text requires nonempty visible text, assert_value requires form value in expected (value alias is accepted), assert_count exact selector match count, assert_storage localStorage key/value, assert_canvas ensures canvas contains visible nonuniform pixels.
-Include at least one interaction (click/type/key), at least two assertions, and assertions meaningfully testing the requested functionality (e.g. add a task and check it appears; game starts, score or state changes). Do not include arbitrary JS in checks. No passed field: independent harness computes success. Browser also checks mobile layout, visible rendered content, and uncaught JavaScript errors.
+type REPLACES the entire input (select all + typing). insert INSERTS at the current caret, without selecting all. For multiline replacement use action="type_lines", selector and lines=["hello","中文"] (real newline between lines, no double-escaped backslash-n). key focuses its selector before pressing the key. Do not modify normal app editing to work around a mistaken test action.
+Include at least one interaction (click/type/key), at least two assertions against actual app results (root html/body counts do not qualify), and assertions meaningfully testing the requested functionality (e.g. add a task and check it appears; game starts, score or state changes). Do not include arbitrary JS in checks. No passed field: independent harness computes success. Browser also checks mobile layout, visible rendered content, and uncaught JavaScript errors.
 '''
+
+REVIEW_SYSTEM = '''You review an offline app's acceptance contract independently of its implementation.
+You are given only the user's requirements and proposed browser steps, never the generated HTML. Independently calculate expected numeric results and check units, direction of conversions, totals, counts, time, state transitions, persistence and invalid inputs. Do not assume a proposed assertion is correct. A wrong expected value can make later repairs corrupt a correct application.
+Return one JSON object {"checks":[complete corrected steps],"notes":[brief reasons for corrections]}. No HTML, tools, prose, or passed field. Preserve stable CSS selectors and the tested requirements. Correct wrong inputs/expectations or add necessary checks; do not remove interactions or weaken assertions merely to obtain a pass. Do not test labels or static explanatory examples instead of the actual result. Random games must have reproducible test inputs/state; do not guess random answers. The implementation will be repaired to satisfy this reviewed contract, not the other way around.
+''' + SYSTEM[SYSTEM.index('checks is 3 to 24'):]
+
+def review_checks(config, requirement, checks):
+    text, usage = complete(dict(config, _purpose='acceptance_review'), REVIEW_SYSTEM,
+        'User requirements:\n'+requirement+'\nProposed contract (untrusted, independently verify):\n'+json.dumps(checks,ensure_ascii=False))
+    raw = text.strip()
+    fenced = re.fullmatch(r'```(?:json)?\s*([\s\S]*?)\s*```', raw)
+    if fenced: raw = fenced.group(1)
+    try: value = json.loads(raw)
+    except (ValueError,TypeError): raise Failure('验收规则复核未返回有效 JSON；尚未运行或判定作品通过') from None
+    if not isinstance(value,dict): raise Failure('验收规则复核结构无效')
+    reviewed = value.get('checks')
+    validate_checks(reviewed)
+    notes = value.get('notes',[])
+    if not isinstance(notes,list) or len(notes)>24 or any(not isinstance(n,str) or len(n)>1000 for n in notes):
+        raise Failure('验收规则复核说明无效')
+    return reviewed, {'notes':notes,'usage':usage,'implementation_visible':False}
+
+def deterministic_checks(requirement):
+    lower = requirement.lower()
+    if ('文本统计' in lower or 'text statistics' in lower) and ('字符' in lower or 'character' in lower):
+        result=[]
+        for value in ['', 'hello', 'hello\n中文', '中文', 'A🙂中', '']:
+            entry=dict(label='替换文本为 '+repr(value),action='type_lines',selector='textarea[data-text-stat-input]',lines=value.split('\n'))
+            result.extend([entry,
+                dict(label=f'字符数应为 {len(value)}',action='assert_number',selector='[data-stat="characters"]',expected=len(value)),
+                dict(label=f'行数应为 {len(value.split(chr(10))) if value else 0}',action='assert_number',selector='[data-stat="lines"]',expected=len(value.split('\n')) if value else 0)])
+        return result
+    if not ((('厘米' in lower and '英寸' in lower) or ('centimeter' in lower and 'inch' in lower))
+        and any(word in lower for word in ['换算','互转','转换','convert','conversion'])):
+        return None
+    result=[]
+    # Canonical dimension relationship: one inch is exactly 2.54 centimeters.
+    # These expectations are owned by the harness, never by generated code/model.
+    for source,target,value,expected in [('cm','in','2.54',1),('in','cm','2.54',6.4516),('in','cm','10',25.4),('cm','in','12.7',5)]:
+        result.extend([
+            dict(label=f'输入 {value} {source}',action='type',selector=f'input[data-unit="{source}"]',value=value),
+            dict(label=f'{value} {source} 应为 {expected} {target}',action='assert_number',selector=f'input[data-unit="{target}"]',expected=expected,tolerance=0.001),
+        ])
+    for value,label in [('abc','非法输入'),('','空输入')]:
+        result.extend([
+            dict(label=label,action='type',selector='input[data-unit="cm"]',value=value),
+            dict(label=label+'不保留旧结果',action='assert_value',selector='input[data-unit="in"]',expected=''),
+            dict(label=label+'有可见提示',action='assert_nonempty',selector='[data-conversion-feedback]'),
+        ])
+    return result
 
 def _extract_html_title(html):
     for pattern in [r'<title[^>]*>([\s\S]*?)</title>', r'<h1[^>]*>([\s\S]*?)</h1>']:
@@ -208,13 +263,6 @@ def _extract_html_title(html):
             if cleaned:
                 return cleaned[:80]
     return '可交互单文件作品'
-
-def _default_checks():
-    return [
-        {'label': '页面焦点交互', 'action': 'key', 'value': 'Tab'},
-        {'label': '文档根节点检查', 'action': 'assert_count', 'selector': 'html', 'expected': 1},
-        {'label': '页面主体渲染检查', 'action': 'assert_count', 'selector': 'body', 'expected': 1},
-    ]
 
 def parse_program(text):
     raw = (text or '').strip()
@@ -245,7 +293,7 @@ def parse_program(text):
                 'name': title,
                 'title': title,
                 'summary': '已生成可交互单文件作品',
-                'checks': _default_checks(),
+                'checks': [],
             }
         meta['html'] = html_code
         value = meta
@@ -272,7 +320,7 @@ def parse_program(text):
                     'title': title,
                     'summary': '已生成可交互单文件作品',
                     'html': html_code,
-                    'checks': _default_checks(),
+                    'checks': [],
                 }
             else:
                 raise Failure('需要完整 HTML 代码块及 name/checks JSON 代码块，不能包含未完成的代码')
@@ -282,24 +330,19 @@ def parse_program(text):
     checks = value.get('checks')
     if not isinstance(html, str) or len(html.encode()) > MAX_HTML or not re.search(r'<html\b', html, re.I) or not re.search(r'<body\b', html, re.I):
         raise Failure('需要不超过 2 MiB 的完整 HTML 文档')
-    try:
-        validate_checks(checks)
-    except Failure:
-        if from_fenced_or_raw_html:
-            checks = _default_checks()
-            validate_checks(checks)
-        else:
-            raise
+    # Rendering a page is not evidence that its requested workflow works.
+    # Missing/invalid acceptance steps must trigger repair, never a fabricated pass.
+    validate_checks(checks)
     extracted_title = _extract_html_title(html)
     name = str(value.get('name') or value.get('title') or '').strip()[:80] or extracted_title or '未命名作品'
     summary = str(value.get('summary') or '已生成可交互单文件作品').strip()[:160]
     return {'name': name, 'title': name, 'summary': summary, 'html': html, 'checks': checks}
 
 def validate_checks(checks):
-    allowed = {'click','type','key','reload','wait','assert_text','assert_value','assert_count','assert_storage','assert_canvas'}
+    allowed = {'click','type','type_lines','insert','key','reload','wait','assert_text','assert_value','assert_count','assert_storage','assert_canvas','assert_number','assert_nonempty'}
     if not isinstance(checks, list) or not 3 <= len(checks) <= 24:
         raise Failure('需要 3–24 个可执行验收步骤')
-    actions = assertions = 0
+    actions = assertions = specific_assertions = 0
     for check in checks:
         if not isinstance(check, dict) or check.get('action') not in allowed:
             raise Failure('验收步骤包含不支持的操作')
@@ -321,12 +364,22 @@ def validate_checks(checks):
             raise Failure('文字断言不能使用空字符串')
         if action == 'assert_count' and (not isinstance(check.get('expected'), int) or check['expected'] < 0):
             raise Failure('数量断言需要非负整数')
-        if action in ('click','type','key'):
+        if action == 'assert_number':
+            if (not isinstance(check.get('expected'),(int,float)) or not math.isfinite(check['expected'])
+                or not isinstance(check.get('tolerance',0),(int,float)) or not 0<=check.get('tolerance',0)<=0.01):
+                raise Failure('数值断言需要有限预期值及不超过 0.01 的容差')
+        if action == 'type_lines':
+            lines=check.get('lines')
+            if not isinstance(lines,list) or not 1<=len(lines)<=30 or any(not isinstance(v,str) or len(v)>1000 for v in lines):
+                raise Failure('多行输入需要 1–30 行文字')
+        if action in ('click','type','type_lines','insert','key'):
             actions += 1
         if action.startswith('assert_'):
             assertions += 1
-    if actions < 1 or assertions < 2:
-        raise Failure('验收至少包含一次交互及两次结果断言')
+            if action == 'assert_storage' or str(check.get('selector', '')).strip().lower() not in ('html', 'body', '*', ':root'):
+                specific_assertions += 1
+    if actions < 1 or assertions < 2 or specific_assertions < 2:
+        raise Failure('验收至少包含一次交互及两次功能结果断言；仅检查 html/body 存在不能证明应用可用')
 
 class Browser:
     """Ephemeral CDP pipe; no TCP debug port, cookie import, or user browser profile."""
@@ -510,17 +563,22 @@ def check_step(browser, check):
         for kind in ['mousePressed','mouseReleased']:
             browser.call('Input.dispatchMouseEvent',dict(type=kind,button='left',clickCount=1,**bounds),browser.session)
         time.sleep(.1); return True
-    if action == 'type':
-        ok = browser.evaluate('(()=>{const e=%s;if(!e||e.disabled||e.readOnly||!(e instanceof HTMLInputElement||e instanceof HTMLTextAreaElement))return false;e.focus();e.select();return true})()' % element)
+    if action in ('type','type_lines','insert'):
+        select = '' if action=='insert' else 'e.select();'
+        ok = browser.evaluate('(()=>{const e=%s;if(!e||e.disabled||e.readOnly||!(e instanceof HTMLInputElement||e instanceof HTMLTextAreaElement))return false;e.focus();%sreturn true})()' % (element,select))
         if not ok: return False
-        browser.call('Input.insertText',{'text':str(check.get('value',''))},browser.session)
+        text='\n'.join(check['lines']) if action=='type_lines' else str(check.get('value',''))
+        browser.call('Input.insertText',{'text':text},browser.session)
         return True
     if action == 'key':
         key = str(check.get('value',''))
         codes = {'Enter':13,'Tab':9,'Space':32,'Escape':27,'ArrowLeft':37,'ArrowUp':38,'ArrowRight':39,'ArrowDown':40,'Backspace':8}
         if key not in codes: raise Failure('验收使用了不支持的按键')
+        if check.get('selector') and browser.evaluate('(()=>{const e=%s;if(!e||e.disabled)return false;e.focus();return true})()'%element) is not True:
+            return False
         for kind in ['keyDown','keyUp']:
-            browser.call('Input.dispatchKeyEvent',{'type':kind,'key':' ' if key=='Space' else key,'code':key,'windowsVirtualKeyCode':codes[key]},browser.session)
+            text={'text':'\r','unmodifiedText':'\r'} if key=='Enter' and kind=='keyDown' else {}
+            browser.call('Input.dispatchKeyEvent',{'type':kind,'key':' ' if key=='Space' else key,'code':key,'windowsVirtualKeyCode':codes[key],**text},browser.session)
         time.sleep(.1); return True
     if action == 'assert_count':
         return browser.evaluate('document.querySelectorAll(%s).length===%s' % (selector,expected)) is True
@@ -530,6 +588,11 @@ def check_step(browser, check):
         return browser.evaluate('(()=>{const e=%s;return !!e&&e.getBoundingClientRect().width>0&&e.getBoundingClientRect().height>0&&e.innerText.includes(String(%s))})()' % (element,expected)) is True
     if action == 'assert_value':
         return browser.evaluate('(()=>{const e=%s;return !!e&&e.value===String(%s)})()' % (element,expected)) is True
+    if action == 'assert_number':
+        tolerance=json.dumps(check.get('tolerance',0))
+        return browser.evaluate('(()=>{const e=%s;if(!e)return false;const s=String(e.value??e.innerText).trim();const n=Number(s);return s.length>0&&Number.isFinite(n)&&Math.abs(n-(%s))<=%s})()' % (element,expected,tolerance)) is True
+    if action == 'assert_nonempty':
+        return browser.evaluate('(()=>{const e=%s;return !!e&&e.getBoundingClientRect().width>0&&e.getBoundingClientRect().height>0&&e.innerText.trim().length>0})()'%element) is True
     if action == 'assert_canvas':
         return browser.evaluate('(()=>{const e=%s;if(!(e instanceof HTMLCanvasElement)||!e.width||!e.height)return false;const c=document.createElement("canvas");c.width=c.height=32;const x=c.getContext("2d");x.drawImage(e,0,0,32,32);const a=x.getImageData(0,0,32,32).data,s=new Set();for(let i=0;i<a.length;i+=4)s.add(a[i]+","+a[i+1]+","+a[i+2]+","+a[i+3]);return s.size>2})()' % element) is True
     return False
@@ -577,6 +640,7 @@ def generate(request):
     if source:
         prompt += '\n\nImprove this existing version, retaining working behavior:\n'+source
     acceptance = None
+    acceptance_review = None
     for round_no in range(1,4):
         emit('status',message='第 %d / 3 轮：%s'%(round_no,'生成作品' if round_no==1 else '重试生成或根据验收反馈修复'))
         output = root/('round-%d'%round_no); output.mkdir(mode=0o700)
@@ -585,7 +649,13 @@ def generate(request):
             text,usage = complete(config,SYSTEM,prompt)
             program = parse_program(text)
             if acceptance is None:
-                acceptance = program['checks']
+                acceptance = deterministic_checks(request['prompt'])
+                if acceptance is not None:
+                    acceptance_review = {'source':'deterministic-contract','notes':['预期由项目维护，覆盖已支持的单位换算或文本统计与正常替换输入；不采用模型的数值预期。'],'implementation_visible':False}
+                else:
+                    emit('status',message='正在单独复核验收预期，核对计算结果与操作流程…')
+                    acceptance, acceptance_review = review_checks(config,request['prompt'],program['checks'])
+                program['checks'] = acceptance
             else:
                 # Repairs must meet the original observable contract, not rewrite
                 # their own expected result to conceal a failed interaction.
@@ -602,12 +672,14 @@ def generate(request):
             continue
         private_write(output/'index.html',program['html'])
         private_write(output/'checks.json',json.dumps(program['checks'],ensure_ascii=False,indent=2))
+        private_write(output/'acceptance-review.json',json.dumps(acceptance_review,ensure_ascii=False,indent=2))
         emit('status',message='第 %d 轮：在隔离浏览器中验证页面、手机布局和真实交互'%round_no)
         try:
             report = verify(request['browser'],program,output)
         except Failure as error:
             report = {'passed':False,'html_sha256':hashlib.sha256(program['html'].encode('utf-8')).hexdigest(),'checks':[{'label':'浏览器验收','passed':False,'detail':str(error)}], 'limitations':'浏览器验收未完成，仍可在本地预览或发送到手机体验。'}
         report['usage'] = usage
+        report['acceptance_review'] = acceptance_review
         private_write(output/'report.json',json.dumps(report,ensure_ascii=False,indent=2))
         passed = report['passed']
         total = len(report['checks']); count = sum(1 for c in report['checks'] if c['passed'])

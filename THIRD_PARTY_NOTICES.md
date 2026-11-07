@@ -1,13 +1,78 @@
-# 第三方组件与素材
+# Third-Party Notices / 第三方开源组件说明
 
-- **FaCloud / Warp 派生 UI**：`vendor/` 中保留独立构建所需的九个 crate。许可证见各 Cargo.toml 与 `licenses/`。FaCloud UI / UI core 使用 MIT；其余适用 AGPL-3.0-only 等原许可。保留 Denver Technologies / FaCloud 原版权说明。本快照将 workspace 继承清单展开为独立清单，并去除依赖私有工作区的开发依赖，未改变原许可。
-- **Rust 依赖**：`desktop/Cargo.lock` 锁定来源与版本，各 crate 按原许可使用。
-- **GELab-Zero**：GUI Agent 提示词格式参考其 MIT 许可项目；版本、原版权与许可见 `desktop/companion-app/third_party/gelab-zero/`。
-- **ZXing**：扫码库遵循 Apache-2.0；许可与 JAR 位于 `desktop/companion-app/third_party/`。
-- **scrcpy / ADB**：发布时从 Genymobile 官方发行包下载，经固定 SHA256 核验后随包分发。scrcpy 为 Apache-2.0；ADB 及其依赖沿用官方压缩包内的 NOTICE/LICENSE。源代码与对应发行见 https://github.com/Genymobile/scrcpy/releases/tag/v5.0.1 和 https://android.googlesource.com/platform/packages/modules/adb/ 。
-- **图标与品牌素材**：StepX / Amoo 名称、Amoo 形象和手机原厂界面素材归各自权利人所有，仅用于识别所连接的产品；不授予商标或品牌形象的独立使用权。项目自有线性 SVG 图标随源码许可。StepX Companion 的应用图标为独立生成的手机与电脑连接图形，不使用 Amoo 星形角色作为产品标识；外观预览根据实机参考生成，用于设备识别。生成提示词见 `docs/ASSET_PROMPTS.json`。
+StepX Companion 的项目源码按 [`AGPL-3.0-only`](LICENSE) 发布。项目在构建、运行或移动端协作适配中使用或集成了以下第三方开源软件与组件，各组件均遵循其原始开源许可证条款。
 
-项目整体采用 AGPL-3.0-only，以满足包含的 AGPL 组件要求；这不会改变第三方文件已有的 MIT、Apache 或其他许可。Google Play / Google 服务 APK、厂商系统固件不包含在本仓库或发布包中。
+StepX Companion source code is released under [`AGPL-3.0-only`](LICENSE). This project incorporates, links to, or interacts at runtime with the following third-party open-source components, each governed by its respective license.
 
-- **CPython**：Windows 使用 python.org 的 3.13.13 嵌入包，Linux/macOS 使用 Astral python-build-standalone 20261021 的 CPython 3.13.17；下载均固定 SHA256，保留包内许可证。https://www.python.org/ 和 https://github.com/astral-sh/python-build-standalone 。
-- **OpenJDK / Android 签名校验工具**：运行时由 Eclipse Temurin 17 的 jlink 生成，保留 legal 目录；Android build-tools 36.0.0 的 aapt/apksigner 随带 NOTICE。源代码见 https://github.com/adoptium/temurin17-binaries 和 https://android.googlesource.com/platform/tools/apksig/ 。
+---
+
+## 1. 移动端与内嵌第三方组件 / Bundled & Mobile Third-Party Components
+
+| 组件 / Component | 用途 / Purpose | 许可证 / License | 仓库内许可与说明路径 / Local License & Notice Path |
+| --- | --- | --- | --- |
+| **GELab-Zero** (`stepfun-ai/gelab-zero`) | 移动端 GUI 观察/动作解析格式参考与默认技能提示词适配（固定修订 `7b619f6f67d2b1101021fc453cb27bd48a29e4f2`） | MIT License | [`desktop/companion-app/third_party/gelab-zero/LICENSE`](desktop/companion-app/third_party/gelab-zero/LICENSE)<br>[`desktop/companion-app/third_party/gelab-zero/NOTICE.md`](desktop/companion-app/third_party/gelab-zero/NOTICE.md) |
+| **ZXing Core** (`com.google.zxing:core:3.5.4`) | 手机端 StepX 伴侣本地二维码解析（配对与局域网连接），不上传相机帧 | Apache License 2.0 | [`desktop/companion-app/libs/ZXing-LICENSE.txt`](desktop/companion-app/libs/ZXing-LICENSE.txt)<br>[`desktop/companion-app/libs/ZXing-source.txt`](desktop/companion-app/libs/ZXing-source.txt) |
+
+### GELab-Zero (MIT License)
+- **Upstream**: https://github.com/stepfun-ai/gelab-zero
+- **Copyright**: Copyright (c) 2025 stepfun-ai
+- **License File**: [`desktop/companion-app/third_party/gelab-zero/LICENSE`](desktop/companion-app/third_party/gelab-zero/LICENSE)
+- **Notes**: Android 侧适配层仅复用 `copilot_tools/parser_0920_summary_adv.py`（MIT）中的 `default_skill` 与制表符动作格式约定，不在 Android 上运行上游 Python/ADB 运行时。详见 [`desktop/companion-app/third_party/gelab-zero/NOTICE.md`](desktop/companion-app/third_party/gelab-zero/NOTICE.md)。
+
+### ZXing Core (`zxing-core-3.5.4.jar`, Apache License 2.0)
+- **Upstream**: https://github.com/zxing/zxing/tree/zxing-3.5.4
+- **License File**: [`desktop/companion-app/libs/ZXing-LICENSE.txt`](desktop/companion-app/libs/ZXing-LICENSE.txt)
+- **Source & Checksum Metadata**: [`desktop/companion-app/libs/ZXing-source.txt`](desktop/companion-app/libs/ZXing-source.txt)
+
+---
+
+## 2. 外部运行时工具与编解码组件 / Runtime Tools & Codec Components
+
+| 组件 / Component | 用途 / Purpose | 许可证 / License | 上游项目 / Upstream |
+| --- | --- | --- | --- |
+| **scrcpy** | 桌面端设备画面投屏与低延迟键鼠控制运行时工具 | Apache License 2.0 | https://github.com/Genymobile/scrcpy |
+| **adb (Android Debug Bridge)** | Android SDK Platform-Tools 授权设备通信、文件互传与调试通道运行时工具 | Apache License 2.0 | https://developer.android.com/tools/releases/platform-tools |
+| **OpenH264 (`openh264`)** | H.264 视频流软解码支持（Cisco OpenH264 编解码库及 Rust 绑定） | BSD-2-Clause License | https://github.com/cisco/openh264<br>https://crates.io/crates/openh264 |
+
+- **scrcpy & adb**: 作为外部子进程工具调用，遵循 Apache License 2.0。源码仓库不直接修改其内部实现；发布包随附运行时工具时保留其各自的 `NOTICE` 与许可证文件。
+- **openh264**: Copyright (c) 2013, Cisco Systems, All rights reserved. 按 BSD 2-Clause "Simplified" License 授权使用。
+
+---
+
+## 3. Rust 生态依赖项 / Rust Ecosystem Dependencies
+
+桌面客户端（`desktop/Cargo.toml`）基于 Rust 构建，使用了以下主要开源 crate（均遵循 MIT License、Apache License 2.0 或 BSD 类宽松开源许可）：
+
+| Crate | 版本 / Version | 许可证 / License | 用途说明 / Purpose |
+| --- | --- | --- | --- |
+| `serde` / `serde_json` | `1.x` | MIT OR Apache-2.0 | 数据结构序列化与 JSON 协议编解码 |
+| `chrono` | `0.4` | MIT OR Apache-2.0 | 日期、时间与时间戳格式化处理 |
+| `image` | `0.25` | MIT OR Apache-2.0 | PNG / JPEG / WebP / GIF 图像解码与缩放处理 |
+| `qrcode` | `0.14` | MIT OR Apache-2.0 | 配对二维码与局域网观看链接二维码生成 |
+| `mdns-sd` | `0.21.6` | MIT OR Apache-2.0 | 局域网 mDNS / DNS-SD 设备发现与广播 |
+| `winit` | `0.29` (patched) | Apache-2.0 | 跨平台原生窗口创建与输入事件循环 |
+| `openh264` | `0.8.1` | BSD-2-Clause | H.264 视频帧解码封装 |
+| `anyhow` | `1.x` | MIT OR Apache-2.0 | 错误上下文传播与诊断格式化 |
+| `rand` | `0.8` | MIT OR Apache-2.0 | 随机数生成（配对码与临时会话标识） |
+| `tempfile` | `3.x` | MIT OR Apache-2.0 | 安全临时文件与原子写入暂存 |
+| `quick-xml` | `0.37` | MIT | XML 清单与结构解析 |
+| `base64` | `0.22` | MIT OR Apache-2.0 | Base64 编解码（IPC 载荷与图标资源） |
+| `url` | `2.x` | MIT OR Apache-2.0 | URL 解析与安全校验 |
+| `async-channel` | `2.5` | Apache-2.0 OR MIT | 异步任务与 UI 线程消息通道 |
+| `global-hotkey` | `0.7` | Apache-2.0 OR MIT | 桌面全局快捷键注册 |
+| `tray-icon` | `0.26.1` | Apache-2.0 OR MIT | 系统托盘图标与菜单支持 |
+| `native-dialog` | `0.7` | MIT | 原生文件选择与保存对话框 |
+| `pathfinder_geometry` / `pathfinder_simd` | `0.5.1` | Apache-2.0 OR MIT | 2D 几何计算与 GPU 矢量渲染支撑 |
+| `libc` / `libloading` / `x11rb` | `0.2` / `0.8` / `0.13.2` | MIT OR Apache-2.0 | 平台系统调用、动态库加载与 Linux X11 交互 |
+| `embed-resource` | `3.0` | MIT | Windows 可执行文件图标与清单资源嵌入 |
+
+---
+
+## 4. 未打包的外部可选集成说明 / Unbundled Optional Upstream Integrations
+
+- **Neo Agent Touch（仅本机适配层）**：仓库内 [`desktop/neo-agent-adapter/`](desktop/neo-agent-adapter/README.md) 仅包含 StepX Companion 独立编写的 Android IPC 适配层源码与构建脚本，**不包含** JiayuStudio 的 Neo Agent Touch 上游源码或预编译 APK。任何本机组合构建均需用户自行在私有目录拉取并遵循原作者版权要求，不随公开仓库或标准安装包再分发。
+- **Google Play / GMS 组件**：仓库及公开构建不内置任何 Google 专有 APK，详见 [`NOTICE`](NOTICE)。
+
+## Android 官方连接教程截图
+
+`desktop/assets/connection-guide/` 中的版本号、USB 调试、电脑授权和无线调试图片来自 Google / Android Developers 的实机文档截图，依 [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) 使用。来源为 [连接 Android 设备](https://developer.android.com/codelabs/basic-android-kotlin-compose-connect-device) 和 [在硬件设备上运行](https://developer.android.com/studio/run/device)。部分图片仅裁切周边空白或无关设置项，未生成或修改系统控件；中文提示在客户端单独绘制。逐图网址和裁切坐标见 [来源清单](desktop/assets/connection-guide/sources.json)。Android 及相关产品标识仍归原权利人所有；引用不表示 Google 为本项目背书。

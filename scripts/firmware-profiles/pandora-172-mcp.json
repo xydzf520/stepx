@@ -1,0 +1,2492 @@
+{
+  "schemaVersion": 1,
+  "profileId": "pandora-172",
+  "model": "PZ261A",
+  "androidApi": 36,
+  "fingerprint": "StepX/pandora/pandora:16/BQ2A.260122.002-BP2A.250705.008/172:user/release-keys",
+  "firmware": "Step AOS 1.0.0.2.26001_stable_user_20261004_131555",
+  "checkedAt": "2026-10-28",
+  "transport": {
+    "action": "com.stepos.mcp.sdk.TOOLS_SERVICE",
+    "binder": "com.stepos.mcp.sdk.IMCPBinderService",
+    "callback": "com.stepos.mcp.sdk.IMCPBinderCallback",
+    "permission": "com.stepos.mcp.sdk.permission.ACCESS_MCP_SERVICES",
+    "jsonrpc": "2.0",
+    "protocolVersion": "2024-11-05"
+  },
+  "changePolicy": "Any fingerprint, package version, APK digest or schema digest change requires a new profile and business regression. Discovery is not proof of authorization or completion.",
+  "services": [
+    {
+      "package": "com.android.alarmclock",
+      "versionCode": 10029,
+      "versionName": "1.0.0_20260928_153709",
+      "apk_sha256": "c49748936e25fe90abf52e704ff90cddb922f3146880415a4c32b1e76bef5c23",
+      "schema_resource": "res/d0.json",
+      "schema_sha256": "383e065733431a312738e6dc248d3011324aaadb43d438542fddcf90669fe86c",
+      "status": "static_discovery",
+      "tool_count": 10,
+      "tools": [
+        {
+          "name": "alarm_clock_add",
+          "parameters": [
+            "hour",
+            "minute",
+            "vibrate",
+            "label",
+            "repeatDays",
+            "weekdays"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "alarm_clock_delete",
+          "parameters": [
+            "hour",
+            "minute"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "alarm_clock_delete_all",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "alarm_clock_disable",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "alarm_clock_disable_one",
+          "parameters": [
+            "hour",
+            "minute"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "alarm_clock_snooze",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "alarm_clock_get_enable",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "alarm_clock_get_current_time_zone",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "alarm_clock_get_current_time_by_city",
+          "parameters": [
+            "city"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "alarm_clock_timer_add",
+          "parameters": [
+            "seconds",
+            "label"
+          ],
+          "verification": "not_tested"
+        }
+      ]
+    },
+    {
+      "package": "com.stepos.filemanager",
+      "versionCode": 10029,
+      "versionName": "1.0.0_20260928_153655",
+      "apk_sha256": "e6579c1222d1cf1df8d5c9ff034a0ee95d1f0af2b1042f09baa9988352185ac9",
+      "schema_resource": "res/O2.json",
+      "schema_sha256": "803ed51f927b8e33a5d70b258df0cba0e451c0d109b288555a731c130e7dd117",
+      "status": "static_discovery",
+      "tool_count": 26,
+      "tools": [
+        {
+          "name": "filemanager_get_file_path",
+          "parameters": [
+            "file_uri"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "filemanager_get_file_size",
+          "parameters": [
+            "file_uri"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "filemanager_get_file_create_time",
+          "parameters": [
+            "file_uri"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "filemanager_get_file_update_time",
+          "parameters": [
+            "file_uri"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "filemanager_get_file_detail",
+          "parameters": [
+            "file_uri"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "filemanager_create_folder",
+          "parameters": [
+            "folderName"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "filemanager_create_file",
+          "parameters": [
+            "folderPath",
+            "fileName"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "filemanager_search_file",
+          "parameters": [
+            "keywords"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "filemanager_get_apk_file_list",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "filemanager_get_compress_file_list",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "filemanager_get_document_file_list",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "filemanager_get_voice_file_list",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "filemanager_get_video_file_list",
+          "parameters": [
+            "file_uri"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "filemanager_get_download_file_list",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "filemanager_get_weixin_file_list",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "filemanager_get_browser_file_list",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "filemanager_get_bluetooth_file_list",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "filemanager_get_ringtone_file_list",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "filemanager_get_screenshot_file_list",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "filemanager_get_screen_recording_file_list",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "filemanager_move_file",
+          "parameters": [
+            "srcPath",
+            "desPath"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "filemanager_get_garbage_file_list",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "filemanager_recovery_garbage_file",
+          "parameters": [
+            "garbagePath"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "filemanager_recovery_garbage_files",
+          "parameters": [
+            "garbagePaths",
+            "originalPathPrefix",
+            "restoreAll"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "filemanager_edit_folder_name",
+          "parameters": [
+            "file_uri",
+            "newName"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "filemanager_edit_file_name",
+          "parameters": [
+            "file_uri",
+            "newName"
+          ],
+          "verification": "not_tested"
+        }
+      ]
+    },
+    {
+      "package": "com.stepos.calculator",
+      "versionCode": 10020,
+      "versionName": "1.0.0_20260923_163057",
+      "apk_sha256": "d089d116ee3a2257e2aead0514761a517ee13a590729dc1e00e4f1d57bd13af2",
+      "schema_resource": "res/O2.json",
+      "schema_sha256": "b74459db95c5117c50e7ebc2a7217dbc7549629326e94bd116bb6587bcdfee21",
+      "status": "static_discovery",
+      "tool_count": 1,
+      "tools": [
+        {
+          "name": "evaluate_expression",
+          "parameters": [
+            "expression",
+            "use_radians"
+          ],
+          "verification": "not_tested"
+        }
+      ]
+    },
+    {
+      "package": "com.android.calendar",
+      "versionCode": 100011,
+      "versionName": "1.0.0_20260928_171857",
+      "apk_sha256": "0f4bdb252f716615a13fe2322399940b107d91685ab024baf2b6226ef5791940",
+      "schema_resource": "res/z0.json",
+      "schema_sha256": "4af86f2dc969aa30d1f10c82fc8cfcedce221bcae5d9be493cd694f77b49ddaa",
+      "status": "static_discovery",
+      "tool_count": 8,
+      "tools": [
+        {
+          "name": "calendar_add_event",
+          "parameters": [
+            "title",
+            "description",
+            "location",
+            "start_time",
+            "end_time",
+            "reminder_offset",
+            "recurrence_type",
+            "recurrence_sub_type",
+            "recurrence_until_time",
+            "recurrence_until_count",
+            "is_all_day"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "calendar_query_event",
+          "parameters": [
+            "start_time",
+            "end_time"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "calendar_delete_event",
+          "parameters": [
+            "title",
+            "description",
+            "location",
+            "start_time",
+            "end_time"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "calendar_edit_event",
+          "parameters": [
+            "title",
+            "start_time",
+            "end_time",
+            "new_title",
+            "new_start_time",
+            "new_end_time"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "calendar_add_special_event",
+          "parameters": [
+            "type",
+            "title",
+            "description",
+            "date_time",
+            "reminder_day",
+            "reminder_time"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "calendar_query_special_event",
+          "parameters": [
+            "start_time",
+            "end_time",
+            "event_types"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "calendar_delete_special_event",
+          "parameters": [
+            "start_time",
+            "end_time",
+            "event_types"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "calendar_edit_special_event",
+          "parameters": [
+            "type",
+            "title",
+            "date_time",
+            "new_title",
+            "new_date_time",
+            "new_reminder_day",
+            "new_reminder_time"
+          ],
+          "verification": "not_tested"
+        }
+      ]
+    },
+    {
+      "package": "com.android.soundrecorder",
+      "versionCode": 100020,
+      "versionName": "1.1.4_20260930_174706",
+      "apk_sha256": "548ad54437fe51ffe55254c26d4e7ca0738958f73940dc5b8f3e9e8aeb09f6c7",
+      "schema_resource": "res/O2.json",
+      "schema_sha256": "63a0993ffa8a0229b9a0899c839d5a46278291faac3bdcaacb187e7257759dbb",
+      "status": "static_discovery",
+      "tool_count": 5,
+      "tools": [
+        {
+          "name": "lite_recorder_open_recording",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "lite_recorder_open_home",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "lite_recorder_stop_recording",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "lite_recorder_pause_recording",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "lite_recorder_resume_recording",
+          "parameters": [],
+          "verification": "not_tested"
+        }
+      ]
+    },
+    {
+      "package": "com.stepos.xmscore",
+      "versionCode": 10005,
+      "versionName": "1.0.0_20260924_164731",
+      "apk_sha256": "f60b1c3a158589695b9fca9b8d268c8bbb074680159a3802c22f030345c4d9bd",
+      "schema_resource": "res/O2.json",
+      "schema_sha256": "48b63cf90f8da4ac04039d06e8a2e118307b8b4d4a6ad4b2570d71c6b58b6ab0",
+      "status": "static_discovery",
+      "tool_count": 1,
+      "tools": [
+        {
+          "name": "get_current_location",
+          "parameters": [],
+          "verification": "not_tested"
+        }
+      ]
+    },
+    {
+      "package": "com.stepos.logreport",
+      "versionCode": 100003,
+      "versionName": "1.0.3_20260925_144015",
+      "apk_sha256": "e2cee7e1b2f0dc72bc6728bf560c0e0205579f6e45a7d9bb51e00a535995eca8",
+      "schema_resource": "res/O2.json",
+      "schema_sha256": "f0b1e78c29140b5255fe32ec32773531233117a7355d82fbd929b5fe546139f0",
+      "status": "static_discovery",
+      "tool_count": 2,
+      "tools": [
+        {
+          "name": "start_record_log",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "stop_record_log",
+          "parameters": [],
+          "verification": "not_tested"
+        }
+      ]
+    },
+    {
+      "package": "com.stepos.ailauncher",
+      "versionCode": 100001,
+      "versionName": "1.0.0_20261002_221513",
+      "apk_sha256": "b424847331d71c3822969f894e88edf225ee5ed819556f6b00ad3a076749219b",
+      "schema_resource": "res/cr.json",
+      "schema_sha256": "f184277183c34f6ad6b07a40cfd67f03699766a68d49ca81971e6419c2cf75e0",
+      "status": "static_discovery",
+      "tool_count": 4,
+      "tools": [
+        {
+          "name": "assistant_change_voice_id",
+          "parameters": [
+            "voice_id"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "assistant_get_voice_list",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "assistant_show_risk_statement",
+          "parameters": [
+            "title",
+            "level",
+            "description",
+            "tags",
+            "scene"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "ailauncher_load_tripartite_common_card",
+          "parameters": [
+            "templateType",
+            "taskId",
+            "taskTitle",
+            "taskStatus",
+            "displayMode",
+            "bizChannel",
+            "summary",
+            "links",
+            "searchSource",
+            "businessData",
+            "error"
+          ],
+          "verification": "not_tested"
+        }
+      ]
+    },
+    {
+      "package": "com.android.systemui",
+      "versionCode": 10000000,
+      "versionName": "1.0.0_20261004_135423",
+      "apk_sha256": "256fe8ea05811f9a1d31ae133efac4b8d98589dc34d09ef4ec94ecdd3502edcc",
+      "schema_resource": "res/raw/mcp_tools.json",
+      "schema_sha256": "e7676293815f0eab755cef476ce70d633c9197a2f27727254827e9ca28b692fc",
+      "status": "static_discovery",
+      "tool_count": 2,
+      "tools": [
+        {
+          "name": "open_flash_light",
+          "parameters": [
+            "openState"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "query_notification_info",
+          "parameters": [
+            "keyword"
+          ],
+          "verification": "not_tested"
+        }
+      ]
+    },
+    {
+      "package": "com.android.settings",
+      "versionCode": 10006000,
+      "versionName": "1.0.6_20261004_134914",
+      "apk_sha256": "eb75ed980cd725518b421536d1c53a27c455eb0f8fd2158ce0a44c7cf24a7e90",
+      "schema_resource": "res/raw/mcp_tools.json",
+      "schema_sha256": "0417767152c4c4972095b203e8e17cdfe55e134c35f2f1f76d4bf0578df9ea8d",
+      "status": "static_discovery",
+      "tool_count": 51,
+      "tools": [
+        {
+          "name": "settings_battery_percentage_switch",
+          "parameters": [
+            "openState"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_wifi_switch",
+          "parameters": [
+            "openState"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_bluetooth_switch",
+          "parameters": [
+            "openState"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_hotspot_switch",
+          "parameters": [
+            "openState"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_airplane_mode_switch",
+          "parameters": [
+            "openState"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_data_switch",
+          "parameters": [
+            "openState"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_vibration_switch",
+          "parameters": [
+            "openState"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_dark_mode_switch",
+          "parameters": [
+            "openState"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_disturb_mode_switch",
+          "parameters": [
+            "openState"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_adjust_sound",
+          "parameters": [
+            "openState",
+            "soundType"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_adjust_brightness",
+          "parameters": [
+            "openState",
+            "newValue"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_dialing_keypad_sound_switch",
+          "parameters": [
+            "openState"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_screen_lock_sound_switch",
+          "parameters": [
+            "openState"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_charging_notif_sound_switch",
+          "parameters": [
+            "openState"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_touch_sound_switch",
+          "parameters": [
+            "openState"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_auto_brightness_switch",
+          "parameters": [
+            "openState"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_auto_rotation_switch",
+          "parameters": [
+            "openState"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_screen_saver_switch",
+          "parameters": [
+            "openState"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_one_handed_mode_switch",
+          "parameters": [
+            "openState"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_tapToCheck_phone_switch",
+          "parameters": [
+            "openState"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_liftToCheck_phone_switch",
+          "parameters": [
+            "openState"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_battery_saver_switch",
+          "parameters": [
+            "openState"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_adjust_navigation_mode",
+          "parameters": [
+            "openState"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_choose_wifi",
+          "parameters": [
+            "newValue"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_forget_wifi",
+          "parameters": [
+            "newValue"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_set_screen_off_time",
+          "parameters": [
+            "newValue",
+            "openState"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_set_media_sound",
+          "parameters": [
+            "newValue"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_get_battery_percentage_state",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_get_current_battery_level",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_get_wifi_state",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_get_bluetooth_state",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_get_hotspot_state",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_get_airplane_mode_state",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_get_data_state",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_get_vibration_state",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_get_dark_mode_state",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_get_dialing_keypad_sound_state",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_get_screen_lock_sound_state",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_get_charging_notif_sound_state",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_get_touch_sound_state",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_get_auto_brightness_state",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_get_auto_rotation_state",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_get_screen_saver_state",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_get_one_handed_mode_state",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_get_tapToCheck_phone_state",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_get_liftToCheck_phone_state",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_get_battery_saver_state",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_get_app_lock_state",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_app_lock_config_switch",
+          "parameters": [
+            "openState"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_adjust_font_size",
+          "parameters": [
+            "openState"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "settings_eye_protection_mode_switch",
+          "parameters": [
+            "openState"
+          ],
+          "verification": "not_tested"
+        }
+      ]
+    },
+    {
+      "package": "com.stepos.systemuiex",
+      "versionCode": 10005,
+      "versionName": "1.0.0_20260928_171105",
+      "apk_sha256": "bb1a050711961679127ac81a69f830b2b9cc23a5589e42fa7109bdfbf4779d6e",
+      "schema_resource": "res/O2.json",
+      "schema_sha256": "bb92a06490d30fd865b066c5e50790b4f2c564775543c5df04496bac6a8d31f4",
+      "status": "static_discovery",
+      "tool_count": 4,
+      "tools": [
+        {
+          "name": "screen_capture_record",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "screen_capture_stop_record",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "screen_capture_screenshot",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "screen_capture_take_long_screenshot",
+          "parameters": [],
+          "verification": "not_tested"
+        }
+      ]
+    },
+    {
+      "package": "com.stepos.feedback",
+      "versionCode": 10010,
+      "versionName": "1.0.2_20260928_144153",
+      "apk_sha256": "4d8d9cfc39a097b5c6a48a024d4188839581a6cc478a5b30fd42720c2ebcf0ad",
+      "schema_resource": "res/O2.json",
+      "schema_sha256": "c228064bdecdaa913969731dcf80e8cc007f04fbb525bab8504ccf53d49a440f",
+      "status": "static_discovery",
+      "tool_count": 1,
+      "tools": [
+        {
+          "name": "feedback_submit_question",
+          "parameters": [
+            "categoryId",
+            "content",
+            "contact"
+          ],
+          "verification": "not_tested"
+        }
+      ]
+    },
+    {
+      "package": "com.stepos.secureservice",
+      "versionCode": 10023,
+      "versionName": "1.0.0_20260925_170239",
+      "apk_sha256": "1835d5eeed5760527aba4beac9855145666cba9ed2edbbefd08bc2cef2b78557",
+      "schema_resource": "res/O2.json",
+      "schema_sha256": "ec6d9f1ba34a5bf4a4f9944c0ccd3d2ab029f3fde24bb3028129486dab1b7858",
+      "status": "static_discovery",
+      "tool_count": 2,
+      "tools": [
+        {
+          "name": "security_service_open_oaid_settings",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "security_service_get_uuid",
+          "parameters": [],
+          "verification": "not_tested"
+        }
+      ]
+    },
+    {
+      "package": "com.stepos.agentsafetycenter",
+      "versionCode": 10021,
+      "versionName": "1.0.0_20260928_192215",
+      "apk_sha256": "3cb58988b1ac032aa005e8d231275e3d5a0b4310358ddda5305fdb5b004daa89",
+      "schema_resource": "res/O2.json",
+      "schema_sha256": "5d23daf275c42b1566105141be3a62c3a48018307da95d01d09900484a50259f",
+      "status": "static_discovery",
+      "tool_count": 2,
+      "tools": [
+        {
+          "name": "file_safe_delete",
+          "parameters": [
+            "path",
+            "paths",
+            "recursive",
+            "truth_id"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "file_restore",
+          "parameters": [
+            "path",
+            "paths",
+            "recursive"
+          ],
+          "verification": "not_tested"
+        }
+      ]
+    },
+    {
+      "package": "com.stepos.safebox",
+      "versionCode": 10007,
+      "versionName": "1.0.0_20260921_113512",
+      "apk_sha256": "0824417692c0369f2c96876ab9f229c11a576b146489f9e775ca323c77ad0270",
+      "schema_resource": "res/O2.json",
+      "schema_sha256": "1eb8feb3cd1536607464da779120ea364fdd04b992ddc6eef22df3818998e5d7",
+      "status": "static_discovery",
+      "tool_count": 2,
+      "tools": [
+        {
+          "name": "security_safebox_auto_fill",
+          "parameters": [
+            "enable"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "security_safebox_open",
+          "parameters": [],
+          "verification": "not_tested"
+        }
+      ]
+    },
+    {
+      "package": "com.stepos.safe",
+      "versionCode": 10045,
+      "versionName": "1.0.0_20261004_114800",
+      "apk_sha256": "dfbc791f845c9a46eacdd1fe75503495c920a11a93a285af9c92106c10f07478",
+      "schema_resource": "res/O2.json",
+      "schema_sha256": "78f668464b79ddc64a8aaa84a4a6926d17f0020e056b8a53472770b2465e2270",
+      "status": "static_discovery",
+      "tool_count": 12,
+      "tools": [
+        {
+          "name": "security_center_open_main",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "security_center_into_practicaltools_page",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "security_manager_open_harassment_interception",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "security_manager_into_virus_page",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "security_center_network_pay_enable",
+          "parameters": [
+            "enable"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "security_center_pay_enable",
+          "parameters": [
+            "enable"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "security_center_usb_install_enable",
+          "parameters": [
+            "enable"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "security_center_acceleration_shortcut_enable",
+          "parameters": [
+            "enable"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "security_center_acceleration_execute",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "security_center_safe_scan_shortcut_enable",
+          "parameters": [
+            "enable"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "security_center_lock_screen_shortcut_enable",
+          "parameters": [
+            "enable"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "security_center_enable_function",
+          "parameters": [
+            "enable"
+          ],
+          "verification": "not_tested"
+        }
+      ]
+    },
+    {
+      "package": "com.stepos.common.ability.proxy",
+      "versionCode": 10011,
+      "versionName": "1.0.11_20261002_222619",
+      "apk_sha256": "3d60ad9280e251abe75970c48b7e4c61866eba8665cceddf5a2e53a7368f5f85",
+      "schema_resource": "res/O2.json",
+      "schema_sha256": "f338edc0491c21eb05caf8e3b2bde079c714a475303ad5405a6dd1ee3636bb0a",
+      "status": "static_discovery",
+      "tool_count": 24,
+      "tools": [
+        {
+          "name": "open_app_by_package",
+          "parameters": [
+            "packageName",
+            "className"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "open_app_by_name",
+          "parameters": [
+            "appName",
+            "className"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "show_widget_by_package_class",
+          "parameters": [
+            "packageName",
+            "className"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "show_notify_by_info",
+          "parameters": [
+            "title",
+            "content",
+            "intent",
+            "icon"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "batch_file_upload",
+          "parameters": [
+            "files"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "batch_file_upload_return_all",
+          "parameters": [
+            "files"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "batch_file_upload_all_progress",
+          "parameters": [
+            "files"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "common_ability_play_music",
+          "parameters": [
+            "songName"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "common_ability_clipboard_text",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "common_ability_has_fingerprint",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "common_ability_has_face_rec",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "common_ability_get_screen_size",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "common_ability_get_app_versioncode",
+          "parameters": [
+            "packageName"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "common_ability_get_app_permissions",
+          "parameters": [
+            "packageName"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "common_ability_check_app_permission",
+          "parameters": [
+            "packageName",
+            "permissionName"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "check_app_installed_by_package",
+          "parameters": [
+            "packageName"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "check_app_installed_by_name",
+          "parameters": [
+            "appName"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "open_url_with_browser",
+          "parameters": [
+            "url"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "common_ability_get_app_list",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "common_ability_get_app_count",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "speak_text",
+          "parameters": [
+            "text"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "stop_speak_text",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "start_vibration",
+          "parameters": [
+            "duration_ms",
+            "amplitude"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "stop_vibration",
+          "parameters": [],
+          "verification": "not_tested"
+        }
+      ]
+    },
+    {
+      "package": "com.stepos.ability",
+      "versionCode": 101002,
+      "versionName": "1.1.2_20261003_004257",
+      "apk_sha256": "c9f56f3078df96d8d726422b1c622a1c19fe8c7dec8cadd8537d9a6ecf513ac4",
+      "schema_resource": "res/O2.json",
+      "schema_sha256": "9800144630d9df420cdf92a1275af051cab43a7d0c08e2f5d4395f903791246e",
+      "status": "static_discovery",
+      "tool_count": 19,
+      "tools": [
+        {
+          "name": "mdi_task_create",
+          "parameters": [
+            "taskName",
+            "reuse"
+          ],
+          "verification": "live_jd_orders_2026-10-28"
+        },
+        {
+          "name": "mdi_task_finish",
+          "parameters": [
+            "taskName",
+            "ignoreActions"
+          ],
+          "verification": "live_jd_orders_2026-10-28"
+        },
+        {
+          "name": "mdi_open_app",
+          "parameters": [
+            "packageName",
+            "taskName"
+          ],
+          "verification": "live_jd_orders_2026-10-28"
+        },
+        {
+          "name": "mdi_move_app",
+          "parameters": [
+            "packageName",
+            "toDisplayId",
+            "toTop",
+            "taskName"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "mdi_top_app",
+          "parameters": [
+            "displayId",
+            "taskName"
+          ],
+          "verification": "live_jd_orders_2026-10-28"
+        },
+        {
+          "name": "mdi_click",
+          "parameters": [
+            "x",
+            "y",
+            "contentDesc",
+            "text",
+            "durationMs",
+            "taskName"
+          ],
+          "verification": "live_jd_orders_2026-10-28"
+        },
+        {
+          "name": "mdi_tap",
+          "parameters": [
+            "x",
+            "y",
+            "contentDesc",
+            "text",
+            "durationMs",
+            "taskName"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "mdi_long_click",
+          "parameters": [
+            "x",
+            "y",
+            "durationMs",
+            "taskName"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "mdi_swipe",
+          "parameters": [
+            "startX",
+            "startY",
+            "endX",
+            "endY",
+            "durationMs",
+            "steps",
+            "taskName"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "mdi_fling",
+          "parameters": [
+            "startX",
+            "startY",
+            "velocityX",
+            "velocityY",
+            "durationMs",
+            "taskName"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "mdi_scale",
+          "parameters": [
+            "centerX",
+            "centerY",
+            "startDistance",
+            "endDistance",
+            "durationMs",
+            "taskName"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "mdi_set_text",
+          "parameters": [
+            "content",
+            "x",
+            "y",
+            "taskName"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "mdi_key_event",
+          "parameters": [
+            "keyCode",
+            "taskName"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "mdi_back",
+          "parameters": [
+            "taskName"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "mdi_home",
+          "parameters": [
+            "taskName"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "mdi_wait",
+          "parameters": [
+            "durationMs",
+            "taskName"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "mdi_capture",
+          "parameters": [
+            "targetPackageName",
+            "taskName"
+          ],
+          "verification": "live_jd_orders_2026-10-28"
+        },
+        {
+          "name": "mdi_snapshot",
+          "parameters": [
+            "packageName",
+            "timeoutMs",
+            "taskName"
+          ],
+          "verification": "live_jd_orders_2026-10-28"
+        },
+        {
+          "name": "mdi_ime_enable",
+          "parameters": [
+            "enable",
+            "taskName"
+          ],
+          "verification": "not_tested"
+        }
+      ]
+    },
+    {
+      "package": "com.stepos.media.gallery",
+      "versionCode": 100001,
+      "versionName": "1.0.0_20261002_204345",
+      "apk_sha256": "b7efe60217c02fa2a91a2406b53783c811210747277a56d42684eeb568670bc3",
+      "schema_resource": "res/raw/mcp_tools.json",
+      "schema_sha256": "23c70a4366c117832c1f49ef92c0cac8cbd9966df6225f82f0381b4aaadeb9ef",
+      "status": "static_discovery",
+      "tool_count": 49,
+      "tools": [
+        {
+          "name": "gallery_get_latest_media",
+          "parameters": [
+            "mediaType"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_get_media_by_time_range",
+          "parameters": [
+            "mediaType",
+            "startTime",
+            "endTime"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_open_picture_editor",
+          "parameters": [
+            "path"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_ai_extend_image",
+          "parameters": [
+            "path"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_ai_erase_image",
+          "parameters": [
+            "path"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_ai_style_image",
+          "parameters": [
+            "path"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_add_picture_text",
+          "parameters": [
+            "path",
+            "value",
+            "position",
+            "color",
+            "size",
+            "faceType",
+            "rotation"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_add_picture_watermark",
+          "parameters": [
+            "path",
+            "width",
+            "height",
+            "value",
+            "color",
+            "size",
+            "position",
+            "rotation"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_add_picture_mosaic",
+          "parameters": [
+            "path",
+            "regions",
+            "blockSize",
+            "type"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_edit_picture_paint",
+          "parameters": [
+            "path",
+            "width",
+            "height",
+            "paintPath",
+            "size",
+            "color"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_add_picture_filter",
+          "parameters": [
+            "path",
+            "filterType"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_reduce_picture_resolution",
+          "parameters": [
+            "path",
+            "width",
+            "height",
+            "reduceResolution"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_edit_picture_sharpen",
+          "parameters": [
+            "path",
+            "width",
+            "height",
+            "sharpen"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_edit_picture_temperature",
+          "parameters": [
+            "path",
+            "width",
+            "height",
+            "temperature"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_edit_picture_saturation",
+          "parameters": [
+            "path",
+            "width",
+            "height",
+            "saturation"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_edit_picture_brightness",
+          "parameters": [
+            "path",
+            "width",
+            "height",
+            "brightness"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_edit_picture_aspect_ratio",
+          "parameters": [
+            "path",
+            "width",
+            "height",
+            "aspectRatio"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_edit_picture_degree",
+          "parameters": [
+            "path",
+            "degrees",
+            "width",
+            "height"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_edit_picture_flip",
+          "parameters": [
+            "path",
+            "direction"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_open_video_editor",
+          "parameters": [
+            "path"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_open_video_player",
+          "parameters": [
+            "path"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_intelligent_search",
+          "parameters": [
+            "search_content",
+            "countLimit"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_local_search",
+          "parameters": [
+            "search_content",
+            "date_keywords",
+            "locations",
+            "people",
+            "albums",
+            "scenes",
+            "ocr_texts",
+            "screenshot_sources",
+            "device_sources",
+            "annotations",
+            "start_time",
+            "end_time",
+            "countLimit"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_create_album",
+          "parameters": [
+            "albumName"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_rename_album",
+          "parameters": [
+            "oldAlbumName",
+            "newAlbumName"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_copy_files_to_album",
+          "parameters": [
+            "albumName",
+            "filePaths"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_move_media_to_album",
+          "parameters": [
+            "filePath",
+            "albumName"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_hide_album",
+          "parameters": [
+            "albumName"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_set_album_cover",
+          "parameters": [
+            "albumName",
+            "coverFilePath"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_open_trash_bin",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_open_hidden_album",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_open_private_album",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_select_media_file_card",
+          "parameters": [
+            "mediaType",
+            "maxSelectNum",
+            "minSelectNum"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_get_sticker_columns",
+          "parameters": [
+            "countLimit"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_get_stickers",
+          "parameters": [
+            "columnIds",
+            "countLimit"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_get_local_stickers",
+          "parameters": [
+            "countLimit"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_get_style_templates",
+          "parameters": [
+            "countLimit"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_get_photo_info",
+          "parameters": [
+            "path"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_get_video_info",
+          "parameters": [
+            "path"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_copy_media",
+          "parameters": [
+            "sourcePath",
+            "destinationPath"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_move_to_folder",
+          "parameters": [
+            "path",
+            "folderPath"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_restore_media_from_trash",
+          "parameters": [
+            "filePaths"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_get_trash_media_list",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_hide_media",
+          "parameters": [
+            "path"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_unhide_media",
+          "parameters": [
+            "path"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_share_media",
+          "parameters": [
+            "path"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_favorite_media",
+          "parameters": [
+            "path",
+            "isFavorite"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_rename_media",
+          "parameters": [
+            "path",
+            "newName"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "gallery_compress_media",
+          "parameters": [
+            "path",
+            "quality"
+          ],
+          "verification": "not_tested"
+        }
+      ]
+    },
+    {
+      "package": "com.stepos.net.search",
+      "versionCode": 10005,
+      "versionName": "1.0.0_20260928_152817",
+      "apk_sha256": "3d0a450bdc0eacef082a12b4c1d2f6d7df7f8c23612e51226921182d699aea96",
+      "schema_resource": "res/O2.json",
+      "schema_sha256": "c90e9965caa07118a0c95b030d4ab1ebcc361daa2833103a9131fdc5aafd2290",
+      "status": "static_discovery",
+      "tool_count": 2,
+      "tools": [
+        {
+          "name": "search_open",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "search_setting",
+          "parameters": [],
+          "verification": "not_tested"
+        }
+      ]
+    },
+    {
+      "package": "com.android.dialer",
+      "versionCode": 10009,
+      "versionName": "1.0.0_20261003_134114",
+      "apk_sha256": "e5ab9c0dffc7e4ce006f92da97c8457086062ec7c87a4d2cbf6bd2a3b43462dc",
+      "schema_resource": "res/O2d.json",
+      "schema_sha256": "a4aba147312452bf22e6ef101aa8e3cfec1a34e6d51ba6d1bbe44dbad7676f5d",
+      "status": "static_discovery",
+      "tool_count": 36,
+      "tools": [
+        {
+          "name": "dialer_call_to",
+          "parameters": [
+            "number",
+            "isVideo"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "dialer_call_contact",
+          "parameters": [
+            "name",
+            "work",
+            "contactId",
+            "isVideo"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "dialer_show_incall_screen",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "dialer_accept_call",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "dialer_hangup_call",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "dialer_call_back",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "dialer_contacts_add",
+          "parameters": [
+            "number",
+            "name",
+            "email",
+            "company",
+            "title",
+            "note",
+            "address"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "dialer_contacts_update",
+          "parameters": [
+            "number",
+            "name",
+            "email",
+            "company",
+            "title",
+            "note",
+            "address"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "dialer_contacts_query",
+          "parameters": [
+            "number",
+            "name",
+            "work",
+            "limit"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "dialer_contacts_delete",
+          "parameters": [
+            "number",
+            "name",
+            "company",
+            "address"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "dialer_contacts_restore",
+          "parameters": [
+            "name",
+            "number",
+            "address",
+            "company"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "dialer_open_contacts_editor",
+          "parameters": [
+            "number",
+            "name"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "dialer_contacts_set_starred",
+          "parameters": [
+            "number",
+            "name",
+            "starred"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "dialer_contacts_copy_number",
+          "parameters": [
+            "name"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "dialer_open_my_business_card",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "dialer_check_last_caller",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "dialer_query_calllog",
+          "parameters": [
+            "date",
+            "startDate",
+            "endDate",
+            "name",
+            "limit"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "dialer_delete_calllog",
+          "parameters": [
+            "date",
+            "startDate",
+            "endDate",
+            "name",
+            "number",
+            "last"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "dialer_query_calllog_of_contact",
+          "parameters": [
+            "name",
+            "limit"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "dialer_query_calllog_by_type",
+          "parameters": [
+            "callType",
+            "limit"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "dialer_query_calllog_by_number",
+          "parameters": [
+            "number",
+            "limit"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "dialer_query_call_duration_ranking",
+          "parameters": [
+            "name",
+            "limit"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "dialer_show_dialpad",
+          "parameters": [
+            "number"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "dialer_open_call_settings",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "dialer_open_sim_card_settings",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "dialer_open_medical_emergency_information",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "dialer_settings_enable_power_button_ends_call",
+          "parameters": [
+            "enable"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "dialer_settings_enable_incoming_flip_silent",
+          "parameters": [
+            "enable"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "dialer_settings_vibrate_when_mocall_connected",
+          "parameters": [
+            "enable"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "dialer_settings_open_auto_record_screen",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "dialer_settings_allow_viewing_medical_information",
+          "parameters": [
+            "enable"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "dialer_settings_sos_auto_call",
+          "parameters": [
+            "enable"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "dialer_add_group",
+          "parameters": [
+            "title"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "dialer_add_number_to_blocked_list",
+          "parameters": [
+            "number"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "dialer_query_blocked_number",
+          "parameters": [
+            "number"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "dialer_delete_number_from_blocked_list",
+          "parameters": [
+            "number"
+          ],
+          "verification": "not_tested"
+        }
+      ]
+    },
+    {
+      "package": "com.android.mms",
+      "versionCode": 10114,
+      "versionName": "1.0.0_20260929_152107",
+      "apk_sha256": "d7797d1e83b9fc4f25cd8892a28061ad1575a0faa3be26c2d9eeaad80b6e0105",
+      "schema_resource": "res/O2d.json",
+      "schema_sha256": "8f1255fb1715da9a00e6047281c754bb19662f6f6b9c0ad90b6c4528d638f58f",
+      "status": "static_discovery",
+      "tool_count": 28,
+      "tools": [
+        {
+          "name": "sms_send",
+          "parameters": [
+            "phone",
+            "message",
+            "send_directly",
+            "sim_slot"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "sms_send_direct",
+          "parameters": [
+            "phone",
+            "message"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "sms_delete",
+          "parameters": [
+            "phone_number"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "sms_read_status",
+          "parameters": [
+            "phone",
+            "read"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "sms_forward",
+          "parameters": [
+            "forward_to",
+            "keywords"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "sms_statistics",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "sms_search",
+          "parameters": [
+            "keyword",
+            "phone",
+            "date_from",
+            "date_to",
+            "type",
+            "limit"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "sms_draft_save",
+          "parameters": [
+            "message",
+            "phone_number"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "sms_draft_get",
+          "parameters": [
+            "phone",
+            "limit"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "sms_draft_delete",
+          "parameters": [
+            "phone_number",
+            "delete_all"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "sms_schedule_send",
+          "parameters": [
+            "phone_number",
+            "message",
+            "timestamp",
+            "datetime",
+            "delay_minutes"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "sms_thread_delete",
+          "parameters": [
+            "phone_number",
+            "contact_name",
+            "delete_all"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "sms_settings_intelligent_msg",
+          "parameters": [
+            "enable"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "sms_settings_notif_detail",
+          "parameters": [
+            "enable"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "sms_settings_auto_retrieval",
+          "parameters": [
+            "enable",
+            "sim_id"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "sms_settings_risk_url",
+          "parameters": [
+            "enable"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "sms_settings_expired_veri",
+          "parameters": [
+            "enable"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "sms_settings_expired_pickup",
+          "parameters": [
+            "enable"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "sms_settings_delivery_reports",
+          "parameters": [
+            "enable",
+            "sim_id"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "sms_settings_quick_reply",
+          "parameters": [
+            "content",
+            "index"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "sms_settings_center_num",
+          "parameters": [
+            "number",
+            "sim_id"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "sms_settings_sim_messages",
+          "parameters": [
+            "sim_id"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "sms_account_balance_inquiry",
+          "parameters": [
+            "slot_index"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "sms_data_balance_inquiry",
+          "parameters": [
+            "slot_index"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "sms_open_personal_list",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "sms_open_notice_list",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "sms_open_collected_list",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "sms_open_settings_page",
+          "parameters": [],
+          "verification": "not_tested"
+        }
+      ]
+    },
+    {
+      "package": "com.android.packageinstaller",
+      "versionCode": 36,
+      "versionName": "16",
+      "apk_sha256": "51b975d22ef2bdee6b333111bed41b2cd9acb1749970000e19788c52335b1776",
+      "schema_resource": "res/raw/mcp_tools.json",
+      "schema_sha256": "d61d67d920d703b94c2594b2ced33f92786bdd171687c7bfa31a6776372fd366",
+      "status": "static_discovery",
+      "tool_count": 3,
+      "tools": [
+        {
+          "name": "security_packageinstaller_uninstall",
+          "parameters": [
+            "appLabel"
+          ],
+          "verification": "not_tested"
+        },
+        {
+          "name": "security_packageinstaller_install_calendar",
+          "parameters": [],
+          "verification": "not_tested"
+        },
+        {
+          "name": "security_packageinstaller_install_filemanager",
+          "parameters": [],
+          "verification": "not_tested"
+        }
+      ]
+    }
+  ],
+  "companion": {
+    "package": "com.stepx.companion.app",
+    "versionName": "0.1.36",
+    "versionCode": 37,
+    "tools": {
+      "stepx_desktop_work": {
+        "operations": [
+          "files",
+          "start",
+          "status",
+          "cancel",
+          "retry"
+        ],
+        "verification": "live_normal_chat_csv_txt_xlsx_phone_preview_reconnect_cancel_retry_duplicate",
+        "firmware": "pandora-172",
+        "lockedScreen": "OEM safety approval may require manual unlock",
+        "verifiedDesktopVersion": "0.2.64",
+        "states": [
+          "queued",
+          "running",
+          "cancelling",
+          "awaiting_delivery",
+          "completed",
+          "failed",
+          "cancelled",
+          "interrupted"
+        ]
+      },
+      "stepx_gui_agent": {
+        "verification": "live_JD_orders_MDI_previous_0.2.62",
+        "needsIndependentVisionModel": true
+      }
+    },
+    "bootRestoredPermissions": [
+      "com.stepos.permission.MANAGE_BACK_SCREEN",
+      "android.permission.MANAGE_DEBUGGING",
+      "android.permission.WRITE_SECURE_SETTINGS",
+      "com.stepos.cloud.push.permission.MESSAGE"
+    ],
+    "backscreenVerification": "hardware_power_and_frames_verified_user_confirmed_light_and_animation_stop_restores_settings",
+    "mcpSchemaSha256": "c6269064f2848fd8768be0e864a24074f2be6f92032d607384ec89b27e8876fe",
+    "mcpExtVersionCode": 4
+  },
+  "protectedRuntimes": [
+    {
+      "package": "com.stepos.agentbus",
+      "apk": "/system/priv-app/AgentBus/AgentBus.apk",
+      "apk_sha256": "50a1bbd6af20d1cceff335e2336cff04e08d3718cf4cad581a86954c354f2a48",
+      "purpose": "Amoo account transport and protected task lease",
+      "verification": "wireless_screen_off_text_reply_after_reboot",
+      "limits": "Phone-native safety decisions remain in force",
+      "versionCode": 100026,
+      "versionName": "1.0.26_20260925_135026"
+    }
+  ]
+}

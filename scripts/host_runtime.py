@@ -46,13 +46,36 @@ def subprocess_options():
     return {'creationflags': subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {}
 
 
+def adb_executable():
+    if os.environ.get('STEPX_ADB'):
+        return os.environ['STEPX_ADB']
+    executable = 'adb.exe' if os.name == 'nt' else 'adb'
+    candidates = [
+        ROOT / 'tools/bin' / executable,
+        ROOT / '.tools/bin' / executable,
+    ]
+    for key in ('ANDROID_SDK_ROOT', 'ANDROID_HOME'):
+        if os.environ.get(key):
+            candidates.append(Path(os.environ[key]) / 'platform-tools' / executable)
+    candidates += [
+        Path.home() / 'Android/Sdk/platform-tools' / executable,
+        Path.home() / 'Library/Android/sdk/platform-tools/adb',
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return shutil.which('adb') or 'adb'
+
+
 def java_environment():
     env = os.environ.copy()
     candidates = [Path(env['STEPX_JDK'])] if env.get('STEPX_JDK') else []
     candidates.append(ROOT / 'runtime/java')
     if env.get('JAVA_HOME'): candidates.append(Path(env['JAVA_HOME']))
     candidates += [Path.home()/'.local/opt/android-studio/jbr',
-                   Path('/opt/android-studio/jbr'), Path('/Applications/Android Studio.app/Contents/jbr/Contents/Home')]
+                   Path('/opt/android-studio/jbr'), Path('/Applications/Android Studio.app/Contents/jbr/Contents/Home'),
+                   Path('/usr/lib/jvm/default-java'), Path('/usr/lib/jvm/java-21-openjdk-amd64'),
+                   Path('/usr/lib/jvm/java-17-openjdk-amd64'), Path('/opt/homebrew/opt/openjdk')]
     executable = 'java.exe' if os.name == 'nt' else 'java'
     for directory in candidates:
         if (directory / 'bin' / executable).is_file():
@@ -65,6 +88,7 @@ def java_environment():
 def build_tools():
     """Do not guess a developer's home or a single installed SDK version."""
     yield ROOT / 'runtime/android-build-tools'
+    yield ROOT / '.tools/android-build-tools'
     for key in ('ANDROID_SDK_ROOT', 'ANDROID_HOME'):
         if os.environ.get(key):
             base = Path(os.environ[key]) / 'build-tools'

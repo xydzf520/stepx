@@ -14,7 +14,7 @@ from pathlib import Path
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
-DEX_SHA256 = 'b9079410bf7ed9d5f30d6b41960e07d46b8279a271e3995d2ea3b9dda17d3e78'
+DEX_SHA256 = 'c413bad64a74c13fa091317cbc371f851049d826d6c5e7251134dcdc219464a6'
 DEX = ROOT / 'desktop/assets/stepx-native-gui-isolated-probe.dex'
 
 
@@ -53,10 +53,10 @@ out['probe_only']=True
 probe_path=PROBE_ENV['CLASSPATH']
 probe_written=False
 try:
- assert hashlib.sha256(open('/system/priv-app/ability/ability.apk','rb').read()).hexdigest()=='c9f56f3078df96d8d726422b1c622a1c19fe8c7dec8cadd8537d9a6ecf513ac4'
+ assert hashlib.sha256(open('/system/priv-app/ability/ability.apk','rb').read()).hexdigest() in ('c9f56f3078df96d8d726422b1c622a1c19fe8c7dec8cadd8537d9a6ecf513ac4','a7dbeaa721c13836bbb3990026af6c3d66bf164afc4c73f70bd453aa119fbca8')
  assert os.stat(os.path.dirname(probe_path)).st_uid==1000
  data=base64.b64decode(PROBE_DEX)
- assert hashlib.sha256(data).hexdigest()=='b9079410bf7ed9d5f30d6b41960e07d46b8279a271e3995d2ea3b9dda17d3e78'
+ assert hashlib.sha256(data).hexdigest()=='c413bad64a74c13fa091317cbc371f851049d826d6c5e7251134dcdc219464a6'
  fd=os.open(probe_path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o400)
  probe_written=True
  try:

@@ -1,6 +1,10 @@
 {
   "serial": "",
   "fingerprint": "StepX/pandora/pandora:16/BQ2A.260122.002-BP2A.250705.008/172:user/release-keys",
+  "fingerprints": [
+    "StepX/pandora/pandora:16/BQ2A.260122.002-BP2A.250705.008/172:user/release-keys",
+    "StepX/pandora/pandora:16/BQ2A.260122.002-BP2A.250705.008/12:user/release-keys"
+  ],
   "sdk": "36",
   "abi": "arm64-v8a",
   "stock_sha256": "5cfe5a88a97eca424bd4922fe813e0cc553adad0e8623105311ec1514022152f",

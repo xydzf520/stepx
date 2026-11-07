@@ -24,6 +24,10 @@ import zlib
 
 APK = '/system/priv-app/ability/ability.apk'
 APK_SHA = 'c9f56f3078df96d8d726422b1c622a1c19fe8c7dec8cadd8537d9a6ecf513ac4'
+ALLOWED_APK_SHAS = (
+    APK_SHA,
+    'a7dbeaa721c13836bbb3990026af6c3d66bf164afc4c73f70bd453aa119fbca8',
+)
 SOURCE = '/data/user/0/com.stepos.ability/files/mmkv/model_config_prefs'
 DEFAULT_ID = 'step3p7-mtp3-0520-mm-reasoning-effort-fp8-aos-prod'
 BUILTINS = {
@@ -174,7 +178,7 @@ def worker_snapshot():
         digest = hashlib.sha256()
         for chunk in iter(lambda: stream.read(65536), b''):
             digest.update(chunk)
-    require(digest.hexdigest() == APK_SHA, 'unsupported_original_apk')
+    require(digest.hexdigest() in ALLOWED_APK_SHAS, 'unsupported_original_apk')
     source = os.path.realpath(SOURCE)
     require(source == os.path.join(os.path.realpath('/data/user/0/com.stepos.ability'),
                                   'files', 'mmkv', 'model_config_prefs'), 'redirected_source')
@@ -200,7 +204,7 @@ def worker_snapshot():
 def build_worker():
     """Generate self-contained, read-only code; never execute a device command."""
     code = 'import hashlib,json,os,re,stat,struct,zlib\n'
-    for name in ('APK', 'APK_SHA', 'SOURCE', 'DEFAULT_ID', 'BUILTINS', 'MAX_DATA', 'MAX_CRC'):
+    for name in ('APK', 'APK_SHA', 'ALLOWED_APK_SHAS', 'SOURCE', 'DEFAULT_ID', 'BUILTINS', 'MAX_DATA', 'MAX_CRC'):
         code += name + '=' + repr(globals()[name]) + '\n'
     for function in (require, varint32, block, selected_strings, describe, parse_preferences,
                      read_owned, worker_snapshot):

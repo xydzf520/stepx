@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Bounded independent diagnostic child, restores factory launcher before work."""
-import pathlib,subprocess,json,sys,time,base64,uuid,os
+import pathlib,subprocess,json,sys,time,base64,uuid,os,hashlib
 from common import ROOT, ADB, guard
 import argparse
 parser=argparse.ArgumentParser(description=__doc__)
@@ -61,7 +61,20 @@ finally:
  finally:os.close(fd)
  os._exit(0)
 '''.replace('signal.alarm(25)', 'signal.alarm('+str(min(60,int(os.environ.get('STEPX_WORKER_TIMEOUT','25'))))+')').replace('CODE',repr(code)).replace('RESULT',repr(result))
-gw('import os,base64;p='+repr(wrapper)+';open(p,"wb").write(base64.b64decode('+repr(base64.b64encode(src.encode()).decode())+'));os.chmod(p,0o755)')
+def stage_source(path,source):
+ data=source.encode()
+ if not data or len(data)>512*1024:raise RuntimeError('Invalid bounded worker size')
+ gw('import os;fd=os.open('+repr(path)+',os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600);os.close(fd)')
+ try:
+  for offset in range(0,len(data),8192):
+   chunk=base64.b64encode(data[offset:offset+8192]).decode()
+   gw('import os,base64;p='+repr(path)+';assert os.path.getsize(p)=='+str(offset)+';f=open(p,"ab");f.write(base64.b64decode('+repr(chunk)+'));f.close()')
+  gw('import os,hashlib;p='+repr(path)+';f=open(p,"rb");digest=hashlib.sha256(f.read()).hexdigest();f.close();assert digest=='+repr(hashlib.sha256(data).hexdigest())+';os.chmod(p,0o755)')
+ except Exception:
+  try:gw('import os;os.unlink('+repr(path)+')')
+  except Exception:pass
+  raise
+stage_source(wrapper,src)
 def root(c):
  p=subprocess.run([sys.executable,str(ROOT/'tools/root_bridge.py')],input=c,capture_output=True,text=True,timeout=40);return p.stdout
 parent=next(int(l.split()[0]) for l in sh('ps -A -o PID,PPID,NAME').splitlines() if l.split()[-1]=='openclaw_env' and l.split()[1]=='1')

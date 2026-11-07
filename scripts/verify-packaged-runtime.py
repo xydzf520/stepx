@@ -2,6 +2,10 @@
 import importlib.util, os, shutil, struct, subprocess, sys, tempfile
 from pathlib import Path
 root=Path(sys.argv[1]).resolve()
+from public_release_policy import audit_bundle
+privacy_issues = audit_bundle(root)
+if privacy_issues:
+    raise RuntimeError('Package privacy preflight failed:\n' + '\n'.join(privacy_issues))
 
 def run_checked(args, env, timeout):
     # GUI-subsystem EXEs need explicit redirected handles for CI diagnostics.

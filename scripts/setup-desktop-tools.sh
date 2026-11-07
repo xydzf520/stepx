@@ -43,24 +43,43 @@ fi
 if [ "$OS" = "Darwin" ]; then
     if command -v brew >/dev/null 2>&1; then
         echo "Detected macOS with Homebrew. Installing/linking android-platform-tools and scrcpy..."
-        brew list --versions android-platform-tools >/dev/null 2>&1 || brew install --cask android-platform-tools
-        brew list --versions scrcpy >/dev/null 2>&1 || brew install scrcpy
-        ln -sf "$(command -v adb)" "$TOOLS/bin/adb"
-        ln -sf "$(command -v scrcpy)" "$TOOLS/bin/scrcpy"
-    else
-        echo "Downloading official Android platform-tools for macOS into .tools..."
-        ZIP="$TOOLS/packages/platform-tools-latest-darwin.zip"
-        curl -fL --connect-timeout 10 --max-time 120 \
-            "https://dl.google.com/android/repository/platform-tools-latest-darwin.zip" -o "$ZIP"
-        unzip -q -o "$ZIP" -d "$TOOLS/root"
-        ln -sf "$TOOLS/root/platform-tools/adb" "$TOOLS/bin/adb"
-        if command -v scrcpy >/dev/null 2>&1; then
-            ln -sf "$(command -v scrcpy)" "$TOOLS/bin/scrcpy"
+        brew list --versions android-platform-tools >/dev/null 2>&1 || brew install --cask android-platform-tools || true
+        brew list --versions scrcpy >/dev/null 2>&1 || brew install scrcpy || true
+        command -v adb >/dev/null 2>&1 && ln -sf "$(command -v adb)" "$TOOLS/bin/adb" || true
+        command -v scrcpy >/dev/null 2>&1 && ln -sf "$(command -v scrcpy)" "$TOOLS/bin/scrcpy" || true
+    fi
+    if [ ! -x "$TOOLS/bin/scrcpy" ] || ! "$TOOLS/bin/scrcpy" --help 2>&1 | grep -q -- '--keep-active'; then
+        if [ "$(uname -m)" = "arm64" ] || [ "$(uname -m)" = "aarch64" ]; then
+            MAC_DIR="scrcpy-macos-aarch64-v5.0.1"
+            ARCHIVE="scrcpy-macos-aarch64-v5.0.1.tar.gz"
         else
-            echo "Note: install scrcpy via Homebrew (brew install scrcpy) for real-time screen mirroring."
+            MAC_DIR="scrcpy-macos-x86_64-v5.0.1"
+            ARCHIVE="scrcpy-macos-x86_64-v5.0.1.tar.gz"
         fi
+        echo "Downloading official $ARCHIVE for macOS into .tools..."
+        curl -fL --connect-timeout 10 --max-time 120 \
+            "https://github.com/Genymobile/scrcpy/releases/download/v5.0.1/$ARCHIVE" -o "$TOOLS/packages/$ARCHIVE"
+        tar -xzf "$TOOLS/packages/$ARCHIVE" -C "$TOOLS/root"
+        rm -f "$TOOLS/bin/adb" "$TOOLS/bin/scrcpy"
+        cat > "$TOOLS/bin/adb" <<WRAPPER
+#!/usr/bin/env bash
+set -euo pipefail
+TOOLS="\$(cd "\$(dirname "\$0")/.." && pwd)"
+export ADB_MDNS_OPENSCREEN=1
+exec "\$TOOLS/root/$MAC_DIR/adb" "\$@"
+WRAPPER
+        cat > "$TOOLS/bin/scrcpy" <<WRAPPER
+#!/usr/bin/env bash
+set -euo pipefail
+TOOLS="\$(cd "\$(dirname "\$0")/.." && pwd)"
+export ADB="\${ADB:-\$TOOLS/bin/adb}"
+export SCRCPY_SERVER_PATH="\$TOOLS/root/$MAC_DIR/scrcpy-server"
+exec "\$TOOLS/root/$MAC_DIR/scrcpy" "\$@"
+WRAPPER
+        chmod +x "$TOOLS/bin/adb" "$TOOLS/bin/scrcpy"
     fi
     "$TOOLS/bin/adb" version
+    "$TOOLS/bin/scrcpy" --version
     exit 0
 fi
 
