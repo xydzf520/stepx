@@ -54,3 +54,21 @@ APK 包名通过 Android 官方 apksig 的解析器读取，签名仍用 apksign
 ### 应用商店联网验收
 
 默认回归使用内置目录与本机 HTTP 夹具，验证搜索一致性、去重、下载中断与续传。第三方商店目录、华为下载地址和真实 APK 下载属于显式联网验收，避免将外部服务的临时变化误判为本地构建失败。可在隔离的用户配置与缓存目录中运行 `cargo test --locked --manifest-path desktop/Cargo.toml --no-default-features --lib app_store::tests::test_live_ -- --ignored --test-threads=1`；其中 APK 验收会下载超过 100 MB 的数据并需要 Android 签名校验工具。联网失败应单独记录，不能据此宣称对应商店已验证可用。
+
+Python 的华为解析及远程 APK 包名、版本校验也默认跳过真实联网项；离线解析与本机 HTTP 续传、截断、备用地址回归照常运行。单独启用真实联网项：
+
+```bash
+# Linux / macOS
+STEPX_LIVE_STORE_TESTS=1 python3 -X utf8 -m unittest discover -s desktop/tests -p test_store_download.py
+```
+
+```powershell
+# Windows PowerShell；验收后恢复默认的离线测试范围。
+$env:STEPX_LIVE_STORE_TESTS = '1'
+try { python -X utf8 -m unittest discover -s desktop/tests -p test_store_download.py }
+finally { Remove-Item Env:STEPX_LIVE_STORE_TESTS }
+```
+
+### 首页性能回归
+
+交互测试在各平台的调试构建中验证行为；耗时由独立的 release 构建检查，避免并行测试和未优化代码产生误报。运行 `python3 desktop/scripts/check-home-performance.py --output artifacts/home-performance.json`：编译完成后，三个独立进程分别采样空数据与模拟长列表、三种窗口大小、五种布局。30 个场景的中位数及 P95 均须小于 15 ms。可用 `--baseline artifacts/previous-home-performance.json` 对比同一机器、编译器及构建模式的数据。该指标仅测量界面结构创建与释放，不代表 GPU 帧率、冷启动时间或手机同步速度；没有历史基线时不宣称提速。
