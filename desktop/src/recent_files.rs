@@ -627,7 +627,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let image_path = dir.path().join("picture.png");
         let cache = dir.path().join("cache");
-        let original_time = UNIX_EPOCH + Duration::new(1000, 1);
+        // NTFS timestamps have 100 ns precision; keep the change below 1 ms
+        // while remaining representable on every supported filesystem.
+        let original_time = UNIX_EPOCH + Duration::new(1000, 100_000);
         image::RgbImage::from_pixel(1, 1, image::Rgb([255, 0, 0])).save(&image_path).unwrap();
         fs::File::options().write(true).open(&image_path).unwrap()
             .set_times(fs::FileTimes::new().set_modified(original_time)).unwrap();
@@ -641,7 +643,7 @@ mod tests {
         image::RgbImage::from_pixel(1, 1, image::Rgb([0, 0, 255])).save(&image_path).unwrap();
         assert_eq!(fs::metadata(&image_path).unwrap().len(), file.bytes);
         fs::File::options().write(true).open(&image_path).unwrap()
-            .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::new(1000, 2))).unwrap();
+            .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::new(1000, 200_000))).unwrap();
         let second = thumbnail_in(&file, &cache).unwrap();
         assert_ne!(first, second);
         assert_eq!(image::open(&second).unwrap().to_rgb8().get_pixel(0,0).0, [0,0,255]);

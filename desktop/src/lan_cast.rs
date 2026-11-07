@@ -2306,6 +2306,12 @@ fn handle_http_client(
     bytes_broadcast: Arc<AtomicU64>,
     shared: Arc<(Mutex<SharedStreamState>, Condvar)>,
 ) {
+    // BSD/macOS can inherit O_NONBLOCK from the accept listener. This worker
+    // reads complete HTTP lines with bounded timeouts, so it must be blocking.
+    // Otherwise a delayed first packet or split header closes the connection.
+    if stream.set_nonblocking(false).is_err() {
+        return;
+    }
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_nodelay(true);
@@ -3224,6 +3230,36 @@ mod tests {
         assert!(!html.contains("href=\"/live.ts\""));
         assert!(!html.contains("Access-Control-Allow-Origin: *"));
         assert!(authorized_cast_path("/session/secret-test/api/status", "next-session").is_none());
+    }
+
+    #[test]
+    fn cast_accepts_delayed_and_split_requests_from_nonblocking_listener() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            // Reproduce BSD's inherited listener mode on every test platform.
+            stream.set_nonblocking(true).unwrap();
+            ready_tx.send(()).unwrap();
+            handle_http_client(stream, addr.port(), "127.0.0.1".into(), "secret-test".into(),
+                PathBuf::from("must-not-run-adb"), Arc::new(Mutex::new("fixture".into())),
+                Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)),
+                Arc::new((Mutex::new(SharedStreamState::default()), Condvar::new())));
+        });
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        client.write_all(b"GET /session/secret-test/api/status HTTP/1.1\r\nHost: local").unwrap();
+        thread::sleep(Duration::from_millis(100));
+        client.write_all(b"host\r\nContent-Length: 0\r\n\r\n").unwrap();
+        let mut result = String::new();
+        client.read_to_string(&mut result).unwrap();
+        worker.join().unwrap();
+        assert!(result.starts_with("HTTP/1.1 200"), "{result}");
+        assert!(result.contains("\"ok\":true"), "{result}");
     }
 
     #[test]

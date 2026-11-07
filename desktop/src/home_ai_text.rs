@@ -927,7 +927,11 @@ for host, json_mode, model in [
             socket.read_exact(&mut first).unwrap();
             started_tx.send(()).unwrap();
             let mut remainder=Vec::new();
-            socket.read_to_end(&mut remainder).unwrap();
+            // Cancelling an in-flight request may send RST instead of FIN on
+            // Windows. Both prove that the client closed its connection.
+            if let Err(error) = socket.read_to_end(&mut remainder) {
+                assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+            }
         });
         let cancel=Arc::new(AtomicBool::new(false));
         let worker_cancel=cancel.clone();

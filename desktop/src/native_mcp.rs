@@ -867,6 +867,42 @@ mod tests {
         assert_eq!(args[1]["method"], "dialer_show_dialpad");
         assert_eq!(args[2]["method"], "dialer_hangup_call");
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_fixture_preserves_delayed_partial_frames_and_idle_connections() {
+        use std::io::{Read, Write};
+        let fixture = test_support::Fixture::new(vec![], Some(json!("accepted")));
+        let mut socket = std::net::TcpStream::connect(("127.0.0.1", fixture.port)).unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let hello = serde_json::to_vec(&json!({"method":"connect","id":"slow-hello"})).unwrap();
+        let header = (hello.len() as u32).to_be_bytes();
+        // Each pause exceeds the old peer's 200ms read timeout. Partial headers
+        // must survive timeout polling instead of being discarded or closed.
+        socket.write_all(&header[..2]).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        socket.write_all(&header[2..]).unwrap();
+        socket.write_all(&hello[..3]).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        socket.write_all(&hello[3..]).unwrap();
+        let read_reply = |socket: &mut std::net::TcpStream| {
+            let mut header = [0; 4];
+            socket.read_exact(&mut header).unwrap();
+            let mut body = vec![0; u32::from_be_bytes(header) as usize];
+            socket.read_exact(&mut body).unwrap();
+            serde_json::from_slice::<Value>(&body).unwrap()
+        };
+        assert_eq!(read_reply(&mut socket)["id"], "slow-hello");
+        std::thread::sleep(Duration::from_millis(300));
+        let body = serde_json::to_vec(&json!({"payload":{"command":"ability.list","id":"after-idle"}})).unwrap();
+        let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(&body);
+        socket.write_all(&frame).unwrap();
+        assert_eq!(read_reply(&mut socket)["params"]["id"], "after-idle");
+        assert!(fixture.calls.lock().unwrap().is_empty());
+        // Drop must also stop a peer with a still-open idle client promptly.
+        drop(fixture);
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -878,6 +914,26 @@ pub(crate) mod test_support {
         sync::{Arc, Mutex},
         thread,
     };
+
+    fn read_exact_until_stopped(
+        stream: &mut std::net::TcpStream,
+        mut bytes: &mut [u8],
+        stop: &AtomicBool,
+    ) -> std::io::Result<()> {
+        while !bytes.is_empty() {
+            if stop.load(Ordering::Relaxed) {
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            match stream.read(bytes) {
+                Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+                Ok(count) => bytes = &mut bytes[count..],
+                Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
     /// Real framed AgentBus peer behind a fake ADB forward. Also used by legacy
     /// compatibility tests to explicitly advertise that no native tool exists.
     pub struct Fixture {
@@ -910,12 +966,21 @@ pub(crate) mod test_support {
                         thread::sleep(Duration::from_millis(5));
                         continue;
                     };
+                    // BSD/macOS can inherit O_NONBLOCK from the listening
+                    // socket, unlike Linux. The framed peer below expects a
+                    // blocking stream with bounded shutdown polling.
+                    stream.set_nonblocking(false).unwrap();
                     stream
-                        .set_read_timeout(Some(Duration::from_millis(200)))
+                        .set_read_timeout(Some(Duration::from_millis(100)))
                         .unwrap();
+                    stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+                    stream.set_nodelay(true).unwrap();
                     loop {
                         let mut len = [0; 4];
-                        if stream.read_exact(&mut len).is_err() {
+                        // A poll timeout is only an opportunity to notice Drop.
+                        // Slow scheduling or macOS delayed ACKs are not EOF, and
+                        // partially received frame bytes must remain intact.
+                        if read_exact_until_stopped(&mut stream, &mut len, &stopping).is_err() {
                             break;
                         }
                         let n = u32::from_be_bytes(len) as usize;
@@ -923,7 +988,7 @@ pub(crate) mod test_support {
                             break;
                         }
                         let mut body = vec![0; n];
-                        if stream.read_exact(&mut body).is_err() {
+                        if read_exact_until_stopped(&mut stream, &mut body, &stopping).is_err() {
                             break;
                         }
                         let request: Value = serde_json::from_slice(&body).unwrap();
@@ -940,11 +1005,9 @@ pub(crate) mod test_support {
                             json!({"type":"req","method":"node.invoke.result","params":{"id":request["payload"]["id"],"ok":true,"payload":result}})
                         };
                         let body = serde_json::to_vec(&response).unwrap();
-                        if stream
-                            .write_all(&(body.len() as u32).to_be_bytes())
-                            .is_err()
-                            || stream.write_all(&body).is_err()
-                        {
+                        let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+                        frame.extend_from_slice(&body);
+                        if stream.write_all(&frame).is_err() {
                             break;
                         }
                     }
