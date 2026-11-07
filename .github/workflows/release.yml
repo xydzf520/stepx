@@ -74,6 +74,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: desktop
+          cache-on-failure: true
       - name: Linux dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get -o Acquire::Retries=2 update && sudo apt-get -o Acquire::Retries=2 install -y pkg-config clang libclang-dev libssl-dev libfontconfig1-dev libfreetype-dev libxkbcommon-dev libwayland-dev libxcb1-dev libx11-dev libxi-dev libxcursor-dev libxrandr-dev libgl1-mesa-dev libdbus-1-dev
@@ -89,9 +90,18 @@ jobs:
         # storage, TCP framing and local download fixtures remain blocking gates.
         run: cargo test --locked --manifest-path desktop/Cargo.toml --no-default-features --lib --test contracts
       - name: Desktop state and interaction tests
+        # Collect independent UI/runtime failures even when a core test fails.
+        # Build and publication still require every test step to succeed.
+        if: ${{ !cancelled() }}
         run: cargo test --locked --manifest-path desktop/Cargo.toml --bin stepx-companion
       - name: Runtime and updater tests
+        if: ${{ !cancelled() }}
         run: python scripts/ci-platform-smoke.py
+      - name: Isolated release homepage performance gate
+        if: runner.os == 'Linux' && success()
+        run: |
+          python3 desktop/scripts/check-home-performance.py --self-test
+          python3 desktop/scripts/check-home-performance.py --output artifacts/home-performance.json
       - name: Build
         run: cargo build --release --locked --manifest-path desktop/Cargo.toml
       - name: Package and smoke test
