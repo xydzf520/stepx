@@ -67,7 +67,9 @@ pub fn database_for(legacy: &Path) -> PathBuf {
             .join("stepx.sqlite3")
     }
 }
-fn key(path: &Path) -> Result<String> {
+/// Snapshot names use one separator on Windows as well as Unix. In particular,
+/// `join("actions/ledger.json")` and two `join` calls must address the same rows.
+pub(crate) fn key(path: &Path) -> Result<String> {
     ensure!(
         !path
             .components()
@@ -79,7 +81,75 @@ fn key(path: &Path) -> Result<String> {
     } else {
         std::env::current_dir()?.join(path)
     };
-    Ok(absolute.to_string_lossy().into_owned())
+    let name = absolute.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    let name = name.replace('\\', "/");
+    Ok(name)
+}
+
+/// Older Windows builds persisted native and mixed separators. Convert their
+/// identities together, including foreign keys and migration receipts. Ambiguous
+/// identities are rejected atomically rather than overwriting either history.
+#[cfg(any(windows, test))]
+fn migrate_windows_keys(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS storage_meta (key TEXT PRIMARY KEY,value TEXT NOT NULL)",
+    )?;
+    if tx
+        .query_row(
+            "SELECT value FROM storage_meta WHERE key='windows-path-keys'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        .as_deref()
+        == Some("slash-v1")
+    {
+        tx.commit()?;
+        return Ok(());
+    }
+    let names = {
+        let mut statement =
+            tx.prepare("SELECT name FROM snapshots UNION SELECT name FROM migrations")?;
+        let names = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        names
+    };
+    let mut normalized = HashMap::new();
+    for name in &names {
+        let canonical = name.replace('\\', "/");
+        ensure!(
+            normalized.insert(canonical, name).is_none(),
+            "旧数据库包含重复路径，未覆盖任何记录；请保留数据库并联系支持"
+        );
+    }
+    tx.execute_batch("PRAGMA defer_foreign_keys=ON")?;
+    for name in names {
+        let canonical = name.replace('\\', "/");
+        if canonical == name {
+            continue;
+        }
+        tx.execute(
+            "UPDATE snapshots SET name=?1 WHERE name=?2",
+            params![canonical, name],
+        )?;
+        tx.execute(
+            "UPDATE records SET snapshot=?1 WHERE snapshot=?2",
+            params![canonical, name],
+        )?;
+        tx.execute(
+            "UPDATE migrations SET name=?1 WHERE name=?2",
+            params![canonical, name],
+        )?;
+    }
+    tx.execute(
+        "INSERT INTO storage_meta(key,value) VALUES('windows-path-keys','slash-v1')",
+        [],
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 fn protect(path: &Path, directory: bool) -> Result<()> {
     let meta = fs::symlink_metadata(path)?;
@@ -141,6 +211,8 @@ pub fn open(path: &Path) -> Result<Connection> {
         );
         conn.execute_batch("COMMIT")?;
     }
+    #[cfg(windows)]
+    migrate_windows_keys(&conn)?;
     let check: String = conn.query_row("PRAGMA quick_check(1)", [], |r| r.get(0))?;
     ensure!(
         check == "ok",
@@ -186,6 +258,14 @@ pub fn with_connection<T>(path: &Path, f: impl FnOnce(&mut Connection) -> Result
 }
 pub fn close_thread_connections() {
     CONNECTIONS.with(|pool| pool.borrow_mut().clear());
+}
+/// Used while holding the owning scope's write lock, before removing its files.
+/// Production's shared database is outside the scope and remains open.
+pub fn close_thread_connections_under(directory: &Path) {
+    CONNECTIONS.with(|pool| {
+        pool.borrow_mut()
+            .retain(|path, _| !path.starts_with(directory))
+    });
 }
 #[derive(Serialize, serde::Deserialize, Default)]
 struct Shape {
@@ -311,7 +391,9 @@ fn assemble_raw(conn: &Connection, name: &str) -> Result<Option<String>> {
 }
 fn append_snapshot(out: &mut String, text: &str, limit: usize) -> Result<()> {
     ensure!(
-        out.len().checked_add(text.len()).is_some_and(|len| len <= limit),
+        out.len()
+            .checked_add(text.len())
+            .is_some_and(|len| len <= limit),
         "本地记录超过读取上限，原数据保留"
     );
     out.push_str(text);
@@ -357,7 +439,11 @@ fn assemble_raw_limited(conn: &Connection, name: &str, limit: u64) -> Result<Opt
             }
             first = false;
             if !array {
-                append_snapshot(&mut out, &serde_json::to_string(row.get_ref(0)?.as_str()?)?, limit)?;
+                append_snapshot(
+                    &mut out,
+                    &serde_json::to_string(row.get_ref(0)?.as_str()?)?,
+                    limit,
+                )?;
                 append_snapshot(&mut out, ":", limit)?;
             }
             // Borrow SQLite's row buffer and reject before copying it into the
@@ -679,8 +765,10 @@ pub fn read<T: DeserializeOwned + Serialize>(path: &Path, limit: u64) -> Result<
             .as_ref()
             .filter(|v| v.name == name && v.version == version && v.changes == changes)
         {
-            ensure!(saved.raw.len() as u64 <= limit.min(SNAPSHOT_READ_LIMIT),
-                "本地记录超过读取上限，原数据保留");
+            ensure!(
+                saved.raw.len() as u64 <= limit.min(SNAPSHOT_READ_LIMIT),
+                "本地记录超过读取上限，原数据保留"
+            );
             let value = serde_json::from_str(&saved.raw).context("本地记录结构无效；未覆盖数据")?;
             tx.commit()?;
             return Ok(Some(value));
@@ -1154,6 +1242,106 @@ mod tests {
     use super::*;
     use serde_json::json;
     #[test]
+    fn windows_path_migration_preserves_rows_and_import_receipts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open(&dir.path().join("stepx.sqlite3")).unwrap();
+        #[cfg(windows)]
+        conn.execute("DELETE FROM storage_meta WHERE key='windows-path-keys'", [])
+            .unwrap();
+        let old = r"C:\Users\example\历史\actions/ledger.json";
+        let normalized = "C:/Users/example/历史/actions/ledger.json";
+        put(
+            &mut conn,
+            old,
+            br#"{"rows":[{"id":"one","text":"retained"}]}"#,
+            None,
+            None,
+        )
+        .unwrap();
+        conn.execute("INSERT INTO migrations VALUES(?1,'hash',1,1,1)", [old])
+            .unwrap();
+        migrate_windows_keys(&conn).unwrap();
+        assert!(assemble(&conn, old).unwrap().is_none());
+        assert_eq!(
+            assemble(&conn, normalized).unwrap().unwrap()["rows"][0]["text"],
+            "retained"
+        );
+        assert_eq!(
+            conn.query_row("SELECT name FROM migrations", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            normalized
+        );
+        let changes = conn.total_changes();
+        migrate_windows_keys(&conn).unwrap();
+        assert_eq!(
+            conn.total_changes(),
+            changes,
+            "migration must be idempotent"
+        );
+        let broken: i64 = conn
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(broken, 0);
+    }
+
+    #[test]
+    fn windows_path_migration_rejects_collision_without_data_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open(&dir.path().join("stepx.sqlite3")).unwrap();
+        #[cfg(windows)]
+        conn.execute("DELETE FROM storage_meta WHERE key='windows-path-keys'", [])
+            .unwrap();
+        for (name, value) in [(r"C:\fixture\state.json", 1), ("C:/fixture/state.json", 2)] {
+            put(
+                &mut conn,
+                name,
+                &serde_json::to_vec(&json!({"value":value})).unwrap(),
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        assert!(migrate_windows_keys(&conn).is_err());
+        assert_eq!(
+            assemble(&conn, r"C:\fixture\state.json").unwrap().unwrap()["value"],
+            1
+        );
+        assert_eq!(
+            assemble(&conn, "C:/fixture/state.json").unwrap().unwrap()["value"],
+            2
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_path_separators_address_the_same_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let native = dir.path().join("actions").join("ledger.json");
+        let mixed = dir.path().join("actions/ledger.json");
+        write(&native, &json!({"id":"same"})).unwrap();
+        assert_eq!(key(&native).unwrap(), key(&mixed).unwrap());
+        assert!(has_snapshot(&mixed).unwrap());
+        assert_eq!(read::<Value>(&mixed, 1000).unwrap().unwrap()["id"], "same");
+        remove_scope(native.parent().unwrap()).unwrap();
+        assert!(!has_snapshot(&mixed).unwrap());
+    }
+
+    #[test]
+    fn closing_scope_connections_keeps_other_databases_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let scoped = dir.path().join("scope/ledger.json");
+        let elsewhere = dir.path().join("other/ledger.json");
+        write(&scoped, &json!({"id":"scoped"})).unwrap();
+        write(&elsewhere, &json!({"id":"elsewhere"})).unwrap();
+        close_thread_connections_under(scoped.parent().unwrap());
+        fs::remove_dir_all(scoped.parent().unwrap()).unwrap();
+        assert!(has_snapshot(&elsewhere).unwrap());
+        assert!(!scoped.parent().unwrap().exists());
+    }
+
+    #[test]
     fn database_and_cached_reads_honor_the_callers_byte_limit_without_modifying_data() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("limits.json");
@@ -1169,7 +1357,10 @@ mod tests {
             close_thread_connections();
             // Cold SQL assembly, including header-only and multibyte values.
             assert!(read::<Value>(&path, expected_bytes - 1).is_err());
-            assert_eq!(read::<Value>(&path, expected_bytes).unwrap(), Some(value.clone()));
+            assert_eq!(
+                read::<Value>(&path, expected_bytes).unwrap(),
+                Some(value.clone())
+            );
             // The same limit must apply when the validated snapshot is cached.
             assert!(read::<Value>(&path, expected_bytes - 1).is_err());
             assert_eq!(read::<Value>(&path, expected_bytes).unwrap(), Some(value));

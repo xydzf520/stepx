@@ -1,10 +1,18 @@
 //! Small private snapshots. Large histories belong in indexed stores, not here.
 use anyhow::{ensure, Context, Result};
 use std::{
+    collections::hash_map::DefaultHasher,
     fs,
+    hash::{Hash, Hasher},
     io::{Read, Write},
     path::Path,
+    sync::{Mutex, OnceLock},
 };
+
+// Bounded lock striping avoids concurrent Windows MoveFileEx replacements
+// leaving a destination delete-pending while another writer still holds it.
+// Only snapshot writers share these locks; independent reads remain concurrent.
+static WRITERS: OnceLock<[Mutex<()>; 64]> = OnceLock::new();
 
 pub fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
     let meta = fs::symlink_metadata(path)?;
@@ -27,8 +35,7 @@ pub fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
     ensure!(opened.is_file(), "数据文件必须是普通文件，不能是链接或设备");
     ensure!(opened.len() <= limit, "数据文件超过读取上限，原文件已保留");
     let mut bytes = Vec::new();
-    file.take(limit.saturating_add(1))
-        .read_to_end(&mut bytes)?;
+    file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
     ensure!(
         bytes.len() as u64 <= limit,
         "数据文件超过读取上限，原文件已保留"
@@ -39,6 +46,12 @@ pub fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
 /// Atomic replacement, unique temporary file, durable contents and directory entry.
 /// Returns false for an unchanged snapshot; does not rewrite it on each UI tick.
 pub fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<bool> {
+    let mut hash = DefaultHasher::new();
+    path.hash(&mut hash);
+    let locks = WRITERS.get_or_init(|| std::array::from_fn(|_| Mutex::new(())));
+    let _writer = locks[hash.finish() as usize % locks.len()]
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     if let Ok(meta) = fs::symlink_metadata(path) {
         ensure!(
             meta.is_file() && !meta.file_type().is_symlink(),
@@ -59,10 +72,38 @@ pub fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<bool> {
     }
     tmp.write_all(bytes)?;
     tmp.as_file().sync_all()?;
-    tmp.persist(path).map_err(|e| e.error)?;
+    persist_snapshot(tmp, path)?;
     #[cfg(unix)]
     fs::File::open(parent)?.sync_all()?;
     Ok(true)
+}
+
+fn persist_snapshot(mut pending: tempfile::NamedTempFile, path: &Path) -> Result<()> {
+    // Antivirus/indexer handles may briefly prevent a Windows rename. Keep the
+    // intact old file and retry the same durable temp; never remove first.
+    #[cfg(windows)]
+    let attempts = 8;
+    #[cfg(not(windows))]
+    let attempts = 1;
+    for attempt in 0..attempts {
+        match pending.persist(path) {
+            Ok(file) => {
+                drop(file);
+                return Ok(());
+            }
+            Err(failure) => {
+                if !cfg!(windows)
+                    || attempt + 1 == attempts
+                    || !matches!(failure.error.raw_os_error(), Some(5 | 32 | 33))
+                {
+                    return Err(failure.error.into());
+                }
+                pending = failure.file;
+                std::thread::sleep(std::time::Duration::from_millis(2 << attempt.min(4)));
+            }
+        }
+    }
+    unreachable!("at least one persist attempt")
 }
 
 #[cfg(test)]

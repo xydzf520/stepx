@@ -57,8 +57,7 @@ pub fn load_page(path: &Path, offset: usize, limit: usize) -> Result<Page> {
 }
 pub fn load(path: &Path) -> Result<Vec<Entry>> { Ok(load_page(path, 0, MAX_ENTRIES)?.entries) }
 fn path_key(path: &Path) -> Result<String> {
-    anyhow::ensure!(!path.components().any(|p| matches!(p,std::path::Component::ParentDir)), "日志路径不能包含上级目录");
-    Ok(if path.is_absolute() {path.to_path_buf()} else {std::env::current_dir()?.join(path)}.to_string_lossy().into_owned())
+    crate::data_store::key(path)
 }
 fn append(path: &Path, mut batch: Vec<Entry>) -> Result<()> {
     let parent = path.parent().context("日志目录无效")?;

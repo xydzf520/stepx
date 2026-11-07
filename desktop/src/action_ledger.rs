@@ -161,7 +161,7 @@ fn write_actions(dir: &Path, snapshot: &Snapshot, ids: &BTreeSet<String>) -> Res
         changes.push(crate::data_store::RecordChange {section:"actions",id:&action.id,position:None,value});
     }
     ensure!(changes.len()==ids.len() && snapshot.actions.len()<=MAX_ACTIONS,"行动变更集合无效或达到容量上限，原记录未覆盖");
-    let name = if path.is_absolute() {path.clone()} else {std::env::current_dir()?.join(&path)}.to_string_lossy().into_owned();
+    let name = crate::data_store::key(&path)?;
     let stored_bytes: i64 = crate::data_store::with_connection(&crate::data_store::database_for(&path), |c| Ok(c.query_row(
         "SELECT COALESCE(SUM(length(CAST(body AS BLOB))),0)+count(*) FROM records WHERE snapshot=?",[name],|r|r.get(0))?))?;
     ensure!(stored_bytes as u64 + added_bytes as u64 + serde_json::to_vec(&head.value)?.len() as u64 + 1024 <= MAX_BYTES, "行动账本达到容量上限，原记录未覆盖");

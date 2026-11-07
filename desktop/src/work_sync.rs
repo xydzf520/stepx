@@ -127,7 +127,8 @@ fn enqueue_in(root: &Path, workspace: &Path, paths: &[PathBuf], serial: &str) ->
         fs::create_dir_all(&cache)?;
         let cached = cache.join(&name);
         fs::copy(&path, &cached)?;
-        fs::File::open(&cached)?.sync_all()?;
+        // Windows FlushFileBuffers requires a writable handle.
+        fs::OpenOptions::new().write(true).open(&cached)?.sync_all()?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

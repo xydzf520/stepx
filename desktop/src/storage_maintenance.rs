@@ -158,7 +158,8 @@ pub fn run(force_backup: bool) -> Result<String> {
     }
     let freed = crate::work_sync::clean_staging()?;
     let (thumbnails, thumbnail_bytes) = crate::recent_files::clean_thumbnails(
-        &crate::resources::user_state().join("recent-thumbnails"), now,
+        &crate::resources::user_state().join("recent-thumbnails"),
+        now,
     )?;
     if db.exists() {
         crate::data_store::maintain(&db)?;
@@ -215,7 +216,11 @@ pub fn restore(db: &Path, source: &Path) -> Result<PathBuf> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&stage, fs::Permissions::from_mode(0o600))?;
     }
-    fs::File::open(&stage)?.sync_all()?;
+    // FlushFileBuffers on Windows requires a writable handle.
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&stage)?
+        .sync_all()?;
     let marker = parent.join("restore-pending");
     crate::local_store::write_if_changed(
         &marker,

@@ -545,19 +545,7 @@ impl Journal {
 const JOURNAL_LIMIT: usize = 16 * 1024 * 1024;
 
 fn journal_key(path: &Path) -> Result<String> {
-    ensure!(
-        !path
-            .components()
-            .any(|p| matches!(p, std::path::Component::ParentDir)),
-        "任务路径不能包含上级目录"
-    );
-    Ok(if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    }
-    .to_string_lossy()
-    .into_owned())
+    crate::data_store::key(path)
 }
 
 /// Import the original JSON once, retaining it unchanged. Missing sections from

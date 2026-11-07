@@ -310,7 +310,7 @@ fn ledger_commit_base(dir: &Path, ledger: &Ledger) -> Result<Option<LedgerCommit
     let path = dir.join("ledger.json");
     let Some(head) = crate::data_store::read_head(&path)? else {return Ok(None);};
     let metadata = ledger_metadata(ledger);
-    let name = if path.is_absolute() {path.clone()} else {std::env::current_dir()?.join(&path)}.to_string_lossy().into_owned();
+    let name = crate::data_store::key(&path)?;
     let shape: String = crate::data_store::with_connection(&crate::data_store::database_for(&path),|c|Ok(c.query_row("SELECT shape FROM snapshots WHERE name=?",[name],|r|r.get(0))?))?;
     let shape: serde_json::Value = serde_json::from_str(&shape)?;
     // Older ledgers may lack newly introduced empty sections. Upgrade their
@@ -465,6 +465,7 @@ pub fn clear(root: &Path, device: &str, account: Option<&str>) -> Result<()> {
     let _scope_guard=scope_write_lock(root,device,account)?;
     let dir = scoped(root, device, account);
     crate::data_store::remove_scope(&dir)?;
+    crate::data_store::close_thread_connections_under(&dir);
     if dir.exists() { fs::remove_dir_all(dir).context("清除当前上下文记录失败")?; }
     Ok(())
 }

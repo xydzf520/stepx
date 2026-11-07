@@ -1325,6 +1325,10 @@ mod atomic_scope_tests {
         assert!(bundle.files.iter().all(|file|file.path.is_file()));
         assert!(crate::data_store::exists(&root.path().join(&request.scope_id).join("actions/ledger.json")).unwrap());
         assert!(!root.path().join("clear-completed").exists(),"clear must wait through candidate ingestion");
+        // The isolated fixture stores its database inside the temporary scope.
+        // Release this process's read cache before the child removes that scope;
+        // Windows forbids deleting an open SQLite file. The write lock stays held.
+        crate::data_store::close_thread_connections_under(&root.path().join(&request.scope_id));
         drop(guard);
         let deadline=Instant::now()+Duration::from_secs(5);
         let status=loop {
