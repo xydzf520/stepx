@@ -1,5 +1,7 @@
 """Exercise the shipped runtime with PATH/SDK cleared, including non-ASCII paths."""
-import importlib.util, os, shutil, struct, subprocess, sys, tempfile
+import sys
+sys.dont_write_bytecode = True
+import importlib.util, os, shutil, struct, subprocess, tempfile
 from pathlib import Path
 root=Path(sys.argv[1]).resolve()
 from public_release_policy import audit_bundle
@@ -20,7 +22,7 @@ with tempfile.TemporaryDirectory(prefix='StepX 中文 runtime ') as td:
         shutil.copytree(root/folder,copy/folder,symlinks=True)
     (copy/'desktop/assets').mkdir(parents=True)
     apk=copy/'desktop/assets/stepx-companion.apk';shutil.copy2(root/'desktop/assets/stepx-companion.apk',apk)
-    env={k:v for k,v in os.environ.items() if k not in ['ANDROID_HOME','ANDROID_SDK_ROOT','JAVA_HOME','STEPX_JDK','PYTHONPATH','STEPX_RESOURCE_DIR','STEPX_PYTHON']}
+    env={k:v for k,v in os.environ.items() if k not in ['ANDROID_HOME','ANDROID_SDK_ROOT','JAVA_HOME','STEPX_JDK','PYTHONPATH','PYTHONPYCACHEPREFIX','STEPX_RESOURCE_DIR','STEPX_PYTHON']}
     env['PATH']=str(Path(os.environ.get('SystemRoot','/usr'))/'System32') if os.name=='nt' else '/usr/bin:/bin'
     env['PYTHONUTF8']='1';env['PYTHONIOENCODING']='utf-8'
     env['STEPX_STATE_DIR']=str(Path(td)/'user data');env['PYTHONDONTWRITEBYTECODE']='1'
@@ -71,7 +73,7 @@ print('Packaged signer, Unicode paths, imports and file lock: PASS')
     run_checked([str(copy/binary_name),'--check-runtime'],env,45)
     adb=copy/'tools/bin'/('adb.exe' if os.name=='nt' else 'adb')
     run_checked([str(adb),'version'],env,15)
-    run_checked([str(python),'-X','utf8','-c',code,str(copy)],env,45)
+    run_checked([str(python),'-B','-X','utf8','-c',code,str(copy)],env,45)
     # Use the client command, including the argv used by store APK validation.
     run_checked([str(copy/binary_name),'--check-apk',str(apk)],env,45)
     result = subprocess.run([str(copy/binary_name),'--check-apk',str(copy/'tampered.apk')],

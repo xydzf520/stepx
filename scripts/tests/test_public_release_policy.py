@@ -3,10 +3,12 @@
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
@@ -22,6 +24,7 @@ def load(name, filename):
 
 stage = load('release_stage', 'stage-release-resources.py').stage
 export = load('release_export', 'sync-public-repo.py')
+package = load('release_package', 'package-release.py')
 
 
 class PublicationBoundaryTests(unittest.TestCase):
@@ -122,6 +125,33 @@ class PublicationBoundaryTests(unittest.TestCase):
             self.assertEqual(expected, export.fixture_placeholders('test.rs', text))
         fixture = '"/Users/macuser" "/Users/macuser/Library/data"'
         self.assertEqual(fixture, export.fixture_placeholders('test.rs', fixture))
+
+    def test_runtime_verification_cannot_write_bytecode_to_stage_or_inherited_cache(self):
+        # Exercise the actual child-process launcher, not just its argv. The
+        # verifier imports a new module then starts another Python process;
+        # both must preserve the candidate package byte-for-byte.
+        fake_root = Path(self.temp.name) / 'packaging'
+        scripts = fake_root / 'scripts'
+        scripts.mkdir(parents=True)
+        candidate = Path(self.temp.name) / 'candidate'
+        candidate.mkdir()
+        (candidate / 'probe.py').write_text('VALUE = 42\n')
+        (candidate / 'child.py').write_text('VALUE = 7\n')
+        (scripts / 'verify-packaged-runtime.py').write_text(
+            'import sys, subprocess\n'
+            'sys.path.insert(0, sys.argv[1])\n'
+            'import probe\n'
+            'assert probe.VALUE == 42 and sys.dont_write_bytecode\n'
+            'subprocess.run([sys.executable, "-c", '
+            '"import child; assert child.VALUE == 7"], cwd=sys.argv[1], check=True)\n')
+        before = {p.relative_to(candidate): p.read_bytes() for p in candidate.rglob('*') if p.is_file()}
+        inherited = Path(self.temp.name) / 'external-cache'
+        with mock.patch.object(package, 'ROOT', fake_root), mock.patch.dict(
+                os.environ, {'PYTHONDONTWRITEBYTECODE': '', 'PYTHONPYCACHEPREFIX': str(inherited)}):
+            package.verify_runtime(Path(sys.executable), candidate)
+        after = {p.relative_to(candidate): p.read_bytes() for p in candidate.rglob('*') if p.is_file()}
+        self.assertEqual(before, after)
+        self.assertFalse(inherited.exists())
 
 
 if __name__ == '__main__':

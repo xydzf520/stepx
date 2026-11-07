@@ -147,7 +147,7 @@ Studio 首次网页登录需要本人完成；之后可以复用已授权会话�
 
 [详细步骤](docs/GETTING_STARTED.md) · [存储扩容](docs/STORAGE_EXPANSION.md) · [Amoo 工作区](docs/AMOO_WORKSPACE.md)
 
-固件与跨端协作开发：见 [安装、MCP 合约与固件升级复评](docs/compatibility/cross-device-172.html) 和 [172 固件 MCP 清单](scripts/firmware-profiles/pandora-172-mcp.json)。新增固件必须重新核验接口和业务，不直接沿用旧补丁。
+固件与跨端协作开发：见 [安装与连接说明](docs/GETTING_STARTED.md) 和 [172 固件 MCP 清单](scripts/firmware-profiles/pandora-172-mcp.json)。新增固件必须重新核验接口和业务，不直接沿用旧补丁。
 
 ## 数据留在你的用户目录
 

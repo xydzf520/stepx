@@ -2,6 +2,7 @@
 """Build a portable package from the native release binary and verified upstream tools."""
 import argparse, hashlib, os, platform, plistlib, shutil, subprocess, sys, tarfile, tempfile, urllib.request, zipfile
 from pathlib import Path
+sys.dont_write_bytecode = True
 from public_release_policy import audit_bundle, content_problems, manifest, runtime_plan, safe_read
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -11,6 +12,20 @@ TOOLS = {
     'macos-x86_64': ('scrcpy-macos-x86_64-v5.0.1.tar.gz', '31a5467a9e907f162b093267cbbab1276b15c6e709c2ea8159566a8d165beb50'),
     'windows-x86_64': ('scrcpy-win64-v5.0.1.zip', 'b12a2c4ee8be317422451fc7dcf8ee20a71b5ea7ef9ad73ddd825a25316227a5'),
 }
+
+def verification_environment():
+    """Never let validation mutate the staged runtime or an inherited cache path."""
+    env = os.environ.copy()
+    env.pop('PYTHONPYCACHEPREFIX', None)
+    env.update(PYTHONDONTWRITEBYTECODE='1', PYTHONUTF8='1', PYTHONIOENCODING='utf-8')
+    return env
+
+def verify_runtime(python, resources):
+    # -B takes effect before Python imports encodings/site, which happens before
+    # the verifier can set an environment variable or inspect the staged tree.
+    subprocess.run([str(python), '-B', '-X', 'utf8',
+                    str(ROOT/'scripts/verify-packaged-runtime.py'), str(resources)],
+                   check=True, env=verification_environment(), timeout=180)
 
 def main():
     p=argparse.ArgumentParser();p.add_argument('--platform',choices=TOOLS,required=True);p.add_argument('--version',required=True);a=p.parse_args()
@@ -47,7 +62,7 @@ def main():
         else:binary_dir=resource_dir=base
         binary_name='stepx-companion'+('.exe' if windows else '')
         shutil.copy2(ROOT/'desktop'/'target'/'release'/binary_name,binary_dir/binary_name)
-        subprocess.run([sys.executable,str(ROOT/'scripts/stage-release-resources.py'),str(ROOT),str(resource_dir)],check=True)
+        subprocess.run([sys.executable,'-B',str(ROOT/'scripts/stage-release-resources.py'),str(ROOT),str(resource_dir)],check=True,env=verification_environment())
         for rel,data in documents.items():
             target=resource_dir/rel;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(data)
         filename,digest=TOOLS[a.platform];download=stage/filename
@@ -60,15 +75,15 @@ def main():
             with tarfile.open(download) as t:t.extractall(unpack,filter='data')
         roots=list(unpack.iterdir());source=roots[0] if len(roots)==1 and roots[0].is_dir() else unpack
         tools_dir=resource_dir/'tools/bin';shutil.copytree(source,tools_dir)
-        subprocess.run([sys.executable,str(ROOT/'scripts/package-runtime.py'),str(resource_dir),*(['--windows'] if windows else [])],check=True)
-        tool_env=os.environ.copy();tool_env['LD_LIBRARY_PATH']=str(tools_dir)+os.pathsep+tool_env.get('LD_LIBRARY_PATH','')
+        subprocess.run([sys.executable,'-B',str(ROOT/'scripts/package-runtime.py'),str(resource_dir),*(['--windows'] if windows else [])],check=True,env=verification_environment())
+        tool_env=verification_environment();tool_env['LD_LIBRARY_PATH']=str(tools_dir)+os.pathsep+tool_env.get('LD_LIBRARY_PATH','')
         for executable,arg in [(binary_dir/binary_name,'--version'),(tools_dir/('adb.exe' if windows else 'adb'),'version'),(tools_dir/('scrcpy.exe' if windows else 'scrcpy'),'--version')]:
             subprocess.run([str(executable),arg],check=True,env=tool_env,timeout=30)
         python=resource_dir/'runtime/python/python.exe' if windows else resource_dir/'runtime/python/bin/python3'
-        subprocess.run([str(python),'-X','utf8',str(ROOT/'scripts/verify-packaged-runtime.py'),str(resource_dir)],check=True,timeout=180)
+        verify_runtime(python, resource_dir)
         if mac:
             subprocess.run(['codesign','--force','--deep','--sign','-',str(base/'StepX Companion.app')],check=True)
-            subprocess.run([str(binary_dir/binary_name),'--check-runtime'],check=True,timeout=45)
+            subprocess.run([str(binary_dir/binary_name),'--check-runtime'],check=True,env=verification_environment(),timeout=45)
             subprocess.run(['codesign','--verify','--deep','--strict',str(base/'StepX Companion.app')],check=True)
         issues=audit_bundle(resource_dir)
         if issues: raise RuntimeError('Package privacy verification failed:\n'+'\n'.join(issues))
