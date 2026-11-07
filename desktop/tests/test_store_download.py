@@ -1,4 +1,5 @@
 """Download selection must preserve the app and source the user chose."""
+import os
 import re
 import sys
 import unittest
@@ -104,6 +105,8 @@ class StoreDownloadTests(unittest.TestCase):
             ],
         )
 
+    @unittest.skipUnless(os.environ.get('STEPX_LIVE_STORE_TESTS') == '1',
+                         'Live Huawei probe: explicitly set STEPX_LIVE_STORE_TESTS=1')
     def test_live_aito_and_hima_huawei_resolution_and_manifest_package(self):
         import struct
         import urllib.request

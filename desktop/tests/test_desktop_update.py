@@ -1,4 +1,4 @@
-import hashlib, importlib.util, io, json, os, stat, tarfile, tempfile, unittest, zipfile
+import hashlib, importlib.util, io, json, os, stat, subprocess, tarfile, tempfile, unittest, zipfile
 from pathlib import Path
 from unittest.mock import patch
 spec=importlib.util.spec_from_file_location('updater',Path(__file__).parents[1]/'src/desktop_update.py')
@@ -86,10 +86,23 @@ class UpdateTests(unittest.TestCase):
                 new.chmod(0o755)
                 c=dict(target=str(a),stage=str(stage),backup=str(root/'backup'),job=tmp,pid=99999999,version='0.2.19',relative_exe='stepx-companion',nonce='test')
                 u.atomic_json(root/'install.json',c)
-                result=u.install(c,ack_seconds=2)
-                self.assertEqual(result,success)
-                status=json.loads((root/'status.json').read_text())
-                self.assertEqual(status['state'],'installed' if success else 'rolled_back')
-                if success:self.assertTrue((root/'backup/stepx-companion').exists())
-                else:self.assertEqual((a/'stepx-companion').read_text(),'#!/usr/bin/env python3\n')
+                # Production must leave the accepted app (or restored app) open.
+                # This fixture owns both child processes and reaps them before
+                # removing their working directory, including assertion failures.
+                children=[];launch=u.launch
+                def record_launch(*args,**kwargs):
+                    child=launch(*args,**kwargs);children.append(child);return child
+                try:
+                    with patch.object(u,'launch',side_effect=record_launch):
+                        result=u.install(c,ack_seconds=2)
+                    self.assertEqual(result,success)
+                    status=json.loads((root/'status.json').read_text())
+                    self.assertEqual(status['state'],'installed' if success else 'rolled_back')
+                    if success:self.assertTrue((root/'backup/stepx-companion').exists())
+                    else:self.assertEqual((a/'stepx-companion').read_text(),'#!/usr/bin/env python3\n')
+                finally:
+                    for child in children:
+                        if child.poll() is None:child.terminate()
+                        try:child.wait(timeout=2)
+                        except subprocess.TimeoutExpired:child.kill();child.wait(timeout=2)
 if __name__=='__main__':unittest.main()

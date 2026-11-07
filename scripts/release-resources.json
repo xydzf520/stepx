@@ -754,6 +754,7 @@
     "licenses/FaCloud-NOTICE"
   ],
   "public_files": [
+    "desktop/scripts/check-home-performance.py",
     "desktop/scripts/test-file-dialog-macos.cjs",
     "desktop/scripts/verify-macos-file-dialogs.py",
     "docs/videos/README.md",

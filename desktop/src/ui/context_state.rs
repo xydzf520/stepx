@@ -8717,13 +8717,25 @@ mod tests {
         assert!(!app.context.show_all_items);
     }
 
-    fn wait_for_context_worker(ui: &mut ContextUi) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+    fn wait_for_context_worker(ui: &mut ContextUi, phase: &str) {
+        // This is a persistence/scope-isolation test, not a latency benchmark.
+        // The real worker queues behind LEDGER_WRITES and performs durable file
+        // and SQLite commits. Parallel native Windows CI can spend more than
+        // five seconds in that queue alone; retain a bounded deadlock guard
+        // without treating shared-runner scheduling as a product regression.
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(30);
         while ui.worker.is_some() && Instant::now() < deadline {
             ui.poll_worker();
-            std::thread::sleep(Duration::from_millis(5));
+            if ui.worker.is_some() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
-        assert!(ui.worker.is_none(), "context worker did not complete");
+        assert!(
+            ui.worker.is_none(),
+            "context worker did not complete during {phase} after {:?}; scope={:?}, generation={}, error={:?}",
+            started.elapsed(), ui.scope, ui.generation, ui.error,
+        );
     }
 
     #[test]
@@ -8776,7 +8788,7 @@ mod tests {
         app.handle_context_action(&ContextAction::Link(objects[0].clone(), objects[1].clone()));
         assert!(app.context.relation_active());
         assert!(app.context.start_pending_relation());
-        wait_for_context_worker(&mut app.context);
+        wait_for_context_worker(&mut app.context, "persist link");
         assert!(app.context.error.is_none(), "{:?}", app.context.error);
         assert_eq!(app.context.overview.items.len(), 1);
         assert_eq!(app.context.overview.items[0].source_objects.len(), 2);
@@ -8800,7 +8812,7 @@ mod tests {
             account: None,
         };
         app.context.change_scope(other.clone());
-        wait_for_context_worker(&mut app.context);
+        wait_for_context_worker(&mut app.context, "persist split after scope change");
         assert!(app.context.overview.items.is_empty());
         assert_eq!(app.context.scope, Some(other.clone()));
         assert!(ledger::load(temp.path(), &other.device, None)
