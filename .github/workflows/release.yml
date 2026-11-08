@@ -144,15 +144,9 @@ jobs:
           test "$CURRENT_HEAD" = "$GITHUB_SHA" || { echo 'Refusing to publish superseded source'; exit 1; }
           NOTES_FILE="docs/RELEASE_${RELEASE_VERSION//./_}.md"
           test -s "$NOTES_FILE"
-          cp desktop/assets/stepx-companion.apk dist/StepX-companion.apk
-          # Keep historical videos in the repository, but publish exactly the
-          # product tour and cumulative update for the version being packaged.
-          PRODUCT_VIDEO="StepX-product-$RELEASE_VERSION.mp4"
-          UPDATE_VIDEO="StepX-0.2.60-to-$RELEASE_VERSION.mp4"
-          test -s "docs/videos/$PRODUCT_VIDEO"
-          test -s "docs/videos/$UPDATE_VIDEO"
-          cp "docs/videos/$PRODUCT_VIDEO" "docs/videos/$UPDATE_VIDEO" dist/
-          (cd dist && sha256sum StepX-companion.apk "$PRODUCT_VIDEO" "$UPDATE_VIDEO" > media-sha256.txt)
+          # Bugfix releases may link to the previous demonstrations. If new
+          # videos are supplied, both must exist and pass non-empty validation.
+          python3 scripts/package-release.py --version "$RELEASE_VERSION" --stage-media-only
           if gh release view "v$RELEASE_VERSION" --json isDraft > /tmp/stepx-release.json 2>/dev/null; then
             test "$(jq -r .isDraft /tmp/stepx-release.json)" = true || { echo 'Refusing to replace a published release'; exit 1; }
             gh release upload "v$RELEASE_VERSION" dist/* --clobber

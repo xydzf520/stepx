@@ -7,6 +7,14 @@ run('-m','unittest','discover','-s','desktop/tests','-p','test_desktop_update.py
 run('scripts/test-host-runtime.py')
 run('-m','unittest','discover','-s','desktop/tests','-p','test_store_download.py')
 run('-m','unittest','discover','-s','desktop/tests','-p','test_companion_system.py')
+for suite in ['test_root_bridge.py','test_google_install_flow.py','test_google_runtime_status.py','test_companion_boot.py']:
+ run('-m','unittest','discover','-s','desktop/tests','-p',suite)
+if os.name=='posix':
+ # These tests execute the Android/Linux filesystem payload with fcntl and
+ # O_NOFOLLOW in an isolated host directory. Host-only boot tests run above.
+ run('scripts/test-companion-boot.py')
+else:
+ print('Android boot filesystem payload: POSIX-only; host boot checks still ran')
 paths=[shutil.which(x) for x in ['google-chrome','chromium','msedge','chrome']]
 paths += ['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome','/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge']
 for key in ['PROGRAMFILES','PROGRAMFILES(X86)','LOCALAPPDATA']:

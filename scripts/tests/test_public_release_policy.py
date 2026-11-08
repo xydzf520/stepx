@@ -298,6 +298,41 @@ class PublicationBoundaryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'leaves the source tree'):
             package.package_document('README.md', b'[private](../private.txt)', '1.2.3', set())
 
+    def test_maintenance_package_keeps_video_links_on_the_recorded_release(self):
+        source = ('[产品](docs/videos/StepX-product-0.2.180.mp4)\n'
+                  '[更新](docs/videos/StepX-0.2.60-to-0.2.180.mp4)\n')
+        result = package.package_document('README.md', source.encode(), '0.2.181', set()).decode()
+        self.assertIn('releases/download/v0.2.180/StepX-product-0.2.180.mp4', result)
+        self.assertIn('releases/download/v0.2.180/StepX-0.2.60-to-0.2.180.mp4', result)
+        self.assertNotIn('v0.2.181', result)
+
+    def test_maintenance_release_stages_apk_without_fabricating_new_videos(self):
+        self.write('desktop/assets/stepx-companion.apk', b'signed-apk-fixture')
+        dist = Path(self.temp.name)/'dist'
+        names = package.stage_release_media(self.root, dist, '0.2.181')
+        self.assertEqual(names, ['StepX-companion.apk'])
+        self.assertEqual((dist/'StepX-companion.apk').read_bytes(), b'signed-apk-fixture')
+        self.assertEqual((dist/'media-sha256.txt').read_text().splitlines(),
+                         [hashlib.sha256(b'signed-apk-fixture').hexdigest()+'  StepX-companion.apk'])
+
+    def test_release_video_pair_is_atomic_and_each_file_must_be_nonempty(self):
+        self.write('desktop/assets/stepx-companion.apk', b'signed-apk-fixture')
+        product = 'docs/videos/StepX-product-0.2.181.mp4'
+        update = 'docs/videos/StepX-0.2.60-to-0.2.181.mp4'
+        self.write(product, b'product-video-fixture')
+        dist = Path(self.temp.name)/'dist'
+        with self.assertRaisesRegex(ValueError, 'both product and update'):
+            package.stage_release_media(self.root, dist, '0.2.181')
+        self.assertFalse(dist.exists())
+        self.write(update, b'')
+        with self.assertRaisesRegex(ValueError, 'empty'):
+            package.stage_release_media(self.root, dist, '0.2.181')
+        self.assertFalse(dist.exists())
+        self.write(update, b'update-video-fixture')
+        names = package.stage_release_media(self.root, dist, '0.2.181')
+        self.assertEqual(len(names), 3)
+        self.assertEqual(len((dist/'media-sha256.txt').read_text().splitlines()), 3)
+
 
 if __name__ == '__main__':
     unittest.main()

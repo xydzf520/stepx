@@ -53,7 +53,12 @@ def package_document(rel, data, version, packaged_paths):
             raise ValueError(f'{rel}: documentation link leaves the source tree')
         encoded = urllib.parse.quote(resolved, safe='/')
         if resolved.startswith('docs/videos/') and resolved.lower().endswith('.mp4'):
-            url = ('https://github.com/xydzf520/stepx/releases/download/' + tag +
+            # A maintenance release can reuse an older product demonstration.
+            # Its filename records the release that actually owns the asset.
+            recorded = re.fullmatch(r'StepX-(?:product|\d+\.\d+\.\d+-to)-(\d+\.\d+\.\d+)\.mp4',
+                                    posixpath.basename(resolved))
+            media_tag = 'v' + recorded[1] if recorded else tag
+            url = ('https://github.com/xydzf520/stepx/releases/download/' + media_tag +
                    '/' + urllib.parse.quote(posixpath.basename(resolved), safe=''))
         elif resolved.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg')):
             url = 'https://raw.githubusercontent.com/xydzf520/stepx/' + tag + '/' + encoded
@@ -76,11 +81,42 @@ def package_document(rel, data, version, packaged_paths):
             chunks[index] = pattern.sub(lambda m: m[1] + destination(m[2]), chunks[index])
     return ''.join(chunks).encode('utf-8')
 
+
+def stage_release_media(root, dist, version):
+    """Maintenance releases may omit both new videos, never publish half a pair."""
+    if not re.fullmatch(r'\d+\.\d+\.\d+', version):
+        raise ValueError('Invalid media release version')
+    root, dist = Path(root), Path(dist)
+    videos = [root/'docs/videos'/name for name in
+              (f'StepX-product-{version}.mp4', f'StepX-0.2.60-to-{version}.mp4')]
+    present = [path.exists() for path in videos]
+    if any(present) and not all(present):
+        raise ValueError('Release videos must include both product and update, or neither')
+    inputs = [(root/'desktop/assets/stepx-companion.apk', 'StepX-companion.apk')]
+    if all(present):
+        inputs += [(path, path.name) for path in videos]
+    if any(path.is_symlink() or not path.is_file() or path.stat().st_size == 0 for path, _ in inputs):
+        raise ValueError('Release media is missing, empty, or a symlink')
+    dist.mkdir(parents=True, exist_ok=True)
+    checksums = []
+    for source, name in inputs:
+        target = dist/name
+        shutil.copy2(source, target)
+        checksums.append(hashlib.sha256(target.read_bytes()).hexdigest() + '  ' + name)
+    (dist/'media-sha256.txt').write_text('\n'.join(checksums)+'\n', encoding='utf-8')
+    return [name for _, name in inputs]
+
+
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--platform',choices=TOOLS,required=True);p.add_argument('--version',required=True);a=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--platform',choices=TOOLS);p.add_argument('--version',required=True);p.add_argument('--stage-media-only',action='store_true');a=p.parse_args()
     if not all(c.isalnum() or c in '.-_' for c in a.version):p.error('Invalid version')
     import tomllib
     if tomllib.loads((ROOT/'desktop/Cargo.toml').read_text())['package']['version']!=a.version: p.error('Package version must match Cargo.toml')
+    if a.stage_media_only:
+        if a.platform:p.error('--stage-media-only does not take --platform')
+        print('Release media:', ', '.join(stage_release_media(ROOT,ROOT/'dist',a.version)))
+        return
+    if not a.platform:p.error('--platform is required for native packaging')
     windows=a.platform.startswith('windows');mac=a.platform.startswith('macos')
     host_os={'Darwin':'macos','Windows':'windows','Linux':'linux'}.get(platform.system())
     host_arch={'AMD64':'x86_64','aarch64':'arm64'}.get(platform.machine(),platform.machine())
