@@ -1,305 +1,881 @@
 {
-  "version": "0.2.177",
-  "purpose": "Explain product value and cumulative 0.2.60 → 0.2.177 changes; no job-seeking or personal-contact promotion.",
+  "version": "0.2.180",
+  "captured_on": "2026-11-08",
+  "purpose": "Show the complete product workflow and the cumulative 0.2.60 to 0.2.180 changes through everyday scenarios.",
+  "format": {
+    "width": 1600,
+    "height": 1040,
+    "fps": 24,
+    "video": "H.264 / yuv420p",
+    "audio": "AAC / 24 kHz / mono"
+  },
   "narration": {
     "voice": "zh-CN-XiaoxiaoNeural",
-    "provider": "Microsoft Edge online TTS via edge-tts",
-    "rate": "+8%",
-    "disclosure": "AI synthesized female narration; not a recording of the author."
+    "provider": "Microsoft Edge online TTS",
+    "rate": "+5%",
+    "disclosure": "AI-synthesized narration for the video; not the phone offline speech feature."
   },
-  "visual_provenance": "Real native client captures with isolated demonstration data. UI captures are not end-to-end device verification evidence.",
+  "visual_provenance": "All product footage recorded from the native 0.2.180 client with isolated configuration and demonstration data. Mouse actions operate the actual UI. Separate popup shots are edited together with the main-window context. These are UI demonstrations, not real-device call, transfer or live AI-generation acceptance evidence.",
+  "validation": {
+    "complete_movie_decode": true,
+    "asr_checked_narration_scenes": 25,
+    "critical_asr_rechecks": 6,
+    "human_listening_claimed": false,
+    "notes": "Decoded actual audio and checked ASR transcripts and word timing; final frame/subtitle and clipping checks are described in the individual QA reports."
+  },
   "films": [
     {
-      "file": "StepX-0.2.60-to-0.2.177.mp4",
-      "subtitles": "StepX-0.2.60-to-0.2.177.srt",
+      "file": "StepX-product-0.2.180.mp4",
+      "subtitles": "StepX-product-0.2.180.srt",
+      "contact_sheet": "StepX-product-0.2.180-contact-sheet.jpg",
+      "qa_report": "StepX-product-0.2.180-qa.json",
+      "version_range": null,
+      "duration_seconds": 208.751,
+      "size_bytes": 8717303,
       "scenes": [
         {
-          "key": "StepX-0.2.60-to-0.2.177-final-brand-intro",
-          "title": "StepX Companion · 连接工作与生活",
-          "text": "以人为中心，让 AI 贯通终端与服务。连接手机与电脑上的消息、文件、安排、工具与 AI 成果，让提醒及时到达，让工作与生活跨端继续。",
-          "kind": "intro",
-          "source": "home",
-          "tags": [
-            "手机 × 电脑",
-            "信息 · 工具 · 服务"
+          "id": "product-01",
+          "title": "以人为中心，让 AI 贯通终端与服务",
+          "shot": "最新首页全貌，交代手机与电脑协作场景",
+          "start_seconds": 0,
+          "duration_seconds": 13.33,
+          "source_clips": [
+            "home"
           ],
-          "start": 0,
-          "duration": 14.266666666666667
+          "display_narration": "以人为中心，让 AI 贯通终端与服务。手机上的提醒、资料和正在做的事，来到电脑前，也能接着处理。",
+          "spoken_narration": "以人为中心，让 人工智能 贯通终端与服务。手机上的提醒、资料和正在做的事，来到电脑前，也能接着处理。",
+          "subtitles": [
+            {
+              "start_seconds": 0.35,
+              "end_seconds": 5.0047,
+              "text": "以人为中心，让 AI 贯通终端与服务。"
+            },
+            {
+              "start_seconds": 5.0047,
+              "end_seconds": 9.5047,
+              "text": "手机上的提醒、资料和正在做的事，来到电脑前，"
+            },
+            {
+              "start_seconds": 9.5047,
+              "end_seconds": 11.174,
+              "text": "也能接着处理。"
+            }
+          ]
         },
         {
-          "key": "u_scope",
-          "title": "从 v0.2.60 到 v0.2.177",
-          "text": "这次更新，把手机上的重要信息，带到你正在工作的电脑。先看提醒、胶囊、首页和最近文件。",
-          "kind": "wide",
-          "source": "home",
-          "start": 14.266666666666667,
-          "duration": 10.066666666666666
+          "id": "product-02",
+          "title": "先把手机连起来",
+          "shot": "终端页面 → 设备卡连接入口 → 连接引导步骤",
+          "start_seconds": 13.33,
+          "duration_seconds": 13.92,
+          "source_clips": [
+            "connection"
+          ],
+          "display_narration": "第一次使用，点开设备卡上的连接入口，跟着引导连接手机。完成授权后，回到首页查看设备和同步状态，知道现在能用什么。",
+          "spoken_narration": "第一次使用，点开设备卡上的连接入口，跟着引导连接手机。完成授权后，回到首页查看设备和同步状态，知道现在能用什么。",
+          "subtitles": [
+            {
+              "start_seconds": 0.35,
+              "end_seconds": 3.7929,
+              "text": "第一次使用，点开设备卡上的连接入口，"
+            },
+            {
+              "start_seconds": 3.7929,
+              "end_seconds": 5.8143,
+              "text": "跟着引导连接手机。"
+            },
+            {
+              "start_seconds": 5.8143,
+              "end_seconds": 9.8738,
+              "text": "完成授权后，回到首页查看设备和同步状态，"
+            },
+            {
+              "start_seconds": 9.8738,
+              "end_seconds": 11.75,
+              "text": "知道现在能用什么。"
+            }
+          ]
         },
         {
-          "key": "u_popup",
-          "title": "重要提醒，不必来回找手机",
-          "text": "验证码优先看到，红包有醒目的红色提示。同一会话合并显示，也能暂停提醒。清理本次弹窗后，历史还在，新的消息照常提醒。",
-          "kind": "popup",
-          "source": "popup",
-          "tags": [
-            "验证码优先",
-            "同类合并",
-            "清理本次，保留历史"
+          "id": "product-03",
+          "title": "今天先做什么",
+          "shot": "首页月历 → 点击日期 → 查看当天安排",
+          "start_seconds": 27.25,
+          "duration_seconds": 13.17,
+          "source_clips": [
+            "home"
           ],
-          "start": 24.333333333333336,
-          "duration": 13.2
+          "display_narration": "坐到电脑前，先看今天。完整月历把安排放在最前面，工作和生活用不同颜色区分，点一天，就看这一天的事情。",
+          "spoken_narration": "坐到电脑前，先看今天。完整月历把安排放在最前面，工作和生活用不同颜色区分，点一天，就看这一天的事情。",
+          "subtitles": [
+            {
+              "start_seconds": 0.35,
+              "end_seconds": 3.0524,
+              "text": "坐到电脑前，先看今天。"
+            },
+            {
+              "start_seconds": 3.0524,
+              "end_seconds": 5.7547,
+              "text": "完整月历把安排放在最前面，"
+            },
+            {
+              "start_seconds": 5.7547,
+              "end_seconds": 9.219,
+              "text": "工作和生活用不同颜色区分，点一天，"
+            },
+            {
+              "start_seconds": 9.219,
+              "end_seconds": 11.006,
+              "text": "就看这一天的事情。"
+            }
+          ]
         },
         {
-          "key": "u_capsule",
-          "title": "关键信息，跟着状态走",
-          "text": "快递、日程和未接来电，集中在顶部胶囊。规则先判断，模糊的再交给 Agent 复核。证据不足不猜测，完成后自然收起。",
-          "kind": "portrait",
-          "source": "capsule_clip",
-          "tags": [
-            "先规则，再复核",
-            "处理后收起",
-            "不知道，就不猜"
+          "id": "product-04",
+          "title": "按你的习惯摆",
+          "shot": "调整布局 → 选择卡片尺寸 → 保存",
+          "start_seconds": 40.42,
+          "duration_seconds": 12.58,
+          "source_clips": [
+            "layout-final"
           ],
-          "start": 37.53333333333333,
-          "duration": 12.866666666666667
+          "display_narration": "每天常用什么，就把什么放在手边。首页模块可以移动、缩放和隐藏，调整后保存，也能撤销，回到自己熟悉的布局。",
+          "spoken_narration": "每天常用什么，就把什么放在手边。首页模块可以移动、缩放和隐藏，调整后保存，也能撤销，回到自己熟悉的布局。",
+          "subtitles": [
+            {
+              "start_seconds": 0.35,
+              "end_seconds": 3.6714,
+              "text": "每天常用什么，就把什么放在手边。"
+            },
+            {
+              "start_seconds": 3.6714,
+              "end_seconds": 7.9453,
+              "text": "首页模块可以移动、缩放和隐藏，调整后保存，"
+            },
+            {
+              "start_seconds": 7.9453,
+              "end_seconds": 11.198,
+              "text": "也能撤销，回到自己熟悉的布局。"
+            }
+          ]
         },
         {
-          "key": "u_home",
-          "title": "打开首页，先看今天怎么安排",
-          "text": "完整月历放在最前面，工作和生活用两种颜色区分。十六个模块都保留，按你的习惯调整大小、移动或隐藏。",
-          "kind": "wide",
-          "source": "home_clip",
-          "tags": [
-            "完整月历",
-            "工作 / 生活",
-            "16 个可定制模块"
+          "id": "product-05",
+          "title": "验证码，不用找手机",
+          "shot": "完整界面 → 验证码复制 → 红包提醒 → 弹窗菜单",
+          "start_seconds": 53.0,
+          "duration_seconds": 11.88,
+          "source_clips": [
+            [
+              "popup-context",
+              0,
+              1
+            ],
+            [
+              "popup-otp",
+              1.25,
+              4.25
+            ],
+            [
+              "popup-red",
+              0,
+              2.1
+            ],
+            [
+              "popup-otp",
+              6.1,
+              11.3
+            ]
           ],
-          "start": 50.4,
-          "duration": 11.333333333333334
+          "display_narration": "忙着处理工作，验证码直接在桌面复制，红包也更容易认出来。不方便被打扰时，可以暂停提醒，或者清理本次弹窗。",
+          "spoken_narration": "忙着处理工作，验证码直接在桌面复制，红包也更容易认出来。不方便被打扰时，可以暂停提醒，或者清理本次弹窗。",
+          "subtitles": [
+            {
+              "start_seconds": 0.35,
+              "end_seconds": 4.031,
+              "text": "忙着处理工作，验证码直接在桌面复制，"
+            },
+            {
+              "start_seconds": 4.031,
+              "end_seconds": 6.1714,
+              "text": "红包也更容易认出来。"
+            },
+            {
+              "start_seconds": 6.1714,
+              "end_seconds": 11.198,
+              "text": "不方便被打扰时，可以暂停提醒，或者清理本次弹窗。"
+            }
+          ]
         },
         {
-          "key": "u_files_scoped",
-          "title": "刚保存的东西，马上接着用",
-          "text": "常用目录里刚保存的图片、文档和 PDF，可以在最近文件找到。不限浏览器、AI 工具或办公软件。电脑与手机集中查看，再选择打开，或传到另一端。",
-          "kind": "wide",
-          "source": "files_clip",
-          "tags": [
-            "不限应用来源",
-            "电脑 + 手机",
-            "打开 · 传到手机 · 存到电脑"
+          "id": "product-06",
+          "title": "还没办完的事",
+          "shot": "顶部胶囊 → 查看日程与物流状态 → 关闭浮层",
+          "start_seconds": 64.88,
+          "duration_seconds": 11.88,
+          "source_clips": [
+            "capsule"
           ],
-          "start": 61.733333333333334,
-          "duration": 15.466666666666667
+          "display_narration": "会议快到了，快递要取了，抬头就能看见。打开胶囊查看事情和状态，处理完成后收起，让手边只留下还要关注的事。",
+          "spoken_narration": "会议快到了，快递要取了，抬头就能看见。打开胶囊查看事情和状态，处理完成后收起，让手边只留下还要关注的事。",
+          "subtitles": [
+            {
+              "start_seconds": 0.35,
+              "end_seconds": 4.3857,
+              "text": "会议快到了，快递要取了，抬头就能看见。"
+            },
+            {
+              "start_seconds": 4.3857,
+              "end_seconds": 8.4929,
+              "text": "打开胶囊查看事情和状态，处理完成后收起，"
+            },
+            {
+              "start_seconds": 8.4929,
+              "end_seconds": 11.198,
+              "text": "让手边只留下还要关注的事。"
+            }
+          ]
         },
         {
-          "key": "u_search",
-          "title": "想找什么，直接搜",
-          "text": "消息、文件、Amoo 对话和功能入口，可以一起搜索。默认综合检索，也能切到手机或电脑，直接打开对应内容。",
-          "kind": "portrait",
-          "source": "search_clip",
-          "tags": [
-            "综合 · 手机 · 电脑",
-            "消息 / 文件 / 对话",
-            "结果直达原位置"
+          "id": "product-07",
+          "title": "刚保存，就能找到",
+          "shot": "首页最近文件 → 文件与扩容 → 切换手机、电脑来源",
+          "start_seconds": 76.76,
+          "duration_seconds": 13.79,
+          "source_clips": [
+            "files"
           ],
-          "start": 77.2,
-          "duration": 11.333333333333334
+          "display_narration": "刚保存的图片、文档和 PDF，不用再翻好几个文件夹。最近文件把两端资料放在一起，认清来源，再打开或传到另一端。",
+          "spoken_narration": "刚保存的图片、文档和 P D F，不用再翻好几个文件夹。最近文件把两端资料放在一起，认清来源，再打开或传到另一端。",
+          "subtitles": [
+            {
+              "start_seconds": 0.35,
+              "end_seconds": 3.3286,
+              "text": "刚保存的图片、文档和 PDF，"
+            },
+            {
+              "start_seconds": 3.3286,
+              "end_seconds": 5.4571,
+              "text": "不用再翻好几个文件夹。"
+            },
+            {
+              "start_seconds": 5.4571,
+              "end_seconds": 9.3262,
+              "text": "最近文件把两端资料放在一起，认清来源，"
+            },
+            {
+              "start_seconds": 9.3262,
+              "end_seconds": 11.606,
+              "text": "再打开或传到另一端。"
+            }
+          ]
         },
         {
-          "key": "u_phone",
-          "title": "手机放下，电脑仍能接着用",
-          "text": "无线熄屏时继续同步数据。在支持的手机和 Linux 环境，已验证来电弹窗、电脑双向通话、挂断和回拨。",
-          "kind": "wide",
-          "source": "phone",
-          "tags": [
-            "纯无线 · 熄屏同步",
-            "电脑接听 / 手机接听",
-            "通话能力以设备支持为准"
+          "id": "product-08",
+          "title": "记得关键词就够了",
+          "shot": "顶部搜索 → 最近文件 → 输入“会议” → 全部结果",
+          "start_seconds": 90.55,
+          "duration_seconds": 14.13,
+          "source_clips": [
+            "search"
           ],
-          "start": 88.53333333333333,
-          "duration": 11.266666666666667
+          "display_narration": "只记得几个关键词，也可以找。顶部搜索先展示最近文件，输入后再查已同步的消息、文件和讨论，按手机或电脑筛选。",
+          "spoken_narration": "只记得几个关键词，也可以找。顶部搜索先展示最近文件，输入后再查已同步的消息、文件和讨论，按手机或电脑筛选。",
+          "subtitles": [
+            {
+              "start_seconds": 0.35,
+              "end_seconds": 3.3619,
+              "text": "只记得几个关键词，也可以找。"
+            },
+            {
+              "start_seconds": 3.3619,
+              "end_seconds": 6.0167,
+              "text": "顶部搜索先展示最近文件，"
+            },
+            {
+              "start_seconds": 6.0167,
+              "end_seconds": 9.6119,
+              "text": "输入后再查已同步的消息、文件和讨论，"
+            },
+            {
+              "start_seconds": 9.6119,
+              "end_seconds": 11.942,
+              "text": "按手机或电脑筛选。"
+            }
+          ]
         },
         {
-          "key": "u_perf",
-          "title": "用起来顺畅，才是真正的改进",
-          "text": "这轮还优化了数据库增量写入、分页、缓存和独立同步队列。生成方案与总结时，数据同步继续进行；具体速度，以实际场景测量为准。",
-          "kind": "wide",
-          "source": "home",
-          "tags": [
-            "减少重复写入",
-            "分页与缓存",
-            "同步与生成分开进行"
+          "id": "product-09",
+          "title": "回到同一段交流",
+          "shot": "侧栏消息 → 打开会话 → 查看已同步内容",
+          "start_seconds": 104.68,
+          "duration_seconds": 13.08,
+          "source_clips": [
+            "messages"
           ],
-          "start": 99.8,
-          "duration": 14.0
+          "display_narration": "手机消息到了电脑，先看清是哪段交流，再打开查看上下文。能直接回复的通知会提供入口，历史范围以已同步内容为准。",
+          "spoken_narration": "手机消息到了电脑，先看清是哪段交流，再打开查看上下文。能直接回复的通知会提供入口，历史范围以已同步内容为准。",
+          "subtitles": [
+            {
+              "start_seconds": 0.35,
+              "end_seconds": 4.0667,
+              "text": "手机消息到了电脑，先看清是哪段交流，"
+            },
+            {
+              "start_seconds": 4.0667,
+              "end_seconds": 6.1357,
+              "text": "再打开查看上下文。"
+            },
+            {
+              "start_seconds": 6.1357,
+              "end_seconds": 9.0286,
+              "text": "能直接回复的通知会提供入口，"
+            },
+            {
+              "start_seconds": 9.0286,
+              "end_seconds": 11.774,
+              "text": "历史范围以已同步内容为准。"
+            }
+          ]
+        },
+        {
+          "id": "product-10",
+          "title": "找回未接来电",
+          "shot": "侧栏电话 → 筛选未接 → 选择记录 → 回拨入口",
+          "start_seconds": 117.76,
+          "duration_seconds": 12.75,
+          "source_clips": [
+            "phone"
+          ],
+          "display_narration": "来电时，可以选择手机接听，支持的设备也能使用电脑音频。错过的电话在这里找到，再从回拨入口继续联系。",
+          "spoken_narration": "来电时，可以选择手机接听，支持的设备也能使用电脑音频。错过的电话在这里找到，再从回拨入口继续联系。",
+          "subtitles": [
+            {
+              "start_seconds": 0.35,
+              "end_seconds": 3.031,
+              "text": "来电时，可以选择手机接听，"
+            },
+            {
+              "start_seconds": 3.031,
+              "end_seconds": 6.0286,
+              "text": "支持的设备也能使用电脑音频。"
+            },
+            {
+              "start_seconds": 6.0286,
+              "end_seconds": 10.574,
+              "text": "错过的电话在这里找到，再从回拨入口继续联系。"
+            }
+          ]
+        },
+        {
+          "id": "product-11",
+          "title": "把讨论继续做下去",
+          "shot": "侧栏 Amoo → 选择演示会话 → 查看已有讨论",
+          "start_seconds": 130.51,
+          "duration_seconds": 12.79,
+          "source_clips": [
+            "amoo"
+          ],
+          "display_narration": "回到 Amoo，继续手机上的讨论。文字、图片和文件留在同一段会话里，方案和文档成果也能继续查看、修改和保存。",
+          "spoken_narration": "回到 阿莫，继续手机上的讨论。文字、图片和文件留在同一段会话里，方案和文档成果也能继续查看、修改和保存。",
+          "subtitles": [
+            {
+              "start_seconds": 0.35,
+              "end_seconds": 3.7547,
+              "text": "回到 Amoo，继续手机上的讨论。"
+            },
+            {
+              "start_seconds": 3.7547,
+              "end_seconds": 7.2071,
+              "text": "文字、图片和文件留在同一段会话里，"
+            },
+            {
+              "start_seconds": 7.2071,
+              "end_seconds": 11.534,
+              "text": "方案和文档成果也能继续查看、修改和保存。"
+            }
+          ]
+        },
+        {
+          "id": "product-12",
+          "title": "成果有自己的位置",
+          "shot": "侧栏我的作品 → 切换分类 → 查看演示成果",
+          "start_seconds": 143.3,
+          "duration_seconds": 13.25,
+          "source_clips": [
+            "studio"
+          ],
+          "display_narration": "做出来的文件和小应用，放到作品里继续使用。先在电脑预览，再选择交付到手机，让一次讨论留下能接着用的成果。",
+          "spoken_narration": "做出来的文件和小应用，放到作品里继续使用。先在电脑预览，再选择交付到手机，让一次讨论留下能接着用的成果。",
+          "subtitles": [
+            {
+              "start_seconds": 0.35,
+              "end_seconds": 4.7429,
+              "text": "做出来的文件和小应用，放到作品里继续使用。"
+            },
+            {
+              "start_seconds": 4.7429,
+              "end_seconds": 7.9571,
+              "text": "先在电脑预览，再选择交付到手机，"
+            },
+            {
+              "start_seconds": 7.9571,
+              "end_seconds": 11.102,
+              "text": "让一次讨论留下能接着用的成果。"
+            }
+          ]
+        },
+        {
+          "id": "product-13",
+          "title": "工作生活都安排好",
+          "shot": "侧栏日历 → 选择日期 → 闹钟入口",
+          "start_seconds": 156.55,
+          "duration_seconds": 12.83,
+          "source_clips": [
+            "calendar"
+          ],
+          "display_narration": "工作会议、生活安排，回到日历里细看。常用的闹钟也有单独入口，不用为了查一个时间，反复拿起手机切应用。",
+          "spoken_narration": "工作会议、生活安排，回到日历里细看。常用的闹钟也有单独入口，不用为了查一个时间，反复拿起手机切应用。",
+          "subtitles": [
+            {
+              "start_seconds": 0.35,
+              "end_seconds": 4.3262,
+              "text": "工作会议、生活安排，回到日历里细看。"
+            },
+            {
+              "start_seconds": 4.3262,
+              "end_seconds": 8.3976,
+              "text": "常用的闹钟也有单独入口，不用为了查一个时间，"
+            },
+            {
+              "start_seconds": 8.3976,
+              "end_seconds": 10.67,
+              "text": "反复拿起手机切应用。"
+            }
+          ]
+        },
+        {
+          "id": "product-14",
+          "title": "照片与空间一起管",
+          "shot": "侧栏图库 → 文件与扩容 → 扩容入口",
+          "start_seconds": 169.38,
+          "duration_seconds": 13.33,
+          "source_clips": [
+            "gallery"
+          ],
+          "display_narration": "手机里的图片，可以在更大的屏幕上查看。需要整理空间时，再到文件与扩容选择资料，先核对保存结果，再处理原件。",
+          "spoken_narration": "手机里的图片，可以在更大的屏幕上查看。需要整理空间时，再到文件与扩容选择资料，先核对保存结果，再处理原件。",
+          "subtitles": [
+            {
+              "start_seconds": 0.35,
+              "end_seconds": 4.1595,
+              "text": "手机里的图片，可以在更大的屏幕上查看。"
+            },
+            {
+              "start_seconds": 4.1595,
+              "end_seconds": 8.0524,
+              "text": "需要整理空间时，再到文件与扩容选择资料，"
+            },
+            {
+              "start_seconds": 8.0524,
+              "end_seconds": 11.15,
+              "text": "先核对保存结果，再处理原件。"
+            }
+          ]
+        },
+        {
+          "id": "product-15",
+          "title": "手机的特色，也带过来",
+          "shot": "背屏图案预览 → 常用工具 → 应用与商店入口",
+          "start_seconds": 182.71,
+          "duration_seconds": 13.0,
+          "source_clips": [
+            [
+              "backscreen",
+              0,
+              6
+            ],
+            [
+              "tools",
+              1,
+              4.5
+            ],
+            [
+              "tools",
+              9,
+              12.5
+            ]
+          ],
+          "display_narration": "背屏图案和文字可以先预览，常用工具、应用管理和商店也集中在这里。想调整手机，知道从哪里开始，比记住操作更重要。",
+          "spoken_narration": "背屏图案和文字可以先预览，常用工具、应用管理和商店也集中在这里。想调整手机，知道从哪里开始，比记住操作更重要。",
+          "subtitles": [
+            {
+              "start_seconds": 0.35,
+              "end_seconds": 3.15,
+              "text": "背屏图案和文字可以先预览，"
+            },
+            {
+              "start_seconds": 3.15,
+              "end_seconds": 7.1476,
+              "text": "常用工具、应用管理和商店也集中在这里。"
+            },
+            {
+              "start_seconds": 7.1476,
+              "end_seconds": 12.014,
+              "text": "想调整手机，知道从哪里开始，比记住操作更重要。"
+            }
+          ]
+        },
+        {
+          "id": "product-16",
+          "title": "围绕正在做的事",
+          "shot": "回到最新首页，收束安排与资料接续场景",
+          "start_seconds": 195.71,
+          "duration_seconds": 13.0,
+          "source_clips": [
+            "home"
+          ],
+          "display_narration": "少切一次设备，少找一遍资料，把注意力留给正在做的事。这里是 Step X，连接手机和电脑，也连接工作与生活。",
+          "spoken_narration": "少切一次设备，少找一遍资料，把注意力留给正在做的事。这里是 Step X，连接手机和电脑，也连接工作与生活。",
+          "subtitles": [
+            {
+              "start_seconds": 0.35,
+              "end_seconds": 3.2929,
+              "text": "少切一次设备，少找一遍资料，"
+            },
+            {
+              "start_seconds": 3.2929,
+              "end_seconds": 5.731,
+              "text": "把注意力留给正在做的事。"
+            },
+            {
+              "start_seconds": 5.731,
+              "end_seconds": 8.7667,
+              "text": "这里是 Step X，连接手机和电脑，"
+            },
+            {
+              "start_seconds": 8.7667,
+              "end_seconds": 10.838,
+              "text": "也连接工作与生活。"
+            }
+          ]
         }
       ]
     },
     {
-      "file": "StepX-product-0.2.177.mp4",
-      "subtitles": "StepX-product-0.2.177.srt",
+      "file": "StepX-0.2.60-to-0.2.180.mp4",
+      "subtitles": "StepX-0.2.60-to-0.2.180.srt",
+      "contact_sheet": "StepX-0.2.60-to-0.2.180-contact-sheet.jpg",
+      "qa_report": "StepX-0.2.60-to-0.2.180-qa.json",
+      "version_range": "0.2.60 → 0.2.180",
+      "duration_seconds": 122.417667,
+      "size_bytes": 5103775,
       "scenes": [
         {
-          "key": "StepX-product-0.2.177-final-brand-intro",
-          "title": "StepX Companion · 连接工作与生活",
-          "text": "以人为中心，让 AI 贯通终端与服务。连接手机与电脑上的消息、文件、安排、工具与 AI 成果，让提醒及时到达，让工作与生活跨端继续。",
-          "kind": "intro",
-          "source": "home",
-          "tags": [
-            "手机 × 电脑",
-            "信息 · 工具 · 服务"
+          "id": "update-01",
+          "title": "0.2.60 → 0.2.180",
+          "shot": "最新首页全貌，明确 0.2.60 → 0.2.180",
+          "start_seconds": 0,
+          "duration_seconds": 13.75,
+          "source_clips": [
+            "home"
           ],
-          "start": 0,
-          "duration": 13.866666666666667
+          "display_narration": "以人为中心，让 AI 贯通终端与服务。从 0.2.60，到 0.2.180，这次把提醒、安排和两端资料，接得更顺手。",
+          "spoken_narration": "以人为中心，让 人工智能 贯通终端与服务。从零点二点六零，到零点二点一八零，这次把提醒、安排和两端资料，接得更顺手。",
+          "subtitles": [
+            {
+              "start_seconds": 0.35,
+              "end_seconds": 5.0047,
+              "text": "以人为中心，让 AI 贯通终端与服务。"
+            },
+            {
+              "start_seconds": 5.0047,
+              "end_seconds": 8.4333,
+              "text": "从0.2.60，到0.2.180，"
+            },
+            {
+              "start_seconds": 8.4333,
+              "end_seconds": 12.806,
+              "text": "这次把提醒、安排和两端资料，接得更顺手。"
+            }
+          ]
         },
         {
-          "key": "p_morning",
-          "title": "坐到电脑前，先把一天安排清楚",
-          "text": "你坐到电脑前，先看今天的安排。首页用完整月历把日程、待处理和工作记录放到一起。工作和生活各一个颜色，不用逐个应用翻找。",
-          "kind": "wide",
-          "source": "home_clip",
-          "tags": [
-            "一天的安排，集中看",
-            "工作 / 生活两种颜色"
+          "id": "update-02",
+          "title": "新消息，及时看见",
+          "shot": "验证码、红包与当前弹窗菜单",
+          "start_seconds": 13.75,
+          "duration_seconds": 12.166667,
+          "source_clips": [
+            [
+              "popup-context",
+              0,
+              1
+            ],
+            [
+              "popup-otp",
+              1.25,
+              4.25
+            ],
+            [
+              "popup-red",
+              0,
+              2.1
+            ],
+            [
+              "popup-otp",
+              6.1,
+              11.3
+            ]
           ],
-          "start": 13.866666666666667,
-          "duration": 13.0
+          "display_narration": "新的消息和验证码优先提醒，红包更醒目，同一会话集中展示。菜单里可以暂停提醒，清理本次弹窗，历史仍然留着。",
+          "spoken_narration": "新的消息和验证码优先提醒，红包更醒目，同一会话集中展示。菜单里可以暂停提醒，清理本次弹窗，历史仍然留着。",
+          "subtitles": [
+            {
+              "start_seconds": 0.35,
+              "end_seconds": 4.3405,
+              "text": "新的消息和验证码优先提醒，红包更醒目，"
+            },
+            {
+              "start_seconds": 4.3405,
+              "end_seconds": 6.4095,
+              "text": "同一会话集中展示。"
+            },
+            {
+              "start_seconds": 6.4095,
+              "end_seconds": 11.51,
+              "text": "菜单里可以暂停提醒，清理本次弹窗，历史仍然留着。"
+            }
+          ]
         },
         {
-          "key": "p_layout",
-          "title": "这个首页，可以按你的习惯来",
-          "text": "常用的放前面，不常用的隐藏。十六个模块都保留，可以移动、调整大小。宽屏看更多内容，小窗口先保留最重要的信息。",
-          "kind": "wide",
-          "source": "home_edit",
-          "tags": [
-            "移动 · 调整大小 · 隐藏",
-            "保留全部模块，自由选择"
+          "id": "update-03",
+          "title": "提醒跟着状态走",
+          "shot": "打开胶囊，解释寄件、收件与完成状态",
+          "start_seconds": 25.916667,
+          "duration_seconds": 12.42,
+          "source_clips": [
+            "capsule"
           ],
-          "start": 26.866666666666667,
-          "duration": 12.133333333333333
+          "display_narration": "胶囊开始更认真地区分事情的状态：寄给别人的快递，不该催你去收。规则先判断，有歧义再复核，完成的事情及时收起。",
+          "spoken_narration": "胶囊开始更认真地区分事情的状态：寄给别人的快递，不该催你去收。规则先判断，有歧义再复核，完成的事情及时收起。",
+          "subtitles": [
+            {
+              "start_seconds": 0.35,
+              "end_seconds": 5.0429,
+              "text": "胶囊开始更认真地区分事情的状态：寄给别人的快递，"
+            },
+            {
+              "start_seconds": 5.0429,
+              "end_seconds": 6.6953,
+              "text": "不该催你去收。"
+            },
+            {
+              "start_seconds": 6.6953,
+              "end_seconds": 11.75,
+              "text": "规则先判断，有歧义再复核，完成的事情及时收起。"
+            }
+          ]
         },
         {
-          "key": "p_popup",
-          "title": "忙着工作，也不错过重要提醒",
-          "text": "手机有新消息，电脑右下角出现自己的提醒窗口。验证码更靠前，红包用红色突出，同一会话集中显示。你不用停下手里的事，反复拿手机确认。",
-          "kind": "popup",
-          "source": "popup",
-          "tags": [
-            "验证码优先",
-            "红包醒目",
-            "同一会话合并"
+          "id": "update-04",
+          "title": "布局跟着你调整",
+          "shot": "完整月历 → 尺寸选择 → 保存布局",
+          "start_seconds": 38.336667,
+          "duration_seconds": 12.75,
+          "source_clips": [
+            "layout-final"
           ],
-          "start": 39.0,
-          "duration": 14.133333333333333
+          "display_narration": "全月日历在最前面，十六个模块继续保留。移动、缩放、隐藏都有反馈，不同宽高展示不同重点，宽窗口也减少无用留白。",
+          "spoken_narration": "全月日历在最前面，十六个模块继续保留。移动、缩放、隐藏都有反馈，不同宽高展示不同重点，宽窗口也减少无用留白。",
+          "subtitles": [
+            {
+              "start_seconds": 0.35,
+              "end_seconds": 4.4929,
+              "text": "全月日历在最前面，十六个模块继续保留。"
+            },
+            {
+              "start_seconds": 4.4929,
+              "end_seconds": 9.469,
+              "text": "移动、缩放、隐藏都有反馈，不同宽高展示不同重点，"
+            },
+            {
+              "start_seconds": 9.469,
+              "end_seconds": 12.062,
+              "text": "宽窗口也减少无用留白。"
+            }
+          ]
         },
         {
-          "key": "p_quiet",
-          "title": "什么时候被打扰，由你决定",
-          "text": "点开菜单，可以暂停半小时、一小时，或今天不提醒。清理本次，只收起这一批弹窗；消息历史还在，后续的新消息不会被关闭。",
-          "kind": "popup",
-          "source": "popup_menu",
-          "tags": [
-            "暂停提醒，时长可选",
-            "清理本次，不删除历史"
+          "id": "update-05",
+          "title": "刚生成，马上接着用",
+          "shot": "首页最近文件 → 来源切换与文件操作入口",
+          "start_seconds": 51.086667,
+          "duration_seconds": 13.92,
+          "source_clips": [
+            "files"
           ],
-          "start": 53.13333333333333,
-          "duration": 12.933333333333334
+          "display_narration": "手机照片、电脑文档、刚生成的 PDF，都可以在最近文件里找到。看清文件来自哪里，再打开，或者选择传到另一端继续用。",
+          "spoken_narration": "手机照片、电脑文档、刚生成的 P D F，都可以在最近文件里找到。看清文件来自哪里，再打开，或者选择传到另一端继续用。",
+          "subtitles": [
+            {
+              "start_seconds": 0.35,
+              "end_seconds": 4.1738,
+              "text": "手机照片、电脑文档、刚生成的 PDF，"
+            },
+            {
+              "start_seconds": 4.1738,
+              "end_seconds": 6.5762,
+              "text": "都可以在最近文件里找到。"
+            },
+            {
+              "start_seconds": 6.5762,
+              "end_seconds": 9.1357,
+              "text": "看清文件来自哪里，再打开，"
+            },
+            {
+              "start_seconds": 9.1357,
+              "end_seconds": 11.75,
+              "text": "或者选择传到另一端继续用。"
+            }
+          ]
         },
         {
-          "key": "p_capsule",
-          "title": "待办不是越多越好，状态要准确",
-          "text": "快递到了、会议快开始、刚才有未接电话，胶囊把关键状态留在手边。先用明确规则识别，有歧义再请 Agent 复核；不把寄给别人的快递猜成自己待收。",
-          "kind": "portrait",
-          "source": "capsule_clip",
-          "tags": [
-            "规则先判断",
-            "Agent 复核歧义",
-            "已完成，及时收起"
+          "id": "update-06",
+          "title": "直接看到内容",
+          "shot": "搜索直接展示文件 → 输入关键词 → 全部结果",
+          "start_seconds": 65.006667,
+          "duration_seconds": 14.125,
+          "source_clips": [
+            "search"
           ],
-          "start": 66.06666666666666,
-          "duration": 14.733333333333333
+          "display_narration": "搜索打开后，直接给你最近文件，不再先弹功能菜单。输入关键词，再从消息、文件、讨论和安排里找，按来源进一步筛选。",
+          "spoken_narration": "搜索打开后，直接给你最近文件，不再先弹功能菜单。输入关键词，再从消息、文件、讨论和安排里找，按来源进一步筛选。",
+          "subtitles": [
+            {
+              "start_seconds": 0.35,
+              "end_seconds": 5.2667,
+              "text": "搜索打开后，直接给你最近文件，不再先弹功能菜单。"
+            },
+            {
+              "start_seconds": 5.2667,
+              "end_seconds": 9.8976,
+              "text": "输入关键词，再从消息、文件、讨论和安排里找，"
+            },
+            {
+              "start_seconds": 9.8976,
+              "end_seconds": 11.966,
+              "text": "按来源进一步筛选。"
+            }
+          ]
         },
         {
-          "key": "p_files_scoped",
-          "title": "一个文件，接上另一端的下一步",
-          "text": "常用目录里新保存的文档、图片或 PDF，首页和文件页都能快速找到。你能打开电脑文件，把它传到手机；也能找到手机的新图片，保存到电脑继续处理。",
-          "kind": "wide",
-          "source": "files_clip",
-          "tags": [
-            "不限 ChatGPT 或某个应用",
-            "电脑 → 手机",
-            "手机 → 电脑"
+          "id": "update-07",
+          "title": "手机放下，事情继续",
+          "shot": "电话页 → 未接记录 → 回拨入口，说明同步与音频边界",
+          "start_seconds": 79.131667,
+          "duration_seconds": 15.0,
+          "source_clips": [
+            "phone"
           ],
-          "start": 80.8,
-          "duration": 14.6
+          "display_narration": "这轮修复了显示在线却读不动的问题，消息同步和 AI 任务分开处理。来电、挂断和回拨也有电脑入口，音频能力按设备支持。",
+          "spoken_narration": "这轮修复了显示在线却读不动的问题，消息同步和 人工智能 任务分开处理。来电、挂断和回拨也有电脑入口，音频能力按设备支持。",
+          "subtitles": [
+            {
+              "start_seconds": 0.35,
+              "end_seconds": 3.5548,
+              "text": "这轮修复了显示在线却读不动的问题，"
+            },
+            {
+              "start_seconds": 3.5548,
+              "end_seconds": 7.3857,
+              "text": "消息同步和 AI 任务分开处理。"
+            },
+            {
+              "start_seconds": 7.3857,
+              "end_seconds": 10.4333,
+              "text": "来电、挂断和回拨也有电脑入口，"
+            },
+            {
+              "start_seconds": 10.4333,
+              "end_seconds": 12.854,
+              "text": "音频能力按设备支持。"
+            }
+          ]
         },
         {
-          "key": "p_search",
-          "title": "少记位置，多用搜索",
-          "text": "记得一句消息、一个文件名，或者功能名称，就从顶部搜索。综合、手机、电脑可以切换，搜索结果能直接进入对应位置。消息检索以已经同步的内容为准。",
-          "kind": "portrait",
-          "source": "search_clip",
-          "tags": [
-            "消息 · 文件 · Amoo · 功能",
-            "综合 / 手机 / 电脑",
-            "点击结果，继续下一步"
+          "id": "update-08",
+          "title": "原来的能力，继续完善",
+          "shot": "Amoo 会话 → 作品分类 → 背屏预览；原有能力继续完善",
+          "start_seconds": 94.131667,
+          "duration_seconds": 13.38,
+          "source_clips": [
+            [
+              "amoo",
+              0,
+              4.5
+            ],
+            [
+              "studio",
+              2,
+              6
+            ],
+            [
+              "backscreen",
+              2,
+              6
+            ]
           ],
-          "start": 95.39999999999999,
-          "duration": 14.933333333333334
+          "display_narration": "Amoo 讨论、文档成果、作品和手机工具继续完善。需要整理方案、找回成果，或调整背屏，都有清楚入口，完成后能继续用。",
+          "spoken_narration": "阿莫 讨论、文档成果、作品和手机工具继续完善。需要整理方案、找回成果，或调整背屏，都有清楚入口，完成后能继续用。",
+          "subtitles": [
+            {
+              "start_seconds": 0.35,
+              "end_seconds": 5.8143,
+              "text": "Amoo 讨论、文档成果、作品和手机工具继续完善。"
+            },
+            {
+              "start_seconds": 5.8143,
+              "end_seconds": 9.4095,
+              "text": "需要整理方案、找回成果，或调整背屏，"
+            },
+            {
+              "start_seconds": 9.4095,
+              "end_seconds": 12.686,
+              "text": "都有清楚入口，完成后能继续用。"
+            }
+          ]
         },
         {
-          "key": "p_ai",
-          "title": "让讨论，留下可以继续做的成果",
-          "text": "讨论不只停在聊天里。把相关的手机上下文整理成方案、待办和日周月复盘，保留依据和下一步。需要确认的内容，让人核对；已经形成的成果，可以回到手机。",
-          "kind": "wide",
-          "source": "agent",
-          "tags": [
-            "方案 · 待办 · 复盘",
-            "保留依据和下一步",
-            "成果回到手机"
+          "id": "update-09",
+          "title": "少等一会，少打断一次",
+          "shot": "首页拖动预览 → 取消回原布局，说明减少重复处理与缓存",
+          "start_seconds": 107.511667,
+          "duration_seconds": 14.88,
+          "source_clips": [
+            "performance"
           ],
-          "start": 110.33333333333333,
-          "duration": 15.066666666666666
-        },
-        {
-          "key": "p_phone",
-          "title": "电话来了，选择在哪里接",
-          "text": "来电窗口显示联系人和号码，可以选择手机接听或电脑接听，也能挂断、回拨。电脑双向通话已在支持的手机和 Linux 环境验证，实际可用性取决于设备与音频通道。",
-          "kind": "wide",
-          "source": "phone",
-          "tags": [
-            "手机接听 / 电脑接听",
-            "挂断 · 回拨",
-            "以设备与音频支持为准"
-          ],
-          "start": 125.39999999999999,
-          "duration": 15.933333333333334
-        },
-        {
-          "key": "p_more",
-          "title": "常用的小事，也顺手完成",
-          "text": "剪贴板、图库、背屏、文件和应用管理，都可以从电脑接着操作。后台读取与 AI 生成分开排队，配合分页和缓存，让常用的操作更稳定、更连贯。",
-          "kind": "wide",
-          "source": "tools",
-          "tags": [
-            "剪贴板 · 图库 · 背屏",
-            "文件 · 应用 · 工具",
-            "同步与生成分开进行"
-          ],
-          "start": 141.33333333333331,
-          "duration": 14.733333333333333
+          "display_narration": "性能优化落在具体操作上：减少重复扫描，采用分页和缓存，也改进同步恢复与数据写入。想看完整功能，另一支产品片里继续。",
+          "spoken_narration": "性能优化落在具体操作上：减少重复扫描，采用分页和缓存，也改进同步恢复与数据写入。想看完整功能，另一支产品片里继续。",
+          "subtitles": [
+            {
+              "start_seconds": 0.35,
+              "end_seconds": 4.4357,
+              "text": "性能优化落在具体操作上：减少重复扫描，"
+            },
+            {
+              "start_seconds": 4.4357,
+              "end_seconds": 9.1357,
+              "text": "采用分页和缓存，也改进同步恢复与数据写入。"
+            },
+            {
+              "start_seconds": 9.1357,
+              "end_seconds": 12.686,
+              "text": "想看完整功能，另一支产品片里继续。"
+            }
+          ]
         }
       ]
     }
-  ],
-  "brand_statement": "以人为中心，让 AI 贯通终端与服务。",
-  "style": {
-    "background": "#FAFAFB",
-    "text": "#18181B",
-    "secondary_text": "#71717A",
-    "blue": "#3B82F6",
-    "teal": "#0D9488",
-    "border": "#E5E5EA",
-    "motion": "0.33 second dissolve, no UI layout distortion"
-  }
+  ]
 }

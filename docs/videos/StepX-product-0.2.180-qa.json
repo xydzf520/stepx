@@ -1,0 +1,401 @@
+{
+  "version": "0.2.180",
+  "movie": "StepX-product-0.2.180.mp4",
+  "version_range": null,
+  "sha256": "440d8b3299c1cece6bade43a3135876985f0229047cb53230dac868c31ce87bd",
+  "metadata": {
+    "width": 1600,
+    "height": 1040,
+    "fps": 24.0,
+    "video_codec": "h264",
+    "pixel_format": "yuv420p",
+    "audio_codec": "aac",
+    "sample_rate": 24000,
+    "channels": 1,
+    "duration_seconds": 208.751,
+    "size_bytes": 8717303
+  },
+  "expected_timeline_seconds": 208.71,
+  "complete_decode_pass": true,
+  "continuous_black_intervals": [],
+  "audio": {
+    "mean_volume": -20.6,
+    "max_volume": -2.5,
+    "peak_dbfs": -2.53,
+    "clipped_samples": 0,
+    "sample_count": 5032640
+  },
+  "captions": {
+    "count": 54,
+    "within_movie": true,
+    "matches_burned_in_timeline": true,
+    "last_end_seconds": 206.548
+  },
+  "privacy_text_hits": [],
+  "capture_sources": {
+    "home": {
+      "capture_version": "0.2.180",
+      "source": "native X11 window; isolated demo"
+    },
+    "connection": {
+      "capture_version": "0.2.180",
+      "source": "native X11 window; isolated demo"
+    },
+    "layout-final": {
+      "capture_version": "0.2.180",
+      "source": "native X11 window; isolated demo"
+    },
+    "popup-context": {
+      "capture_version": "0.2.180",
+      "source": "native X11 window; isolated demo"
+    },
+    "popup-otp": {
+      "capture_version": "0.2.180",
+      "source": "native X11 window; isolated demo"
+    },
+    "popup-red": {
+      "capture_version": "0.2.180",
+      "source": "native X11 window; isolated demo"
+    },
+    "capsule": {
+      "capture_version": "0.2.180",
+      "source": "native X11 window; isolated demo"
+    },
+    "files": {
+      "capture_version": "0.2.180",
+      "source": "native X11 window; isolated demo"
+    },
+    "search": {
+      "capture_version": "0.2.180",
+      "source": "native X11 window; isolated demo"
+    },
+    "messages": {
+      "capture_version": "0.2.180",
+      "source": "native X11 window; isolated demo"
+    },
+    "phone": {
+      "capture_version": "0.2.180",
+      "source": "native X11 window; isolated demo"
+    },
+    "amoo": {
+      "capture_version": "0.2.180",
+      "source": "native X11 window; isolated demo"
+    },
+    "studio": {
+      "capture_version": "0.2.180",
+      "source": "native X11 window; isolated demo"
+    },
+    "calendar": {
+      "capture_version": "0.2.180",
+      "source": "native X11 window; isolated demo"
+    },
+    "gallery": {
+      "capture_version": "0.2.180",
+      "source": "native X11 window; isolated demo"
+    },
+    "backscreen": {
+      "capture_version": "0.2.180",
+      "source": "native X11 window; isolated demo"
+    },
+    "tools": {
+      "capture_version": "0.2.180",
+      "source": "native X11 window; isolated demo"
+    }
+  },
+  "frame_review_samples": [
+    {
+      "scene": "product-01",
+      "moment": "entry",
+      "time": 2.0,
+      "file": "product-01-entry.png"
+    },
+    {
+      "scene": "product-01",
+      "moment": "action",
+      "time": 7.332,
+      "file": "product-01-action.png"
+    },
+    {
+      "scene": "product-01",
+      "moment": "result",
+      "time": 11.93,
+      "file": "product-01-result.png"
+    },
+    {
+      "scene": "product-02",
+      "moment": "entry",
+      "time": 15.33,
+      "file": "product-02-entry.png"
+    },
+    {
+      "scene": "product-02",
+      "moment": "action",
+      "time": 20.986,
+      "file": "product-02-action.png"
+    },
+    {
+      "scene": "product-02",
+      "moment": "result",
+      "time": 25.85,
+      "file": "product-02-result.png"
+    },
+    {
+      "scene": "product-03",
+      "moment": "entry",
+      "time": 29.25,
+      "file": "product-03-entry.png"
+    },
+    {
+      "scene": "product-03",
+      "moment": "action",
+      "time": 34.493,
+      "file": "product-03-action.png"
+    },
+    {
+      "scene": "product-03",
+      "moment": "result",
+      "time": 39.02,
+      "file": "product-03-result.png"
+    },
+    {
+      "scene": "product-04",
+      "moment": "entry",
+      "time": 42.42,
+      "file": "product-04-entry.png"
+    },
+    {
+      "scene": "product-04",
+      "moment": "action",
+      "time": 47.339,
+      "file": "product-04-action.png"
+    },
+    {
+      "scene": "product-04",
+      "moment": "result",
+      "time": 51.6,
+      "file": "product-04-result.png"
+    },
+    {
+      "scene": "product-05",
+      "moment": "entry",
+      "time": 55.0,
+      "file": "product-05-entry.png"
+    },
+    {
+      "scene": "product-05",
+      "moment": "action",
+      "time": 59.534,
+      "file": "product-05-action.png"
+    },
+    {
+      "scene": "product-05",
+      "moment": "result",
+      "time": 63.48,
+      "file": "product-05-result.png"
+    },
+    {
+      "scene": "product-06",
+      "moment": "entry",
+      "time": 66.88,
+      "file": "product-06-entry.png"
+    },
+    {
+      "scene": "product-06",
+      "moment": "action",
+      "time": 71.414,
+      "file": "product-06-action.png"
+    },
+    {
+      "scene": "product-06",
+      "moment": "result",
+      "time": 75.36,
+      "file": "product-06-result.png"
+    },
+    {
+      "scene": "product-07",
+      "moment": "entry",
+      "time": 78.76,
+      "file": "product-07-entry.png"
+    },
+    {
+      "scene": "product-07",
+      "moment": "action",
+      "time": 84.344,
+      "file": "product-07-action.png"
+    },
+    {
+      "scene": "product-07",
+      "moment": "result",
+      "time": 89.15,
+      "file": "product-07-result.png"
+    },
+    {
+      "scene": "product-08",
+      "moment": "entry",
+      "time": 92.55,
+      "file": "product-08-entry.png"
+    },
+    {
+      "scene": "product-08",
+      "moment": "action",
+      "time": 98.321,
+      "file": "product-08-action.png"
+    },
+    {
+      "scene": "product-08",
+      "moment": "result",
+      "time": 103.28,
+      "file": "product-08-result.png"
+    },
+    {
+      "scene": "product-09",
+      "moment": "entry",
+      "time": 106.68,
+      "file": "product-09-entry.png"
+    },
+    {
+      "scene": "product-09",
+      "moment": "action",
+      "time": 111.874,
+      "file": "product-09-action.png"
+    },
+    {
+      "scene": "product-09",
+      "moment": "result",
+      "time": 116.36,
+      "file": "product-09-result.png"
+    },
+    {
+      "scene": "product-10",
+      "moment": "entry",
+      "time": 119.76,
+      "file": "product-10-entry.png"
+    },
+    {
+      "scene": "product-10",
+      "moment": "action",
+      "time": 124.772,
+      "file": "product-10-action.png"
+    },
+    {
+      "scene": "product-10",
+      "moment": "result",
+      "time": 129.11,
+      "file": "product-10-result.png"
+    },
+    {
+      "scene": "product-11",
+      "moment": "entry",
+      "time": 132.51,
+      "file": "product-11-entry.png"
+    },
+    {
+      "scene": "product-11",
+      "moment": "action",
+      "time": 137.544,
+      "file": "product-11-action.png"
+    },
+    {
+      "scene": "product-11",
+      "moment": "result",
+      "time": 141.9,
+      "file": "product-11-result.png"
+    },
+    {
+      "scene": "product-12",
+      "moment": "entry",
+      "time": 145.3,
+      "file": "product-12-entry.png"
+    },
+    {
+      "scene": "product-12",
+      "moment": "action",
+      "time": 150.587,
+      "file": "product-12-action.png"
+    },
+    {
+      "scene": "product-12",
+      "moment": "result",
+      "time": 155.15,
+      "file": "product-12-result.png"
+    },
+    {
+      "scene": "product-13",
+      "moment": "entry",
+      "time": 158.55,
+      "file": "product-13-entry.png"
+    },
+    {
+      "scene": "product-13",
+      "moment": "action",
+      "time": 163.606,
+      "file": "product-13-action.png"
+    },
+    {
+      "scene": "product-13",
+      "moment": "result",
+      "time": 167.98,
+      "file": "product-13-result.png"
+    },
+    {
+      "scene": "product-14",
+      "moment": "entry",
+      "time": 171.38,
+      "file": "product-14-entry.png"
+    },
+    {
+      "scene": "product-14",
+      "moment": "action",
+      "time": 176.712,
+      "file": "product-14-action.png"
+    },
+    {
+      "scene": "product-14",
+      "moment": "result",
+      "time": 181.31,
+      "file": "product-14-result.png"
+    },
+    {
+      "scene": "product-15",
+      "moment": "entry",
+      "time": 184.71,
+      "file": "product-15-entry.png"
+    },
+    {
+      "scene": "product-15",
+      "moment": "action",
+      "time": 189.86,
+      "file": "product-15-action.png"
+    },
+    {
+      "scene": "product-15",
+      "moment": "result",
+      "time": 194.31,
+      "file": "product-15-result.png"
+    },
+    {
+      "scene": "product-16",
+      "moment": "entry",
+      "time": 197.71,
+      "file": "product-16-entry.png"
+    },
+    {
+      "scene": "product-16",
+      "moment": "action",
+      "time": 202.86,
+      "file": "product-16-action.png"
+    },
+    {
+      "scene": "product-16",
+      "moment": "result",
+      "time": 207.31,
+      "file": "product-16-result.png"
+    }
+  ],
+  "fast_start": true,
+  "visual_privacy_review": "Final scene contact sheets and critical full frames visually reviewed 2026-11-08; native isolated fixtures only. Closing error frame replaced with clean homepage; no personal chats, identities, recruiting/contact cards or developer paths observed.",
+  "narration_review": "Decoded audio and independent ASR reviewed separately; no claim of human listening.",
+  "errors": [],
+  "warnings": [],
+  "technical_pass": true
+}

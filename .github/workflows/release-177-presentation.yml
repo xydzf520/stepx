@@ -1,9 +1,8 @@
 name: Refresh 0.2.177 public presentation
 
 on:
-  push:
-    branches: [main]
-    paths: [.github/workflows/release-177-presentation.yml, docs/RELEASE_NOTES.md, docs/videos/**]
+  # Historical maintenance only. New release documentation and media must not
+  # re-run this workflow against the fixed 0.2.177 release or obsolete draft.
   workflow_dispatch:
 
 permissions:

@@ -1,0 +1,259 @@
+{
+  "version": "0.2.180",
+  "movie": "StepX-0.2.60-to-0.2.180.mp4",
+  "version_range": "0.2.60 → 0.2.180",
+  "sha256": "4b22f915282c25a6702003beb86c1cd6dcf234f144c27cdb21c33f9edb1103e5",
+  "metadata": {
+    "width": 1600,
+    "height": 1040,
+    "fps": 24.0,
+    "video_codec": "h264",
+    "pixel_format": "yuv420p",
+    "audio_codec": "aac",
+    "sample_rate": 24000,
+    "channels": 1,
+    "duration_seconds": 122.417667,
+    "size_bytes": 5103775
+  },
+  "expected_timeline_seconds": 122.39166666666667,
+  "complete_decode_pass": true,
+  "continuous_black_intervals": [],
+  "audio": {
+    "mean_volume": -20.3,
+    "max_volume": -1.6,
+    "peak_dbfs": -1.635,
+    "clipped_samples": 0,
+    "sample_count": 2951816
+  },
+  "captions": {
+    "count": 29,
+    "within_movie": true,
+    "matches_burned_in_timeline": true,
+    "last_end_seconds": 120.198
+  },
+  "privacy_text_hits": [],
+  "capture_sources": {
+    "home": {
+      "capture_version": "0.2.180",
+      "source": "native X11 window; isolated demo"
+    },
+    "popup-context": {
+      "capture_version": "0.2.180",
+      "source": "native X11 window; isolated demo"
+    },
+    "popup-otp": {
+      "capture_version": "0.2.180",
+      "source": "native X11 window; isolated demo"
+    },
+    "popup-red": {
+      "capture_version": "0.2.180",
+      "source": "native X11 window; isolated demo"
+    },
+    "capsule": {
+      "capture_version": "0.2.180",
+      "source": "native X11 window; isolated demo"
+    },
+    "layout-final": {
+      "capture_version": "0.2.180",
+      "source": "native X11 window; isolated demo"
+    },
+    "files": {
+      "capture_version": "0.2.180",
+      "source": "native X11 window; isolated demo"
+    },
+    "search": {
+      "capture_version": "0.2.180",
+      "source": "native X11 window; isolated demo"
+    },
+    "phone": {
+      "capture_version": "0.2.180",
+      "source": "native X11 window; isolated demo"
+    },
+    "amoo": {
+      "capture_version": "0.2.180",
+      "source": "native X11 window; isolated demo"
+    },
+    "studio": {
+      "capture_version": "0.2.180",
+      "source": "native X11 window; isolated demo"
+    },
+    "backscreen": {
+      "capture_version": "0.2.180",
+      "source": "native X11 window; isolated demo"
+    },
+    "performance": {
+      "capture_version": "0.2.180",
+      "source": "native X11 window; isolated demo"
+    }
+  },
+  "frame_review_samples": [
+    {
+      "scene": "update-01",
+      "moment": "entry",
+      "time": 2.0,
+      "file": "update-01-entry.png"
+    },
+    {
+      "scene": "update-01",
+      "moment": "action",
+      "time": 7.563,
+      "file": "update-01-action.png"
+    },
+    {
+      "scene": "update-01",
+      "moment": "result",
+      "time": 12.35,
+      "file": "update-01-result.png"
+    },
+    {
+      "scene": "update-02",
+      "moment": "entry",
+      "time": 15.75,
+      "file": "update-02-entry.png"
+    },
+    {
+      "scene": "update-02",
+      "moment": "action",
+      "time": 20.442,
+      "file": "update-02-action.png"
+    },
+    {
+      "scene": "update-02",
+      "moment": "result",
+      "time": 24.517,
+      "file": "update-02-result.png"
+    },
+    {
+      "scene": "update-03",
+      "moment": "entry",
+      "time": 27.917,
+      "file": "update-03-entry.png"
+    },
+    {
+      "scene": "update-03",
+      "moment": "action",
+      "time": 32.748,
+      "file": "update-03-action.png"
+    },
+    {
+      "scene": "update-03",
+      "moment": "result",
+      "time": 36.937,
+      "file": "update-03-result.png"
+    },
+    {
+      "scene": "update-04",
+      "moment": "entry",
+      "time": 40.337,
+      "file": "update-04-entry.png"
+    },
+    {
+      "scene": "update-04",
+      "moment": "action",
+      "time": 45.349,
+      "file": "update-04-action.png"
+    },
+    {
+      "scene": "update-04",
+      "moment": "result",
+      "time": 49.687,
+      "file": "update-04-result.png"
+    },
+    {
+      "scene": "update-05",
+      "moment": "entry",
+      "time": 53.087,
+      "file": "update-05-entry.png"
+    },
+    {
+      "scene": "update-05",
+      "moment": "action",
+      "time": 58.743,
+      "file": "update-05-action.png"
+    },
+    {
+      "scene": "update-05",
+      "moment": "result",
+      "time": 63.607,
+      "file": "update-05-result.png"
+    },
+    {
+      "scene": "update-06",
+      "moment": "entry",
+      "time": 67.007,
+      "file": "update-06-entry.png"
+    },
+    {
+      "scene": "update-06",
+      "moment": "action",
+      "time": 72.775,
+      "file": "update-06-action.png"
+    },
+    {
+      "scene": "update-06",
+      "moment": "result",
+      "time": 77.732,
+      "file": "update-06-result.png"
+    },
+    {
+      "scene": "update-07",
+      "moment": "entry",
+      "time": 81.132,
+      "file": "update-07-entry.png"
+    },
+    {
+      "scene": "update-07",
+      "moment": "action",
+      "time": 87.382,
+      "file": "update-07-action.png"
+    },
+    {
+      "scene": "update-07",
+      "moment": "result",
+      "time": 92.732,
+      "file": "update-07-result.png"
+    },
+    {
+      "scene": "update-08",
+      "moment": "entry",
+      "time": 96.132,
+      "file": "update-08-entry.png"
+    },
+    {
+      "scene": "update-08",
+      "moment": "action",
+      "time": 101.491,
+      "file": "update-08-action.png"
+    },
+    {
+      "scene": "update-08",
+      "moment": "result",
+      "time": 106.112,
+      "file": "update-08-result.png"
+    },
+    {
+      "scene": "update-09",
+      "moment": "entry",
+      "time": 109.512,
+      "file": "update-09-entry.png"
+    },
+    {
+      "scene": "update-09",
+      "moment": "action",
+      "time": 115.696,
+      "file": "update-09-action.png"
+    },
+    {
+      "scene": "update-09",
+      "moment": "result",
+      "time": 120.992,
+      "file": "update-09-result.png"
+    }
+  ],
+  "fast_start": true,
+  "visual_privacy_review": "Final scene contact sheets and critical full frames visually reviewed 2026-11-08; native isolated fixtures only. Closing error frame replaced with clean homepage; no personal chats, identities, recruiting/contact cards or developer paths observed.",
+  "narration_review": "Decoded audio and independent ASR reviewed separately; no claim of human listening.",
+  "errors": [],
+  "warnings": [],
+  "technical_pass": true
+}

@@ -2,6 +2,7 @@ name: Build and publish desktop release
 on:
   push:
     branches: [main]
+    tags: ['v0.2.*']
     paths: ['desktop/Cargo.toml', '.github/workflows/release.yml']
   workflow_dispatch:
 permissions:
@@ -12,8 +13,9 @@ env:
   PYTHONIOENCODING: utf-8
   PYTHONDONTWRITEBYTECODE: '1'
 concurrency:
-  group: desktop-release-${{ github.ref }}
-  # A newer release fix supersedes in-flight packages from the previous head.
+  group: desktop-release-${{ github.repository }}
+  # Main and an explicit version tag share one queue. A newer publication
+  # replaces an in-flight build instead of publishing duplicate release assets.
   cancel-in-progress: true
 jobs:
   metadata:
@@ -25,8 +27,11 @@ jobs:
       - id: version
         run: |
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import tomllib
-          print('version=' + tomllib.load(open('desktop/Cargo.toml', 'rb'))['package']['version'])
+          import os, tomllib
+          version = tomllib.load(open('desktop/Cargo.toml', 'rb'))['package']['version']
+          if os.environ.get('GITHUB_REF_TYPE') == 'tag':
+              assert os.environ['GITHUB_REF_NAME'] == f'v{version}', 'Tag does not match Cargo version'
+          print('version=' + version)
           PY
       - name: Release story and public source checks
         run: |
@@ -133,13 +138,21 @@ jobs:
         run: |
           CURRENT_HEAD=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
           test "$CURRENT_HEAD" = "$GITHUB_SHA" || { echo 'Refusing to publish superseded source'; exit 1; }
+          NOTES_FILE="docs/RELEASE_${RELEASE_VERSION//./_}.md"
+          test -s "$NOTES_FILE"
           cp desktop/assets/stepx-companion.apk dist/StepX-companion.apk
-          cp docs/videos/*.mp4 dist/
-          (cd dist && sha256sum StepX-companion.apk *.mp4 > media-sha256.txt)
+          # Keep historical videos in the repository, but publish exactly the
+          # product tour and cumulative update for the version being packaged.
+          PRODUCT_VIDEO="StepX-product-$RELEASE_VERSION.mp4"
+          UPDATE_VIDEO="StepX-0.2.60-to-$RELEASE_VERSION.mp4"
+          test -s "docs/videos/$PRODUCT_VIDEO"
+          test -s "docs/videos/$UPDATE_VIDEO"
+          cp "docs/videos/$PRODUCT_VIDEO" "docs/videos/$UPDATE_VIDEO" dist/
+          (cd dist && sha256sum StepX-companion.apk "$PRODUCT_VIDEO" "$UPDATE_VIDEO" > media-sha256.txt)
           if gh release view "v$RELEASE_VERSION" --json isDraft > /tmp/stepx-release.json 2>/dev/null; then
             test "$(jq -r .isDraft /tmp/stepx-release.json)" = true || { echo 'Refusing to replace a published release'; exit 1; }
             gh release upload "v$RELEASE_VERSION" dist/* --clobber
-            gh release edit "v$RELEASE_VERSION" --target "$GITHUB_SHA" --notes-file docs/RELEASE_NOTES.md --draft=false
+            gh release edit "v$RELEASE_VERSION" --target "$GITHUB_SHA" --title "StepX Companion $RELEASE_VERSION · 以人为中心，让 AI 贯通终端与服务" --notes-file "$NOTES_FILE" --draft=false --latest
           else
-            gh release create "v$RELEASE_VERSION" dist/* --target "$GITHUB_SHA" --title "StepX Companion $RELEASE_VERSION · 人在哪里，哪里就是中心" --notes-file docs/RELEASE_NOTES.md
+            gh release create "v$RELEASE_VERSION" dist/* --target "$GITHUB_SHA" --title "StepX Companion $RELEASE_VERSION · 以人为中心，让 AI 贯通终端与服务" --notes-file "$NOTES_FILE" --latest
           fi
