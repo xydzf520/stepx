@@ -93,6 +93,14 @@ def baseline_matches(value):
     return bool(DEVICE_KEY) and value.get('serial') in (DEVICE_KEY, SERIAL) and value.get('fingerprint') in ALLOWED_FINGERPRINTS
 
 
+def verified_fingerprint():
+    """The target profile lists compatible firmware; it is not device evidence."""
+    actual = shell('getprop', 'ro.build.fingerprint')
+    if actual not in ALLOWED_FINGERPRINTS:
+        raise RuntimeError('Unsupported firmware; recovery metadata was not changed')
+    return actual
+
+
 def private_write(path, data):
     path = Path(path)
     if isinstance(data, str):
@@ -119,10 +127,13 @@ def sha256(path):
 
 
 def root_json(code):
-    result = run([sys.executable, str(ROOT / 'tools/root_bridge.py')], input=code, timeout=45)
+    result = run([sys.executable, str(ROOT / 'tools/root_bridge.py')], input=code, timeout=150)
     # The apt hook deliberately exits before apt update; its exit 100 is expected.
     # Success is established by the operation's structured proof, never that exit code.
     try:
-        return json.JSONDecoder().raw_decode(result.stdout.lstrip())[0]
+        proof = json.JSONDecoder().raw_decode(result.stdout.lstrip())[0]
+        if not isinstance(proof, dict):
+            raise ValueError('Operation proof must be a JSON object')
+        return proof
     except ValueError:
         raise RuntimeError('No valid root-operation proof; inspect the bridge locally') from None

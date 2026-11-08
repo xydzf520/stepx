@@ -30,7 +30,7 @@ else:
  shutil.rmtree(base);shutil.rmtree(state)
  print(json.dumps({'restored':True,'sha256':hashlib.sha256(open(launcher,'rb').read()).hexdigest()}))
 '''.replace('STOCK_SHA', repr(INSTALL['original_sha256'])).replace('WRAPPER_SHA', repr(INSTALL['launcher_sha256']))
-result = subprocess.run([sys.executable, str(ROOT / 'tools/root_bridge.py')], input=code, text=True, capture_output=True, timeout=45)
+result = subprocess.run([sys.executable, str(ROOT / 'tools/root_bridge.py')], input=code, text=True, capture_output=True, timeout=150)
 proof = json.JSONDecoder().raw_decode(result.stdout.lstrip())[0]
 assert proof.get('restored'), '启动器恢复未得到确认；停止后续操作'
 print('原厂启动器已恢复。正在重启以撤销运行时权限和应用身份适配。', flush=True)

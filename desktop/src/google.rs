@@ -435,6 +435,7 @@ pub fn apply_adapter_status(status: &mut GoogleSuiteStatus, value: &serde_json::
     status.pid_matches = value["current_pid_matches"].as_bool() == Some(true)
         && value["current_boot_matches"].as_bool() == Some(true);
     let ready = value["status"].as_str() == Some("success")
+        && value["needs_repair"].as_bool() != Some(true)
         && value["detached"].as_bool() == Some(true)
         && status.pid_matches
         && status.system_server_pid > 0
@@ -592,7 +593,7 @@ pub fn inspect(device: &Device, adb: &Adb) -> Result<GoogleSuiteStatus> {
     let verification = (|| -> Result<()> {
         let value = manage_res?;
         if !apply_adapter_status(&mut status, &value) {
-            bail!("当前 Google 权限已失效或未恢复；组件更新后请点击「修复 Google 服务」");
+            bail!("{}", value["message"].as_str().unwrap_or("当前 Google 权限已失效或未恢复；组件更新后请点击「修复 Google 服务」"));
         }
         let package_state = pkg_res?;
         status.persistent_flags_clear = package_flags_clear(&package_state["persistent_package"])?;
@@ -671,6 +672,13 @@ fn install_plan(preflight: &serde_json::Value) -> Result<GoogleInstallPlan> {
     })
 }
 
+fn require_install_switch(preflight: &serde_json::Value) -> Result<()> {
+    if preflight["usb_install_master_enabled"].as_bool() != Some(true) {
+        bail!("请在手机「设置 → 开发者选项」开启「USB 安装」后重试；程序不会自动修改安装总开关");
+    }
+    Ok(())
+}
+
 pub struct GoogleInstallResult {
     pub google: GoogleSuiteStatus,
     pub companion: crate::companion_app::CompanionStatus,
@@ -689,6 +697,9 @@ pub fn install(device: &Device, adb: &Adb, progress: impl Fn(&str)) -> Result<Go
         bail!("请先解锁手机，再安装 Google Play 与 StepX伴侣");
     }
     let plan = install_plan(&preflight)?;
+    if plan == GoogleInstallPlan::Missing {
+        require_install_switch(&preflight)?;
+    }
     let mut companion = crate::companion_app::install(adb, device, |message| {
         progress(&format!("StepX伴侣 · {message}"));
     })
@@ -752,6 +763,7 @@ fn install_fresh(device: &Device, adb: &Adb, progress: impl Fn(&str)) -> Result<
     // Preflight validates the exact firmware before downloading or changing phone data.
     let preflight: serde_json::Value =
         serde_json::from_str(&run_script(device, adb, "manage.py", &["preflight"])?)?;
+    require_install_switch(&preflight)?;
     if preflight["user_unlocked"].as_bool() != Some(true) {
         bail!("请先在手机上解锁，再安装 Google 服务");
     }
@@ -908,6 +920,13 @@ mod tests {
         assert!(package_flags_clear(&serde_json::json!({"publicFlags":"0"})).is_err());
     }
     #[test]
+    fn usb_install_switch_is_required_before_installing_google_packages() {
+        assert!(require_install_switch(&serde_json::json!({"usb_install_master_enabled":true})).is_ok());
+        for report in [serde_json::json!({}), serde_json::json!({"usb_install_master_enabled":false})] {
+            assert!(require_install_switch(&report).unwrap_err().to_string().contains("开发者选项"));
+        }
+    }
+    #[test]
     fn missing_or_stale_adapter_evidence_never_passes() {
         let valid = serde_json::json!({"status":"success", "detached":true, "current_pid_matches":true,
             "current_boot_matches":true, "permission_checks":153, "all_checked_granted":true,
@@ -936,6 +955,12 @@ mod tests {
         assert!(!apply_adapter_status(
             &mut GoogleSuiteStatus::default(),
             &serde_json::json!({})
+        ));
+        let mut changed_components = valid.clone();
+        changed_components["needs_repair"] = serde_json::json!(true);
+        assert!(!apply_adapter_status(
+            &mut GoogleSuiteStatus::default(),
+            &changed_components
         ));
     }
 
