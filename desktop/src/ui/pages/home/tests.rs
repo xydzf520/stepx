@@ -1483,20 +1483,22 @@ fn home_live_unsynced_authenticity_and_wireless_transport_failover_verification(
             }
         });
         let script = format!(
-            r#"#!/usr/bin/env bash
-echo "$*" >> "{log}"
-if [[ "$1" == "devices" ]]; then
-  echo "List of devices attached"
-  echo "10.0.0.42:34257       device product:Basic model:StepPhone device:P01 transport_id:7"
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "{log}"
+if [ "$1" = "devices" ]; then
+  printf '%s\n' "List of devices attached" "10.0.0.42:34257       device product:Basic model:StepPhone device:P01 transport_id:7"
   exit 0
 fi
-if [[ "$1" == "-s" && "$2" == "10.0.0.42:34257" ]]; then
+if [ "$1" = "-s" ] && [ "$2" = "10.0.0.42:34257" ]; then
   shift 2
-  if [[ "$1" == "forward" && "$2" == "tcp:0" ]]; then
+  if [ "$1" = "forward" ] && [ "$2" = "tcp:0" ]; then
     echo "{port}"
     exit 0
   fi
-  if [[ "$1" == "shell" ]]; then
+  if [ "$1" = "forward" ] && [ "$2" = "--remove" ]; then
+    exit 0
+  fi
+  if [ "$1" = "shell" ]; then
     shift
     case "$*" in
       *"getprop"*"ro.serialno"*)
@@ -1509,7 +1511,8 @@ if [[ "$1" == "-s" && "$2" == "10.0.0.42:34257" ]]; then
         ;;
     esac
   fi
-  exit 0
+  printf 'unsupported fake adb command: %s\n' "$*" >&2
+  exit 64
 fi
 echo "error: device '$2' not found" >&2
 exit 1
@@ -1522,6 +1525,17 @@ exit 1
         std::fs::set_permissions(&fake_adb, perms).unwrap();
 
         let adb = stepx_companion::adb::Adb { path: fake_adb };
+        // Validate and start the process fixture before exercising the bounded
+        // recovery path. An env-selected Bash cold start on a busy CI host is
+        // not a phone identity response; use the platform POSIX shell and keep
+        // the production 900 ms identity probe and six-second budget unchanged.
+        let fixture_identity = adb
+            .run_timeout(
+                &["-s", "10.0.0.42:34257", "shell", "getprop", "ro.serialno"],
+                std::time::Duration::from_secs(3),
+            )
+            .expect("fake adb must start and return its explicit device identity");
+        assert_eq!(fixture_identity.trim(), "HOMEVERIFYUNIT001");
         // Device initially has USB transport ("HOMEVERIFYUNIT001"), with wireless backup ("10.0.0.42:34257") online
         let usb_device_with_wireless_standby = stepx_companion::device::Device {
             serial: "HOMEVERIFYUNIT001".into(),
@@ -1533,7 +1547,12 @@ exit 1
         usb_device_with_wireless_standby.set_backup_transports(vec!["10.0.0.42:34257".into()]);
         let resolved = usb_device_with_wireless_standby
             .resolve_active_transport(&adb)
-            .expect("Must fail over to online wireless backup transport");
+            .unwrap_or_else(|error| {
+                panic!(
+                    "Must fail over to online wireless backup transport: {error:#}\nFake ADB calls:\n{}",
+                    std::fs::read_to_string(&log_path).unwrap_or_default()
+                )
+            });
         assert_eq!(resolved, "10.0.0.42:34257");
         assert_eq!(usb_device_with_wireless_standby.serial, "HOMEVERIFYUNIT001");
 
