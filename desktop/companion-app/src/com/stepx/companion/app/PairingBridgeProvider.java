@@ -39,6 +39,24 @@ public final class PairingBridgeProvider extends ContentProvider {
     }
     @Override public Bundle call(String method,String arg,Bundle extras){
         int uid=Binder.getCallingUid(),pid=Binder.getCallingPid();
+        // A diagnostic must observe a fresh Binder roundtrip, not pairing.json.
+        // The manifest also requires DUMP. This branch cannot start/cancel pairing
+        // or change wireless settings, and never discloses the pairing password.
+        if(uid==2000&&pid>0&&"status".equals(method)&&arg==null&&(extras==null||extras.isEmpty())){
+            long identity=Binder.clearCallingIdentity();
+            try{
+                JSONObject answer;
+                try{answer=exchange(new JSONObject().put("op","pairing_status"));}
+                catch(Exception unavailable){answer=new JSONObject().put("ok",false);}
+                JSONObject proof=new JSONObject().put("protocol",1).put("ok",answer.optBoolean("ok"))
+                    .put("service","stepx-pairing-v1").put("uid",android.os.Process.myUid())
+                    .put("pid",answer.optInt("pid")).put("processUid",answer.optInt("processUid"))
+                    .put("supported",answer.optBoolean("supported"));
+                Bundle response=new Bundle();response.putString("result",android.util.Base64.encodeToString(
+                    proof.toString().getBytes(StandardCharsets.UTF_8),android.util.Base64.NO_WRAP));return response;
+            }catch(Exception error){throw new IllegalStateException("Unable to inspect pairing service",error);}
+            finally{Binder.restoreCallingIdentity(identity);}
+        }
         if((uid!=2000&&uid!=1000)||pid<=0||!"attach".equals(method)||arg!=null||extras==null||extras.getInt("version")!=1)throw new SecurityException("Untrusted pairing service");
         IBinder candidate=extras.getBinder("service");
         if(candidate==null)throw new IllegalArgumentException("Missing pairing service");

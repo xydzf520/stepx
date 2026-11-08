@@ -6,6 +6,7 @@ changes, no Google launcher changes. Installation and stop are explicit. Reboot
 persistence is intentionally reported false until separately implemented/tested.
 """
 import argparse
+import base64
 import hashlib
 import importlib.util
 import json
@@ -141,10 +142,71 @@ def saved_service(identity):
     return prior
 
 
+def pairing_probe(identity):
+    """The signed app checks Binder ownership on every fresh read-only exchange.
+
+    Older APKs do not implement this method. They report unknown, never ready
+    based solely on a stale external-storage status file. No device state is
+    changed by this probe, and no private pairing/password fields are returned.
+    """
+    try:
+        before = system_session()
+        if before != identity.get('system_session'):
+            raise RuntimeError('Android session changed before pairing inspection')
+        raw = permissions.shell('content', 'call', '--uri',
+                                'content://com.stepx.companion.app.pairing', '--method', 'status')
+        if len(raw) > 8192:
+            raise RuntimeError('Pairing status response exceeds its bound')
+        match = re.search(r'\bresult=([A-Za-z0-9+/=]+)', raw)
+        if not match:
+            raise RuntimeError('Installed companion lacks live pairing inspection')
+        value = json.loads(base64.b64decode(match[1], validate=True))
+        if (value.get('protocol') != 1 or value.get('service') != identity['service'] or
+                type(value.get('uid')) is not int or value['uid'] != identity['companion_uid'] or
+                type(value.get('ok')) is not bool):
+            raise RuntimeError('Pairing inspection identity mismatch')
+        if (system_session() != before or
+                permissions.shell('cat', '/proc/sys/kernel/random/boot_id') != identity['boot_id']):
+            raise RuntimeError('Android restarted during pairing inspection')
+        if value['ok'] is not True:
+            return {'state': 'unavailable', 'ready': False}
+        if type(value.get('processUid')) is not int or type(value.get('pid')) is not int:
+            raise RuntimeError('Pairing process identity is not an integer')
+        if value.get('processUid') == 1000 and value.get('pid') == before['pid']:
+            source = 'system'
+        elif value.get('processUid') == 2000 and type(value.get('pid')) is int and value['pid'] > 1:
+            source = 'shell'
+        else:
+            raise RuntimeError('Pairing Binder does not belong to the current service')
+        return {'state': 'ready' if value.get('supported') is True else 'unsupported',
+                'ready': value.get('supported') is True, 'source': source,
+                'pid': value['pid'], 'uid': value['processUid'], 'live_binder_verified': True}
+    except Exception:
+        return {'state': 'unknown', 'ready': False,
+                'message': '未确认实时配对服务；请更新伴侣后重新检测。未采用缓存的配对状态。'}
+
+
+def system_ready(identity, probe, prior=None):
+    """Keep the CLI's current-session contract; distinguish its actual provider."""
+    return {**identity, 'status': 'running', 'running': True, 'artifact_current': True,
+            'service_source': 'system', 'effective_scope': 'companion_boot_v1',
+            'shell_running': bool(prior), 'process': prior.get('process') if prior else None,
+            'system_process': {'pid': probe['pid'], 'uid': 1000},
+            'pairing_ready': True, 'pairing_probe': probe,
+            'message': '系统配对服务已就绪；无需另启 Shell 配对服务。'}
+
+
 def status(apk):
     identity = preflight(apk); prior = saved_service(identity)
-    return {**identity, 'status': 'running' if prior else 'not_running',
+    probe = pairing_probe(identity)
+    if probe.get('ready') and probe.get('source') == 'system':
+        return system_ready(identity, probe, prior)
+    return {**identity, 'status': 'running' if prior else 'unknown' if probe['state'] == 'unknown' else 'not_running',
             'running': bool(prior), 'process': prior.get('process') if prior else None,
+            'shell_running': bool(prior), 'service_source': 'shell' if prior else 'unconfirmed',
+            'pairing_ready': bool(prior and probe.get('ready') and probe.get('source') == 'shell'
+                                  and probe.get('pid') == prior['process']['pid']),
+            'pairing_probe': probe,
             'artifact_current': bool(prior and prior['dex_sha256'] == identity['dex_sha256'] and
                                      prior['signer'] == identity['signer'] and
                                      prior['companion_uid'] == identity['companion_uid'] and
@@ -153,6 +215,11 @@ def status(apk):
 
 def start(apk):
     identity = preflight(apk); prior = saved_service(identity)
+    probe = pairing_probe(identity)
+    if probe.get('ready') and probe.get('source') == 'system':
+        return {**system_ready(identity, probe, prior), 'status': 'already_running'}
+    if probe.get('state') == 'unknown':
+        raise RuntimeError('无法确认当前配对服务，未启动重复服务；请更新伴侣并重新检测')
     if prior:
         if any(prior.get(k) != identity.get(k) for k in ('dex_sha256', 'signer', 'companion_uid', 'system_session')):
             raise RuntimeError('Stop the verified old pairing service before installing the new artifact')
@@ -205,15 +272,16 @@ def start(apk):
         if process(pid) != found:
             raise RuntimeError('Pairing service stopped before the companion accepted it; inspect service.log')
         try:
-            readback = json.loads(permissions.shell('cat', PAIRING_STATUS))
-            if (readback.get('pairingBridgeReady') is True and readback.get('pairingSupported') is True and
-                    readback.get('updatedAtMs', 0) >= started):
+            readback = pairing_probe(identity)
+            if (readback.get('ready') is True and readback.get('source') == 'shell' and
+                    readback.get('pid') == pid):
                 result = {**identity, 'status': 'ready', 'running': True, 'process': found,
-                          'companion_accepted': True, 'started_at_ms': started}
+                          'companion_accepted': True, 'started_at_ms': started,
+                          'service_source': 'shell', 'shell_running': True,
+                          'pairing_ready': True, 'pairing_probe': readback}
                 save(record_path(), result); return result
         except Exception:
-            # A newly installed app may not have created its external status
-            # file yet; adb reports a command failure, not FileNotFoundError.
+            # The app may still be accepting the scoped Binder registration.
             # Only this read is tolerated. Process identity checks stay strict.
             pass
         time.sleep(.3)
@@ -223,7 +291,10 @@ def start(apk):
 def stop(apk):
     identity = preflight(apk); prior = saved_service(identity)
     if prior is None:
-        return {**identity, 'status': 'not_running', 'running': False}
+        probe = pairing_probe(identity)
+        return {**identity, 'status': 'not_running', 'running': False, 'shell_running': False,
+                'effective_running': probe.get('ready') is True, 'pairing_probe': probe,
+                'message': '没有本命令启动的 Shell 服务；系统配对服务未被停止。'}
     found = prior['process']
     # Recheck PID/start time/argv/UID/domain immediately before the sole signal.
     if process(found['pid']) != found:

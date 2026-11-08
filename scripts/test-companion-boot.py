@@ -268,12 +268,58 @@ class BaselineCaptureTests(unittest.TestCase):
         b=self.b;b.capture_baselines(Path('test.apk'));path=self.paths()[0]
         legacy={'signer':self.cert,'fingerprint':b.p.CONFIG['fingerprint'],'before_flags':0,'uid':self.uid}
         self.persist(path,legacy);before=path.read_bytes();self.worker.reset_mock()
-        for action in (lambda:b.baseline_for(self.cert,self.uid),lambda:b.capture_baselines(Path('test.apk')),lambda:b.activate(Path('test.apk'))):
+        for action in (lambda:b.baseline_for(self.cert,self.uid),lambda:b.capture_baselines(Path('test.apk'))):
             with self.assertRaisesRegex(RuntimeError,'trustworthy native'):action()
         with patch.object(b,'status',return_value={'config':{'uid':self.uid}}),patch.object(b.p,'root_json') as root:
             with self.assertRaisesRegex(RuntimeError,'trustworthy native'):b.remove(Path('test.apk'))
             root.assert_not_called()
         self.worker.assert_not_called();self.assertEqual(path.read_bytes(),before)
+    def test_legacy_grant_before_activation_is_remeasured_and_archived(self):
+        from unittest.mock import patch
+        b=self.b;b.capture_baselines(Path('test.apk'));path=self.paths()[0]
+        legacy={'signer':self.cert,'fingerprint':b.p.CONFIG['fingerprint'],'before_flags':0,'uid':self.uid}
+        self.persist(path,legacy);before=path.read_bytes();self.events.clear()
+        with patch.object(b,'install',return_value={'status':'installed','skipped_hook':True}):
+            result=b.activate(Path('test.apk'))
+        self.assertEqual(result['status'],'activated')
+        self.assertEqual([event for event in self.events if event in ('inspect','grant')],['inspect','grant'])
+        self.assertEqual(b.baseline_for(self.cert,self.uid)[b.p.PERMISSION],4)
+        archives=list(path.parent.glob(path.stem+'-before-capture-*.json'))
+        self.assertEqual(len(archives),1);self.assertEqual(archives[0].read_bytes(),before)
+        self.assertEqual(json.loads(path.read_text())['origin'],'before_activation')
+    def test_refresh_cannot_replace_wrong_uid_or_tampered_evidence(self):
+        b=self.b;b.capture_baselines(Path('test.apk'));path=self.paths()[0];original=path.read_bytes()
+        for defect in ('uid','serial','flags','proof'):
+            value=json.loads(original)
+            if defect=='uid':value['uid']=10001
+            elif defect=='serial':value['serial']='another-device'
+            elif defect=='flags':value['before_flags']=1234
+            else:value['snapshot_proof']=str(self.root/'missing.json')
+            self.persist(path,value);before=path.read_bytes();self.worker.reset_mock()
+            with self.subTest(defect=defect),self.assertRaises(RuntimeError):
+                b.capture_baselines(Path('test.apk'),origin='before_activation',force_refresh=True)
+            self.worker.assert_not_called();self.assertEqual(path.read_bytes(),before)
+        path.write_bytes(original)
+    def test_explicit_refresh_archives_valid_baseline_before_new_boundary(self):
+        b=self.b;self.flags=0;b.capture_baselines(Path('test.apk'));before={p:p.read_bytes() for p in self.paths()}
+        self.flags=4;b.capture_baselines(Path('test.apk'),origin='before_activation',force_refresh=True)
+        self.assertEqual(set(b.baseline_for(self.cert,self.uid).values()),{4})
+        for path,data in before.items():
+            archives=list(path.parent.glob(path.stem+'-before-capture-*.json'))
+            self.assertEqual(len(archives),1);self.assertEqual(archives[0].read_bytes(),data)
+    def test_direct_install_can_capture_legacy_grants_before_persistence(self):
+        from unittest.mock import patch
+        b=self.b;b.capture_baselines(Path('test.apk'));path=self.paths()[0]
+        self.persist(path,{'signer':self.cert,'fingerprint':b.p.CONFIG['fingerprint'],'before_flags':0,'uid':self.uid})
+        staged={};self.events.clear()
+        def root_result(code):
+            if "'exists':os.path.exists" in code:return {'exists':True}
+            config=json.loads(staged['config.json'])
+            return {'status':'installed','backup_sha256':config['original_sha256'],'config':config}
+        with patch.object(b,'stage_file',side_effect=lambda path,data:staged.update({Path(path).name:data})),patch.object(b,'gateway_command'),patch.object(b.p,'root_json',side_effect=root_result),patch.object(b.subprocess,'run'):
+            result=b.install(Path('test.apk'))
+        self.assertEqual(result['config']['baseline'][b.p.PERMISSION],4)
+        self.assertEqual([e for e in self.events if e in ('inspect','grant')],['inspect'])
     def test_snapshot_reference_must_prove_the_exact_flags_and_identity(self):
         b=self.b;b.capture_baselines(Path('test.apk'));path=self.paths()[0];original=path.read_text();value=json.loads(original)
         evidence=Path(value['snapshot_proof']);proof=evidence.read_text()

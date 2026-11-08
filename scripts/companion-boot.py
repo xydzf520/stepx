@@ -17,6 +17,10 @@ GROUP=(p.PERMISSION,)+p.CONNECTION_PERMISSIONS+p.WAKE_PERMISSIONS
 class MissingPermissionBaselines(RuntimeError):
     pass
 
+class LegacyPermissionBaseline(RuntimeError):
+    """Identity is checked separately; this record predates native read proofs."""
+    pass
+
 def digest(data):return hashlib.sha256(data).hexdigest()
 def verified_fingerprint():
     actual=p.shell('getprop','ro.build.fingerprint')
@@ -26,6 +30,12 @@ def verified_fingerprint():
 def private(value,name):
     STATE_LOCAL.mkdir(parents=True,exist_ok=True,mode=0o700)
     p.private_json(STATE_LOCAL/name,value)
+
+def sync_parent(path):
+    if os.name=='posix':
+        fd=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY)
+        try:os.fsync(fd)
+        finally:os.close(fd)
 
 def payload(cert,uid,baseline,operation="grant"):
     if operation not in ("inspect","grant","revoke"):raise RuntimeError("Unsupported boot operation")
@@ -53,6 +63,8 @@ def validate_baseline_evidence(value,cert,uid,names):
     Keep those files untouched, but never treat them as exact recovery proof.
     """
     failure='Permission baseline lacks trustworthy native before-state evidence; preserving existing permissions and recovery files'
+    if not any(k in value for k in ('origin','snapshot_proof','permission_changes','boot_id','captured_at')):
+        raise LegacyPermissionBaseline(failure+'; run companion-boot.py capture-baselines --origin before_activation to measure current flags without revoking permissions')
     if value.get('origin') not in ('before_rebind_snapshot','before_activation') or value.get('permission_changes') is not False:raise RuntimeError(failure)
     scope='backscreen_permission_v1' if names==(p.PERMISSION,) else p.WAKE_SCOPE if names==p.WAKE_PERMISSIONS else p.CONNECTION_SCOPE
     if value.get('serial')!=p.device_key() or value.get('scope')!=scope or (names==p.WAKE_PERMISSIONS and value.get('owner')!=p.WAKE_OWNER):raise RuntimeError(failure)
@@ -101,29 +113,31 @@ def capture_baselines(apk,origin='before_rebind_snapshot',force_refresh=False):
     unless force_refresh is requested after an APK update resets permission flags.
     """
     if origin not in ('before_rebind_snapshot','before_activation'):raise RuntimeError('Unsupported baseline observation boundary')
+    if force_refresh and origin!='before_activation':raise RuntimeError('--force-refresh requires --origin before_activation')
     initial=p.inspect(apk);p.guard(native=True)
     if not initial.get('installed') or initial.get('signature_verified') is not True:raise RuntimeError('Verified installed companion is required for baseline capture')
     cert=p.signer(apk);uid=initial['uid'];serial=p.device_key();fingerprint=verified_fingerprint()
     paths=[p.baseline_path(cert,uid),p.connection_baseline_path(cert,uid),p.wake_baseline_path(cert,uid)]
     groups=[(p.PERMISSION,),p.CONNECTION_PERMISSIONS,p.WAKE_PERMISSIONS]
     scopes=['backscreen_permission_v1',p.CONNECTION_SCOPE,p.WAKE_SCOPE]
-    missing=[]
+    missing=[];previous={}
     for index,path in enumerate(paths):
-        if force_refresh and origin=='before_activation':
-            missing.append(index);continue
         if not path.exists():missing.append(index);continue
         if path.is_symlink() or not path.is_file():raise RuntimeError('Invalid existing permission baseline file')
+        previous[index]=path.read_bytes()
         try:
             prior=json.loads(path.read_text());p.validate_baseline(prior,cert,uid)
             if prior.get('serial',serial)!=serial:raise RuntimeError('Existing permission baseline belongs to another device')
             flags={p.PERMISSION:prior.get('before_flags')} if index==0 else prior.get('before_flags')
             if not isinstance(flags,dict) or set(flags)!=set(groups[index]) or any(type(v)is not int or not -(2**31)<=v<2**31 for v in flags.values()):raise RuntimeError('Existing permission baseline is invalid; no overwrite')
             if index>0 and prior.get('scope')!=scopes[index]:raise RuntimeError('Existing permission baseline scope differs')
+            if index==2 and prior.get('owner')!=p.WAKE_OWNER:raise RuntimeError('Existing wake permission owner differs')
             validate_baseline_evidence(prior,cert,uid,groups[index])
-        except Exception:
+        except LegacyPermissionBaseline:
             if origin=='before_activation':
                 missing.append(index);continue
             raise
+        if force_refresh:missing.append(index)
     if not missing:
         baseline_for(cert,uid)
         return {'status':'already_saved','package':p.PACKAGE,'uid':uid,'permission_changes':False,'existing_baselines_preserved':True}
@@ -149,17 +163,35 @@ def capture_baselines(apk,origin='before_rebind_snapshot',force_refresh=False):
         evidence=p.STATE/('baseline-snapshot-'+uuid.uuid4().hex+'.json')
         record={'version':1,'origin':origin,'serial':serial,'signer':cert,'uid':uid,'fingerprint':fingerprint,'boot_id':boot_id,'captured_at':int(time.time()),'permission_changes':False,'proof':proof}
         p.private_json(evidence,record)
+        sync_parent(evidence)
         for index in missing:
             path=paths[index]
             if path.exists() and not (origin=='before_activation'):raise RuntimeError('Permission baseline appeared during capture; preserving it and stopping')
+            if index in previous:
+                if path.read_bytes()!=previous[index]:raise RuntimeError('Permission baseline changed during capture; no overwrite')
+                archive=path.with_name(path.stem+'-before-capture-'+uuid.uuid4().hex+'.json')
+                # Keep the exact legacy recovery file before replacing it with a
+                # newly measured activation boundary (never an assumed zero).
+                fd=os.open(archive,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+                with os.fdopen(fd,'wb') as f:f.write(previous[index]);f.flush();os.fsync(f.fileno())
+                sync_parent(archive)
+            elif path.exists():raise RuntimeError('Permission baseline appeared during capture; no overwrite')
             flags=measured[p.PERMISSION] if index==0 else {name:measured[name] for name in groups[index]}
             value={'signer':cert,'fingerprint':fingerprint,'uid':uid,'serial':serial,'scope':scopes[index],'before_flags':flags,'origin':origin,'captured_at':record['captured_at'],'boot_id':boot_id,'snapshot_proof':str(evidence),'permission_changes':False}
             if index==2:value['owner']=p.WAKE_OWNER
             p.private_json(path,value)
+            sync_parent(path)
     baseline_for(cert,uid)
     return {'status':'captured','package':p.PACKAGE,'uid':uid,'origin':origin,'permission_changes':False,'groups_saved':len(missing),'existing_baselines_preserved':not force_refresh,
             'restoration_boundary':'Exact state before this rebind; not a claim about permissions before the first installation' if origin=='before_rebind_snapshot' else 'Exact observed state before activation grants',
             'snapshot_proof':str(evidence)}
+
+def activation_baseline(apk,cert,uid,rebind=False):
+    try:return baseline_for(cert,uid,require_exact=True)
+    except (MissingPermissionBaselines,LegacyPermissionBaseline):
+        if rebind:raise
+        capture_baselines(apk,origin='before_activation')
+        return baseline_for(cert,uid,require_exact=True)
 
 def current_permissions_ready(initial):
     # Updating an APK can invalidate grants without changing the boot ID/PID.
@@ -214,7 +246,7 @@ def stage_file(path,data):
 def install(apk,rebind=False):
     initial=p.inspect(apk);p.guard(native=True)
     if not initial.get('signature_verified'):raise RuntimeError('Companion signing trust is required')
-    cert=p.signer(apk);uid=initial['uid'];baseline=baseline_for(cert,uid,require_exact=rebind);fingerprint=verified_fingerprint()
+    cert=p.signer(apk);uid=initial['uid'];fingerprint=verified_fingerprint();baseline=activation_baseline(apk,cert,uid,rebind)
     files={name:read_python_source(ROOT/'scripts/companion_boot'/name) for name in ('chain.py','boot.py','launcher.py')}
     files['grant.py']=payload(cert,uid,baseline)
     serial=p.device_key()
@@ -426,11 +458,7 @@ def activate(apk,rebind=False):
     initial=p.inspect(apk);p.guard(native=True)
     if not initial.get('signature_verified'):raise RuntimeError('Companion signing trust is required')
     cert=p.signer(apk);uid=initial['uid']
-    try:baseline=baseline_for(cert,uid,require_exact=True)
-    except MissingPermissionBaselines:
-        if rebind:raise
-        capture_baselines(apk,origin='before_activation',force_refresh=True)
-        baseline=baseline_for(cert,uid,require_exact=True)
+    baseline=activation_baseline(apk,cert,uid,rebind)
     target=int(p.shell('pidof','system_server'))
     code="os.environ['STEPX_SYSTEM_SERVER_PID']="+repr(str(target))+"\n"+payload(cert,uid,baseline).decode()
     with p.runtime_lock():proof=p.run_bounded_android_worker(code,target)
@@ -476,12 +504,18 @@ print(json.dumps({'recorded':True}))
     if not p.root_json(code).get('recorded'):raise RuntimeError('Runtime readiness receipt was not saved')
 
 def main():
-    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('command',choices=['install','status','remove','activate','capture-baselines']);parser.add_argument('--apk',type=Path,default=ROOT/'desktop/assets/stepx-companion.apk');parser.add_argument('--rebind',action='store_true',help='After an explicitly authorized reinstall, archive and rebind only a fully verified owned companion boot adapter');args=parser.parse_args()
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('command',choices=['install','status','remove','activate','capture-baselines']);parser.add_argument('--apk',type=Path,default=ROOT/'desktop/assets/stepx-companion.apk');parser.add_argument('--rebind',action='store_true',help='After an explicitly authorized reinstall, archive and rebind only a fully verified owned companion boot adapter')
+    parser.add_argument('--origin',choices=['before_activation','before_rebind_snapshot'],default=None)
+    parser.add_argument('--force-refresh',action='store_true',help='Archive prior valid evidence and capture current flags; never revoke permissions')
+    args=parser.parse_args()
     if args.rebind and args.command not in ('install','activate'):parser.error('--rebind is only valid with install or activate')
+    if (args.origin or args.force_refresh) and args.command!='capture-baselines':parser.error('--origin/--force-refresh require capture-baselines')
+    if args.force_refresh and args.origin!='before_activation':parser.error('--force-refresh requires --origin before_activation')
     STATE_LOCAL.mkdir(parents=True,exist_ok=True,mode=0o700)
     with p.file_lock(STATE_LOCAL/'operation.lock'):
         if args.command in ('install','activate'):result={'install':install,'activate':activate}[args.command](args.apk,rebind=args.rebind)
-        else:result={'status':status,'remove':remove,'capture-baselines':capture_baselines}[args.command](args.apk)
+        elif args.command=='capture-baselines':result=capture_baselines(args.apk,origin=args.origin or 'before_rebind_snapshot',force_refresh=args.force_refresh)
+        else:result={'status':status,'remove':remove}[args.command](args.apk)
     print(json.dumps(result,ensure_ascii=False))
 if __name__=='__main__':
     try:main()

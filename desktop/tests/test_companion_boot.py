@@ -1,10 +1,11 @@
 """System activation proof and bounded gateway staging; no device access."""
-import contextlib,importlib.util,json,tempfile,unittest
+import contextlib,importlib.util,json,tempfile,unittest,os
 from pathlib import Path
 from unittest.mock import patch
 spec=importlib.util.spec_from_file_location('companion_boot_test',Path(__file__).resolve().parents[2]/'scripts/companion-boot.py')
 b=importlib.util.module_from_spec(spec);spec.loader.exec_module(b)
 class BootAdapter(unittest.TestCase):
+    @unittest.skipUnless(hasattr(os,'O_NOFOLLOW'),'Android staging payload needs POSIX O_NOFOLLOW')
     def test_staging_large_artifact_roundtrip_and_argv_bound(self):
         with tempfile.TemporaryDirectory() as root:
             data=bytes(range(256))*1000;target=Path(root)/'artifact';calls=[]
