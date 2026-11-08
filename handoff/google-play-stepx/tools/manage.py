@@ -4,7 +4,7 @@ from common import baseline_matches, DEVICE_KEY
 import argparse
 import base64
 from contextlib import contextmanager, redirect_stdout
-from datetime import datetime
+from datetime import datetime, timezone as datetime_timezone
 import hashlib
 import importlib.util
 import io
@@ -516,7 +516,55 @@ def component_versions(dumps):
             for package, data in dumps.items()}
 
 
-def phone_component_identity_matches(phone, versions, timezone=None):
+class ComponentTimeUnavailable(RuntimeError):
+    """A failed timezone read is not evidence that a component needs repair."""
+
+
+def format_component_epoch(epoch_ms, timezone, cache):
+    """Format the observed epoch in the phone's current zone, including DST.
+
+    Windows' bundled Python may lack IANA data. Android already carries the
+    matching timezone database; use its read-only date utility on that slow path.
+    Forward formatting avoids guessing a fold when a local clock hour repeats.
+    """
+    if (type(epoch_ms) is not int or epoch_ms <= 0 or epoch_ms > 253402300799999
+            or not isinstance(timezone, str)
+            or not re.fullmatch(r'[A-Za-z0-9_+-]+(?:/[A-Za-z0-9_+-]+)*', timezone)):
+        raise ComponentTimeUnavailable('Current component time could not be verified; no repair was requested')
+    key = (epoch_ms // 1000, timezone)
+    if key in cache:
+        return cache[key]
+    zone = datetime_timezone.utc if timezone in ('UTC', 'GMT', 'Etc/UTC', 'Etc/GMT') else None
+    if zone is None:
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+        try:
+            zone = ZoneInfo(timezone)
+        except ZoneInfoNotFoundError:
+            pass
+    if zone is not None:
+        try:
+            formatted = datetime.fromtimestamp(key[0], zone).strftime('%Y-%m-%d %H:%M:%S')
+        except (ValueError, OverflowError, OSError) as error:
+            raise ComponentTimeUnavailable('Current component time could not be verified; no repair was requested') from error
+    else:
+        try:
+            formatted = shell('env', 'TZ=' + timezone, 'date', '-d', '@' + str(key[0]), '+%Y-%m-%d %H:%M:%S')
+        except (RuntimeError, subprocess.SubprocessError) as error:
+            raise ComponentTimeUnavailable('Phone timezone read did not complete; no repair was requested') from error
+    # An unsupported date flag or partial transport output cannot turn into a
+    # false identity mismatch and trigger maintenance.
+    try:
+        if not re.fullmatch(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}', formatted):
+            raise ValueError('incomplete component timestamp')
+        datetime.strptime(formatted, '%Y-%m-%d %H:%M:%S')
+    except (ValueError, TypeError) as error:
+        raise ComponentTimeUnavailable('Phone timezone result was incomplete; no repair was requested') from error
+    cache[key] = formatted
+    return formatted
+
+
+def phone_component_identity_matches(phone, versions, timezone=None, time_cache=None):
+    time_cache = {} if time_cache is None else time_cache
     for package, prefix in [('com.google.android.gms', 'gms'), ('com.android.vending', 'play'),
                             ('com.google.android.gsf', 'gsf')]:
         current = versions.get(package, {})
@@ -529,13 +577,7 @@ def phone_component_identity_matches(phone, versions, timezone=None):
         if phone.get(prefix + '_updated_local') != current.get('lastUpdateTime'):
             if not timezone:
                 return False
-            try:
-                from zoneinfo import ZoneInfo
-                current_seconds = int(datetime.strptime(current.get('lastUpdateTime', ''), '%Y-%m-%d %H:%M:%S')
-                                      .replace(tzinfo=ZoneInfo(timezone)).timestamp())
-                if current_seconds != phone[prefix + '_updated_at'] // 1000:
-                    return False
-            except (ValueError, KeyError, TypeError):
+            if format_component_epoch(phone.get(prefix + '_updated_at'), timezone, time_cache) != current.get('lastUpdateTime'):
                 return False
     return True
 
@@ -580,7 +622,7 @@ def runtime_summary(adapter, boot_id, pid, dumps, previous=None, registered=None
     return summary
 
 
-def phone_recovery_summary(phone, boot_id, pid, dumps, registered, timezone=None):
+def phone_recovery_summary(phone, boot_id, pid, dumps, registered, timezone=None, time_cache=None):
     """Accept an in-place phone repair only after current independent read-back.
 
     Old boot last.json is not updated by the phone's package-update listener.
@@ -599,7 +641,7 @@ def phone_recovery_summary(phone, boot_id, pid, dumps, registered, timezone=None
         if phone.get('signatures_verified') is not True or phone.get('permissions_verified') is not True:
             return None
         if (phone.get('registered') is not True or phone.get('domain_ready') is not True
-                or not phone_component_identity_matches(phone, versions, timezone)):
+                or not phone_component_identity_matches(phone, versions, timezone, time_cache)):
             return None
         proof = phone.get('permission_result', '')
         if not isinstance(proof, str) or not proof.strip():
@@ -657,12 +699,13 @@ print(json.dumps(r))''')
             summary['permission_definitions_checked'] = True
     phone = result.get('phone_recovery') or {}
     timezone = None
+    time_cache = {}
     if phone.get('schema') == 2 and not phone_component_identity_matches(phone, component_versions(dumps)):
         # The phone's timezone can change after receipt creation. Only this slow
         # mismatch path needs another read; normal checks compare local strings.
         timezone = shell('getprop', 'persist.sys.timezone')
     if registered is not None:
-        summary = phone_recovery_summary(phone, result['boot_id'], current_pid, dumps, registered, timezone) or summary
+        summary = phone_recovery_summary(phone, result['boot_id'], current_pid, dumps, registered, timezone, time_cache) or summary
     summary['phone_recovery'] = {key: phone.get(key) for key in
         ('schema', 'status', 'checked_at', 'retry_after_ms', 'recovery_pending', 'attempt', 'boot_id', 'system_server_pid', 'reason', 'signatures_verified',
          'recheck_supported', 'runtime_revision', 'grant_authorized', 'error_code', 'identity_package')}
@@ -676,7 +719,7 @@ print(json.dumps(r))''')
     summary['monitor_schema_unsupported'] = result['phone_recovery_read_state'] == 'readable' and (not supported_schema
         or (phone.get('schema') == 2 and phone.get('runtime_revision') not in (None, MONITOR_REVISION)))
     summary['phone_recovery_current_session'] = phone.get('boot_id') == result['boot_id'] and str(phone.get('system_server_pid')) == current_pid
-    summary['phone_recovery_current_components'] = phone_component_identity_matches(phone, component_versions(dumps), timezone)
+    summary['phone_recovery_current_components'] = phone_component_identity_matches(phone, component_versions(dumps), timezone, time_cache)
     if (phone.get('schema') == 2 and summary['phone_recovery_current_session']
             and phone.get('status') != 'ready'):
         summary.update(status='needs_repair', needs_repair=True,

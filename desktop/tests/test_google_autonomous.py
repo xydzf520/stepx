@@ -256,6 +256,67 @@ class PhoneReceiptTests(unittest.TestCase):
             dumps['com.android.vending'] = dumps['com.android.vending'].replace('12:00:00', '12:00:01')
             self.assertIsNone(manage.phone_recovery_summary(phone, 'boot', '123', dumps, registered, 'UTC'))
 
+    def test_utc_and_gmt_do_not_require_host_tzdata_or_phone_calls(self):
+        from zoneinfo import ZoneInfoNotFoundError
+        with patch('zoneinfo.ZoneInfo', side_effect=ZoneInfoNotFoundError('no IANA database')), \
+             patch.object(manage, 'shell') as shell:
+            for zone in ['UTC', 'GMT', 'Etc/UTC', 'Etc/GMT']:
+                self.assertEqual(manage.format_component_epoch(1794139200000, zone, {}), '2026-11-08 12:00:00')
+            shell.assert_not_called()
+
+    def test_named_zone_without_host_tzdata_uses_phone_historical_rules(self):
+        from zoneinfo import ZoneInfoNotFoundError
+        # Winter, summer, and the two sides of the autumn repeated hour. These
+        # epochs must be formatted in the named zone, never with today's offset.
+        cases = [(1768496400000, '2026-01-15 12:00:00'),
+                 (1784131200000, '2026-07-15 12:00:00'),
+                 (1793511000000, '2026-11-01 01:30:00'),
+                 (1793514600000, '2026-11-01 01:30:00')]
+        for epoch, expected in cases:
+            with self.subTest(epoch=epoch), patch('zoneinfo.ZoneInfo', side_effect=ZoneInfoNotFoundError('missing')), \
+                 patch.object(manage, 'shell', return_value=expected) as shell:
+                cache = {}
+                self.assertEqual(manage.format_component_epoch(epoch, 'America/New_York', cache), expected)
+                self.assertEqual(manage.format_component_epoch(epoch, 'America/New_York', cache), expected)
+                shell.assert_called_once_with('env','TZ=America/New_York','date','-d','@'+str(epoch//1000),'+%Y-%m-%d %H:%M:%S')
+
+    def test_phone_timezone_fallback_preserves_component_identity_checks(self):
+        from zoneinfo import ZoneInfoNotFoundError
+        phone, dumps, reviewed, registered = self.fixture()
+        for prefix in ['gms','play','gsf']:
+            phone[prefix+'_updated_at'] = 1794139200000
+            phone[prefix+'_updated_local'] = '2026-11-08 12:00:00'
+        dumps = {p:d.replace('12:00:00','07:00:00') for p,d in dumps.items()}
+        with patch('zoneinfo.ZoneInfo', side_effect=ZoneInfoNotFoundError('missing')), \
+             patch.object(manage, 'shell', return_value='2026-11-08 07:00:00') as shell, \
+             patch.dict(manage.REVIEWED_PERMISSIONS, reviewed, clear=True):
+            self.assertIsNotNone(manage.phone_recovery_summary(phone, 'boot', '123', dumps, registered, 'America/New_York'))
+            self.assertEqual(shell.call_count, 1, 'matching package epochs share a single status-local conversion')
+            for before, after in [('07:00:00','07:00:01'), ('appId=10123','appId=10124'), ('versionCode=123','versionCode=124')]:
+                changed={**dumps,'com.android.vending':dumps['com.android.vending'].replace(before,after)}
+                self.assertIsNone(manage.phone_recovery_summary(phone, 'boot', '123', changed, registered, 'America/New_York'))
+
+    def test_unavailable_or_malformed_phone_conversion_is_not_a_mismatch(self):
+        from zoneinfo import ZoneInfoNotFoundError
+        for result in ['', 'date: bad date', '2026-11-08 07:00', '2026-1-8 07:00:00', '2026-02-30 07:00:00']:
+            with self.subTest(result=result), patch('zoneinfo.ZoneInfo', side_effect=ZoneInfoNotFoundError('missing')), \
+                 patch.object(manage, 'shell', return_value=result):
+                with self.assertRaises(manage.ComponentTimeUnavailable):
+                    manage.format_component_epoch(1794139200000, 'America/New_York', {})
+        with patch('zoneinfo.ZoneInfo', side_effect=ZoneInfoNotFoundError('missing')), \
+             patch.object(manage, 'shell', side_effect=RuntimeError('phone disconnected')):
+            with self.assertRaises(manage.ComponentTimeUnavailable):
+                manage.format_component_epoch(1794139200000, 'America/New_York', {})
+
+    def test_timezone_read_failure_cannot_reserve_or_request_repair(self):
+        with patch.object(manage, 'operation_lock', return_value=nullcontext()), \
+             patch.object(manage, 'companion_operation_lock', return_value=nullcontext()), \
+             patch.object(manage, '_autonomous_status', side_effect=manage.ComponentTimeUnavailable('timezone unavailable')), \
+             patch.object(manage, 'save_json') as save, patch.object(manage, 'request_native_recheck') as recheck, \
+             patch.object(manage, 'upgrade_owned_monitor') as upgrade:
+            with self.assertRaises(manage.ComponentTimeUnavailable): manage.repair_autonomous()
+            save.assert_not_called(); recheck.assert_not_called(); upgrade.assert_not_called()
+
 
 class OperationLockTests(unittest.TestCase):
     def test_nested_same_operation_reentrant_but_other_thread_defers(self):
