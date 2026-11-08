@@ -957,6 +957,7 @@ pub(crate) enum Action {
         task: String,
         path: PathBuf,
     },
+    HomeFillDraft(String),
     HomeSubmitCommand,
     HomeRunGuiCommand,
     HomeRunWorkCommand,
@@ -1118,7 +1119,7 @@ fn default_amoo_sessions() -> Vec<AmooSessionItem> {
                     thinking_steps: vec![
                         "1. 视觉识别「报销发票_1021.png」：提取高德打车电子发票 ¥68.00，归档至 10 月报销单（累计 ¥386.00）".into(),
                         "2. 背屏点阵生成：合成 23×17「赛博闪电」像素矩阵（391 颗 LED）".into(),
-                        "3. 通讯录匹配「李明」(138 0013 8000)，拟定短信正文并触发敏感操作确认".into(),
+                        "3. 通讯录匹配「李明」(138 0000 9367)，拟定短信正文并触发敏感操作确认".into(),
                     ],
                     tools_summary: "归档发票 · 生成背屏图 · 拟定短信".into(),
                     text: None,
@@ -1262,28 +1263,28 @@ fn default_demo_call_logs() -> Vec<CallRecord> {
     let min = 60_000;
     vec![
         CallRecord {
-            number: "138 0013 8000".into(),
+            number: "138 0000 9367".into(),
             name: "李明 · 产品组".into(),
             call_type: 1,
             date_ms: now - 18 * min,
             duration_sec: 265,
         },
         CallRecord {
-            number: "139 1024 6688".into(),
+            number: "138 0000 0041".into(),
             name: "王磊 · 架构师".into(),
             call_type: 2,
             date_ms: now - 95 * min,
             duration_sec: 412,
         },
         CallRecord {
-            number: "186 2100 5520".into(),
+            number: "138 0000 9765".into(),
             name: "顺丰派件员".into(),
             call_type: 3,
             date_ms: now - 180 * min,
             duration_sec: 0,
         },
         CallRecord {
-            number: "135 8801 9200".into(),
+            number: "138 0000 1985".into(),
             name: "张晓楠 · 设计组".into(),
             call_type: 1,
             date_ms: now - 420 * min,
@@ -1296,23 +1297,23 @@ fn default_demo_contacts() -> Vec<ContactEntry> {
     vec![
         ContactEntry {
             name: "李明 · 产品组".into(),
-            number: "138 0013 8000".into(),
+            number: "138 0000 9367".into(),
         },
         ContactEntry {
             name: "王磊 · 架构师".into(),
-            number: "139 1024 6688".into(),
+            number: "138 0000 0041".into(),
         },
         ContactEntry {
             name: "张晓楠 · 设计组".into(),
-            number: "135 8801 9200".into(),
+            number: "138 0000 1985".into(),
         },
         ContactEntry {
             name: "陈思远 · 硬件研发".into(),
-            number: "137 6012 3390".into(),
+            number: "138 0000 0362".into(),
         },
         ContactEntry {
             name: "顺丰速运园区网点".into(),
-            number: "186 2100 5520".into(),
+            number: "138 0000 9765".into(),
         },
     ]
 }
@@ -1919,7 +1920,7 @@ impl Companion {
             pending_call: None,
             selected_call_sim: None,
             active_call_number: if demo_mode {
-                Some("138 0013 8000".into())
+                Some("138 0000 9367".into())
             } else {
                 None
             },

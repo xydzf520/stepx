@@ -39,6 +39,10 @@ pub(in crate::ui) fn home_canvas_content_width(window_width: f32) -> f32 {
         .max(0.).min(HOME_CONTENT_MAX_WIDTH)
 }
 
+pub(in crate::ui) fn home_grid_span_width(canvas: f32, gap: f32, units: f32) -> f32 {
+    ((canvas + gap) * units.clamp(0., 12.) / 12. - gap).max(0.)
+}
+
 /// Functional domain category for `Page::Home` modular cards.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum HomeModuleCategory {
@@ -1286,9 +1290,10 @@ impl Companion {
         if content < 760. || self.home_modules.module_width(id) == HomeModuleWidth::Full {
             return content;
         }
-        let Some((count, total, weight)) = self.home_modules.packed_row_metrics(id) else { return content; };
-        if count <= 1 || (count >= 3 && content < 1040.) { return content; }
-        (content - S3 * (count - 1) as f32) * f32::from(weight) / f32::from(total)
+        let Some((count, _, weight)) = self.home_modules.packed_row_metrics(id) else { return content; };
+        if count == 1 { return content; }
+        if count >= 3 && content < 1040. { return content; }
+        home_grid_span_width(content, S3, f32::from(weight))
     }
 
     pub(in crate::ui) fn home_module_content_width(&self, id: HomeModuleId) -> HomeModuleWidth {
@@ -1311,7 +1316,7 @@ impl Companion {
         // Tall unlocks more content; no universal minimum height adds blanks.
         match height {
             HomeModuleHeight::Compact | HomeModuleHeight::Tall => height,
-            HomeModuleHeight::Auto | HomeModuleHeight::Standard if self.workspace.viewport.y() < 740. => HomeModuleHeight::Compact,
+            HomeModuleHeight::Auto if self.workspace.viewport.y() < 740. => HomeModuleHeight::Compact,
             _ => HomeModuleHeight::Standard,
         }
     }

@@ -331,9 +331,19 @@ impl Element for EditableLine {
                 .position_cache
                 .get_position(id)
                 .unwrap_or(RectF::new(o, vec2f(0., 20.)));
+            // Ellipsized text may still report the original, offscreen glyph
+            // position. Keep the caret (and native IME anchor) in the editor,
+            // away from the adjacent microphone and action buttons.
+            let size = self.text.size().unwrap_or(vec2f(1.5, 20.));
+            let height = (glyph.height() - 2.).max(14.).min(size.y());
             let caret = RectF::new(
-                glyph.origin() + vec2f(if *at_end { glyph.width() } else { 0. }, 1.),
-                vec2f(1.5, (glyph.height() - 2.).max(14.)),
+                vec2f(
+                    (glyph.min_x() + if *at_end { glyph.width() } else { 0. })
+                        .clamp(o.x(), o.x() + (size.x() - 1.5).max(0.)),
+                    (glyph.min_y() + 1.)
+                        .clamp(o.y(), o.y() + (size.y() - height).max(0.)),
+                ),
+                vec2f(1.5, height),
             );
             ctx.position_cache.start();
             ctx.position_cache

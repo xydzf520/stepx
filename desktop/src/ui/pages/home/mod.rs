@@ -50,6 +50,9 @@ use stepx_companion::{
 pub mod actions;
 pub mod calendar_alarms_timeline;
 pub mod canvas_drag;
+#[cfg(all(test, feature = "ui-capture"))]
+mod quick_start_tests;
+mod card_frames;
 pub mod layout_config;
 pub mod messages_and_life;
 pub mod plots;
@@ -151,7 +154,7 @@ impl Companion {
                 if let Some(health) = self.render_productivity_health() { sections.push(health); }
                 if let Some(preservation) = self.render_productivity_preservation() { sections.push(preservation); }
                 sections.push(self.render_productivity_hub());
-                Some(self.vstack(S2, sections))
+                Some(self.home_surface_stack(S2, sections))
             }
             HomeModuleId::LiveCountdown => self
                 .render_home_live_countdown_banner(snapshot)
@@ -208,7 +211,7 @@ impl Companion {
                         ));
                     }
                     let desc = Self::truncate_chars("专注倒计时", profile.char_budget);
-                    Some(self.panel(vec![row_between_expanded(
+                    Some(self.home_frame(HomeModuleId::LiveCountdown, vec![row_between_expanded(
                         self.hstack(
                             S2,
                             vec![
@@ -258,15 +261,14 @@ impl Companion {
                             | HomeModuleWidth::TwoThirds
                             | HomeModuleWidth::Full
                     ) {
-                        Some(self.responsive_columns(
+                        Some(self.home_aligned_columns(
                             520.,
                             S2,
                             S2,
-                            CrossAxisAlignment::Stretch,
                             vec![(1.08, studio_card), (1.0, habit_card)],
                         ))
                     } else {
-                        Some(self.vstack(S2, vec![studio_card, habit_card]))
+                        Some(self.home_surface_stack(S2, vec![studio_card, habit_card]))
                     }
                 }
             }
@@ -278,14 +280,14 @@ impl Companion {
                 let p = self.p();
                 let weather = &self.weather_snapshot;
                 if !weather.from_live_api && !self.demo_mode {
-                    return Some(self.panel(vec![
+                    return Some(self.home_frame(HomeModuleId::WeatherModule, vec![
                         row_between_expanded(self.home_section_heading(UiIcon::Sun, "天气"),
                             self.button_icon("home-weather-refresh", "刷新", UiIcon::Refresh,
                                 Action::WeatherRefresh, Btn::Ghost), S2),
                         self.text("刷新后查看当前天气与出行提示", CAPTION, p.text2),
                     ]));
                 }
-                Some(self.panel(vec![
+                Some(self.home_frame(HomeModuleId::WeatherModule, vec![
                     row_between_expanded(
                         self.home_section_heading(UiIcon::Sun, "天气"),
                         self.hstack(S1, vec![
@@ -539,6 +541,7 @@ impl Companion {
                 let mut rank_cursor = 0usize;
 
                 for row in packed_rows {
+                    let configured_count = row.len();
                     let row_start_idx = rank_cursor;
                     let all_core_workbench =
                         !row.is_empty() && row.iter().all(|(id, _, _)| id.is_core_workbench_col());
@@ -575,20 +578,7 @@ impl Companion {
                         continue;
                     }
 
-                    let row_el = if rendered_cols.len() == 1 {
-                        // A lone visible card uses the row. Its saved width
-                        // still controls packing when another card is present.
-                        rendered_cols.into_iter().next().unwrap().1
-                    } else {
-                        let min_wide = if rendered_cols.len() >= 3 { 1040. } else { 760. };
-                        self.responsive_columns(
-                            min_wide,
-                            S3,
-                            S3,
-                            CrossAxisAlignment::Start,
-                            rendered_cols,
-                        )
-                    };
+                    let row_el = self.home_canvas_columns(configured_count, rendered_cols);
 
                     if all_core_workbench {
                         // 不再渲染「今日事项 · …」说明横幅，模块卡片自带标题。
@@ -1288,7 +1278,7 @@ impl Companion {
             panel_children.push(self.grid_cols(quick_tiles, profile.columns, S2));
         }
 
-        self.panel(panel_children)
+        self.home_frame(HomeModuleId::ToolsSummaryDock, panel_children)
     }
 
     pub(in crate::ui) fn render_home_new_request(&self) -> El {
@@ -1301,40 +1291,7 @@ impl Companion {
         let profile =
             self.compute_home_module_value_profile(HomeModuleId::QuickStartRequest, width, height);
 
-        let mut hdr_copy = vec![self.home_section_heading(UiIcon::Send, "快速发起")];
-        if eff_h != HomeModuleHeight::Compact {
-            hdr_copy.push(self.text(
-                Self::truncate_chars(
-                    "输入事项或点选常用场景，快速发起对话、文档整理或手机协同",
-                    profile.char_budget,
-                ),
-                CAPTION,
-                p.text2,
-            ));
-        }
-        let header = row_between_expanded(
-            self.vstack(2., hdr_copy),
-            self.hstack(
-                S1,
-                vec![
-                    self.icon_action(
-                        "home-new-gui",
-                        "手机操作代办",
-                        UiIcon::Smartphone,
-                        vec![Action::HomeRunGuiCommand],
-                        false,
-                    ),
-                    self.icon_action(
-                        "home-new-work",
-                        "文档工作台",
-                        UiIcon::File,
-                        vec![Action::HomeRunWorkCommand],
-                        false,
-                    ),
-                ],
-            ),
-            S2,
-        );
+        let header = self.home_section_heading(UiIcon::Send, "快速发起");
 
         // The month calendar has its own navigation and agenda; the task
         // composer belongs here and must never target a hidden calendar input.
@@ -1354,135 +1311,70 @@ impl Companion {
                 S2,
             );
 
-        let all_presets = vec![
-            self.chip(
-                "home-preset-plan",
-                "起草活动方案",
-                Some(UiIcon::File),
-                vec![
-                    Action::Focus(F_HOME_COMMAND),
-                    Action::ClearField(F_HOME_COMMAND),
-                    Action::Insert("写一份活动方案并整理执行清单".into()),
-                ],
-                false,
-                false,
-            ),
-            self.chip(
-                "home-preset-summary",
-                "梳理今日进展",
-                Some(UiIcon::File),
-                vec![
-                    Action::Focus(F_HOME_COMMAND),
-                    Action::ClearField(F_HOME_COMMAND),
-                    Action::Insert("总结今天的进展与下一步待办".into()),
-                ],
-                false,
-                false,
-            ),
-            self.chip(
-                "home-preset-reply",
-                "汇总未读消息",
-                Some(UiIcon::Chat),
-                vec![
-                    Action::Focus(F_HOME_COMMAND),
-                    Action::ClearField(F_HOME_COMMAND),
-                    Action::Insert("梳理重要未读消息并给出回复建议".into()),
-                ],
-                false,
-                false,
-            ),
-            self.chip(
-                "home-preset-review",
-                "打开日终复盘",
-                Some(UiIcon::Activity),
-                vec![Action::Context(
-                    crate::ui::context_state::ContextAction::Period(
-                        stepx_companion::context_ledger::Period::Day,
-                    ),
-                )],
-                false,
-                false,
-            ),
-            self.chip(
-                "home-preset-weekly",
-                "生成周报纪要",
-                Some(UiIcon::Layers),
-                vec![
-                    Action::Focus(F_HOME_COMMAND),
-                    Action::ClearField(F_HOME_COMMAND),
-                    Action::Insert("汇总本周关键成果并生成结构化周报".into()),
-                ],
-                false,
-                false,
-            ),
-            self.chip(
-                "home-preset-express",
-                "查快递与提醒",
-                Some(UiIcon::Package),
-                vec![
-                    Action::Focus(F_HOME_COMMAND),
-                    Action::ClearField(F_HOME_COMMAND),
-                    Action::Insert("查看近期快递取件码并同步背屏提醒".into()),
-                ],
-                false,
-                false,
-            ),
-            self.chip(
-                "home-preset-voice",
-                "整理会议文字",
-                Some(UiIcon::File),
-                vec![
-                    Action::Focus(F_HOME_COMMAND),
-                    Action::ClearField(F_HOME_COMMAND),
-                    Action::Insert("请根据我接下来提供的会议文字，提取已确认的结论、待办、负责人及待确认事项".into()),
-                ],
-                false,
-                false,
-            ),
-            self.chip(
-                "home-preset-archive",
-                "跨端文件归档",
-                Some(UiIcon::FolderOpen),
-                vec![
-                    Action::Focus(F_HOME_COMMAND),
-                    Action::ClearField(F_HOME_COMMAND),
-                    Action::Insert("归档手机回传成果并生成交付清单".into()),
-                ],
-                false,
-                false,
-            ),
+        // Choosing a template fills the draft. It must visibly select the
+        // matching scene without sending or replacing the user's edits later.
+        let templates = [
+            ("plan", "起草方案", UiIcon::File, "写一份活动方案并整理执行清单"),
+            ("summary", "今日进展", UiIcon::Activity, "总结今天的进展与下一步待办"),
+            ("reply", "未读消息", UiIcon::Chat, "梳理重要未读消息并给出回复建议"),
+            ("weekly", "周报纪要", UiIcon::Layers, "汇总本周关键成果并生成结构化周报"),
+            ("express", "快递提醒", UiIcon::Package, "查看近期快递取件码并同步背屏提醒"),
+            ("voice", "会议文字", UiIcon::File, "请根据我接下来提供的会议文字，提取已确认的结论、待办、负责人及待确认事项"),
+            ("archive", "文件归档", UiIcon::FolderOpen, "归档手机回传成果并生成交付清单"),
         ];
-        let capped_presets: Vec<El> = all_presets.into_iter().take(profile.max_items).collect();
-        let presets = if eff_h == HomeModuleHeight::Tall {
-            let cols = if width == HomeModuleWidth::OneThird {
-                2
-            } else {
-                4
-            };
-            self.grid_cols(capped_presets, cols, S1)
-        } else if width == HomeModuleWidth::OneThird && eff_h != HomeModuleHeight::Compact {
-            self.grid_cols(capped_presets, 2, S1)
-        } else {
-            self.wrap(capped_presets)
+        let draft = self.fields[F_HOME_COMMAND].text.trim();
+        let exact_template = templates.iter().find(|(_, _, _, prompt)| *prompt == draft);
+        let appended_template = templates.iter().find(|(_, _, _, prompt)|
+            draft.ends_with(&format!("\n\n{prompt}")));
+        let selected = exact_template.or(appended_template);
+        let choices: Vec<El> = templates.iter().take(profile.max_items).map(|(id, label, icon, prompt)| {
+            self.chip(format!("home-preset-{id}"), *label, Some(*icon),
+                if draft.is_empty() || exact_template.is_some() {
+                    vec![Action::HomeFillDraft((*prompt).into())]
+                } else {
+                    // Change only an appended preset; keep the user's wording and
+                    // make repeated clicks idempotent instead of duplicating prompts.
+                    let base = appended_template.and_then(|(_, _, _, previous)|
+                        draft.strip_suffix(&format!("\n\n{previous}"))).unwrap_or(draft);
+                    vec![Action::HomeFillDraft(format!("{base}\n\n{prompt}"))]
+                },
+                selected.is_some_and(|(selected_id, _, _, _)| selected_id == id), false)
+        }).collect();
+        let presets = self.bounded_wrap(choices);
+        let feedback = match selected {
+            Some((_, label, _, _)) if appended_template.is_some() => format!("已选「{label}」，保留原草稿；点开始执行"),
+            Some((_, label, _, _)) => format!("已选「{label}」，可修改内容后点开始"),
+            None if !draft.is_empty() => "已保留草稿；选择场景可追加要求，再点开始".into(),
+            None => "选一个场景填入草稿，或直接输入事项".into(),
         };
+        let footer = self.vstack(S2, vec![self.divider(), self.bounded_wrap(vec![
+            self.button_icon("home-new-gui", if draft.is_empty() { "操作手机" } else { "手机执行" }, UiIcon::Smartphone,
+                Action::HomeRunGuiCommand, Btn::Ghost),
+            self.button_icon("home-new-work", if draft.is_empty() { "文档工作台" } else { "生成文档" }, UiIcon::File,
+                Action::HomeRunWorkCommand, Btn::Ghost),
+            self.button_icon("home-preset-review", "日终复盘", UiIcon::Activity,
+                Action::Context(crate::ui::context_state::ContextAction::Period(
+                    stepx_companion::context_ledger::Period::Day)), Btn::Ghost),
+        ])]);
 
         let mut sections = vec![header];
+        let preset_section = self.vstack(S2, vec![
+            self.text(feedback, CAPTION, if selected.is_some() { p.accent } else { p.text2 }),
+            presets,
+        ]);
         if profile.columns >= 2 && eff_h != HomeModuleHeight::Compact {
             sections.push(self.responsive_columns(
-                620.,
-                S2,
-                S2,
-                CrossAxisAlignment::Center,
-                vec![(1.15, composer), (1.0, presets)],
+                620., S3, S2, CrossAxisAlignment::Start,
+                vec![(1.15, composer), (1., preset_section)],
             ));
         } else {
             sections.push(composer);
-            sections.push(presets);
+            sections.push(preset_section);
         }
         if let Some(result) = self.agent_result(true) {
             sections.push(result);
         }
-        self.panel(sections)
+        self.home_frame_with_footer(HomeModuleId::QuickStartRequest, sections, Some(footer))
     }
 
     pub(in crate::ui) fn render_home_continuity(&self) -> El {
@@ -2118,7 +2010,7 @@ impl Companion {
                 ),
             ));
         }
-        let panel = self.panel(children);
+        let panel = self.home_frame(HomeModuleId::ContinuityWorkspace, children);
         #[cfg(test)]
         let panel = SavePosition::new(panel, "continuity-panel").finish();
         panel

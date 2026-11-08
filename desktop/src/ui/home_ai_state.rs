@@ -672,6 +672,12 @@ mod tests {
         app.home_tools_expanded = true;
         app.home_modules
             .apply_preset(crate::ui::pages::home::HomeModulePreset::CompleteAll);
+        // Exercise the optional dial explicitly; narrow standard cards use compact metrics.
+        app.home_modules.set_module_size(
+            crate::ui::pages::home::HomeModuleId::PulseAndKpi,
+            crate::ui::pages::home::HomeModuleWidth::Full,
+            crate::ui::pages::home::HomeModuleHeight::Tall,
+        );
         let _ = app.home_page();
         let pending = app.svg_slots.take_pending();
         let slots: std::collections::HashSet<_> = pending.iter().map(|(slot, _, _)| slot.as_str()).collect();
@@ -706,6 +712,12 @@ mod tests {
             ..Default::default()
         });
         app.context.overview.evidence_count = 4;
+        // Exercise the optional dial explicitly; narrow standard cards use compact metrics.
+        app.home_modules.set_module_size(
+            crate::ui::pages::home::HomeModuleId::PulseAndKpi,
+            crate::ui::pages::home::HomeModuleWidth::Full,
+            crate::ui::pages::home::HomeModuleHeight::Tall,
+        );
         let _ = app.home_page();
         let _ = app.overview_page();
         let _ = app.gallery_page();

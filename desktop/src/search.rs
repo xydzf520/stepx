@@ -80,6 +80,12 @@ pub fn find(docs: &[Document], query: &str, kind: Option<Kind>, phone: Option<bo
     find_indices(docs, query, kind, phone, 0..docs.len())
 }
 
+/// Opening global search browses real files. Explicit type filters and typed
+/// queries still search their full scope, including functional destinations.
+pub fn browsing_files(query: &str, kind: Option<Kind>) -> bool {
+    query.trim().is_empty() && kind.is_none()
+}
+
 pub(crate) fn find_indices(docs: &[Document], query: &str, kind: Option<Kind>, phone: Option<bool>, indices: impl Iterator<Item=usize>) -> Vec<Hit> {
     let query = query.trim().to_lowercase();
     use chrono::{Datelike, TimeZone};
@@ -123,6 +129,12 @@ pub(crate) fn find_indices(docs: &[Document], query: &str, kind: Option<Kind>, p
         if kind.is_some_and(|k| k != d.kind) || phone.is_some_and(|p| p != d.phone) {
             continue;
         }
+        if browsing_files(&query, kind)
+            && !matches!(d.kind, Kind::File | Kind::Image)
+            && !(d.kind == Kind::Work && d.id.starts_with("local:"))
+        {
+            continue;
+        }
         if date_range.is_some_and(|(a, b)| d.at < a || d.at >= b) {
             continue;
         }
@@ -142,11 +154,7 @@ pub(crate) fn find_indices(docs: &[Document], query: &str, kind: Option<Kind>, p
             continue;
         }
         let score = if query.is_empty() {
-            ["page:Sms", "page:Amoo", "page:Calendar", "page:Files"]
-                .iter()
-                .position(|id| *id == d.id)
-                .map(|i| 1000 - i as u32)
-                .unwrap_or(0)
+            0
         } else if title == query {
             1000
         } else if title.starts_with(&query) {
@@ -408,6 +416,29 @@ mod tests {
             source: "微信".into(),
             at: 1,
         }
+    }
+    #[test]
+    fn blank_search_lists_real_files_newest_first_and_respects_source() {
+        let make = |id: &str, kind, phone, at| Document {
+            id: id.into(), kind, phone, title: "项目方案".into(),
+            body: String::new(), source: String::new(), at,
+        };
+        let docs = vec![
+            make("page:Files", Kind::Function, false, 999),
+            make("message:1", Kind::Message, true, 998),
+            make("local:report.pdf", Kind::File, false, 100),
+            make("phone:photo.png", Kind::Image, true, 200),
+            make("local:draft.docx", Kind::Work, false, 150),
+            make("studio:1", Kind::Work, false, 997),
+        ];
+        let indices = |query, kind, phone| find(&docs, query, kind, phone)
+            .iter().map(|hit| hit.index).collect::<Vec<_>>();
+        assert_eq!(indices("  ", None, None), vec![3, 4, 2]);
+        assert_eq!(indices("", None, Some(true)), vec![3]);
+        assert_eq!(indices("", None, Some(false)), vec![4, 2]);
+        assert_eq!(indices("", Some(Kind::Message), None), vec![1]);
+        assert_eq!(indices("项目方案", None, None).len(), docs.len(),
+            "typing must restore all categories, including messages and functions");
     }
     #[test]
     fn exact_title_beats_body_and_preserves_unicode() {

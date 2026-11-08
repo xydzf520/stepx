@@ -248,19 +248,19 @@ fn home_ui_actions_update_companion_state_accurately() {
     let prev_sms_len = app.sms.len();
     assert!(app.apply_home_action(
         &Action::HomeQuickSmsReply {
-            number: "13800138000".into(),
+            number: "13800009367".into(),
             body: "放门口即可，谢谢".into(),
         },
         None,
     ));
-    assert_eq!(app.fields[F_SMS_TO].text, "13800138000");
+    assert_eq!(app.fields[F_SMS_TO].text, "13800009367");
     assert_eq!(app.fields[F_SMS_BODY].text, "放门口即可，谢谢");
     assert_eq!(app.sms.len(), prev_sms_len + 1);
     let last_sms = app.sms.last().expect("outgoing SMS recorded");
-    assert_eq!(last_sms.address, "13800138000");
+    assert_eq!(last_sms.address, "13800009367");
     assert_eq!(last_sms.body, "放门口即可，谢谢");
     assert!(last_sms.outgoing);
-    assert!(app.status.contains("演示：已模拟回复短信至 13800138000"));
+    assert!(app.status.contains("演示：已模拟回复短信至 13800009367"));
 
     // 3. Action::HomeSubmitCommand routes natural-language commands via classify_command_intent
     // 3a. BackScreen status command also synthesizes LED glyph frame immediately
@@ -562,7 +562,8 @@ fn home_renders_in_dark_theme_and_with_empty_phone_data() {
     app.back_screen.stepos_suite.wellbeing.top_apps.clear();
     let _ = app.home_page();
     let light: Vec<_> = app.svg_slots.take_pending();
-    assert!(light.iter().any(|(slot, _, _)| slot == "dial"));
+    assert!(!light.iter().any(|(slot, _, _)| slot == "dial"),
+        "narrow telemetry prioritizes statistics instead of stacking a large dial");
     assert!(light.iter().any(|(slot, _, _)| slot == "usage-donut"));
     assert_eq!(
         light
@@ -1019,7 +1020,7 @@ fn home_calendar_date_selection_updates_panorama_weekly_bars_and_context_life_ca
     app.home_modules.apply_preset(HomeModulePreset::CompleteAll);
     let _ = app.home_page();
     let slots = app.svg_slots.take_pending();
-    for fixed in ["dial", "usage-donut"] {
+    for fixed in ["usage-donut"] {
         assert!(
             slots.iter().any(|(slot, _, _)| slot == fixed),
             "missing fixed SVG chart {fixed}"
@@ -2490,7 +2491,7 @@ fn office_layout_is_calendar_first_compact_and_preserves_later_customization() {
 }
 
 #[test]
-fn home_lone_custom_card_fills_row_without_overwriting_saved_width() {
+fn home_lone_custom_card_fills_row_without_changing_saved_span() {
     struct HomeOnly(Companion);
     impl facloud_ui::Entity for HomeOnly { type Event = (); }
     impl facloud_ui::View for HomeOnly {
@@ -2524,8 +2525,9 @@ fn home_lone_custom_card_fills_row_without_overwriting_saved_width() {
                 let measured_width = registry.borrow().card_rects[&HomeModuleId::WeatherModule].width();
                 measured_width
             });
-            if paired {
-                assert!(width > 300. && width < 450., "paired card respects 1/3 width: {width}");
+            if viewport >= 760. && paired {
+                let expected = layout_config::home_grid_span_width(viewport, S3, 4.);
+                assert!((width - expected).abs() < 1., "actual 1/3 width, paired={paired}: {width}/{expected}");
             } else {
                 assert!((width - viewport).abs() < 1., "lone card fills available row: {width}/{viewport}");
             }
@@ -2546,7 +2548,7 @@ fn home_density_uses_current_canvas_space_and_never_promotes_for_background_arri
     for id in HomeModuleId::ALL {
         assert_eq!(app.home_module_available_width(id), 722., "narrow canvas stacks {id:?}");
         assert_eq!(app.resolve_effective_height(id, HomeModuleHeight::Auto), HomeModuleHeight::Compact);
-        assert_eq!(app.resolve_effective_height(id, HomeModuleHeight::Standard), HomeModuleHeight::Compact);
+        assert_eq!(app.resolve_effective_height(id, HomeModuleHeight::Standard), HomeModuleHeight::Standard);
         assert_eq!(app.resolve_effective_height(id, HomeModuleHeight::Tall), HomeModuleHeight::Tall);
     }
     app.workspace.viewport = vec2f(1440., 900.);
@@ -2555,18 +2557,18 @@ fn home_density_uses_current_canvas_space_and_never_promotes_for_background_arri
     let continuation = app.home_module_available_width(HomeModuleId::ContinuityWorkspace);
     let quick = app.home_module_available_width(HomeModuleId::QuickStartRequest);
     assert!((continuation + quick + S3 - full).abs() < 0.1);
-    assert!((continuation / quick - 2.).abs() < 0.01);
+    assert!(((continuation + S3) / (quick + S3) - 2.).abs() < 0.01);
     app.init_demo_push();
     for id in HomeModuleId::ALL {
         assert_eq!(app.resolve_effective_height(id, HomeModuleHeight::Auto), HomeModuleHeight::Standard);
         assert!(app.compute_home_module_value_profile(id, HomeModuleWidth::Full, HomeModuleHeight::Auto).max_items > 0);
     }
     assert_eq!(app.home_module_content_width(HomeModuleId::QuickStartRequest), HomeModuleWidth::OneThird);
-    // Moving to its own row immediately gives the card a full content budget;
-    // no previous-frame pointer registry rectangle is used.
+    // A lone card uses its row; the saved span survives for later pairing.
     app.home_modules.enabled = vec![HomeModuleId::QuickStartRequest];
     assert_eq!(app.home_module_available_width(HomeModuleId::QuickStartRequest), full);
     assert_eq!(app.home_module_content_width(HomeModuleId::QuickStartRequest), HomeModuleWidth::Full);
+    assert_eq!(app.home_modules.module_width(HomeModuleId::QuickStartRequest), HomeModuleWidth::OneThird);
     assert!(HomeModuleHeight::Tall.min_card_height().is_none());
 }
 
@@ -2584,11 +2586,10 @@ fn home_width_budget_matches_packed_rows_for_custom_layouts_without_cached_rects
             app.workspace.viewport = vec2f(viewport, 900.);
             let content = home_canvas_content_width(viewport);
             for row in app.home_modules.pack_rows() {
-                let stacked = row.len() == 1 || content < if row.len() >= 3 { 1040. } else { 760. };
-                let total: f32 = row.iter().map(|(_, width, _)| width.flex_weight()).sum();
+                let stacked = content < if row.len() >= 3 { 1040. } else { 760. };
                 for (id, width, _) in &row {
-                    let expected = if stacked { content } else {
-                        (content - S3 * (row.len() - 1) as f32) * width.flex_weight() / total
+                    let expected = if stacked || row.len() == 1 { content } else {
+                        layout_config::home_grid_span_width(content, S3, width.flex_weight())
                     };
                     assert!((app.home_module_available_width(*id) - expected).abs() < 0.01,
                         "packing mismatch at viewport {viewport}, row {row:?}, module {id:?}");
@@ -3225,10 +3226,10 @@ fn home_real_mode_interactions_and_frame_budget_regression() {
         ..Default::default()
     });
     noisy_snap.threads.push(stepx_companion::push::ImThread {
-        thread_id: "com.android.server.telecom::184 6667 5517".into(),
+        thread_id: "com.android.server.telecom::138 0000 6424".into(),
         package_name: "com.android.server.telecom".into(),
         app_name: "更多社交".into(),
-        title: "184 6667 5517".into(),
+        title: "138 0000 6424".into(),
         last_message: "上海 移动".into(),
         last_timestamp_ms: 1775021100000,
         unread_count: 1,
@@ -3241,7 +3242,7 @@ fn home_real_mode_interactions_and_frame_budget_regression() {
     let telecom_and_dianping_dumpsys = r#"
   NotificationRecord(0x01: pkg=com.android.server.telecom user=UserHandle{0} id=1 tag=missed_call importance=3 key=0|com.android.server.telecom|1|missed_call|1000: Notification(channel=phone_missed_call flags=0x10 category=missed_call))
     extras={
-      android.title=String (184 6667 5517)
+      android.title=String (138 0000 6424)
       android.text=String (上海 移动)
     }
     postTime=1775021100000

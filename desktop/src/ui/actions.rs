@@ -2311,6 +2311,7 @@ impl Companion {
             | Action::HomeResumeTask(_)
             | Action::HomeShowHistory
             | Action::HomeOpenTaskOutput { .. }
+            | Action::HomeFillDraft(_)
             | Action::HomeSubmitCommand
             | Action::HomeRunGuiCommand
             | Action::HomeRunWorkCommand

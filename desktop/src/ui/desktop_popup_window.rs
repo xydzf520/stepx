@@ -410,9 +410,30 @@ impl Companion {
         RectF::new(vec2f(x, y), vec2f(width, height))
     }
 
+    fn cancel_home_gesture_on_window_deactivation(&mut self, was_active: bool, is_active: bool) -> bool {
+        if !was_active || is_active {
+            return false;
+        }
+        let mut registry = self.home_pointer_registry.borrow_mut();
+        if registry.active_op.take().is_none() {
+            return false;
+        }
+        // A release can be delivered to another application after Alt-Tab.
+        // Discard only that unfinished gesture; never save or cancel the
+        // user's layout draft, text input, or desktop notification state.
+        registry.pointer_redraw_due = None;
+        registry.edit_feedback = Some("已取消移动或缩放，布局草稿已保留".into());
+        self.home_pending_move = None;
+        true
+    }
+
     pub(crate) fn sync_desktop_popup_window(&mut self, ctx: &mut ViewContext<Self>) {
+        let was_main_active = self.desktop_popup.main_window_active;
         self.desktop_popup.main_window_active =
             !self.settings.hidden && ctx.windows().active_window() == Some(ctx.window_id());
+        if self.cancel_home_gesture_on_window_deactivation(was_main_active, self.desktop_popup.main_window_active) {
+            ctx.notify();
+        }
         // Clicking back into another window ends an empty reply session. A
         // stale editor flag must not pin an old card over later verification codes.
         if self.desktop_popup.reply_focused && self.fields[F_TOAST_REPLY].preedit.is_empty() {
@@ -597,6 +618,103 @@ impl Companion {
 mod tests {
     use super::*;
     use crate::ui::notification_center_state::UnifiedNotificationItem;
+
+    #[test]
+    fn main_window_deactivation_cancels_only_incomplete_home_gesture() {
+        use crate::ui::pages::home::{HomeModuleHeight, HomeModuleId, HomeModuleWidth, HomePointerOp};
+
+        let module = HomeModuleId::RecentFiles;
+        let operations = [
+            HomePointerOp::DragModule {
+                source: module, start_pos: vec2f(20., 20.), current_pos: vec2f(220., 120.),
+                hover_target: Some(HomeModuleId::CalendarPanorama), moved: true,
+            },
+            HomePointerOp::ResizeModule {
+                module, start_pos: vec2f(20., 20.), current_pos: vec2f(220., 120.),
+                start_rect: RectF::new(vec2f(0., 0.), vec2f(480., 280.)), start_row_width: 1000.,
+                initial_width: HomeModuleWidth::OneHalf, initial_height: HomeModuleHeight::Standard,
+                preview_width: HomeModuleWidth::Full, preview_height: HomeModuleHeight::Tall, moved: true,
+            },
+        ];
+        for operation in operations {
+            let mut app = Companion::new_for_test();
+            app.page = Page::Home;
+            app.home_module_edit_mode = true;
+            let original = app.home_modules.clone();
+            app.home_pointer_registry.borrow_mut().begin_edit(&original);
+            app.home_modules.set_module_size(module, HomeModuleWidth::OneThird, HomeModuleHeight::Compact);
+            let draft = app.home_modules.clone();
+            assert_ne!(draft, original);
+            let redraw_due = std::time::Instant::now();
+            {
+                let mut registry = app.home_pointer_registry.borrow_mut();
+                registry.record_edit(original.clone(), &draft);
+                registry.active_op = Some(operation.clone());
+                registry.pointer_redraw_due = Some(redraw_due);
+            }
+            app.home_pending_move = Some(module);
+            app.focus = Some(F_AMOO);
+            app.fields[F_AMOO].set("保留主窗草稿");
+            app.fields[F_AMOO].preedit = "zhong".into();
+            app.fields[F_TOAST_REPLY].set("保留弹窗回复");
+            app.desktop_popup.reply_focused = true;
+            let item = fixture();
+            app.notification_center.items = vec![item.clone()];
+            app.notification_center.popup_queue.push_back(item.id.clone());
+            app.notification_center.active_popup_id = Some(item.id.clone());
+            app.settings.notify_draft.popup_mode = stepx_companion::desktop_notify::PopupMode::FullReply;
+            let notify_draft = serde_json::to_value(&app.settings.notify_draft).unwrap();
+            let preferences = serde_json::to_value(&app.push.prefs).unwrap();
+
+            for (was_active, is_active) in [(false, false), (false, true), (true, true)] {
+                assert!(!app.cancel_home_gesture_on_window_deactivation(was_active, is_active));
+                let registry = app.home_pointer_registry.borrow();
+                assert_eq!(registry.active_op.as_ref(), Some(&operation));
+                assert_eq!(registry.pointer_redraw_due, Some(redraw_due));
+            }
+            assert!(app.cancel_home_gesture_on_window_deactivation(true, false));
+            {
+                let registry = app.home_pointer_registry.borrow();
+                assert!(registry.active_op.is_none());
+                assert!(registry.pointer_redraw_due.is_none());
+                assert_eq!(registry.edit_original.as_ref(), Some(&original));
+                assert_eq!(registry.edit_undo, vec![original]);
+                assert!(registry.edit_feedback.as_deref().unwrap().contains("草稿已保留"));
+            }
+            assert!(app.home_pending_move.is_none());
+            assert!(app.home_module_edit_mode);
+            assert_eq!(app.home_modules, draft);
+            assert_eq!(app.focus, Some(F_AMOO));
+            assert_eq!(app.fields[F_AMOO].text, "保留主窗草稿");
+            assert_eq!(app.fields[F_AMOO].preedit, "zhong");
+            assert_eq!(app.fields[F_TOAST_REPLY].text, "保留弹窗回复");
+            assert!(app.desktop_popup.reply_focused);
+            assert_eq!(app.notification_center.active_popup_id.as_ref(), Some(&item.id));
+            assert_eq!(app.notification_center.popup_queue.front(), Some(&item.id));
+            assert_eq!(app.notification_center.items.len(), 1);
+            assert_eq!(serde_json::to_value(&app.settings.notify_draft).unwrap(), notify_draft);
+            assert_eq!(serde_json::to_value(&app.push.prefs).unwrap(), preferences);
+        }
+    }
+
+    #[test]
+    fn main_window_deactivation_without_pointer_gesture_keeps_click_move_and_editor() {
+        use crate::ui::pages::home::HomeModuleId;
+
+        let mut app = Companion::new_for_test();
+        app.home_module_edit_mode = true;
+        app.home_pending_move = Some(HomeModuleId::RecentFiles);
+        app.home_pointer_registry.borrow_mut().begin_edit(&app.home_modules);
+        app.home_pointer_registry.borrow_mut().edit_feedback = Some("请选择移动位置".into());
+        let original = app.home_modules.clone();
+        assert!(!app.cancel_home_gesture_on_window_deactivation(true, false));
+        assert_eq!(app.home_pending_move, Some(HomeModuleId::RecentFiles));
+        assert!(app.home_module_edit_mode);
+        assert_eq!(app.home_modules, original);
+        let registry = app.home_pointer_registry.borrow();
+        assert_eq!(registry.edit_original.as_ref(), Some(&original));
+        assert_eq!(registry.edit_feedback.as_deref(), Some("请选择移动位置"));
+    }
 
     #[test]
     fn popup_submit_snapshots_enter_and_button_drafts_and_preserves_later_input() {

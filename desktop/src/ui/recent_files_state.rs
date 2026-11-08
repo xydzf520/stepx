@@ -219,7 +219,10 @@ impl Companion {
         }
         // The module updates while other pages/AI jobs are active. No disk walk in render/tick.
         {
-            if !self.recent_files.desktop_busy
+            // Demo/catalogue captures must never discover the host's private
+            // directories or replace explicit fixtures with background scans.
+            if !self.demo_mode
+                && !self.recent_files.desktop_busy
                 && self
                     .recent_files
                     .desktop_at
@@ -549,15 +552,22 @@ impl Companion {
                 Btn::Secondary,
             ));
         }
-        let visible = state.visible(if home { if compact { 2 } else { home_profile.max_items } } else { usize::MAX });
+        // A compact, wide card is a small file shelf, not two stretched rows.
+        // Keep two actual rows of information at either width; discovery order
+        // remains unchanged when resizing and filters still apply before limits.
+        let compact_columns = if home && self.home_module_available_width(HomeModuleId::RecentFiles) >= 932. { 2 } else { 1 };
+        let home_limit = if compact { compact_columns * 2 } else { home_profile.max_items };
+        let visible = state.visible(if home { home_limit } else { usize::MAX });
         let page_key = format!("recent-files:{}:{:?}",state.source,state.kind);
-        let range = if home {0..visible.len().min(if compact { 2 } else { home_profile.max_items })} else {self.list_page_range(&page_key,visible.len(),20)};
+        let range = if home {0..visible.len().min(home_limit)} else {self.list_page_range(&page_key,visible.len(),20)};
         if !home { body.push(self.list_page_controls(&page_key,visible.len(),20)); }
         if visible.is_empty() {
             let hint = if state.source == 2 && self.selected.is_none() {
                 "连接手机后，最近下载、拍摄和收到的文件会出现在这里"
             } else if state.desktop_busy && state.desktop.is_empty() {
                 "正在发现最近文件…"
+            } else if state.kind.is_some() || state.source != 0 {
+                "当前筛选下没有文件，试试其他来源或文件类型。"
             } else {
                 "这里还没有文件。保存到下载、文档、图片文件夹，或添加你常用的导出目录。"
             };
@@ -620,13 +630,15 @@ impl Companion {
                     ),
                 ],
             );
-            let open = self.icon_action(
+            let open = self.button_icon(
                 format!("recent-open-{index}"),
-                "打开文件",
+                "打开",
                 UiIcon::ExternalLink,
-                vec![action(RecentFilesAction::Open(id.clone()))],
-                false,
+                action(RecentFilesAction::Open(id.clone())),
+                Btn::Ghost,
             );
+            #[cfg(test)]
+            let open = SavePosition::new(open, &format!("recent-test-open-{index}")).finish();
             let transfer = if state.operation.is_some() {
                 self.disabled_button(if state.operation.as_ref() == Some(&id) { "处理中…" } else { "请稍候" })
             } else {
@@ -646,6 +658,8 @@ impl Companion {
                     Btn::Secondary,
                 )
             };
+            #[cfg(test)]
+            let transfer = SavePosition::new(transfer, &format!("recent-test-transfer-{index}")).finish();
             let mut controls = vec![open];
             if !phone {
                 controls.push(self.icon_action(
@@ -669,13 +683,13 @@ impl Companion {
             let content = super::scenario_check::control(format!("recent-file-{index}"), content);
             let card = if compact {
                 self.responsive_columns(
-                    480.,
+                    640.,
                     S2,
                     S1,
                     CrossAxisAlignment::Center,
                     vec![
-                        (2., content),
-                        (1., Align::new(self.hstack(S1, controls)).right().finish()),
+                        (1.4, content),
+                        (1., Align::new(self.bounded_wrap(controls)).right().finish()),
                     ],
                 )
             } else { self.vstack(
@@ -698,23 +712,20 @@ impl Companion {
                     ]),
                 ],
             ) };
-            rows.push(
-                Container::new(card)
-                    .with_uniform_padding(S2)
-                    .with_border(Border::all(1.).with_border_color(p.border))
-                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
-                    .finish(),
-            );
+            let card = Container::new(card)
+                .with_uniform_padding(S2)
+                .with_border(Border::all(1.).with_border_color(p.border))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+                .finish();
+            #[cfg(test)]
+            let card = SavePosition::new(card, &format!("recent-test-file-{index}")).finish();
+            rows.push(card);
         }
         let mut iter = rows.into_iter();
         while let Some(a) = iter.next() {
-            if compact {
-                body.push(a);
-                continue;
-            }
             if let Some(b) = iter.next() {
                 body.push(self.responsive_columns(
-                    680.,
+                    if compact { 900. } else { 680. },
                     S2,
                     S2,
                     CrossAxisAlignment::Stretch,
@@ -737,16 +748,21 @@ impl Companion {
         };
         let mut footer = vec![];
         if state.receipt.is_some() {
-            footer.push(self.icon_action(
+            footer.push(self.button_icon(
                 "recent-receipt",
-                "打开接收位置",
+                "接收位置",
                 UiIcon::Folder,
-                vec![action(RecentFilesAction::OpenReceipt)],
-                false,
+                action(RecentFilesAction::OpenReceipt),
+                Btn::Ghost,
             ));
         }
-        body.push(self.between(self.line(status, MICRO, p.text2), self.hstack(S1, footer)));
-        self.panel(body)
+        let footer = self.between(self.line(status, MICRO, p.text2), self.hstack(S1, footer));
+        if self.page == Page::Home {
+            self.home_frame_with_footer(pages::home::HomeModuleId::RecentFiles, body, Some(footer))
+        } else {
+            body.push(footer);
+            self.panel(body)
+        }
     }
     #[cfg(feature = "ui-capture")]
     pub(super) fn recent_files_diagnostics(&self) -> serde_json::Value {
@@ -793,6 +809,59 @@ mod layout_tests {
             ).top_left().finish()).finish()
         }
     }
+    #[test]
+    fn compact_files_use_wide_space_without_overlapping_actions() {
+        facloud_ui::App::test((), |mut app| async move {
+            for width in [300., 420., 720., 1000., 1420.] {
+                let mut companion = Companion::new_for_test();
+                companion.page = Page::Home;
+                companion.workspace.viewport = vec2f(width + 278., 900.);
+                companion.home_modules.enabled = vec![HomeModuleId::RecentFiles];
+                companion.home_modules.set_module_size(HomeModuleId::RecentFiles,
+                    HomeModuleWidth::Full, HomeModuleHeight::Compact);
+                companion.recent_files.desktop = (0..8).map(|index| RecentFile {
+                    path: PathBuf::from(format!("/tmp/项目交付文件与详细说明-{index}.pdf")),
+                    device: None, bytes: 100, at: 10 - index, modified: 1,
+                    kind: Kind::Pdf, folder: "下载".into(), thumbnail: None,
+                }).collect();
+                companion.recent_files.phone.clear();
+                companion.recent_files.rebuild_order();
+                let (window, _) = app.add_window(facloud_ui::platform::WindowStyle::NotStealFocus,
+                    |_| RecentOnly(companion));
+                let root = app.root_view_id(window).unwrap();
+                app.update(move |ctx| {
+                    let mut presenter = facloud_ui::Presenter::new(window);
+                    presenter.invalidate(facloud_ui::WindowInvalidation {
+                        updated: std::collections::HashSet::from([root]), ..Default::default()
+                    }, ctx);
+                    presenter.build_scene(vec2f(width, 2000.), 1., None, ctx);
+                    let positions = presenter.position_cache();
+                    let first = positions.get_position("recent-test-file-0").unwrap();
+                    let second = positions.get_position("recent-test-file-1").unwrap();
+                    if width >= 1000. {
+                        assert!((first.origin().y() - second.origin().y()).abs() < 1.,
+                            "wide compact file shelf should have two columns: {first:?} / {second:?}");
+                        assert!(positions.get_position("recent-test-file-3").is_some());
+                    } else {
+                        assert!(second.origin().y() >= first.max_y(), "narrow files must stack");
+                        assert!(positions.get_position("recent-test-file-2").is_none());
+                    }
+                    for index in 0..if width >= 1000. { 4 } else { 2 } {
+                        let row = positions.get_position(&format!("recent-test-file-{index}")).unwrap();
+                        let open = positions.get_position(&format!("recent-test-open-{index}")).unwrap();
+                        let transfer = positions.get_position(&format!("recent-test-transfer-{index}")).unwrap();
+                        for control in [open, transfer] {
+                            assert!(control.origin().x() >= row.origin().x() && control.max_x() <= row.max_x()
+                                && control.max_y() <= row.max_y(), "file action outside {width}px row: {control:?} / {row:?}");
+                        }
+                        assert!(open.max_x() <= transfer.origin().x() || open.max_y() <= transfer.origin().y(),
+                            "file actions overlap at {width}px");
+                    }
+                });
+            }
+        });
+    }
+
     #[test]
     fn file_type_filters_wrap_in_narrow_home_cards() {
         facloud_ui::App::test((), |mut app| async move {

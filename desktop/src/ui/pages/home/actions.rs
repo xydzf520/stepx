@@ -498,7 +498,7 @@ impl Companion {
                     HomeModuleAction::SetModuleHeight(id, height) => {
                         self.home_modules.set_module_height(*id, *height);
                         self.status = format!(
-                            "已将「{}」高度设为 {}",
+                            "已将「{}」内容量设为 {}",
                             id.title(),
                             height.label()
                         );
@@ -506,7 +506,7 @@ impl Companion {
                     HomeModuleAction::CycleModuleHeight(id) => {
                         let next_h = self.home_modules.cycle_module_height(*id);
                         self.status = format!(
-                            "已切换「{}」高度为 {}",
+                            "已切换「{}」内容量为 {}",
                             id.title(),
                             next_h.label()
                         );
@@ -654,7 +654,7 @@ impl Companion {
                         self.status = "已取消拖拽排布".into();
                     }
                     HomeModuleAction::BeginResize(id) => {
-                        self.status = format!("正在拖拽缩放模块：「{}」", id.title());
+                        self.status = format!("「{}」：点击选择尺寸，或拖动预览宽度与内容量", id.title());
                     }
                     HomeModuleAction::CommitResize(id, width, height) => {
                         self.home_pointer_registry.borrow_mut().active_op = None;
@@ -689,6 +689,12 @@ impl Companion {
                             self.home_modules.enabled.len()
                         );
                     }
+                }
+                if self.home_module_edit_mode && (before != self.home_modules
+                    || matches!(mod_action, HomeModuleAction::ToggleClickMove(_)
+                        | HomeModuleAction::CancelClickMove | HomeModuleAction::UndoEdit))
+                {
+                    self.home_pointer_registry.borrow_mut().edit_feedback = Some(self.status.clone());
                 }
                 if !matches!(
                     mod_action,
@@ -915,6 +921,16 @@ impl Companion {
                 }
                 self.error = false;
                 self.status = if self.demo_mode { "演示：已刷新首页示例数据" } else { "正在刷新首页消息、日程与手机状态…" }.into();
+            }
+            Action::HomeFillDraft(text) => {
+                // Keep field update and focus atomic. The native window dispatches
+                // pointer actions in reverse order; separate Insert/Clear/Focus
+                // actions can clear the newly inserted draft or edit another field.
+                self.fields[F_HOME_COMMAND].set(text);
+                if let Some(ctx) = ctx.as_deref_mut() {
+                    self.focus_field(F_HOME_COMMAND, ctx);
+                    ctx.notify();
+                }
             }
             Action::HomeSubmitCommand => {
                 let cmd = self.fields[F_HOME_COMMAND].text.trim().to_string();

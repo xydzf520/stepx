@@ -4285,8 +4285,8 @@ mod tests {
         item.metric = "预计 20:30~20:50 送达".into();
         assert_eq!(Companion::live_capsule_text(&item).1, "20:30~20:50");
         item.kind = TopBarCapsuleKind::MissedCall;
-        item.title = "13800138000".into();
-        assert_eq!(Companion::live_capsule_text(&item).1, "13800138000");
+        item.title = "13800009367".into();
+        assert_eq!(Companion::live_capsule_text(&item).1, "13800009367");
         item.kind = TopBarCapsuleKind::ScheduleOrAlarm;
         item.tag = "stepx_schedule".into();
         item.pill_text = "13:30".into();
@@ -4365,7 +4365,7 @@ mod tests {
             },
             Message {
                 provider_id: Some(2),
-                address: "+8613800138000".into(),
+                address: "+8613800009367".into(),
                 body: "第一条新消息".into(),
                 date_ms: now_ms - 60_000,
                 outgoing: false,
@@ -4375,7 +4375,7 @@ mod tests {
             },
             Message {
                 provider_id: Some(3),
-                address: "13800138000".into(),
+                address: "13800009367".into(),
                 body: "同一会话第二条新消息".into(),
                 date_ms: now_ms - 30_000,
                 outgoing: false,
@@ -4398,18 +4398,18 @@ mod tests {
         // Stale thread is marked read; 2 distinct fresh threads remain
         assert_eq!(app.fresh_unread_sms_thread_count(), 2);
 
-        // Selecting 13800138000 records it in read_sms_addresses and persists across re-polls
-        app.selected_thread = Some("13800138000".into());
-        app.mark_sms_thread_read("13800138000");
+        // Selecting 13800009367 records it in read_sms_addresses and persists across re-polls
+        app.selected_thread = Some("13800009367".into());
+        app.mark_sms_thread_read("13800009367");
         assert_eq!(app.fresh_unread_sms_thread_count(), 1);
 
-        // Re-applying fresh ADB poll with read=false on 13800138000 keeps it read
+        // Re-applying fresh ADB poll with read=false on 13800009367 keeps it read
         app.selected_thread = Some("95555".into());
         app.mark_sms_thread_read("95555");
         app.apply_sms_data(Ok(vec![
             Message {
                 provider_id: Some(2),
-                address: "+8613800138000".into(),
+                address: "+8613800009367".into(),
                 body: "第一条新消息".into(),
                 date_ms: now_ms - 60_000,
                 outgoing: false,
@@ -4473,7 +4473,7 @@ mod tests {
                 thread_id: "wx_group_stepx_harbor".into(),
                 package_name: "com.tencent.mm".into(),
                 app_name: "微信".into(),
-                title: "STEPX星辰停泊港".into(),
+                title: "演示交流小组".into(),
                 last_message: "[有人@我] 窝-StepX: @倒影颠倒\u{2005}老大最近有啥新科研吗".into(),
                 last_sender: "窝-StepX".into(),
                 last_timestamp_ms: now_ms - 30_000,
@@ -4630,12 +4630,12 @@ mod tests {
         }];
         app.notification_center.items.push(
             super::notification_center_state::UnifiedNotificationItem {
-                id: "missed-call:13800138000:100".into(),
+                id: "missed-call:13800009367:100".into(),
                 package_name: "com.android.server.telecom".into(),
                 visual: super::notification_center_state::NotificationVisualKind::MissedCall,
                 source_badge: "未接来电".into(),
                 title: "李明 · 产品组".into(),
-                summary: "138 0013 8000 · 点击快速回短信".into(),
+                summary: "138 0000 9367 · 点击快速回短信".into(),
                 unread: true,
                 ..Default::default()
             },
@@ -4653,7 +4653,7 @@ mod tests {
         assert!(
             capsules
                 .iter()
-                .any(|c| c.id == "missed-call:13800138000:100" && c.domain_badge == "未接来电"),
+                .any(|c| c.id == "missed-call:13800009367:100" && c.domain_badge == "未接来电"),
             "Expected missed call capsule"
         );
 
@@ -4675,7 +4675,7 @@ mod tests {
         assert!(!after_silent.iter().any(|c| c.id == "alarm-3001"));
         assert!(!after_silent
             .iter()
-            .any(|c| c.id == "missed-call:13800138000:100"));
+            .any(|c| c.id == "missed-call:13800009367:100"));
     }
 
     #[test]

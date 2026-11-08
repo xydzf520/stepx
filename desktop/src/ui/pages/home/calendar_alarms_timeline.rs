@@ -523,6 +523,7 @@ mod month_calendar_tests {
             for (width, height) in [(390., 560.), (540., 650.), (660., 650.), (746., 650.), (1200., 900.)] {
                 let mut companion = Companion::new_for_test();
                 companion.page = Page::Home;
+                companion.home_modules.set_module_height(HomeModuleId::CalendarPanorama, HomeModuleHeight::Auto);
                 // The isolated view receives the content area, not the outer
                 // desktop shell. Density still uses the real window budget.
                 companion.workspace.viewport = vec2f(width + 278., height);
@@ -539,7 +540,7 @@ mod month_calendar_tests {
                         MonthOnly(companion)
                     });
                 let root = app.root_view_id(window_id).unwrap();
-                let (calendar, agenda, title, create, card, day_rects) = app.update(move |ctx| {
+                let (calendar, agenda, title, create, card, day_rects, number_rects) = app.update(move |ctx| {
                     let mut presenter = facloud_ui::Presenter::new(window_id);
                     presenter.invalidate(
                         facloud_ui::WindowInvalidation {
@@ -562,6 +563,7 @@ mod month_calendar_tests {
                         rect("home-month-create"),
                         rect("home-calendar-card"),
                         day_ids.iter().map(|id| rect(id)).collect::<Vec<_>>(),
+                        day_ids.iter().map(|id| rect(&id.replace("home-month-day-", "home-month-number-"))).collect::<Vec<_>>(),
                     )
                 });
                 for day in &day_rects {
@@ -571,9 +573,13 @@ mod month_calendar_tests {
                         && day.max_y() <= calendar.max_y(),
                         "day escaped its full-month grid at {width}×{height}: {day:?}");
                 }
-                let expected_cell = if height < 740. { 32. } else { 38. };
+                let expected_cell = if height < 740. { 32. } else if width >= 1100. { 46. } else { 38. };
                 assert!((day_rects[0].height() - expected_cell - 2.).abs() < 1.,
                     "calendar uses height budget: {}", day_rects[0].height());
+                for week in number_rects.chunks(7) {
+                    assert!(week.iter().all(|date| (date.origin().y() - week[0].origin().y()).abs() < 1.),
+                        "appointment previews must not shift date numbers at {width}×{height}: {week:?}");
+                }
                 if width > 700. {
                     assert!(
                         agenda.origin().x() >= calendar.max_x(),
@@ -2299,7 +2305,7 @@ impl Companion {
         );
         home_month_geometry_probe(
             "home-calendar-card",
-            self.panel(vec![
+            self.home_frame(HomeModuleId::CalendarPanorama, vec![
                 self.render_home_top_command_and_calendar_header(selected, today),
                 home_geometry_probe(
                     "home-calendar-columns",
@@ -2370,12 +2376,12 @@ impl Companion {
                     vec![Action::BackScreen(BackScreenAction::SyncCalendarAndSuite)],
                     false,
                 ),
-                self.icon_action(
+                self.button_icon(
                     "home-cal-open-page",
-                    "打开日历",
+                    "日历",
                     UiIcon::ExternalLink,
-                    vec![Action::Page(Page::Calendar)],
-                    false,
+                    Action::Page(Page::Calendar),
+                    Btn::Ghost,
                 ),
             ],
         );
@@ -2396,9 +2402,20 @@ impl Companion {
     ) -> El {
         let p = self.p();
         let module = HomeModuleId::CalendarPanorama;
-        let cell_height = match self.resolve_effective_height(module, self.home_modules.module_height(module)) {
+        let density = self.resolve_effective_height(module, self.home_modules.module_height(module));
+        let inner_width = (self.home_module_available_width(module) - S4 * 2. - 2.).max(0.);
+        let month_width = if inner_width >= 680. {
+            (inner_width - S5) * 1.25 / 2.25
+        } else { inner_width };
+        let day_width = ((month_width - 18.) / 7.).max(0.);
+        // Extra room reveals actual appointments, never larger empty cells.
+        // Narrow cards keep the complete month and the same two-domain markers.
+        let show_day_hint = density != HomeModuleHeight::Compact && day_width >= 80.;
+        let hint_budget = ((day_width - 8.) / MICRO).floor().clamp(4., 12.) as usize;
+        let cell_height = match density {
             HomeModuleHeight::Compact => 32.,
             HomeModuleHeight::Tall => 46.,
+            _ if show_day_hint => 46.,
             HomeModuleHeight::Auto | HomeModuleHeight::Standard => 38.,
         };
         let weekdays = self.grid_cols(
@@ -2423,20 +2440,36 @@ impl Companion {
                 let is_current_month =
                     date.month() == selected_date.month() && date.year() == selected_date.year();
                 let marks = day.marks;
+                let hint = show_day_hint.then(|| day.entries.iter()
+                    .find(|entry| entry.kind == MonthEntryKind::Calendar)
+                    .map(|entry| Self::truncate_chars(&entry.title, hint_budget)))
+                    .flatten();
                 let id = format!("home-month-day-{}", date.format("%Y-%m-%d"));
                 let cell = Hoverable::new(self.mouse_state(&id), move |mouse| {
                     let date_label = self.calendar_day_number(date.day(), is_today, is_selected, is_current_month);
+                    #[cfg(test)]
+                    let date_label = home_geometry_probe(
+                        format!("home-month-number-{}", date.format("%Y-%m-%d")),
+                        date_label,
+                    );
                     let markers = self.calendar_day_marks(marks);
-                    Container::new(
-                        ConstrainedBox::new(
-                            Flex::column()
-                                .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                                .with_main_axis_alignment(MainAxisAlignment::Center)
-                                .with_spacing(1.)
-                                .with_child(date_label)
-                                .with_child(markers)
+                    let mut contents = Flex::column()
+                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                        .with_main_axis_alignment(MainAxisAlignment::Center)
+                        .with_spacing(1.)
+                        .with_child(date_label)
+                        .with_child(markers);
+                    if show_day_hint {
+                        // Keep dates on one baseline even when only one day
+                        // in a week has an appointment preview.
+                        contents = contents.with_child(
+                            ConstrainedBox::new(self.line(hint.as_deref().unwrap_or(""), MICRO, p.text2))
+                                .with_height(14.)
                                 .finish(),
-                        )
+                        );
+                    }
+                    Container::new(
+                        ConstrainedBox::new(contents.finish())
                         .with_height(cell_height)
                         .finish(),
                     )
@@ -2897,7 +2930,7 @@ impl Companion {
                         .on_click(move |ctx, _, _| ctx.dispatch_typed_action(action.clone())).finish();
                     Expanded::new(1., home_geometry_probe(format!("home-weekly-day-{idx}"), cell)).finish()
                 })).finish();
-            return home_geometry_probe("home-weekly-and-ai-compact", self.panel(vec![
+            return home_geometry_probe("home-weekly-and-ai-compact", self.home_frame(HomeModuleId::WeeklyAndAi, vec![
                 header, review, self.vstack(3., vec![chart, labels]),
                 self.render_home_ai_brief_card(report),
             ]));
@@ -2907,16 +2940,15 @@ impl Companion {
             let ai_card = self.render_home_ai_brief_card(report);
             return home_geometry_probe(
                 "home-weekly-and-ai-compact",
-                self.vstack(S2, vec![weekly_card, self.panel(vec![ai_card])]),
+                self.home_surface_stack(S2, vec![weekly_card, self.home_frame(HomeModuleId::WeeklyAndAi, vec![ai_card])]),
             );
         }
         let left = self.render_home_weekly_summary_card(weekly);
         let right = self.render_home_ai_brief_panel(report);
-        self.responsive_columns(
+        self.home_aligned_columns(
             760.,
             S3,
             S3,
-            CrossAxisAlignment::Stretch,
             vec![(1.14, left), (1.0, right)],
         )
     }
@@ -3202,7 +3234,7 @@ impl Companion {
             );
             return home_geometry_probe(
                 "home-weekly-card",
-                self.panel(vec![header, chart_box, compact_peak]),
+                self.home_frame(HomeModuleId::WeeklyAndAi, vec![header, chart_box, compact_peak]),
             );
         }
 
@@ -3382,7 +3414,7 @@ impl Companion {
         );
         let card_children = vec![header, body_row, drilldown];
 
-        home_geometry_probe("home-weekly-card", self.panel(card_children))
+        home_geometry_probe("home-weekly-card", self.home_frame(HomeModuleId::WeeklyAndAi, card_children))
     }
 
     pub(in crate::ui) fn render_home_ai_brief_panel(
@@ -3391,7 +3423,7 @@ impl Companion {
     ) -> El {
         home_geometry_probe(
             "home-ai-brief-card",
-            self.panel(vec![self.render_home_ai_brief_card(report)]),
+            self.home_frame(HomeModuleId::WeeklyAndAi, vec![self.render_home_ai_brief_card(report)]),
         )
     }
 
@@ -3747,7 +3779,10 @@ impl Companion {
             }
             rows.push(row.finish());
         }
-        self.responsive_columns(360., S2, S2, CrossAxisAlignment::Start,
+        // The native constraint is the space left after card padding and any
+        // dial. Half-width cards use a readable 2×2 grid; only a genuinely
+        // wide facts area presents all four values on one row.
+        self.responsive_columns(720., S2, S2, CrossAxisAlignment::Start,
             rows.into_iter().map(|row| (1., row)).collect())
     }
 
@@ -4081,7 +4116,7 @@ impl Companion {
             .with_child(Expanded::new(1., self.vstack(4., legend_rows)).finish())
             .finish();
 
-        self.panel(vec![header, body])
+        self.home_frame(HomeModuleId::BackScreenAndHabits, vec![header, body])
     }
 
     pub(in crate::ui) fn render_home_device_and_backscreen_studio_card(
@@ -4203,7 +4238,8 @@ impl Companion {
             false,
         ));
 
-        let mut panel_children = vec![header, visual_showcase, self.wrap(sig_chips)];
+        let panel_children = vec![header, visual_showcase];
+        let mut controls = vec![self.wrap(sig_chips)];
         if eff_h == HomeModuleHeight::Tall {
             let custom_sig_row = Flex::row()
                 .with_main_axis_size(MainAxisSize::Max)
@@ -4220,10 +4256,10 @@ impl Companion {
                     Btn::Secondary,
                 ))
                 .finish();
-            panel_children.push(custom_sig_row);
+            controls.push(custom_sig_row);
         }
 
-        self.panel(panel_children)
+        self.home_frame_with_footer(HomeModuleId::BackScreenAndHabits, panel_children, Some(self.vstack(S2, controls)))
     }
 
     // =========================================================================
@@ -5244,14 +5280,21 @@ impl Companion {
         }
 
         if mod_h == HomeModuleHeight::Compact {
-            let mut compact_children = vec![header, self.vstack(6., event_rows), work_box];
-            if let Some(pomo_card) = pomo_card_opt {
-                compact_children.push(pomo_card);
+            let mut compact_children = vec![header, self.vstack(6., event_rows)];
+            if let Some(task) = task_rows.into_iter().next() {
+                compact_children.push(task);
             }
-            return self.panel(compact_children);
+            let mut footer = vec![work_box];
+            if let Some(pomo_card) = pomo_card_opt {
+                footer.push(pomo_card);
+            }
+            return self.home_frame_with_footer(HomeModuleId::WorkModule,
+                compact_children, Some(self.vstack(S2, footer)));
         }
 
-        if matches!(mod_w, HomeModuleWidth::TwoThirds | HomeModuleWidth::Full) {
+        // Use the same pixel threshold as the body, not a width enum that
+        // describes a different range and then unexpectedly stacks the children.
+        if self.home_module_available_width(HomeModuleId::WorkModule) - S4 * 2. - 2. >= 740. {
             let mut left_parts = vec![quick_create_row, self.vstack(6., event_rows)];
             if !checklist_cards.is_empty() {
                 left_parts.push(self.vstack(6., checklist_cards));
@@ -5318,7 +5361,7 @@ impl Companion {
                 CrossAxisAlignment::Start,
                 vec![(1.08, left_col), (1.0, right_col)],
             );
-            return self.panel(vec![header, split_body]);
+            return self.home_frame(HomeModuleId::WorkModule, vec![header, split_body]);
         }
 
         let mut panel_children = vec![header, quick_create_row, self.vstack(6., event_rows)];
@@ -5328,12 +5371,13 @@ impl Companion {
         if !task_rows.is_empty() {
             panel_children.push(self.vstack(6., task_rows));
         }
-        panel_children.push(work_box);
+        let mut footer = vec![work_box];
         if let Some(pomo_card) = pomo_card_opt {
-            panel_children.push(pomo_card);
+            footer.push(pomo_card);
         }
 
-        self.panel(panel_children)
+        self.home_frame_with_footer(HomeModuleId::WorkModule, panel_children,
+            Some(self.vstack(S2, footer)))
     }
 
     // =========================================================================
@@ -5350,7 +5394,10 @@ impl Companion {
         let stats = self.render_home_kpi_tiles(report);
         #[cfg(test)]
         let stats = SavePosition::new(stats, "home-pulse-stats").finish();
-        let body = if mod_h == HomeModuleHeight::Compact {
+        let show_dial = mod_h == HomeModuleHeight::Tall
+            || (mod_h != HomeModuleHeight::Compact
+                && self.home_module_available_width(HomeModuleId::PulseAndKpi) - S4 * 2. - 2. >= 560.);
+        let body = if !show_dial {
             stats
         } else {
             let dial = Align::new(self.fixed_w(162., self.render_home_day_dial())).finish();
@@ -5364,7 +5411,7 @@ impl Companion {
             let today = now.date_naive();
             children.push(self.render_home_day_timeline_inner(report, today, today));
         }
-        let panel = self.panel(children);
+        let panel = self.home_frame(HomeModuleId::PulseAndKpi, children);
         #[cfg(test)]
         let panel = SavePosition::new(panel, "home-pulse-panel").finish();
         panel
@@ -5578,37 +5625,16 @@ impl Companion {
             Action::BackScreen(BackScreenAction::McpToggleDnd),
         );
 
-        if mod_h == HomeModuleHeight::Compact {
-            return home_month_geometry_probe(
-                "home-alarms-card",
-                self.panel(vec![header, self.vstack(S2, alarm_grid_rows), dnd_cell]),
-            );
+        let mut sections = vec![header];
+        if mod_h != HomeModuleHeight::Compact {
+            sections.push(quick_alarm_bar);
         }
-
-        if matches!(mod_w, HomeModuleWidth::TwoThirds | HomeModuleWidth::Full) {
-            let left_col = self.vstack(S2, vec![quick_alarm_bar, self.vstack(S2, alarm_grid_rows)]);
-            let right_col = self.vstack(S2, vec![dnd_cell]);
-            let split_body = self.responsive_columns(
-                740.,
-                S2,
-                S2,
-                CrossAxisAlignment::Start,
-                vec![(1.4, left_col), (1.0, right_col)],
-            );
-            return home_month_geometry_probe(
-                "home-alarms-card",
-                self.panel(vec![header, split_body]),
-            );
-        }
-
+        sections.push(self.vstack(S2, alarm_grid_rows));
+        // DND is a footer control, not an entire empty column. Alarm times
+        // remain the focus at every width, with controls on a stable lower edge.
         home_month_geometry_probe(
             "home-alarms-card",
-            self.panel(vec![
-                header,
-                quick_alarm_bar,
-                self.vstack(S2, alarm_grid_rows),
-                dnd_cell,
-            ]),
+            self.home_frame_with_footer(HomeModuleId::AlarmsAndControl, sections, Some(dnd_cell)),
         )
     }
 
@@ -5755,6 +5781,68 @@ impl Companion {
         .with_border(Border::all(1.).with_border_color(p.border))
         .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
         .finish()
+    }
+}
+
+#[cfg(test)]
+mod kpi_layout_tests {
+    use super::*;
+
+    struct FactsOnly(Companion);
+    impl facloud_ui::Entity for FactsOnly { type Event = (); }
+    impl facloud_ui::TypedActionView for FactsOnly { type Action = (); }
+    impl facloud_ui::View for FactsOnly {
+        fn ui_name() -> &'static str { "home_kpi_actual_width_test" }
+        fn render(&self, _: &facloud_ui::AppContext) -> El {
+            let report = self.0.with_home_hub_input(
+                &self.0.push.snapshot, &self.0.express_parcels,
+                |input, _, _| build_home_hub_report(input),
+            );
+            Stack::new().with_child(
+                Align::new(self.0.render_home_kpi_tiles(&report)).top_left().finish(),
+            ).finish()
+        }
+    }
+
+    #[test]
+    fn facts_use_two_rows_until_native_area_fits_four_readable_tiles() {
+        facloud_ui::App::test((), |mut host| async move {
+            for width in [260., 358., 541., 719., 720., 900.] {
+                let mut app = Companion::new_for_test();
+                // Deliberately unrelated to actual layout constraints: moving
+                // and resizing must adapt immediately, even before state saves.
+                app.workspace.viewport = vec2f(2400., 1600.);
+                let (window, _) = host.add_window(
+                    facloud_ui::platform::WindowStyle::NotStealFocus,
+                    |_| FactsOnly(app),
+                );
+                let root = host.root_view_id(window).unwrap();
+                host.update(move |ctx| {
+                    let mut presenter = facloud_ui::Presenter::new(window);
+                    presenter.invalidate(facloud_ui::WindowInvalidation {
+                        updated: std::collections::HashSet::from([root]),
+                        ..Default::default()
+                    }, ctx);
+                    presenter.build_scene(vec2f(width, 600.), 1., None, ctx);
+                    let positions = presenter.position_cache();
+                    let tiles = ["home-kpi-messages", "home-kpi-life", "home-kpi-meetings", "home-kpi-screen"]
+                        .map(|id| positions.get_position(id).expect(id));
+                    for tile in tiles {
+                        assert!(tile.origin().x() >= 0. && tile.max_x() <= width + 1.,
+                            "tile overflows actual {width}px constraints: {tile:?}");
+                    }
+                    assert!((tiles[0].origin().y() - tiles[1].origin().y()).abs() < 1.);
+                    assert!((tiles[2].origin().y() - tiles[3].origin().y()).abs() < 1.);
+                    if width < 720. {
+                        assert!(tiles[0].max_y() <= tiles[2].origin().y(),
+                            "{width}px facts area must keep a readable 2×2 grid: {tiles:?}");
+                    } else {
+                        assert!(tiles.iter().all(|tile| (tile.origin().y() - tiles[0].origin().y()).abs() < 1.),
+                            "{width}px facts area should use one row: {tiles:?}");
+                    }
+                });
+            }
+        });
     }
 }
 

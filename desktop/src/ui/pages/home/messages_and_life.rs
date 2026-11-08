@@ -1768,14 +1768,16 @@ impl Companion {
         if matches!(mod_w, HomeModuleWidth::TwoThirds | HomeModuleWidth::Full)
             && mod_h != HomeModuleHeight::Compact
             && !issue_cards.is_empty()
+            && (!msg_rows.is_empty() || composer_box.is_some())
         {
+            // Split only when both sides contain useful information. A wide
+            // pending-work card must not reserve half its body for no messages.
             let left_col = self.vstack(5., issue_cards);
             let mut right_parts = Vec::new();
             if !msg_rows.is_empty() {
                 right_parts.push(self.vstack(5., msg_rows));
             }
             if let Some(composer) = composer_box { right_parts.push(composer); }
-            right_parts.push(all_messages);
             let right_col = self.vstack(5., right_parts);
             let split_body = self.responsive_columns(
                 740.,
@@ -1784,7 +1786,7 @@ impl Companion {
                 CrossAxisAlignment::Start,
                 vec![(1.0, left_col), (1.08, right_col)],
             );
-            return self.panel(vec![header, split_body]);
+            return self.home_frame_with_footer(HomeModuleId::IssuesAndReplyModule, vec![header, split_body], Some(all_messages));
         }
 
         if mod_h == HomeModuleHeight::Compact && mod_w == HomeModuleWidth::OneThird {
@@ -1795,8 +1797,7 @@ impl Companion {
                 compact_children.push(first_msg);
             }
             if let Some(composer) = composer_box { compact_children.push(composer); }
-            compact_children.push(all_messages);
-            return self.panel(compact_children);
+            return self.home_frame_with_footer(HomeModuleId::IssuesAndReplyModule, compact_children, Some(all_messages));
         }
 
         let mut col_children = vec![header];
@@ -1807,9 +1808,8 @@ impl Companion {
             col_children.push(self.vstack(5., msg_rows));
         }
         if let Some(composer) = composer_box { col_children.push(composer); }
-        col_children.push(all_messages);
 
-        self.panel(col_children)
+        self.home_frame_with_footer(HomeModuleId::IssuesAndReplyModule, col_children, Some(all_messages))
     }
 
     // =========================================================================
@@ -2649,7 +2649,7 @@ impl Companion {
                 compact_children.push(self.vstack(6., tracker_cards));
             }
             compact_children.push(life_context_section);
-            return self.panel(compact_children);
+            return self.home_frame(HomeModuleId::LifeModule, compact_children);
         }
 
         if matches!(mod_w, HomeModuleWidth::TwoThirds | HomeModuleWidth::Full) {
@@ -2670,7 +2670,7 @@ impl Companion {
                 CrossAxisAlignment::Start,
                 vec![(1.0, left_col), (1.05, right_col)],
             );
-            return self.panel(vec![header, split_body]);
+            return self.home_frame(HomeModuleId::LifeModule, vec![header, split_body]);
         }
 
         let mut col_children = vec![header];
@@ -2686,7 +2686,7 @@ impl Companion {
             col_children.push(life_tiles_row);
         }
 
-        self.panel(col_children)
+        self.home_frame(HomeModuleId::LifeModule, col_children)
     }
 
     // =========================================================================
@@ -2699,7 +2699,7 @@ impl Companion {
         let p = self.p();
         let w = &self.weather_snapshot;
         if !self.demo_mode && !w.from_live_api {
-            return self.panel(vec![
+            return self.home_frame(HomeModuleId::WeatherModule, vec![
                 self.between(
                     self.home_section_heading(UiIcon::Sun, "天气"),
                     self.icon_action("home-weather-refresh", "刷新天气", UiIcon::Refresh,
@@ -2888,10 +2888,7 @@ impl Companion {
             self.vstack(6., vec![left_col, right_col])
         };
 
-        self.panel(vec![
-            header,
-            body,
-            self.text(format!("{} · {}", w.source_label(), w.updated_label), MICRO, p.text3),
-        ])
+        self.home_frame_with_footer(HomeModuleId::WeatherModule, vec![header, body],
+            Some(self.text(format!("{} · {}", w.source_label(), w.updated_label), MICRO, p.text3)))
     }
 }

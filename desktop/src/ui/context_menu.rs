@@ -37,6 +37,20 @@ pub(super) struct ContextMenuEntry {
 
 fn classify_context_entry(label: &str, action: Option<&Action>) -> (icons::UiIcon, bool, u8) {
     use icons::UiIcon;
+    if let Some(Action::HomeModule(action)) = action {
+        use pages::home::HomeModuleAction as HomeAction;
+        let selected = label.starts_with("✓ ");
+        let category = match action {
+            HomeAction::SetModuleWidth(..) => Some((if selected { UiIcon::Check } else { UiIcon::Maximize }, 0)),
+            HomeAction::SetModuleHeight(..) => Some((if selected { UiIcon::Check } else { UiIcon::Layers }, 1)),
+            HomeAction::MoveUp(_) | HomeAction::MoveToTop(_) => Some((UiIcon::ArrowUp, 2)),
+            HomeAction::MoveDown(_) | HomeAction::MoveToBottom(_) => Some((UiIcon::ArrowDown, 2)),
+            HomeAction::RemoveModule(_) => Some((UiIcon::Minus, 3)),
+            HomeAction::SetEditMode(_) => Some((UiIcon::Edit, 4)),
+            _ => None,
+        };
+        if let Some((icon, group)) = category { return (icon, false, group); }
+    }
     if label.starts_with("✓ 立即过期") || label.starts_with("🧹 一键清理") {
         return (UiIcon::Check, false, 0);
     }
@@ -3330,6 +3344,25 @@ fn intent_menu_position(x: f32, y: f32, anchor_height: f32, width: f32, height: 
 #[cfg(test)]
 mod intent_tests {
     use super::*;
+    #[test]
+    fn home_module_menu_groups_size_content_order_and_reversible_hide() {
+        let app = Companion::new_for_test();
+        let entries = app.context_entries(&Menu {
+            target: Target::HomeModule(pages::home::HomeModuleId::RecentFiles),
+            at: Vector2F::new(20., 20.), text: None, selected: None,
+        });
+        assert!(entries.iter().all(|entry| entry.icon != icons::UiIcon::Tools));
+        let widths: Vec<_> = entries.iter().filter(|entry| entry.label.contains("宽度 ·")).collect();
+        assert_eq!(widths.iter().filter(|entry| entry.icon == icons::UiIcon::Check).count(), 1);
+        assert!(!widths.iter().skip(1).any(|entry| entry.separator_before), "selected width belongs to the same section");
+        let content: Vec<_> = entries.iter().filter(|entry| entry.label.contains("内容 ·")).collect();
+        assert!(content[0].separator_before);
+        assert!(!content.iter().skip(1).any(|entry| entry.separator_before));
+        let hide = entries.iter().find(|entry| entry.label == "隐藏模块").unwrap();
+        assert_eq!(hide.icon, icons::UiIcon::Minus);
+        assert!(hide.separator_before);
+        assert!(!hide.is_danger, "hiding is reversible in the module library");
+    }
     #[test]
     fn opens_below_when_room() {
         assert_eq!(

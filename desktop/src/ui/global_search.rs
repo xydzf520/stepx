@@ -117,6 +117,11 @@ impl Default for SearchState {
                     request = newer;
                 }
                 let indexed = (|| -> anyhow::Result<Vec<Hit>> {
+                    // Recent files are already in memory. Do not make opening
+                    // the popup wait for a full-text index update.
+                    if request.query.trim().is_empty() {
+                        return Ok(search::find(&request.docs, &request.query, request.kind, request.phone));
+                    }
                     let db = index.as_mut().ok_or_else(|| anyhow::anyhow!("搜索索引不可用"))?;
                     if !indexed_docs.as_ref().is_some_and(|old| std::sync::Arc::ptr_eq(old, &request.docs)) {
                         db.sync(&request.docs)?;
@@ -633,6 +638,24 @@ impl Companion {
                 "我的作品".into(),
                 w.updated,
                 Target::Studio(w.id.clone()),
+            );
+        }
+        // Reuse discovery metadata, especially the phone arrival timestamps
+        // absent from its full filename index. No extra device or disk polling.
+        for f in self.recent_files.desktop.iter().chain(self.recent_files.phone.iter()) {
+            let phone = f.device.is_some();
+            if phone && f.device.as_ref() != self.search.device.as_ref() {
+                continue;
+            }
+            add(
+                format!("{}:{}", if phone { "phone" } else { "local" }, f.path.display()),
+                if f.kind == stepx_companion::recent_files::Kind::Image { Kind::Image } else { Kind::File },
+                phone,
+                f.name(),
+                f.path.display().to_string(),
+                format!("{} · {}", f.kind.label(), f.folder),
+                f.at,
+                if phone { Target::PhoneFile(f.path.to_string_lossy().into()) } else { Target::Local(f.path.clone()) },
             );
         }
         for w in self.work.files.iter().filter(|w| !w.is_dir) {
@@ -1486,7 +1509,8 @@ impl Companion {
                 let mut lines =
                     vec![self.search_result_line(&d.title, HEADING, p.text, Weight::Semibold)];
                 if !shortcut {
-                    if !hit.snippet.trim().is_empty() {
+                    if !search::browsing_files(&self.search.applied, self.search.kind)
+                        && !hit.snippet.trim().is_empty() {
                         lines.push(self.search_result_line(
                             &hit.snippet,
                             CAPTION,
@@ -1499,10 +1523,11 @@ impl Companion {
                     } else {
                         &d.source
                     };
+                    let device = if d.phone { "手机" } else { "电脑" };
                     let meta = if d.at > 0 {
-                        format!("{source} · {}", stamp(d.at))
+                        format!("{device} · {source} · {}", stamp(d.at))
                     } else {
-                        source.to_owned()
+                        format!("{device} · {source}")
                     };
                     lines.push(self.hstack(
                         4.,
@@ -1590,10 +1615,13 @@ impl Companion {
 
     fn search_empty(&self, full: bool) -> El {
         let p = self.p();
-        let loading = self.search.filtering;
+        let files = search::browsing_files(&self.fields[F_GLOBAL_SEARCH].text, self.search.kind);
+        let loading = self.search.filtering || (files && (self.search.desktop_busy || self.search.phone_busy));
         let filtered = self.search.phone.is_some() || self.search.kind.is_some();
         let (icon, title) = if loading {
             (UiIcon::Search, "正在检索")
+        } else if files {
+            (UiIcon::Folder, "暂无最近文件")
         } else {
             (UiIcon::ScanText, "未找到匹配内容")
         };
@@ -1751,7 +1779,8 @@ impl Companion {
                     vec![
                 self.section_icon_badge(UiIcon::Search, 22., 44.),
                 Expanded::new(1., self.line_w(
-                    if query.is_empty() { "浏览已索引内容" } else { query },
+                    if search::browsing_files(query, self.search.kind) { "最近文件" }
+                    else if query.is_empty() { "浏览已索引内容" } else { query },
                     22., p.text, Weight::Semibold,
                 )).finish(),
                 self.pill_badge(count, p.text2, p.surface),
@@ -1787,7 +1816,7 @@ impl Companion {
                 ],
             ));
         }
-        if query.is_empty() && !self.search.recent.is_empty() {
+        if query.is_empty() && self.search.kind.is_some() && !self.search.recent.is_empty() {
             parts.push(self.section_heading(UiIcon::Clock, "最近搜索"));
             parts.push(self.search_recent(true));
         }
@@ -1825,8 +1854,9 @@ impl Companion {
         } else {
             (rows_height - S1).max(56.)
         };
-        let heading = if browsing && self.search.phone.is_none() && self.search.kind.is_none() {
-            "快捷入口"
+        let files = search::browsing_files(&self.fields[F_GLOBAL_SEARCH].text, self.search.kind);
+        let heading = if files {
+            "最近文件"
         } else {
             "快速结果"
         };
@@ -1844,7 +1874,7 @@ impl Companion {
             ],
         );
         let mut top = vec![header, self.search_kind_filters(false), self.divider()];
-        if browsing && !self.search.recent.is_empty() {
+        if browsing && !files && !self.search.recent.is_empty() {
             top.push(self.search_recent(false));
         }
         top.push(self.heading(heading));
@@ -1946,6 +1976,37 @@ struct SearchHeight {
 mod search_interaction_tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn recent_file_metadata_is_reused_without_cross_device_results() {
+        facloud_ui::App::test((), |mut app| async move {
+            let (_, owner) = app.add_window(facloud_ui::platform::WindowStyle::NotStealFocus,
+                |_| Companion::new_for_test());
+            owner.update(&mut app, |view, _ctx| {
+                let requests = prepare_results(view);
+                view.fields[F_GLOBAL_SEARCH].clear();
+                view.search.device = Some("current-phone".into());
+                let file = |path: &str, device: Option<&str>, at| stepx_companion::recent_files::RecentFile {
+                    path: path.into(), device: device.map(str::to_owned), at, modified: at,
+                    bytes: 1024, kind: stepx_companion::recent_files::Kind::Pdf,
+                    folder: "Download".into(), thumbnail: None,
+                };
+                view.recent_files.desktop = vec![file("/test/方案.pdf", None, 100)];
+                view.recent_files.phone = vec![
+                    file("/sdcard/Download/报告.pdf", Some("current-phone"), 200),
+                    file("/sdcard/Download/旧设备.pdf", Some("other-phone"), 300),
+                ];
+                view.rebuild_search();
+                let request = requests.try_recv().unwrap();
+                let hits = search::find(&request.docs, &request.query, request.kind, request.phone);
+                let doc = &request.docs[hits.iter().find(|h| request.docs[h.index].title == "报告.pdf").unwrap().index];
+                assert_eq!(doc.at, 200);
+                assert!(matches!(view.search.targets.get(&doc.id), Some(Target::PhoneFile(_))));
+                assert!(request.docs.iter().all(|d| d.title != "旧设备.pdf"));
+                assert!(hits.iter().all(|h| !view.search_shortcut(&request.docs[h.index])));
+            });
+        });
+    }
 
     fn prepare_results(view: &mut Companion) -> mpsc::Receiver<SearchRequest> {
         // Do not index a real user's directories or let an actual worker race

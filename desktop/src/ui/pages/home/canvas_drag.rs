@@ -73,6 +73,9 @@ pub struct HomePointerRegistry {
     pub edit_original: Option<HomeModuleLayoutConfig>,
     pub edit_undo: Vec<HomeModuleLayoutConfig>,
     pub module_library_open: bool,
+    /// Keep layout feedback beside its controls instead of letting background
+    /// synchronization overwrite the user's confirmation in the status bar.
+    pub edit_feedback: Option<String>,
     pub viewport: Option<Vector2F>,
     pub canvas_width: Option<f32>,
     pub pointer_redraw_due: Option<std::time::Instant>,
@@ -84,6 +87,7 @@ impl HomePointerRegistry {
             self.edit_original = Some(layout.clone());
             self.edit_undo.clear();
             self.module_library_open = false;
+            self.edit_feedback = None;
         }
     }
 
@@ -99,6 +103,7 @@ impl HomePointerRegistry {
         self.edit_original = None;
         self.edit_undo.clear();
         self.module_library_open = false;
+        self.edit_feedback = None;
         self.active_op = None;
         self.pointer_redraw_due = None;
     }
@@ -155,6 +160,9 @@ impl HomePointerRegistry {
     }
 
     fn content_width(&self) -> f32 {
+        if let Some(width) = self.canvas_width.filter(|width| width.is_finite() && *width > 0.) {
+            return width;
+        }
         let left = self.card_rects.values().map(|rect| rect.origin().x()).reduce(f32::min);
         let right = self.card_rects.values().map(|rect| rect.max_x()).reduce(f32::max);
         left.zip(right).map(|(left, right)| (right - left).max(120.)).unwrap_or(480.)
@@ -458,8 +466,6 @@ impl facloud_ui::Element for HomeInteractiveCanvas {
             registry.reminder_rects.clear();
         }
         self.child.paint(origin, ctx, app);
-        self.registry.borrow_mut().last_canvas_post_z = Some(ctx.scene.z_index());
-
         let reg_snapshot = self.registry.borrow();
         match reg_snapshot.active_op.clone() {
             Some(HomePointerOp::DragModule {
@@ -554,6 +560,12 @@ impl facloud_ui::Element for HomeInteractiveCanvas {
             }
             _ => {}
         }
+        drop(reg_snapshot);
+        // Cards and the preview badge can paint their own child layers. The
+        // active layer returns to this canvas afterwards; using that index
+        // would mistake another card's handle for an overlay covering a drop.
+        // Include all canvas layers, while later external overlays still block.
+        self.registry.borrow_mut().last_canvas_post_z = Some(ctx.scene.max_active_z_index());
     }
 
     fn size(&self) -> Option<Vector2F> {
@@ -656,7 +668,7 @@ impl facloud_ui::Element for HomeInteractiveCanvas {
                             moved,
                         });
                         if let Some(z) = canvas_post_z {
-                            ctx.set_cursor(Cursor::PointingHand, z);
+                            ctx.set_cursor(Cursor::ClosedHand, z);
                         }
                         if new_target != prev_target || moved != prev_moved {
                             ctx.dispatch_typed_action(Action::HomeModule(
@@ -774,6 +786,11 @@ impl facloud_ui::Element for HomeInteractiveCanvas {
                             let _ = (preview_width, preview_height);
                             ctx.dispatch_typed_action(Action::HomeModule(
                                 HomeModuleAction::CommitResize(module, final_w, final_h),
+                            ));
+                        } else {
+                            ctx.dispatch_typed_action(Action::ContextOpen(
+                                crate::ui::context_menu::Target::HomeModule(module),
+                                *position,
                             ));
                         }
                         ctx.notify();
@@ -1060,9 +1077,13 @@ impl Companion {
             } else { self.disabled_button("撤销") },
             self.button("home-mod-studio-cancel", "取消",
                 Action::HomeModule(HomeModuleAction::CancelEdit), Btn::Ghost),
-            self.button_icon("home-mod-studio-done", "完成", UiIcon::Check,
+            self.button_icon("home-mod-studio-done", "完成并保存", UiIcon::Check,
                 Action::HomeModule(HomeModuleAction::SetEditMode(false)), Btn::Primary),
-        ]), self.text("拖动模块调整位置，拖动尺寸手柄预览大小；完成后统一保存。", CAPTION, p.text2)];
+        ]), self.text("拖动或点选「移动」排序；点击「尺寸」选择宽度与内容量。独占一行时自动铺满，同排时使用所选比例。", CAPTION, p.text2)];
+        sections.push(self.line(
+            registry.edit_feedback.as_deref().unwrap_or("可随时撤销调整；隐藏的模块可从「添加」恢复。"),
+            CAPTION, if registry.edit_feedback.is_some() { p.accent } else { p.text2 },
+        ));
 
         if library_open {
             let modules = HomeModuleId::ALL.into_iter().map(|module| {
@@ -1118,7 +1139,7 @@ impl Companion {
             4.,
             vec![
                 self.ui_icon(UiIcon::Menu, 14., p.text2),
-                self.line_w(mod_id.short_title(), CAPTION, p.text, Weight::Semibold),
+                self.line_w(format!("移动 · {}", mod_id.short_title()), CAPTION, p.text, Weight::Semibold),
             ],
         ))
         .with_horizontal_padding(7.)
@@ -1137,7 +1158,7 @@ impl Companion {
         .finish();
         let drag_registry = self.home_pointer_registry.clone();
         let drag_pill_inner = Hoverable::new(self.mouse_state(format!("home-drag-press-{slug}")), move |_| drag_pill_inner)
-            .with_cursor(Cursor::PointingHand)
+            .with_cursor(Cursor::OpenHand)
             .on_mouse_down(move |ctx, _, position| {
                 drag_registry.borrow_mut().active_op = Some(HomePointerOp::DragModule {
                     source: mod_id,
@@ -1161,7 +1182,7 @@ impl Companion {
 
         let resize_pill_inner = Container::new(self.hstack(4., vec![
             self.ui_icon(UiIcon::Maximize, 14., p.text2),
-            self.line(format!("{} · {}", cur_w.short_label(), cur_h.short_label()), MICRO, p.text2),
+            self.line(format!("尺寸 {} · {}", cur_w.short_label(), cur_h.short_label()), CAPTION, p.text),
         ]))
         .with_horizontal_padding(7.)
         .with_vertical_padding(5.)
@@ -1171,7 +1192,7 @@ impl Companion {
         .finish();
         let resize_registry = self.home_pointer_registry.clone();
         let resize_pill_inner = Hoverable::new(self.mouse_state(format!("home-resize-press-{slug}")), move |_| resize_pill_inner)
-            .with_cursor(Cursor::ResizeUpDown)
+            .with_cursor(Cursor::PointingHand)
             .on_mouse_down(move |ctx, _, position| {
                 let mut registry = resize_registry.borrow_mut();
                 let start_rect = registry.card_rects.get(&mod_id).copied()
@@ -1203,24 +1224,25 @@ impl Companion {
             }),
         );
 
-        let mut actions: Vec<El> = Vec::new();
-        if let Some(source) = self.home_pending_move {
-            if source == mod_id {
-                actions.push(self.icon_action(format!("home-click-move-{slug}"), "取消移动", UiIcon::Close,
-                    vec![Action::HomeModule(HomeModuleAction::CancelClickMove)], false));
-            } else {
-                actions.push(self.chip(format!("home-drop-insert-{slug}"), "移到此处", Some(UiIcon::ArrowDown),
-                    vec![Action::HomeModule(HomeModuleAction::MoveBefore(source, mod_id))], true, false));
-            }
-        }
         let menu_position = self.home_pointer_registry.borrow().card_rects.get(&mod_id)
             .map(|rect| vec2f(rect.origin().x() + 16., rect.origin().y() + 40.))
             .unwrap_or_else(Vector2F::zero);
-        actions.push(self.icon_action(format!("home-module-menu-{slug}"), "尺寸与排序", UiIcon::MoreHorizontal,
-            vec![Action::ContextOpen(crate::ui::context_menu::Target::HomeModule(mod_id), menu_position)], false));
+        // Reuse the ordering slot in click-to-move mode. Adding another button
+        // here used to wrap narrow toolbars and move the user's target away.
+        let ordering = match self.home_pending_move {
+            Some(source) if source == mod_id => self.chip(format!("home-click-move-{slug}"),
+                "取消移动", Some(UiIcon::Close),
+                vec![Action::HomeModule(HomeModuleAction::CancelClickMove)], true, false),
+            Some(source) => self.chip(format!("home-drop-insert-{slug}"),
+                "移到此处", Some(UiIcon::ArrowDown),
+                vec![Action::HomeModule(HomeModuleAction::MoveBefore(source, mod_id))], true, false),
+            None => self.chip(format!("home-module-menu-{slug}"), "调整排序", Some(UiIcon::Menu),
+                vec![Action::ContextOpen(crate::ui::context_menu::Target::HomeModule(mod_id), menu_position)], false, false),
+        };
+        let mut actions: Vec<El> = vec![ordering];
         if total_enabled > 1 {
-            actions.push(self.icon_action(format!("home-mod-inline-hide-{slug}"), "隐藏模块，可在添加中恢复", UiIcon::Minus,
-                vec![Action::HomeModule(HomeModuleAction::RemoveModule(mod_id))], false));
+            actions.push(self.chip(format!("home-mod-inline-hide-{slug}"), "隐藏", Some(UiIcon::Minus),
+                vec![Action::HomeModule(HomeModuleAction::RemoveModule(mod_id))], false, false));
         }
         #[cfg(test)]
         let actions: Vec<El> = actions.into_iter().enumerate().map(|(i, action)|
@@ -1243,7 +1265,7 @@ impl Companion {
             || self.home_pending_move.is_some()
             || self.home_drag_active();
         let card_stack = if show_ctrl_bar {
-            self.vstack(4., vec![ctrl_bar, body])
+            self.home_surface_stack(4., vec![ctrl_bar, body])
         } else {
             body
         };
@@ -1300,6 +1322,11 @@ mod responsive_home_controls_tests {
         let module = original.enabled[0];
         edit(&mut app, HomeModuleAction::SetEditMode(true));
         edit(&mut app, HomeModuleAction::RemoveModule(module));
+        let feedback = app.home_pointer_registry.borrow().edit_feedback.clone();
+        assert!(feedback.as_ref().is_some_and(|message| message.contains("隐藏")));
+        app.status = "新消息已同步".into();
+        assert_eq!(app.home_pointer_registry.borrow().edit_feedback, feedback,
+            "background sync must not replace layout feedback");
         let hidden = app.home_modules.clone();
         assert_eq!(app.home_pointer_registry.borrow().edit_original.as_ref(), Some(&original));
         edit(&mut app, HomeModuleAction::CommitResize(module, HomeModuleWidth::OneThird, HomeModuleHeight::Compact));
@@ -1311,6 +1338,7 @@ mod responsive_home_controls_tests {
         assert!(!app.home_module_edit_mode);
         assert!(app.home_pointer_registry.borrow().edit_original.is_none());
         assert!(app.home_pointer_registry.borrow().edit_undo.is_empty());
+        assert!(app.home_pointer_registry.borrow().edit_feedback.is_none());
         assert_eq!(app.fields[F_HOME_COMMAND].text, "保留正在输入的安排");
 
         edit(&mut app, HomeModuleAction::SetEditMode(true));
@@ -1522,6 +1550,92 @@ mod responsive_home_controls_tests {
         app: Companion,
         renders: std::rc::Rc<std::cell::Cell<usize>>,
     }
+
+    struct InteractiveEditorOnly { app: Companion }
+    impl facloud_ui::Entity for InteractiveEditorOnly { type Event = (); }
+    impl facloud_ui::TypedActionView for InteractiveEditorOnly { type Action = (); }
+    impl facloud_ui::View for InteractiveEditorOnly {
+        fn ui_name() -> &'static str { "home_edit_gesture_test" }
+        fn render(&self, _: &facloud_ui::AppContext) -> El {
+            let app = &self.app;
+            let cards = [HomeModuleId::RecentFiles, HomeModuleId::WeatherModule]
+                .into_iter().enumerate().map(|(i, id)| app.wrap_module_with_edit_controls(
+                    id, i, 2, app.panel(vec![app.text("模块内容", BODY, app.p().text)])))
+                .collect();
+            Box::new(HomeInteractiveCanvas {
+                child: app.vstack(12., cards),
+                floating_badge: Some(app.panel(vec![app.text("松开以移动模块", BODY, app.p().text)])),
+                editing: true, registry: app.home_pointer_registry.clone(),
+                module_sizes: Default::default(), accent: app.p().accent, surface: app.p().card,
+                size: None, origin: None,
+            })
+        }
+    }
+
+    fn typed_actions(actions: &[facloud_ui::presenter::DispatchedAction]) -> Vec<&Action> {
+        actions.iter().filter_map(|action| match &action.kind {
+            facloud_ui::presenter::DispatchedActionKind::Typed(action) => action.as_ref().as_any().downcast_ref::<Action>(),
+            _ => None,
+        }).collect()
+    }
+
+    #[test]
+    fn home_size_click_opens_choices_while_drag_commits_and_preview_never_blocks_drop() {
+        facloud_ui::App::test((), |mut app| async move {
+            let mut companion = Companion::new_for_test();
+            companion.home_module_edit_mode = true;
+            let registry = companion.home_pointer_registry.clone();
+            let (window, _) = app.add_window(facloud_ui::platform::WindowStyle::NotStealFocus,
+                |_| InteractiveEditorOnly { app: companion });
+            let root = app.root_view_id(window).unwrap();
+            app.update(move |ctx| {
+                let mut presenter = facloud_ui::Presenter::new(window);
+                presenter.invalidate(facloud_ui::WindowInvalidation {
+                    updated: std::collections::HashSet::from([root]), ..Default::default()
+                }, ctx);
+                presenter.build_scene(vec2f(700., 800.), 1., None, ctx);
+                let rect = registry.borrow().resize_handle_rects[&HomeModuleId::RecentFiles];
+                let position = rect.origin() + rect.size() * 0.5;
+                presenter.dispatch_event(Event::LeftMouseDown { position, modifiers: Default::default(),
+                    click_count: 1, is_first_mouse: false }, ctx);
+                assert!(matches!(registry.borrow().active_op, Some(HomePointerOp::ResizeModule { moved: false, .. })));
+                let release = presenter.dispatch_event(Event::LeftMouseUp { position, modifiers: Default::default() }, ctx);
+                assert!(typed_actions(&release.actions).iter().any(|action| matches!(action,
+                    Action::ContextOpen(crate::ui::context_menu::Target::HomeModule(HomeModuleId::RecentFiles), _))),
+                    "a size click must visibly open choices rather than silently do nothing");
+                assert!(registry.borrow().active_op.is_none());
+                presenter.dispatch_event(Event::LeftMouseDown { position, modifiers: Default::default(),
+                    click_count: 1, is_first_mouse: false }, ctx);
+                let release = presenter.dispatch_event(Event::LeftMouseUp {
+                    position: position + vec2f(160., 0.), modifiers: Default::default() }, ctx);
+                assert!(typed_actions(&release.actions).iter().any(|action| matches!(action,
+                    Action::HomeModule(HomeModuleAction::CommitResize(HomeModuleId::RecentFiles, _, _)))));
+                assert!(!typed_actions(&release.actions).iter().any(|action| matches!(action, Action::ContextOpen(..))));
+
+                // The real badge clamps against the right canvas edge and can
+                // cover the pointer. Dropping there must still reach the card.
+                let source = HomeModuleId::RecentFiles;
+                let target = HomeModuleId::WeatherModule;
+                let target_rect = registry.borrow().card_rects[&target];
+                let target_handle = registry.borrow().drag_handle_rects[&target];
+                for drop_position in [
+                    vec2f(target_rect.max_x() - 15., target_rect.origin().y() + 15.),
+                    target_handle.origin() + target_handle.size() * 0.5,
+                ] {
+                    registry.borrow_mut().active_op = Some(HomePointerOp::DragModule {
+                        source, start_pos: position, current_pos: drop_position,
+                        hover_target: Some(target), moved: true,
+                    });
+                    presenter.build_scene(vec2f(700., 800.), 1., None, ctx);
+                    let release = presenter.dispatch_event(Event::LeftMouseUp {
+                        position: drop_position, modifiers: Default::default() }, ctx);
+                    assert!(typed_actions(&release.actions).iter().any(|action| matches!(action,
+                        Action::HomeModule(HomeModuleAction::CommitDragInsert(s, t, _)) if *s == source && *t == target)),
+                        "the drag preview or target handle must not intercept its own drop");
+                }
+            });
+        });
+    }
     impl facloud_ui::Entity for ReflowPaintOnly { type Event = (); }
     impl facloud_ui::TypedActionView for ReflowPaintOnly { type Action = (); }
     impl facloud_ui::View for ReflowPaintOnly {
@@ -1637,6 +1751,11 @@ mod responsive_home_controls_tests {
                     let mut companion = Companion::new_for_test();
                     companion.home_modules.enabled = vec![HomeModuleId::PulseAndKpi];
                     companion.home_modules.set_module_size(HomeModuleId::PulseAndKpi, HomeModuleWidth::OneHalf, height);
+                    // This fixture paints the canvas alone. Supply the shell
+                    // width that allocates exactly this canvas width so render
+                    // density and native layout receive the same geometry.
+                    companion.workspace.viewport = vec2f(width + 2. + SIDEBAR_W + S5 * 2.
+                        + ScrollbarWidth::Auto.as_f32() + 4., 5000.);
                     let (window, _) = app.add_window(facloud_ui::platform::WindowStyle::NotStealFocus,
                         |_| CardOnly { app: companion, editor: false });
                     let root = app.root_view_id(window).unwrap();
@@ -1655,11 +1774,16 @@ mod responsive_home_controls_tests {
                         for id in ["home-kpi-messages", "home-kpi-life", "home-kpi-meetings", "home-kpi-screen"] {
                             inside(rect(id), stats, id);
                         }
-                        if height != HomeModuleHeight::Compact {
+                        let shows_dial = height == HomeModuleHeight::Tall
+                            || (height != HomeModuleHeight::Compact && panel.size().x() - 34. >= 560.);
+                        if shows_dial {
                             let dial = rect("home-pulse-dial");
                             inside(dial, panel, "dial");
                             assert!(dial.max_x() <= stats.origin().x() || dial.max_y() <= stats.origin().y(),
                                 "dial overlaps facts at {width}: {dial:?}/{stats:?}");
+                        } else {
+                            assert!(positions.get_position("home-pulse-dial").is_none(),
+                                "compact and narrow standard cards prioritize the facts without a dial");
                         }
                     });
                 }

@@ -896,7 +896,7 @@ impl Companion {
       self.sync_desktop_popup_window(ctx);
       let now_ms = chrono::Utc::now().timestamp_millis();
       let wechat_threads = [
-        ("Builder One • STEPX探索基地", true, "陈工", "下午 3 点评审新版桌面端通知与微信会话交互，大家准时参加。"),
+        ("示例团队 • 项目讨论", true, "陈工", "下午 3 点评审新版桌面端通知与微信会话交互，大家准时参加。"),
         ("云啊", false, "云啊", "今天天气不错，周末去爬山吗？"),
         ("我是照相机先生 · step x neo", false, "我是照相机先生", "真机无线直连同步测试已经全部跑通了！"),
         ("朱凯凯", false, "朱凯凯", "收到，我把设计稿发你微信了。"),
@@ -955,7 +955,7 @@ impl Companion {
       self.sms = vec![
         stepx_companion::sms::Message {
           provider_id: Some(101),
-          address: "+8613322988887".to_string(),
+          address: "+8613800003135".to_string(),
           body: "test".to_string(),
           date_ms: now_ms - 86_400_000,
           outgoing: false,
@@ -965,7 +965,7 @@ impl Companion {
         },
         stepx_companion::sms::Message {
           provider_id: Some(102),
-          address: "+8613322988887".to_string(),
+          address: "+8613800003135".to_string(),
           body: "已收到您的测试消息，正在会议中稍后联系。".to_string(),
           date_ms: now_ms - 86_000_000,
           outgoing: true,
@@ -1041,7 +1041,7 @@ impl Companion {
         },
       ];
       self.push.im_channel = stepx_companion::push::ImChannel::All;
-      self.push.selected_im_thread = Some("com.tencent.mm::Builder One • STEPX探索基地".to_string());
+      self.push.selected_im_thread = Some("com.tencent.mm::示例团队 • 项目讨论".to_string());
       self.selected_thread = None;
       self.schedule_tick(ctx);
     },
@@ -1875,7 +1875,7 @@ impl Companion {
         "open_phone_prefill_contact" => {
           self.handle_action(&Action::Page(Page::Phone), ctx);
           self.fields[F_PHONE_CONTACT_NAME].set(v["name"].as_str().unwrap_or("李工 · 研发部"));
-          self.fields[F_PHONE_DIAL].set(v["number"].as_str().unwrap_or("135 8888 9999"));
+          self.fields[F_PHONE_DIAL].set(v["number"].as_str().unwrap_or("138 0000 2440"));
         }
         "trigger_mcp_key" => {
           let key = v["key"].as_str().unwrap_or("open_app_manager").to_string();
@@ -2121,10 +2121,10 @@ impl Companion {
 
           // Seed IM threads: WeChat direct @ mention + BOSS直聘 HR message
           let mut harbor_thread = stepx_companion::push::ImThread {
-            thread_id: "com.tencent.mm::STEPX星辰停泊港".into(),
+            thread_id: "com.tencent.mm::演示交流小组".into(),
             package_name: "com.tencent.mm".into(),
             app_name: "微信".into(),
-            title: "STEPX星辰停泊港".into(),
+            title: "演示交流小组".into(),
             is_group: true,
             unread_count: 2,
             last_timestamp_ms: now_ms - 30_000,
@@ -2326,10 +2326,10 @@ impl Companion {
           self.sms_loaded = true;
 
           let mut harbor_thread = stepx_companion::push::ImThread {
-            thread_id: "com.tencent.mm::STEPX星辰停泊港".into(),
+            thread_id: "com.tencent.mm::演示交流小组".into(),
             package_name: "com.tencent.mm".into(),
             app_name: "微信".into(),
-            title: "STEPX星辰停泊港".into(),
+            title: "演示交流小组".into(),
             is_group: true,
             unread_count: 2,
             last_timestamp_ms: now_ms - 8_000,
@@ -2430,7 +2430,7 @@ impl Companion {
 
           self.apply_select_im_channel(stepx_companion::push::ImChannel::All);
           self.selected_thread = None;
-          self.push.selected_im_thread = Some("com.tencent.mm::STEPX星辰停泊港".into());
+          self.push.selected_im_thread = Some("com.tencent.mm::演示交流小组".into());
           self.back_screen.stepos_suite.phone_clipboard = "Github 送的 Copilot Max".into();
           self.sync_live_express_parcels();
           self.sync_notification_center();
@@ -2509,10 +2509,10 @@ impl Companion {
           self.sms_loaded = true;
 
           let mut harbor_thread = stepx_companion::push::ImThread {
-            thread_id: "com.tencent.mm::STEPX星辰停泊港".into(),
+            thread_id: "com.tencent.mm::演示交流小组".into(),
             package_name: "com.tencent.mm".into(),
             app_name: "微信".into(),
-            title: "STEPX星辰停泊港".into(),
+            title: "演示交流小组".into(),
             is_group: true,
             unread_count: 2,
             last_timestamp_ms: now_ms - 8_000,
@@ -2536,8 +2536,8 @@ impl Companion {
           };
           stepx_companion::push::recompute_thread_summary(&mut harbor_thread);
           self.push.snapshot.threads = vec![harbor_thread];
-          self.push.selected_im_thread = Some("com.tencent.mm::STEPX星辰停泊港".into());
-          self.selected_thread = Some("com.tencent.mm::STEPX星辰停泊港".into());
+          self.push.selected_im_thread = Some("com.tencent.mm::演示交流小组".into());
+          self.selected_thread = Some("com.tencent.mm::演示交流小组".into());
           self.push.snapshot.listener_connected = true;
           self.push.snapshot.notifications = vec![
             stepx_companion::push::PushNotification {
@@ -2775,10 +2775,10 @@ impl Companion {
           self.sms_loaded = true;
 
           let mut harbor_thread = stepx_companion::push::ImThread {
-            thread_id: "com.tencent.mm::STEPX星辰停泊港".into(),
+            thread_id: "com.tencent.mm::演示交流小组".into(),
             package_name: "com.tencent.mm".into(),
             app_name: "微信".into(),
-            title: "STEPX星辰停泊港".into(),
+            title: "演示交流小组".into(),
             is_group: true,
             unread_count: 2,
             last_timestamp_ms: now_ms - 8_000,
@@ -2802,8 +2802,8 @@ impl Companion {
           };
           stepx_companion::push::recompute_thread_summary(&mut harbor_thread);
           self.push.snapshot.threads = vec![harbor_thread];
-          self.push.selected_im_thread = Some("com.tencent.mm::STEPX星辰停泊港".into());
-          self.selected_thread = Some("com.tencent.mm::STEPX星辰停泊港".into());
+          self.push.selected_im_thread = Some("com.tencent.mm::演示交流小组".into());
+          self.selected_thread = Some("com.tencent.mm::演示交流小组".into());
           self.push.snapshot.listener_connected = true;
           self.push.snapshot.notifications = vec![
             stepx_companion::push::PushNotification {
