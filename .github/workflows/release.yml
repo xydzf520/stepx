@@ -3,7 +3,7 @@ on:
   push:
     branches: [main]
     tags: ['v0.2.*']
-    paths: ['desktop/Cargo.toml', '.github/workflows/release.yml']
+    paths: ['desktop/**', 'scripts/**', '.github/workflows/release.yml']
   workflow_dispatch:
 permissions:
   contents: read

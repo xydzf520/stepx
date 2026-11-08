@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 pub const FPS: u32 = 12;
 pub const FRAME_COUNT: u32 = 468;
+pub const FRAME_WIDTH: usize = 960;
+pub const FRAME_HEIGHT: usize = 600;
 pub const FRAME_ASSET: &str = "stepx-release-video-frame";
 const BYTES: &[u8] = include_bytes!(concat!(
     "../assets/release-notes/",
@@ -208,7 +210,7 @@ mod tests {
         let mut count = 0;
         for n in openh264::nal_units(BYTES) {
             if let Some(yuv) = d.decode(n).unwrap() {
-                assert_eq!(yuv.dimensions(), (960, 628));
+                assert_eq!(yuv.dimensions(), (FRAME_WIDTH, FRAME_HEIGHT));
                 count += 1;
             }
         }

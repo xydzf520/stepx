@@ -6738,6 +6738,12 @@ esac"#,
 case "$*" in
 *stat\ -c\ %s*) printf 'READY'; exit 0;;
 *app_process*)
+    # The real bridge reads its newline-delimited request before replying.
+    # Exiting without consuming stdin races ADB's writer thread and can turn a
+    # valid response into BrokenPipe on a fast CI worker.
+    IFS= read -r request || exit 31
+    printf '%s\n' "$request" >> usage_requests
+    case "$request" in *'"op":"stepos_usage"'*) ;; *) exit 32;; esac
     printf 'STEPX_RESULT:{"ok":true,"screen_time_minutes":35,"unlock_count":6,"clipboard":"HelloCache","top_apps":[],"calendar_events":[],"alarms":[],"read_errors":[],"controls":{"dnd_on":false,"wifi_on":true,"bluetooth_on":true,"brightness_percent":70}}\n'
     exit 0;;
 *sget*)
@@ -6749,7 +6755,18 @@ esac"#,
         crate::bridge::mark_bridge_jar_cached(&device.serial);
 
         let r1 = inspect_stepos_ai_suite(&adb, &device).unwrap();
+        assert!(
+            r1.read_error.is_none(),
+            "suite read failed: {:?}",
+            r1.read_error
+        );
         assert_eq!(r1.phone_clipboard, "HelloCache");
+        let requests = std::fs::read_to_string(dir.path().join("usage_requests")).unwrap();
+        assert_eq!(requests.lines().count(), 1);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(requests.trim()).unwrap(),
+            serde_json::json!({"op": "stepos_usage"})
+        );
         let calls_after_first = std::fs::read_to_string(dir.path().join("calls")).unwrap();
         let count_first = calls_after_first.lines().count();
         assert!(count_first >= 2);

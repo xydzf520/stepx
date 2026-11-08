@@ -736,6 +736,14 @@
     "2bb7c8d6ecb74a59ac2cfdcf98200797cc72e90c3012d567fa8c787206832d86": {
       "example": "docs/videos/StepX-product-0.2.180-contact-sheet.jpg",
       "review": "2026-11-08: final native 0.2.180 isolated-demo media inspected in scene/contact frames; synthetic messages, contacts and files; no private user records or recruiting text in videos. Complete video/audio decode and caption-timing checks passed."
+    },
+    "a992399f5e3022ab82f8783a60456ebd1a2553f07504825165d7dede59d1d740": {
+      "example": "desktop/assets/release-notes/0.2.180/tour.mp4",
+      "review": "2026-11-08 final native tour: same visually reviewed isolated scene sequence, explicit 960x600 encoding without macroblock rescaling; 468 frames decoded, pause/seek/resume/drop tests passed; no private data."
+    },
+    "71966be5d0156cc0d0d016b525205c5835a43682bb8e42debcd5b8976fa5ff15": {
+      "example": "desktop/assets/release-notes/0.2.180/tour.h264",
+      "review": "2026-11-08 final native tour: same visually reviewed isolated scene sequence, explicit 960x600 encoding without macroblock rescaling; 468 frames decoded, pause/seek/resume/drop tests passed; no private data."
     }
   },
   "reviewed_text_fixtures": [
