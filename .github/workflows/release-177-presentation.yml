@@ -1,0 +1,103 @@
+name: Refresh 0.2.177 public presentation
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/release-177-presentation.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-177-presentation
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    if: github.repository == 'xydzf520/stepx'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check exact release and public content
+        run: |
+          python3 - <<'PY'
+          import pathlib, re, tomllib
+          assert tomllib.loads(pathlib.Path('desktop/Cargo.toml').read_text())['package']['version'] == '0.2.177'
+          paths = ['README.md', 'docs/RELEASE_NOTES.md', 'docs/SHARE_0_2_177.md', 'docs/videos/storyboard.json']
+          paths += [str(p) for p in pathlib.Path('docs/videos').glob('*.srt')]
+          for name in paths:
+              assert not re.search(r'找工作|求职|内推|164245026|f@ab\.cool', pathlib.Path(name).read_text()), name
+          PY
+          mkdir -p backup/old-draft work
+          gh api "repos/$GH_REPO/releases/437773241" > work/release-before.json
+          jq -e '.tag_name == "v0.2.177" and .draft == false' work/release-before.json
+          gh api "repos/$GH_REPO/releases?per_page=100" > work/releases.json
+          jq '[.[] | select(.id == 421541370 and .tag_name == "v0.1.0" and .draft == true)]' work/releases.json > work/obsolete-drafts.json
+      - name: Back up obsolete draft before removal
+        run: |
+          if [ "$(jq length work/obsolete-drafts.json)" = 1 ]; then
+            jq '.[0]' work/obsolete-drafts.json > backup/old-draft/release.json
+            jq -r '.[0].assets[] | [.id, .name, .digest] | @tsv' work/obsolete-drafts.json |
+            while IFS=$'\t' read -r asset_id asset_name digest; do
+              case "$asset_name" in */*|..*) exit 1 ;; esac
+              gh api -H 'Accept: application/octet-stream' "repos/$GH_REPO/releases/assets/$asset_id" > "backup/old-draft/$asset_name"
+              if [[ "$digest" == sha256:* ]]; then
+                printf '%s  %s\n' "${digest#sha256:}" "backup/old-draft/$asset_name" | sha256sum -c -
+              fi
+            done
+          fi
+          cp work/release-before.json backup/release-177-before.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-presentation-backup
+          path: backup/
+          retention-days: 90
+          if-no-files-found: error
+      - name: Update notes, media, and latest marker
+        run: |
+          mkdir -p work/media
+          cp docs/videos/StepX-0.2.60-to-0.2.177.mp4 docs/videos/StepX-product-0.2.177.mp4 work/media/
+          cp desktop/assets/stepx-companion.apk work/media/StepX-companion.apk
+          (
+            cd work/media
+            sha256sum StepX-companion.apk StepX-0.2.60-to-0.2.177.mp4 StepX-product-0.2.177.mp4 > media-sha256.txt
+          )
+          expected_apk=$(jq -r '.assets[] | select(.name == "StepX-companion.apk") | .digest' work/release-before.json)
+          actual_apk="sha256:$(sha256sum work/media/StepX-companion.apk | cut -d ' ' -f1)"
+          test "$expected_apk" = "$actual_apk"
+          gh release upload v0.2.177 work/media/StepX-0.2.60-to-0.2.177.mp4 work/media/StepX-product-0.2.177.mp4 work/media/media-sha256.txt --clobber
+          jq -n --rawfile body docs/RELEASE_NOTES.md '{body: $body, make_latest: "true"}' > work/patch.json
+          gh api --method PATCH "repos/$GH_REPO/releases/437773241" --input work/patch.json > work/release-after.json
+          python3 - <<'PY'
+          import hashlib, json, pathlib
+          before = json.loads(pathlib.Path('work/release-before.json').read_text())
+          after = json.loads(pathlib.Path('work/release-after.json').read_text())
+          assets = {a['name']: a for a in after['assets']}
+          edited = {'StepX-0.2.60-to-0.2.177.mp4', 'StepX-product-0.2.177.mp4', 'media-sha256.txt'}
+          assert len(before['assets']) == len(after['assets'])
+          for old in before['assets']:
+              name = old['name']
+              if name in edited:
+                  data = pathlib.Path('work/media', name).read_bytes()
+                  assert assets[name]['digest'] == 'sha256:' + hashlib.sha256(data).hexdigest(), name
+              else:
+                  assert assets[name]['id'] == old['id'] and assets[name]['digest'] == old['digest'], name
+          assert after['body'] == pathlib.Path('docs/RELEASE_NOTES.md').read_text()
+          PY
+      - name: Remove only the backed-up obsolete draft
+        run: |
+          if [ "$(jq length work/obsolete-drafts.json)" = 1 ]; then
+            gh api "repos/$GH_REPO/releases/421541370" > work/draft-current.json
+            jq -e '.id == 421541370 and .tag_name == "v0.1.0" and .draft == true' work/draft-current.json
+            gh api --method DELETE "repos/$GH_REPO/releases/421541370"
+          fi
+          gh api "repos/$GH_REPO/releases/latest" --jq '.tag_name' | grep -Fx 'v0.2.177'
+          gh api "repos/$GH_REPO/releases?per_page=100" > work/releases-after.json
+          jq -e '.[0].tag_name == "v0.2.177" and (any(.[]; .id == 421541370) | not)' work/releases-after.json
+          printf 'Updated 0.2.177 notes and two videos. Installer assets and release tag were preserved. Obsolete draft backed up before removal.\n' >> "$GITHUB_STEP_SUMMARY"

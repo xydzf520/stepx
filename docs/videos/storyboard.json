@@ -1,6 +1,6 @@
 {
   "version": "0.2.177",
-  "purpose": "User-value update and product introduction, with author job-search contact.",
+  "purpose": "Product value and update introduction for public sharing.",
   "narration": {
     "voice": "zh-CN-XiaoxiaoNeural",
     "provider": "Microsoft Edge online TTS via edge-tts",
@@ -132,16 +132,6 @@
           ],
           "start": 92.66666666666667,
           "duration": 14.0
-        },
-        {
-          "key": "u_end",
-          "title": "正在找工作，欢迎联系或内推",
-          "text": "我是董正法，正在找产品、AI 产品，或产品与 AI 应用开发复合岗位。我有十年以上产品与管理经验，做过软硬件协同产品，也能独立推进产品，从调研规划到开发测试、上线迭代。上海及周边、华东地区都可以，欢迎联系或帮我内推。微信，一六四二四五零二六。邮箱，f at a b 点 cool。",
-          "kind": "end",
-          "source": "home",
-          "tags": [],
-          "start": 106.66666666666667,
-          "duration": 28.666666666666668
         }
       ]
     },
@@ -298,16 +288,6 @@
           ],
           "start": 136.53333333333333,
           "duration": 14.733333333333333
-        },
-        {
-          "key": "p_end",
-          "title": "正在找工作，欢迎联系或内推",
-          "text": "我是董正法，正在找产品、AI 产品，或产品与 AI 应用开发复合岗位。我有十年以上产品与管理经验，做过软硬件协同产品，也能独立推进产品，从调研规划到开发测试、上线迭代。上海及周边、华东地区都可以，欢迎联系或帮我内推。微信，一六四二四五零二六。邮箱，f at a b 点 cool。",
-          "kind": "end",
-          "source": "home",
-          "tags": [],
-          "start": 151.26666666666665,
-          "duration": 28.333333333333332
         }
       ]
     }

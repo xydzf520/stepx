@@ -13,10 +13,6 @@ Linux / macOS / Windows · Rust 原生客户端 · 面向 STEPX Neo / PZ261A
 
 </div>
 
-> **我正在找工作，欢迎联系或内推。** 我是董正法，寻求 **产品岗 / AI 产品岗 / 产品与 AI 应用开发复合岗**，上海及周边、华东地区均可。10 年以上产品与管理经验，既能带团队推进业务，也能借助 AI 独立完成从调研、规划、体验设计到业务开发、测试、部署和迭代的交付。做过 App、软硬件协同产品和企业 AI 平台。
->
-> **微信：164245026 · 邮箱：f@ab.cool**。完整经历、个人微信与交流群二维码可在客户端「设置 → 关于」查看。
-
 面向 STEPX 用户的社区项目，与 STEPX、Amoo、Google 无官方隶属关系。普通 Android 不在本版支持范围；原厂专有能力仍依赖对应固件、权限和账号。
 
 ## 先看你最常用的几个场景
@@ -41,7 +37,7 @@ Linux / macOS / Windows · Rust 原生客户端 · 面向 STEPX Neo / PZ261A
 - [StepX 产品介绍：让信息、工具和服务跟着人走](docs/videos/StepX-product-0.2.177.mp4)
 - [适合发群的介绍与更新文案](docs/SHARE_0_2_177.md) · [完整分镜、字幕及素材说明](docs/videos/README.md)
 
-视频开头说明产品理念，使用真实客户端界面和隔离演示数据；支持条件会在相应画面标注。作者求职与联系信息保留在片尾。旧版 [0.2.59 更新视频](https://github.com/xydzf520/stepx/releases/download/v0.2.59/StepX-Companion-0.2.59-update-wechat.mp4) 仍可回看。
+视频开头说明产品理念，使用真实客户端界面和隔离演示数据；支持条件会在相应画面标注。旧版 [0.2.59 更新视频](https://github.com/xydzf520/stepx/releases/download/v0.2.59/StepX-Companion-0.2.59-update-wechat.mp4) 仍可回看。
 
 ## 公开版 0.2.60 → 0.2.177
 
@@ -171,4 +167,4 @@ UI 依赖已放在 `vendor/`。系统依赖、Android 构建和打包见 [构建
 
 仓库不包含账号密钥、个人手机备份或私有聊天记录。系统维护属于实验性能力，执行前请阅读界面的范围与恢复说明。
 
-目前在上海，寻求产品岗及复合型岗位机会，欢迎交流与推荐。**微信：164245026**。如有内容涉及侵权，请联系我，我会及时核实并删除。客户端「设置 → 关于」也提供项目与联系信息。
+使用问题、建议与版权反馈可通过 [GitHub Issues](https://github.com/xydzf520/stepx/issues) 联系项目。
