@@ -1,0 +1,120 @@
+{
+  "capture_version": "0.2.180",
+  "captured_on": "2026-11-08",
+  "mode": "native ui-capture --demo, isolated directories",
+  "images": {
+    "home.png": {
+      "capture_version": "0.2.180",
+      "capture": "home.png",
+      "mode": "Native client capture, isolated configuration and fixtures",
+      "export_size": [
+        1280,
+        800
+      ],
+      "data": "Synthetic demo content; no private phone data; no live transfer or call claimed"
+    },
+    "search.png": {
+      "capture_version": "0.2.180",
+      "capture": "search.png",
+      "mode": "Native client capture, isolated configuration and fixtures",
+      "export_size": [
+        1280,
+        800
+      ],
+      "data": "Synthetic demo content; no private phone data; no live transfer or call claimed"
+    },
+    "messages.png": {
+      "capture_version": "0.2.180",
+      "capture": "messages.png",
+      "mode": "Native client capture, isolated configuration and fixtures",
+      "export_size": [
+        760,
+        388
+      ],
+      "data": "Synthetic demo content; no private phone data; no live transfer or call claimed"
+    },
+    "files.png": {
+      "capture_version": "0.2.180",
+      "capture": "files.png",
+      "mode": "Native client capture, isolated configuration and fixtures",
+      "export_size": [
+        1280,
+        800
+      ],
+      "data": "Synthetic demo content; no private phone data; no live transfer or call claimed"
+    },
+    "agent.png": {
+      "capture_version": "0.2.180",
+      "capture": "agent.png",
+      "mode": "Native client capture, isolated configuration and fixtures",
+      "export_size": [
+        1280,
+        900
+      ],
+      "data": "Synthetic demo content; no private phone data; no live transfer or call claimed"
+    },
+    "phone.png": {
+      "capture_version": "0.2.180",
+      "capture": "phone.png",
+      "mode": "Native client capture, isolated configuration and fixtures",
+      "export_size": [
+        1280,
+        800
+      ],
+      "data": "Synthetic demo content; no private phone data; no live transfer or call claimed"
+    },
+    "capsule.png": {
+      "capture_version": "0.2.180",
+      "capture": "capsule.png",
+      "mode": "Native client capture, isolated configuration and fixtures",
+      "export_size": [
+        1280,
+        800
+      ],
+      "data": "Synthetic demo content; no private phone data; no live transfer or call claimed"
+    },
+    "connection.png": {
+      "capture_version": "0.2.180",
+      "capture": "connection.png",
+      "mode": "Native client capture, isolated configuration and fixtures",
+      "export_size": [
+        1280,
+        800
+      ],
+      "data": "Synthetic demo content; no private phone data; no live transfer or call claimed"
+    },
+    "tools.png": {
+      "capture_version": "0.2.180",
+      "capture": "tools.png",
+      "mode": "Native client capture, isolated configuration and fixtures",
+      "export_size": [
+        1280,
+        800
+      ],
+      "data": "Synthetic demo content; no private phone data; no live transfer or call claimed"
+    }
+  },
+  "notes": [
+    "All current images and clips were captured in 0.2.180.",
+    "Connection guide contains credited Android documentation images.",
+    "File rows combine local demonstration files and synthetic phone metadata."
+  ],
+  "video": {
+    "file": "tour.mp4",
+    "native_file": "tour.h264",
+    "captured_from": "0.2.180",
+    "recorded_on": "2026-11-08",
+    "audio": false,
+    "mode": "Actual native entry and action captures; isolated demo",
+    "native_encoding": "H.264 Annex B constrained baseline, 960x600, 12fps, 468 frames",
+    "actions": [
+      "Select home calendar date",
+      "Open module size menu and save",
+      "Copy demonstration verification code and open reminder menu",
+      "Open capsule hub",
+      "Filter recent files by source",
+      "Type a search keyword"
+    ]
+  },
+  "reuse_note": "Maintenance release 0.2.181 reuses reviewed 0.2.180 captures unchanged; no new screenshots or recordings are claimed."
+}

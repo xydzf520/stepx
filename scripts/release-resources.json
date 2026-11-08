@@ -107,7 +107,8 @@
     "docs/SHARE_0_2_180.md",
     "docs/STORAGE_EXPANSION.md",
     "docs/STUDIO_INTEGRATION.md",
-    "docs/RELEASE_0_2_181.md"
+    "docs/RELEASE_0_2_181.md",
+    "docs/RELEASE_0_2_182.md"
   ],
   "runtime_files": [
     "desktop/assets/amoo_desktop_icon.png",
@@ -489,7 +490,20 @@
     "desktop/assets/release-notes/0.2.181/sources.json",
     "desktop/assets/release-notes/0.2.181/tools.png",
     "desktop/assets/release-notes/0.2.181/tour.h264",
-    "desktop/assets/release-notes/0.2.181/tour.mp4"
+    "desktop/assets/release-notes/0.2.181/tour.mp4",
+    "desktop/assets/release-notes/0.2.182.json",
+    "desktop/assets/release-notes/0.2.182/agent.png",
+    "desktop/assets/release-notes/0.2.182/capsule.png",
+    "desktop/assets/release-notes/0.2.182/connection.png",
+    "desktop/assets/release-notes/0.2.182/files.png",
+    "desktop/assets/release-notes/0.2.182/home.png",
+    "desktop/assets/release-notes/0.2.182/messages.png",
+    "desktop/assets/release-notes/0.2.182/phone.png",
+    "desktop/assets/release-notes/0.2.182/search.png",
+    "desktop/assets/release-notes/0.2.182/sources.json",
+    "desktop/assets/release-notes/0.2.182/tools.png",
+    "desktop/assets/release-notes/0.2.182/tour.h264",
+    "desktop/assets/release-notes/0.2.182/tour.mp4"
   ],
   "reviewed_media_sha256": {
     "04775fef84a54afd8e157c82d9f6be474ba7a815cd715a1bc56bec898e0f2295": {
@@ -905,7 +919,8 @@
     "docs/videos/StepX-product-0.2.180-qa.json",
     "docs/videos/StepX-product-0.2.180.mp4",
     "docs/videos/StepX-product-0.2.180.srt",
-    "docs/videos/storyboard.json"
+    "docs/videos/storyboard.json",
+    "handoff/google-play-stepx/java/GmsProbe.java"
   ],
   "public_removed_files": [
     "docs/videos/StepX-0.2.60-to-0.2.177-contact-sheet.jpg",
