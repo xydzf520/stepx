@@ -3,7 +3,7 @@ name: Refresh 0.2.177 public presentation
 on:
   push:
     branches: [main]
-    paths: [.github/workflows/release-177-presentation.yml]
+    paths: [.github/workflows/release-177-presentation.yml, docs/RELEASE_NOTES.md, docs/videos/**]
   workflow_dispatch:
 
 permissions:
@@ -72,7 +72,7 @@ jobs:
           actual_apk="sha256:$(sha256sum work/media/StepX-companion.apk | cut -d ' ' -f1)"
           test "$expected_apk" = "$actual_apk"
           gh release upload v0.2.177 work/media/StepX-0.2.60-to-0.2.177.mp4 work/media/StepX-product-0.2.177.mp4 work/media/media-sha256.txt --clobber
-          jq -n --rawfile body docs/RELEASE_NOTES.md '{body: $body, make_latest: "true"}' > work/patch.json
+          jq -n --rawfile body docs/RELEASE_NOTES.md '{name: "StepX Companion 0.2.177 · 以人为中心，让 AI 贯通终端与服务", body: $body, make_latest: "true"}' > work/patch.json
           gh api --method PATCH "repos/$GH_REPO/releases/437773241" --input work/patch.json > work/release-after.json
           python3 - <<'PY'
           import hashlib, json, pathlib

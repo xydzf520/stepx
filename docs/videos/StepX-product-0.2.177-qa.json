@@ -1,7 +1,7 @@
 {
   "file": "StepX-product-0.2.177.mp4",
-  "bytes": 3432839,
-  "duration_seconds": 151.267,
+  "bytes": 3416851,
+  "duration_seconds": 156.067,
   "width": 1280,
   "height": 720,
   "fps": 15,
@@ -10,10 +10,8 @@
   "black_intervals": 0,
   "decode": "full A/V decode passed",
   "volume": [
-    "[Parsed_volumedetect_0 @ 0x7f19a4002cc0] mean_volume: -20.0 dB",
-    "[Parsed_volumedetect_0 @ 0x7f19a4002cc0] max_volume: -3.1 dB"
+    "mean_volume: -20.1 dB",
+    "max_volume: -2.8 dB"
   ],
-  "sha256": "c95fa780995420b1d85cddbad68e729dd80da795055dd971e1c29d6ba1da0f36",
-  "subtitle_check": "Ordered non-overlapping timestamps within video duration; product-only narration and scenes.",
-  "subtitle_entries": 27
+  "sha256": "0add1eb6da04ff4a6f186e848e078627da12d70d6df48e1e497738764c45c3f0"
 }
