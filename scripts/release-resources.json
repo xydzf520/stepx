@@ -108,7 +108,8 @@
     "docs/STORAGE_EXPANSION.md",
     "docs/STUDIO_INTEGRATION.md",
     "docs/RELEASE_0_2_181.md",
-    "docs/RELEASE_0_2_182.md"
+    "docs/RELEASE_0_2_182.md",
+    "docs/RELEASE_0_2_182_CUMULATIVE.md"
   ],
   "runtime_files": [
     "desktop/assets/amoo_desktop_icon.png",
