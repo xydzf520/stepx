@@ -2,6 +2,7 @@
 """Privacy boundaries: fail before publishing, preserve developer/user data."""
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -9,6 +10,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+import urllib.error
 from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -26,6 +28,63 @@ def load(name, filename):
 stage = load('release_stage', 'stage-release-resources.py').stage
 export = load('release_export', 'sync-public-repo.py')
 package = load('release_package', 'package-release.py')
+
+
+class ToolDownloadTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.target = Path(self.temp.name) / 'tool.tar.gz'
+        self.url = 'https://github.com/example/tool/releases/download/v1/tool.tar.gz'
+        self.payload = b'verified-upstream-tool'
+        self.digest = hashlib.sha256(self.payload).hexdigest()
+        self.sleep = mock.patch.object(package.time, 'sleep').start()
+        self.addCleanup(mock.patch.stopall)
+
+    def test_transient_failure_retries_fresh_request_and_keeps_digest_verification(self):
+        failure = urllib.error.HTTPError(self.url, 504, 'Gateway timeout', {}, None)
+        with mock.patch.object(package.urllib.request, 'urlopen', side_effect=[failure, io.BytesIO(self.payload)]) as opener:
+            package.download_verified_tool(self.url, self.target, self.digest)
+        self.assertEqual(self.target.read_bytes(), self.payload)
+        self.assertEqual(opener.call_args_list[0].args[0].full_url, self.url)
+        self.assertTrue(opener.call_args_list[1].args[0].full_url.startswith(self.url + '?stepx_retry='))
+        self.assertEqual(opener.call_args_list[1].kwargs['timeout'], 30)
+        self.assertEqual(list(self.target.parent.glob('*.part')), [])
+
+    def test_wrong_hash_never_replaces_existing_archive_or_retries(self):
+        self.target.write_bytes(b'previous-verified-archive')
+        with mock.patch.object(package.urllib.request, 'urlopen', return_value=io.BytesIO(b'wrong-file')) as opener:
+            with self.assertRaisesRegex(RuntimeError, 'SHA256 mismatch'):
+                package.download_verified_tool(self.url, self.target, self.digest)
+        self.assertEqual(opener.call_count, 1)
+        self.assertEqual(self.target.read_bytes(), b'previous-verified-archive')
+        self.assertEqual(list(self.target.parent.glob('*.part')), [])
+
+    def test_upstream_gateway_failure_uses_same_official_release_asset(self):
+        api = 'https://api.github.com/repos/example/tool/releases/assets/123'
+        failure = urllib.error.HTTPError(self.url, 504, 'Gateway timeout', {}, None)
+        with mock.patch.object(package.urllib.request, 'urlopen', side_effect=[failure, io.BytesIO(self.payload)]) as opener:
+            package.download_verified_tool(self.url, self.target, self.digest, asset_api_url=api)
+        request = opener.call_args_list[1].args[0]
+        self.assertTrue(request.full_url.startswith(api + '?stepx_retry='))
+        self.assertEqual(request.get_header('Accept'), 'application/octet-stream')
+        self.assertEqual(self.target.read_bytes(), self.payload)
+
+    def test_network_failure_has_bounded_retries_and_leaves_no_archive(self):
+        with mock.patch.object(package.urllib.request, 'urlopen', side_effect=urllib.error.URLError('offline')) as opener:
+            with self.assertRaises(urllib.error.URLError):
+                package.download_verified_tool(self.url, self.target, self.digest)
+        self.assertEqual(opener.call_count, 3)
+        self.assertFalse(self.target.exists())
+        self.assertEqual(list(self.target.parent.glob('*.part')), [])
+
+    def test_permanent_http_failure_is_not_retried(self):
+        failure = urllib.error.HTTPError(self.url, 404, 'Not found', {}, None)
+        with mock.patch.object(package.urllib.request, 'urlopen', side_effect=failure) as opener:
+            with self.assertRaises(urllib.error.HTTPError):
+                package.download_verified_tool(self.url, self.target, self.digest)
+        self.assertEqual(opener.call_count, 1)
+        self.assertFalse(self.target.exists())
 
 
 class PublicationBoundaryTests(unittest.TestCase):
