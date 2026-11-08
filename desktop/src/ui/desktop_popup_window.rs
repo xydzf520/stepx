@@ -854,7 +854,7 @@ mod tests {
     }
 
     #[test]
-    fn popup_menu_and_clear_preserve_native_bounds_main_draft_and_confirmation() {
+    fn popup_direct_and_menu_clear_preserve_native_bounds_main_draft_and_confirmation() {
         let dir = tempfile::tempdir().unwrap();
         let _guard = TestUiConfigDirGuard::set(dir.path());
         facloud_ui::App::test((), |mut app| async move {
@@ -862,6 +862,7 @@ mod tests {
                 stepx_companion::desktop_notify::PopupMode::Banner,
                 stepx_companion::desktop_notify::PopupMode::FullReply,
             ] {
+              for open_menu in [false, true] {
                 let (main_id, owner) = app.add_window(platform::WindowStyle::NotStealFocus, |_| Companion::new_for_test());
                 let (popup_id, popup, before) = owner.update(&mut app, |view, ctx| {
                     view.notification_center = notification_center_state::NotificationCenterState::new_empty();
@@ -884,14 +885,16 @@ mod tests {
                     (window.id, window.view.upgrade(ctx).unwrap(), window.last_bounds)
                 });
                 let initial_popup_focus = app.focused_view_id(popup_id);
-                popup.update(&mut app, |view, ctx| view.handle_action(
-                    &Action::NotificationCenter(NotificationCenterAction::PopupMenu(Some(fixture().id))), ctx));
+                if open_menu {
+                    popup.update(&mut app, |view, ctx| view.handle_action(
+                        &Action::NotificationCenter(NotificationCenterAction::PopupMenu(Some(fixture().id))), ctx));
+                }
                 owner.update(&mut app, |view, ctx| {
                     view.sync_desktop_popup_window(ctx);
                     let window = view.desktop_popup.window.as_ref().unwrap();
                     assert_eq!(window.id, popup_id);
                     assert_eq!(window.last_bounds.size(), before.size());
-                    assert!(view.notification_center.popup_menu_item_id.is_some());
+                    assert_eq!(view.notification_center.popup_menu_item_id.is_some(), open_menu);
                 });
                 assert_eq!(app.focused_view_id(main_id), Some(owner.id()));
                 assert_eq!(app.focused_view_id(popup_id), initial_popup_focus, "menu must not claim text focus");
@@ -909,6 +912,7 @@ mod tests {
                     assert!(view.interaction.review.is_some(), "clear must not accept the main-window confirmation");
                 });
                 assert_eq!(app.focused_view_id(main_id), Some(owner.id()));
+              }
             }
         });
     }

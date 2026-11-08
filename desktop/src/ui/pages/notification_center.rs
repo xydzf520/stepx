@@ -1216,6 +1216,39 @@ impl Companion {
         with_control_alias(button, id)
     }
 
+    fn popup_clear_control(&self) -> El {
+        let p = self.p();
+        // Capture exactly the events shown in this render. A later message in
+        // the same conversation must remain queued when this click is handled.
+        let receipts = self.popup_batch_receipts();
+        let enabled = !receipts.is_empty();
+        let button = Hoverable::new(self.mouse_state("popup-header:notif-popup-clear-direct"), move |mouse| {
+            let hovered = enabled && mouse.is_mouse_over_element();
+            let ink = if !enabled { p.text3 } else if hovered { p.text } else { p.text2 };
+            ConstrainedBox::new(
+                Container::new(Align::new(self.hstack(4., vec![
+                    self.ui_icon(UiIcon::Trash, 14., ink),
+                    self.line_w("清空", 12., ink, Weight::Medium),
+                ])).finish())
+                    .with_background_color(if hovered { p.hover } else { ColorU::transparent_black() })
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
+                    .finish(),
+            ).with_width(60.).with_height(32.).finish()
+        });
+        let button = if enabled {
+            button.with_cursor(Cursor::PointingHand)
+                .on_click(move |ctx, _, _| ctx.dispatch_typed_action(Action::NotificationCenter(
+                    NotificationCenterAction::ClearPopupBatch { receipts: receipts.clone() },
+                )))
+                .finish()
+        } else {
+            // An active call alone has nothing to clear; never present it as a
+            // destructive action or let an empty control open the underlying card.
+            button.on_click(|_, _, _| {}).finish()
+        };
+        with_control_alias(button, "notif-popup-clear-direct")
+    }
+
     fn popup_reminder_menu(&self, item: &UnifiedNotificationItem, standalone: bool) -> El {
         let p = self.p();
         let header = self.between(
@@ -1402,7 +1435,7 @@ impl Companion {
                     ),
                 )
                 .finish(),
-                self.hstack(4., vec![self.popup_header_control(
+                self.hstack(4., vec![self.popup_clear_control(), self.popup_header_control(
                     "notif-popup-menu",
                     UiIcon::MoreHorizontal,
                     Action::NotificationCenter(
@@ -2742,6 +2775,73 @@ mod tests {
         let _pill_complete = app.render_top_bar_auto_sync_pill();
         let _details = app.render_device_sync_panel();
         let _device_card_complete = app.device_block();
+    }
+
+    #[test]
+    fn popup_header_clear_menu_close_keep_order_and_safe_insets() {
+        struct CardOnly(Companion);
+        impl facloud_ui::Entity for CardOnly { type Event = (); }
+        impl facloud_ui::TypedActionView for CardOnly { type Action = (); }
+        impl facloud_ui::View for CardOnly {
+            fn ui_name() -> &'static str { "popup_header_geometry" }
+            fn render(&self, _: &facloud_ui::AppContext) -> El {
+                Stack::new().with_child(self.0.render_360_popup_card_for_window(true).unwrap()).finish()
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = TestUiConfigDirGuard::set(dir.path());
+        facloud_ui::App::test((), |mut app| async move {
+            for dark in [false, true] {
+              for (mode, height, live_call) in [
+                (stepx_companion::desktop_notify::PopupMode::Banner, 118., false),
+                (stepx_companion::desktop_notify::PopupMode::FullReply, 194., false),
+                (stepx_companion::desktop_notify::PopupMode::FullReply, 194., true),
+              ] {
+                let mut companion = Companion::new_for_test();
+                companion.palette.set(Palette::for_theme(dark));
+                companion.notification_center = NotificationCenterState::new_empty();
+                companion.push.prefs.popup_mode = mode;
+                let item = UnifiedNotificationItem {
+                    id: if live_call { "live-call:header" } else { "header-message" }.into(),
+                    package_name: "com.tencent.mm".into(), source_badge: "微信".into(),
+                    title: "长会话名称也不会挤压清空、菜单和关闭按钮".into(), unread: true,
+                    popup_widget: if live_call {
+                        NotificationPopupWidget::LiveCall { id: "header".into(), ringing: true }
+                    } else { NotificationPopupWidget::None },
+                    ..Default::default()
+                };
+                companion.notification_center.active_popup_id = Some(item.id.clone());
+                companion.notification_center.popup_queue.push_back(item.id.clone());
+                companion.notification_center.items = vec![item];
+                assert_eq!(companion.popup_batch_receipts().is_empty(), live_call);
+                let (window, _) = app.add_window(facloud_ui::platform::WindowStyle::PopupToast, |_| CardOnly(companion));
+                let root = app.root_view_id(window).unwrap();
+                app.update(move |ctx| {
+                    let mut presenter = facloud_ui::Presenter::new(window);
+                    presenter.invalidate(facloud_ui::WindowInvalidation {
+                        updated: std::collections::HashSet::from([root]), ..Default::default()
+                    }, ctx);
+                    presenter.build_scene(vec2f(380., height), 1., None, ctx);
+                    let positions = presenter.position_cache();
+                    let mut previous_right = 0.;
+                    for (id, width) in [
+                        ("notif-popup-clear-direct", 60.),
+                        ("notif-popup-menu", 32.),
+                        ("notif-popup-dismiss", 32.),
+                    ] {
+                        let bounds = positions.get_position(id).unwrap();
+                        assert_eq!(bounds.width(), width, "{id}: {bounds:?}");
+                        assert_eq!(bounds.height(), 32., "{id}: {bounds:?}");
+                        assert!(bounds.origin().x() >= previous_right && bounds.max_x() <= 368., "{id}: {bounds:?}");
+                        assert!(bounds.origin().y() >= 12. && bounds.max_y() <= height - 12., "{id}: {bounds:?}");
+                        previous_right = bounds.max_x() + 4.;
+                    }
+                    let card = positions.get_position("notification-popup-toast").unwrap();
+                    assert!(card.max_x() <= 380. && card.max_y() <= height + 1., "{card:?}");
+                });
+              }
+            }
+        });
     }
 
     #[test]
