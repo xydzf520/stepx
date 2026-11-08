@@ -13,6 +13,8 @@ import urllib.request
 import zipfile
 from common import ADB, CONFIG, ROOT, STATE, DOWNLOADS, guard, init_state, private_write, root_json, run, save_json, sdk_tool, sdk_command, sha256, shell
 
+from source_integrity import python_source_sha256
+
 PACKAGES = ['com.google.android.gsf', 'com.google.android.gms', 'com.android.vending']
 
 
@@ -197,7 +199,7 @@ def repair_runtime():
     assert 'RUNNING_UNLOCKED' in shell('dumpsys', 'user'), 'Unlock the phone first'
     assert shell('getprop', 'persist.openclaw.zygote.path') == '', 'Another startup operation is active'
     assert shell('getprop', 'sys.openclaw.env.start') == '', 'Another startup operation is active'
-    expected = {name: sha256(ROOT / 'module' / name) for name in ('boot.py', 'inject.py')}
+    expected = {name: python_source_sha256(ROOT / 'module' / name) for name in ('boot.py', 'inject.py')}
     code = '''import os,json,hashlib,fcntl,time
 base='/usr/local/lib/stepx-gms';state='/var/lib/stepx-gms'
 def sha(path):return hashlib.sha256(open(path,'rb').read()).hexdigest()
@@ -321,7 +323,7 @@ def recover_metadata():
     assert baseline_matches(baseline)
     assert sha256(STATE / 'ubuntu_zygote.stock') == CONFIG['stock_sha256']
     assert not (STATE / 'boot-install.json').exists(), 'Existing recovery metadata must be reviewed, not overwritten'
-    expected = {p.name: sha256(p) for p in (ROOT / 'module').glob('*.py')}
+    expected = {p.name: python_source_sha256(p) for p in (ROOT / 'module').glob('*.py')}
     code = '''import json,hashlib
 def digest(p):return hashlib.sha256(open(p,'rb').read()).hexdigest()
 base='/usr/local/lib/stepx-gms'

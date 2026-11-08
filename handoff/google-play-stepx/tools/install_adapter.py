@@ -5,6 +5,7 @@ import sys
 import pathlib, subprocess, json, base64, uuid, hashlib, shutil
 
 from common import ROOT, STATE as BACKUP, ADB, CONFIG, guard
+from source_integrity import read_python_source
 import argparse
 argparse.ArgumentParser(description=__doc__).parse_args()
 guard(native=True)
@@ -13,13 +14,13 @@ baseline = json.loads((BACKUP / 'baseline.json').read_text())
 assert baseline_matches(baseline), 'Wrong device baseline'
 assert subprocess.check_output(ADB + ['shell', 'getprop', 'ro.build.fingerprint'], text=True).strip() == baseline['fingerprint']
 assert subprocess.check_output(ADB + ['shell', 'getprop', 'persist.openclaw.zygote.path'], text=True).strip() == ''
-files = {p.name: p.read_bytes() for p in (ROOT / 'module').glob('*.py')}
+files = {p.name: read_python_source(p) for p in (ROOT / 'module').glob('*.py')}
 assert set(files) == {'launcher.py', 'boot.py', 'inject.py'}
 for name, data in files.items():
     compile(data, name, 'exec')
 manifest = {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}
 stage = '/tmp/stepx-gms-stage-' + uuid.uuid4().hex[:10]
-remote = 'import os,base64,json;d=' + repr({n: base64.b64encode(b).decode() for n, b in files.items()}) + ';os.mkdir(' + repr(stage) + ',0o700)\nfor n,b in d.items():\n open(' + repr(stage) + '+"/"+n,"wb").write(base64.b64decode(b))\nprint("staged")'
+remote = 'import os,base64,json;d=' + repr({n: base64.b64encode(b).decode() for n, b in files.items()}) + ';os.mkdir(' + repr(stage) + ',0o700)\nfor n,b in d.items():\n with open(' + repr(stage) + '+"/"+n,"wb") as f: f.write(base64.b64decode(b))\nprint("staged")'
 result = subprocess.run([sys.executable, str(ROOT / 'tools/gateway.py')], input=json.dumps({'command': ['python3', '-c', remote], 'timeoutMs': 15000}), capture_output=True, text=True, timeout=45)
 response = json.loads(result.stdout)
 assert response.get('exitCode') == 0, 'Staging failed'
@@ -85,7 +86,11 @@ proof = json.JSONDecoder().raw_decode(result.stdout.lstrip())[0]
 assert proof.get('installed') and proof['original_sha256'] == STOCK_SHA
 (BACKUP / 'boot-install.json').write_text(json.dumps(proof, indent=2))
 (BACKUP / 'boot-install.json').chmod(0o600)
-shutil.copytree(ROOT / 'module', BACKUP / 'boot-module', dirs_exist_ok=True)
+# Save the exact bytes staged and verified above, not checkout-native CRLF.
+(BACKUP / 'boot-module').mkdir(exist_ok=True, mode=0o700)
 (BACKUP / 'boot-module').chmod(0o700)
-for path in (BACKUP / 'boot-module').glob('*.py'): path.chmod(0o600)
+for name, data in files.items():
+    path = BACKUP / 'boot-module' / name
+    path.write_bytes(data)
+    path.chmod(0o600)
 print('Boot adapter installed; original launcher preserved and hashes verified.')

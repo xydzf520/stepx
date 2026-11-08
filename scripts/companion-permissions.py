@@ -27,6 +27,7 @@ from common import ADB, ALLOWED_FINGERPRINTS, CONFIG, guard, root_json, shell
 from host_runtime import file_lock, sdk_tool, sdk_command, java_environment, subprocess_options
 from companion_apk import ensure_update_preserves_runtime, signer_digests
 from companion_loader import adapt as adapt_native_loader
+from source_integrity import read_python_source, python_source_sha256
 
 PACKAGE = 'com.stepx.companion.app'
 PERMISSION = 'com.stepos.permission.MANAGE_BACK_SCREEN'
@@ -493,7 +494,7 @@ def run_bounded_android_worker(code, target_pid, preserve_verified_result=None, 
     properties = {key: shell('getprop', key) for key in ('persist.openclaw.zygote.path', 'sys.openclaw.env.start')}
     if any(properties.values()):
         raise RuntimeError('Another StepClaw startup operation is active; companion permission was not changed')
-    expected_launcher = hashlib.sha256((WORKFLOW / 'module/launcher.py').read_bytes()).hexdigest()
+    expected_launcher = python_source_sha256(WORKFLOW / 'module/launcher.py')
     allowed_launchers = {s for s in (expected_launcher, getattr(common, 'STOCK_SHA', None), CONFIG.get('stock_sha256', '')) if s}
     before = root_json("import os,json,hashlib; print(json.dumps({'launcher':hashlib.sha256(open('/usr/local/bin/ubuntu_zygote','rb').read()).hexdigest(),'root_available':os.geteuid()==0}))")
     if before.get('launcher') not in allowed_launchers or before.get('root_available') is not True:
@@ -505,12 +506,12 @@ def run_bounded_android_worker(code, target_pid, preserve_verified_result=None, 
     device_started = int(shell('date', '+%s'))
     with tempfile.TemporaryDirectory(prefix='stepx-companion-grant-') as directory:
         operation, output = Path(directory) / 'operation.py', Path(directory) / 'result.json'
-        operation.write_text(code); operation.chmod(0o600)
+        operation.write_bytes(code.encode('utf-8')); operation.chmod(0o600)
         worker_path = WORKFLOW / 'tools/root_worker.py'
         if worker_context == 'agentbus':
-            source = agentbus_worker_source(worker_path.read_text())
+            source = agentbus_worker_source(read_python_source(worker_path).decode('utf-8'))
             worker_path = Path(directory) / 'agentbus-worker.py'
-            worker_path.write_text('import sys\nsys.path.insert(0, ' + repr(str(WORKFLOW / 'tools')) + ')\n' + source)
+            worker_path.write_bytes(('import sys\nsys.path.insert(0, ' + repr(str(WORKFLOW / 'tools')) + ')\n' + source).encode('utf-8'))
             worker_path.chmod(0o600)
         worker = subprocess.run([sys.executable, str(worker_path), str(operation), str(output)],
             text=True, capture_output=True, timeout=130)
@@ -573,7 +574,7 @@ def run_bounded_android_worker(code, target_pid, preserve_verified_result=None, 
 
 
 def inject(cert, grant, restore_flags, expected_uid):
-    source = (WORKFLOW / 'module/inject.py').read_text()
+    source = read_python_source(WORKFLOW / 'module/inject.py').decode('utf-8')
     if hashlib.sha256(source.encode()).hexdigest() != LOADER_SHA256:
         raise RuntimeError('Native loader changed; review the companion adapter before reuse')
     source = adapt_native_loader(source)
@@ -652,7 +653,7 @@ def inject_connection(cert, operation, before_flags, expected_uid):
         raise RuntimeError('Unsupported connection permission operation')
     if operation != 'inspect':
         validate_connection_flags(before_flags)
-    source = (WORKFLOW / 'module/inject.py').read_text()
+    source = read_python_source(WORKFLOW / 'module/inject.py').decode('utf-8')
     if hashlib.sha256(source.encode()).hexdigest() != LOADER_SHA256:
         raise RuntimeError('Native loader changed; review the connection permission adapter')
     source = adapt_native_loader(source)
@@ -777,7 +778,7 @@ def inject_wake(cert, operation, before_flags, expected_uid):
         raise RuntimeError('Unsupported wake permission operation')
     if operation != 'inspect':
         validate_wake_flags(before_flags)
-    source = (WORKFLOW / 'module/inject.py').read_text()
+    source = read_python_source(WORKFLOW / 'module/inject.py').decode('utf-8')
     if hashlib.sha256(source.encode()).hexdigest() != LOADER_SHA256:
         raise RuntimeError('Native loader changed; review the wake permission adapter')
     source = adapt_native_loader(source)

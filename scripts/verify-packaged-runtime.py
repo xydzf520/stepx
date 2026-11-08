@@ -28,13 +28,18 @@ with tempfile.TemporaryDirectory(prefix='StepX 中文 runtime ') as td:
     env['PYTHONUTF8']='1';env['PYTHONIOENCODING']='utf-8'
     env['STEPX_STATE_DIR']=str(Path(td)/'user data');env['PYTHONDONTWRITEBYTECODE']='1'
     python=copy/'runtime/python/python.exe' if os.name=='nt' else copy/'runtime/python/bin/python3'
-    code="""import importlib.util,sys
+    code="""import importlib.util,sys,hashlib
 from pathlib import Path
 root=Path(sys.argv[1]);sys.path.insert(0,str(root/'scripts'))
 for name in ['companion-permissions','companion-power','companion-system']:
  spec=importlib.util.spec_from_file_location(name,root/'scripts'/(name+'.py'));m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
  if name=='companion-permissions':
   signer=m.signer(root/'desktop/assets/stepx-companion.apk');assert len(signer)==64
+  for relative,expected in [('module/inject.py',m.LOADER_SHA256),('tools/root_worker.py',m.WORKER_SHA256)]:
+   data=(root/'handoff/google-play-stepx'/relative).read_bytes()
+   assert b'\\r' not in data, 'Packaged Python source must use LF: '+relative
+   assert hashlib.sha256(data).hexdigest()==expected, 'Packaged audited source hash differs: '+relative
+  print('Packaged loader and worker exact-byte integrity: PASS')
 # Verify that signature checking rejects modified APK bytes, not just a known filename.
 import zipfile
 apk=root/'desktop/assets/stepx-companion.apk';bad=root/'tampered.apk';data=bytearray(apk.read_bytes())

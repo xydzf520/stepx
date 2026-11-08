@@ -5,11 +5,12 @@ from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 spec=importlib.util.spec_from_file_location('permissions',ROOT/'scripts/companion-permissions.py')
 p=importlib.util.module_from_spec(spec);spec.loader.exec_module(p)
+from source_integrity import read_python_source, python_source_sha256
 BASE='/usr/local/lib/stepx-companion'
 STATE='/var/lib/stepx-companion'
 HOOK='/usr/local/lib/stepx-gms/boot.py'
 STOCK_SHA='5cfe5a88a97eca424bd4922fe813e0cc553adad0e8623105311ec1514022152f'
-ORIGINAL_SHA=hashlib.sha256((p.WORKFLOW/'module/boot.py').read_bytes()).hexdigest()
+ORIGINAL_SHA=python_source_sha256(p.WORKFLOW/'module/boot.py')
 STATE_LOCAL=p.STATE.parent/'boot'
 GROUP=(p.PERMISSION,)+p.CONNECTION_PERMISSIONS+p.WAKE_PERMISSIONS
 
@@ -28,7 +29,7 @@ def private(value,name):
 
 def payload(cert,uid,baseline,operation="grant"):
     if operation not in ("inspect","grant","revoke"):raise RuntimeError("Unsupported boot operation")
-    source=(p.WORKFLOW/'module/inject.py').read_text()
+    source=read_python_source(p.WORKFLOW/'module/inject.py').decode('utf-8')
     if digest(source.encode())!=p.LOADER_SHA256:raise RuntimeError('Unreviewed native loader')
     source=p.adapt_native_loader(source)
     dex=(ROOT/'desktop/assets/stepx-companion-permissions.dex').read_bytes()
@@ -214,7 +215,7 @@ def install(apk,rebind=False):
     initial=p.inspect(apk);p.guard(native=True)
     if not initial.get('signature_verified'):raise RuntimeError('Companion signing trust is required')
     cert=p.signer(apk);uid=initial['uid'];baseline=baseline_for(cert,uid,require_exact=rebind);fingerprint=verified_fingerprint()
-    files={name:(ROOT/'scripts/companion_boot'/name).read_bytes() for name in ('chain.py','boot.py','launcher.py')}
+    files={name:read_python_source(ROOT/'scripts/companion_boot'/name) for name in ('chain.py','boot.py','launcher.py')}
     files['grant.py']=payload(cert,uid,baseline)
     serial=p.device_key()
     config={'version':2,'signer':cert,'uid':uid,'package':p.PACKAGE,'fingerprint':fingerprint,'serial':serial,'baseline':baseline,'installed_boot':p.shell('cat','/proc/sys/kernel/random/boot_id'),'grant_sha256':digest(files['grant.py']),'chain_sha256':digest(files['chain.py']),'boot_sha256':digest(files['boot.py']),'launcher_sha256':digest(files['launcher.py']),'original_sha256':ORIGINAL_SHA}

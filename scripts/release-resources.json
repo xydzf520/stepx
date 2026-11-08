@@ -72,6 +72,7 @@
     "scripts/setup-desktop-tools.py",
     "scripts/setup-desktop-tools.sh",
     "scripts/setup-material-asr.py",
+    "scripts/source_integrity.py",
     "scripts/stage-release-resources.py",
     "scripts/studio-lab-runtime.py",
     "scripts/sync-public-repo.py",
@@ -84,6 +85,8 @@
     "scripts/test-studio-lab.py",
     "scripts/test_companion_apk.py",
     "scripts/tests/test_public_release_policy.py",
+    "scripts/tests/test_source_checkout.py",
+    "scripts/tests/test_source_integrity.py",
     "scripts/tests/test_windows_crt.py",
     "scripts/verify-packaged-runtime.py",
     "scripts/verify-storage-tools.py",
@@ -425,6 +428,7 @@
     "scripts/play_protect_certification.py",
     "scripts/public_release_policy.py",
     "scripts/release-resources.json",
+    "scripts/source_integrity.py",
     "scripts/stage-release-resources.py",
     "scripts/studio-lab-runtime.py",
     "scripts/test-host-runtime.py",
@@ -831,6 +835,7 @@
     "licenses/FaCloud-NOTICE"
   ],
   "public_files": [
+    ".gitattributes",
     ".github/workflows/release-177-presentation.yml",
     ".github/workflows/release.yml",
     "desktop/scripts/check-home-performance.py",

@@ -95,6 +95,64 @@ class PublicationBoundaryTests(unittest.TestCase):
         self.assertFalse((destination / 'desktop/assets/release-notes/1.2.2.json').exists())
         self.assertTrue((destination / 'desktop/assets/release-notes/1.2.3.json').exists())
 
+    def test_crlf_checkout_stages_identical_python_bytes_and_hashes_without_rewriting_other_inputs(self):
+        source = '# coding: utf-8\nprint("你好")\n'.encode('utf-8')
+        windows_source = source.replace(b'\n', b'\r\n')
+        # Exercise the actual staging entry point, not only the normalizer.
+        # Even an explicitly allowlisted vendor .py must remain byte-for-byte.
+        untouched = {
+            'desktop/assets/runtime.bin': b'\x00\xffbinary\r\n\rpayload',
+            'runtime/python/Lib/vendor.py': b'# vendor\r\nVALUE = 42\r\n',
+            'tools/vendor.py': b'# external tool\r\nVALUE = 7\r\n',
+        }
+        self.policy['runtime_files'] += [policy.MANIFEST, *untouched]
+        self.save_policy()
+        self.write('scripts/main.py', windows_source)
+        for rel, data in untouched.items():
+            self.write(rel, data)
+        destination = Path(self.temp.name) / 'windows-stage'
+        stage(self.root, destination)
+        self.assertEqual(source, (destination / 'scripts/main.py').read_bytes())
+        self.assertEqual(windows_source, (self.root / 'scripts/main.py').read_bytes(),
+                         'packaging must not mutate the developer checkout')
+        digests = json.loads((destination / 'release-resources.sha256.json').read_bytes())
+        self.assertEqual(hashlib.sha256(source).hexdigest(), digests['scripts/main.py'])
+        for rel, data in untouched.items():
+            self.assertEqual(data, (destination / rel).read_bytes())
+            self.assertEqual(hashlib.sha256(data).hexdigest(), digests[rel])
+        for rel, digest in digests.items():
+            self.assertEqual(hashlib.sha256((destination / rel).read_bytes()).hexdigest(), digest)
+        self.assertEqual([], policy.audit_bundle(destination))
+
+        self.write('scripts/main.py', source)
+        reference = Path(self.temp.name) / 'lf-stage'
+        stage(self.root, reference)
+        self.assertEqual(digests, json.loads((reference / 'release-resources.sha256.json').read_bytes()),
+                         'the same source checkout must produce the same resource digests on every OS')
+
+    def test_noncanonical_packaged_python_is_rejected_even_with_a_matching_resource_digest(self):
+        self.policy['runtime_files'].append(policy.MANIFEST)
+        self.save_policy()
+        destination = Path(self.temp.name) / 'output'
+        stage(self.root, destination)
+        for broken in [b'print("safe")\r\n', b'print("safe")\r', b'# invalid UTF-8 \xff\n']:
+            with self.subTest(data=broken):
+                (destination / 'scripts/main.py').write_bytes(broken)
+                hashes = json.loads((destination / 'release-resources.sha256.json').read_bytes())
+                hashes['scripts/main.py'] = hashlib.sha256(broken).hexdigest()
+                (destination / 'release-resources.sha256.json').write_text(json.dumps(hashes))
+                issues = policy.audit_bundle(destination)
+                self.assertTrue(any('scripts/main.py: first-party Python source' in issue for issue in issues))
+
+    def test_invalid_first_party_python_fails_before_staging_any_files(self):
+        for index, broken in enumerate([b'print("safe")\r', b'# invalid UTF-8 \xff\n']):
+            with self.subTest(data=broken):
+                self.write('scripts/main.py', broken)
+                destination = Path(self.temp.name) / f'invalid-stage-{index}'
+                with self.assertRaises(ValueError):
+                    stage(self.root, destination)
+                self.assertFalse(destination.exists())
+
     def test_source_symlink_rejected(self):
         (self.root / 'scripts/main.py').unlink()
         external = Path(self.temp.name) / 'external.py'

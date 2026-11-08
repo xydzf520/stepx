@@ -8,6 +8,7 @@ import hashlib
 import json
 import re
 from pathlib import Path, PurePosixPath
+from source_integrity import canonical_python_source
 from windows_crt import CRT_DLLS, CRT_MANIFEST, verify_manifest
 
 MANIFEST = 'scripts/release-resources.json'
@@ -101,6 +102,12 @@ def generic_target(root: Path) -> bytes:
     return (json.dumps(value, ensure_ascii=False, indent=2) + '\n').encode()
 
 
+def is_first_party_runtime_python(rel: str, policy: dict) -> bool:
+    path = PurePosixPath(rel)
+    return (rel in policy['runtime_files'] and path.suffix.lower() == '.py'
+            and path.parts[0] not in {'runtime', 'tools'})
+
+
 def runtime_plan(root: Path) -> dict[str, bytes]:
     policy = manifest(root)
     # Ship only the release story matching the built app. Older histories remain
@@ -114,7 +121,13 @@ def runtime_plan(root: Path) -> dict[str, bytes]:
             tail = rel.removeprefix('desktop/assets/release-notes/')
             if tail != version + '.json' and not tail.startswith(version + '/'):
                 continue
-        result[rel] = safe_read(root, rel)
+        data = safe_read(root, rel)
+        # Git on Windows may check source out with CRLF. Canonicalize before
+        # staging so the package and its resource manifest hash identical bytes.
+        # Never rewrite executables, APKs, archives, or vendor runtime sources.
+        if is_first_party_runtime_python(rel, policy):
+            data = canonical_python_source(data, label=rel)
+        result[rel] = data
     result['handoff/google-play-stepx/target.json'] = generic_target(root)
     result['handoff/google-play-stepx/target.example.json'] = generic_target(root)
     issues = [issue for rel, data in result.items() for issue in content_problems(rel, data, policy)]
@@ -169,7 +182,15 @@ def audit_bundle(root: Path) -> list[str]:
             if path.stat().st_size <= 2_000_000 and path.suffix.lower() in {'.json', '.txt', '.py', '.sh', '.ps1'}:
                 issues.extend(content_problems(checked_rel, path.read_bytes(), policy, media_review=False))
         else:
-            issues.extend(content_problems(rel, path.read_bytes(), policy, media_review=is_product))
+            data = path.read_bytes()
+            issues.extend(content_problems(rel, data, policy, media_review=is_product))
+            if is_first_party_runtime_python(rel, policy):
+                try:
+                    canonical = canonical_python_source(data, label=rel)
+                except ValueError:
+                    canonical = None
+                if canonical != data:
+                    issues.append(f'{rel}: first-party Python source must be canonical UTF-8 with LF line endings')
     return sorted(set(issues))
 
 
