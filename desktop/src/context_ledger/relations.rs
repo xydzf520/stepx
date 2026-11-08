@@ -456,7 +456,7 @@ mod tests {
         t.turns.push(Turn{user:false,text:"[项目: Secret Launch] 我猜手机会话也是此项目".into(),at_ms:Some(c.now_ms)});
         c.tasks=vec![t];c.push=Some(chat(&c,"[项目: Secret Launch] 请确认价格？"));c.push.as_mut().unwrap().threads[0].title="客户方案".into();
         let o=process(root.path(),&c).unwrap();assert_eq!(o.items.len(),2);assert!(o.items.iter().all(|i|i.source_objects.len()==1));assert!(o.link_candidates.is_empty());
-        assert!(anchors("DEV-12 USB-23 https://zoom.us/j/12345678 https://example.com 用户 13800138000 明天开会").is_empty());
+        assert!(anchors("DEV-12 USB-23 https://zoom.us/j/12345678 https://example.com 用户 13800009367 明天开会").is_empty());
         assert_eq!(anchors("[项目: ABC-1234] https://example.com/issues/1234").len(),1);
     }
     #[test]
@@ -555,10 +555,10 @@ mod tests {
     fn sms_capture() -> Capture {
         let mut c=capture();let body="请确认这份订单资料是否需要回复？保留原始内容与时间。";
         c.push=Some(crate::push::PushSnapshot {threads:vec![crate::push::ImThread {
-            package_name:"com.android.mms".into(),app_name:"短信".into(),thread_id:"com.android.mms::+8613800138000".into(),title:"+8613800138000".into(),
-            messages:vec![ImMessage{id:"mirror-original".into(),sender:"+8613800138000".into(),text:body.into(),timestamp_ms:c.now_ms+180,
+            package_name:"com.android.mms".into(),app_name:"短信".into(),thread_id:"com.android.mms::+8613800009367".into(),title:"+8613800009367".into(),
+            messages:vec![ImMessage{id:"mirror-original".into(),sender:"+8613800009367".into(),text:body.into(),timestamp_ms:c.now_ms+180,
                 time_known:Some(true),via:"notification".into(),..Default::default()}],..Default::default()}],..Default::default()});
-        c.sms=Some(vec![crate::sms::Message {provider_id:Some(17),address:"13800138000".into(),body:body.into(),date_ms:c.now_ms,
+        c.sms=Some(vec![crate::sms::Message {provider_id:Some(17),address:"13800009367".into(),body:body.into(),date_ms:c.now_ms,
             outgoing:false,kind:1,read:true,subscription:None}]);c
     }
     fn raw(root:&Path,c:&Capture)->Ledger {read_ledger(&scoped(root,&c.device,c.account.as_deref()),&c.device,c.account.as_deref()).unwrap().unwrap()}
@@ -593,7 +593,7 @@ mod tests {
         for variant in 0..4 {
             let root=tempfile::tempdir().unwrap();let mut c=sms_capture();let m=&mut c.push.as_mut().unwrap().threads[0].messages[0];
             match variant {
-                0=>{m.sender="13900139000".into();c.push.as_mut().unwrap().threads[0].thread_id="com.android.mms::13900139000".into();},
+                0=>{m.sender="13800009996".into();c.push.as_mut().unwrap().threads[0].thread_id="com.android.mms::13800009996".into();},
                 1=>m.time_known=Some(false),
                 2=>m.timestamp_ms=c.now_ms+1001,
                 _=>{let mut extra=c.sms.as_ref().unwrap()[0].clone();extra.provider_id=Some(18);extra.date_ms+=20;c.sms.as_mut().unwrap().push(extra);},

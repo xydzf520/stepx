@@ -3424,7 +3424,7 @@ impl Companion {
                                             ),
                                         ))
                                         .with_child(self.line(
-                                            "138 0013 8000 · “我取完快递马上过去。”",
+                                            "138 0000 9367 · “我取完快递马上过去。”",
                                             11.,
                                             p.text2,
                                         ))
@@ -3458,7 +3458,7 @@ impl Companion {
                                     6.,
                                     self.content_icon(UiIcon::Check, 14., p.success_text),
                                     self.line_w(
-                                        "已允许执行 · 已向李明 (138 0013 8000) 发送短信",
+                                        "已允许执行 · 已向李明 (138 0000 9367) 发送短信",
                                         CAPTION,
                                         p.success_text,
                                         Weight::Semibold,

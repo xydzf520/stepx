@@ -2837,7 +2837,7 @@ mod tests {
             },
             NotificationPopupWidget::CallerBadge {
                 name: "林婉清".into(),
-                number: "139 1024 6688".into(),
+                number: "138 0000 0041".into(),
             },
             NotificationPopupWidget::SafetyConfirm {
                 prompt: "需要确认提交订单操作".into(),

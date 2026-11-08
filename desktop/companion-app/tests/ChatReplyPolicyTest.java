@@ -2,8 +2,8 @@ package com.stepx.companion.app;
 public final class ChatReplyPolicyTest {
  private static void check(boolean b){if(!b)throw new AssertionError();}
  public static void main(String[] args){
-  check(ChatReplyPolicy.sameRecipient("+8613812345678","138 1234 5678"));
-  check(!ChatReplyPolicy.sameRecipient("13812345678","13812345679"));
+  check(ChatReplyPolicy.sameRecipient("+8613800002916","138 0000 2916"));
+  check(!ChatReplyPolicy.sameRecipient("13800002916","13800007650"));
   check(!ChatReplyPolicy.sameRecipient("Alice","Alice work"));
   check(!ChatReplyPolicy.sameRecipient("+441234567890","1234567890"));
   check(!ChatReplyPolicy.sameRecipient("", ""));

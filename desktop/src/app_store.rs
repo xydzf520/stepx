@@ -4991,7 +4991,7 @@ fn build_curated_catalog_uncached() -> Vec<StoreApp> {
             StoreSource::Global,
             "1.16.0-1",
             13_508_490,
-            "https://pool.apk.aptoide.com/appupdater/com-zerotier-one-193-71762287-535d419f75c7b7ee317a9d0650c76f56.apk",
+            "https://pool.apk.aptoide.com/appupdater/com-zerotier-one-138-00002045-535d419f75c7b7ee317a9d0650c76f56.apk",
         ),
         quick_curated_app(
             "moe.shizuku.privileged.api",

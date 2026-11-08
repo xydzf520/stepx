@@ -190,11 +190,11 @@ mod tests {
 
     #[test]
     fn normalizes_mainland_mobile_prefixes_to_same_key() {
-        assert_eq!(normalize_address("+8613322988887"), "13322988887");
-        assert_eq!(normalize_address("+86 133-2298-8887"), "13322988887");
-        assert_eq!(normalize_address("008613322988887"), "13322988887");
-        assert_eq!(normalize_address("8613322988887"), "13322988887");
-        assert_eq!(normalize_address("13322988887"), "13322988887");
+        assert_eq!(normalize_address("+8613800003135"), "13800003135");
+        assert_eq!(normalize_address("+86 138-0000-3135"), "13800003135");
+        assert_eq!(normalize_address("008613800003135"), "13800003135");
+        assert_eq!(normalize_address("8613800003135"), "13800003135");
+        assert_eq!(normalize_address("13800003135"), "13800003135");
         assert_eq!(normalize_address("1069800095555"), "1069800095555");
     }
 }

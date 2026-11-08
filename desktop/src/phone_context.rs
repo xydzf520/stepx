@@ -1569,21 +1569,21 @@ mod tests {
     fn call_logs_and_media_clues_convert_to_context_messages() {
         let mut calls = vec![
             crate::bridge::BridgeCall {
-                number: "13800138000".into(),
+                number: "13800009367".into(),
                 name: "陈总监".into(),
                 call_type: 3,
                 date_ms: NOW,
                 duration_secs: 0,
             },
             crate::bridge::BridgeCall {
-                number: "+86 139-0013-9000".into(),
+                number: "+86 138-0000-9996".into(),
                 name: String::new(),
                 call_type: 1,
                 date_ms: NOW - 1000,
                 duration_secs: 180,
             },
             crate::bridge::BridgeCall {
-                number: "13700137000".into(),
+                number: "13800005051".into(),
                 name: "短通话".into(),
                 call_type: 2,
                 date_ms: NOW - 2000,
@@ -1592,7 +1592,7 @@ mod tests {
         ];
         let contacts = vec![crate::bridge::BridgeContact {
             display_name: "周工".into(),
-            number: "13900139000".into(),
+            number: "13800009996".into(),
         }];
         enrich_calls_with_contacts(&mut calls, &contacts);
         assert_eq!(calls[1].name, "周工");
@@ -1656,7 +1656,7 @@ mod tests {
              *app_process*)\n\
                read -r req\n\
                printf '%s\\n' \"$req\" >> {}\n\
-               printf 'STEPX_RESULT:{{\"ok\":true,\"results\":{{\"calls\":{{\"ok\":true,\"rows\":[{{\"number\":\"13900139000\",\"name\":\"\",\"type\":\"3\",\"date\":\"1793400000000\",\"duration\":\"0\"}}]}},\"contacts\":{{\"ok\":true,\"rows\":[{{\"display_name\":\"王工\",\"data1\":\"13900139000\"}}]}},\"recordings\":{{\"ok\":true,\"rows\":[{{\"path\":\"/sdcard/Recordings/rec1.m4a\",\"name\":\"rec1.m4a\",\"bytes\":10240,\"modified_ms\":1793400000000}}]}},\"capabilities\":{{\"ok\":true,\"send_sms\":true,\"locked\":false,\"default_subscription\":1,\"protocol\":2,\"subscriptions\":[]}},\"usage\":{{\"ok\":true,\"screen_time_minutes\":42,\"unlock_count\":5,\"clipboard\":\"SF1234567890123\"}}}}}}\\n'\n\
+               printf 'STEPX_RESULT:{{\"ok\":true,\"results\":{{\"calls\":{{\"ok\":true,\"rows\":[{{\"number\":\"13800009996\",\"name\":\"\",\"type\":\"3\",\"date\":\"1793400000000\",\"duration\":\"0\"}}]}},\"contacts\":{{\"ok\":true,\"rows\":[{{\"display_name\":\"王工\",\"data1\":\"13800009996\"}}]}},\"recordings\":{{\"ok\":true,\"rows\":[{{\"path\":\"/sdcard/Recordings/rec1.m4a\",\"name\":\"rec1.m4a\",\"bytes\":10240,\"modified_ms\":1793400000000}}]}},\"capabilities\":{{\"ok\":true,\"send_sms\":true,\"locked\":false,\"default_subscription\":1,\"protocol\":2,\"subscriptions\":[]}},\"usage\":{{\"ok\":true,\"screen_time_minutes\":42,\"unlock_count\":5,\"clipboard\":\"SF1234567890123\"}}}}}}\\n'\n\
                exit 0;;\n\
              *find\\ /sdcard*)\n\
                printf '1793400000.0|20480|/sdcard/Pictures/Screenshots/shot1.png\\n'\n\

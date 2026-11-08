@@ -5806,7 +5806,7 @@ mod tests {
             notification_key: "otp-1".into(),
         });
         app.call_logs.push(CallRecord {
-            number: "139 1024 6688".into(),
+            number: "138 0000 0041".into(),
             name: "林婉清".into(),
             call_type: 3,
             date_ms: now_ms - 60_000,
@@ -6382,7 +6382,7 @@ mod tests {
             ..Default::default()
         });
         app.call_logs.push(CallRecord {
-            number: "13800138000".into(),
+            number: "13800009367".into(),
             name: "王总".into(),
             call_type: 3,
             date_ms: now_ms - 4_000,
@@ -7019,7 +7019,7 @@ mod tests {
             subscription: None,
         });
         app.call_logs.push(CallRecord {
-            number: "13800138000".into(),
+            number: "13800009367".into(),
             name: "张三".into(),
             call_type: 3,
             date_ms: now_ms - 400_000,

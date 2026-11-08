@@ -3120,7 +3120,9 @@ impl Companion {
                 _ => self.render_productivity_overview(),
             });
         }
-        let element = self.panel(children);
+        let element = if self.page == Page::Home {
+            self.home_frame(pages::home::HomeModuleId::ProductivityHub, children)
+        } else { self.panel(children) };
         #[cfg(feature = "ui-capture")]
         let element = super::scenario_check::control("productivity-hub".into(), element);
         element

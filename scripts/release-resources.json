@@ -92,11 +92,15 @@
   "public_docs": [
     "docs/BUILDING.md",
     "docs/DESKTOP_UPDATES.md",
+    "docs/FEATURE_GUIDE.md",
+    "docs/FEATURE_HISTORY.md",
     "docs/GETTING_STARTED.md",
     "docs/PERFORMANCE.md",
+    "docs/RELEASE_0_2_180.md",
     "docs/RELEASE_NOTES.md",
     "docs/RELEASE_NOTES_GUIDELINES.md",
     "docs/SHARE_0_2_177.md",
+    "docs/SHARE_0_2_180.md",
     "docs/STORAGE_EXPANSION.md",
     "docs/STUDIO_INTEGRATION.md"
   ],
@@ -672,6 +676,66 @@
     "46c57cc84e02d9c64533e7352c6684b56bf17e82a3b5aac57020c804cd9df3cf": {
       "example": "docs/videos/popup-sequence.jpg",
       "review": "Reviewed isolated native-client demo frames, final video contact sheets, popup sequence and authorized author/contact end cards; no live chats or call recordings."
+    },
+    "5c49256e9391c690fc4f89fa079636c8c3bccd866f6ae4b7dae8acb533562bc0": {
+      "example": "desktop/assets/release-notes/0.2.180/messages.png",
+      "review": "2026-11-08: final native 0.2.180 isolated-demo media inspected in scene/contact frames; synthetic messages, contacts and files; no private user records or recruiting text in videos. Complete video/audio decode and caption-timing checks passed."
+    },
+    "2969a18ed72088d38f1576e712f1092328e5a517f3f756b31cbbe5efe1050c81": {
+      "example": "desktop/assets/release-notes/0.2.180/search.png",
+      "review": "2026-11-08: final native 0.2.180 isolated-demo media inspected in scene/contact frames; synthetic messages, contacts and files; no private user records or recruiting text in videos. Complete video/audio decode and caption-timing checks passed."
+    },
+    "9777b1be7b3e0a9b6d9586c17335cc5d27589eb4f0173ac12413f90e5a2b4cad": {
+      "example": "desktop/assets/release-notes/0.2.180/phone.png",
+      "review": "2026-11-08: final native 0.2.180 isolated-demo media inspected in scene/contact frames; synthetic messages, contacts and files; no private user records or recruiting text in videos. Complete video/audio decode and caption-timing checks passed."
+    },
+    "3d2e14f9900412e74da68c3c5171afc083aa827411f6ab0df7fa264c0208a381": {
+      "example": "desktop/assets/release-notes/0.2.180/capsule.png",
+      "review": "2026-11-08: final native 0.2.180 isolated-demo media inspected in scene/contact frames; synthetic messages, contacts and files; no private user records or recruiting text in videos. Complete video/audio decode and caption-timing checks passed."
+    },
+    "cf582fd9261088315f73d5f60aa41e973496635813ddd1603d3a6926063f5712": {
+      "example": "desktop/assets/release-notes/0.2.180/home.png",
+      "review": "2026-11-08: final native 0.2.180 isolated-demo media inspected in scene/contact frames; synthetic messages, contacts and files; no private user records or recruiting text in videos. Complete video/audio decode and caption-timing checks passed."
+    },
+    "3c4828dc314166baebde62250137ffe0c91e2a855e5b4dbd1f065da37108a217": {
+      "example": "desktop/assets/release-notes/0.2.180/agent.png",
+      "review": "2026-11-08: final native 0.2.180 isolated-demo media inspected in scene/contact frames; synthetic messages, contacts and files; no private user records or recruiting text in videos. Complete video/audio decode and caption-timing checks passed."
+    },
+    "482ac41fd5888509070ca04b7376739f859ce360da692df1df435450e4f91a9a": {
+      "example": "desktop/assets/release-notes/0.2.180/tools.png",
+      "review": "2026-11-08: final native 0.2.180 isolated-demo media inspected in scene/contact frames; synthetic messages, contacts and files; no private user records or recruiting text in videos. Complete video/audio decode and caption-timing checks passed."
+    },
+    "d30c9a40642a001b0b5e28d41cb0ff3d8979ec81e95a75576670a0f492abec97": {
+      "example": "desktop/assets/release-notes/0.2.180/files.png",
+      "review": "2026-11-08: final native 0.2.180 isolated-demo media inspected in scene/contact frames; synthetic messages, contacts and files; no private user records or recruiting text in videos. Complete video/audio decode and caption-timing checks passed."
+    },
+    "52be3391d271653b1c2b65f7d03ca53426c6bf8f1f47974e306d24d28cd74318": {
+      "example": "desktop/assets/release-notes/0.2.180/connection.png",
+      "review": "2026-11-08: final native 0.2.180 isolated-demo media inspected in scene/contact frames; synthetic messages, contacts and files; no private user records or recruiting text in videos. Complete video/audio decode and caption-timing checks passed."
+    },
+    "68461268a10a697be844deb5bcb34bbbd1d9d9b7c7bc934aae56b47a0a22c7ef": {
+      "example": "desktop/assets/release-notes/0.2.180/tour.mp4",
+      "review": "2026-11-08: final native 0.2.180 isolated-demo media inspected in scene/contact frames; synthetic messages, contacts and files; no private user records or recruiting text in videos. Complete video/audio decode and caption-timing checks passed."
+    },
+    "02d14a55003f9bf4f9d221d9036ad9aa9c2072dafd3fcf3eeb5ffc86b56b782d": {
+      "example": "desktop/assets/release-notes/0.2.180/tour.h264",
+      "review": "2026-11-08: final native 0.2.180 isolated-demo media inspected in scene/contact frames; synthetic messages, contacts and files; no private user records or recruiting text in videos. Complete video/audio decode and caption-timing checks passed."
+    },
+    "4b22f915282c25a6702003beb86c1cd6dcf234f144c27cdb21c33f9edb1103e5": {
+      "example": "docs/videos/StepX-0.2.60-to-0.2.180.mp4",
+      "review": "2026-11-08: final native 0.2.180 isolated-demo media inspected in scene/contact frames; synthetic messages, contacts and files; no private user records or recruiting text in videos. Complete video/audio decode and caption-timing checks passed."
+    },
+    "440d8b3299c1cece6bade43a3135876985f0229047cb53230dac868c31ce87bd": {
+      "example": "docs/videos/StepX-product-0.2.180.mp4",
+      "review": "2026-11-08: final native 0.2.180 isolated-demo media inspected in scene/contact frames; synthetic messages, contacts and files; no private user records or recruiting text in videos. Complete video/audio decode and caption-timing checks passed."
+    },
+    "0dd5fe572285d9cdd4a29ec2acb4422b776f7d20b6fba85c809c0647e9138ca3": {
+      "example": "docs/videos/StepX-0.2.60-to-0.2.180-contact-sheet.jpg",
+      "review": "2026-11-08: final native 0.2.180 isolated-demo media inspected in scene/contact frames; synthetic messages, contacts and files; no private user records or recruiting text in videos. Complete video/audio decode and caption-timing checks passed."
+    },
+    "2bb7c8d6ecb74a59ac2cfdcf98200797cc72e90c3012d567fa8c787206832d86": {
+      "example": "docs/videos/StepX-product-0.2.180-contact-sheet.jpg",
+      "review": "2026-11-08: final native 0.2.180 isolated-demo media inspected in scene/contact frames; synthetic messages, contacts and files; no private user records or recruiting text in videos. Complete video/audio decode and caption-timing checks passed."
     }
   },
   "reviewed_text_fixtures": [
@@ -759,10 +823,23 @@
     "licenses/FaCloud-NOTICE"
   ],
   "public_files": [
+    ".github/workflows/release-177-presentation.yml",
+    ".github/workflows/release.yml",
     "desktop/scripts/check-home-performance.py",
     "desktop/scripts/test-file-dialog-macos.cjs",
     "desktop/scripts/verify-macos-file-dialogs.py",
     "docs/videos/README.md",
+    "docs/videos/StepX-0.2.60-to-0.2.180-contact-sheet.jpg",
+    "docs/videos/StepX-0.2.60-to-0.2.180-qa.json",
+    "docs/videos/StepX-0.2.60-to-0.2.180.mp4",
+    "docs/videos/StepX-0.2.60-to-0.2.180.srt",
+    "docs/videos/StepX-product-0.2.180-contact-sheet.jpg",
+    "docs/videos/StepX-product-0.2.180-qa.json",
+    "docs/videos/StepX-product-0.2.180.mp4",
+    "docs/videos/StepX-product-0.2.180.srt",
+    "docs/videos/storyboard.json"
+  ],
+  "public_removed_files": [
     "docs/videos/StepX-0.2.60-to-0.2.177-contact-sheet.jpg",
     "docs/videos/StepX-0.2.60-to-0.2.177-qa.json",
     "docs/videos/StepX-0.2.60-to-0.2.177.mp4",
@@ -771,7 +848,6 @@
     "docs/videos/StepX-product-0.2.177-qa.json",
     "docs/videos/StepX-product-0.2.177.mp4",
     "docs/videos/StepX-product-0.2.177.srt",
-    "docs/videos/popup-sequence.jpg",
-    "docs/videos/storyboard.json"
+    "docs/videos/popup-sequence.jpg"
   ]
 }

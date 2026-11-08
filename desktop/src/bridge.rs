@@ -1895,8 +1895,8 @@ mod tests {
         let calls_val = json!({
             "ok": true,
             "rows": [
-                {"number": "13800138000", "name": "王总", "type": "3", "date": "1761840000000", "duration": "0"},
-                {"number": "13900139000", "name": "李工", "type": "1", "date": "1761840600000", "duration": "185"}
+                {"number": "13800009367", "name": "王总", "type": "3", "date": "1761840000000", "duration": "0"},
+                {"number": "13800009996", "name": "李工", "type": "1", "date": "1761840600000", "duration": "185"}
             ]
         });
         let parsed_calls = parse_calls(&calls_val).unwrap();
@@ -1907,19 +1907,19 @@ mod tests {
         assert_eq!(parsed_calls[1].name, "王总");
         assert!(parsed_calls[1].is_missed());
         assert_eq!(parsed_calls[1].type_label(), "未接来电");
-        assert_eq!(parsed_calls[1].display_peer(), "王总 (13800138000)");
+        assert_eq!(parsed_calls[1].display_peer(), "王总 (13800009367)");
 
-        let content_raw = "Row: 0 number=13700001111, name=张经理, type=3, date=1761850000000, duration=0\nRow: 1 number=13600002222, name=NULL, type=2, date=1761845000000, duration=95\n";
+        let content_raw = "Row: 0 number=13800007357, name=张经理, type=3, date=1761850000000, duration=0\nRow: 1 number=13800001721, name=NULL, type=2, date=1761845000000, duration=95\n";
         let fallback_calls = parse_calls_content_output(content_raw, 10);
         assert_eq!(fallback_calls.len(), 2);
         assert!(fallback_calls[0].is_missed());
-        assert_eq!(fallback_calls[1].display_peer(), "13600002222");
+        assert_eq!(fallback_calls[1].display_peer(), "13800001721");
 
         let contacts_val = json!({
             "ok": true,
             "rows": [
-                {"display_name": "张三", "data1": "13800138000"},
-                {"display_name": "李四", "data1": "13900139000"}
+                {"display_name": "张三", "data1": "13800009367"},
+                {"display_name": "李四", "data1": "13800009996"}
             ]
         });
         let parsed_contacts = parse_contacts(&contacts_val).unwrap();

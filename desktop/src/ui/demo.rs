@@ -59,23 +59,23 @@ impl Companion {
         self.contacts = vec![
             stepx_companion::device::ContactEntry {
                 name: "张晓峰".into(),
-                number: "138 0013 8000".into(),
+                number: "138 0000 9367".into(),
             },
             stepx_companion::device::ContactEntry {
                 name: "林婉清".into(),
-                number: "139 1024 6688".into(),
+                number: "138 0000 0041".into(),
             },
             stepx_companion::device::ContactEntry {
                 name: "王磊".into(),
-                number: "186 2100 9527".into(),
+                number: "138 0000 4193".into(),
             },
             stepx_companion::device::ContactEntry {
                 name: "陈思远".into(),
-                number: "137 6408 3310".into(),
+                number: "138 0000 9054".into(),
             },
             stepx_companion::device::ContactEntry {
                 name: "周明轩".into(),
-                number: "150 0192 7741".into(),
+                number: "138 0000 2571".into(),
             },
             stepx_companion::device::ContactEntry {
                 name: "顺丰速运客服".into(),
@@ -85,28 +85,28 @@ impl Companion {
         self.selected_contact = 0;
         self.call_logs = vec![
             stepx_companion::device::CallRecord {
-                number: "138 0013 8000".into(),
+                number: "138 0000 9367".into(),
                 name: "张晓峰".into(),
                 call_type: 1,
                 date_ms: now - 18 * min,
                 duration_sec: 265,
             },
             stepx_companion::device::CallRecord {
-                number: "139 1024 6688".into(),
+                number: "138 0000 0041".into(),
                 name: "林婉清".into(),
                 call_type: 3,
                 date_ms: now - 46 * min,
                 duration_sec: 0,
             },
             stepx_companion::device::CallRecord {
-                number: "186 2100 9527".into(),
+                number: "138 0000 4193".into(),
                 name: "王磊".into(),
                 call_type: 2,
                 date_ms: now - 135 * min,
                 duration_sec: 142,
             },
             stepx_companion::device::CallRecord {
-                number: "137 6408 3310".into(),
+                number: "138 0000 9054".into(),
                 name: "陈思远".into(),
                 call_type: 1,
                 date_ms: now - 310 * min,
@@ -120,7 +120,7 @@ impl Companion {
                 duration_sec: 0,
             },
             stepx_companion::device::CallRecord {
-                number: "150 0192 7741".into(),
+                number: "138 0000 2571".into(),
                 name: "周明轩".into(),
                 call_type: 2,
                 date_ms: now - 1480 * min,
@@ -167,13 +167,13 @@ impl Companion {
                 false,
             ),
             msg(
-                "138 0013 8000",
+                "138 0000 9367",
                 "会议改到明天下午 2 点，地点不变。",
                 125,
                 false,
             ),
-            msg("138 0013 8000", "收到，我会准时到。", 110, true),
-            msg("138 0013 8000", "好的，记得带上周的数据。", 95, false),
+            msg("138 0000 9367", "收到，我会准时到。", 110, true),
+            msg("138 0000 9367", "好的，记得带上周的数据。", 95, false),
             msg(
                 "95588",
                 "您尾号 1234 的账户于 10-20 14:02 支出 128.00 元。",
@@ -187,8 +187,8 @@ impl Companion {
                 false,
             ),
         ];
-        self.selected_thread = Some("138 0013 8000".into());
-        self.fields[F_SMS_TO].set("138 0013 8000");
+        self.selected_thread = Some("138 0000 9367".into());
+        self.fields[F_SMS_TO].set("138 0000 9367");
         let entry = |name: &str, bytes: u64, directory: bool| Entry {
             name: name.into(),
             path: format!("/sdcard/{name}"),
@@ -499,7 +499,7 @@ impl Companion {
             self.fields[F_SMS_BODY].set("收到，我会准时到。");
             self.pending_sms_plan = Some(SmsPlan {
                 request_id: "demo".into(),
-                number: "138 0013 8000".into(),
+                number: "138 0000 9367".into(),
                 body: "收到，我会准时到。".into(),
                 subscription: 1,
                 subscription_label: "卡 1 · 中国移动".into(),

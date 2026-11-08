@@ -2487,7 +2487,7 @@ mod tests {
         }];
         app.sms_loaded = true;
         app.call_logs = vec![CallRecord {
-            number: "13800138000".into(),
+            number: "13800009367".into(),
             name: "测试联系人".into(),
             call_type: 1,
             date_ms: 1_700_000_000_000,
@@ -2495,7 +2495,7 @@ mod tests {
         }];
         app.contacts = vec![ContactEntry {
             name: "测试联系人".into(),
-            number: "13800138000".into(),
+            number: "13800009367".into(),
         }];
         app.phone_loaded = true;
 

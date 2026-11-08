@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import subprocess
 from pathlib import Path
 import sys
 import tempfile
@@ -125,6 +126,70 @@ class PublicationBoundaryTests(unittest.TestCase):
             self.assertEqual(expected, export.fixture_placeholders('test.rs', text))
         fixture = '"/Users/macuser" "/Users/macuser/Library/data"'
         self.assertEqual(fixture, export.fixture_placeholders('test.rs', fixture))
+
+    def test_public_phone_fixture_preserves_normalization_and_is_idempotent(self):
+        original = '133' + '2298' + '8887'
+        formats = [original, '+86' + original, '0086' + original,
+                   '86' + original, '+86 ' + original[:3] + '-' + original[3:7] + '-' + original[7:]]
+        clean = export.fixture_placeholders('desktop/src/normalization.rs', ' '.join('"' + v + '"' for v in formats))
+        self.assertNotIn(original, clean)
+        local = clean.split('"')[1]
+        self.assertTrue(local.startswith('1380000'))
+        self.assertIn('+86' + local, clean)
+        self.assertIn('0086' + local, clean)
+        self.assertIn('+86 ' + local[:3] + '-' + local[3:7] + '-' + local[7:], clean)
+        self.assertEqual(clean, export.fixture_placeholders('desktop/src/normalization.rs', clean))
+
+    def test_public_recipient_fixtures_stay_distinct(self):
+        originals = ['139' + '1024' + '6688', '186' + '2100' + '5520']
+        clean = [export.fixture_placeholders('desktop/src/test.rs', v) for v in originals]
+        self.assertEqual(len(set(clean)), len(originals))
+        self.assertFalse(set(clean) & set(originals))
+
+    def test_existing_public_inputs_receive_full_policy_before_writes(self):
+        public = Path(self.temp.name) / 'public'
+        public.mkdir()
+        subprocess.run(['git', 'init', '-q', str(public)], check=True)
+        (public / 'old.db').write_bytes(b'private runtime database')
+        (public / 'old.png').write_bytes(b'unreviewed screenshot')
+        with mock.patch.object(export, 'ROOT', self.root), mock.patch.object(export, 'PUBLIC_ROOT', public):
+            findings = export.scan_public_repo({})
+        self.assertTrue(any('old.db' in f for f in findings))
+        self.assertTrue(any('old.png' in f for f in findings))
+
+    def test_tracked_ignored_private_files_are_not_silently_skipped(self):
+        public = Path(self.temp.name) / 'public'
+        public.mkdir()
+        subprocess.run(['git', 'init', '-q', str(public)], check=True)
+        (public / 'state').mkdir()
+        (public / 'state/device.json').write_text('{}')
+        subprocess.run(['git', '-C', str(public), 'add', 'state/device.json'], check=True)
+        (public / '.gitignore').write_text('state/\n')
+        with mock.patch.object(export, 'ROOT', self.root), mock.patch.object(export, 'PUBLIC_ROOT', public):
+            findings = export.scan_public_repo({})
+        self.assertTrue(any('state/device.json' in f for f in findings))
+
+    def test_retired_media_removed_only_from_public_copy_after_preflight(self):
+        rel = 'docs/videos/obsolete.mp4'
+        self.policy['public_removed_files'] = [rel]
+        self.save_policy()
+        self.write(rel, b'local recording retained')
+        public = Path(self.temp.name) / 'public'
+        (public / rel).parent.mkdir(parents=True)
+        (public / rel).write_bytes(b'old public output')
+        with mock.patch.object(export, 'ROOT', self.root), mock.patch.object(export, 'PUBLIC_ROOT', public):
+            export.execute_sync({}, check_only=True)
+            self.assertTrue((public / rel).exists())
+            export.execute_sync({}, check_only=False)
+        self.assertFalse((public / rel).exists())
+        self.assertEqual(b'local recording retained', (self.root / rel).read_bytes())
+
+    def test_retired_media_cannot_escape_public_videos(self):
+        for rel in ['../private', 'state/user.db', 'desktop/src/main.rs']:
+            self.policy['public_removed_files'] = [rel]
+            self.save_policy()
+            with mock.patch.object(export, 'ROOT', self.root), self.assertRaises(ValueError):
+                export.publication_removals({})
 
     def test_runtime_verification_cannot_write_bytecode_to_stage_or_inherited_cache(self):
         # Exercise the actual child-process launcher, not just its argv. The

@@ -22,7 +22,7 @@ import stat
 import sys
 from typing import Dict, List, Set, Tuple
 
-from public_release_policy import manifest, safe_read, content_problems, generic_target
+from public_release_policy import manifest, safe_read, content_problems, generic_target, path_problems
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 PUBLIC_ROOT = ROOT / "releases" / "stepx-public"
@@ -253,6 +253,33 @@ def fixture_placeholders(rel: str, text: str) -> str:
     text = re.sub(r'''/(home|Users)/([A-Za-z0-9_.-]+)(?=/|["'\s]|$)''', public_home, text)
     # Known developer LAN endpoint fixtures only; retain private-address semantics.
     text = text.replace('10.0.1.177', '10.0.0.42').replace('10.0.1.200', '10.0.0.43')
+    # Parser and UI scenario fixtures must not publish conversation names taken
+    # from a developer's phone. Keep exact-match relationships across files.
+    conversation_fixtures = {
+        'd72ffe602380b4dd66888d02362a9f35d99993c209a606d72bfb55a7d8eeed52': '演示交流小组',
+        'fa0f35b8a6923ddf5816bded2768a19df37ebab73243016e400c281701b0bf3f': '示例团队 • 项目讨论',
+        'a03e6539e2aea5f48e276231ccdef3e0b9d602c1a854f594389063760d1c3eb6': '示例团队 · 项目讨论',
+    }
+    text = re.sub(r'(?:Builder\s+One[\s•·]*STEPX|STEPX)[\u3400-\u9fff]{2,16}',
+                  lambda m: conversation_fixtures.get(hashlib.sha256(m[0].encode()).hexdigest(), m[0]), text)
+    if rel == 'CHANGELOG.md':
+        # Historical implementation notes quoted an actual @ mention. A neutral
+        # example explains the behavior without publishing the conversation.
+        text = re.sub(r'如 `[^`\n]*@[^`\n]*`', '如 `演示成员: @我 请确认明天的评审时间`', text)
+    # Source fixtures exercise number normalization and recipient matching. Use
+    # deterministic synthetic numbers while preserving country-code/separator
+    # formatting, so both inputs and expected outputs still agree. Do not touch
+    # author contact information explicitly retained in the client About panel.
+    if pathlib.PurePosixPath(rel).suffix in {'.rs', '.java', '.kt', '.py'}:
+        def public_phone(match):
+            local = match.group('local')
+            digits = re.sub(r'\D', '', local)
+            if digits.startswith('1380000'):
+                return match.group(0)
+            replacement = '1380000' + str(int(hashlib.sha256(digits.encode()).hexdigest()[:8], 16) % 10000).zfill(4)
+            cursor = iter(replacement)
+            return match.group('prefix') + ''.join(next(cursor) if char.isdigit() else char for char in local)
+        text = re.sub(r'(?<![0-9A-Za-z])(?P<prefix>(?:(?:\+?86|0086)[ \t]?)?)(?P<local>1[3-9](?:[ -]?\d){9})(?![0-9A-Za-z])', public_phone, text)
     return text
 
 
@@ -270,7 +297,7 @@ def collect_sync_plan() -> Dict[str, Tuple[bytes, int]]:
             if path.is_file() and not should_skip_path(path):
                 paths.add(path.relative_to(ROOT).as_posix())
     allowed_code_suffixes = {'.rs', '.toml', '.lock', '.java', '.kt', '.xml', '.json', '.srt',
-        '.md', '.txt', '.py', '.sh', '.ps1', '.js', '.cjs', '.mjs', '.svg', '.rc',
+        '.md', '.txt', '.py', '.sh', '.ps1', '.js', '.cjs', '.mjs', '.svg', '.rc', '.yml', '.yaml',
         '.dex', '.jar', '.apk', '.aar', '.so', '.ttf', '.otf', '.pro', '.gradle'}
     allowed_code_suffixes.update({'.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico', '.mp4', '.h264'})
     for rel in sorted(paths):
@@ -305,7 +332,7 @@ def collect_sync_plan() -> Dict[str, Tuple[bytes, int]]:
         if not path.is_file() or should_skip_path(path):
             continue
         rel = path.relative_to(PUBLIC_ROOT).as_posix()
-        if rel in plan or rel.startswith(('vendor/', '.github/')):
+        if rel in plan or rel in policy.get('public_removed_files', []) or rel.startswith(('vendor/', '.github/')):
             continue
         if path.suffix.lower() not in {'.md', '.txt', '.rs', '.py', '.sh', '.ps1', '.json', '.toml', '.js', '.cjs'}:
             continue
@@ -346,24 +373,53 @@ def scan_public_repo(plan: Dict[str, Tuple[bytes, int]]) -> List[str]:
             continue
         findings.extend(scan_bytes_for_secrets(f"[staged] {rel}", data))
 
-    # 2. Scan existing files not replaced by the fully validated plan
+    # 2. Audit every existing publication input not replaced by the plan, using
+    # the same full path/content/media policy. The public checkout can retain
+    # older media or ignored-but-tracked runtime data; a token-only scan misses
+    # those. Git's file list avoids inspecting private untracked build outputs.
     if PUBLIC_ROOT.is_dir():
-        for path in sorted(PUBLIC_ROOT.rglob("*")):
-            if not path.is_file() or should_skip_path(path):
+        import subprocess
+        policy = manifest(ROOT)
+        result = subprocess.run(['git', '-C', str(PUBLIC_ROOT), 'ls-files', '-z',
+                                 '--cached', '--others', '--exclude-standard'],
+                                check=True, stdout=subprocess.PIPE)
+        removed = publication_removals(plan)
+        for rel in sorted(set(result.stdout.decode('utf-8').split('\0')) - {''}):
+            if rel in plan or rel in removed:
                 continue
-            if path.suffix.lower() in BINARY_EXTENSIONS:
+            path = PUBLIC_ROOT / rel
+            if not path.exists() and not path.is_symlink():
                 continue
-            rel = path.relative_to(PUBLIC_ROOT).as_posix()
-            if rel not in plan:
-                findings.extend(scan_bytes_for_secrets(rel, path.read_bytes()))
+            if path.is_symlink():
+                findings.append(f'{rel}: source symlinks require explicit review')
+                continue
+            if path.is_file():
+                findings.extend(content_problems(rel, path.read_bytes(), policy))
 
     return findings
+
+
+def publication_removals(plan: Dict[str, Tuple[bytes, int]]) -> Set[str]:
+    """Explicitly retired video outputs, only in the public mirror.
+
+    Local historical recordings are never removed. This also prevents stale,
+    superseded media from being silently republished by the existing Git tree.
+    """
+    removed = set(manifest(ROOT).get('public_removed_files', []))
+    for rel in removed:
+        if path_problems(rel) or not rel.startswith('docs/videos/') or rel in plan:
+            raise ValueError(f'{rel}: invalid retired-public-media entry')
+        dest = PUBLIC_ROOT / rel
+        if dest.is_symlink() or (dest.exists() and not dest.is_file()):
+            raise ValueError(f'{rel}: retired public media must be a regular file')
+    return removed
 
 
 def execute_sync(plan: Dict[str, Tuple[bytes, int]], check_only: bool) -> Tuple[int, int, int]:
     added = 0
     modified = 0
     unchanged = 0
+    removed = publication_removals(plan)
 
     for rel in plan:
         dest = PUBLIC_ROOT / rel
@@ -389,6 +445,8 @@ def execute_sync(plan: Dict[str, Tuple[bytes, int]], check_only: bool) -> Tuple[
                 unchanged += 1
 
     if not check_only and PUBLIC_ROOT.is_dir():
+        for rel in sorted(removed):
+            (PUBLIC_ROOT / rel).unlink(missing_ok=True)
         for pycache in list((PUBLIC_ROOT / "scripts").rglob("__pycache__")):
             if pycache.is_dir():
                 shutil.rmtree(pycache, ignore_errors=True)

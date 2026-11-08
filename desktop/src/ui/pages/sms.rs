@@ -6829,8 +6829,8 @@ mod tests {
         use stepx_companion::push::{ImMessage, ImThread};
 
         assert_eq!(
-            sanitize_ui_display_text("⋆STEPX星辰停泊港📱"),
-            "⋆STEPX星辰停泊港"
+            sanitize_ui_display_text("⋆演示交流小组📱"),
+            "⋆演示交流小组"
         );
         assert_eq!(
             sanitize_ui_display_text("[文件传输助手队列消息 #1] 第一条队列消息"),
@@ -6927,8 +6927,8 @@ mod tests {
         };
 
         assert_eq!(
-            canonical_conversation_title_key("Builder One • STEPX探索基地[月亮]"),
-            canonical_conversation_title_key("Builder One • STEPX探索基地[表情][表情]")
+            canonical_conversation_title_key("示例团队 • 项目讨论[月亮]"),
+            canonical_conversation_title_key("示例团队 • 项目讨论[表情][表情]")
         );
         assert!(is_scraped_ui_noise_thread(&ImThread {
             title: "通过朋友验证".into(),

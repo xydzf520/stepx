@@ -897,7 +897,7 @@ mod tests {
     fn agent_only_accepts_attested_phrase_and_sends_no_source_content() {
         let candidate = notification(
             "顺丰速运",
-            "收件联系顾客甲 13812345678，快件 SF123456789012 正在派送，将送至您处",
+            "收件联系顾客甲 13800002916，快件 SF123456789012 正在派送，将送至您处",
             "private-key",
             NOW,
         )
@@ -915,7 +915,7 @@ mod tests {
         assert!(!vague.agent_candidate());
         assert!(!sent.agent_candidate());
         let prompt = agent_request(DEFAULT_AGENT_PROMPT, &[&candidate]);
-        for secret in ["顾客甲", "13812345678", "SF123456789012", "private-key"] {
+        for secret in ["顾客甲", "13800002916", "SF123456789012", "private-key"] {
             assert!(!prompt.contains(secret));
         }
         for evidence in ["不存在", "您的快件", ""] {

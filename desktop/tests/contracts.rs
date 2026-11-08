@@ -342,14 +342,14 @@ fn backscreen_matrix_preserves_379_active_leds_and_12_corner_cutouts() {
 #[test]
 fn call_logs_and_contacts_parse_cleanly() {
     use stepx_companion::device::{parse_call_logs, parse_contacts};
-    let raw_calls = "Row: 0 number=13800138000, name=王磊, type=1, date=1700000050000, duration=125\nRow: 1 number=13910245678, name=NULL, type=3, date=1700000090000, duration=0\n";
+    let raw_calls = "Row: 0 number=13800009367, name=王磊, type=1, date=1700000050000, duration=125\nRow: 1 number=13800004846, name=NULL, type=3, date=1700000090000, duration=0\n";
     let calls = parse_call_logs(raw_calls);
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[0].type_label(), "未接");
     assert_eq!(calls[1].type_label(), "呼入");
     assert_eq!(calls[1].format_duration(), "2分5秒");
 
-    let raw_contacts = "Row: 0 display_name=王磊, data1=138 0013 8000\nRow: 1 display_name=王磊, data1=138 0013 8000\nRow: 2 display_name=林晓雨, data1=139 1024 5678\n";
+    let raw_contacts = "Row: 0 display_name=王磊, data1=138 0000 9367\nRow: 1 display_name=王磊, data1=138 0000 9367\nRow: 2 display_name=林晓雨, data1=138 0000 4846\n";
     let contacts = parse_contacts(raw_contacts);
     assert_eq!(contacts.len(), 2);
 }

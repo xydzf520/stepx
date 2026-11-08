@@ -8421,7 +8421,7 @@ mod tests {
             updated_at: "12:15".into(),
         }];
         let call_logs = vec![CallRecord {
-            number: "13800138000".into(),
+            number: "13800009367".into(),
             name: "张总".into(),
             call_type: 3,
             date_ms: 1_760_000_020_000,
@@ -9041,7 +9041,7 @@ mod tests {
         ];
         let sms = vec![Message {
             provider_id: None,
-            address: "13910246688".into(),
+            address: "13800000041".into(),
             body: "你好，下午的会议纪要发我一份".into(),
             date_ms: 1_760_000_115_000,
             outgoing: false,
@@ -9050,7 +9050,7 @@ mod tests {
             subscription: None,
         }];
         let call_logs = vec![CallRecord {
-            number: "18621005520".into(),
+            number: "13800009765".into(),
             name: "顺丰派件员".into(),
             call_type: 3,
             date_ms: 1_760_000_118_000,
@@ -9519,7 +9519,7 @@ mod tests {
 
         let sms = vec![crate::sms::Message {
             provider_id: Some(11),
-            address: "13800138000".into(),
+            address: "13800009367".into(),
             body: "周三的会议资料请查收".into(),
             date_ms: dt_ms(2026, 10, 28, 14, 20),
             outgoing: false,
@@ -10458,7 +10458,7 @@ mod tests {
         );
 
         let call_logs = vec![CallRecord {
-            number: "13800138000".into(),
+            number: "13800009367".into(),
             name: "张总".into(),
             call_type: 3,
             date_ms: start_ms + 300_000,
@@ -10528,7 +10528,7 @@ mod tests {
         assert!(looks_like_sms_service_number("106839382199220262"));
         assert!(looks_like_sms_service_number("88888888888888"));
         assert!(looks_like_sms_service_number("95338"));
-        assert!(looks_like_sms_service_number("13812345678"));
+        assert!(looks_like_sms_service_number("13800002916"));
         assert!(!looks_like_sms_service_number("SF1234567890123"));
         assert!(!is_completed_express_text(
             "【菜鸟驿站】您的包裹已签收，感谢使用"
@@ -10818,7 +10818,7 @@ mod tests {
             },
             Message {
                 provider_id: Some(703),
-                address: "+8613900001111".into(),
+                address: "+8613800006877".into(),
                 body: "刚在开会，现在方便通电话吗？".into(),
                 date_ms: now_ms - 60_000, // newer outgoing SMS after missed call
                 outgoing: true,
@@ -10852,7 +10852,7 @@ mod tests {
             },
         ];
         let call_logs = vec![CallRecord {
-            number: "139 0000 1111".into(),
+            number: "138 0000 6877".into(),
             name: "刘总".into(),
             call_type: 3,
             date_ms: now_ms - 300_000, // 5 mins ago, resolved by newer outgoing SMS above

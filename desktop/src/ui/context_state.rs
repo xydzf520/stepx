@@ -5046,7 +5046,7 @@ impl Companion {
                 12.,
                 12.,
             ));
-            return self.panel(children);
+            return self.home_frame(pages::home::HomeModuleId::ContextLedgerHub, children);
         }
 
         let _ = is_tall;
@@ -5215,7 +5215,7 @@ impl Companion {
             ));
         }
 
-        self.panel(children)
+        self.home_frame(pages::home::HomeModuleId::ContextLedgerHub, children)
     }
 
     fn render_context_review_panel(&self) -> widgets::El {
