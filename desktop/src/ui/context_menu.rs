@@ -2808,19 +2808,106 @@ impl Companion {
                 );
             }
             Target::HomeModule(mod_id) => {
-                for width in pages::home::HomeModuleWidth::ALL {
-                    push(&format!("{}宽度 · {}", if self.home_modules.module_width(*mod_id) == width { "✓ " } else { "" }, width.short_label()), "",
-                        Some(Action::HomeModule(pages::home::HomeModuleAction::SetModuleWidth(*mod_id, width))));
-                }
-                for height in pages::home::HomeModuleHeight::ALL {
-                    push(&format!("{}内容 · {}", if self.home_modules.module_height(*mod_id) == height { "✓ " } else { "" }, height.short_label()), "",
-                        Some(Action::HomeModule(pages::home::HomeModuleAction::SetModuleHeight(*mod_id, height))));
-                }
-                push("向前移动", "", Some(Action::HomeModule(pages::home::HomeModuleAction::MoveUp(*mod_id))));
-                push("向后移动", "", Some(Action::HomeModule(pages::home::HomeModuleAction::MoveDown(*mod_id))));
-                push("移到最前", "", Some(Action::HomeModule(pages::home::HomeModuleAction::MoveToTop(*mod_id))));
-                push("隐藏模块", "", Some(Action::HomeModule(pages::home::HomeModuleAction::RemoveModule(*mod_id))));
-                if !self.home_module_edit_mode {
+                if self.home_module_edit_mode {
+                    for width in pages::home::HomeModuleWidth::ALL {
+                        push(&format!("{}宽度 · {}", if self.home_modules.module_width(*mod_id) == width { "✓ " } else { "" }, width.short_label()), "",
+                            Some(Action::HomeModule(pages::home::HomeModuleAction::SetModuleWidth(*mod_id, width))));
+                    }
+                    for height in pages::home::HomeModuleHeight::ALL {
+                        push(&format!("{}内容 · {}", if self.home_modules.module_height(*mod_id) == height { "✓ " } else { "" }, height.short_label()), "",
+                            Some(Action::HomeModule(pages::home::HomeModuleAction::SetModuleHeight(*mod_id, height))));
+                    }
+                    push("向前移动", "", Some(Action::HomeModule(pages::home::HomeModuleAction::MoveUp(*mod_id))));
+                    push("向后移动", "", Some(Action::HomeModule(pages::home::HomeModuleAction::MoveDown(*mod_id))));
+                    push("移到最前", "", Some(Action::HomeModule(pages::home::HomeModuleAction::MoveToTop(*mod_id))));
+                    push("隐藏模块", "", Some(Action::HomeModule(pages::home::HomeModuleAction::RemoveModule(*mod_id))));
+                } else {
+                    use pages::home::HomeModuleId as Module;
+                    use super::context_state::ContextAction;
+                    use super::productivity_state::ProductivityAction;
+                    use stepx_companion::context_ledger::Period;
+                    // Reuse the visible controls' actions. Opening a menu never
+                    // creates a phone event, sends a message, or runs an Agent.
+                    let create_event = || Action::BackScreen(
+                        BackScreenAction::CalendarStartCreateOnDate(
+                            self.back_screen.calendar_year,
+                            self.back_screen.calendar_month,
+                            self.back_screen.selected_calendar_day,
+                        ),
+                    );
+                    let shortcuts = match mod_id {
+                        Module::RecentFiles => vec![
+                            ("查看全部最近文件", Action::FileView(true)),
+                            ("刷新最近文件", Action::RecentFiles(RecentFilesAction::Refresh)),
+                            ("设置文件来源", Action::RecentFiles(RecentFilesAction::Folders)),
+                        ],
+                        Module::ProductivityHub => vec![
+                            ("查看跟进行动", Action::Productivity(ProductivityAction::Tab(2))),
+                            ("刷新资料与行动", Action::Productivity(ProductivityAction::Refresh)),
+                        ],
+                        Module::LiveCountdown => vec![
+                            ("查看实况胶囊", Action::BackScreen(BackScreenAction::ToggleLiveCapsulePopover)),
+                            ("打开闹钟", Action::Page(Page::Alarms)),
+                        ],
+                        Module::CalendarPanorama => vec![
+                            ("打开完整日历", Action::Page(Page::Calendar)),
+                            ("在所选日期新建日程…", create_event()),
+                            ("同步日历", Action::BackScreen(BackScreenAction::SyncCalendarAndSuite)),
+                        ],
+                        Module::WeeklyAndAi => vec![
+                            ("查看本周回顾", Action::Context(ContextAction::Period(Period::Week))),
+                            ("刷新回顾资料", Action::Context(ContextAction::Refresh)),
+                        ],
+                        Module::WorkModule => vec![
+                            ("在所选日期新建日程…", create_event()),
+                            ("打开工作文件", Action::Page(Page::Work)),
+                        ],
+                        Module::LifeModule => vec![
+                            ("打开消息与通知", Action::Page(Page::Notifications)),
+                            ("查看天气与出行", Action::OpenTool(Some(ToolPage::Weather))),
+                        ],
+                        Module::IssuesAndReplyModule => vec![
+                            ("查看全部消息", Action::Page(Page::Notifications)),
+                            ("查看通话记录", Action::Page(Page::Phone)),
+                        ],
+                        Module::PulseAndKpi => vec![
+                            ("查看数字健康", Action::OpenTool(Some(ToolPage::Wellbeing))),
+                            ("刷新手机状态", Action::BackScreen(BackScreenAction::InspectStepOsSuite)),
+                        ],
+                        Module::AlarmsAndControl => vec![
+                            ("打开全部闹钟", Action::Page(Page::Alarms)),
+                            ("同步闹钟与状态", Action::BackScreen(BackScreenAction::SyncCalendarAndSuite)),
+                        ],
+                        Module::BackScreenAndHabits => vec![
+                            ("打开背屏编辑", Action::Page(Page::BackScreen)),
+                            ("刷新背屏与用机时长", Action::BackScreen(BackScreenAction::InspectStepOsSuite)),
+                        ],
+                        Module::ToolsSummaryDock => vec![
+                            ("打开全部小工具", Action::OpenTool(None)),
+                            ("打开双端剪贴板", Action::OpenTool(Some(ToolPage::Clipboard))),
+                        ],
+                        Module::ContinuityWorkspace => vec![
+                            ("查看对话与草稿", Action::HomeShowHistory),
+                            ("打开我的作品", Action::Page(Page::Studio)),
+                        ],
+                        Module::ContextLedgerHub => vec![
+                            ("查看今日回顾", Action::Context(ContextAction::Period(Period::Day))),
+                            ("管理讨论与成果", Action::Context(ContextAction::Manage)),
+                            ("刷新讨论与成果", Action::Context(ContextAction::Refresh)),
+                        ],
+                        Module::QuickStartRequest => vec![
+                            ("输入新的需求…", Action::Focus(F_HOME_COMMAND)),
+                            ("打开 Amoo 对话", Action::Page(Page::Amoo)),
+                            ("打开工作文件", Action::Page(Page::Work)),
+                        ],
+                        Module::WeatherModule => vec![
+                            ("查看完整天气预报", Action::OpenTool(Some(ToolPage::Weather))),
+                            ("刷新天气", Action::WeatherRefresh),
+                        ],
+                    };
+                    for (label, action) in shortcuts {
+                        push(label, "", Some(action));
+                    }
                     push("调整首页布局", "", Some(Action::HomeModule(pages::home::HomeModuleAction::SetEditMode(true))));
                 }
             }
@@ -2851,20 +2938,22 @@ impl Companion {
                         pages::home::HomeModuleAction::ToggleEditMode,
                     )),
                 );
-                push(
-                    &format!("显示全部 {} 个首页模块", pages::home::HomeModuleId::ALL.len()),
-                    "",
-                    Some(Action::HomeModule(
-                        pages::home::HomeModuleAction::ShowAllModules,
-                    )),
-                );
-                push(
-                    "恢复首页默认布局",
-                    "",
-                    Some(Action::HomeModule(
-                        pages::home::HomeModuleAction::ResetDefault,
-                    )),
-                );
+                if self.home_module_edit_mode {
+                    push(
+                        &format!("显示全部 {} 个首页模块", pages::home::HomeModuleId::ALL.len()),
+                        "",
+                        Some(Action::HomeModule(
+                            pages::home::HomeModuleAction::ShowAllModules,
+                        )),
+                    );
+                    push(
+                        "恢复首页默认布局",
+                        "",
+                        Some(Action::HomeModule(
+                            pages::home::HomeModuleAction::ResetDefault,
+                        )),
+                    );
+                }
             }
         }
         let is_intent = matches!(menu.target, Target::WorkspaceIntent(_));
@@ -2879,7 +2968,41 @@ impl Companion {
             .into_iter()
             .enumerate()
             .map(|(idx, (label, key, action))| {
-                let (icon, is_danger, group) = classify_context_entry(&label, action.as_ref());
+                let (mut icon, is_danger, mut group) = classify_context_entry(&label, action.as_ref());
+                if matches!(menu.target, Target::HomeModule(_)) && !self.home_module_edit_mode {
+                    // Module shortcuts share one compact group and use their
+                    // domain's SVG, independently of wording. Layout is last.
+                    if !matches!(action, Some(Action::HomeModule(_))) {
+                        group = 0;
+                        icon = match action.as_ref() {
+                            Some(Action::FileView(_)) => icons::UiIcon::Folder,
+                            Some(Action::RecentFiles(RecentFilesAction::Folders)) => icons::UiIcon::Settings,
+                            Some(Action::RecentFiles(RecentFilesAction::Refresh)
+                                | Action::WeatherRefresh
+                                | Action::Productivity(super::productivity_state::ProductivityAction::Refresh)
+                                | Action::Context(super::context_state::ContextAction::Refresh)
+                                | Action::BackScreen(BackScreenAction::SyncCalendarAndSuite | BackScreenAction::InspectStepOsSuite)) => icons::UiIcon::Refresh,
+                            Some(Action::Context(super::context_state::ContextAction::Manage)
+                                | Action::Productivity(super::productivity_state::ProductivityAction::Tab(_))) => icons::UiIcon::Clipboard,
+                            Some(Action::Context(super::context_state::ContextAction::Period(_))) => icons::UiIcon::Chart,
+                            Some(Action::BackScreen(BackScreenAction::ToggleLiveCapsulePopover)) => icons::UiIcon::Bolt,
+                            Some(Action::BackScreen(BackScreenAction::CalendarStartCreateOnDate(..))) => icons::UiIcon::Plus,
+                            Some(Action::Page(Page::Calendar)) => icons::UiIcon::Calendar,
+                            Some(Action::Page(Page::Alarms)) => icons::UiIcon::Clock,
+                            Some(Action::Page(Page::Work)) => icons::UiIcon::File,
+                            Some(Action::Page(Page::Studio)) => icons::UiIcon::Apps,
+                            Some(Action::Page(Page::Notifications)) => icons::UiIcon::Sms,
+                            Some(Action::Page(Page::Phone)) => icons::UiIcon::Phone,
+                            Some(Action::Page(Page::BackScreen)) => icons::UiIcon::Matrix,
+                            Some(Action::Page(Page::Amoo) | Action::HomeShowHistory) => icons::UiIcon::Chat,
+                            Some(Action::OpenTool(Some(ToolPage::Weather))) => icons::UiIcon::Sun,
+                            Some(Action::OpenTool(Some(ToolPage::Wellbeing))) => icons::UiIcon::Activity,
+                            Some(Action::OpenTool(Some(ToolPage::Clipboard))) => icons::UiIcon::Clipboard,
+                            Some(Action::Focus(F_HOME_COMMAND)) => icons::UiIcon::Edit,
+                            _ => icon,
+                        };
+                    }
+                }
                 let separator_before = if is_intent || idx == 0 {
                     false
                 } else if is_home_ctx {
@@ -3344,24 +3467,142 @@ fn intent_menu_position(x: f32, y: f32, anchor_height: f32, width: f32, height: 
 #[cfg(test)]
 mod intent_tests {
     use super::*;
+
+    fn home_menu(target: Target) -> Menu {
+        Menu { target, at: Vector2F::new(20., 20.), text: None, selected: None }
+    }
+
+    #[test]
+    fn every_home_module_normal_menu_has_safe_shortcuts_and_only_an_edit_entry() {
+        use pages::home::{HomeModuleAction, HomeModuleId};
+        let mut app = Companion::new_for_test();
+        app.home_module_edit_mode = false;
+        let original_layout = app.home_modules.clone();
+        let original_focus = app.focus;
+        for module in HomeModuleId::ALL {
+            let entries = app.context_entries(&home_menu(Target::HomeModule(module)));
+            assert!((3..=4).contains(&entries.len()), "{module:?}: concise shortcuts plus layout entry");
+            for entry in &entries[..entries.len() - 1] {
+                // In particular, CalendarCreateOnSelectedDate, SendToAmoo,
+                // phone-control mutations and layout mutations are not shortcuts.
+                assert!(matches!(entry.action.as_ref(), Some(
+                    Action::Page(_)
+                    | Action::FileView(true)
+                    | Action::RecentFiles(RecentFilesAction::Refresh | RecentFilesAction::Folders)
+                    | Action::OpenTool(_)
+                    | Action::Context(super::super::context_state::ContextAction::Manage
+                        | super::super::context_state::ContextAction::Period(_)
+                        | super::super::context_state::ContextAction::Refresh)
+                    | Action::Productivity(super::super::productivity_state::ProductivityAction::Refresh
+                        | super::super::productivity_state::ProductivityAction::Tab(2))
+                    | Action::BackScreen(BackScreenAction::CalendarStartCreateOnDate(..)
+                        | BackScreenAction::SyncCalendarAndSuite
+                        | BackScreenAction::InspectStepOsSuite
+                        | BackScreenAction::ToggleLiveCapsulePopover)
+                    | Action::HomeShowHistory | Action::WeatherRefresh | Action::Focus(F_HOME_COMMAND)
+                )), "{module:?}: unsupported or unsafe shortcut {}", entry.label);
+                assert!(!entry.is_danger);
+                assert!(!entry.separator_before, "module shortcuts belong to one section");
+            }
+            let edit = entries.last().unwrap();
+            assert!(matches!(edit.action, Some(Action::HomeModule(HomeModuleAction::SetEditMode(true)))));
+            assert_eq!(edit.label, "调整首页布局");
+            assert!(edit.separator_before);
+            assert_eq!(edit.icon, icons::UiIcon::Edit);
+        }
+        assert_eq!(app.home_modules, original_layout, "opening menus must not change the layout");
+        assert_eq!(app.focus, original_focus, "opening menus must not interrupt typing");
+    }
+
+    #[test]
+    fn home_shortcuts_target_real_views_and_preserve_selected_calendar_date() {
+        use pages::home::HomeModuleId as Module;
+        let mut app = Companion::new_for_test();
+        app.home_module_edit_mode = false;
+        app.back_screen.calendar_year = 2027;
+        app.back_screen.calendar_month = 2;
+        app.back_screen.selected_calendar_day = 17;
+        for module in [Module::CalendarPanorama, Module::WorkModule] {
+            let entries = app.context_entries(&home_menu(Target::HomeModule(module)));
+            assert!(entries.iter().any(|entry| matches!(entry.action,
+                Some(Action::BackScreen(BackScreenAction::CalendarStartCreateOnDate(2027, 2, 17))))));
+        }
+        let files = app.context_entries(&home_menu(Target::HomeModule(Module::RecentFiles)));
+        assert!(matches!(files[0].action, Some(Action::FileView(true))));
+        assert!(matches!(files[1].action, Some(Action::RecentFiles(RecentFilesAction::Refresh))));
+        assert!(matches!(files[2].action, Some(Action::RecentFiles(RecentFilesAction::Folders))));
+        let backscreen = app.context_entries(&home_menu(Target::HomeModule(Module::BackScreenAndHabits)));
+        assert!(matches!(backscreen[0].action, Some(Action::Page(Page::BackScreen))));
+        for module in [Module::WeeklyAndAi, Module::ContextLedgerHub] {
+            let entries = app.context_entries(&home_menu(Target::HomeModule(module)));
+            let Some(Action::Context(action)) = &entries[0].action else {
+                panic!("{module:?} must open its review view");
+            };
+            app.handle_context_action(action);
+            assert!(app.context_home_is_focused(), "review opens visibly instead of changing a hidden tab");
+        }
+        let ledger = app.context_entries(&home_menu(Target::HomeModule(Module::ContextLedgerHub)));
+        let Some(Action::Context(action)) = &ledger[1].action else {
+            panic!("discussion management must be an existing context action");
+        };
+        app.handle_context_action(action);
+        assert!(app.context_home_is_focused());
+        let history = app.context_entries(&home_menu(Target::HomeModule(Module::ContinuityWorkspace)));
+        assert!(app.apply_home_action(history[0].action.as_ref().unwrap(), None));
+        assert_eq!(app.page, Page::Amoo);
+        assert!(app.workspace.history, "history shortcut opens the existing drafts/history view");
+    }
+
+    #[test]
+    fn home_canvas_layout_mutations_require_edit_mode_and_entry_enables_it() {
+        use pages::home::HomeModuleAction;
+        let mut app = Companion::new_for_test();
+        app.home_module_edit_mode = false;
+        let original_layout = app.home_modules.clone();
+        let entries = app.context_entries(&home_menu(Target::HomeCanvas));
+        let layout_actions: Vec<_> = entries.iter().filter_map(|entry| match &entry.action {
+            Some(Action::HomeModule(action)) => Some(action),
+            _ => None,
+        }).collect();
+        assert_eq!(layout_actions.len(), 1);
+        assert!(matches!(layout_actions[0], HomeModuleAction::ToggleEditMode));
+        let edit_entry = entries.iter().find(|entry| matches!(entry.action,
+            Some(Action::HomeModule(HomeModuleAction::ToggleEditMode)))).unwrap();
+        assert!(app.apply_home_action(edit_entry.action.as_ref().unwrap(), None));
+        assert!(app.home_module_edit_mode);
+        assert_eq!(app.home_modules, original_layout, "entering edit mode must not reset a custom layout");
+        let entries = app.context_entries(&home_menu(Target::HomeCanvas));
+        assert!(entries.iter().any(|entry| matches!(entry.action,
+            Some(Action::HomeModule(HomeModuleAction::ShowAllModules)))));
+        assert!(entries.iter().any(|entry| matches!(entry.action,
+            Some(Action::HomeModule(HomeModuleAction::ResetDefault)))));
+        assert!(app.apply_home_action(&Action::HomeModule(HomeModuleAction::CancelEdit), None));
+        assert!(!app.home_module_edit_mode);
+        assert_eq!(app.home_modules, original_layout);
+    }
+
     #[test]
     fn home_module_menu_groups_size_content_order_and_reversible_hide() {
-        let app = Companion::new_for_test();
-        let entries = app.context_entries(&Menu {
-            target: Target::HomeModule(pages::home::HomeModuleId::RecentFiles),
-            at: Vector2F::new(20., 20.), text: None, selected: None,
-        });
-        assert!(entries.iter().all(|entry| entry.icon != icons::UiIcon::Tools));
-        let widths: Vec<_> = entries.iter().filter(|entry| entry.label.contains("宽度 ·")).collect();
-        assert_eq!(widths.iter().filter(|entry| entry.icon == icons::UiIcon::Check).count(), 1);
-        assert!(!widths.iter().skip(1).any(|entry| entry.separator_before), "selected width belongs to the same section");
-        let content: Vec<_> = entries.iter().filter(|entry| entry.label.contains("内容 ·")).collect();
-        assert!(content[0].separator_before);
-        assert!(!content.iter().skip(1).any(|entry| entry.separator_before));
-        let hide = entries.iter().find(|entry| entry.label == "隐藏模块").unwrap();
-        assert_eq!(hide.icon, icons::UiIcon::Minus);
-        assert!(hide.separator_before);
-        assert!(!hide.is_danger, "hiding is reversible in the module library");
+        let mut app = Companion::new_for_test();
+        app.home_module_edit_mode = true;
+        for module in pages::home::HomeModuleId::ALL {
+            let entries = app.context_entries(&home_menu(Target::HomeModule(module)));
+            assert!(entries.iter().all(|entry| matches!(entry.action, Some(Action::HomeModule(_)))));
+            assert!(entries.iter().all(|entry| entry.icon != icons::UiIcon::Tools));
+            let widths: Vec<_> = entries.iter().filter(|entry| entry.label.contains("宽度 ·")).collect();
+            assert_eq!(widths.len(), pages::home::HomeModuleWidth::ALL.len());
+            assert_eq!(widths.iter().filter(|entry| entry.icon == icons::UiIcon::Check).count(), 1);
+            assert!(!widths.iter().skip(1).any(|entry| entry.separator_before), "selected width belongs to the same section");
+            let content: Vec<_> = entries.iter().filter(|entry| entry.label.contains("内容 ·")).collect();
+            assert_eq!(content.len(), pages::home::HomeModuleHeight::ALL.len());
+            assert_eq!(content.iter().filter(|entry| entry.icon == icons::UiIcon::Check).count(), 1);
+            assert!(content[0].separator_before);
+            assert!(!content.iter().skip(1).any(|entry| entry.separator_before));
+            let hide = entries.iter().find(|entry| entry.label == "隐藏模块").unwrap();
+            assert_eq!(hide.icon, icons::UiIcon::Minus);
+            assert!(hide.separator_before);
+            assert!(!hide.is_danger, "hiding is reversible in the module library");
+        }
     }
     #[test]
     fn opens_below_when_room() {
