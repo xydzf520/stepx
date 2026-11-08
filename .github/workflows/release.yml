@@ -98,8 +98,12 @@ jobs:
       - name: Desktop state and interaction tests
         # Collect independent UI/runtime failures even when a core test fails.
         # Build and publication still require every test step to succeed.
+        # Renderer benchmarks and fake-device processes share small CI hosts.
+        # Run cases sequentially so CPU-heavy layout work cannot starve a
+        # transport fixture's real deadlines. Tests that exercise concurrency
+        # still start their own workers; no production timeout is relaxed.
         if: ${{ !cancelled() }}
-        run: cargo test --locked --manifest-path desktop/Cargo.toml --bin stepx-companion
+        run: cargo test --locked --manifest-path desktop/Cargo.toml --bin stepx-companion -- --test-threads=1
       - name: Runtime and updater tests
         if: ${{ !cancelled() }}
         run: python scripts/ci-platform-smoke.py
