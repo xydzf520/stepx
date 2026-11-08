@@ -4,12 +4,13 @@ import sys
 """恢复原厂 StepClaw 启动器并移除本次 GMS 安装；会删除本次 Google 本地数据。"""
 import pathlib, subprocess, json, time, sys
 
-from common import ROOT, STATE as HERE, ADB, CONFIG, guard, shell
+from common import ROOT, STATE as HERE, ADB, CONFIG, guard, shell, hold_operation_lock
 import argparse
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--keep-apps', action='store_true')
 args = parser.parse_args()
 guard()
+operation_lease = hold_operation_lock()
 BASELINE = json.loads((HERE / 'baseline.json').read_text())
 assert baseline_matches(BASELINE), 'Wrong device baseline'
 INSTALL = json.loads((HERE / 'boot-install.json').read_text())

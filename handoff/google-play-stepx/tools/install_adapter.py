@@ -4,11 +4,12 @@ import sys
 """Install only the reviewed, fixed-device GMS boot adapter, preserving stock."""
 import pathlib, subprocess, json, base64, uuid, hashlib, shutil
 
-from common import ROOT, STATE as BACKUP, ADB, CONFIG, guard, verified_fingerprint
+from common import ROOT, STATE as BACKUP, ADB, CONFIG, guard, verified_fingerprint, hold_operation_lock
 from source_integrity import read_python_source
 import argparse
 argparse.ArgumentParser(description=__doc__).parse_args()
 guard(native=True)
+operation_lease = hold_operation_lock()
 STOCK_SHA = '5cfe5a88a97eca424bd4922fe813e0cc553adad0e8623105311ec1514022152f'
 baseline = json.loads((BACKUP / 'baseline.json').read_text())
 assert baseline_matches(baseline), 'Wrong device baseline'

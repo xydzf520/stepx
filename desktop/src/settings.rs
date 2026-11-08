@@ -24,6 +24,7 @@ pub struct Settings {
     pub close_to_tray: bool,
     pub reduced_motion: bool,
     pub sync_work_outputs: bool,
+    pub google_auto_repair: bool,
     pub capsule_agent_enabled: bool,
     pub capsule_agent_prompt: String,
     pub home_agent_enabled: bool,
@@ -40,6 +41,7 @@ impl Default for Settings {
             close_to_tray: false,
             reduced_motion: false,
             sync_work_outputs: false,
+            google_auto_repair: true,
             capsule_agent_enabled: false,
             capsule_agent_prompt: crate::capsule_fulfillment::DEFAULT_AGENT_PROMPT.into(),
             home_agent_enabled: false,
@@ -262,5 +264,17 @@ mod tests {
         assert_eq!(load_from(&path).home_agent_prompt, "先核对原文，再整理待办");
         fs::write(&path, r#"{"home_agent_prompt":" "}"#).unwrap();
         assert_eq!(load_from(&path).home_agent_prompt, crate::agent_workflows::DEFAULT_PROMPT);
+    }
+    #[test]
+    fn google_maintenance_defaults_on_and_preserves_an_explicit_pause() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        fs::write(&path, r#"{"reduced_motion":true}"#).unwrap();
+        let mut value = load_from(&path);
+        assert!(value.google_auto_repair && value.reduced_motion);
+        value.google_auto_repair = false;
+        save_to(&path, &value).unwrap();
+        let restored = load_from(&path);
+        assert!(!restored.google_auto_repair && restored.reduced_motion);
     }
 }

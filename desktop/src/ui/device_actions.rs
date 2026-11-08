@@ -55,7 +55,10 @@ impl Companion {
                 return;
             }
             Page::Tools if !self.demo_mode => match self.tool_page {
-                Some(ToolPage::Google) if !self.google_suite.checked => {
+                Some(ToolPage::Google) if !self.google_suite.checked
+                    && !self.google_recovery.inspect_requested
+                    && !self.google_recovery.is_inspecting()
+                    && self.google_recovery.inspection_error.is_empty() => {
                     self.handle_device_action(&Action::GoogleSuiteInspect);
                     return;
                 }
@@ -663,6 +666,8 @@ impl Companion {
                 | Action::InspectServices
                 | Action::InspectInputMethod
                 | Action::GoogleSuiteInspect
+                | Action::GoogleAutoRepairToggle
+                | Action::GoogleAutoRepairNow
                 | Action::CompanionInspect
                 | Action::NeoInspect
                 | Action::Apps
@@ -2034,17 +2039,34 @@ impl Companion {
             }
             Action::InspectInputMethod | Action::SwitchInputMethodFcitx5(_) => {}
             Action::GoogleSuiteInspect => {
-                self.google_suite = GoogleSuiteStatus::default();
-                *self.google_progress.lock().unwrap() = String::new();
-                self.with_device("正在检测 Google 服务…", |adb, d| {
-                    let suite = d.inspect_google_suite(adb)?;
-                    let companion = companion_app::inspect(adb, &d)?;
-                    let msg = suite.verification_note.clone();
-                    Ok(Outcome::GoogleSuite(suite, companion, msg))
-                });
+                self.google_recovery.inspect_requested = true;
+                self.google_recovery.inspection_error.clear();
+            }
+            Action::GoogleAutoRepairToggle => {
+                if let Err(error) = self.set_google_auto_repair(!self.settings.value.google_auto_repair) {
+                    self.google_recovery.inspection_error = error.to_string();
+                }
+            }
+            Action::GoogleAutoRepairNow => {
+                if let Some(device) = &self.selected {
+                    self.google_recovery.coordinator.request_now(&device.serial);
+                }
+                self.google_recovery.inspect_requested = true;
+                self.google_recovery.inspection_error.clear();
             }
             Action::GoogleSuiteMaintain | Action::GoogleSuiteRollback => {
+                if let Some(reason) = self.google_mutation_wait_reason() {
+                    self.google_recovery.inspection_error = reason.into();
+                    return;
+                }
                 let rollback = matches!(action, Action::GoogleSuiteRollback);
+                self.google_recovery.coordinator.cancel();
+                if rollback {
+                    if let Err(error) = self.set_google_auto_repair(false) {
+                        self.google_recovery.inspection_error = error.to_string();
+                        return;
+                    }
+                }
                 let progress = self.google_progress.clone();
                 *progress.lock().unwrap() = if rollback {
                     "核对兼容补丁备份…".into()
@@ -2076,6 +2098,11 @@ impl Companion {
                 );
             }
             Action::GoogleSuiteInstall => {
+                if let Some(reason) = self.google_mutation_wait_reason() {
+                    self.google_recovery.inspection_error = reason.into();
+                    return;
+                }
+                self.google_recovery.coordinator.cancel();
                 self.google_suite = GoogleSuiteStatus::default();
                 let progress = self.google_progress.clone();
                 *progress.lock().unwrap() = "检查 Google Play 与 StepX伴侣安装条件…".into();

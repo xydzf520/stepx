@@ -122,7 +122,10 @@ class CanonicalSourceTests(unittest.TestCase):
             lf = b'print(1)\n'
             for name in ('boot.py', 'inject.py', 'launcher.py'):
                 (local / 'module' / name).write_bytes(lf.replace(b'\n', b'\r\n'))
-            for function in ('repair_runtime', 'recover_metadata'):
+            wrapper = next(n for n in module.body if isinstance(n, ast.FunctionDef) and n.name == 'repair_runtime')
+            self.assertIn('operation_lock()', ast.unparse(wrapper))
+            self.assertIn('_repair_runtime()', ast.unparse(wrapper))
+            for function in ('_repair_runtime', 'recover_metadata'):
                 fn = next(n for n in module.body if isinstance(n, ast.FunctionDef) and n.name == function)
                 scope = {'ROOT': local, 'python_source_sha256': python_source_sha256}
                 execute([assignment(fn.body, 'expected')], scope)

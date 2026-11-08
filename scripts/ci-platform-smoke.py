@@ -7,8 +7,9 @@ run('-m','unittest','discover','-s','desktop/tests','-p','test_desktop_update.py
 run('scripts/test-host-runtime.py')
 run('-m','unittest','discover','-s','desktop/tests','-p','test_store_download.py')
 run('-m','unittest','discover','-s','desktop/tests','-p','test_companion_system.py')
-for suite in ['test_root_bridge.py','test_google_install_flow.py','test_google_runtime_status.py','test_companion_boot.py']:
+for suite in ['test_root_bridge.py','test_google_install_flow.py','test_google_runtime_status.py','test_google_autonomous.py','test_companion_boot.py']:
  run('-m','unittest','discover','-s','desktop/tests','-p',suite)
+run('-m','unittest','discover','-s','desktop/tests','-p','test_google_login_runtime.py')
 if os.name=='posix':
  # These tests execute the Android/Linux filesystem payload with fcntl and
  # O_NOFOLLOW in an isolated host directory. Host-only boot tests run above.

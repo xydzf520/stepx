@@ -226,7 +226,7 @@ class PreparationPayloadTests(unittest.TestCase):
                 patch.object(manage, 'shell', side_effect=shell), patch.object(manage, 'root_json', return_value=proof), \
                 patch.object(manage, 'save_json', side_effect=lambda n,v: (state / n).write_text(json.dumps(v))), \
                 contextlib.redirect_stdout(io.StringIO()):
-            manage.prepare()
+            manage._prepare()
         for name in ('baseline.json', 'install-progress.json'):
             self.assertEqual(json.loads((state / name).read_text())['fingerprint'], observed['fingerprint'])
         self.assertEqual((state / 'ubuntu_zygote.stock').read_bytes(), self.original)

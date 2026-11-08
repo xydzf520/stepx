@@ -6,7 +6,7 @@ import json
 import re
 import time
 from pathlib import Path
-from common import ROOT, guard, root_json, shell
+from common import ROOT, guard, root_json, shell, operation_lock
 
 GOOGLE = ('com.google.android.gsf', 'com.google.android.gms', 'com.android.vending')
 
@@ -65,6 +65,13 @@ print(json.dumps(json.load(open(p)) if os.path.exists(p) else {}))''')
 
 
 def repair():
+    import manage
+    with operation_lock():
+        with manage.companion_operation_lock():
+            return _repair()
+
+
+def _repair():
     if not inspect()['needs_repair']:
         return {'status': 'already_ready'}
     # The same companion boot installation is used by the combined Play installer.

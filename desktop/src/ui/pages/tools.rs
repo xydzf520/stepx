@@ -3744,6 +3744,11 @@ impl Companion {
     fn google_tool_page(&self) -> El {
         let p = self.p();
         let g = &self.google_suite;
+        let automatic = self.settings.value.google_auto_repair;
+        let maintenance = self.google_recovery.snapshot.as_ref();
+        let maintaining = maintenance.is_some_and(|state| state.in_flight);
+        let mutation_blocked = self.busy || self.google_mutation_wait_reason().is_some();
+        let reading_details = self.google_recovery.is_inspecting() || self.google_recovery.inspect_requested;
 
         let pill_badge =
             |label: &str, fg: facloud_ui::color::ColorU, bg: facloud_ui::color::ColorU| -> El {
@@ -3767,10 +3772,14 @@ impl Companion {
                 || g.health_needs_repair
                 || (g.compatibility_supported && !g.compatibility_active));
 
-        let (overall_label, overall_fg, overall_bg) = if !g.checked {
+        let (overall_label, overall_fg, overall_bg) = if maintaining {
+            ("自动维护中", p.blue, crate::ui::pages::home::soft_tint(p.blue, p.dark))
+        } else if reading_details {
+            ("正在读取状态", p.blue, crate::ui::pages::home::soft_tint(p.blue, p.dark))
+        } else if !g.checked {
             ("待检测", p.text2, p.sidebar)
         } else if all_ready {
-            ("已就绪 · 可正常使用", p.success, p.success_soft)
+            ("服务检查通过", p.success, p.success_soft)
         } else if g.installed {
             ("已安装 · 建议修复", p.warning, p.warning_soft)
         } else {
@@ -3778,8 +3787,8 @@ impl Companion {
         };
 
         let mut top_actions = Vec::new();
-        if self.busy {
-            top_actions.push(self.disabled_button("处理中…"));
+        if mutation_blocked {
+            top_actions.push(self.disabled_button(if maintaining { "自动维护中…" } else { "暂不可修复" }));
         } else if !g.installed {
             top_actions.push(self.button(
                 "tool-google-install",
@@ -3794,7 +3803,7 @@ impl Companion {
                 Btn::Secondary,
             ));
         } else {
-            if needs_repair {
+            if needs_repair && !maintaining {
                 top_actions.push(self.button(
                     "tool-google-compat-apply",
                     "一键修复",
@@ -3843,9 +3852,10 @@ impl Companion {
                         if !g.checked {
                             "连接手机后自动读取安装与权限状态"
                         } else if all_ready {
-                            "三件套、系统权限与登录服务均已生效，开启 VPN 即可登录下载"
+                            "三件套、系统权限与登录入口检查通过；具体应用仍需网络和认证条件支持"
                         } else if g.installed {
-                            "检测到权限或登录服务待恢复，点击右侧「一键修复」即可恢复"
+                            if automatic { "连接电脑后自动检查并恢复已配置的服务，进度显示在下方" }
+                            else { "电脑自动维护已暂停，可手动检查或修复服务" }
                         } else {
                             "一键安装 Google 框架、Play 服务、Play 商店及 StepX 手机伴侣"
                         },
@@ -3894,7 +3904,7 @@ impl Companion {
         let perm_val = if !g.checked {
             ("待检测".into(), p.text2)
         } else if perms_ok {
-            ("153/153 正常".into(), p.success)
+            (format!("{}/{} 正常", g.granted_count, g.total_permissions), p.success)
         } else if g.installed {
             ("需恢复权限".into(), p.warning)
         } else {
@@ -3946,6 +3956,38 @@ impl Companion {
             ],
         );
 
+        let automatic_message = if !automatic {
+            if maintaining { "当前步骤完成后暂停电脑维护；手机自身的更新恢复继续运行" }
+            else { "已暂停电脑自动维护；手机自身的更新恢复继续运行" }.to_string()
+        } else if let Some(state) = maintenance {
+            if state.message.is_empty() { "连接后自动检查 Google 服务".into() }
+            else { state.message.clone() }
+        } else {
+            "连接后自动检查 Google 服务".into()
+        };
+        let automatic_color = if !automatic { p.text2 }
+            else if maintenance.is_some_and(|state| matches!(state.phase,
+                stepx_companion::google::recovery::RecoveryPhase::NeedsAttention |
+                stepx_companion::google::recovery::RecoveryPhase::Blocked)) { p.warning }
+            else if maintenance.is_some_and(|state| state.phase == stepx_companion::google::recovery::RecoveryPhase::Healthy) { p.success }
+            else { p.blue };
+        let mut maintenance_content = vec![
+            self.between(
+                self.section_heading(UiIcon::Refresh, "服务自动维护"),
+                self.hstack(S2, vec![
+                    if maintaining { self.disabled_button("检查中…") }
+                    else { self.button("google-auto-check", "立即检查", Action::GoogleAutoRepairNow, Btn::Secondary) },
+                    self.button("google-auto-toggle", if automatic { "暂停电脑维护" } else { "开启自动维护" },
+                        Action::GoogleAutoRepairToggle, Btn::Ghost),
+                ]),
+            ),
+            self.line_w(automatic_message, BODY, automatic_color, Weight::Medium),
+            self.line("Google 组件更新后，手机先恢复权限与登录服务；电脑检查结果并在需要时补救。保留已有账号和应用数据。", CAPTION, p.text2),
+        ];
+        if !self.google_recovery.inspection_error.is_empty() {
+            maintenance_content.push(self.line(&self.google_recovery.inspection_error, CAPTION, p.warning));
+        }
+        let maintenance_panel = self.panel(maintenance_content);
         let overview_panel = self.panel(vec![header_row, metrics_grid]);
 
         let quick_fix_row = |title: &str, desc: String, right_btn: El| -> El {
@@ -3961,13 +4003,13 @@ impl Companion {
             )
         };
 
-        let mut compat_btns = vec![self.button(
+        let mut compat_btns = vec![if mutation_blocked { self.disabled_button("稍后修复") } else { self.button(
             "google-step3-patch-btn",
             "一键修复",
             Action::GoogleSuiteMaintain,
             Btn::Secondary,
-        )];
-        if g.compatibility_can_rollback {
+        ) }];
+        if g.compatibility_can_rollback && !mutation_blocked {
             compat_btns.push(self.button(
                 "tool-google-compat-rollback",
                 "撤销补丁",
@@ -3980,18 +4022,18 @@ impl Companion {
             self.heading("常见问题处理"),
             quick_fix_row(
                 "卡在「正在核对信息」或商店闪退",
-                "先开启手机 VPN（国际网络），再点右侧修复权限与服务后重开商店".into(),
-                self.button(
+                "先检查手机网络。组件与权限问题会自动尝试恢复；仍未恢复时可手动重试".into(),
+                if mutation_blocked { self.disabled_button("稍后修复") } else { self.button(
                     "google-step2-repair-btn",
                     "修复权限与服务",
                     Action::GoogleSuiteMaintain,
                     Btn::Secondary,
-                ),
+                ) },
             ),
             self.divider(),
             quick_fix_row(
                 "提示「设备未认证」无法登录或下载",
-                "重新写入商店兼容补丁；如需恢复出厂初始状态可撤销补丁".into(),
+                "可检查已支持的商店兼容配置；权限修复不代表 Play Integrity 或厂商认证通过".into(),
                 self.hstack(S2, compat_btns),
             ),
             self.divider(),
@@ -4014,7 +4056,7 @@ impl Companion {
             ),
         ]);
 
-        self.vstack(S4, vec![overview_panel, fixes_panel])
+        self.vstack(S4, vec![overview_panel, maintenance_panel, fixes_panel])
     }
 
     pub(in crate::ui) fn weather_tool_page(&self) -> El {

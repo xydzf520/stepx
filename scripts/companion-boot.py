@@ -480,6 +480,7 @@ def activate(apk,rebind=False):
         record_activation(persistence['config'],target,result)
     return {'status':'activated','package':p.PACKAGE,'service_uid':1000,'signature_verified':True,
             'system_server_unchanged':True,'boot_installed':persistence.get('status')=='installed' and not persistence.get('skipped_hook'),
+            'google_login':result.get('google_login'),
             'package_update_recovery':True,
             'reboot_verified':False,'identity_rebound':persistence.get('identity_rebound',False),'recovery_path':persistence.get('recovery_path')}
 

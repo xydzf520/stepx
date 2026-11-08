@@ -256,6 +256,13 @@ class BaselineCaptureTests(unittest.TestCase):
         with patch.object(self.b,'install',return_value={'status':'installed','skipped_hook':True}):self.b.activate(Path('test.apk'))
         self.assertEqual([event for event in self.events if event in ('inspect','grant')],['inspect','grant'])
         self.assertTrue(all(json.loads(path.read_text())['origin']=='before_activation' for path in self.paths()))
+    def test_google_monitor_failure_is_visible_in_activation_result(self):
+        from unittest.mock import patch
+        self.bad_result=lambda result:result.update(google_login={'status':'needs_google_repair','error':'SecurityException'})
+        with patch.object(self.b,'install',return_value={'status':'installed','skipped_hook':True}):
+            result=self.b.activate(Path('test.apk'))
+        self.assertEqual(result['status'],'activated')
+        self.assertEqual(result['google_login'],{'status':'needs_google_repair','error':'SecurityException'})
     def test_existing_exact_baseline_wins_over_later_snapshot(self):
         b=self.b;self.flags=0;b.capture_baselines(Path('test.apk'));self.flags=4
         path=self.paths()[0]

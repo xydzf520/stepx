@@ -1,5 +1,7 @@
 """Host helpers. All device operations are pinned to one explicitly selected serial."""
 import hashlib
+import atexit
+from contextlib import contextmanager, ExitStack
 import json
 import os
 from pathlib import Path
@@ -7,6 +9,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT.parents[1] / 'scripts'))
@@ -38,6 +41,57 @@ ADB = [_resolve_adb(), '-s', SERIAL]
 DEVICE_KEY = DEVICE_SERIAL or (SERIAL if ':' not in SERIAL and '._adb-' not in SERIAL else '')
 STATE = user_state_root() / 'google-play/devices' / hashlib.sha256(DEVICE_KEY.encode()).hexdigest()[:24] / 'state'
 DOWNLOADS = user_state_root() / 'google-play/downloads'
+_operation_scope = threading.local()
+
+
+class OperationBusy(RuntimeError):
+    pass
+
+
+@contextmanager
+def operation_lock(path=None):
+    """Nonblocking, process-wide and reentrant within one operation thread."""
+    init_state()
+    path = Path(path) if path is not None else STATE / 'operation.lock'
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    key = str(path.resolve())
+    held = getattr(_operation_scope, 'held', None)
+    if held is None:
+        held = _operation_scope.held = set()
+    if key in held:
+        try: yield
+        finally: pass
+        return
+    if path.is_symlink():
+        raise RuntimeError('Invalid Google operation lock')
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+    with os.fdopen(fd, 'r+b') as stream:
+        if os.name == 'nt':
+            import msvcrt
+            if os.fstat(fd).st_size == 0:
+                stream.write(b'\0'); stream.flush()
+            stream.seek(0)
+            try: msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            except OSError: raise OperationBusy('Google 安装或修复正在运行；自动维护已延期') from None
+            unlock = lambda: (stream.seek(0), msvcrt.locking(fd, msvcrt.LK_UNLCK, 1))
+        else:
+            import fcntl
+            try: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError: raise OperationBusy('Google 安装或修复正在运行；自动维护已延期') from None
+            unlock = lambda: fcntl.flock(fd, fcntl.LOCK_UN)
+        held.add(key)
+        try: yield
+        finally:
+            held.remove(key)
+            unlock()
+
+
+def hold_operation_lock():
+    """Keep legacy top-level installation scripts locked through interpreter exit."""
+    scope = ExitStack()
+    scope.enter_context(operation_lock())
+    atexit.register(scope.close)
+    return scope
 
 
 def run(args, **kwargs):

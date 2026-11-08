@@ -1,5 +1,6 @@
 //! Desktop entry points for the fixed-firmware Google workflow. Inspection is
-//! read-only; compatibility changes require an explicit installation or action.
+//! read-only. Managed installations may use authorized background maintenance;
+//! installation and rollback remain explicit actions.
 use crate::{
     adb::Adb,
     device::{
@@ -10,6 +11,8 @@ use crate::{
 };
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
+
+pub mod recovery;
 
 const PLAY_PROTECT_SCHEMA: &str = "stepx-play-protect-certification-v1";
 
@@ -436,10 +439,14 @@ pub fn apply_adapter_status(status: &mut GoogleSuiteStatus, value: &serde_json::
         && value["current_boot_matches"].as_bool() == Some(true);
     let ready = value["status"].as_str() == Some("success")
         && value["needs_repair"].as_bool() != Some(true)
-        && value["detached"].as_bool() == Some(true)
+        && (value["detached"].as_bool() == Some(true)
+            || (value["recovery_source"].as_str() == Some("phone_update_monitor")
+                && value["phone_runtime_verified"].as_bool() == Some(true)
+                && value["phone_recovery_current_components"].as_bool() == Some(true)
+                && value["permission_coverage_verified"].as_bool() == Some(true)))
         && status.pid_matches
         && status.system_server_pid > 0
-        && count >= 120
+        && (count >= 120 || (count > 0 && value["permission_coverage_verified"].as_bool() == Some(true)))
         && value["all_checked_granted"].as_bool() == Some(true)
         && value["current_permissions_granted"].as_bool() == Some(true);
     status.granted_count = if ready { count } else { 0 };
@@ -962,6 +969,22 @@ mod tests {
             &mut GoogleSuiteStatus::default(),
             &changed_components
         ));
+    }
+
+    #[test]
+    fn verified_in_process_recovery_is_not_a_native_detach_receipt() {
+        let valid = serde_json::json!({"status":"success", "detached":null, "needs_repair":false,
+            "current_pid_matches":true, "current_boot_matches":true, "target_pid":123,
+            "permission_checks":2, "permission_coverage_verified":true,
+            "all_checked_granted":true, "current_permissions_granted":true,
+            "recovery_source":"phone_update_monitor", "phone_runtime_verified":true,
+            "phone_recovery_current_components":true});
+        assert!(apply_adapter_status(&mut GoogleSuiteStatus::default(), &valid));
+        for key in ["phone_runtime_verified", "permission_coverage_verified", "phone_recovery_current_components", "recovery_source"] {
+            let mut incomplete = valid.clone();
+            incomplete.as_object_mut().unwrap().remove(key);
+            assert!(!apply_adapter_status(&mut GoogleSuiteStatus::default(), &incomplete));
+        }
     }
 
     fn certification_payload() -> serde_json::Value {

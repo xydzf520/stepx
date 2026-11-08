@@ -44,6 +44,7 @@ mod amoo_sync;
 mod amoo_ui_state;
 mod connection_watch;
 mod battery_state;
+mod google_recovery_state;
 mod context_menu;
 mod context_state;
 mod expansion_state;
@@ -887,6 +888,8 @@ pub(crate) enum Action {
     GoogleSuiteMaintain,
     GoogleSuiteRollback,
     GoogleSuiteSnapshot,
+    GoogleAutoRepairToggle,
+    GoogleAutoRepairNow,
     CompanionInspect,
     CompanionInstall,
     NeoInspect,
@@ -1373,6 +1376,7 @@ struct Companion {
     tools_feedback: Option<(Option<ToolPage>, String, bool)>,
     job_tool: Option<ToolPage>,
     google_progress: Arc<std::sync::Mutex<String>>,
+    google_recovery: google_recovery_state::GoogleRecoveryUi,
     tools_tab: u8,
     tools_result_page: usize,
     system_compression: Option<toolbox::SystemCompression>,
@@ -1788,6 +1792,7 @@ impl Companion {
             tools_feedback: None,
             job_tool: None,
             google_progress: Default::default(),
+            google_recovery: Default::default(),
             tools_tab: 0,
             tools_result_page: 0,
             system_compression: None,
@@ -2551,6 +2556,7 @@ impl Companion {
         self.tick_status_expiry(ctx);
         self.tick_connection_watch(ctx);
         self.tick_battery(ctx);
+        self.tick_google_recovery(ctx);
         self.tick_weather_fetch(ctx);
         self.ensure_calendar_state_scope();
         self.tick_settings(ctx);

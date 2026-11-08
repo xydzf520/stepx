@@ -3,8 +3,11 @@ from common import baseline_matches, DEVICE_KEY
 """Explicit workflow steps; invoking --help or preflight never installs anything."""
 import argparse
 import base64
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
+from datetime import datetime
 import hashlib
+import importlib.util
+import io
 import json
 import re
 import shutil
@@ -13,12 +16,13 @@ import sys
 import time
 import urllib.request
 import zipfile
-from common import ADB, CONFIG, ROOT, STATE, DOWNLOADS, guard, init_state, private_write, root_json, run, save_json, sdk_tool, sdk_command, sha256, shell, verified_fingerprint
+from common import ADB, CONFIG, ROOT, STATE, DOWNLOADS, guard, init_state, private_write, root_json, run, save_json, sdk_tool, sdk_command, sha256, shell, verified_fingerprint, operation_lock, OperationBusy
 from host_runtime import file_lock
 
 from source_integrity import python_source_sha256
 
 PACKAGES = ['com.google.android.gsf', 'com.google.android.gms', 'com.android.vending']
+MONITOR_REVISION = 'google-login-v2-recheck-1'
 INSTALL_LABELS = dict(zip(PACKAGES, ['Google 服务框架', 'Google Play 服务', 'Google Play 商店']))
 INSTALL_GUIDANCE = '请在手机「设置 → 开发者选项」开启「USB 安装」后重试；程序不会自动修改安装总开关'
 
@@ -315,6 +319,11 @@ def check_apks():
 
 
 def prepare():
+    with operation_lock():
+        return _prepare()
+
+
+def _prepare():
     current = preflight()
     assert current['user_unlocked'], 'Unlock the phone first'
     if (STATE/'baseline.json').exists():
@@ -381,7 +390,7 @@ print(json.dumps(r))
 
 def install_apks():
     guard(native=True)
-    with file_lock(STATE / 'install.lock'):
+    with operation_lock(), file_lock(STATE / 'install.lock'):
         return _install_apks()
 
 
@@ -502,8 +511,33 @@ def component_versions(dumps):
     return {package: {key: (match[1].strip() if (match := re.search(pattern, data, re.M)) else None)
                       for key, pattern in [('versionCode', r'^\s*versionCode=(\d+)'),
                                            ('versionName', r'^\s*versionName=([^\r\n]+)'),
+                                           ('uid', r'^\s*(?:appId|userId)=(\d+)'),
                                            ('lastUpdateTime', r'^\s*lastUpdateTime=([^\r\n]+)')]}
             for package, data in dumps.items()}
+
+
+def phone_component_identity_matches(phone, versions, timezone=None):
+    for package, prefix in [('com.google.android.gms', 'gms'), ('com.android.vending', 'play'),
+                            ('com.google.android.gsf', 'gsf')]:
+        current = versions.get(package, {})
+        if str(phone.get(prefix + '_version')) != current.get('versionCode'):
+            return False
+        if str(phone.get(prefix + '_uid')) != current.get('uid'):
+            return False
+        # Both values are produced on the phone in its local timezone. Never
+        # interpret dumpsys timestamps using the desktop's possibly different zone.
+        if phone.get(prefix + '_updated_local') != current.get('lastUpdateTime'):
+            if not timezone:
+                return False
+            try:
+                from zoneinfo import ZoneInfo
+                current_seconds = int(datetime.strptime(current.get('lastUpdateTime', ''), '%Y-%m-%d %H:%M:%S')
+                                      .replace(tzinfo=ZoneInfo(timezone)).timestamp())
+                if current_seconds != phone[prefix + '_updated_at'] // 1000:
+                    return False
+            except (ValueError, KeyError, TypeError):
+                return False
+    return True
 
 
 def runtime_summary(adapter, boot_id, pid, dumps, previous=None, registered=None):
@@ -519,15 +553,22 @@ def runtime_summary(adapter, boot_id, pid, dumps, previous=None, registered=None
     receipt = hashlib.sha256(json.dumps({k: adapter.get(k) for k in
         ('identity', 'target_pid', 'unix_time', 'java_result')}, sort_keys=True).encode()).hexdigest()
     same_receipt = previous and previous.get('receipt_sha256') == receipt
-    changed = [package for package in PACKAGES if same_receipt and previous.get('versions', {}).get(package) != versions[package]]
+    def previous_version_matches(package):
+        old = previous.get('versions', {}).get(package, {})
+        # Older desktop observations predate the UID field. Introducing this
+        # extra read-back must not itself look like an app update.
+        return all(old.get(key) == value for key, value in versions[package].items()
+                   if key != 'uid' or key in old)
+    changed = [package for package in PACKAGES if same_receipt and not previous_version_matches(package)]
     summary.update(current_permissions_granted=bool(checks) and not missing and not uncovered and not unknown,
                    missing_permissions=missing, newly_declared_permissions=uncovered,
                    permission_coverage_unknown=unknown,
                    updated_components=changed, component_versions=versions,
                    receipt_sha256=receipt)
+    summary['permission_coverage_verified'] = registered is not None and not unknown and not uncovered and bool(checks)
     ready = (summary['status'] == 'success' and summary['detached'] is True
              and summary['current_boot_matches'] and summary['current_pid_matches']
-             and len(checks) >= 120 and summary['all_checked_granted']
+             and (len(checks) >= 120 or summary['permission_coverage_verified']) and summary['all_checked_granted']
              and summary['current_permissions_granted'] and not changed and not unknown
              and all(value['versionCode'] for value in versions.values()))
     summary['needs_repair'] = not ready
@@ -539,23 +580,71 @@ def runtime_summary(adapter, boot_id, pid, dumps, previous=None, registered=None
     return summary
 
 
+def phone_recovery_summary(phone, boot_id, pid, dumps, registered, timezone=None):
+    """Accept an in-place phone repair only after current independent read-back.
+
+    Old boot last.json is not updated by the phone's package-update listener.
+    Its stale permissions must not cause another unnecessary gateway restart.
+    """
+    if not isinstance(phone, dict) or phone.get('status') != 'ready':
+        return None
+    if (phone.get('boot_id') != boot_id or str(phone.get('system_server_pid')) != pid
+            or phone.get('update_monitor') is not True or type(phone.get('checked_at')) is not int):
+        return None
+    versions = component_versions(dumps)
+    for package, key in [('com.google.android.gms', 'gms_version'), ('com.android.vending', 'play_version')]:
+        if str(phone.get(key)) != versions[package]['versionCode']:
+            return None
+    if type(phone.get('schema')) is int and phone.get('schema') == 2:
+        if phone.get('signatures_verified') is not True or phone.get('permissions_verified') is not True:
+            return None
+        if (phone.get('registered') is not True or phone.get('domain_ready') is not True
+                or not phone_component_identity_matches(phone, versions, timezone)):
+            return None
+        proof = phone.get('permission_result', '')
+        if not isinstance(proof, str) or not proof.strip():
+            return None
+    else:
+        # Legacy receipts lack the complete read-back and installation identities.
+        # Keep them diagnostic only; never invent permission checks for an update.
+        return None
+    summary = runtime_summary({'status': 'success', 'identity': boot_id, 'target_pid': int(pid),
+                               'detached': True, 'unix_time': phone['checked_at'] // 1000, 'java_result': proof},
+                              boot_id, pid, dumps, registered=registered)
+    if summary['needs_repair']:
+        return None
+    summary['recovery_source'] = 'phone_update_monitor'
+    summary['phone_runtime_verified'] = True
+    summary['detached'] = None  # This is current in-process proof, not a native-worker detach receipt.
+    return summary
+
+
 def status():
     guard()
     init_state()
-    result = root_json("import os,json; p='/var/lib/stepx-gms/last.json'; print(json.dumps({'boot_id':open('/proc/sys/kernel/random/boot_id').read().strip(),'adapter':json.load(open(p)) if os.path.exists(p) else None}))")
-    adapter = result['adapter']
+    result = root_json('''import os,json
+p='/var/lib/stepx-gms/last.json'
+r={'boot_id':open('/proc/sys/kernel/random/boot_id').read().strip(),'adapter':json.load(open(p)) if os.path.exists(p) else None,'phone_recovery':None,'phone_recovery_read_state':'unavailable'}
+try:
+ parent=next(p for p in os.listdir('/proc') if p.isdigit() and os.path.exists('/proc/'+p+'/comm') and open('/proc/'+p+'/comm').read().strip()=='openclaw_env')
+ q='/proc/'+parent+'/root/data/system/stepx-google-login-runtime.json'
+ try:
+  with open(q) as f:phone=json.load(f)
+ except FileNotFoundError:r['phone_recovery_read_state']='missing'
+ else:
+  if not isinstance(phone,dict):raise ValueError('invalid phone recovery receipt')
+  r.update(phone_recovery=phone,phone_recovery_read_state='readable')
+except (OSError,ValueError,StopIteration):pass
+print(json.dumps(r))''')
+    adapter = result['adapter'] or {}
     save_json('adapter-status.json', result)
-    if not adapter:
-        summary = {'status': 'needs_repair', 'needs_repair': True,
-                   'message': '未读取到 Google 启动适配回执；请解锁手机并点击「修复 Google 服务」',
-                   'repair_command': 'manage.py repair-runtime'}
-        print(json.dumps(summary, ensure_ascii=False)); return summary
     observation = STATE / 'component-observation.json'
     previous = json.loads(observation.read_text()) if observation.exists() else None
     dumps = {package: shell('dumpsys', 'package', package) for package in PACKAGES}
     current_pid = shell('pidof', 'system_server')
     summary = runtime_summary(adapter, result['boot_id'], current_pid, dumps, previous)
-    if summary['newly_declared_permissions']:
+    registered = None
+    if summary['newly_declared_permissions'] or result.get('phone_recovery'):
         # Only needed for uncovered requests; steady receipts use the existing
         # three dumpsys reads, without repeated APK digest work.
         try:
@@ -566,13 +655,289 @@ def status():
         else:
             summary = runtime_summary(adapter, result['boot_id'], current_pid, dumps, previous, registered)
             summary['permission_definitions_checked'] = True
+    phone = result.get('phone_recovery') or {}
+    timezone = None
+    if phone.get('schema') == 2 and not phone_component_identity_matches(phone, component_versions(dumps)):
+        # The phone's timezone can change after receipt creation. Only this slow
+        # mismatch path needs another read; normal checks compare local strings.
+        timezone = shell('getprop', 'persist.sys.timezone')
+    if registered is not None:
+        summary = phone_recovery_summary(phone, result['boot_id'], current_pid, dumps, registered, timezone) or summary
+    summary['phone_recovery'] = {key: phone.get(key) for key in
+        ('schema', 'status', 'checked_at', 'retry_after_ms', 'recovery_pending', 'attempt', 'boot_id', 'system_server_pid', 'reason', 'signatures_verified',
+         'recheck_supported', 'runtime_revision', 'grant_authorized', 'error_code', 'identity_package')}
+    summary['boot_id'] = result['boot_id']
+    summary['phone_recovery_read_state'] = result['phone_recovery_read_state']
+    supported_schema = type(phone.get('schema')) is int and phone.get('schema') in (1, 2)
+    legacy_monitor = supported_schema and (phone.get('schema') == 1
+        or (phone.get('schema') == 2 and phone.get('runtime_revision') is None))
+    summary['monitor_upgrade_needed'] = (result['phone_recovery_read_state'] == 'missing'
+        or (result['phone_recovery_read_state'] == 'readable' and legacy_monitor))
+    summary['monitor_schema_unsupported'] = result['phone_recovery_read_state'] == 'readable' and (not supported_schema
+        or (phone.get('schema') == 2 and phone.get('runtime_revision') not in (None, MONITOR_REVISION)))
+    summary['phone_recovery_current_session'] = phone.get('boot_id') == result['boot_id'] and str(phone.get('system_server_pid')) == current_pid
+    summary['phone_recovery_current_components'] = phone_component_identity_matches(phone, component_versions(dumps), timezone)
+    if (phone.get('schema') == 2 and summary['phone_recovery_current_session']
+            and phone.get('status') != 'ready'):
+        summary.update(status='needs_repair', needs_repair=True,
+                       message='手机 Google 恢复监听尚未通过权限、登录入口与链接验证；自动维护将等待或复核')
+    summary['components_enabled'] = {}
+    for package, data in dumps.items():
+        user = re.search(r'^\s*User 0:([^\n]*)', data, re.M)
+        value = user[1] if user else ''
+        enabled = re.search(r'\benabled=(\d+)', value)
+        summary['components_enabled'][package] = bool(user and 'installed=true' in value
+            and 'hidden=false' in value and 'suspended=false' in value and enabled and enabled[1] in ('0', '1'))
     if not summary['needs_repair']:
         save_json(observation.name, {'receipt_sha256': summary['receipt_sha256'], 'versions': summary['component_versions']})
     print(json.dumps(summary, indent=2, ensure_ascii=False))
     return summary
 
 
+def owned_runtime():
+    """Verify an existing reviewed installation; never adopt an unknown hook."""
+    expected = {name: python_source_sha256(ROOT / 'module' / name) for name in ('boot.py', 'inject.py', 'launcher.py')}
+    chain = python_source_sha256(ROOT.parents[1] / 'scripts/companion_boot/chain.py')
+    code = '''import os,json,hashlib,stat
+base='/usr/local/lib/stepx-gms';launcher='/usr/local/bin/ubuntu_zygote'
+def read(path):
+ fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW)
+ with os.fdopen(fd,'rb') as f:
+  if not stat.S_ISREG(os.fstat(fd).st_mode):raise ValueError('not regular')
+  return f.read(1048577)
+def sha(path):return hashlib.sha256(read(path)).hexdigest()
+owned=False
+try:
+ manifest=json.loads(read(base+'/manifest.json'))
+ boot=base+'/boot.py'
+ if sha(boot)!=EXPECTED['boot.py']:
+  c=json.loads(read('/usr/local/lib/stepx-companion/config.json'))
+  if c.get('chain_sha256')!=CHAIN or sha(boot)!=CHAIN:raise ValueError('unknown chain')
+  boot='/usr/local/lib/stepx-companion/previous-boot.py'
+ owned=(manifest==EXPECTED and sha(boot)==EXPECTED['boot.py'] and sha(base+'/inject.py')==EXPECTED['inject.py'] and sha(launcher)==EXPECTED['launcher.py'] and sha(launcher+'.stepx-stock-20261021')==STOCK)
+except (OSError,ValueError,KeyError):pass
+print(json.dumps({'owned':owned}))
+'''.replace('EXPECTED', repr(expected)).replace('CHAIN', repr(chain)).replace('STOCK', repr(CONFIG['stock_sha256']))
+    return root_json(code).get('owned') is True
+
+
+def autonomous_plan(summary, prior, owned, now):
+    """Pure policy: phone listener first, persistent bounded desktop fallback."""
+    def answer(state, message, delay=300, **extra):
+        return {'state': state, 'message': message, 'retry_after_seconds': delay,
+                'repair_allowed': False, **extra}
+    if not owned:
+        return answer('blocked', '未确认由 StepX 管理的 Google 适配；自动维护未修改手机'), prior
+    if summary.get('phone_recovery_read_state') == 'unavailable':
+        return answer('waiting', '手机恢复监听状态暂时无法读取，稍后复检；未修改手机', 60), prior
+    if summary.get('monitor_schema_unsupported'):
+        return answer('blocked', '手机恢复组件版本暂不支持，保留现有组件，请更新桌面端'), prior
+    phone = summary.get('phone_recovery') or {}
+    if summary.get('phone_recovery_current_session'):
+        if phone.get('status') in ('blocked', 'disabled', 'not_installed', 'stopped'):
+            message = {'unsupported_context': '当前固件或执行环境不支持 Google 自动维护，保留现有服务',
+                       'signer_changed': 'Google 组件签名不在已验证范围，自动维护已暂停',
+                       'uid_outside_user_zero': 'Google 组件安装用户与适配范围不符，自动维护已暂停'}.get(phone.get('error_code'),
+                       '手机已暂停 Google 恢复或组件不符合适配条件；请查看详情')
+            return answer('blocked', message), prior
+        if summary.get('phone_recovery_current_components') and phone.get('recovery_pending') is True:
+            until = (phone.get('checked_at', 0) + phone.get('retry_after_ms', 0)) / 1000 + 5
+            if now < until:
+                return answer('waiting', '手机正在原地恢复 Google 服务', max(5, min(180, int(until - now)))), prior
+    upgrade = summary.get('monitor_upgrade_needed') is True
+    if summary.get('status') == 'success' and summary.get('needs_repair') is False and not upgrade:
+        return answer('healthy', 'Google 服务已校验，手机更新后会自动恢复'), {}
+    if ((summary.get('needs_repair') is not True and not upgrade) or summary.get('permission_coverage_unknown')
+            or summary.get('permission_definitions_checked') is False
+            or not summary.get('component_versions')):
+        return answer('waiting', '检测证据暂不完整，稍后自动复检；未修改手机', 60), prior
+    versions = summary['component_versions']
+    if not all(v.get('versionCode') for v in versions.values()):
+        return answer('blocked', 'Google 组件信息不完整，请查看检测详情'), prior
+    if not upgrade and not (summary.get('phone_recovery_current_session') and summary.get('phone_recovery_current_components')
+            and phone.get('signatures_verified') is True and phone.get('recheck_supported') is True):
+        return answer('needs_attention', '尚未确认当前组件的手机恢复监听与签名，请先修复 Google 服务以启用自动维护'), prior
+    # A boot or a different receipt is not a new retry budget. Client restarts
+    # and repeated gateway attempts for the same component generation are bounded.
+    fault = hashlib.sha256(json.dumps({'versions': None if upgrade else versions, 'operation': 'upgrade_monitor' if upgrade else 'native_recheck',
+                          'monitor_artifact': summary.get('monitor_artifact_sha256') if upgrade else None}, sort_keys=True).encode()).hexdigest()
+    state = dict(prior) if prior.get('fault') == fault else {'fault': fault, 'attempts': 0, 'first_seen': now, 'next_retry': now + 45}
+    if state.get('attempts', 0) >= (1 if upgrade else 3):
+        return answer('needs_attention', '本版自动维护组件升级未通过校验，已停止重复激活，请查看原因' if upgrade
+                      else '自动恢复已尝试 3 次，请查看具体原因；不会继续重复操作'), state
+    if now < state.get('next_retry', 0):
+        return answer('waiting', '先等待手机自动恢复，随后重新核验', max(1, int(state['next_retry'] - now))), state
+    return answer('repair_needed', '准备更新既有 Google 自动维护组件' if upgrade else 'Google 更新后权限待恢复，准备后台修复', 0,
+                  repair_allowed=True, fault=fault, operation='upgrade_monitor' if upgrade else 'native_recheck'), state
+
+
+def _autonomous_status():
+    guard()
+    installed = shell('pm', 'list', 'packages', '--user', '0')
+    if not all('package:' + package in installed.splitlines() for package in PACKAGES):
+        return {'state': 'blocked', 'message': '未安装完整 Google 组件，自动维护不会安装应用', 'retry_after_seconds': 300, 'repair_allowed': False}
+    disabled = shell('pm', 'list', 'packages', '-d', '--user', '0').splitlines()
+    if any('package:' + package in disabled for package in PACKAGES):
+        return {'state': 'blocked', 'message': 'Google 组件已被停用，保留你的设置', 'retry_after_seconds': 300, 'repair_allowed': False}
+    with redirect_stdout(io.StringIO()):
+        summary = status()
+    if summary.get('monitor_upgrade_needed'):
+        summary['monitor_artifact_sha256'] = sha256(ROOT.parents[1] / 'desktop/assets/stepx-companion-permissions.dex')
+    if not all(summary.get('components_enabled', {}).get(package) is True for package in PACKAGES):
+        return {'state': 'blocked', 'message': 'Google 组件未启用或已暂停，保留你的应用设置', 'retry_after_seconds': 300, 'repair_allowed': False}
+    path = STATE / 'auto-recovery.json'
+    prior = json.loads(path.read_text()) if path.exists() else {}
+    decision, history = autonomous_plan(summary, prior, owned_runtime(), int(time.time()))
+    if history != prior:
+        save_json(path.name, history)
+    decision['summary'] = summary
+    return decision
+
+
+def autonomous_status():
+    try:
+        with operation_lock():
+            return _autonomous_status()
+    except OperationBusy:
+        return {'state': 'waiting', 'message': 'Google 安装或修复正在运行，自动维护稍后继续', 'retry_after_seconds': 30, 'repair_allowed': False}
+
+
+def phone_idle_for_recovery():
+    raw = shell('dumpsys', 'telephony.registry')
+    values = re.findall(r'\bmCallState\s*=\s*(\d+)', raw)
+    if not values or any(value != '0' for value in values):
+        return False
+    return 'RUNNING_UNLOCKED' in shell('dumpsys', 'user')
+
+
+def companion_boot_module():
+    script = ROOT.parents[1] / 'scripts/companion-boot.py'
+    spec = importlib.util.spec_from_file_location('google_auto_companion_boot', script)
+    boot = importlib.util.module_from_spec(spec); spec.loader.exec_module(boot)
+    return boot
+
+
+def companion_operation_lock():
+    return operation_lock(companion_boot_module().STATE_LOCAL / 'operation.lock')
+
+
+def request_native_recheck():
+    # Only the already registered system-context observer receives this fixed,
+    # DUMP-protected request. It cannot authorize grants or create a new watcher.
+    # A broadcast response is not evidence that recovery completed.
+    shell('am', 'broadcast', '--user', '0', '-a',
+          'com.stepx.companion.action.RECHECK_GOOGLE_RUNTIME', '-p', 'android')
+
+
+def upgrade_owned_monitor():
+    """Activate the signed, already installed companion's new in-process observer.
+
+    This does not install an APK or rebind an identity. The existing bounded
+    worker preserves Android but may replace the Ubuntu gateway while acquiring
+    its reviewed execution context. Upgrade is attempted only once per artifact.
+    """
+    boot = companion_boot_module()
+    apk = ROOT.parents[1] / 'desktop/assets/stepx-companion.apk'
+    with operation_lock(boot.STATE_LOCAL / 'operation.lock'):
+        current = boot.status(apk)
+        config = current.get('config') or {}
+        if (not current.get('installed') or config.get('package') != boot.p.PACKAGE
+                or config.get('serial') != boot.p.device_key() or config.get('boot_mode') != 'chained'
+                or config.get('fingerprint') not in boot.p.ALLOWED_FINGERPRINTS):
+            raise RuntimeError('No identity-bound managed companion; automatic monitor upgrade stopped')
+        # Every active byte must still match the existing owned manifest before
+        # any native activation. The installer repeats this guard transactionally.
+        proof = root_json('''import os,json,hashlib,stat
+b='/usr/local/lib/stepx-companion'
+def read(path):
+ fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW)
+ with os.fdopen(fd,'rb') as f:
+  if not stat.S_ISREG(os.fstat(fd).st_mode):raise ValueError('not regular')
+  return f.read(1048577)
+def sha(path):return hashlib.sha256(read(path)).hexdigest()
+c=json.loads(read(b+'/config.json'))
+ok=c==EXPECTED and all(sha(b+'/'+name)==c[key] for name,key in [('grant.py','grant_sha256'),('chain.py','chain_sha256'),('boot.py','boot_sha256')])
+ok=ok and sha('/usr/local/lib/stepx-gms/boot.py')==c['chain_sha256'] and sha(b+'/previous-boot.py')==c['original_sha256']
+print(json.dumps({'owned':ok}))
+'''.replace('EXPECTED', repr(config)))
+        if proof.get('owned') is not True:
+            raise RuntimeError('Managed companion artifacts changed; automatic upgrade stopped')
+        # Do not request rebind. Existing signer/UID plus exact observed baseline
+        # are required; legacy baselines are measured read-only by this API.
+        if not phone_idle_for_recovery():
+            raise RuntimeError('Call began before monitor activation; deferred')
+        result = boot.activate(apk, rebind=False)
+        if result.get('status') != 'activated' or result.get('system_server_unchanged') is not True:
+            raise RuntimeError('Monitor upgrade did not pass native read-back')
+        google = result.get('google_login') or {}
+        if (google.get('status') not in ('scheduled', 'needs_google_repair')
+                or google.get('update_monitor') is not True or google.get('error')):
+            raise RuntimeError('Phone Google monitor rejected activation: ' + str(google.get('error') or google.get('status') or 'missing proof'))
+
+
+def repair_autonomous():
+    try:
+        # Acquire both gates before reserving an attempt. A manual companion
+        # operation delays maintenance; it must not consume the repair budget.
+        with operation_lock(), companion_operation_lock():
+            decision = _autonomous_status()  # Never turn a failed read into a write.
+            if not decision.get('repair_allowed'):
+                return decision
+            if not phone_idle_for_recovery():
+                return {'state': 'waiting', 'message': '等待通话结束或首次解锁后自动维护', 'retry_after_seconds': 30, 'repair_allowed': False}
+            guard(native=decision.get('operation') == 'upgrade_monitor')
+            history = json.loads((STATE / 'auto-recovery.json').read_text())
+            if history.get('fault') != decision['fault']:
+                raise RuntimeError('Google recovery generation changed; nothing was activated')
+            history['attempts'] = history.get('attempts', 0) + 1
+            history['next_retry'] = int(time.time()) + min(1800, 30 * 2 ** (history['attempts'] - 1))
+            # Durable reservation precedes native activation or a recheck request. A crash consumes
+            # one attempt; it cannot silently reset the budget after restarting.
+            save_json('auto-recovery.json', history)
+            try:
+                with redirect_stdout(io.StringIO()):
+                    if decision.get('operation') == 'upgrade_monitor':
+                        upgrade_owned_monitor()
+                        time.sleep(3)  # Native observer initial check is delayed 1.5s.
+                    else:
+                        request_native_recheck()
+                        return {'state': 'waiting', 'message': '已请求手机原地复检 Google 服务，稍后验证结果',
+                                'retry_after_seconds': 5, 'repair_allowed': False, 'attempts': history['attempts']}
+                    verified = status()
+                if (decision.get('operation') == 'upgrade_monitor' and verified.get('monitor_upgrade_needed') is False
+                        and verified.get('phone_recovery_current_session')):
+                    # Native observer now owns its retry sequence. Do not start
+                    # a gateway restart inside the same upgrade operation.
+                    save_json('auto-recovery.json', {})
+                    return {'state': 'healthy' if not verified.get('needs_repair') else 'waiting',
+                            'message': 'Google 自动维护组件已更新，正在完成手机端复核',
+                            'retry_after_seconds': 30, 'repair_allowed': False, 'summary': verified}
+                if (verified.get('status') != 'success' or verified.get('needs_repair') is not False
+                        or verified.get('monitor_upgrade_needed')):
+                    raise RuntimeError('Google recovery read-back did not pass')
+            except Exception as error:
+                save_json('auto-recovery-last-error.json', {'operation': decision.get('operation', 'native_recheck'),
+                          'attempt': history['attempts'], 'checked_at': int(time.time()),
+                          'error_type': type(error).__name__, 'detail': str(error)[:2048]})
+                upgrade = decision.get('operation') == 'upgrade_monitor'
+                return {'state': 'needs_attention' if upgrade or history['attempts'] >= 3 else 'retrying',
+                        'message': ('手机 Google 自动维护组件拒绝激活或未通过回读，已停止重复升级；原服务与数据已保留' if upgrade
+                                    else 'Google 自动恢复未通过回读，账号和应用数据已保留'),
+                        'retry_after_seconds': max(30, history['next_retry'] - int(time.time())),
+                        'repair_allowed': False, 'attempts': history['attempts']}
+            save_json('auto-recovery.json', {})
+            return {'state': 'healthy', 'message': 'Google 更新后的权限已恢复并通过回读',
+                    'retry_after_seconds': 300, 'repair_allowed': False, 'summary': verified}
+    except OperationBusy:
+        return {'state': 'waiting', 'message': 'Google 安装或修复正在运行，自动维护稍后继续', 'retry_after_seconds': 30, 'repair_allowed': False}
+
+
 def repair_runtime():
+    with operation_lock(), companion_operation_lock():
+        return _repair_runtime()
+
+
+def _repair_runtime():
     """Re-run the existing pinned adapter after a package update; keep boot hooks intact."""
     guard(native=True)
     assert 'RUNNING_UNLOCKED' in shell('dumpsys', 'user'), 'Unlock the phone first'
@@ -720,11 +1085,14 @@ print(json.dumps({'manifest':manifest,'actual':actual,'stock':digest('/usr/local
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
-    for name in ['preflight', 'check-apks', 'prepare', 'install-apks', 'status', 'verify', 'certification', 'recover-adapter-metadata', 'repair-runtime']:
+    for name in ['preflight', 'check-apks', 'prepare', 'install-apks', 'status', 'verify', 'certification', 'recover-adapter-metadata', 'repair-runtime', 'auto-status', 'repair-autonomous']:
         commands.add_parser(name)
     commands.add_parser('fetch').add_argument('--archive')
     commands.add_parser('adopt-backup').add_argument('directory')
     args = parser.parse_args()
+    if args.command in ('auto-status', 'repair-autonomous'):
+        result = autonomous_status() if args.command == 'auto-status' else repair_autonomous()
+        print(json.dumps(result, ensure_ascii=False)); return
     if args.command == 'certification':
         from certification import inspect
         print(json.dumps(inspect(), ensure_ascii=False, indent=2))
