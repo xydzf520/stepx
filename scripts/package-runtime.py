@@ -1,15 +1,16 @@
 """Package host-side installers with no dependency on a developer SDK path."""
 import argparse, hashlib, os, platform, shutil, subprocess, tarfile, tempfile, urllib.request, zipfile
 from pathlib import Path
+from release_download import download_verified_tool
 
 PYTHON_URL='https://www.python.org/ftp/python/3.13.13/python-3.13.13-embed-amd64.zip'
 PYTHON_SHA256='8766a8775746235e23cf5aee5027ab1060bb981d93110577adcf3508aa0cbd55'
 
 
 PYTHON_UNIX={
- 'macos-arm64':('aarch64-apple-darwin','8dc60610a82f1e73be7faf964383e02520f95f6e39592a5c37c3809f5a7b798e'),
- 'macos-x86_64':('x86_64-apple-darwin','ce9c748c8f7525c0052247edb2435fdb1cac89c77e687e0e199eaf2b827668c2'),
- 'linux-x86_64':('x86_64-unknown-linux-gnu','f829adc9d888e76c8801b4799ed444188d35239fcae3a9808a99ec5cb0d8d92c'),
+ 'macos-arm64':('aarch64-apple-darwin','8dc60610a82f1e73be7faf964383e02520f95f6e39592a5c37c3809f5a7b798e',663544854),
+ 'macos-x86_64':('x86_64-apple-darwin','ce9c748c8f7525c0052247edb2435fdb1cac89c77e687e0e199eaf2b827668c2',663545760),
+ 'linux-x86_64':('x86_64-unknown-linux-gnu','f829adc9d888e76c8801b4799ed444188d35239fcae3a9808a99ec5cb0d8d92c',663545914),
 }
 
 def enable_windows_utf8_launcher(executable):
@@ -64,8 +65,8 @@ def build_runtime(root, windows):
     if windows:enable_windows_utf8_launcher(runtime/'java/bin/java.exe')
     if windows:
         with tempfile.TemporaryDirectory() as directory:
-            archive=Path(directory)/'python.zip';urllib.request.urlretrieve(PYTHON_URL,archive)
-            if hashlib.sha256(archive.read_bytes()).hexdigest()!=PYTHON_SHA256:raise RuntimeError('Python digest mismatch')
+            archive=Path(directory)/'python.zip'
+            download_verified_tool(PYTHON_URL,archive,PYTHON_SHA256)
             with zipfile.ZipFile(archive) as z:z.extractall(runtime/'python')
         # Keep isolated search paths, adding only bundled application modules.
         (runtime/'python/python313._pth').write_text('python313.zip\n.\n../../scripts\n../../handoff/google-play-stepx/tools\nimport site\n',encoding='utf-8')
@@ -81,11 +82,12 @@ subprocess.Popen = QuietPopen
 ''',encoding='utf-8')
     else:
         key=('macos-' if platform.system()=='Darwin' else 'linux-')+('arm64' if platform.machine() in ('arm64','aarch64') else 'x86_64')
-        triple,digest=PYTHON_UNIX[key]
+        triple,digest,asset_id=PYTHON_UNIX[key]
         url='https://github.com/astral-sh/python-build-standalone/releases/download/20261021/cpython-3.13.17%2B20261021-'+triple+'-install_only_stripped.tar.gz'
         with tempfile.TemporaryDirectory() as directory:
-            archive=Path(directory)/'python.tar.gz';urllib.request.urlretrieve(url,archive)
-            if hashlib.sha256(archive.read_bytes()).hexdigest()!=digest:raise RuntimeError('Python digest mismatch')
+            archive=Path(directory)/'python.tar.gz'
+            download_verified_tool(url,archive,digest,
+                asset_api_url=f'https://api.github.com/repos/astral-sh/python-build-standalone/releases/assets/{asset_id}')
             with tarfile.open(archive) as t:t.extractall(runtime,filter='data')
     # Upstream distributions can include bytecode caches. Rebuildable caches
     # are not release data; only prune this newly constructed temporary tree.

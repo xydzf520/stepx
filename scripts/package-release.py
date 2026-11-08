@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Build a portable package from the native release binary and verified upstream tools."""
-import argparse, hashlib, http.client, os, platform, plistlib, posixpath, re, shutil, subprocess, sys, tarfile, tempfile, time, urllib.error, urllib.parse, urllib.request, zipfile
+import argparse, hashlib, os, platform, plistlib, posixpath, re, shutil, subprocess, sys, tarfile, tempfile, urllib.parse, urllib.request, zipfile
 from pathlib import Path
 sys.dont_write_bytecode = True
 from public_release_policy import audit_bundle, content_problems, manifest, runtime_plan, safe_read
 from windows_crt import package_windows_crt, verify_manifest
+from release_download import download_verified_tool
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS = {
@@ -13,51 +14,6 @@ TOOLS = {
     'macos-x86_64': ('scrcpy-macos-x86_64-v5.0.1.tar.gz', '31a5467a9e907f162b093267cbbab1276b15c6e709c2ea8159566a8d165beb50', 620992832),
     'windows-x86_64': ('scrcpy-win64-v5.0.1.zip', 'b12a2c4ee8be317422451fc7dcf8ee20a71b5ea7ef9ad73ddd825a25316227a5', 620992965),
 }
-
-def download_verified_tool(url, destination, expected_sha256, *, asset_api_url=None):
-    """Retry transient upstream failures without accepting partial/unverified tools."""
-    destination = Path(destination)
-    for attempt in range(3):
-        partial = None
-        try:
-            request_url = asset_api_url if attempt and asset_api_url else url
-            if attempt:
-                parts = urllib.parse.urlsplit(request_url)
-                query = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
-                query.append(('stepx_retry', str(time.time_ns())))
-                request_url = urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
-            request = urllib.request.Request(request_url, headers={
-                'User-Agent': 'StepX-release-packager', 'Accept': 'application/octet-stream'})
-            started = time.monotonic()
-            digest = hashlib.sha256()
-            with urllib.request.urlopen(request, timeout=30) as response:
-                with tempfile.NamedTemporaryFile(dir=destination.parent, suffix='.part', delete=False) as output:
-                    partial = Path(output.name)
-                    while True:
-                        if time.monotonic() - started > 120:
-                            raise TimeoutError('Tool archive download exceeded its time budget')
-                        # At most one underlying read before checking the deadline again.
-                        chunk = response.read1(64 * 1024)
-                        if not chunk:
-                            break
-                        digest.update(chunk)
-                        output.write(chunk)
-            if digest.hexdigest() != expected_sha256:
-                raise RuntimeError('Tool archive SHA256 mismatch')
-            os.replace(partial, destination)
-            return
-        except urllib.error.HTTPError as error:
-            if error.code not in {408, 429, 500, 502, 503, 504} or attempt == 2:
-                raise
-            print(f'Tool download returned HTTP {error.code}; retrying ({attempt + 2}/3)', flush=True)
-        except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.IncompleteRead):
-            if attempt == 2:
-                raise
-            print(f'Tool download interrupted; retrying ({attempt + 2}/3)', flush=True)
-        finally:
-            if partial is not None:
-                partial.unlink(missing_ok=True)
-        time.sleep(attempt + 1)
 
 def verification_environment():
     """Never let validation mutate the staged runtime or an inherited cache path."""
