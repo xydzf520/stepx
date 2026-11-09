@@ -195,6 +195,7 @@ REVIEWED_PERMISSIONS = {
 
 def preflight():
     guard(native=True)
+    import install_recovery
     result = {
         'fingerprint': verified_fingerprint(),
         'boot_completed': shell('getprop', 'sys.boot_completed'),
@@ -202,7 +203,7 @@ def preflight():
         'avb': shell('getprop', 'ro.boot.verifiedbootstate'),
         'bootloader_locked': shell('getprop', 'ro.boot.flash.locked'),
         'selinux': shell('getenforce'),
-        'google_packages': {p: bool(shell('pm', 'list', 'packages', '--user', '0', p)) for p in PACKAGES},
+        'google_packages': install_recovery.package_inventory(),
         'usb_install_master_enabled': shell('settings', 'get', 'secure', 'usb_install_item_switch') == 'switch:1',
     }
     result['install_guidance'] = '' if result['usb_install_master_enabled'] else INSTALL_GUIDANCE
@@ -291,22 +292,35 @@ def fetch(archive=None):
     folder = DOWNLOADS
     folder.mkdir(parents=True, exist_ok=True)
     meta = CONFIG['archive']
-    if archive:
-        path = __import__('pathlib').Path(archive).resolve()
-    else:
-        path = folder / meta['name']
-        if not path.exists():
-            temp = path.with_suffix('.partial')
-            with urllib.request.urlopen(meta['url'], timeout=60) as source, open(temp, 'wb') as target:
-                shutil.copyfileobj(source, target)
-            assert sha256(temp) == meta['sha256'], 'Archive digest mismatch'
-            temp.replace(path)
-    assert sha256(path) == meta['sha256'], 'Archive digest mismatch'
-    with zipfile.ZipFile(path) as z:
-        for entry in CONFIG['apks']:
-            dest = folder / entry['filename']
-            dest.write_bytes(z.read(entry['zip_path']))
-    check_apks()
+    with file_lock(folder / '.fetch.lock'):
+        if archive:
+            path = __import__('pathlib').Path(archive).resolve()
+            assert sha256(path) == meta['sha256'], 'Archive digest mismatch'
+        else:
+            path = folder / meta['name']
+            # An interrupted/corrupt managed cache is retryable, not a permanent
+            # assertion loop. Never delete a user-supplied archive.
+            if path.exists() and sha256(path) != meta['sha256']:
+                path.replace(path.with_suffix('.invalid'))
+            if not path.exists():
+                temp = path.with_suffix('.partial')
+                for attempt in range(2):
+                    try:
+                        with urllib.request.urlopen(meta['url'], timeout=60) as source, open(temp, 'wb') as target:
+                            shutil.copyfileobj(source, target)
+                        assert sha256(temp) == meta['sha256'], 'Archive digest mismatch'
+                        temp.replace(path)
+                        break
+                    except Exception:
+                        temp.unlink(missing_ok=True)
+                        if attempt: raise
+        with zipfile.ZipFile(path) as z:
+            for entry in CONFIG['apks']:
+                dest = folder / entry['filename']
+                content = z.read(entry['zip_path'])
+                assert hashlib.sha256(content).hexdigest() == entry['sha256'], 'APK digest mismatch'
+                private_write(dest, content)
+        check_apks()
 
 
 def check_apks():
@@ -323,20 +337,46 @@ def prepare():
         return _prepare()
 
 
-def _prepare():
+def _prepare(recovery=False):
     current = preflight()
     assert current['user_unlocked'], 'Unlock the phone first'
-    if (STATE/'baseline.json').exists():
+    import install_recovery
+    baseline_name = 'recovery-baseline.json' if recovery else 'baseline.json'
+    progress_name = 'recovery-progress.json' if recovery else 'install-progress.json'
+    stock_name = 'recovery-ubuntu_zygote.stock' if recovery else 'ubuntu_zygote.stock'
+    verified = install_recovery.verify_existing(current['google_packages']) if recovery else {}
+    managed = owned_runtime() if recovery else False
+    if recovery and (STATE / baseline_name).exists():
+        saved = json.loads((STATE / baseline_name).read_text())
+        install_recovery.check_recovery_receipt(saved, current['fingerprint'], DEVICE_KEY)
+        assert sha256(STATE / stock_name) == CONFIG['stock_sha256'], '原启动文件备份校验失败'
+        # The snapshot is committed first. A crash before the progress write
+        # must be resumable; progress is never evidence of installed packages.
+        if not (STATE / progress_name).exists():
+            save_json(progress_name, {'serial': DEVICE_KEY, 'fingerprint': current['fingerprint'], 'completed': []})
+        install_recovery.check_progress(json.loads((STATE / progress_name).read_text()), current['fingerprint'], DEVICE_KEY)
+        print('Resuming verified recovery; original snapshot retained.')
+        return
+    if not recovery and (STATE/'baseline.json').exists():
+        if not (STATE / progress_name).exists() and not any(current['google_packages'].values()):
+            saved = json.loads((STATE / 'baseline.json').read_text())
+            require_current_baseline(saved)
+            assert isinstance(saved.get('packages'), list) and not any(p in saved['packages'] for p in PACKAGES), 'Prior Google package state exists'
+            assert not (STATE / 'boot-install.json').exists(), 'Adapter already exists'
+            assert sha256(STATE / stock_name) == CONFIG['stock_sha256'], '原启动文件备份校验失败'
+            save_json(progress_name, {'serial': DEVICE_KEY, 'fingerprint': current['fingerprint'], 'completed': []})
         assert resumable_install(current['fingerprint']), '现有安装基线需要核对，未覆盖备份或账号数据'
         assert sha256(STATE/'ubuntu_zygote.stock')==CONFIG['stock_sha256'], '原启动文件备份校验失败'
         print('Resuming the same verified installation; original baseline retained.')
         return
-    assert not any(current['google_packages'].values()), 'Google packages already exist; use maintenance workflow'
+    if not recovery:
+        assert not any(current['google_packages'].values()), 'Google packages already exist; use maintenance workflow'
     all_packages = shell('pm', 'list', 'packages', '-u')
-    assert all('package:' + p + '\n' not in all_packages + '\n' for p in PACKAGES), 'Prior Google package state exists'
+    if not recovery:
+        assert all('package:' + p + '\n' not in all_packages + '\n' for p in PACKAGES), 'Prior Google package state exists'
     assert re.findall(r'UserInfo\{(\d+):', shell('pm', 'list', 'users')) == ['0'], 'Only user 0 was validated'
     init_state()
-    assert not (STATE / 'baseline.json').exists(), 'Do not overwrite an existing baseline'
+    assert not (STATE / baseline_name).exists(), 'Do not overwrite an existing baseline'
     baseline = {'serial': DEVICE_KEY, 'fingerprint': current['fingerprint'],
                 'packages': [x.removeprefix('package:') for x in shell('pm', 'list', 'packages').splitlines()],
                 'google_core': shell('settings', 'get', 'global', 'cn_gms_core'),
@@ -348,7 +388,7 @@ def _prepare():
     parent = next(int(x.split()[0]) for x in lines if x.split()[-1] == 'openclaw_env' and x.split()[1] == '1')
     code = '''import os,json,hashlib,base64,stat
 h=HOST
-assert not os.path.lexists('/usr/local/lib/stepx-gms') and not os.path.lexists('/var/lib/stepx-gms'), 'Adapter already exists'
+assert MANAGED or (not os.path.lexists('/usr/local/lib/stepx-gms') and not os.path.lexists('/var/lib/stepx-gms')), 'Adapter already exists'
 def read_regular(path):
  fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW)
  with os.fdopen(fd,'rb') as f:
@@ -358,7 +398,7 @@ def digest(path):return hashlib.sha256(read_regular(path)).hexdigest()
 p='/usr/local/bin/ubuntu_zygote';stock=p+'.stepx-stock-20261021';data=read_regular(p)
 if os.path.lexists(stock):
  assert digest(stock)==STOCK_SHA, 'Existing stock backup differs; preserve and stop'
- if hashlib.sha256(data).hexdigest()!=STOCK_SHA:
+ if not MANAGED and hashlib.sha256(data).hexdigest()!=STOCK_SHA:
   companion='/usr/local/lib/stepx-companion';config=json.loads(read_regular(companion+'/config.json'))
   assert config.get('boot_mode')=='standalone' and config.get('hook_path')==p, 'Unknown companion bootstrap'
   assert config.get('serial')==DEVICE and config.get('fingerprint')==FINGERPRINT, 'Companion bootstrap identity differs'
@@ -373,16 +413,18 @@ for path in ['/data/system/packages.xml','/data/misc_de/0/apexdata/com.android.p
  except PermissionError:r['skipped_files'][path]='permission_denied'
  except FileNotFoundError:r['skipped_files'][path]='not_present'
 print(json.dumps(r))
-'''.replace('HOST', repr('/proc/' + str(parent) + '/root')).replace('STOCK_SHA', repr(CONFIG['stock_sha256'])).replace('DEVICE', repr(DEVICE_KEY)).replace('FINGERPRINT', repr(current['fingerprint']))
+'''.replace('HOST', repr('/proc/' + str(parent) + '/root')).replace('STOCK_SHA', repr(CONFIG['stock_sha256'])).replace('DEVICE', repr(DEVICE_KEY)).replace('FINGERPRINT', repr(current['fingerprint'])).replace('MANAGED', repr(managed))
     proof = root_json(code)
     assert proof['stock_sha256'] == CONFIG['stock_sha256'], 'Unexpected factory launcher'
-    private_write(STATE / 'ubuntu_zygote.stock', base64.b64decode(proof['stock']))
+    private_write(STATE / stock_name, base64.b64decode(proof['stock']))
     for path, encoded in proof['files'].items():
-        private_write(STATE / ('before-' + path.rsplit('/', 1)[-1]), base64.b64decode(encoded))
+        private_write(STATE / (('recovery-before-' if recovery else 'before-') + path.rsplit('/', 1)[-1]), base64.b64decode(encoded))
     baseline['metadata_backups'] = {path: 'saved' for path in proof['files']}
     baseline['metadata_backups'].update(proof.get('skipped_files', {}))
-    save_json('baseline.json', baseline)
-    save_json('install-progress.json', {'serial':DEVICE_KEY,'fingerprint':current['fingerprint'],'completed':[]})
+    if recovery:
+        baseline.update(kind='recovery_snapshot', verified_packages=verified, managed_runtime=managed, accounts_preserved=True)
+    save_json(baseline_name, baseline)
+    save_json(progress_name, {'serial':DEVICE_KEY,'fingerprint':current['fingerprint'],'completed':[]})
     print('Original launcher verified and saved privately. No Google APK installed yet.')
     if proof.get('skipped_files'):
         print('系统限制了部分只读诊断备份；已记录缺项，不修改 SELinux。原启动文件的完整备份已通过校验。')
@@ -394,24 +436,32 @@ def install_apks():
         return _install_apks()
 
 
-def _install_apks():
+def _install_apks(recovery=False):
     # Restore every interrupted package gate before validating this attempt.
     # Missing downloads or a newer already-installed APK must not leave a
     # different package's temporary installation permission enabled forever.
     for package in PACKAGES:
         finish_install_gate(package)
-    baseline = json.loads((STATE / 'baseline.json').read_text())
+    import install_recovery
+    baseline = json.loads((STATE / ('recovery-baseline.json' if recovery else 'baseline.json')).read_text())
     require_current_baseline(baseline)
-    assert all(p not in baseline['packages'] for p in PACKAGES)
-    assert resumable_install(), '缺少本次安装记录；未覆盖已有 Google 组件'
-    check_apks()
+    if recovery:
+        install_recovery.check_recovery_receipt(baseline, verified_fingerprint(), DEVICE_KEY)
+    else:
+        assert all(p not in baseline['packages'] for p in PACKAGES)
+        assert resumable_install(), '缺少本次安装记录；未覆盖已有 Google 组件'
+    progress_name = 'recovery-progress.json' if recovery else 'install-progress.json'
+    receipt = json.loads((STATE / progress_name).read_text())
+    install_recovery.check_progress(receipt, verified_fingerprint(), DEVICE_KEY)
+    inventory = install_recovery.package_inventory()
+    if not all(inventory.values()):
+        check_apks()
+    # Recheck every existing component before the first new install or grant.
+    install_recovery.verify_existing(inventory)
     for package in PACKAGES:
         meta = next(x for x in CONFIG['apks'] if x['package'] == package)
-        if shell('pm','list','packages','--user','0',package):
-            paths=shell('pm','path','--user','0',package).splitlines()
-            assert len(paths)==1 and paths[0].startswith('package:/data/app/'), '已有 Google 组件位置不同，未覆盖'
-            current=shell('sha256sum',paths[0][8:]).split()[0]
-            assert current==meta['sha256'], '已有 Google 组件版本不同，已保留；请使用检测/修复'
+        if 'package:' + package in shell('pm','list','packages','--user','0',package).splitlines():
+            install_recovery.verify_installed_package(package)
             print('Preserved verified installed package: '+package,flush=True)
             continue
         # These provider packages must be discoverable by clients that assume a
@@ -421,9 +471,9 @@ def _install_apks():
             assert 'Success' in result.stdout, 'Installation not confirmed: ' + package
         paths=shell('pm','path','--user','0',package).splitlines()
         assert len(paths)==1 and paths[0].startswith('package:/data/app/') and shell('sha256sum',paths[0][8:]).split()[0]==meta['sha256'], 'Installed APK read-back mismatch'
-        receipt=json.loads((STATE/'install-progress.json').read_text())
+        receipt=json.loads((STATE/progress_name).read_text())
         receipt['completed']=list(dict.fromkeys(receipt.get('completed',[])+[package]))
-        save_json('install-progress.json',receipt)
+        save_json(progress_name,receipt)
         print('Installed and verified ' + package, flush=True)
     shell('settings', 'put', 'global', 'cn_gms_core', '1')
     for package in PACKAGES:
@@ -1125,10 +1175,31 @@ print(json.dumps({'manifest':manifest,'actual':actual,'stock':digest('/usr/local
     print('Local rollback metadata recovered from verified device files; phone unchanged.')
 
 
+def install_plan_report():
+    import install_recovery
+    with redirect_stdout(io.StringIO()):
+        current = preflight()
+        retained = shell('pm', 'list', 'packages', '-u').splitlines()
+        current['retained_packages'] = [p for p in PACKAGES if 'package:' + p in retained and not current['google_packages'][p]]
+        install_recovery.verify_existing(current['google_packages'])
+        current['installation'] = install_recovery.plan(current, owned_runtime())
+    print(json.dumps(current, ensure_ascii=False))
+    return current
+
+
+def recover_install(stage):
+    guard(native=True)
+    with operation_lock(), file_lock(STATE / 'install.lock'):
+        if stage == 'prepare':
+            return _prepare(recovery=True)
+        assert 'RUNNING_UNLOCKED' in shell('dumpsys', 'user'), 'Unlock the phone first'
+        return _install_apks(recovery=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
-    for name in ['preflight', 'check-apks', 'prepare', 'install-apks', 'status', 'verify', 'certification', 'recover-adapter-metadata', 'repair-runtime', 'auto-status', 'repair-autonomous']:
+    for name in ['preflight', 'check-apks', 'prepare', 'install-apks', 'status', 'verify', 'certification', 'recover-adapter-metadata', 'repair-runtime', 'auto-status', 'repair-autonomous', 'install-plan', 'recovery-prepare', 'recovery-install-apks']:
         commands.add_parser(name)
     commands.add_parser('fetch').add_argument('--archive')
     commands.add_parser('adopt-backup').add_argument('directory')
@@ -1140,7 +1211,10 @@ def main():
         from certification import inspect
         print(json.dumps(inspect(), ensure_ascii=False, indent=2))
         return
-    if args.command == 'fetch': fetch(args.archive)
+    if args.command == 'install-plan': install_plan_report()
+    elif args.command == 'recovery-prepare': recover_install('prepare')
+    elif args.command == 'recovery-install-apks': recover_install('install')
+    elif args.command == 'fetch': fetch(args.archive)
     elif args.command == 'adopt-backup': adopt(args.directory)
     else: {'preflight': preflight, 'check-apks': check_apks, 'prepare': prepare,
            'install-apks': install_apks, 'status': status, 'verify': verify,
@@ -1148,4 +1222,9 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except Exception as error:
+        from workflow_errors import emit
+        emit(error, sys.stderr)
+        raise SystemExit(2)

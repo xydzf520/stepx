@@ -11,6 +11,15 @@ from common import ROOT, guard, root_json, shell, operation_lock
 GOOGLE = ('com.google.android.gsf', 'com.google.android.gms', 'com.android.vending')
 
 
+def account_count(raw):
+    # A failed/truncated binder read is unknown, not proof of no accounts.
+    totals = re.findall(r'^\s*Accounts: (\d+)\s*$', raw, re.M)
+    rows = re.findall(r'^\s*Account \{[^\n]*\}\s*$', raw, re.M)
+    if not totals or len(rows) != sum(map(int, totals)):
+        return None
+    return sum(bool(re.search(r'type=com\.google\}', row)) for row in rows)
+
+
 def current_login(receipt, boot, pid, versions):
     return bool(receipt.get('status') == 'ready' and receipt.get('registered') is True
                 and receipt.get('update_monitor') is True and receipt.get('boot_id') == boot
@@ -46,7 +55,7 @@ print(json.dumps(json.load(open(p)) if os.path.exists(p) else {}))''')
     ready = current_login(receipt, boot, pid, versions)
     domain_ready = ready and receipt.get('domain_ready') is True
     accounts = shell('dumpsys', 'account')
-    google_accounts = len(re.findall(r'Account \{[^\n]*type=com\.google\}', accounts))
+    google_accounts = account_count(accounts)
     checks = [
         {'id': 'components', 'title': 'Google 基础组件', 'state': 'pass' if all(packages.values()) else 'fail',
          'detail': '服务框架、Play 服务与商店已启用' if all(packages.values()) else '组件缺失、已停用或被暂停；保留数据，请先检查应用设置'},

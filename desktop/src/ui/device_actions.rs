@@ -2061,6 +2061,7 @@ impl Companion {
                 }
                 let rollback = matches!(action, Action::GoogleSuiteRollback);
                 self.google_recovery.coordinator.cancel();
+                self.google_recovery.inspect_requested = true;
                 if rollback {
                     if let Err(error) = self.set_google_auto_repair(false) {
                         self.google_recovery.inspection_error = error.to_string();
@@ -2078,9 +2079,15 @@ impl Companion {
                     if rollback {
                         "正在撤销 Google Play 兼容补丁…"
                     } else {
-                        "正在应用 Google Play 兼容补丁…"
+                        "正在检查并修复 Google 服务…"
                     },
                     move |adb, d| {
+                        if !rollback {
+                            let result = stepx_companion::google::install(&d, adb, |label| {
+                                if let Ok(mut value) = progress.lock() { *value = label.into(); }
+                            })?;
+                            return Ok(Outcome::GoogleSuite(result.google, result.companion, result.message));
+                        }
                         let (suite, message) = stepx_companion::google::change_compatibility(
                             &d,
                             adb,
@@ -2103,7 +2110,9 @@ impl Companion {
                     return;
                 }
                 self.google_recovery.coordinator.cancel();
-                self.google_suite = GoogleSuiteStatus::default();
+                // Keep the last observed inventory visible during retries and
+                // refresh after success or failure instead of flashing "unknown".
+                self.google_recovery.inspect_requested = true;
                 let progress = self.google_progress.clone();
                 *progress.lock().unwrap() = "检查 Google Play 与 StepX伴侣安装条件…".into();
                 self.with_device(

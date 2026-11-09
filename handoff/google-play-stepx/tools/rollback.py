@@ -13,6 +13,10 @@ guard()
 operation_lease = hold_operation_lock()
 BASELINE = json.loads((HERE / 'baseline.json').read_text())
 assert baseline_matches(BASELINE), 'Wrong device baseline'
+if not args.keep_apps:
+    from install_recovery import require_fresh_rollback
+    from common import verified_fingerprint
+    require_fresh_rollback(BASELINE, verified_fingerprint(), DEVICE_KEY)
 INSTALL = json.loads((HERE / 'boot-install.json').read_text())
 assert subprocess.check_output(ADB + ['shell', 'getprop', 'ro.build.fingerprint'], text=True).strip() == BASELINE['fingerprint'], '设备固件已变化，停止自动回退'
 code = '''import os,json,hashlib,shutil,fcntl,stat

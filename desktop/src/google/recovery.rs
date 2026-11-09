@@ -249,16 +249,22 @@ impl RecoveryCoordinator {
                     delay,
                 )
             }
-            Err(_) => {
+            Err(error) => {
                 state.failures = state.failures.saturating_add(1);
                 let delay = (30u64.saturating_mul(1u64 << state.failures.saturating_sub(1).min(6)))
                     .min(1800);
-                // Raw bridge stderr can contain host paths or device identifiers.
+                let failure = error.downcast_ref::<super::WorkflowFailure>();
+                let retryable = failure.is_some_and(|failure| failure.retryable) && state.failures <= 3;
+                let phase = if retryable { RecoveryPhase::Retrying }
+                    else if failure.is_some_and(|f| f.code == "unsupported_firmware") { RecoveryPhase::Blocked }
+                    else { RecoveryPhase::NeedsAttention };
+                let message = failure.map(|failure| failure.message.clone()).unwrap_or_else(||
+                    "Google 检测未通过，请重新检测并查看具体原因；自动维护未修改手机".into());
+                let delay = if retryable { delay } else { 1800 };
                 (
                     RecoverySnapshot {
-                        phase: RecoveryPhase::Retrying,
-                        message: "Google 检测未完成，连接恢复后自动重试；未因读取失败修改手机"
-                            .into(),
+                        phase,
+                        message,
                         retry_after_seconds: delay,
                         in_flight: false,
                     },
@@ -395,12 +401,23 @@ mod tests {
     #[test]
     fn errors_back_off_without_private_exception_details() {
         let c = coordinator();
-        for expected in [30, 60, 120, 240, 480, 960, 1800, 1800] {
-            c.finish(7, Err(anyhow::anyhow!("secret phone id and path")));
+        for expected in [30, 60, 120, 1800, 1800] {
+            c.finish(7, Err(super::super::WorkflowFailure { code:"connection".into(), message:"手机连接中断".into(), retryable:true }.into()));
             let s = c.inner.lock().unwrap();
             assert_eq!(s.snapshot.retry_after_seconds, expected);
             assert!(!s.snapshot.message.contains("secret"));
         }
+        assert_eq!(c.snapshot("phone").phase, RecoveryPhase::NeedsAttention);
+        c.finish(7, Err(anyhow::anyhow!("secret phone id and path")));
+        assert!(!c.snapshot("phone").message.contains("secret"));
+    }
+    #[test]
+    fn unsupported_firmware_is_not_reported_as_a_network_retry() {
+        let c = coordinator();
+        c.finish(7, Err(super::super::WorkflowFailure { code:"unsupported_firmware".into(), message:"固件尚未适配".into(), retryable:false }.into()));
+        let s = c.snapshot("phone");
+        assert_eq!(s.phase, RecoveryPhase::Blocked);
+        assert_eq!(s.message, "固件尚未适配");
     }
     #[test]
     fn explicit_check_does_not_change_authorization_or_retry_budget() {

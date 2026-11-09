@@ -14,6 +14,38 @@ use std::path::PathBuf;
 
 pub mod recovery;
 
+#[derive(Debug)]
+pub struct WorkflowFailure {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+}
+impl std::fmt::Display for WorkflowFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.message) }
+}
+impl std::error::Error for WorkflowFailure {}
+
+fn script_failure(stderr: &str) -> anyhow::Error {
+    for line in stderr.lines().rev() {
+        if let Some(json) = line.strip_prefix("STEPX_GOOGLE_ERROR ") {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(json) {
+                if let (Some(code), Some(message), Some(retryable)) =
+                    (value["code"].as_str(), value["message"].as_str(), value["retryable"].as_bool()) {
+                    return WorkflowFailure { code: code.chars().take(64).collect(), message: message.chars().take(320).collect(), retryable }.into();
+                }
+            }
+        }
+    }
+    // Legacy helpers may still return a traceback. Keep private paths and
+    // identifiers out of the UI while retaining a useful failure category.
+    let (code, message, retryable) = if stderr.contains("Unsupported firmware") || stderr.contains("Native image mismatch") {
+        ("unsupported_firmware", "当前固件尚未适配，请更新手机系统或客户端后重新检测；重复重试不会解决。", false)
+    } else if stderr.contains("timed out") || stderr.contains("TimeoutExpired") || stderr.contains("device offline") {
+        ("timeout", "读取超时或手机已离线，请恢复连接后重试；已完成的步骤和数据保留。", true)
+    } else { ("needs_inspection", "当前安装步骤未通过验证，请重新检测并查看排障日志；现有组件和账号已保留。", false) };
+    WorkflowFailure { code: code.into(), message: message.into(), retryable }.into()
+}
+
 const PLAY_PROTECT_SCHEMA: &str = "stepx-play-protect-certification-v1";
 
 pub fn workflow_root() -> Result<PathBuf> {
@@ -41,12 +73,7 @@ pub fn run_script(device: &Device, adb: &Adb, script: &str, args: &[&str]) -> Re
         .context("Google 安装步骤未完成，原数据已保留；请检查网络和手机连接后重试")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let reason = stderr
-            .lines()
-            .rev()
-            .find(|s| !s.trim().is_empty())
-            .unwrap_or("组件未完成操作");
-        bail!("{} {} 失败：{}", script, args.join(" "), reason);
+        return Err(script_failure(&stderr));
     }
     Ok(String::from_utf8(output.stdout)?.trim().into())
 }
@@ -501,6 +528,18 @@ pub fn inspect(device: &Device, adb: &Adb) -> Result<GoogleSuiteStatus> {
     ]
     .iter()
     .all(|v| !v.is_empty());
+    // Detect unsupported firmware separately from a disconnected transport.
+    // Package inventory remains visible even if the privileged workflow cannot run.
+    if let Err(error) = run_script(device, adb, "manage.py", &["preflight"]) {
+        if let Some(failure) = error.downcast_ref::<WorkflowFailure>() {
+            status.install_blocked = !failure.retryable;
+            status.install_guidance = failure.message.clone();
+            status.verification_note = failure.message.clone();
+            status.health_needs_repair = true;
+            return Ok(status);
+        }
+        return Err(error);
+    }
     if !status.installed {
         status.compatibility_note = "完整安装 Google 服务后，可检查兼容补丁适配情况。".into();
         status.verification_note = if [
@@ -513,7 +552,7 @@ pub fn inspect(device: &Device, adb: &Adb) -> Result<GoogleSuiteStatus> {
         {
             "未检测到 Google 服务，可继续安装条件检查。"
         } else {
-            "检测到部分 Google 组件。为保留现有数据，已停用重复安装，请先检查已有安装。"
+            "检测到部分 Google 组件。点击「检查并补齐」会先验证已有组件签名，再仅安装缺失组件，保留账号和应用。"
         }
         .into();
         return Ok(status);
@@ -605,6 +644,8 @@ pub fn inspect(device: &Device, adb: &Adb) -> Result<GoogleSuiteStatus> {
         let package_state = pkg_res?;
         status.persistent_flags_clear = package_flags_clear(&package_state["persistent_package"])?;
         if !status.persistent_flags_clear {
+            status.install_blocked = true;
+            status.install_guidance = "检测到异常的持久化标记，已停止安装与修复；请保留现状并检查设备，避免账号数据受损。".into();
             bail!("检测到异常的持久化标记，请停止安装操作并检查设备");
         }
         Ok(())
@@ -621,6 +662,7 @@ pub fn inspect(device: &Device, adb: &Adb) -> Result<GoogleSuiteStatus> {
     match health_res {
         Ok(report) => {
             status.health_needs_repair = report["needs_repair"].as_bool().unwrap_or(true);
+            status.accounts_checked = report["account_count"].as_u64().is_some();
             status.google_accounts = report["account_count"].as_u64().unwrap_or(0) as u32;
             if let Some(checks) = report["checks"].as_array() {
                 status.health_checks = checks
@@ -651,7 +693,7 @@ pub fn inspect(device: &Device, adb: &Adb) -> Result<GoogleSuiteStatus> {
 enum GoogleInstallPlan {
     Missing,
     Existing,
-    Partial,
+    Recovery,
 }
 
 fn install_plan(preflight: &serde_json::Value) -> Result<GoogleInstallPlan> {
@@ -671,11 +713,14 @@ fn install_plan(preflight: &serde_json::Value) -> Result<GoogleInstallPlan> {
                 .context("Google 包检测结果不完整")?,
         );
     }
+    if let Some(mode) = preflight["installation"]["mode"].as_str() {
+        return match mode { "fresh" => Ok(GoogleInstallPlan::Missing), "existing" => Ok(GoogleInstallPlan::Existing), "recovery" => Ok(GoogleInstallPlan::Recovery), _ => bail!("Google 安装方案不完整，请重新检测") };
+    }
     if preflight["resume_install"] == true { return Ok(GoogleInstallPlan::Missing); }
     Ok(match installed {
         0 => GoogleInstallPlan::Missing,
         3 => GoogleInstallPlan::Existing,
-        _ => GoogleInstallPlan::Partial,
+        _ => GoogleInstallPlan::Recovery,
     })
 }
 
@@ -699,12 +744,12 @@ pub fn install(device: &Device, adb: &Adb, progress: impl Fn(&str)) -> Result<Go
     device.verify(adb)?;
     progress("检查 Google Play 与 StepX伴侣安装条件…");
     let preflight: serde_json::Value =
-        serde_json::from_str(&run_script(device, adb, "manage.py", &["preflight"])?)?;
+        serde_json::from_str(&run_script(device, adb, "manage.py", &["install-plan"])?)?;
     if preflight["user_unlocked"].as_bool() != Some(true) {
         bail!("请先解锁手机，再安装 Google Play 与 StepX伴侣");
     }
     let plan = install_plan(&preflight)?;
-    if plan == GoogleInstallPlan::Missing {
+    if preflight["installation"]["requires_install_switch"] == true || plan == GoogleInstallPlan::Missing {
         require_install_switch(&preflight)?;
     }
     let mut companion = crate::companion_app::install(adb, device, |message| {
@@ -717,11 +762,11 @@ pub fn install(device: &Device, adb: &Adb, progress: impl Fn(&str)) -> Result<Go
         })
         .with_context(|| format!("{} Google Play 安装尚未完成", companion.message))?,
         GoogleInstallPlan::Existing => "已有 Google 组件已保留，未重复安装。".into(),
-        GoogleInstallPlan::Partial => bail!("检测到其他来源或没有安装记录的部分 Google 组件，已保留账号和应用。请先检测状态；不能将其误报为安装完成"),
+        GoogleInstallPlan::Recovery => install_recovery(device, adb, preflight["installation"]["requires_install_switch"] == true, &progress)?,
     };
     // The Google launch hook only exists after first installation. Configure the
     // companion chain now, never report the pre-hook result as reboot-ready.
-    if plan == GoogleInstallPlan::Missing {
+    if plan != GoogleInstallPlan::Existing {
         progress("正在补齐 StepX伴侣开机恢复并回读权限…");
         companion = crate::companion_app::complete_boot_setup(adb, device)
             .context("Google 组件已安装；伴侣开机恢复未完成，现有数据保留，请重试修复")?;
@@ -731,6 +776,7 @@ pub fn install(device: &Device, adb: &Adb, progress: impl Fn(&str)) -> Result<Go
     progress("正在回读 Google Play 与 StepX伴侣安装状态…");
     let mut google = inspect(device, adb)
         .with_context(|| format!("{} Google Play 状态回读未完成", companion.message))?;
+    if google.install_blocked { bail!("{}", google.install_guidance); }
     if should_apply_during_install(plan, &google) {
         let (updated, patch_message) = change_compatibility(device, adb, false, &progress)
             .with_context(|| format!("{} Google 组件已保留，兼容补丁未完成", companion.message))?;
@@ -741,8 +787,8 @@ pub fn install(device: &Device, adb: &Adb, progress: impl Fn(&str)) -> Result<Go
         message.push(' ');
         message.push_str(&google.compatibility_note);
     }
-    if plan == GoogleInstallPlan::Existing
-        && google.compatibility_supported
+    if plan != GoogleInstallPlan::Missing
+        && google.installed
         && !google.boot_module_ready
     {
         progress("恢复 Google 组件更新后的运行权限…");
@@ -752,16 +798,39 @@ pub fn install(device: &Device, adb: &Adb, progress: impl Fn(&str)) -> Result<Go
             bail!("Google 服务恢复后校验未通过，请查看检测详情");
         }
     }
-    if google.compatibility_supported && google.installed && google.health_needs_repair {
+    if google.installed && google.boot_module_ready && google.health_needs_repair {
         progress("完善通用 Google 登录与组件更新恢复…");
         run_script(device, adb, "health.py", &["repair"])?;
         google = inspect(device, adb)?;
+    }
+    if !google.installed { bail!("Google 组件仍未安装完整，请继续安装；已有组件和账号已保留"); }
+    if google.boot_module_ready && !google.persistent_flags_clear {
+        bail!("Google 组件已保留，但持久化标记检查未通过，请重新检测；当前不能按安装成功验收");
+    }
+    if !google.boot_module_ready || google.health_needs_repair {
+        message.push_str(" 服务尚未全部就绪。请按提示重启手机并解锁后重新检测；当前不代表 Google 登录或认证通过。");
     }
     Ok(GoogleInstallResult {
         google,
         companion,
         message,
     })
+}
+
+fn install_recovery(device: &Device, adb: &Adb, missing: bool, progress: &impl Fn(&str)) -> Result<String> {
+    for (stage, label) in [
+        ("fetch", "1 / 4 · 获取并校验缺失组件安装包"),
+        ("recovery-prepare", "2 / 4 · 核验已有组件并保存恢复记录"),
+        ("recovery-install-apks", "3 / 4 · 保留已有版本，仅补齐缺失组件"),
+    ] {
+        if stage == "fetch" && !missing { continue; }
+        progress(label);
+        run_script(device, adb, "manage.py", &[stage])
+            .with_context(|| format!("恢复安装停在 {stage}，已完成步骤保留，可重试继续"))?;
+    }
+    progress("4 / 4 · 校验并补齐开机恢复");
+    run_script(device, adb, "install_adapter.py", &["--recovery"])?;
+    Ok("已核验并补齐 Google 组件；已有版本、账号和应用数据保留。".into())
 }
 
 fn install_fresh(device: &Device, adb: &Adb, progress: impl Fn(&str)) -> Result<String> {
@@ -800,6 +869,25 @@ fn install_fresh(device: &Device, adb: &Adb, progress: impl Fn(&str)) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn workflow_errors_keep_retry_policy_and_hide_legacy_details() {
+        let error = script_failure("STEPX_GOOGLE_ERROR {\"code\":\"storage_full\",\"message\":\"手机空间不足，请释放空间后继续\",\"retryable\":false}");
+        let failure = error.downcast_ref::<WorkflowFailure>().unwrap();
+        assert_eq!(failure.code, "storage_full");
+        assert!(!failure.retryable);
+        let error = script_failure("Traceback /private/account/path unexpected failure");
+        assert!(!error.to_string().contains("/private"));
+        assert!(!error.downcast_ref::<WorkflowFailure>().unwrap().retryable);
+    }
+    #[test]
+    fn lost_receipt_uses_recovery_even_with_all_packages_present() {
+        let mut report = serde_json::json!({"google_packages": {
+            "com.google.android.gsf":true, "com.google.android.gms":true, "com.android.vending":true
+        }, "installation":{"mode":"recovery"}});
+        assert_eq!(install_plan(&report).unwrap(), GoogleInstallPlan::Recovery);
+        report["installation"]["mode"] = "invalid".into();
+        assert!(install_plan(&report).is_err());
+    }
     #[test]
     fn compatibility_status_keeps_certification_separate_and_requires_guards() {
         let mut status = GoogleSuiteStatus {
@@ -859,7 +947,7 @@ mod tests {
             GoogleInstallPlan::Existing,
             &valid
         ));
-        for plan in [GoogleInstallPlan::Missing, GoogleInstallPlan::Partial] {
+        for plan in [GoogleInstallPlan::Missing, GoogleInstallPlan::Recovery] {
             assert!(!should_apply_during_install(plan, &valid));
         }
         let mut status = valid.clone();
@@ -901,11 +989,11 @@ mod tests {
         );
         assert_eq!(
             install_plan(&report(false, true, true)).unwrap(),
-            GoogleInstallPlan::Partial
+            GoogleInstallPlan::Recovery
         );
         assert_eq!(
             install_plan(&report(true, false, false)).unwrap(),
-            GoogleInstallPlan::Partial
+            GoogleInstallPlan::Recovery
         );
         assert!(install_plan(&serde_json::json!({})).is_err());
         assert!(install_plan(&serde_json::json!({"google_packages":{"com.google.android.gsf":true,"com.google.android.gms":true}})).is_err());

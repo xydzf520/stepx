@@ -19,7 +19,9 @@ impl GoogleRecoveryUi {
 
 impl Companion {
     pub(super) fn google_mutation_wait_reason(&self) -> Option<&'static str> {
-        if self.google_recovery.snapshot.as_ref().is_some_and(|state| state.in_flight) {
+        if self.google_recovery.is_inspecting() {
+            Some("Google 状态正在检测，完成后可继续安装或修复")
+        } else if self.google_recovery.snapshot.as_ref().is_some_and(|state| state.in_flight) {
             Some("自动维护正在完成当前步骤，请稍后重试")
         } else if self.active_call_number.is_some()
             || self.push.snapshot.live_call.ongoing(chrono::Local::now().timestamp_millis())

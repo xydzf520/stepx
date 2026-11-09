@@ -591,6 +591,28 @@ impl Companion {
    let Ok(bytes)=std::fs::read(dir.join("command.json"))else{return;};let Ok(v)=serde_json::from_slice::<serde_json::Value>(&bytes)else{return;};let seq=v["seq"].as_u64().unwrap_or(0);if seq<=last.0{return;}last.0=seq;
    let mut error=None;
    match v["op"].as_str().unwrap_or("") {
+    "preview_google_install" if self.demo_mode => {
+      use stepx_companion::device::GoogleSuiteStatus;
+      self.desktop_update.whats_new_open = false;
+      self.page = Page::Tools;
+      self.tool_page = Some(ToolPage::Google);
+      self.google_recovery.inspect_requested = false;
+      self.google_suite = match v["state"].as_str().unwrap_or("partial") {
+        "healthy" => GoogleSuiteStatus::default_verified(),
+        "blocked" => GoogleSuiteStatus {
+          checked:true, install_blocked:true,
+          install_guidance:"当前手机固件尚未通过 Google 安装适配验证。请先更新手机系统或桌面客户端，再重新检测；现有数据已保留。".into(),
+          verification_note:"固件未适配，已停止安装。重复重试不会解决。".into(),
+          ..Default::default()
+        },
+        _ => GoogleSuiteStatus {
+          checked:true, gms_version:"26.41.31".into(),
+          verification_note:"缺少服务框架与 Play 商店。已有 Play 服务会先验证签名，再补齐缺项；保留账号和应用。".into(),
+          ..Default::default()
+        },
+      };
+      ctx.notify();
+    },
     "preview_battery" if self.demo_mode => {
       match serde_json::from_value::<stepx_companion::battery::BatteryState>(v["battery"].clone()) {
         Ok(reading) => if let Some(serial) = self.selected.as_ref().map(|d| d.serial.clone()) {

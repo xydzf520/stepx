@@ -3747,8 +3747,9 @@ impl Companion {
         let automatic = self.settings.value.google_auto_repair;
         let maintenance = self.google_recovery.snapshot.as_ref();
         let maintaining = maintenance.is_some_and(|state| state.in_flight);
-        let mutation_blocked = self.busy || self.google_mutation_wait_reason().is_some();
+        let mutation_blocked = self.busy || g.install_blocked || self.google_mutation_wait_reason().is_some();
         let reading_details = self.google_recovery.is_inspecting() || self.google_recovery.inspect_requested;
+        let installed_count = [&g.gsf_version, &g.gms_version, &g.play_version].iter().filter(|v| !v.is_empty()).count();
 
         let pill_badge =
             |label: &str, fg: facloud_ui::color::ColorU, bg: facloud_ui::color::ColorU| -> El {
@@ -3763,12 +3764,13 @@ impl Companion {
         let perms_ok = g.boot_module_ready
             && g.granted_count >= g.total_permissions
             && g.total_permissions > 0;
-        let patch_or_login_ok =
-            g.compatibility_active || (!g.compatibility_supported && !g.health_needs_repair);
+        let patch_or_login_ok = g.installed && perms_ok && !g.health_needs_repair
+            && (g.compatibility_active || !g.compatibility_supported);
         let all_ready =
-            g.checked && g.installed && perms_ok && !g.health_needs_repair && patch_or_login_ok;
+            g.checked && !g.install_blocked && g.installed && perms_ok && g.persistent_flags_clear && !g.health_needs_repair && patch_or_login_ok;
         let needs_repair = g.installed
             && (!perms_ok
+                || !g.persistent_flags_clear
                 || g.health_needs_repair
                 || (g.compatibility_supported && !g.compatibility_active));
 
@@ -3778,21 +3780,27 @@ impl Companion {
             ("正在读取状态", p.blue, crate::ui::pages::home::soft_tint(p.blue, p.dark))
         } else if !g.checked {
             ("待检测", p.text2, p.sidebar)
+        } else if g.install_blocked {
+            ("安装条件未满足", p.warning, p.warning_soft)
         } else if all_ready {
             ("服务检查通过", p.success, p.success_soft)
         } else if g.installed {
             ("已安装 · 建议修复", p.warning, p.warning_soft)
+        } else if installed_count > 0 {
+            ("已安装部分组件", p.warning, p.warning_soft)
         } else {
             ("尚未安装", p.warning, p.warning_soft)
         };
 
         let mut top_actions = Vec::new();
-        if mutation_blocked {
-            top_actions.push(self.disabled_button(if maintaining { "自动维护中…" } else { "暂不可修复" }));
+        if g.install_blocked {
+            top_actions.push(self.button("google-step1-recheck-btn", "重新检测", Action::GoogleSuiteInspect, Btn::Primary));
+        } else if mutation_blocked {
+            top_actions.push(self.disabled_button(if maintaining { "自动维护中…" } else if reading_details { "正在检测…" } else { "暂不可修复" }));
         } else if !g.installed {
             top_actions.push(self.button(
                 "tool-google-install",
-                "一键安装",
+                if installed_count > 0 { "检查并补齐" } else { "一键安装" },
                 Action::PrepareUtility(Box::new(Action::GoogleSuiteInstall)),
                 Btn::Primary,
             ));
@@ -3851,11 +3859,15 @@ impl Companion {
                     self.line(
                         if !g.checked {
                             "连接手机后自动读取安装与权限状态"
+                        } else if g.install_blocked {
+                            g.install_guidance.as_str()
                         } else if all_ready {
                             "三件套、系统权限与登录入口检查通过；具体应用仍需网络和认证条件支持"
                         } else if g.installed {
                             if automatic { "连接电脑后自动检查并恢复已配置的服务，进度显示在下方" }
                             else { "电脑自动维护已暂停，可手动检查或修复服务" }
+                        } else if installed_count > 0 {
+                            "自动核验已有组件，仅补齐缺失项；保留账号、已有版本和应用数据"
                         } else {
                             "一键安装 Google 框架、Play 服务、Play 商店及 StepX 手机伴侣"
                         },
@@ -3892,11 +3904,17 @@ impl Companion {
             ("待检测".into(), p.text2)
         } else if g.installed {
             ("已安装".into(), p.success)
+        } else if installed_count > 0 {
+            (format!("已安装 {installed_count} / 3"), p.warning)
         } else {
             ("未安装".into(), p.warning)
         };
         let suite_sub = if g.installed {
             format!("Play {} · GMS {}", g.play_short(), g.gms_short())
+        } else if g.checked {
+            let missing: Vec<_> = [("GSF", &g.gsf_version), ("Play 服务", &g.gms_version), ("Play 商店", &g.play_version)]
+                .into_iter().filter_map(|(name, version)| version.is_empty().then_some(name)).collect();
+            format!("待补齐：{}", missing.join(" / "))
         } else {
             "GSF / GMS / Play 商店".into()
         };
@@ -3925,10 +3943,10 @@ impl Companion {
         } else if patch_or_login_ok {
             "登录入口与自动恢复已生效"
         } else {
-            "解除未认证登录拦截"
+            "检查商店配置与登录入口"
         };
 
-        let account_val = if !g.checked {
+        let account_val = if !g.accounts_checked {
             ("待检测".into(), p.text2)
         } else if g.google_accounts > 0 {
             (format!("已登录 {} 个", g.google_accounts), p.success)
@@ -3956,7 +3974,9 @@ impl Companion {
             ],
         );
 
-        let automatic_message = if !automatic {
+        let automatic_message = if g.install_blocked {
+            "当前条件不支持自动修复，已保留手机现有状态。请先处理上方原因，再重新检测。".to_string()
+        } else if !automatic {
             if maintaining { "当前步骤完成后暂停电脑维护；手机自身的更新恢复继续运行" }
             else { "已暂停电脑自动维护；手机自身的更新恢复继续运行" }.to_string()
         } else if let Some(state) = maintenance {
@@ -3965,7 +3985,8 @@ impl Companion {
         } else {
             "连接后自动检查 Google 服务".into()
         };
-        let automatic_color = if !automatic { p.text2 }
+        let automatic_color = if g.install_blocked { p.warning }
+            else if !automatic { p.text2 }
             else if maintenance.is_some_and(|state| matches!(state.phase,
                 stepx_companion::google::recovery::RecoveryPhase::NeedsAttention |
                 stepx_companion::google::recovery::RecoveryPhase::Blocked)) { p.warning }
@@ -3988,7 +4009,12 @@ impl Companion {
             maintenance_content.push(self.line(&self.google_recovery.inspection_error, CAPTION, p.warning));
         }
         let maintenance_panel = self.panel(maintenance_content);
-        let overview_panel = self.panel(vec![header_row, metrics_grid]);
+        let mut overview = vec![header_row, metrics_grid];
+        if g.checked && !all_ready {
+            overview.push(self.line(&g.verification_note, CAPTION, p.warning));
+            overview.push(self.line("流程：检查设备与签名 → 保存恢复记录 → 补齐组件 → 校验权限与登录。中断后点同一按钮继续，无需卸载重装。", CAPTION, p.text2));
+        }
+        let overview_panel = self.panel(overview);
 
         let quick_fix_row = |title: &str, desc: String, right_btn: El| -> El {
             self.between(

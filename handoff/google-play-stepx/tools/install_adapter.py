@@ -4,14 +4,19 @@ import sys
 """Install only the reviewed, fixed-device GMS boot adapter, preserving stock."""
 import pathlib, subprocess, json, base64, uuid, hashlib, shutil
 
-from common import ROOT, STATE as BACKUP, ADB, CONFIG, guard, verified_fingerprint, hold_operation_lock
+from common import ROOT, STATE as BACKUP, ADB, CONFIG, guard, verified_fingerprint, hold_operation_lock, private_write
 from source_integrity import read_python_source
 import argparse
-argparse.ArgumentParser(description=__doc__).parse_args()
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--recovery', action='store_true', help='Use a verified repair snapshot; never enables destructive rollback')
+args = parser.parse_args()
 guard(native=True)
 operation_lease = hold_operation_lock()
 STOCK_SHA = '5cfe5a88a97eca424bd4922fe813e0cc553adad0e8623105311ec1514022152f'
-baseline = json.loads((BACKUP / 'baseline.json').read_text())
+baseline = json.loads((BACKUP / ('recovery-baseline.json' if args.recovery else 'baseline.json')).read_text())
+if args.recovery:
+    from install_recovery import check_recovery_receipt
+    check_recovery_receipt(baseline, verified_fingerprint(), DEVICE_KEY)
 assert baseline_matches(baseline), 'Wrong device baseline'
 assert verified_fingerprint() == baseline['fingerprint'], '安装基线固件与当前手机不同；备份已保留'
 assert subprocess.check_output(ADB + ['shell', 'getprop', 'persist.openclaw.zygote.path'], text=True).strip() == ''
@@ -95,8 +100,10 @@ print(json.dumps({'installed':True,'original_sha256':regular_digest(stock),'laun
 result = subprocess.run([sys.executable, str(ROOT / 'tools/root_bridge.py')], input=code, capture_output=True, text=True, timeout=150)
 proof = json.JSONDecoder().raw_decode(result.stdout.lstrip())[0]
 assert proof.get('installed') and proof['original_sha256'] == STOCK_SHA
-(BACKUP / 'boot-install.json').write_text(json.dumps(proof, indent=2))
-(BACKUP / 'boot-install.json').chmod(0o600)
+proof['install_kind'] = 'recovery' if args.recovery else 'fresh'
+# Retain the original receipt after a recovery; never turn today's package
+# inventory into permission to remove accounts during an old rollback.
+private_write(BACKUP / ('recovery-boot-install.json' if args.recovery else 'boot-install.json'), json.dumps(proof, indent=2))
 # Save the exact bytes staged and verified above, not checkout-native CRLF.
 (BACKUP / 'boot-module').mkdir(exist_ok=True, mode=0o700)
 (BACKUP / 'boot-module').chmod(0o700)

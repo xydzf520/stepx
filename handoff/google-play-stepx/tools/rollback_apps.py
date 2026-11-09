@@ -2,14 +2,16 @@ from common import baseline_matches, DEVICE_KEY
 #!/usr/bin/env python3
 """Remove a partial fresh APK installation, only while the factory launcher is intact."""
 import json
-from common import ADB, CONFIG, STATE, guard, root_json, run, shell
+from common import ADB, CONFIG, STATE, guard, root_json, run, shell, hold_operation_lock, verified_fingerprint
+from install_recovery import require_fresh_rollback
 
 import argparse
 argparse.ArgumentParser(description=__doc__).parse_args()
 guard()
+operation_lease = hold_operation_lock()
 baseline = json.loads((STATE / 'baseline.json').read_text())
 assert baseline_matches(baseline), 'Wrong device baseline'
-assert baseline['fingerprint'] == CONFIG['fingerprint']
+require_fresh_rollback(baseline, verified_fingerprint(), DEVICE_KEY)
 proof = root_json("import hashlib,json;print(json.dumps({'sha':hashlib.sha256(open('/usr/local/bin/ubuntu_zygote','rb').read()).hexdigest()}))")
 assert proof['sha'] == CONFIG['stock_sha256'], 'Use full rollback.py while adapter is installed'
 for package in ['com.android.vending', 'com.google.android.gms', 'com.google.android.gsf']:

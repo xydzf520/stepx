@@ -3740,6 +3740,8 @@ pub struct GoogleHealthCheck {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct GoogleSuiteStatus {
     pub checked: bool,
+    pub install_blocked: bool,
+    pub install_guidance: String,
     pub verification_note: String,
     pub installed: bool,
     pub gsf_version: String,
@@ -3751,6 +3753,7 @@ pub struct GoogleSuiteStatus {
     pub pid_matches: bool,
     pub persistent_flags_clear: bool,
     pub google_accounts: u32,
+    pub accounts_checked: bool,
     pub boot_module_ready: bool,
     pub certification_note: String,
     pub certification_catalog: String,
@@ -3769,6 +3772,8 @@ impl GoogleSuiteStatus {
     pub fn default_verified() -> Self {
         Self {
             checked: true,
+            install_blocked: false,
+            install_guidance: String::new(),
             verification_note: "演示数据".into(),
             installed: true,
             gsf_version: "16-13343139".into(),
@@ -3780,6 +3785,7 @@ impl GoogleSuiteStatus {
             pid_matches: true,
             persistent_flags_clear: true,
             google_accounts: 1,
+            accounts_checked: true,
             boot_module_ready: true,
             certification_note: "演示数据 · 认证未验证".into(),
             certification_catalog: String::new(),
@@ -3880,6 +3886,8 @@ impl Default for GoogleSuiteStatus {
     fn default() -> Self {
         Self {
             checked: false,
+            install_blocked: false,
+            install_guidance: String::new(),
             verification_note: "待检测".into(),
             installed: false,
             gsf_version: String::new(),
@@ -3891,6 +3899,7 @@ impl Default for GoogleSuiteStatus {
             pid_matches: false,
             persistent_flags_clear: false,
             google_accounts: 0,
+            accounts_checked: false,
             boot_module_ready: false,
             certification_note: "认证尚未核验".into(),
             certification_catalog: String::new(),
@@ -3902,7 +3911,7 @@ impl Default for GoogleSuiteStatus {
             compatibility_note: "兼容补丁尚未检测".into(),
             play_protect: PlayProtectReport::default(),
             health_checks: Vec::new(),
-            health_needs_repair: false,
+            health_needs_repair: true,
         }
     }
 }

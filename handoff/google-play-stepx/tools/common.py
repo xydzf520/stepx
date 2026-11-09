@@ -10,10 +10,12 @@ import shutil
 import subprocess
 import sys
 import threading
+import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT.parents[1] / 'scripts'))
 from host_runtime import sdk_tool, sdk_command, subprocess_options, user_state_root, migrate_legacy_state
+from workflow_errors import WorkflowError
 
 
 def _resolve_adb():
@@ -120,14 +122,17 @@ def guard(native=False):
             raise RuntimeError('连接的手机与已选设备不一致，请重新选择设备（命令行运行请设置环境变量 STEPX_SERIAL=<设备序列号>）')
         raise RuntimeError('连接的手机与已选设备不一致，请重新选择设备')
     actual_fp = shell('getprop', 'ro.build.fingerprint')
-    assert actual_fp in ALLOWED_FINGERPRINTS, f"Unsupported firmware: {actual_fp} (expected {ALLOWED_FINGERPRINTS})"
+    if actual_fp not in ALLOWED_FINGERPRINTS:
+        raise WorkflowError('unsupported_firmware', '当前手机固件尚未通过 Google 安装适配验证。请先更新手机系统或桌面客户端，再重新检测；重复安装不会解决，现有数据已保留。')
     actual_sdk = shell('getprop', 'ro.build.version.sdk')
-    assert actual_sdk == CONFIG['sdk'], f"Unsupported SDK: {actual_sdk} (expected {CONFIG['sdk']})"
-    assert shell('getprop', 'ro.product.cpu.abilist') == CONFIG['abi'], 'Unsupported ABI'
-    assert shell('getenforce') == 'Enforcing', 'Unexpected SELinux state'
+    if actual_sdk != CONFIG['sdk'] or shell('getprop', 'ro.product.cpu.abilist') != CONFIG['abi']:
+        raise WorkflowError('unsupported_firmware', '当前系统版本或处理器架构不在已验证的 Google 安装范围；请更新客户端后重新检测。')
+    if shell('getenforce') != 'Enforcing':
+        raise WorkflowError('unsupported_firmware', '手机系统安全状态与已验证配置不同，已停止安装和自动修复。')
     if native:
         for path, expected in CONFIG['native_hashes'].items():
-            assert shell('sha256sum', path).split()[0] == expected, 'Native image mismatch: ' + path
+            if shell('sha256sum', path).split()[0] != expected:
+                raise WorkflowError('unsupported_firmware', '手机系统关键库与已验证固件不一致，已停止安装。请更新客户端适配后重新检测。')
     init_state()
 
 
@@ -159,12 +164,21 @@ def private_write(path, data):
     path = Path(path)
     if isinstance(data, str):
         data = data.encode()
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, 'wb') as stream:
-        stream.write(data)
-        stream.flush()
-        os.fsync(stream.fileno())
-    path.chmod(0o600)
+    if path.is_symlink():
+        raise RuntimeError('恢复记录路径异常，未覆盖现有记录')
+    fd, temporary = tempfile.mkstemp(prefix='.' + path.name + '-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        if os.name != 'nt':
+            directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try: os.fsync(directory)
+            finally: os.close(directory)
+    finally:
+        if os.path.exists(temporary): os.unlink(temporary)
 
 
 def save_json(name, value):

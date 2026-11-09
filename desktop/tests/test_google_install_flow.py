@@ -21,6 +21,8 @@ sys.path.insert(0, str(TOOLS))
 spec = importlib.util.spec_from_file_location('google_install_flow', TOOLS / 'manage.py')
 manage = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(manage)
+import install_recovery
+from workflow_errors import WorkflowError
 
 
 def digest(data):
@@ -42,12 +44,17 @@ class InstallGateFixture:
         self.stack.enter_context(patch.object(manage, 'baseline_matches', side_effect=lambda x: x.get('serial') == 'fixture-device' and x.get('fingerprint') == 'reviewed-12'))
         self.stack.enter_context(patch.object(manage, 'save_json', side_effect=lambda name, value: (self.root / name).write_text(json.dumps(value))))
         self.stack.enter_context(patch.object(manage, 'shell', side_effect=self.shell))
+        self.stack.enter_context(patch.object(install_recovery, 'shell', side_effect=lambda *a: manage.shell(*a)))
+        self.stack.enter_context(patch.object(install_recovery, 'run', side_effect=lambda *a, **kw: manage.run(*a, **kw)))
+        self.stack.enter_context(patch.object(install_recovery, 'STATE', self.root))
 
     def tearDown(self):
         self.stack.close()
         self.temp.cleanup()
 
     def shell(self, *args):
+        if args == ('pm', 'list', 'packages', '--user', '0'):
+            return 'package:android'
         if args[:3] == ('settings', 'get', 'secure'):
             return self.settings.get(args[3], 'null')
         if args[:3] == ('settings', 'put', 'secure'):
@@ -154,7 +161,7 @@ class PreparationPayloadTests(unittest.TestCase):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             exec(self.code, {'HOST': str(self.host), 'STOCK_SHA': digest(self.original),
-                             'DEVICE': 'fixture-device', 'FINGERPRINT': 'reviewed-12'})
+                             'DEVICE': 'fixture-device', 'FINGERPRINT': 'reviewed-12', 'MANAGED': False})
         return json.loads(output.getvalue())
 
     def test_permission_denied_optional_metadata_does_not_lose_stock_proof(self):
@@ -274,8 +281,9 @@ class InstallTransactionTests(InstallGateFixture, unittest.TestCase):
                 return '0' * 64 + '  ' + args[1]
             return original_shell(*args)
         with patch.object(manage, 'shell', side_effect=shell), patch.object(manage, 'check_apks'), \
-                patch.object(manage, 'run') as install:
-            with self.assertRaisesRegex(AssertionError, '版本不同'):
+                patch.object(manage, 'run') as install, \
+                patch.object(install_recovery, 'verify_installed_package', side_effect=WorkflowError('untrusted_package', '签名未验证')):
+            with self.assertRaisesRegex(WorkflowError, '签名未验证'):
                 manage._install_apks()
             install.assert_not_called()
         self.assert_gates_restored()
@@ -289,6 +297,7 @@ class InstallTransactionTests(InstallGateFixture, unittest.TestCase):
         metadata = {entry['package']: entry for entry in manage.CONFIG['apks']}
         def shell(*args):
             if args[:4] == ('pm', 'list', 'packages', '--user'):
+                if len(args) == 5: return 'package:android\n' + '\n'.join('package:' + p for p in installed)
                 return 'package:' + args[-1] if args[-1] in installed else ''
             if args[:2] == ('pm', 'path'):
                 return 'package:/data/app/' + args[-1] + '/base.apk'
@@ -324,7 +333,7 @@ class InstallTransactionTests(InstallGateFixture, unittest.TestCase):
         original_shell = self.shell
         def shell(*args):
             if args[:4] == ('pm', 'list', 'packages', '--user'):
-                return ''
+                return 'package:android' if len(args) == 5 else ''
             return original_shell(*args)
         def install(*args, **kwargs):
             self.assertEqual(self.settings[self.key], manage.INSTALL_LABELS[self.package] + ':1')
