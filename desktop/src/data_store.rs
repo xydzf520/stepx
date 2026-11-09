@@ -45,9 +45,19 @@ struct WriteCache {
     heads: Vec<HeadSpan>,
     head: String,
 }
+struct DatabaseUseGate(fs::File);
+impl Drop for DatabaseUseGate {
+    fn drop(&mut self) {
+        // Closing only this descriptor can leave a flock alive in a transient
+        // fork/exec child. Release our lock explicitly when its owner closes.
+        let _ = self.0.unlock();
+    }
+}
+
 struct CachedConnection {
+    // Fields drop in declaration order: close SQLite before releasing its gate.
     conn: Connection,
-    _gate: fs::File,
+    _gate: DatabaseUseGate,
     write_cache: Option<WriteCache>,
     read_cache: Option<ReadCache>,
 }
@@ -240,6 +250,7 @@ fn with_cached<T>(path: &Path, f: impl FnOnce(&mut CachedConnection) -> Result<T
                 .open(parent.join("database-use.lock"))?;
             gate.try_lock_shared()
                 .context("数据库正在恢复，请稍后打开客户端")?;
+            let gate = DatabaseUseGate(gate);
             pool.insert(
                 path.to_path_buf(),
                 CachedConnection {
@@ -1241,6 +1252,45 @@ pub fn updated_at(path: &Path) -> Result<i64> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[cfg(unix)]
+    #[test]
+    fn closing_database_releases_gate_despite_duplicated_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.json");
+        write(&path, &json!({"rows": [1, 2]})).unwrap();
+        let db = database_for(&path);
+        let backup_path = dir.path().join("backup.sqlite3");
+        backup(&db, &backup_path).unwrap();
+        // A concurrent process spawn can temporarily inherit an open file
+        // description before exec closes its CLOEXEC descriptors.
+        let inherited = with_cached(&db, |cached| Ok(cached._gate.0.try_clone()?)).unwrap();
+        assert!(crate::storage_maintenance::restore(&db, &backup_path).is_err());
+        close_thread_connections();
+        let preserved = crate::storage_maintenance::restore(&db, &backup_path).unwrap();
+        assert!(preserved.join("stepx.sqlite3").is_file());
+        assert!(inherited.metadata().is_ok(), "duplicate is still open during restore");
+        drop(inherited);
+        assert_eq!(read::<Value>(&path, 1024).unwrap().unwrap()["rows"], json!([1, 2]));
+        close_thread_connections();
+    }
+
+    #[test]
+    fn closing_database_does_not_release_an_independent_readers_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.json");
+        write(&path, &json!({"rows": [1, 2]})).unwrap();
+        let db = database_for(&path);
+        let backup_path = dir.path().join("backup.sqlite3");
+        backup(&db, &backup_path).unwrap();
+        let other = fs::OpenOptions::new().read(true).write(true)
+            .open(dir.path().join("database-use.lock")).unwrap();
+        other.try_lock_shared().unwrap();
+        close_thread_connections();
+        assert!(crate::storage_maintenance::restore(&db, &backup_path).is_err());
+        other.unlock().unwrap();
+        crate::storage_maintenance::restore(&db, &backup_path).unwrap();
+    }
+
     #[test]
     fn windows_path_migration_preserves_rows_and_import_receipts() {
         let dir = tempfile::tempdir().unwrap();
