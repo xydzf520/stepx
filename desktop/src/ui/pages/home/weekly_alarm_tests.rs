@@ -229,13 +229,20 @@ fn alarms_fit_actual_width_and_weekly_standard_exposes_details() {
                     input.max_x() <= create.origin().x(),
                     "create button overlaps input"
                 );
-                let first = rect("home-alarm-tile-801");
-                let second = rect("home-alarm-tile-802");
                 if width < 600. {
-                    assert!(
-                        first.max_y() <= second.origin().y(),
-                        "narrow alarms must stack"
-                    );
+                    // Upcoming alarms precede elapsed ones, so their order
+                    // changes when the host clock crosses a fixture's time.
+                    // Verify every pair is vertically disjoint in either order.
+                    let tiles = [801, 802, 803].map(|id| rect(&format!("home-alarm-tile-{id}")));
+                    for (index, first) in tiles.iter().enumerate() {
+                        for second in &tiles[index + 1..] {
+                            assert!(
+                                first.max_y() <= second.origin().y()
+                                    || second.max_y() <= first.origin().y(),
+                                "narrow alarms must stack at {width}: {first:?} / {second:?}"
+                            );
+                        }
+                    }
                 }
             });
         }
