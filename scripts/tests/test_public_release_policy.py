@@ -31,6 +31,36 @@ export = load('release_export', 'sync-public-repo.py')
 package = load('release_package', 'package-release.py')
 
 
+class PackagedGoogleImportsTests(unittest.TestCase):
+    def test_google_entry_points_import_from_staged_resources_without_checkout(self):
+        # Use the real release allowlist and an isolated interpreter. Importing
+        # from the checkout can hide a missing transitive runtime dependency.
+        with tempfile.TemporaryDirectory(prefix='StepX packaged imports ') as td:
+            root = Path(td) / 'resources'
+            stage(SCRIPTS.parent, root)
+            code = """import importlib, importlib.util, subprocess, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+sys.path[:0] = [str(root/'scripts'), str(root/'handoff/google-play-stepx/tools')]
+def forbidden(*args, **kwargs):
+    raise AssertionError('Import verification must not invoke external tools')
+subprocess.run = subprocess.Popen = subprocess.check_output = forbidden
+for name in ['common', 'manage', 'health', 'install_recovery', 'workflow_errors']:
+    module = importlib.import_module(name)
+    assert Path(module.__file__).resolve().is_relative_to(root.resolve())
+for name in ['companion-permissions', 'companion-power', 'companion-system']:
+    spec = importlib.util.spec_from_file_location(name, root/'scripts'/(name+'.py'))
+    spec.loader.exec_module(importlib.util.module_from_spec(spec))
+print('Isolated packaged Google imports: PASS')
+"""
+            env = {key: value for key, value in os.environ.items()
+                   if not key.startswith('STEPX_') and key not in ('PYTHONPATH', 'PYTHONHOME')}
+            env['STEPX_STATE_DIR'] = str(Path(td) / 'isolated-user-data')
+            result = subprocess.run([sys.executable, '-I', '-B', '-c', code, str(root)],
+                                    cwd=td, env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
 class ToolDownloadTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
