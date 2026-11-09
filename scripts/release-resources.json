@@ -109,7 +109,9 @@
     "docs/STUDIO_INTEGRATION.md",
     "docs/RELEASE_0_2_181.md",
     "docs/RELEASE_0_2_182.md",
-    "docs/RELEASE_0_2_182_CUMULATIVE.md"
+    "docs/RELEASE_0_2_182_CUMULATIVE.md",
+    "docs/RELEASE_0_2_183.md",
+    "docs/google-install-recovery-0.2.183.md"
   ],
   "runtime_files": [
     "desktop/assets/amoo_desktop_icon.png",

@@ -9,22 +9,22 @@
 
 Linux / macOS / Windows · Rust 原生客户端 · 面向 STEPX Neo / PZ261A
 
-[下载安装](https://github.com/xydzf520/stepx/releases/latest) · [快速开始](docs/GETTING_STARTED.md) · [更新合集](docs/RELEASE_0_2_182_CUMULATIVE.md) · [反馈问题](https://github.com/xydzf520/stepx/issues)
+[下载安装](https://github.com/xydzf520/stepx/releases/latest) · [快速开始](docs/GETTING_STARTED.md) · [更新合集](docs/RELEASE_0_2_183.md) · [反馈问题](https://github.com/xydzf520/stepx/issues)
 
 </div>
 
 面向 STEPX 用户的社区项目，与 STEPX、Amoo、Google 无官方隶属关系。普通 Android 不在本版支持范围；原厂专有能力仍依赖对应固件、权限和账号。
 
-## 下载最新版 · 0.2.182
+## 下载最新版 · 0.2.183
 
-**2026-11-08 发布** · [最新版发布页与校验文件](https://github.com/xydzf520/stepx/releases/latest) · [0.2.60 → 0.2.182 更新合集](docs/RELEASE_0_2_182_CUMULATIVE.md)
+**2026-11-09 发布** · [最新版发布页与校验文件](https://github.com/xydzf520/stepx/releases/latest) · [0.2.60 → 0.2.183 更新合集](docs/RELEASE_0_2_183.md)
 
 | 电脑 | 下载 | 使用条件 |
 | --- | --- | --- |
-| Windows x64 | [下载安装包](https://github.com/xydzf520/stepx/releases/download/v0.2.182/StepX-Companion-0.2.182-windows-x86_64.zip) | 完整解压运行；必要时安装手机 USB 驱动 |
-| macOS Apple Silicon | [下载安装包](https://github.com/xydzf520/stepx/releases/download/v0.2.182/StepX-Companion-0.2.182-macos-arm64.zip) | 适用于 Apple 芯片；未 Apple 公证 |
-| macOS Intel | [下载安装包](https://github.com/xydzf520/stepx/releases/download/v0.2.182/StepX-Companion-0.2.182-macos-x86_64.zip) | 适用于 Intel 芯片；未 Apple 公证 |
-| Linux x64 | [下载安装包](https://github.com/xydzf520/stepx/releases/download/v0.2.182/StepX-Companion-0.2.182-linux-x86_64.tar.gz) | Ubuntu 24.04 构建基线，glibc 2.39+ |
+| Windows x64 | [下载安装包](https://github.com/xydzf520/stepx/releases/download/v0.2.183/StepX-Companion-0.2.183-windows-x86_64.zip) | 完整解压运行；必要时安装手机 USB 驱动 |
+| macOS Apple Silicon | [下载安装包](https://github.com/xydzf520/stepx/releases/download/v0.2.183/StepX-Companion-0.2.183-macos-arm64.zip) | 适用于 Apple 芯片；未 Apple 公证 |
+| macOS Intel | [下载安装包](https://github.com/xydzf520/stepx/releases/download/v0.2.183/StepX-Companion-0.2.183-macos-x86_64.zip) | 适用于 Intel 芯片；未 Apple 公证 |
+| Linux x64 | [下载安装包](https://github.com/xydzf520/stepx/releases/download/v0.2.183/StepX-Companion-0.2.183-linux-x86_64.tar.gz) | Ubuntu 24.04 构建基线，glibc 2.39+ |
 
 包内提供 ADB、scrcpy、Python、Java 与 APK 校验工具，请完整解压。手机高级能力依赖受支持固件及授权，客户端会核验设备与接口。
 
@@ -75,13 +75,16 @@ Agent 有独立设置，覆盖找资料、拟回复、整理待办和日程草�
 - **拖动和缩放更连贯。** 减少宽窗口重复布局计算，合并拖动刷新，让模块调整更稳定。
 - **恢复与迁移更稳妥。** 改善 Windows 数据路径迁移、macOS 文件选择和保存窗口等问题；操作失败可查看原因，并对支持的操作重试。
 
-同机合成数据测试中，2 万条记录修改 1,000 条，热快照写入中位数由 **44.054 ms 降至 8.545 ms**。这是该增量场景的测量结果，完整快照仍有成本；[查看性能测量范围](https://github.com/xydzf520/stepx/blob/v0.2.182/docs/PERFORMANCE.md)。
+同机合成数据测试中，2 万条记录修改 1,000 条，热快照写入中位数由 **44.054 ms 降至 8.545 ms**。这是该增量场景的测量结果，完整快照仍有成本；[查看性能测量范围](https://github.com/xydzf520/stepx/blob/v0.2.183/docs/PERFORMANCE.md)。
 
-## 8. Google 服务更新后，自动检查与恢复
+## 8. Google 安装与更新后，减少反复排障
 
-对已经通过 StepX 完成适配的 Google 服务，手机在组件更新后自动核验，按需恢复已支持的权限缺口；电脑连接后后台补检，保留账号和应用数据。
+- **之前只装了一部分，也能继续。** 安装前验证所有已有组件的签名，只补齐缺项；换电脑或没有原安装记录时，建立独立的恢复记录，保留已有新版、账号和应用数据。
+- **断线、下载损坏后不必从头重来。** 缓存校验失败可重新获取，进度在每步完成后保存；从同一入口重试，先重新核对手机状态，不盲目重复安装。
+- **失败原因与下一步更清楚。** 显示已安装数量、缺失项和具体原因；权限、商店或账号尚未查清时不显示成功。未适配固件不会被误报成网络问题反复重试。
+- **更新后仍可自动维护。** 手机在组件更新后核验已支持的权限缺口，电脑空闲时补检；可立即检查或暂停。通话和前台任务优先，保留原有账号和应用数据。
 
-小工具内可查看处理状态、失败原因，立即检查或暂停电脑维护。旧监控首次升级会短暂重建手机网关；后续原生复检无需重建。网络、账号和设备认证问题会单独提示，不能由权限修复保证解决。
+网络、账号与 Google 设备认证有独立条件，权限恢复不能保证解决。未经验证的固件（包括此前反馈的 `/6`）不会套用 `/12` 的系统适配；旧监控首次升级可能短暂重建网关。
 
 ---
 
@@ -91,7 +94,7 @@ Agent 有独立设置，覆盖找资料、拟回复、整理待办和日程草�
 
  [完整产品介绍](https://github.com/xydzf520/stepx/releases/download/v0.2.180/StepX-product-0.2.180.mp4) · [累计更新演示](https://github.com/xydzf520/stepx/releases/download/v0.2.180/StepX-0.2.60-to-0.2.180.mp4)
 
-图片与视频来自 0.2.180 的真实客户端和隔离演示数据；本页文字已合并至 0.2.182。
+图片与视频来自 0.2.180 的真实客户端和隔离演示数据；本页文字已合并至 0.2.183。
 
 <details>
 <summary>适用范围与详细更新记录</summary>
@@ -99,7 +102,7 @@ Agent 有独立设置，覆盖找资料、拟回复、整理待办和日程草�
 - 消息与搜索以已同步内容为准，通知不等于完整聊天历史；手机文件主要按名称检索，电脑可检索指定目录内支持的文本。
 - AI 与后台操作依赖所选来源、账号权限和手机实际开放能力；原厂通用离线语音转写与合成尚未验证可用。
 - 熄屏后台读取需要已有有效授权；重启后的首次解锁和系统安全确认仍需在手机完成。macOS 安装包尚未 Apple 公证。
-- [功能、版本与日期索引](https://github.com/xydzf520/stepx/blob/v0.2.182/docs/FEATURE_HISTORY.md) · [完整逐版更新记录](https://github.com/xydzf520/stepx/blob/v0.2.182/CHANGELOG.md) · [0.2.182 修复验证详情](https://github.com/xydzf520/stepx/blob/v0.2.182/docs/RELEASE_0_2_182.md)
+- [功能、版本与日期索引](https://github.com/xydzf520/stepx/blob/v0.2.183/docs/FEATURE_HISTORY.md) · [完整逐版更新记录](https://github.com/xydzf520/stepx/blob/v0.2.183/CHANGELOG.md) · [0.2.183 修复验证详情](https://github.com/xydzf520/stepx/blob/v0.2.183/docs/google-install-recovery-0.2.183.md)
 
 </details>
 
