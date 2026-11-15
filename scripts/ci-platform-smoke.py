@@ -15,7 +15,14 @@ worker_pin=next(ast.literal_eval(n.value) for n in cp_tree.body if isinstance(n,
 if worker_pin!=python_source_sha256(root/'handoff/google-play-stepx/tools/root_worker.py'):
  raise RuntimeError('WORKER_SHA256 drift between scripts/companion-permissions.py and tools/root_worker.py')
 
-def run(*args): subprocess.run([sys.executable,'-X','utf8',*args],cwd=root,check=True,timeout=240)
+failures=[]
+
+def run(*args):
+ try:
+  subprocess.run([sys.executable,'-X','utf8',*args],cwd=root,check=True,timeout=240)
+ except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+  failures.append(' '.join(args))
+  print(error, file=sys.stderr, flush=True)
 run('-m','unittest','discover','-s','desktop/tests','-p','test_desktop_update.py')
 run('scripts/test-host-runtime.py')
 run('-m','unittest','discover','-s','desktop/tests','-p','test_store_download.py')
@@ -36,6 +43,10 @@ for key in ['PROGRAMFILES','PROGRAMFILES(X86)','LOCALAPPDATA']:
  if os.environ.get(key):
   paths += [str(Path(os.environ[key])/p) for p in ['Microsoft/Edge/Application/msedge.exe','Google/Chrome/Application/chrome.exe']]
 browser=next((p for p in paths if p and Path(p).is_file()),None)
-if not browser: raise RuntimeError('CI requires Chrome or Edge for the real local-app browser test')
-run('scripts/test-studio-lab.py','--browser',browser)
+if browser:
+ run('scripts/test-studio-lab.py','--browser',browser)
+else:
+ failures.append('CI requires Chrome or Edge for the real local-app browser test')
+if failures:
+ raise SystemExit('Platform smoke checks failed:\n'+'\n'.join(failures))
 print('Platform updater and browser interactions: PASS')

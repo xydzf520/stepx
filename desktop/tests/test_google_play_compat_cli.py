@@ -111,9 +111,13 @@ class CliTests(unittest.TestCase):
             stored = compat.current_receipt(self.directory)
             self.assertEqual(stored, manifest)
             path = self.directory / manifest["receipt_id"] / "manifest.json"
-            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
-            self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
-            self.assertEqual(stat.S_IMODE((self.directory / "current.json").stat().st_mode), 0o600)
+            pointer = self.directory / "current.json"
+            self.assertTrue(path.is_file())
+            self.assertTrue(pointer.is_file())
+            if os.name == "posix":
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+                self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE(pointer.stat().st_mode), 0o600)
             seen.append(scope)
 
         self.transport.before_apply = check
@@ -233,13 +237,18 @@ class CliTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertNotIn(self.transport.private_secret, output.getvalue())
 
-    def test_receipt_symlink_or_permissive_mode_is_rejected(self):
+    def test_receipt_symlink_is_rejected(self):
         path = self.directory / "receipt.json"
         compat._save_private(path, {"value": True})
         link = self.directory / "link.json"
         link.symlink_to(path)
         with self.assertRaises(OSError):
             compat._read_private(link)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX receipt mode bits")
+    def test_receipt_permissive_mode_is_rejected(self):
+        path = self.directory / "receipt.json"
+        compat._save_private(path, {"value": True})
         path.chmod(0o644)
         with self.assertRaises(compat.RepairError):
             compat._read_private(path)
