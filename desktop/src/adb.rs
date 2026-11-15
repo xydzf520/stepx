@@ -1901,7 +1901,8 @@ exit 0
 
     #[cfg(unix)]
     #[test]
-    fn non_utf8_transfer_uses_managed_pipeline_with_failover_and_mutation_guard() {
+    fn native_path_transfer_uses_managed_pipeline_with_failover_and_mutation_guard() {
+        #[cfg(not(target_os = "macos"))]
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::PermissionsExt;
 
@@ -1920,7 +1921,7 @@ if [ "$1" = "-s" ] && [ "$2" = "STEPX_NONUTF8_USB" ] && [ "$3" = "shell" ]; then
   exit 0
 fi
 if [ "$1" = "-s" ] && [ "$2" = "STEPX_NONUTF8_USB" ] && [ "$3" = "pull" ]; then
-  printf 'PULLED_OK' > "$5"
+  printf 'PULLED_OK' > "$5" || exit 1
   exit 0
 fi
 if [ "$1" = "devices" ]; then
@@ -1945,8 +1946,13 @@ exit 0
             vec!["STEPX_NONUTF8_USB".to_string()],
         );
 
-        let non_utf8_name = OsStr::from_bytes(b"report_\xff\xfe.bin");
-        let local_dst = dir.path().join(non_utf8_name);
+        // Darwin volumes can reject byte paths that are not valid UTF-8.
+        #[cfg(target_os = "macos")]
+        let report_name = OsStr::new("报告 副本.bin");
+        #[cfg(not(target_os = "macos"))]
+        let report_name = OsStr::from_bytes(b"report_\xff\xfe.bin");
+        let local_dst = dir.path().join(report_name);
+        #[cfg(not(target_os = "macos"))]
         assert!(local_dst.to_str().is_none());
 
         adb.transfer(
@@ -1955,7 +1961,7 @@ exit 0
             Path::new("/sdcard/Download/report.bin"),
             &local_dst,
         )
-        .expect("non-UTF-8 pull should fail over to verified USB backup");
+        .expect("pull should fail over to verified USB backup and preserve its destination path");
         assert_eq!(std::fs::read(&local_dst).unwrap(), b"PULLED_OK");
     }
 }

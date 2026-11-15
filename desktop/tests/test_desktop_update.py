@@ -1,4 +1,4 @@
-import hashlib, importlib.util, io, json, os, stat, subprocess, tarfile, tempfile, unittest, zipfile
+import hashlib, importlib.util, io, json, os, shlex, stat, subprocess, sys, tarfile, tempfile, unittest, zipfile
 from pathlib import Path
 from unittest.mock import patch
 spec=importlib.util.spec_from_file_location('updater',Path(__file__).parents[1]/'src/desktop_update.py')
@@ -95,9 +95,20 @@ class UpdateTests(unittest.TestCase):
                 root=Path(tmp);a=root/'app';stage=root/'stage';a.mkdir();stage.mkdir()
                 old=a/'stepx-companion';old.write_text('#!/usr/bin/env python3\n');old.chmod(0o755)
                 new=stage/'stepx-companion'
-                new.write_text('#!/usr/bin/env python3\nimport sys,json,time\nfrom pathlib import Path\np=Path(sys.argv[2]);d=json.loads(p.read_text());\n'+
-                    ("p.with_name('ack.json').write_text(json.dumps({'nonce':d['nonce'],'version':d['version']}))\ntime.sleep(3)\n" if success else 'sys.exit(1)\n'))
+                new.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} startup.py "$@"\n')
                 new.chmod(0o755)
+                (stage/'startup.py').write_text(
+                    "import sys, json, time\n"
+                    "from pathlib import Path\n"
+                    "job = Path(sys.argv[2]).parent\n"
+                    "config = json.loads((job / 'install.json').read_text())\n"
+                    + (
+                        "(job / 'ack.tmp').write_text(json.dumps({'nonce': config['nonce'], 'version': config['version']}))\n"
+                        "(job / 'ack.tmp').replace(job / 'ack.json')\n"
+                        "while True: time.sleep(1)\n"
+                        if success else "sys.exit(1)\n"
+                    )
+                )
                 c=dict(target=str(a),stage=str(stage),backup=str(root/'backup'),job=tmp,pid=99999999,version='0.2.19',relative_exe='stepx-companion',nonce='test')
                 u.atomic_json(root/'install.json',c)
                 # Production must leave the accepted app (or restored app) open.
@@ -108,9 +119,9 @@ class UpdateTests(unittest.TestCase):
                     child=launch(*args,**kwargs);children.append(child);return child
                 try:
                     with patch.object(u,'launch',side_effect=record_launch):
-                        result=u.install(c,ack_seconds=2)
-                    self.assertEqual(result,success)
+                        result=u.install(c,ack_seconds=8)
                     status=json.loads((root/'status.json').read_text())
+                    self.assertEqual(result,success,status.get('message'))
                     self.assertEqual(status['state'],'installed' if success else 'rolled_back')
                     if success:self.assertTrue((root/'backup/stepx-companion').exists())
                     else:self.assertEqual((a/'stepx-companion').read_text(),'#!/usr/bin/env python3\n')
@@ -332,9 +343,11 @@ class UpdateTests(unittest.TestCase):
             with patch.object(u.os, 'name', 'nt'), \
                  patch.object(u, 'Path', path_cls), \
                  patch.object(u.shutil, 'copytree', side_effect=spy_copytree), \
+                 patch.object(u, 'verify_os_signature') as verify_signature, \
                  patch.object(u.subprocess, 'Popen', side_effect=fake_popen):
                 u.prepare(job, exe, 12345)
 
+            verify_signature.assert_called_once()
             self.assertIs(captured.get('runtime_symlinks'), True)
             self.assertEqual(captured.get('creationflags'), 0x08000000 | 0x00000200)
             self.assertEqual(captured.get('creationflags') & 0x00000008, 0)

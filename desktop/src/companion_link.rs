@@ -1112,7 +1112,7 @@ case "$*" in
   *ro.serialno*) echo recv-lock-phone;;
   *pm*path*) echo package:/data/app/companion.apk;;
   *date*+%s*) echo 1700000000;;
-  *) script=$(printf '%s' "$4" | sed 's|{base}|phone|g'); sh -c "$script";;
+  *) script=$(printf '%s' "$4" | sed -e 's|{base}|phone|g' -e 's|stat -c %s |wc -c < |g'); sh -c "$script";;
 esac
 "#,
             work = shell_quote(dir.path().to_str().unwrap()),

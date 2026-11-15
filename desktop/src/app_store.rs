@@ -10129,6 +10129,17 @@ fn verify_cached_apk_digests(path: &Path, expected_md5: &str, expected_sha256: &
     true
 }
 
+fn stage_apk_download_script() -> Result<tempfile::TempPath> {
+    // The embedded source exceeds Windows' process command-line length limit.
+    let script = tempfile::Builder::new()
+        .prefix("stepx-apk-")
+        .suffix(".py")
+        .tempfile()?
+        .into_temp_path();
+    fs::write(&script, PY_DOWNLOAD_APK_STREAM)?;
+    Ok(script)
+}
+
 pub fn download_apk_with_progress<F: FnMut(u64, u64)>(
     raw_url: &str,
     package: &str,
@@ -10177,7 +10188,7 @@ pub fn download_apk_with_progress<F: FnMut(u64, u64)>(
         }
     }
 
-    let dest_str = dest.to_string_lossy().into_owned();
+    let script = stage_apk_download_script().context("准备 APK 下载脚本失败")?;
     let mut cmd = resources::python_command();
     #[cfg(unix)]
     {
@@ -10185,15 +10196,10 @@ pub fn download_apk_with_progress<F: FnMut(u64, u64)>(
         cmd.process_group(0);
     }
     let child = cmd
-        .args([
-            "-c",
-            PY_DOWNLOAD_APK_STREAM,
-            &final_url,
-            &dest_str,
-            package,
-            &expected_md5,
-            &expected_sha256,
-        ])
+        .arg(&*script)
+        .arg(&final_url)
+        .arg(&dest)
+        .args([package, &expected_md5, &expected_sha256])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -10968,16 +10974,16 @@ mod tests {
         }
 
         // Test PY_DOWNLOAD_APK_STREAM truncation rejection, multi-step HTTP Range resume, and HTTP 200 fallback via local server
-        let test_script = format!(
-            r#"
+        let stream_script = stage_apk_download_script().unwrap();
+        let test_script = r#"
 import http.server, socketserver, threading, tempfile, os, subprocess, sys
 
-STREAM_SCRIPT = {stream_script:?}
+STREAM_SCRIPT = sys.argv[1]
 payload = b"PK\x03\x04" + (b"AITO_APK_PAYLOAD_" * 16384)
 total_len = len(payload)
 quarter_len = total_len // 4
 
-state = {{"range_requests": 0, "mode": "multi_range", "reqs": 0}}
+state = {"range_requests": 0, "mode": "multi_range", "reqs": 0}
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -11013,7 +11019,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(206)
             self.send_header("Content-Type", "application/vnd.android.package-archive")
             self.send_header("Content-Length", str(len(rem)))
-            self.send_header("Content-Range", f"bytes {{start}}-{{total_len - 1}}/{{total_len}}")
+            self.send_header("Content-Range", f"bytes {start}-{total_len - 1}/{total_len}")
             self.end_headers()
             self.wfile.write(chunk)
             self.wfile.flush()
@@ -11032,11 +11038,11 @@ with socketserver.TCPServer(("127.0.0.1", 0), Handler) as httpd:
     with tempfile.TemporaryDirectory() as tmpdir:
         dest1 = os.path.join(tmpdir, "resumed.apk")
         r1 = subprocess.run(
-            [sys.executable, "-c", STREAM_SCRIPT, f"http://127.0.0.1:{{port}}/app.apk", dest1, "app.huawei.auto"],
+            [sys.executable, STREAM_SCRIPT, f"http://127.0.0.1:{port}/app.apk", dest1, "app.huawei.auto"],
             capture_output=True, text=True
         )
-        assert r1.returncode == 0, f"4-step Range resume should succeed: {{r1.stderr}}"
-        assert state["range_requests"] >= 3, f"Should have issued >=3 Range requests, got {{state['range_requests']}}"
+        assert r1.returncode == 0, f"4-step Range resume should succeed: {r1.stderr}"
+        assert state["range_requests"] >= 3, f"Should have issued >=3 Range requests, got {state['range_requests']}"
         with open(dest1, "rb") as f:
             assert f.read() == payload, "Resumed file content must match full payload"
 
@@ -11044,10 +11050,10 @@ with socketserver.TCPServer(("127.0.0.1", 0), Handler) as httpd:
         state["reqs"] = 0
         dest_fallback = os.path.join(tmpdir, "fallback200.apk")
         r_fb = subprocess.run(
-            [sys.executable, "-c", STREAM_SCRIPT, f"http://127.0.0.1:{{port}}/fb.apk", dest_fallback, "app.huawei.auto"],
+            [sys.executable, STREAM_SCRIPT, f"http://127.0.0.1:{port}/fb.apk", dest_fallback, "app.huawei.auto"],
             capture_output=True, text=True
         )
-        assert r_fb.returncode == 0, f"HTTP 200 fallback on Range retry should succeed: {{r_fb.stderr}}"
+        assert r_fb.returncode == 0, f"HTTP 200 fallback on Range retry should succeed: {r_fb.stderr}"
         with open(dest_fallback, "rb") as f:
             assert f.read() == payload, "HTTP 200 fallback file content must match full payload"
 
@@ -11055,18 +11061,17 @@ with socketserver.TCPServer(("127.0.0.1", 0), Handler) as httpd:
         state["reqs"] = 0
         dest2 = os.path.join(tmpdir, "truncated.apk")
         r2 = subprocess.run(
-            [sys.executable, "-c", STREAM_SCRIPT, f"http://127.0.0.1:{{port}}/trunc.apk", dest2, "app.huawei.auto"],
+            [sys.executable, STREAM_SCRIPT, f"http://127.0.0.1:{port}/trunc.apk", dest2, "app.huawei.auto"],
             capture_output=True, text=True
         )
         assert r2.returncode != 0, "Truncated download without progress must fail"
         assert not os.path.exists(dest2), "Truncated file must not be saved to dest"
     httpd.shutdown()
 print("OK")
-"#,
-            stream_script = PY_DOWNLOAD_APK_STREAM
-        );
+"#;
         let out = resources::python_command()
-            .args(["-c", &test_script])
+            .args(["-c", test_script])
+            .arg(&*stream_script)
             .output()
             .expect("运行本地流式下载恢复测试脚本失败");
         assert!(

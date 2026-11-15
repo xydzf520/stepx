@@ -96,7 +96,8 @@ jobs:
       - name: Core tests
         # Live third-party store probes are explicit integration checks; native
         # storage, TCP framing and local download fixtures remain blocking gates.
-        run: cargo test --locked --manifest-path desktop/Cargo.toml --no-default-features --lib --test contracts
+        # Keep playback and transport deadlines independent of test-runner contention.
+        run: cargo test --locked --manifest-path desktop/Cargo.toml --no-default-features --lib --test contracts -- --test-threads=1
       - name: Desktop state and interaction tests
         # Collect independent UI/runtime failures even when a core test fails.
         # Build and publication still require every test step to succeed.

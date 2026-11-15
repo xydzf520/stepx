@@ -880,6 +880,8 @@ mod tests {
         .unwrap();
 
         let script = phone_scan_script(fake_sdcard.to_str().unwrap());
+        #[cfg(target_os = "macos")]
+        let script = script.replace("stat -c '%Y %Z %s %n'", "stat -f '%m %c %z %N'");
         let out = std::process::Command::new("sh")
             .args(["-c", &script])
             .output()

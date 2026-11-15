@@ -766,11 +766,12 @@ esac
             }
         }
 
-        #[derive(Clone, Default)]
-        struct SharedSink(Arc<std::sync::Mutex<Vec<u8>>>);
-        impl Write for SharedSink {
+        struct RecordingSink(std::sync::mpsc::Sender<Vec<u8>>);
+        impl Write for RecordingSink {
             fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
+                self.0
+                    .send(buf.to_vec())
+                    .map_err(|_| std::io::ErrorKind::BrokenPipe)?;
                 Ok(buf.len())
             }
             fn flush(&mut self) -> std::io::Result<()> {
@@ -779,33 +780,36 @@ esac
         }
 
         let (stop_tx, stop_rx) = std::sync::mpsc::channel();
-        let sink = SharedSink::default();
+        let (writes_tx, writes_rx) = std::sync::mpsc::channel();
         let running = Arc::new(AtomicBool::new(true));
         let counter = Arc::new(AtomicU64::new(0));
 
         let handle = pump_uplink(
             CorkedMicReader { stop_rx },
-            sink.clone(),
+            RecordingSink(writes_tx),
             running.clone(),
             counter.clone(),
         );
 
-        std::thread::sleep(Duration::from_millis(470));
+        let frames = (0..2)
+            .map(|_| writes_rx.recv_timeout(Duration::from_secs(3)))
+            .collect::<std::result::Result<Vec<_>, _>>();
         running.store(false, Ordering::Relaxed);
         drop(stop_tx);
         handle.join().unwrap();
 
-        let written = sink.0.lock().unwrap().clone();
+        let mut frames = frames.expect("corked microphone must send consecutive keepalive frames");
+        frames.extend(writes_rx.try_iter());
         assert!(
-            written.len() >= 1280 && written.len() % UPLINK_PCM_FRAME_BYTES == 0,
-            "expected >=2 20ms silence frames (640B each), got {} bytes",
-            written.len()
+            frames.iter().all(|frame| {
+                frame.len() == UPLINK_PCM_FRAME_BYTES && frame.iter().all(|&byte| byte == 0)
+            }),
+            "corked-mic keepalives must be 20ms frames of pure zero PCM"
         );
-        assert!(
-            written.iter().all(|&b| b == 0),
-            "corked-mic keepalive frames must be pure zero PCM"
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            (frames.len() * UPLINK_PCM_FRAME_BYTES) as u64
         );
-        assert_eq!(counter.load(Ordering::Relaxed), written.len() as u64);
     }
 
     #[cfg(unix)]
