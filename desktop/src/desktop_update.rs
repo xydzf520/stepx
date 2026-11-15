@@ -449,6 +449,7 @@ mod tests {
         let script = r#"
 import importlib.util, io, json, os, subprocess, sys, tempfile
 from pathlib import Path
+from queue import Queue
 from unittest.mock import patch
 
 root = Path(sys.argv[1])
@@ -519,12 +520,11 @@ with patch.dict(os.environ, {'STEPX_FORCE_AUTHENTICODE_CHECK': '1'}), \
         pass
 
 # 5. Heartbeat emits periodic JSON progress lines
-lines = []
-with patch.object(u, 'emit', side_effect=lambda k, **d: lines.append((k, d))):
+messages = Queue()
+with patch.object(u, 'emit', side_effect=lambda kind, **data: messages.put((kind, data))):
     with u.heartbeat('extract', received=10, total=20, interval=0.02):
-        import time
-        time.sleep(0.06)
-assert any(k == 'progress' and d.get('phase') == 'extract' for k, d in lines), lines
+        kind, data = messages.get(timeout=5)
+assert kind == 'progress' and data == dict(phase='extract', received=10, total=20, speed=0), (kind, data)
 
 # 6. Atomic rollback if second os.replace fails + backup/job pruning on success
 with tempfile.TemporaryDirectory() as tmp:

@@ -88,8 +88,12 @@ def safe_read(root: Path, rel: str) -> bytes:
     if issues:
         raise ValueError('\n'.join(issues))
     path = root / rel
-    if any(part.is_symlink() for part in [path, *path.parents] if part != root.parent):
-        raise ValueError(f'{rel}: symlink is not a source publication input')
+    # System aliases such as macOS /var may be above the explicit source root.
+    for part in (path, *path.parents):
+        if part.is_symlink():
+            raise ValueError(f'{rel}: symlink is not a source publication input')
+        if part == root:
+            break
     path.resolve().relative_to(root.resolve())
     return path.read_bytes()
 

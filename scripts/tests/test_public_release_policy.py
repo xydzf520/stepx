@@ -361,6 +361,21 @@ class PublicationBoundaryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             policy.runtime_plan(self.root)
 
+    def test_system_alias_above_source_root_is_allowed(self):
+        parent = Path(self.temp.name)
+        physical = parent / 'physical'
+        nested = physical / 'nested'
+        nested.mkdir(parents=True)
+        self.root.rename(nested / 'source')
+        alias = parent / 'system-alias'
+        alias.symlink_to(physical, target_is_directory=True)
+        source = alias / 'nested' / 'source'
+        self.assertEqual(policy.safe_read(source, 'scripts/main.py'), b'print("safe")\n')
+        symlink = source / 'scripts/alias.py'
+        symlink.symlink_to(source / 'scripts/main.py')
+        with self.assertRaisesRegex(ValueError, 'symlink'):
+            policy.safe_read(source, 'scripts/alias.py')
+
     def test_unlisted_installed_file_is_rejected(self):
         self.policy['runtime_files'].append(policy.MANIFEST)
         self.save_policy()

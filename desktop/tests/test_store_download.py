@@ -235,6 +235,7 @@ class StoreDownloadTests(unittest.TestCase):
             self.assertTrue(bool(attrs.get('versionName')))
 
     def test_end_to_end_download_stream_resume_truncation_and_huawei_fallback(self):
+        import contextlib
         import http.server
         import socketserver
         import subprocess
@@ -277,14 +278,18 @@ class StoreDownloadTests(unittest.TestCase):
                     self.wfile.write(payload[:half_len])
                     self.wfile.flush()
 
-        with socketserver.TCPServer(('127.0.0.1', 0), Handler) as httpd:
+        with socketserver.TCPServer(('127.0.0.1', 0), Handler) as httpd, contextlib.ExitStack() as cleanup:
             port = httpd.server_address[1]
             t = threading.Thread(target=httpd.serve_forever, daemon=True)
             t.start()
+            cleanup.callback(t.join)
+            cleanup.callback(httpd.shutdown)
             with tempfile.TemporaryDirectory() as tmpdir:
+                script = Path(tmpdir) / 'download.py'
+                script.write_text(SCRIPT, encoding='utf-8')
                 dest_ok = Path(tmpdir) / 'aito_resumed.apk'
                 r_ok = subprocess.run(
-                    [sys.executable, '-c', SCRIPT, f'http://127.0.0.1:{port}/aito.apk', str(dest_ok), 'app.huawei.auto'],
+                    [sys.executable, str(script), f'http://127.0.0.1:{port}/aito.apk', str(dest_ok), 'app.huawei.auto'],
                     capture_output=True,
                     text=True,
                     timeout=15,
@@ -297,14 +302,13 @@ class StoreDownloadTests(unittest.TestCase):
                 state['mode'] = 'truncate'
                 dest_trunc = Path(tmpdir) / 'aito_truncated.apk'
                 r_trunc = subprocess.run(
-                    [sys.executable, '-c', SCRIPT, f'http://127.0.0.1:{port}/trunc.apk', str(dest_trunc), 'app.huawei.auto'],
+                    [sys.executable, str(script), f'http://127.0.0.1:{port}/trunc.apk', str(dest_trunc), 'app.huawei.auto'],
                     capture_output=True,
                     text=True,
                     timeout=15,
                 )
                 self.assertNotEqual(r_trunc.returncode, 0, 'Truncated APK stream without Range support must fail')
                 self.assertFalse(dest_trunc.exists(), 'Truncated APK must not be left at destination path')
-            httpd.shutdown()
 
     def test_full_download_script_compiles(self):
         compile(SCRIPT, 'store-download', 'exec')
