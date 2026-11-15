@@ -317,6 +317,7 @@ impl Element for Image {
                 self.fit_type,
                 self.cache_option,
             );
+            return;
         }
         let assert_cache = AssetCache::as_ref(app);
         let image = ImageCache::as_ref(app).image(

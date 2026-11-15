@@ -59,14 +59,30 @@ public final class CompanionService extends Service implements SensorEventListen
     }};
     private final PowerManager.OnThermalStatusChangedListener thermalListener=status->{cachedThermalStatus=status;if(status>=PowerManager.THERMAL_STATUS_SEVERE){pause="手机温度较高，已暂停背屏";stopOutput(false);}};
     private boolean isPowerSave(long now){if(now-lastPowerSaveCheck>=1000){cachedPowerSave=power.isPowerSaveMode();lastPowerSaveCheck=now;}return cachedPowerSave;}
+    private boolean enterForeground(String text){
+        try{
+            NotificationManager nm=getSystemService(NotificationManager.class);
+            if(nm!=null)nm.createNotificationChannel(new NotificationChannel("backscreen","背屏与体感游戏",NotificationManager.IMPORTANCE_LOW));
+            startForeground(17,notification(text));
+            lastNotificationText=text;
+            return true;
+        }catch(Throwable t){
+            error=message(t);
+            android.util.Log.w("StepXCompanion","startForeground failed",t);
+            mode="stopped";
+            standby=false;
+            writeStatus(true);
+            stopSelf();
+            return false;
+        }
+    }
     @Override public void onCreate(){super.onCreate();
         android.util.Log.i("StepXCompanion","create instance="+serviceCreatedUptimeMs);
-        NotificationManager nm=getSystemService(NotificationManager.class);nm.createNotificationChannel(new NotificationChannel("backscreen","背屏与体感游戏",NotificationManager.IMPORTANCE_LOW));
-        startForeground(17,notification("等待指令"));
         sensors=getSystemService(SensorManager.class);accel=sensors.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);gravity=sensors.getDefaultSensor(Sensor.TYPE_GRAVITY);gyro=sensors.getDefaultSensor(Sensor.TYPE_GYROSCOPE);rotation=sensors.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR);
         bestScore=getSharedPreferences("game_scores",0).getLong("best",0);lastGameScore=getSharedPreferences("game_scores",0).getLong("last",0);
         power=getSystemService(PowerManager.class);lock=power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,"StepX:BackscreenGame");lock.setReferenceCounted(false);
         cachedThermalStatus=power.getCurrentThermalStatus();cachedPowerSave=power.isPowerSaveMode();lastPowerSaveCheck=SystemClock.elapsedRealtime();
+        if(!enterForeground("等待指令"))return;
         IntentFilter f=new IntentFilter(Intent.ACTION_BATTERY_CHANGED);f.addAction(Intent.ACTION_USER_PRESENT);registerReceiver(systemEvents,f,Context.RECEIVER_NOT_EXPORTED);power.addThermalStatusListener(thermalListener);
         if(checkSelfPermission(Manifest.permission.READ_PHONE_STATE)==PackageManager.PERMISSION_GRANTED){
             phone=getSystemService(TelephonyManager.class);phoneListener=new PhoneStateListener(){@Override public void onCallStateChanged(int state,String unused){calling=state!=TelephonyManager.CALL_STATE_IDLE;}};phone.listen(phoneListener,PhoneStateListener.LISTEN_CALL_STATE);
@@ -90,7 +106,8 @@ public final class CompanionService extends Service implements SensorEventListen
     @Override public int onStartCommand(Intent intent,int flags,int startId){
         serviceStartCount++;lastStartId=startId;
         android.util.Log.i("StepXCompanion","start instance="+serviceCreatedUptimeMs+" startId="+startId+" mode="+mode);
-        if(intent==null){stopSelf();return START_NOT_STICKY;}
+        if(!enterForeground(mode.equals("stopped")?"等待指令":notificationText()))return START_NOT_STICKY;
+        if(intent==null){if(mode.equals("stopped")){try{stopForeground(STOP_FOREGROUND_REMOVE);}catch(Throwable ignored){}stopSelf(startId);}return START_NOT_STICKY;}
         String op=intent.getStringExtra("op");requestId=intent.getStringExtra("request_id");if(requestId==null)requestId="local-"+System.currentTimeMillis();if(requestId.length()>100)requestId=requestId.substring(0,100);
         error="";commandReady=false;
         boolean preserveOutputOnFailure="apply".equals(op)&&!mode.equals("stopped");
@@ -121,12 +138,12 @@ public final class CompanionService extends Service implements SensorEventListen
             // was already queued. Reassert FGS after an idle status/stop removed it.
             // This retains the manifest's specialUse type; it is not a freezer bypass.
             if(!mode.equals("stopped")&&(!notificationText().equals(lastNotificationText)||getForegroundServiceType()==0)){
-                startForeground(17,notification(notificationText()));lastNotificationText=notificationText();
+                if(!enterForeground(notificationText()))return START_NOT_STICKY;
             }
             commandReady=true;
         }catch(Throwable e){error=message(e);if(!preserveOutputOnFailure){stopOutput(true);mode="stopped";standby=false;unregister();}}
         android.util.Log.i("StepXCompanion","ack instance="+serviceCreatedUptimeMs+" startId="+startId+" mode="+mode+" fgsType="+getForegroundServiceType());
-        notifyState();writeStatus(true);if(mode.equals("stopped")){stopForeground(STOP_FOREGROUND_REMOVE);stopSelf(startId);}return START_NOT_STICKY;
+        notifyState();writeStatus(true);if(mode.equals("stopped")){try{stopForeground(STOP_FOREGROUND_REMOVE);}catch(Throwable ignored){}stopSelf(startId);}return START_NOT_STICKY;
     }
     private static String message(Throwable e){while(e.getCause()!=null)e=e.getCause();return e.getClass().getSimpleName()+": "+String.valueOf(e.getMessage());}
     private void connect()throws Exception{
@@ -225,6 +242,6 @@ public final class CompanionService extends Service implements SensorEventListen
         }catch(Exception ignored){}
     }
     static void atomic(File file,byte[]data)throws Exception{File temp=new File(file.getParentFile(),file.getName()+".tmp");try(FileOutputStream out=new FileOutputStream(temp)){out.write(data);out.getFD().sync();}if(!temp.renameTo(file))throw new IOException("原子写入失败");}
-    @Override public void onDestroy(){android.util.Log.i("StepXCompanion","destroy instance="+serviceCreatedUptimeMs+" mode="+mode);h.removeCallbacksAndMessages(null);unregister();stopOutput(true);mode="stopped";writeStatus(true);statusIo.shutdown();try{unregisterReceiver(systemEvents);}catch(Exception ignored){}power.removeThermalStatusListener(thermalListener);if(phone!=null&&phoneListener!=null)phone.listen(phoneListener,PhoneStateListener.LISTEN_NONE);super.onDestroy();}
+    @Override public void onDestroy(){android.util.Log.i("StepXCompanion","destroy instance="+serviceCreatedUptimeMs+" mode="+mode);h.removeCallbacksAndMessages(null);unregister();stopOutput(true);mode="stopped";writeStatus(true);statusIo.shutdown();try{unregisterReceiver(systemEvents);}catch(Exception ignored){}if(power!=null)try{power.removeThermalStatusListener(thermalListener);}catch(Exception ignored){}if(phone!=null&&phoneListener!=null)phone.listen(phoneListener,PhoneStateListener.LISTEN_NONE);super.onDestroy();}
     @Override public IBinder onBind(Intent i){return null;}
 }

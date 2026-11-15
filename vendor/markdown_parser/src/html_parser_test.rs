@@ -565,3 +565,24 @@ fn test_confluence_code_block() {
         }),]
     );
 }
+
+#[test]
+fn test_2000_nested_spans_no_stack_overflow() {
+    let html = format!(
+        "{}deeply nested{}",
+        "<span>".repeat(2000),
+        "</span>".repeat(2000)
+    );
+    let parsed = parse_html(&html).expect("deeply nested HTML should not stack overflow");
+    assert!(parsed.lines.len() <= 1);
+}
+
+#[test]
+fn test_html_phrasing_trims_crlf() {
+    assert_eq!(
+        test_parse_html("<p><span>hello\r\n</span>\r\n</p>"),
+        vec![FormattedTextLine::Line(vec![
+            FormattedTextFragment::plain_text("hello")
+        ])]
+    );
+}

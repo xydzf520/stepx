@@ -29,6 +29,7 @@ const PHRASING_ELEMENT_TAGS: &[&str] = &[
 ];
 
 pub const WARP_EMBED_ATTRIBUTE_NAME: &str = "data-warp-embedded-item";
+const MAX_HTML_DEPTH: usize = 128;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ListArg {
@@ -363,6 +364,13 @@ pub fn parse_html(html: &str) -> Result<FormattedText> {
         pending_inline_nodes.clear();
     }
 
+    // Tear down deep DOM trees iteratively so dropping deeply nested HTML never overflows the stack.
+    let mut drop_stack = vec![Rc::clone(&dom.document)];
+    while let Some(node) = drop_stack.pop() {
+        let mut children = node.children.borrow_mut();
+        drop_stack.extend(children.drain(..));
+    }
+
     Ok(FormattedText { lines: result })
 }
 
@@ -409,6 +417,18 @@ fn parse_pending_inline_nodes(
 // Parse the phrasing content: https://developer.mozilla.org/en-US/docs/Web/HTML/Content_categories#phrasing_content
 // into an inline formatted text.
 fn parse_phrasing_content(nodes: &[Rc<Node>], text_styling: Styling) -> FormattedTextInline {
+    parse_phrasing_content_with_depth(nodes, text_styling, 0)
+}
+
+fn parse_phrasing_content_with_depth(
+    nodes: &[Rc<Node>],
+    text_styling: Styling,
+    depth: usize,
+) -> FormattedTextInline {
+    if depth >= MAX_HTML_DEPTH {
+        return Vec::new();
+    }
+
     let mut result = Vec::new();
     for node in nodes {
         if is_spacing_span(node) {
@@ -424,7 +444,7 @@ fn parse_phrasing_content(nodes: &[Rc<Node>], text_styling: Styling) -> Formatte
             | NodeData::Comment { .. } => {}
             // Push text fragment based on the current text_styling.
             NodeData::Text { contents } => {
-                let content = contents.borrow().trim_end_matches('\n').to_string();
+                let content = contents.borrow().trim_end_matches(['\r', '\n']).to_string();
 
                 // Filter out singular empty lines after trimming as they are from HTML formatting and shouldn't
                 // be inserted into the content. The rare valid case we might be missing here is <p>\n</p>.
@@ -450,9 +470,10 @@ fn parse_phrasing_content(nodes: &[Rc<Node>], text_styling: Styling) -> Formatte
                     _ => (),
                 };
 
-                result.extend(parse_phrasing_content(
+                result.extend(parse_phrasing_content_with_depth(
                     node.children.borrow().as_ref(),
                     decorated_styling,
+                    depth + 1,
                 ));
             }
         }
@@ -516,12 +537,23 @@ fn is_spacing_span(node: &Rc<Node>) -> bool {
 
 // Only parse out text content in the provided nodes and their children.
 fn parse_text_only(nodes: &[Rc<Node>]) -> String {
+    parse_text_only_with_depth(nodes, 0)
+}
+
+fn parse_text_only_with_depth(nodes: &[Rc<Node>], depth: usize) -> String {
+    if depth >= MAX_HTML_DEPTH {
+        return String::new();
+    }
+
     let mut text = String::new();
     for node in nodes {
         if let NodeData::Text { contents } = &node.data {
             text.push_str(contents.borrow().to_string().as_str());
         } else {
-            text.push_str(&parse_text_only(&node.children.borrow()));
+            text.push_str(&parse_text_only_with_depth(
+                &node.children.borrow(),
+                depth + 1,
+            ));
         }
     }
     text
@@ -529,6 +561,17 @@ fn parse_text_only(nodes: &[Rc<Node>]) -> String {
 
 // Recursively parse out the code block content and it's language info.
 fn parse_code_block_and_language(nodes: &[Rc<Node>]) -> (String, Option<String>) {
+    parse_code_block_and_language_with_depth(nodes, 0)
+}
+
+fn parse_code_block_and_language_with_depth(
+    nodes: &[Rc<Node>],
+    depth: usize,
+) -> (String, Option<String>) {
+    if depth >= MAX_HTML_DEPTH {
+        return (String::new(), None);
+    }
+
     let mut text = String::new();
     let mut language = None;
     for node in nodes {
@@ -544,14 +587,20 @@ fn parse_code_block_and_language(nodes: &[Rc<Node>]) -> (String, Option<String>)
                     language = Some(parsed_lang);
                 }
 
-                let (child_str, new_lang) = parse_code_block_and_language(&node.children.borrow());
+                let (child_str, new_lang) = parse_code_block_and_language_with_depth(
+                    &node.children.borrow(),
+                    depth + 1,
+                );
                 text.push_str(&child_str);
 
                 if new_lang.is_some() {
                     language = new_lang;
                 }
             }
-            _ => text.push_str(&parse_text_only(&node.children.borrow())),
+            _ => text.push_str(&parse_text_only_with_depth(
+                &node.children.borrow(),
+                depth + 1,
+            )),
         }
     }
 

@@ -2,6 +2,7 @@
 // _not_ within the Warp binary (where it could cause a terminal to temporarily flash on
 // Windows).
 #![allow(clippy::disallowed_types)]
+#![allow(semicolon_in_expressions_from_non_local_macros)]
 
 use std::{
     env,
@@ -84,6 +85,7 @@ fn compile_metal_shaders() {
     println!("cargo:rerun-if-changed={header_path}");
     println!("cargo:rerun-if-changed={metal_path}");
     println!("cargo:rerun-if-env-changed=FACLOUD_SKIP_METAL_SHADER_BUILD");
+    println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
 
     if env::var_os("FACLOUD_SKIP_METAL_SHADER_BUILD").is_some() {
         println!("cargo:warning=FACLOUD_SKIP_METAL_SHADER_BUILD is set; writing placeholder shaders.metallib for local type-checking only");
@@ -96,13 +98,24 @@ fn compile_metal_shaders() {
         "-fmodules-cache-path={}",
         out_path.join("metal-module-cache").display()
     );
+    let min_version_arg = format!(
+        "-mmacosx-version-min={}",
+         macos_deployment_target()
+    );
 
-    match compile_metal_shaders_with_xcrun(metal_path, air_path, lib_path, &module_cache_arg) {
+    match compile_metal_shaders_with_xcrun(
+        metal_path,
+        air_path,
+        lib_path,
+        &module_cache_arg,
+        &min_version_arg,
+    ) {
         Ok(()) => return,
         Err(xcrun_error) => match compile_metal_shaders_with_installed_toolchain(
             metal_path,
             lib_path,
             &module_cache_arg,
+            &min_version_arg,
         ) {
             Ok(()) => {
                 println!(
@@ -118,16 +131,26 @@ fn compile_metal_shaders() {
     }
 }
 
+fn macos_deployment_target() -> String {
+    env::var("MACOSX_DEPLOYMENT_TARGET")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "11.0".to_string())
+}
+
 fn compile_metal_shaders_with_xcrun(
     metal_path: &str,
     air_path: &str,
     lib_path: &str,
     module_cache_arg: &str,
+    min_version_arg: &str,
 ) -> Result<(), String> {
     let mut compile_args = vec![
         "-sdk",
         "macosx",
         "metal",
+        min_version_arg,
         module_cache_arg,
         "-c",
         metal_path,
@@ -167,9 +190,10 @@ fn compile_metal_shaders_with_installed_toolchain(
     metal_path: &str,
     lib_path: &str,
     module_cache_arg: &str,
+    min_version_arg: &str,
 ) -> Result<(), String> {
     let metal = installed_metal_toolchain_metal()?;
-    let mut args = vec![module_cache_arg];
+    let mut args = vec![min_version_arg, module_cache_arg];
     if cfg!(feature = "enable-metal-frame-capture") {
         args.push("-frecord-sources");
         args.push("-gline-tables-only");
@@ -268,7 +292,9 @@ fn compile_objc_lib() {
         println!("cargo:rustc-link-search={path}");
     }
 
+    let min_version_arg = format!("-mmacosx-version-min={}", macos_deployment_target());
     cc::Build::new()
+        .flag_if_supported(&min_version_arg)
         .file("src/platform/mac/objc/app.m")
         .file("src/platform/mac/objc/host_view.m")
         .file("src/platform/mac/objc/hotkey.m")

@@ -1,29 +1,37 @@
 #!/usr/bin/env python3
 """Build a device-local recovery snapshot operation. --run executes it once."""
 import argparse
+import json
 import os
+from pathlib import Path
+import subprocess
 import sys
 import time
 from build_payload import compile_java, replace_dex
-from common import ROOT, STATE, guard, init_state, private_write, shell
-import subprocess
+from common import ROOT, STATE, guard, init_state, private_write, shell, subprocess_options, user_state_root
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run', action='store_true')
     parser.add_argument('--snapshot-id', type=int, default=int(time.time()))
+    parser.add_argument(
+        '--out',
+        type=Path,
+        default=user_state_root() / 'google-play-stepx/snapshots',
+        help='Output root directory outside read-only application bundles',
+    )
     args = parser.parse_args()
     guard(native=True)
     assert 'RUNNING_UNLOCKED' in shell('dumpsys', 'user'), 'Unlock phone before CE snapshot'
     assert 0 < args.snapshot_id < 2**31
     init_state()
-    folder = ROOT / 'build' / ('snapshot-' + str(args.snapshot_id))
-    folder.mkdir(parents=True, exist_ok=False)
-    source = (ROOT / 'snapshot-java/GmsProbe.java').read_text().replace('1792601000', str(args.snapshot_id))
-    (folder / 'GmsProbe.java').write_text(source)
+    folder = Path(args.out) / ('snapshot-' + str(args.snapshot_id))
+    folder.mkdir(parents=True, exist_ok=False, mode=0o700)
+    source = (ROOT / 'snapshot-java/GmsProbe.java').read_text(encoding='utf-8').replace('1792601000', str(args.snapshot_id))
+    (folder / 'GmsProbe.java').write_text(source, encoding='utf-8')
     dex = compile_java(folder / 'GmsProbe.java', folder)
-    operation = replace_dex((ROOT / 'module/inject.py').read_text(), dex).replace('def wait_stop(timeout=5):', 'def wait_stop(timeout=45):')
+    operation = replace_dex((ROOT / 'module/inject.py').read_text(encoding='utf-8'), dex).replace('def wait_stop(timeout=5):', 'def wait_stop(timeout=45):')
     discover = '''lib.setfsuid(0)
 candidates=[]
 for item in os.listdir('/proc'):
@@ -34,7 +42,7 @@ for item in os.listdir('/proc'):
 assert len(candidates)==1
 os.environ['STEPX_SYSTEM_SERVER_PID']=str(candidates[0])
 '''
-    tail = (ROOT / 'tools/snapshot_tail.py.txt').read_text().replace('SNAPSHOT_ID', str(args.snapshot_id))
+    tail = (ROOT / 'tools/snapshot_tail.py.txt').read_text(encoding='utf-8').replace('SNAPSHOT_ID', str(args.snapshot_id))
     operation = discover + operation + '\n' + tail
     compile(operation, 'snapshot-operation.py', 'exec')
     path = folder / 'operation.py'
@@ -44,9 +52,11 @@ os.environ['STEPX_SYSTEM_SERVER_PID']=str(candidates[0])
         env = os.environ.copy()
         env['STEPX_WORKER_TIMEOUT'] = '60'
         result = STATE / ('account-snapshot-' + str(args.snapshot_id) + '.json')
-        subprocess.run([sys.executable, str(ROOT / 'tools/root_worker.py'), str(path), str(result)], env=env, check=True)
-        import json
-        proof = json.loads(result.read_text())
+        subprocess.run(
+            [sys.executable, str(ROOT / 'tools/root_worker.py'), str(path), str(result)],
+            env=env, check=True, **subprocess_options(),
+        )
+        proof = json.loads(result.read_text(encoding='utf-8'))
         assert not proof.get('error'), proof.get('error')
         assert proof.get('detached') and proof.get('java_result', '').count('SNAPSHOT_OK ') == 3
         assert len(proof.get('account_database_snapshots', [])) == 2

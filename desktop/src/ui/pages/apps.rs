@@ -91,12 +91,91 @@ impl Companion {
     fn app_details_inspector(&self, app: &AppInfo) -> El {
         let p = self.p();
         let package = &app.package;
-        let details = self
+        let real_details = self
             .selected_app_details
             .as_ref()
             .filter(|d| d.package == *package)
-            .cloned()
-            .unwrap_or_else(|| stepx_companion::apps::demo_details(package));
+            .cloned();
+        let Some(details) =
+            real_details.or_else(|| self.demo_mode.then(|| stepx_companion::apps::demo_details(package)))
+        else {
+            let ver_text = if !app.version_name.trim().is_empty() && app.version_code > 0 {
+                format!(
+                    "v{} (versionCode {})",
+                    app.version_name.trim(),
+                    app.version_code
+                )
+            } else if !app.version_name.trim().is_empty() {
+                format!("v{}", app.version_name.trim())
+            } else if app.version_code > 0 {
+                format!("versionCode {}", app.version_code)
+            } else {
+                "系统默认版本".to_string()
+            };
+            let status_badge = if self.selected_app_loading {
+                self.pill_badge_icon(
+                    "正在读取应用详情…",
+                    UiIcon::Refresh,
+                    p.blue,
+                    rgba(p.blue.r, p.blue.g, p.blue.b, if p.dark { 38 } else { 24 }),
+                )
+            } else {
+                self.pill_badge("实时详情待刷新", p.text2, p.tag_bg)
+            };
+            let header = self.between(
+                self.wrap(vec![
+                    self.pill_badge_icon(
+                        "桌面应用详情与权限管理",
+                        UiIcon::Shield,
+                        p.accent,
+                        p.accent_soft,
+                    ),
+                    status_badge,
+                ]),
+                self.hstack(
+                    S2,
+                    vec![
+                        self.button_icon(
+                            format!("app-inspector-refresh:{package}"),
+                            "重新读取",
+                            UiIcon::Refresh,
+                            Action::InspectApp(Some(package.clone())),
+                            Btn::Secondary,
+                        ),
+                        self.button_icon(
+                            "app-inspector-close",
+                            "收起详情",
+                            UiIcon::Close,
+                            Action::InspectApp(None),
+                            Btn::Ghost,
+                        ),
+                    ],
+                ),
+            );
+            let body_msg = if self.selected_app_loading {
+                "正在读取应用详情…（正在向手机查询进程 PID、内存占用、安装来源与运行时权限）"
+            } else {
+                "暂未读取到该应用的实时详情，可点击右上角「重新读取」重试。"
+            };
+            return Container::new(self.vstack(
+                S3,
+                vec![
+                    header,
+                    self.divider(),
+                    self.wrap(vec![
+                        self.app_spec_cell("应用名称", app.label.clone(), false),
+                        self.app_spec_cell("应用包名", package.to_string(), true),
+                        self.app_spec_cell("当前版本", ver_text, true),
+                    ]),
+                    self.line(body_msg, CAPTION, p.text2),
+                ],
+            ))
+            .with_uniform_padding(S4)
+            .with_background_color(p.surface)
+            .with_border(Border::all(1.).with_border_color(p.border_strong))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_PANEL)))
+            .finish();
+        };
 
         // 1. Inspector Header
         let proc_badge = if !details.running_pids.is_empty() {

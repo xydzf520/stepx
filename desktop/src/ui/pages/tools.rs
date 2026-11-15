@@ -699,7 +699,7 @@ impl Companion {
                 let suite = &self.back_screen.stepos_suite;
                 (
                     "🛡",
-                    if suite.aiengine_running {
+                    if (suite.checked || self.demo_mode) && suite.aiengine_running {
                         format!(
                             "AI 引擎运行中 · {} 项已注册能力",
                             suite.aiengine_ability_count
@@ -1704,7 +1704,7 @@ impl Companion {
             } else {
                 "支持 USB / 无线"
             },
-            p.success,
+            if suite.checked { p.success } else { p.text2 },
             p.surface,
         )];
         if detected_url.is_some() {
@@ -2559,6 +2559,24 @@ impl Companion {
                             Btn::Secondary,
                         ),
                     ]),
+                    if self
+                        .selected
+                        .as_ref()
+                        .map(|d| self.online_device_active_transport(d))
+                        .is_some_and(|t| t.contains(':') || t.starts_with("adb-"))
+                    {
+                        self.line(
+                            "注意：当前通过无线 ADB 连接，关闭手机 Wi-Fi 或开启飞行模式会立即中断桌面连接（执行前会弹出二次确认）。",
+                            MICRO,
+                            p.warning,
+                        )
+                    } else {
+                        self.line(
+                            "当前通过 USB 连接，可安全切换手机无线开关。",
+                            MICRO,
+                            p.text3,
+                        )
+                    },
                     self.divider(),
                     self.between(
                         self.line("手机屏幕亮度快捷档位", CAPTION, p.text2),
@@ -3764,15 +3782,25 @@ impl Companion {
         let perms_ok = g.boot_module_ready
             && g.granted_count >= g.total_permissions
             && g.total_permissions > 0;
-        let patch_or_login_ok = g.installed && perms_ok && !g.health_needs_repair
-            && (g.compatibility_active || !g.compatibility_supported);
-        let all_ready =
-            g.checked && !g.install_blocked && g.installed && perms_ok && g.persistent_flags_clear && !g.health_needs_repair && patch_or_login_ok;
+        let eval = evaluate_google_store_login(g, self.demo_mode);
+        let patch_or_login_ok = eval.ready;
+        let all_ready = g.checked
+            && !g.install_blocked
+            && g.installed
+            && perms_ok
+            && g.persistent_flags_clear
+            && !g.health_needs_repair
+            && patch_or_login_ok;
         let needs_repair = g.installed
+            && !g.install_blocked
             && (!perms_ok
                 || !g.persistent_flags_clear
                 || g.health_needs_repair
-                || (g.compatibility_supported && !g.compatibility_active));
+                || !eval.failing_runtime_checks.is_empty()
+                || matches!(
+                    eval.compat_state,
+                    GoogleUiCompatState::Degraded | GoogleUiCompatState::RecoveryRequired
+                ));
 
         let (overall_label, overall_fg, overall_bg) = if maintaining {
             ("自动维护中", p.blue, crate::ui::pages::home::soft_tint(p.blue, p.dark))
@@ -3934,17 +3962,11 @@ impl Companion {
         } else if patch_or_login_ok {
             ("已就绪".into(), p.success)
         } else if g.installed {
-            ("待修复".into(), p.warning)
+            (eval.status_label.into(), p.warning)
         } else {
             ("未启用".into(), p.text3)
         };
-        let patch_sub = if g.compatibility_active {
-            "兼容补丁与登录入口已生效"
-        } else if patch_or_login_ok {
-            "登录入口与自动恢复已生效"
-        } else {
-            "检查商店配置与登录入口"
-        };
+        let patch_sub = eval.status_sub;
 
         let account_val = if !g.accounts_checked {
             ("待检测".into(), p.text2)
@@ -4082,7 +4104,182 @@ impl Companion {
             ),
         ]);
 
-        self.vstack(S4, vec![overview_panel, maintenance_panel, fixes_panel])
+        let mut sections = vec![overview_panel, maintenance_panel];
+        if g.checked {
+            let mut diag_rows: Vec<El> = vec![self.heading("兼容性、认证与健康诊断")];
+            if let Some(blocker) = &eval.device_blocker_note {
+                diag_rows.push(self.vstack(
+                    4.,
+                    vec![
+                        self.hstack(
+                            S2,
+                            vec![
+                                self.line_w("设备阻塞说明", BODY, p.text, Weight::Medium),
+                                pill_badge("需处理", p.warning, p.warning_soft),
+                            ],
+                        ),
+                        self.text(blocker, CAPTION, p.warning),
+                    ],
+                ));
+            }
+            if !g.compatibility_note.trim().is_empty() {
+                if diag_rows.len() > 1 {
+                    diag_rows.push(self.divider());
+                }
+                let (compat_badge, compat_fg, compat_bg) = match eval.compat_state {
+                    GoogleUiCompatState::Ready => ("已就绪", p.success, p.success_soft),
+                    GoogleUiCompatState::RollbackConflict => ("恢复冲突", p.warning, p.warning_soft),
+                    GoogleUiCompatState::RecoveryRequired => ("需恢复补丁", p.warning, p.warning_soft),
+                    GoogleUiCompatState::Degraded => ("待修复", p.warning, p.warning_soft),
+                    GoogleUiCompatState::BlockedOrUnsupported => ("兼容受限", p.warning, p.warning_soft),
+                    GoogleUiCompatState::Unchecked => ("待核验", p.text2, p.sidebar),
+                };
+                diag_rows.push(self.vstack(
+                    4.,
+                    vec![
+                        self.hstack(
+                            S2,
+                            vec![
+                                self.line_w("商店兼容补丁", BODY, p.text, Weight::Medium),
+                                pill_badge(compat_badge, compat_fg, compat_bg),
+                            ],
+                        ),
+                        self.text(
+                            g.compatibility_note.trim(),
+                            CAPTION,
+                            if eval.compat_state == GoogleUiCompatState::Ready {
+                                p.text2
+                            } else {
+                                p.warning
+                            },
+                        ),
+                    ],
+                ));
+            }
+            if !g.certification_note.trim().is_empty()
+                || !g.certification_catalog.trim().is_empty()
+                || !g.boot_security_note.trim().is_empty()
+                || !g.play_protect.note.trim().is_empty()
+            {
+                if diag_rows.len() > 1 {
+                    diag_rows.push(self.divider());
+                }
+                let (cert_badge, cert_fg, cert_bg) = if g.play_protect.checked && g.play_protect.certified {
+                    ("官方已认证", p.success, p.success_soft)
+                } else if g.certification_note.contains("拦截页") || g.certification_note.contains("被停用") {
+                    ("受阻", p.warning, p.warning_soft)
+                } else {
+                    ("认证说明", p.text2, p.sidebar)
+                };
+                let mut cert_items = vec![self.hstack(
+                    S2,
+                    vec![
+                        self.line_w("设备认证与安全", BODY, p.text, Weight::Medium),
+                        pill_badge(cert_badge, cert_fg, cert_bg),
+                    ],
+                )];
+                if !g.certification_note.trim().is_empty() {
+                    cert_items.push(self.text(g.certification_note.trim(), CAPTION, p.text2));
+                }
+                let extra_meta: Vec<&str> = [g.certification_catalog.trim(), g.boot_security_note.trim()]
+                    .into_iter()
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if !extra_meta.is_empty() {
+                    cert_items.push(self.line(extra_meta.join(" · "), MICRO, p.text3));
+                }
+                if !g.play_protect.note.trim().is_empty() {
+                    cert_items.push(self.text(g.play_protect.note.trim(), CAPTION, p.warning));
+                }
+                for blocker in &g.play_protect.blockers {
+                    cert_items.push(self.text(
+                        format!("· {}：{}", blocker.title, blocker.detail),
+                        MICRO,
+                        p.text3,
+                    ));
+                }
+                diag_rows.push(self.vstack(4., cert_items));
+            }
+            if !g.health_checks.is_empty() {
+                if diag_rows.len() > 1 {
+                    diag_rows.push(self.divider());
+                }
+                let non_passing: Vec<&stepx_companion::device::GoogleHealthCheck> = g
+                    .health_checks
+                    .iter()
+                    .filter(|c| !matches!(c.state.as_str(), "pass" | "ok"))
+                    .collect();
+                if non_passing.is_empty() {
+                    diag_rows.push(self.between(
+                        self.line_w("运行时健康检查", BODY, p.text, Weight::Medium),
+                        pill_badge(
+                            &format!("{} 项通过", g.health_checks.len()),
+                            p.success,
+                            p.success_soft,
+                        ),
+                    ));
+                } else {
+                    let mut check_items = vec![self.hstack(
+                        S2,
+                        vec![
+                            self.line_w("运行时健康检查", BODY, p.text, Weight::Medium),
+                            pill_badge(
+                                if eval.failing_runtime_checks.is_empty() {
+                                    "待登录账号"
+                                } else {
+                                    "存在待处理项"
+                                },
+                                if eval.failing_runtime_checks.is_empty() {
+                                    p.text2
+                                } else {
+                                    p.warning
+                                },
+                                if eval.failing_runtime_checks.is_empty() {
+                                    p.sidebar
+                                } else {
+                                    p.warning_soft
+                                },
+                            ),
+                        ],
+                    )];
+                    for check in non_passing {
+                        let is_account_pending =
+                            check.title == "Google 账号" && check.state == "unknown";
+                        let (badge_txt, fg, bg) = if is_account_pending {
+                            ("待登录", p.text2, p.sidebar)
+                        } else if check.state == "fail" {
+                            ("未通过", p.warning, p.warning_soft)
+                        } else {
+                            ("待确认", p.warning, p.warning_soft)
+                        };
+                        check_items.push(self.vstack(
+                            2.,
+                            vec![
+                                self.hstack(
+                                    S2,
+                                    vec![
+                                        self.line_w(&check.title, CAPTION, p.text, Weight::Medium),
+                                        pill_badge(badge_txt, fg, bg),
+                                    ],
+                                ),
+                                self.text(
+                                    &check.detail,
+                                    MICRO,
+                                    if is_account_pending { p.text2 } else { p.warning },
+                                ),
+                            ],
+                        ));
+                    }
+                    diag_rows.push(self.vstack(6., check_items));
+                }
+            }
+            if diag_rows.len() > 1 {
+                sections.push(self.panel(diag_rows));
+            }
+        }
+        sections.push(fixes_panel);
+
+        self.vstack(S4, sections)
     }
 
     pub(in crate::ui) fn weather_tool_page(&self) -> El {
@@ -4367,7 +4564,7 @@ impl Companion {
 
 #[cfg(test)]
 mod tests {
-    use super::Companion;
+    use super::*;
 
     #[test]
     fn mcp_service_action_key_and_label_cover_all_24_stepos_services() {
@@ -4549,6 +4746,200 @@ mod tests {
         assert_eq!(app.tools_actions().len(), 1, "weather context needs a real snapshot");
         app.weather_snapshot.from_live_api = true;
         assert_eq!(app.tools_actions().len(), 2);
+    }
+
+    #[test]
+    fn google_store_login_never_reports_ready_on_degraded_conflict_or_device_blocker() {
+        let mut status = stepx_companion::device::GoogleSuiteStatus::default_verified();
+        status.verification_note = "真实检测".into();
+        status.compatibility_checked = true;
+        status.compatibility_supported = true;
+        status.compatibility_active = true;
+        status.compatibility_note = "兼容补丁已生效；这不改变 Google 的设备认证。".into();
+
+        // Healthy active patch -> ready
+        let ok_eval = evaluate_google_store_login(&status, false);
+        assert!(ok_eval.ready);
+        assert_eq!(ok_eval.compat_state, GoogleUiCompatState::Ready);
+
+        // 1. Degraded / partial scope (supported=true, active=false)
+        let mut degraded = status.clone();
+        degraded.compatibility_active = false;
+        degraded.compatibility_note = "已支持当前系统和 Google 组件版本；兼容补丁尚未完整生效。".into();
+        let deg_eval = evaluate_google_store_login(&degraded, false);
+        assert!(!deg_eval.ready);
+        assert_eq!(deg_eval.compat_state, GoogleUiCompatState::Degraded);
+
+        // 2. Recovery required (can_rollback=true, active=false / unsupported)
+        let mut recovery_req = status.clone();
+        recovery_req.compatibility_supported = false;
+        recovery_req.compatibility_active = false;
+        recovery_req.compatibility_can_rollback = true;
+        recovery_req.compatibility_note = "已有恢复记录且状态发生变化，请重新检查或恢复。".into();
+        let rec_eval = evaluate_google_store_login(&recovery_req, false);
+        assert!(!rec_eval.ready);
+        assert_eq!(rec_eval.compat_state, GoogleUiCompatState::RecoveryRequired);
+
+        // 3. Rollback conflict
+        let mut conflict = recovery_req.clone();
+        conflict.compatibility_note =
+            "部分 Google 数据已有后续变化，已保留这些数据和恢复记录；未强制覆盖。".into();
+        let conf_eval = evaluate_google_store_login(&conflict, false);
+        assert!(!conf_eval.ready);
+        assert_eq!(conf_eval.compat_state, GoogleUiCompatState::RollbackConflict);
+
+        // 4. Device blocker note non-empty
+        let mut blocked = status.clone();
+        blocked.install_guidance = "检测到异常的持久化标记，已停止安装与修复".into();
+        let blk_eval = evaluate_google_store_login(&blocked, false);
+        assert!(!blk_eval.ready);
+        assert!(blk_eval.device_blocker_note.is_some());
+
+        // 5. Failing health check
+        let mut unhealthy = status.clone();
+        unhealthy.health_checks.push(stepx_companion::device::GoogleHealthCheck {
+            title: "Google 登录入口".into(),
+            state: "fail".into(),
+            detail: "登录适配未就绪".into(),
+        });
+        let health_eval = evaluate_google_store_login(&unhealthy, false);
+        assert!(!health_eval.ready);
+        assert_eq!(health_eval.failing_runtime_checks.len(), 1);
+
+        // Smoke-render google_tool_page with diagnostics populated
+        let mut app = Companion::new_for_test();
+        app.demo_mode = false;
+        app.google_suite = conflict;
+        app.google_suite.health_checks = unhealthy.health_checks;
+        app.tool_page = Some(ToolPage::Google);
+        let _ = app.google_tool_page();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GoogleUiCompatState {
+    Unchecked,
+    Ready,
+    Degraded,
+    RecoveryRequired,
+    RollbackConflict,
+    BlockedOrUnsupported,
+}
+
+struct GoogleStoreLoginEval<'a> {
+    ready: bool,
+    compat_state: GoogleUiCompatState,
+    device_blocker_note: Option<String>,
+    failing_runtime_checks: Vec<&'a stepx_companion::device::GoogleHealthCheck>,
+    status_label: &'static str,
+    status_sub: &'static str,
+}
+
+fn evaluate_google_store_login(
+    g: &stepx_companion::device::GoogleSuiteStatus,
+    demo_mode: bool,
+) -> GoogleStoreLoginEval<'_> {
+    let perms_ok =
+        g.boot_module_ready && g.granted_count >= g.total_permissions && g.total_permissions > 0;
+    let device_blocker_note = if !g.device_blocker_note.trim().is_empty() {
+        Some(g.device_blocker_note.trim().to_string())
+    } else if !g.install_guidance.trim().is_empty() {
+        Some(g.install_guidance.trim().to_string())
+    } else if g.install_blocked {
+        Some("当前设备条件不满足，已暂停自动安装与修复".to_string())
+    } else if g.certification_note.contains("拦截页") || g.certification_note.contains("被停用") {
+        Some(g.certification_note.trim().to_string())
+    } else {
+        None
+    };
+
+    let note = g.compatibility_note.trim();
+    let compat_state = if !g.checked {
+        GoogleUiCompatState::Unchecked
+    } else if note.contains("后续变化") || note.contains("rollback_conflict") {
+        GoogleUiCompatState::RollbackConflict
+    } else if (g.compatibility_can_rollback && !g.compatibility_active)
+        || note.contains("恢复记录")
+        || note.contains("recovery_required")
+    {
+        GoogleUiCompatState::RecoveryRequired
+    } else if g.compatibility_active
+        || g.compatibility_state == stepx_companion::device::GoogleCompatibilityState::Active
+    {
+        GoogleUiCompatState::Ready
+    } else if demo_mode && !g.compatibility_checked && g.verification_note == "演示数据" {
+        GoogleUiCompatState::Ready
+    } else if g.compatibility_state == stepx_companion::device::GoogleCompatibilityState::Unsupported
+    {
+        GoogleUiCompatState::BlockedOrUnsupported
+    } else if g.play_protect.checked
+        && g.play_protect.certified
+        && g.compatibility_checked
+        && !g.compatibility_can_rollback
+        && note.is_empty()
+    {
+        GoogleUiCompatState::Ready
+    } else if !g.compatibility_checked {
+        GoogleUiCompatState::Unchecked
+    } else if (g.compatibility_supported && !g.compatibility_active)
+        || g.compatibility_state == stepx_companion::device::GoogleCompatibilityState::Inactive
+        || note.contains("尚未完整生效")
+        || note.contains("degraded")
+    {
+        GoogleUiCompatState::Degraded
+    } else {
+        GoogleUiCompatState::BlockedOrUnsupported
+    };
+
+    let failing_runtime_checks: Vec<&stepx_companion::device::GoogleHealthCheck> = g
+        .health_checks
+        .iter()
+        .filter(|c| {
+            c.state == "fail"
+                || (!matches!(c.state.as_str(), "pass" | "ok") && c.title != "Google 账号")
+        })
+        .collect();
+
+    let ready = g.checked
+        && g.installed
+        && perms_ok
+        && g.persistent_flags_clear
+        && !g.health_needs_repair
+        && failing_runtime_checks.is_empty()
+        && device_blocker_note.is_none()
+        && compat_state == GoogleUiCompatState::Ready;
+
+    let (status_label, status_sub) = if ready {
+        (
+            "已就绪",
+            if g.compatibility_active {
+                "兼容补丁与登录入口已生效"
+            } else {
+                "登录入口与自动恢复已生效"
+            },
+        )
+    } else if !g.installed {
+        ("未启用", "完整安装三件套后启用")
+    } else if device_blocker_note.is_some() {
+        ("存在阻塞项", "请查看下方设备阻塞说明")
+    } else {
+        match compat_state {
+            GoogleUiCompatState::RollbackConflict => ("恢复冲突", "存在后续数据变化，已保留现状"),
+            GoogleUiCompatState::RecoveryRequired => ("需恢复补丁", "存在未完成恢复记录，请检查修复"),
+            GoogleUiCompatState::Degraded => ("补丁未完整生效", "可点击一键修复补齐商店配置"),
+            GoogleUiCompatState::BlockedOrUnsupported => ("兼容待处理", "请查看下方兼容补丁说明"),
+            GoogleUiCompatState::Unchecked => ("待核验", "兼容补丁状态检测尚未完成"),
+            GoogleUiCompatState::Ready => ("待修复", "检查登录入口与运行时健康项"),
+        }
+    };
+
+    GoogleStoreLoginEval {
+        ready,
+        compat_state,
+        device_blocker_note,
+        failing_runtime_checks,
+        status_label,
+        status_sub,
     }
 }
 

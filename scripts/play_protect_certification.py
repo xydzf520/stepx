@@ -30,6 +30,10 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / "scripts") not in sys.path:
+    sys.path.insert(0, str(ROOT / "scripts"))
+from host_runtime import optional_tool_home, subprocess_options, user_state_root
+
 SCHEMA = "stepx-play-protect-certification-v1"
 FORMAT = 1
 DEFAULT_SERIAL = ""
@@ -182,7 +186,7 @@ class Device:
 
     def _run(self, args, timeout=40, check=True):
         try:
-            result = subprocess.run(args, text=True, capture_output=True, timeout=timeout)
+            result = subprocess.run(args, text=True, capture_output=True, timeout=timeout, **subprocess_options())
         except (OSError, subprocess.SubprocessError) as error:
             raise ProbeError(f"无法执行 {args[0]}：{type(error).__name__}") from None
         if check and result.returncode != 0:
@@ -293,7 +297,7 @@ def probe_compat_patch(device, adb_path=None, script=None):
     try:
         result = subprocess.run(
             [sys.executable, str(script), "status"],
-            capture_output=True, text=True, timeout=150, env=environment)
+            capture_output=True, text=True, timeout=150, env=environment, **subprocess_options())
     except (OSError, subprocess.SubprocessError) as error:
         return {"available": False, "reason": f"无法运行兼容补丁组件：{type(error).__name__}"}
     try:
@@ -340,7 +344,24 @@ def probe_client_admission(device, state):
     }
     compat = state.get("compat_patch")
     if compat is None:
-        compat = probe_compat_patch(device, adb_path=state.get("adb_path"))
+        if isinstance(state.get("compat_active"), bool):
+            active = state["compat_active"]
+            compat = {
+                "available": True,
+                "ok": True,
+                "supported": True,
+                "active": active,
+                "can_rollback": active,
+                "official_certification_changed": False,
+                "scopes": {
+                    name: {"cache_active": active, "db_active": active}
+                    for name in ("gms", "play")
+                },
+                "note": "Play 兼容补丁只恢复商店可用性；official_certification_changed 为 false "
+                        "表示它没有改动 Google 的设备认证。",
+            }
+        else:
+            compat = probe_compat_patch(device, adb_path=state.get("adb_path"))
         state["compat_patch"] = compat
     checks = [
         check("Google 三件套已安装", f"{len(present)}/3", "3/3", len(present) == 3,
@@ -434,7 +455,7 @@ def _openssl():
 def _run_openssl(args, stdin=None):
     try:
         return subprocess.run(["openssl", *args], input=stdin, text=True,
-                              capture_output=True, timeout=60)
+                              capture_output=True, timeout=60, **subprocess_options())
     except (OSError, subprocess.SubprocessError):
         return None
 
@@ -499,13 +520,20 @@ def describe_roots(path):
 def chain_certificates(directory):
     """Return subject and decimal serial for every certificate in a capture."""
     leaf, intermediates, _ = load_chain(directory)
-    bundle = subprocess.run(
-        ["openssl", "crl2pkcs7", "-nocrl", "-certfile", str(leaf), "-certfile", str(intermediates)],
-        capture_output=True)
+    try:
+        bundle = subprocess.run(
+            ["openssl", "crl2pkcs7", "-nocrl", "-certfile", str(leaf), "-certfile", str(intermediates)],
+            capture_output=True, timeout=30, **subprocess_options())
+    except (OSError, subprocess.SubprocessError):
+        raise ProbeError("无法读取已采集的证明链") from None
     if bundle.returncode != 0:
         raise ProbeError("无法读取已采集的证明链")
-    pem = subprocess.run(["openssl", "pkcs7", "-print_certs"],
-                         input=bundle.stdout.decode("latin-1"), capture_output=True, text=True)
+    try:
+        pem = subprocess.run(["openssl", "pkcs7", "-print_certs"],
+                             input=bundle.stdout.decode("latin-1"), capture_output=True, text=True,
+                             timeout=30, **subprocess_options())
+    except (OSError, subprocess.SubprocessError):
+        raise ProbeError("无法解析证明链证书") from None
     if pem.returncode != 0:
         raise ProbeError("无法解析证明链证书")
     bodies = re.findall(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
@@ -585,13 +613,19 @@ def verify_chain(directory, roots_url=ATTESTATION_ROOTS_URL, offline=False, cach
     leaf, intermediates, root = load_chain(directory)
     if not _openssl():
         return {"available": False, "reason": "缺少 openssl，无法校验证明链"}
-    chain = subprocess.run(
-        ["openssl", "crl2pkcs7", "-nocrl", "-certfile", str(leaf), "-certfile", str(intermediates)],
-        capture_output=True)
+    try:
+        chain = subprocess.run(
+            ["openssl", "crl2pkcs7", "-nocrl", "-certfile", str(leaf), "-certfile", str(intermediates)],
+            capture_output=True, timeout=30, **subprocess_options())
+    except (OSError, subprocess.SubprocessError):
+        return {"available": False, "reason": "无法读取已采集的证明链"}
     if chain.returncode != 0:
         return {"available": False, "reason": "无法读取已采集的证明链"}
-    pem = subprocess.run(["openssl", "pkcs7", "-print_certs"], input=chain.stdout,
-                         capture_output=True)
+    try:
+        pem = subprocess.run(["openssl", "pkcs7", "-print_certs"], input=chain.stdout,
+                             capture_output=True, timeout=30, **subprocess_options())
+    except (OSError, subprocess.SubprocessError):
+        return {"available": False, "reason": "无法解析证明链证书"}
     if pem.returncode != 0:
         return {"available": False, "reason": "无法解析证明链证书"}
     certificates = re.findall(
@@ -1825,18 +1859,20 @@ def _tool(name, environment):
 
 def build_ota_probe(scratch):
     """Compile the read-only firmware probe when no prebuilt dex is available."""
+    exe = ".exe" if os.name == "nt" else ""
     jdk = os.environ.get("STEPX_JDK") or os.environ.get("JAVA_HOME")
     candidates = ([jdk] if jdk else []) + list(JDK_CANDIDATES)
-    javac = next((Path(root) / "bin" / "javac" for root in candidates
-                  if root and (Path(root) / "bin" / "javac").is_file()), None)
+    javac = next((Path(root) / "bin" / ("javac" + exe) for root in candidates
+                  if root and (Path(root) / "bin" / ("javac" + exe)).is_file()), None)
     if javac is None:
         found = shutil.which("javac")
         javac = Path(found) if found else None
     if javac is None:
         return None
+    home = optional_tool_home()
     sdk = (os.environ.get("ANDROID_SDK_ROOT")
            or os.environ.get("ANDROID_HOME")
-           or str(Path.home() / "Android" / "Sdk"))
+           or (str(home / "Android" / "Sdk") if home is not None else ""))
     android_jar = Path(sdk) / "platforms" / "android-36" / "android.jar" if sdk else None
     if android_jar is None or not android_jar.is_file():
         jars = sorted((Path(sdk) / "platforms").glob("android-*/android.jar"), reverse=True) if sdk else []
@@ -1851,23 +1887,34 @@ def build_ota_probe(scratch):
         return None
     classes = scratch / "classes"
     classes.mkdir(parents=True, exist_ok=True)
-    compiled = subprocess.run(
-        [str(javac), "-encoding", "UTF-8", "--release", "11",
-         "-cp", str(android_jar), "-d", str(classes), str(source)],
-        capture_output=True, text=True)
+    try:
+        compiled = subprocess.run(
+            [str(javac), "-encoding", "UTF-8", "--release", "11",
+             "-cp", str(android_jar), "-d", str(classes), str(source)],
+            capture_output=True, text=True, timeout=60, **subprocess_options())
+    except (OSError, subprocess.SubprocessError):
+        return None
     if compiled.returncode != 0:
         return None
     jar = scratch / "classes.jar"
-    made = subprocess.run([str(javac.parent / "jar"), "cf", str(jar),
-                           "-C", str(classes), "."], capture_output=True, text=True)
+    try:
+        made = subprocess.run([str(javac.parent / ("jar" + exe)), "cf", str(jar),
+                               "-C", str(classes), "."], capture_output=True, text=True,
+                              timeout=60, **subprocess_options())
+    except (OSError, subprocess.SubprocessError):
+        return None
     if made.returncode != 0:
         return None
     dex = scratch / "dex"
     dex.mkdir(parents=True, exist_ok=True)
-    dexed = subprocess.run(
-        [str(javac.parent / "java"), "-cp", str(r8), "com.android.tools.r8.D8",
-         "--release", "--min-api", "36", "--lib", str(android_jar),
-         "--output", str(dex), str(jar)], capture_output=True, text=True)
+    try:
+        dexed = subprocess.run(
+            [str(javac.parent / ("java" + exe)), "-cp", str(r8), "com.android.tools.r8.D8",
+             "--release", "--min-api", "36", "--lib", str(android_jar),
+             "--output", str(dex), str(jar)], capture_output=True, text=True,
+            timeout=90, **subprocess_options())
+    except (OSError, subprocess.SubprocessError):
+        return None
     if dexed.returncode != 0 or not (dex / "classes.dex").is_file():
         return None
     return dex / "classes.dex"
@@ -2183,6 +2230,7 @@ def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("explain", help="打印四层认证机制认知")
+    play_protect_state = user_state_root() / "play-protect"
 
     def add_common(target, serial=True):
         if serial:
@@ -2190,7 +2238,7 @@ def build_parser():
         target.add_argument("--offline", action="store_true", help="不访问 Google 官方资源")
         target.add_argument("--attestation-chain", default=None,
                             help="既往采集的密钥证明链目录（leaf/intermediates/chain-provided-root.pem）")
-        target.add_argument("--roots-cache", default=str(ROOT / ".runtime/attestation-official-roots.pem"),
+        target.add_argument("--roots-cache", default=str(play_protect_state / "attestation-official-roots.pem"),
                             help="Google 官方证明根列表的本地缓存位置")
         target.add_argument("--compat-active", type=tri_state, default=None,
                             help="Play 兼容补丁是否生效；仅记录可用性，不影响认证判定")
@@ -2198,11 +2246,11 @@ def build_parser():
                             help="固件防火墙是否放行 rkpdapp；读取该配置需要 root")
         target.add_argument("--rkp-backend-status", type=int, default=None,
                             help="既往取证到的 RKP signCertificates HTTP 状态码；本工具不主动请求签发")
-        target.add_argument("--cache-file", default=str(ROOT / ".runtime/play-protect-catalog.json"))
+        target.add_argument("--cache-file", default=str(play_protect_state / "play-protect-catalog.json"))
         target.add_argument("--firmware", action="store_true",
                             help="附带只读查询官方固件通道是否有更新构建")
         target.add_argument("--revocation-cache",
-                            default=str(ROOT / ".runtime/attestation-status.json"),
+                            default=str(play_protect_state / "attestation-status.json"),
                             help="Google 吊销列表的本地缓存位置")
 
     for name, help_text in (("status", "逐层取证并给出认证判定"),
@@ -2215,7 +2263,7 @@ def build_parser():
         target = subparsers.add_parser(name, help=help_text)
         add_common(target)
     subparsers.choices["monitor"].add_argument("--state-file",
-                                               default=str(ROOT / ".runtime/play-protect-monitor.json"))
+                                               default=str(play_protect_state / "play-protect-monitor.json"))
     subparsers.choices["monitor"].add_argument("--fail-on-blockers", action="store_true")
     for name in ("dossier", "ticket", "ticket-en", "rkp-pool"):
         subparsers.choices[name].add_argument("--component", default="default")
@@ -2228,9 +2276,9 @@ def build_parser():
 
     chain = subparsers.add_parser("chain", help="离线校验已采集的密钥证明链")
     chain.add_argument("--directory", required=True)
-    chain.add_argument("--roots-cache", default=str(ROOT / ".runtime/attestation-official-roots.pem"))
+    chain.add_argument("--roots-cache", default=str(play_protect_state / "attestation-official-roots.pem"))
     chain.add_argument("--revocation-cache",
-                       default=str(ROOT / ".runtime/attestation-status.json"))
+                       default=str(play_protect_state / "attestation-status.json"))
     chain.add_argument("--offline", action="store_true")
     return parser
 

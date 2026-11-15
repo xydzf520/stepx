@@ -36,12 +36,23 @@ import java.io.BufferedWriter;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
+import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Real-time notification listener, RemoteInput reply handle harvester, LocalServerSocket
@@ -49,18 +60,53 @@ import java.util.concurrent.Executors;
  */
 public final class PushNotificationService extends NotificationListenerService {
     public static final String SOCKET_NAME = "stepx_push_v1";
+    public static final long RESCAN_COOLDOWN_MS = 30_000L;
+    static final int MAX_SOCKET_LINE_BYTES = McpRoutePolicy.MAX_SOCKET_LINE_BYTES;
+    private static final int MAX_AVATAR_CACHE = 256;
+    private static final int SOCKET_READ_TIMEOUT_MS = 5000;
+    private static final int MAX_SUBSCRIBERS = 4;
     static volatile PushNotificationService instance;
 
+    private static final class SubscriberSession {
+        final LocalSocket socket;
+        final BufferedWriter writer;
+
+        SubscriberSession(LocalSocket socket, BufferedWriter writer) {
+            this.socket = socket;
+            this.writer = writer;
+        }
+    }
+
     private volatile boolean running;
+    private volatile long lastFullScanElapsedMs = 0L;
     private LocalServerSocket serverSocket;
     private Thread socketAcceptThread;
+    private ThreadPoolExecutor socketClientExecutor;
+    private ThreadPoolExecutor subscriberExecutor;
+    private ThreadPoolExecutor ingestExecutor;
+    private volatile Thread ingestThread;
+    private ExecutorService deltaExecutor;
     private ConnectivityManager.NetworkCallback wifiCallback;
-    private final CopyOnWriteArrayList<BufferedWriter> streamClients = new CopyOnWriteArrayList<BufferedWriter>();
-    private final ExecutorService deltaExecutor = Executors.newSingleThreadExecutor();
+    private final Set<LocalSocket> activeClientSockets =
+        Collections.newSetFromMap(new ConcurrentHashMap<LocalSocket, Boolean>());
+    private final CopyOnWriteArrayList<SubscriberSession> subscribers = new CopyOnWriteArrayList<SubscriberSession>();
+    private final Map<String, String> avatarCache = new LinkedHashMap<String, String>(256, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
+            return size() > MAX_AVATAR_CACHE;
+        }
+    };
     private PhoneCallMonitor callMonitor;
 
     public static boolean isConnected() {
         return instance != null;
+    }
+
+    public boolean hasRecentFullScan(long maxAgeMs) {
+        long last = lastFullScanElapsedMs;
+        if (last <= 0L) return false;
+        long age = android.os.SystemClock.elapsedRealtime() - last;
+        return age >= 0L && age < maxAgeMs;
     }
 
     /**
@@ -194,14 +240,50 @@ public final class PushNotificationService extends NotificationListenerService {
         return res;
     }
 
+    void restartCallMonitor() {
+        if (callMonitor != null) callMonitor.stop();
+        callMonitor = new PhoneCallMonitor(this);
+        callMonitor.start();
+    }
+
+    private synchronized ThreadPoolExecutor ensureIngestExecutor() {
+        if (ingestExecutor == null || ingestExecutor.isShutdown() || ingestExecutor.isTerminated()) {
+            ingestExecutor = new ThreadPoolExecutor(
+                1,
+                1,
+                0L,
+                TimeUnit.MILLISECONDS,
+                new ArrayBlockingQueue<Runnable>(256),
+                new ThreadFactory() {
+                    @Override
+                    public Thread newThread(Runnable r) {
+                        Thread t = new Thread(r, "StepXPushIngest");
+                        t.setDaemon(true);
+                        ingestThread = t;
+                        return t;
+                    }
+                },
+                new ThreadPoolExecutor.DiscardOldestPolicy()
+            );
+        }
+        return ingestExecutor;
+    }
+
+    private synchronized void shutdownIngestExecutor() {
+        ingestThread = null;
+        if (ingestExecutor != null) {
+            ingestExecutor.shutdownNow();
+            ingestExecutor = null;
+        }
+    }
+
     @Override
     public void onListenerConnected() {
         super.onListenerConnected();
         instance = this;
         running = true;
-        if (callMonitor != null) callMonitor.stop();
-        callMonitor = new PhoneCallMonitor(this);
-        callMonitor.start();
+        ensureIngestExecutor();
+        restartCallMonitor();
         BatteryStateCache.start(this);
         startSocketServer();
         registerWifiSelfHealCallback();
@@ -213,10 +295,12 @@ public final class PushNotificationService extends NotificationListenerService {
         if (callMonitor != null) callMonitor.stop();
         BatteryStateCache.stop();
         PushStore.get(this).recordListenerGap();
+        lastFullScanElapsedMs = 0L;
         if (instance == this) {
             instance = null;
         }
         stopSocketServer();
+        shutdownIngestExecutor();
         unregisterWifiSelfHealCallback();
         super.onListenerDisconnected();
     }
@@ -227,16 +311,50 @@ public final class PushNotificationService extends NotificationListenerService {
         BatteryStateCache.stop();
         PushStore.get(this).recordListenerGap();
         running = false;
+        lastFullScanElapsedMs = 0L;
         if (instance == this) {
             instance = null;
         }
         stopSocketServer();
+        shutdownIngestExecutor();
         unregisterWifiSelfHealCallback();
-        deltaExecutor.shutdownNow();
+        shutdownDeltaExecutor();
+        synchronized (avatarCache) {
+            avatarCache.clear();
+        }
         super.onDestroy();
     }
 
     public void scanActiveNotifications() {
+        if (Thread.currentThread() == ingestThread) {
+            scanActiveNotificationsSync();
+            return;
+        }
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+            try {
+                ensureIngestExecutor().execute(new Runnable() {
+                    @Override
+                    public void run() {
+                        scanActiveNotificationsSync();
+                    }
+                });
+            } catch (Exception ignored) {
+            }
+            return;
+        }
+        try {
+            java.util.concurrent.Future<?> f = ensureIngestExecutor().submit(new Runnable() {
+                @Override
+                public void run() {
+                    scanActiveNotificationsSync();
+                }
+            });
+            f.get(4000L, TimeUnit.MILLISECONDS);
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void scanActiveNotificationsSync() {
         try {
             StatusBarNotification[] active = getActiveNotifications();
             if (active == null) return;
@@ -256,31 +374,49 @@ public final class PushNotificationService extends NotificationListenerService {
             } finally {
                 store.endBatch();
             }
+            lastFullScanElapsedMs = android.os.SystemClock.elapsedRealtime();
             SmartBackScreenController.get(this).onNotificationsUpdated(this, store);
         } catch (Exception ignored) {
         }
     }
 
     @Override
-    public void onNotificationPosted(StatusBarNotification sbn) {
+    public void onNotificationPosted(final StatusBarNotification sbn) {
         if (sbn == null) return;
         if ("com.stepx.companion.app".equals(sbn.getPackageName())) return;
         acquireShortWakeLock();
-        ingestStatusBarNotification(sbn, true);
+        try {
+            ensureIngestExecutor().execute(new Runnable() {
+                @Override
+                public void run() {
+                    ingestStatusBarNotification(sbn, true);
+                }
+            });
+        } catch (Exception ignored) {
+        }
     }
 
     @Override
-    public void onNotificationRemoved(StatusBarNotification sbn, RankingMap rankingMap, int reason) {
+    public void onNotificationRemoved(StatusBarNotification sbn, RankingMap rankingMap, final int reason) {
         if (sbn == null) return;
+        final String key = sbn.getKey();
+        final long removedAt = System.currentTimeMillis();
         try {
-            PushStore store = PushStore.get(this);
-            JSONObject delta = store.onNotificationRemoved(
-                sbn.getKey(), reason, System.currentTimeMillis()
-            );
-            if (delta != null) {
-                broadcastDelta(delta);
-            }
-            SmartBackScreenController.get(this).onNotificationsUpdated(this, store);
+            ensureIngestExecutor().execute(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        PushStore store = PushStore.get(PushNotificationService.this);
+                        JSONObject delta = store.onNotificationRemoved(key, reason, removedAt);
+                        if (delta != null) {
+                            broadcastDelta(delta);
+                        }
+                        SmartBackScreenController.get(PushNotificationService.this)
+                            .onNotificationsUpdated(PushNotificationService.this, store);
+                    } catch (Exception ignored) {
+                    }
+                }
+            });
         } catch (Exception ignored) {
         }
     }
@@ -411,7 +547,7 @@ public final class PushNotificationService extends NotificationListenerService {
                 n, sbnKey, pkg, !conversationTitle.isEmpty() ? conversationTitle : title, postTimeMs
             );
 
-            String avatarB64 = extractNotificationAvatarBase64(n, extras);
+            String avatarB64 = extractNotificationAvatarBase64(sbnKey, postTimeMs, n, extras);
 
             String appName = ImAppCatalog.appDisplayName(this, pkg);
             PushStore store = PushStore.get(this);
@@ -447,7 +583,27 @@ public final class PushNotificationService extends NotificationListenerService {
         }
     }
 
-    private String extractNotificationAvatarBase64(Notification n, Bundle extras) {
+    private String extractNotificationAvatarBase64(String sbnKey, long postTimeMs, Notification n, Bundle extras) {
+        if (n == null) return "";
+        String cacheKey = (sbnKey != null && !sbnKey.isEmpty()) ? (sbnKey + "|" + postTimeMs) : "";
+        if (!cacheKey.isEmpty()) {
+            synchronized (avatarCache) {
+                String cached = avatarCache.get(cacheKey);
+                if (cached != null) {
+                    return cached;
+                }
+            }
+        }
+        String computed = extractNotificationAvatarBase64Uncached(n, extras);
+        if (!cacheKey.isEmpty()) {
+            synchronized (avatarCache) {
+                avatarCache.put(cacheKey, computed);
+            }
+        }
+        return computed;
+    }
+
+    private String extractNotificationAvatarBase64Uncached(Notification n, Bundle extras) {
         if (n == null) return "";
         try {
             // 1. Latest MessagingStyle.Message sender Person.getIcon()
@@ -757,8 +913,55 @@ public final class PushNotificationService extends NotificationListenerService {
         }
     }
 
+    private synchronized ThreadPoolExecutor ensureSocketClientExecutor() {
+        if (socketClientExecutor == null || socketClientExecutor.isShutdown() || socketClientExecutor.isTerminated()) {
+            ThreadPoolExecutor exec = new ThreadPoolExecutor(
+                2,
+                4,
+                30L,
+                TimeUnit.SECONDS,
+                new ArrayBlockingQueue<Runnable>(16),
+                new ThreadFactory() {
+                    private final AtomicInteger seq = new AtomicInteger(1);
+
+                    @Override
+                    public Thread newThread(Runnable r) {
+                        Thread t = new Thread(r, "StepXPushClient-" + seq.getAndIncrement());
+                        t.setDaemon(true);
+                        return t;
+                    }
+                }
+            );
+            exec.allowCoreThreadTimeOut(true);
+            socketClientExecutor = exec;
+        }
+        return socketClientExecutor;
+    }
+
+    private synchronized ExecutorService ensureDeltaExecutor() {
+        if (deltaExecutor == null || deltaExecutor.isShutdown() || deltaExecutor.isTerminated()) {
+            deltaExecutor = Executors.newSingleThreadExecutor(new ThreadFactory() {
+                @Override
+                public Thread newThread(Runnable r) {
+                    Thread t = new Thread(r, "StepXPushDelta");
+                    t.setDaemon(true);
+                    return t;
+                }
+            });
+        }
+        return deltaExecutor;
+    }
+
+    private synchronized void shutdownDeltaExecutor() {
+        if (deltaExecutor != null) {
+            deltaExecutor.shutdownNow();
+            deltaExecutor = null;
+        }
+    }
+
     private synchronized void startSocketServer() {
         if (socketAcceptThread != null && socketAcceptThread.isAlive()) return;
+        ensureSocketClientExecutor();
         socketAcceptThread = new Thread(new Runnable() {
             @Override
             public void run() {
@@ -767,14 +970,21 @@ public final class PushNotificationService extends NotificationListenerService {
                     while (running && serverSocket != null) {
                         final LocalSocket client = serverSocket.accept();
                         if (client == null) continue;
-                        Thread handler = new Thread(new Runnable() {
-                            @Override
-                            public void run() {
-                                handleLocalSocketClient(client);
+                        activeClientSockets.add(client);
+                        try {
+                            ensureSocketClientExecutor().execute(new Runnable() {
+                                @Override
+                                public void run() {
+                                    handleLocalSocketClient(client);
+                                }
+                            });
+                        } catch (Throwable rejected) {
+                            activeClientSockets.remove(client);
+                            try {
+                                client.close();
+                            } catch (Exception ignored) {
                             }
-                        }, "StepXPushClient");
-                        handler.setDaemon(true);
-                        handler.start();
+                        }
                     }
                 } catch (Exception ignored) {
                 }
@@ -782,6 +992,41 @@ public final class PushNotificationService extends NotificationListenerService {
         }, "StepXPushSocketAccept");
         socketAcceptThread.setDaemon(true);
         socketAcceptThread.start();
+    }
+
+    private synchronized ThreadPoolExecutor ensureSubscriberExecutor() {
+        if (subscriberExecutor == null || subscriberExecutor.isShutdown() || subscriberExecutor.isTerminated()) {
+            ThreadPoolExecutor exec = new ThreadPoolExecutor(
+                1,
+                MAX_SUBSCRIBERS,
+                30L,
+                TimeUnit.SECONDS,
+                new ArrayBlockingQueue<Runnable>(MAX_SUBSCRIBERS),
+                new ThreadFactory() {
+                    private final AtomicInteger seq = new AtomicInteger(1);
+
+                    @Override
+                    public Thread newThread(Runnable r) {
+                        Thread t = new Thread(r, "StepXPushSub-" + seq.getAndIncrement());
+                        t.setDaemon(true);
+                        return t;
+                    }
+                }
+            );
+            exec.allowCoreThreadTimeOut(true);
+            subscriberExecutor = exec;
+        }
+        return subscriberExecutor;
+    }
+
+    private void closeSubscriber(SubscriberSession session) {
+        if (session == null) return;
+        subscribers.remove(session);
+        activeClientSockets.remove(session.socket);
+        try {
+            session.socket.close();
+        } catch (Exception ignored) {
+        }
     }
 
     private synchronized void stopSocketServer() {
@@ -792,50 +1037,166 @@ public final class PushNotificationService extends NotificationListenerService {
             }
         } catch (Exception ignored) {
         }
-        streamClients.clear();
+        for (SubscriberSession sub : subscribers) {
+            closeSubscriber(sub);
+        }
+        subscribers.clear();
+        for (LocalSocket client : activeClientSockets) {
+            try {
+                client.close();
+            } catch (Exception ignored) {
+            }
+        }
+        activeClientSockets.clear();
+        if (subscriberExecutor != null) {
+            subscriberExecutor.shutdownNow();
+            subscriberExecutor = null;
+        }
+        if (socketClientExecutor != null) {
+            socketClientExecutor.shutdownNow();
+            socketClientExecutor = null;
+        }
     }
 
-    private void handleLocalSocketClient(LocalSocket client) {
-        BufferedWriter writer = null;
-        try {
-            Credentials creds = client.getPeerCredentials();
-            int uid = creds.getUid();
-            if (uid != 2000 && uid != Process.myUid()) {
-                client.close();
-                return;
-            }
-            BufferedReader reader = new BufferedReader(
-                new InputStreamReader(client.getInputStream(), StandardCharsets.UTF_8)
-            );
-            writer = new BufferedWriter(
-                new OutputStreamWriter(client.getOutputStream(), StandardCharsets.UTF_8)
-            );
+    private JSONObject dispatchSocketJsonRequest(JSONObject req) throws Exception {
+        String op = req.optString("op", "");
+        JSONObject response;
+        if ("expansion_call".equals(op)
+                || op.startsWith("expansion:")
+                || "expansion".equals(req.optString("provider", ""))) {
+            response = handleExpansionSocketRequest(req);
+        } else {
+            response = PushControlProvider.handleRequest(this, req, false);
+        }
+        if (req.has("reqId")) {
+            response.put("reqId", req.opt("reqId"));
+        }
+        return response;
+    }
 
-            String line;
-            while (running && (line = reader.readLine()) != null) {
+    private boolean handOffSubscriber(
+            final LocalSocket client,
+            final McpRoutePolicy.BoundedUtf8LineReader reader,
+            final BufferedWriter writer) {
+        if (!running) return false;
+        while (subscribers.size() >= MAX_SUBSCRIBERS) {
+            SubscriberSession oldest = subscribers.isEmpty() ? null : subscribers.get(0);
+            if (oldest == null) break;
+            closeSubscriber(oldest);
+        }
+        final SubscriberSession session = new SubscriberSession(client, writer);
+        subscribers.add(session);
+        try {
+            ensureSubscriberExecutor().execute(new Runnable() {
+                @Override
+                public void run() {
+                    runSubscriberLoop(session, reader);
+                }
+            });
+            return true;
+        } catch (Throwable rejected) {
+            subscribers.remove(session);
+            return false;
+        }
+    }
+
+    private void runSubscriberLoop(SubscriberSession session, McpRoutePolicy.BoundedUtf8LineReader reader) {
+        int idleTimeouts = 0;
+        try {
+            while (running && subscribers.contains(session)) {
+                final String line;
+                try {
+                    line = reader.readLine();
+                    idleTimeouts = 0;
+                } catch (SocketTimeoutException timeout) {
+                    if (!running) break;
+                    if (++idleTimeouts >= 3) {
+                        idleTimeouts = 0;
+                        synchronized (session.writer) {
+                            session.writer.write('\n');
+                            session.writer.flush();
+                        }
+                    }
+                    continue;
+                }
+                if (line == null) break;
                 String trimmed = line.trim();
                 if (trimmed.isEmpty()) continue;
                 JSONObject response;
                 try {
                     JSONObject req = new JSONObject(trimmed);
-                    String op = req.optString("op", "");
-                    if ("subscribe".equals(op)) {
-                        streamClients.addIfAbsent(writer);
+                    if ("subscribe".equals(req.optString("op", ""))) {
                         response = new JSONObject()
                             .put("ok", true)
                             .put("subscribed", true)
                             .put("revision", PushStore.get(this).getRevision());
-                    } else if ("expansion_call".equals(op)
-                            || op.startsWith("expansion:")
-                            || "expansion".equals(req.optString("provider", ""))) {
-                        response = handleExpansionSocketRequest(req);
+                        if (req.has("reqId")) response.put("reqId", req.opt("reqId"));
                     } else {
-                        response = PushControlProvider.handleRequest(this, req);
-                    }
-                    if (req.has("reqId")) {
-                        response.put("reqId", req.opt("reqId"));
+                        response = dispatchSocketJsonRequest(req);
                     }
                 } catch (Exception e) {
+                    response = new JSONObject()
+                        .put("ok", false)
+                        .put("error", String.valueOf(e.getMessage()));
+                }
+                synchronized (session.writer) {
+                    session.writer.write(response.toString());
+                    session.writer.write('\n');
+                    session.writer.flush();
+                }
+            }
+        } catch (Exception ignored) {
+        } finally {
+            closeSubscriber(session);
+        }
+    }
+
+    private void handleLocalSocketClient(LocalSocket client) {
+        BufferedWriter writer = null;
+        boolean handedOffToSubscriber = false;
+        try {
+            client.setSoTimeout(SOCKET_READ_TIMEOUT_MS);
+            Credentials creds = client.getPeerCredentials();
+            int uid = creds.getUid();
+            if (uid != 2000 && uid != Process.myUid()) {
+                return;
+            }
+            McpRoutePolicy.BoundedUtf8LineReader reader = new McpRoutePolicy.BoundedUtf8LineReader(
+                client.getInputStream(), MAX_SOCKET_LINE_BYTES
+            );
+            writer = new BufferedWriter(
+                new OutputStreamWriter(client.getOutputStream(), StandardCharsets.UTF_8)
+            );
+
+            while (running) {
+                final String line;
+                try {
+                    line = reader.readLine();
+                } catch (SocketTimeoutException timeout) {
+                    break;
+                }
+                if (line == null) break;
+                String trimmed = line.trim();
+                if (trimmed.isEmpty()) continue;
+                JSONObject response;
+                boolean subscribeRequested = false;
+                try {
+                    JSONObject req = new JSONObject(trimmed);
+                    String op = req.optString("op", "");
+                    if ("subscribe".equals(op)) {
+                        subscribeRequested = true;
+                        response = new JSONObject()
+                            .put("ok", true)
+                            .put("subscribed", true)
+                            .put("revision", PushStore.get(this).getRevision());
+                        if (req.has("reqId")) {
+                            response.put("reqId", req.opt("reqId"));
+                        }
+                    } else {
+                        response = dispatchSocketJsonRequest(req);
+                    }
+                } catch (Exception e) {
+                    subscribeRequested = false;
                     response = new JSONObject()
                         .put("ok", false)
                         .put("error", String.valueOf(e.getMessage()));
@@ -845,15 +1206,19 @@ public final class PushNotificationService extends NotificationListenerService {
                     writer.write('\n');
                     writer.flush();
                 }
+                if (subscribeRequested) {
+                    handedOffToSubscriber = handOffSubscriber(client, reader, writer);
+                    break;
+                }
             }
         } catch (Exception ignored) {
         } finally {
-            if (writer != null) {
-                streamClients.remove(writer);
-            }
-            try {
-                client.close();
-            } catch (Exception ignored) {
+            if (!handedOffToSubscriber) {
+                activeClientSockets.remove(client);
+                try {
+                    client.close();
+                } catch (Exception ignored) {
+                }
             }
         }
     }
@@ -902,21 +1267,21 @@ public final class PushNotificationService extends NotificationListenerService {
     }
 
     void broadcastDelta(JSONObject delta) {
-        if (delta == null || streamClients.isEmpty()) return;
+        if (delta == null || subscribers.isEmpty()) return;
         final String payload = delta.toString();
         try {
-            deltaExecutor.execute(new Runnable() {
+            ensureDeltaExecutor().execute(new Runnable() {
                 @Override
                 public void run() {
-                    for (BufferedWriter writer : streamClients) {
+                    for (SubscriberSession session : subscribers) {
                         try {
-                            synchronized (writer) {
-                                writer.write(payload);
-                                writer.write('\n');
-                                writer.flush();
+                            synchronized (session.writer) {
+                                session.writer.write(payload);
+                                session.writer.write('\n');
+                                session.writer.flush();
                             }
                         } catch (Exception broken) {
-                            streamClients.remove(writer);
+                            closeSubscriber(session);
                         }
                     }
                 }

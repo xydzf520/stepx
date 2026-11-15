@@ -1,9 +1,6 @@
 //! Live cellular call audio over an authenticated, dedicated ADB stream.
 //! No recordings, Bluetooth pairing, model service, or shared message socket.
-use crate::{
-    adb::Adb,
-    device::{Device, TransportMutationGuard},
-};
+use crate::{adb::Adb, device::Device};
 use anyhow::{bail, ensure, Context, Result};
 use std::{
     io::{BufRead, BufReader, Read, Write},
@@ -16,23 +13,140 @@ use std::{
     time::{Duration, Instant},
 };
 
+const UPLINK_PCM_FRAME_BYTES: usize = 640; // 20ms @ 16kHz mono s16le
+const UPLINK_SILENCE_KEEPALIVE: Duration = Duration::from_millis(200);
+
 #[derive(Clone, Debug, Default)]
 pub struct Capabilities {
     pub supported: bool,
     pub reason: String,
 }
 
-fn local_audio_commands() -> Result<(std::path::PathBuf, std::path::PathBuf)> {
-    ensure!(
-        cfg!(target_os = "linux"),
-        "当前电脑平台尚未接入双向通话音频，请使用手机接听"
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AudioCommandSpec {
+    program: PathBuf,
+    args: Vec<String>,
+    pipewire_native: bool,
+}
+
+impl AudioCommandSpec {
+    fn command_for_source(&self, source: Option<&str>) -> Command {
+        let mut cmd = Command::new(&self.program);
+        cmd.args(&self.args);
+        if self.pipewire_native {
+            if let Some(src) = source.filter(|s| !s.is_empty()) {
+                cmd.args(["--target", src]);
+            }
+            cmd.arg("-");
+        } else if let Some(src) = source.filter(|s| !s.is_empty()) {
+            cmd.arg(format!("--device={src}"));
+        }
+        cmd
+    }
+}
+
+fn find_audio_tool(name: &str) -> Option<PathBuf> {
+    crate::adb::bundled_tool(name)
+        .or_else(|| crate::adb::find_executable(name))
+        .or_else(|| crate::adb::platform_tool_candidate(name))
+}
+
+fn pulse_stream_args(extra_flag: Option<&str>) -> Vec<String> {
+    let mut out = Vec::with_capacity(8);
+    if let Some(flag) = extra_flag {
+        out.push(flag.to_string());
+    }
+    out.extend(
+        [
+            "--raw",
+            "--format=s16le",
+            "--rate=16000",
+            "--channels=1",
+            "--latency-msec=40",
+            "--client-name=StepX Call",
+            "--property=media.role=phone",
+        ]
+        .into_iter()
+        .map(str::to_owned),
     );
-    let find = |name| {
-        crate::adb::bundled_tool(name)
-            .or_else(|| crate::adb::platform_tool_candidate(name))
-            .with_context(|| format!("电脑缺少 {name} 音频组件，请使用手机接听"))
+    out
+}
+
+fn pipewire_stream_args(mode_flag: &str) -> Vec<String> {
+    [
+        mode_flag,
+        "--raw",
+        "--format=s16",
+        "--rate=16000",
+        "--channels=1",
+        "--latency=40ms",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn resolve_local_audio_backends_with(
+    is_linux: bool,
+    mut lookup: impl FnMut(&str) -> Option<PathBuf>,
+) -> std::result::Result<(AudioCommandSpec, AudioCommandSpec, PathBuf), String> {
+    if !is_linux {
+        return Err("当前电脑平台尚未接入双向通话音频，请使用手机接听".into());
+    }
+    let record = if let Some(program) = lookup("parec") {
+        AudioCommandSpec {
+            program,
+            args: pulse_stream_args(None),
+            pipewire_native: false,
+        }
+    } else if let Some(program) = lookup("pacat") {
+        AudioCommandSpec {
+            program,
+            args: pulse_stream_args(Some("--record")),
+            pipewire_native: false,
+        }
+    } else if let Some(program) = lookup("pw-cat") {
+        AudioCommandSpec {
+            program,
+            args: pipewire_stream_args("--record"),
+            pipewire_native: true,
+        }
+    } else {
+        return Err("电脑缺少 parec / pacat / pw-cat 麦克风音频组件，请使用手机接听".into());
     };
-    Ok((find("parec")?, find("paplay")?))
+
+    let play = if let Some(program) = lookup("paplay") {
+        AudioCommandSpec {
+            program,
+            args: pulse_stream_args(None),
+            pipewire_native: false,
+        }
+    } else if let Some(program) = lookup("pacat") {
+        AudioCommandSpec {
+            program,
+            args: pulse_stream_args(Some("--playback")),
+            pipewire_native: false,
+        }
+    } else if let Some(program) = lookup("pw-cat") {
+        AudioCommandSpec {
+            program,
+            args: pipewire_stream_args("--playback"),
+            pipewire_native: true,
+        }
+    } else {
+        return Err("电脑缺少 paplay / pacat / pw-cat 扬声器音频组件，请使用手机接听".into());
+    };
+
+    let pactl = lookup("pactl")
+        .ok_or_else(|| "电脑缺少输入设备检查组件（pactl），请使用手机接听".to_string())?;
+
+    Ok((record, play, pactl))
+}
+
+/// Fast, non-blocking preflight check verifying that desktop speaker/mic audio
+/// routing binaries are installed locally without spawning any blocking IPC.
+pub fn preflight_check() -> std::result::Result<(), String> {
+    resolve_local_audio_backends_with(cfg!(target_os = "linux"), find_audio_tool).map(|_| ())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,11 +156,6 @@ struct Microphone {
 }
 
 const INPUT_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-
-fn pactl_command() -> Result<PathBuf> {
-    crate::adb::find_executable("pactl")
-        .context("电脑缺少输入设备检查组件，请使用手机接听")
-}
 
 fn pulse_read(pactl: &Path, args: &[&str], deadline: Instant) -> Result<Vec<u8>> {
     let remaining = deadline.saturating_duration_since(Instant::now());
@@ -139,13 +248,19 @@ fn validate_microphone(microphone: &Microphone, sources: &[serde_json::Value]) -
 }
 
 pub fn capabilities(adb: &Adb, device: &Device) -> Result<Capabilities> {
-    if let Err(error) = local_audio_commands() {
-        return Ok(Capabilities {
-            supported: false,
-            reason: error.to_string(),
-        });
-    }
-    if let Err(error) = pactl_command().and_then(|pactl| inspect_microphone(&pactl)) {
+    let (_, _, pactl) = match resolve_local_audio_backends_with(
+        cfg!(target_os = "linux"),
+        find_audio_tool,
+    ) {
+        Ok(backends) => backends,
+        Err(reason) => {
+            return Ok(Capabilities {
+                supported: false,
+                reason,
+            });
+        }
+    };
+    if let Err(error) = inspect_microphone(&pactl) {
         return Ok(Capabilities { supported: false, reason: error.to_string() });
     }
     let value = crate::bridge::call_bridge(
@@ -179,7 +294,6 @@ pub struct CallAudioSession {
     observed_uplink: u64,
     progressed_at: std::time::Instant,
     uplink_progressed_at: std::time::Instant,
-    _lease: Option<TransportMutationGuard>,
 }
 impl Drop for CallAudioSession {
     fn drop(&mut self) {
@@ -188,7 +302,6 @@ impl Drop for CallAudioSession {
             let _ = child.kill();
         }
         let mut children = std::mem::take(&mut self.children);
-        let lease = self._lease.take();
         // Drop runs on the UI thread on cancel/device switch. Never wait for
         // an OS process there: even a killed child can be stuck in kernel I/O.
         let _ = std::thread::Builder::new().name("stepx-call-audio-cleanup".into()).spawn(move || {
@@ -199,12 +312,15 @@ impl Drop for CallAudioSession {
             }
             // A failed OS process must not hold off data-connection recovery
             // forever. Reap any remaining child in this background worker.
-            drop(lease);
             for child in &mut children { let _ = child.wait(); }
         });
     }
 }
 impl CallAudioSession {
+    pub fn preflight_check() -> std::result::Result<(), String> {
+        preflight_check()
+    }
+
     pub fn running(&mut self) -> bool {
         let down = self.downlink.load(Ordering::Relaxed);
         let up = self.uplink.load(Ordering::Relaxed);
@@ -248,8 +364,22 @@ impl CallAudioSession {
         running: Arc<AtomicBool>,
     ) -> Result<Self> {
         ensure_audio_requested(&running)?;
-        let (record, play) = local_audio_commands()?;
-        let pactl = pactl_command()?;
+        let (record, play, pactl) =
+            resolve_local_audio_backends_with(cfg!(target_os = "linux"), find_audio_tool)
+                .map_err(|msg| anyhow::anyhow!("{msg}"))?;
+        Self::start_cancellable_with_backends(adb, device, call_id, running, record, play, pactl)
+    }
+
+    fn start_cancellable_with_backends(
+        adb: &Adb,
+        device: &Device,
+        call_id: &str,
+        running: Arc<AtomicBool>,
+        record: AudioCommandSpec,
+        play: AudioCommandSpec,
+        pactl: PathBuf,
+    ) -> Result<Self> {
+        ensure_audio_requested(&running)?;
         let microphone = inspect_microphone(&pactl)?;
         ensure_audio_requested(&running)?;
         let transport = device.resolve_active_transport(adb)?;
@@ -258,10 +388,12 @@ impl CallAudioSession {
             current.id == call_id && current.state == "active" && !current.multiple_calls,
             "这次通话已结束或变化"
         );
+        // Hold the transport mutation guard ONLY while ensuring/pushing the bridge jar
+        // and completing the initial `Bridge --call-audio` handshake, then drop it before
+        // entering the long-lived audio streaming loop so Hangup/SMS/other mutations are never starved.
+        let startup_lease = crate::device::protect_transport_mutation(&device.serial)?;
         crate::bridge::ensure_bridge_jar(adb, device)?;
         ensure_audio_requested(&running)?;
-        // Keep connection repair from interrupting a live audio stream. Other reads remain concurrent.
-        let lease = crate::device::protect_transport_mutation(&device.serial)?;
         let current = crate::push::fetch_live_call(adb, &transport)?;
         ensure!(current.id == call_id && current.state == "active" && !current.multiple_calls,
             "这次通话已结束或变化");
@@ -280,21 +412,10 @@ impl CallAudioSession {
             observed_uplink: 0,
             progressed_at: std::time::Instant::now(),
             uplink_progressed_at: std::time::Instant::now(),
-            _lease: Some(lease),
         };
-        let args = [
-            "--raw",
-            "--format=s16le",
-            "--rate=16000",
-            "--channels=1",
-            "--latency-msec=40",
-            "--client-name=StepX Call",
-            "--property=media.role=phone",
-        ];
         session.children.push(
-            Command::new(record)
-                .args(args)
-                .arg(format!("--device={}", session.microphone.source))
+            record
+                .command_for_source(Some(&session.microphone.source))
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
@@ -302,8 +423,7 @@ impl CallAudioSession {
                 .context("无法启动电脑麦克风")?,
         );
         session.children.push(
-            Command::new(play)
-                .args(args)
+            play.command_for_source(None)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -344,11 +464,14 @@ impl CallAudioSession {
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => (),
             }
         }
+        // Release the per-device mutation guard now that bridge/stream startup is complete.
+        drop(startup_lease);
+
         let mic = session.children[0].stdout.take().unwrap();
         let speaker = session.children[1].stdin.take().unwrap();
         let input = session.children[2].stdin.take().unwrap();
         let output = session.children[2].stdout.take().unwrap();
-        pump(mic, input, session.running.clone(), session.uplink.clone());
+        pump_uplink(mic, input, session.running.clone(), session.uplink.clone());
         pump(
             output,
             speaker,
@@ -397,6 +520,69 @@ fn ensure_audio_requested(running: &AtomicBool) -> Result<()> {
     ensure!(running.load(Ordering::Relaxed), "电脑音频连接已取消；请在手机继续通话");
     Ok(())
 }
+
+/// Uplink pump with corked/idle-mic silence keepalive:
+/// whenever local capture yields no audio bytes for `>= 200ms` while the session is active,
+/// sends a 20ms zero-PCM silence frame (`640` zero bytes for 16kHz mono s16le) so Android's
+/// `CallAudioTools` reader never times out and drops downlink audio.
+fn pump_uplink(
+    mut source: impl Read + Send + 'static,
+    mut target: impl Write + Send + 'static,
+    running: Arc<AtomicBool>,
+    counter: Arc<AtomicU64>,
+) -> std::thread::JoinHandle<()> {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(32);
+    let reader_running = running.clone();
+    std::thread::spawn(move || {
+        let mut bytes = [0u8; UPLINK_PCM_FRAME_BYTES];
+        while reader_running.load(Ordering::Relaxed) {
+            match source.read(&mut bytes) {
+                Ok(count) if count > 0 => {
+                    if tx.send(bytes[..count].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Ok(_) => break,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    });
+
+    std::thread::spawn(move || {
+        let silence = [0u8; UPLINK_PCM_FRAME_BYTES];
+        while running.load(Ordering::Relaxed) {
+            match rx.recv_timeout(UPLINK_SILENCE_KEEPALIVE) {
+                Ok(chunk) => {
+                    if target
+                        .write_all(&chunk)
+                        .and_then(|_| target.flush())
+                        .is_err()
+                    {
+                        break;
+                    }
+                    counter.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if !running.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if target
+                        .write_all(&silence)
+                        .and_then(|_| target.flush())
+                        .is_err()
+                    {
+                        break;
+                    }
+                    counter.fetch_add(silence.len() as u64, Ordering::Relaxed);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        running.store(false, Ordering::Relaxed);
+    })
+}
+
 fn pump(
     mut source: impl Read + Send + 'static,
     mut target: impl Write + Send + 'static,
@@ -404,7 +590,7 @@ fn pump(
     counter: Arc<AtomicU64>,
 ) {
     std::thread::spawn(move || {
-        let mut bytes = [0u8; 640];
+        let mut bytes = [0u8; UPLINK_PCM_FRAME_BYTES];
         while running.load(Ordering::Relaxed) {
             match source.read(&mut bytes) {
                 Ok(count) if count > 0 => {
@@ -525,5 +711,264 @@ esac
         let active = Arc::new(AtomicBool::new(false));
         let result = CallAudioSession::start_cancellable(&adb, &Device::default(), "call", active);
         assert!(result.err().unwrap().to_string().contains("已取消"));
+    }
+
+    #[test]
+    fn preflight_check_validates_speaker_mic_and_pactl_without_blocking() {
+        let bin = |name: &str| PathBuf::from(format!("/usr/bin/{name}"));
+
+        // PulseAudio classic tools (`parec` + `paplay` + `pactl`)
+        assert!(resolve_local_audio_backends_with(true, |t| {
+            matches!(t, "parec" | "paplay" | "pactl").then(|| bin(t))
+        })
+        .is_ok());
+
+        // Unified `pacat` (`--record` / `--playback`) + `pactl`
+        let (rec, play, _) = resolve_local_audio_backends_with(true, |t| {
+            matches!(t, "pacat" | "pactl").then(|| bin(t))
+        })
+        .unwrap();
+        assert!(rec.args.iter().any(|a| a == "--record"));
+        assert!(play.args.iter().any(|a| a == "--playback"));
+
+        // PipeWire native `pw-cat` + `pactl`
+        let (pw_rec, pw_play, _) = resolve_local_audio_backends_with(true, |t| {
+            matches!(t, "pw-cat" | "pactl").then(|| bin(t))
+        })
+        .unwrap();
+        assert!(pw_rec.pipewire_native && pw_play.pipewire_native);
+
+        // Missing capture, playback, pactl, or unsupported OS must return descriptive errors
+        assert!(resolve_local_audio_backends_with(true, |t| {
+            matches!(t, "paplay" | "pactl").then(|| bin(t))
+        })
+        .is_err());
+        assert!(resolve_local_audio_backends_with(true, |t| {
+            matches!(t, "parec" | "pactl").then(|| bin(t))
+        })
+        .is_err());
+        assert!(resolve_local_audio_backends_with(true, |t| {
+            matches!(t, "parec" | "paplay").then(|| bin(t))
+        })
+        .is_err());
+        assert!(resolve_local_audio_backends_with(false, |t| Some(bin(t))).is_err());
+    }
+
+    #[test]
+    fn corked_mic_sends_20ms_zero_pcm_silence_keepalive_every_200ms() {
+        struct CorkedMicReader {
+            stop_rx: std::sync::mpsc::Receiver<()>,
+        }
+        impl Read for CorkedMicReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                let _ = self.stop_rx.recv();
+                Ok(0)
+            }
+        }
+
+        #[derive(Clone, Default)]
+        struct SharedSink(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for SharedSink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        let sink = SharedSink::default();
+        let running = Arc::new(AtomicBool::new(true));
+        let counter = Arc::new(AtomicU64::new(0));
+
+        let handle = pump_uplink(
+            CorkedMicReader { stop_rx },
+            sink.clone(),
+            running.clone(),
+            counter.clone(),
+        );
+
+        std::thread::sleep(Duration::from_millis(470));
+        running.store(false, Ordering::Relaxed);
+        drop(stop_tx);
+        handle.join().unwrap();
+
+        let written = sink.0.lock().unwrap().clone();
+        assert!(
+            written.len() >= 1280 && written.len() % UPLINK_PCM_FRAME_BYTES == 0,
+            "expected >=2 20ms silence frames (640B each), got {} bytes",
+            written.len()
+        );
+        assert!(
+            written.iter().all(|&b| b == 0),
+            "corked-mic keepalive frames must be pure zero PCM"
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), written.len() as u64);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_call_audio_session_drops_mutation_guard_after_startup_and_survives_corked_mic() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::os::unix::fs::PermissionsExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stop_server = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop_server.clone();
+        listener.set_nonblocking(true).unwrap();
+        let push_server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            while !stop_clone.load(Ordering::Acquire) && Instant::now() < deadline {
+                let stream = match listener.accept() {
+                    Ok((s, _)) => s,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let resp = json!({
+                    "ok": true,
+                    "available": true,
+                    "id": "call-guard-test",
+                    "state": "active",
+                    "multiple_calls": false,
+                    "observed_ms": now_ms
+                });
+                let mut out = serde_json::to_vec(&resp).unwrap();
+                out.push(b'\n');
+                let _ = (&stream).write_all(&out);
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let write_exe = |name: &str, body: &str| -> PathBuf {
+            let p = dir.path().join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+
+        let pactl = write_exe(
+            "pactl",
+            r#"case "$*" in
+  'get-default-source') printf 'corked-mic\n';;
+  '--format=json list sources') printf '[{"name":"corked-mic","description":"Desktop Mic","state":"SUSPENDED","mute":false}]\n';;
+  *) exit 1;;
+esac"#,
+        );
+        // Corked mic: stays open without writing any PCM bytes!
+        let parec = write_exe("parec", "sleep 10");
+        let paplay = write_exe("paplay", "cat >/dev/null");
+        let serial = "CALLAUDIOHWSERIAL01";
+        let endpoint = "192.0.2.212:40101";
+        let reconnect_marker = dir.path().join("reconnected");
+        let fake_adb = write_exe(
+            "adb",
+            &format!(
+                r#"case "$*" in
+  "devices -l")
+    printf 'List of devices attached\n{endpoint} device\n'
+    exit 0
+    ;;
+  *"shell getprop ro.serialno"*)
+    printf '{serial}\n'
+    exit 0
+    ;;
+  *"forward tcp:0 localabstract:stepx_push_v1"*)
+    printf '{port}\n'
+    exit 0
+    ;;
+  *"stat -c %s"*)
+    printf 'READY'
+    exit 0
+    ;;
+  *"--call-audio"*)
+    printf 'STEPX_CALL_AUDIO_READY\n' >&2
+    head -c 1920 /dev/zero
+    cat >/dev/null
+    exit 0
+    ;;
+esac
+exit 0"#,
+            ),
+        );
+
+        let device = Device {
+            transport: endpoint.into(),
+            serial: serial.into(),
+            ..Default::default()
+        };
+        crate::bridge::mark_bridge_jar_cached(endpoint);
+        crate::bridge::mark_bridge_jar_cached(serial);
+
+        let (record_spec, play_spec, pactl_path) = resolve_local_audio_backends_with(true, |t| {
+            match t {
+                "parec" => Some(parec.clone()),
+                "paplay" => Some(paplay.clone()),
+                "pactl" => Some(pactl.clone()),
+                _ => None,
+            }
+        })
+        .unwrap();
+
+        let mut session = CallAudioSession::start_cancellable_with_backends(
+            &Adb { path: fake_adb },
+            &device,
+            "call-guard-test",
+            Arc::new(AtomicBool::new(true)),
+            record_spec,
+            play_spec,
+            pactl_path,
+        )
+        .expect("call audio session should connect using corked-mic keepalive");
+
+        assert!(session.running());
+        let (up, down) = session.bytes();
+        assert!(up >= 640 && down >= 640, "expected >=640B both ways, got ({up}, {down})");
+
+        // CRITICAL [P0-4]: While `session` is still active, TransportMutationGuard MUST already be dropped!
+        // `recover_transport` calls `begin_host_session_repair`, which returns `None` if `writes > 0`.
+        let repair_adb = write_exe(
+            "repair_adb",
+            &format!(
+                r#"case "$*" in
+  "devices -l") printf 'List of devices attached\n{endpoint} device\n';;
+  "-s {endpoint} shell getprop ro.serialno") if [ -f '{marker}' ]; then echo {serial}; else exit 1; fi;;
+  "disconnect {endpoint}") exit 0;;
+  "connect {endpoint}") touch '{marker}';;
+  *) exit 1;;
+esac"#,
+                marker = reconnect_marker.display()
+            ),
+        );
+        assert_eq!(
+            crate::device::recover_transport(
+                &Adb { path: repair_adb },
+                endpoint,
+                Duration::from_secs(4)
+            )
+            .as_deref(),
+            Some(endpoint),
+            "CallAudioSession must release TransportMutationGuard right after startup so mutations/recovery are not starved"
+        );
+        {
+            let _other_mutation = crate::device::protect_transport_mutation(serial)
+                .expect("Concurrent Hangup/SMS mutations must succeed during active call audio");
+        }
+
+        drop(session);
+        stop_server.store(true, Ordering::Release);
+        let _ = push_server.join();
     }
 }

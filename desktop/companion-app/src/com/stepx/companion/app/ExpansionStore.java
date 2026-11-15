@@ -36,6 +36,7 @@ final class ExpansionStore {
     private final File sharedRoot=Environment.getExternalStorageDirectory();
     static final class Db extends SQLiteOpenHelper {
         Db(Context c){super(c,"expansion.db",null,2,new android.database.DatabaseErrorHandler(){public void onCorruption(SQLiteDatabase broken){throw new SQLiteDatabaseCorruptException("扩容数据库损坏，保留原件等待恢复");}});setWriteAheadLoggingEnabled(true);}
+        @Override public void onConfigure(SQLiteDatabase d){super.onConfigure(d);d.enableWriteAheadLogging();try(Cursor c=d.rawQuery("PRAGMA busy_timeout=3000",null)){if(c!=null)c.moveToFirst();}}
         public void onCreate(SQLiteDatabase d){d.execSQL("CREATE TABLE files (id TEXT PRIMARY KEY, path TEXT, name TEXT, kind TEXT, state TEXT, desktop TEXT, size INTEGER, modified INTEGER, updated INTEGER, body TEXT)");d.execSQL("CREATE INDEX by_path ON files(path)");d.execSQL("CREATE TABLE requests (id TEXT PRIMARY KEY, mode TEXT, state TEXT, error TEXT, updated INTEGER)");indices(d);}
         private void indices(SQLiteDatabase d){d.execSQL("CREATE INDEX IF NOT EXISTS files_state_date ON files(state,modified,id)");d.execSQL("CREATE INDEX IF NOT EXISTS files_state_kind_date ON files(state,kind,modified,id)");d.execSQL("CREATE INDEX IF NOT EXISTS requests_state_updated ON requests(state,updated)");}
         public void onUpgrade(SQLiteDatabase d,int old,int next){if(old<2)indices(d);}

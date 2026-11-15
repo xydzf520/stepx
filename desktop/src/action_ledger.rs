@@ -8,6 +8,7 @@ use std::{collections::BTreeSet, fs,  path::{Path, PathBuf}};
 const MAX_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_ACTIONS: usize = 2048;
 const MAX_HISTORY: usize = 1024;
+const UNCONFIRMED_RETENTION_MS: i64 = 90 * 86_400_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -146,30 +147,53 @@ fn write(dir: &Path, snapshot: &Snapshot) -> Result<()> {
     crate::data_store::write(&path, snapshot)?;
     Ok(())
 }
-/// Persist the actual changed actions and scalar revisions in one transaction.
+/// Persist the actual changed/removed actions and scalar revisions in one transaction.
 /// Complete source/history validation still precedes this write boundary.
-fn write_actions(dir: &Path, snapshot: &Snapshot, ids: &BTreeSet<String>) -> Result<()> {
+fn write_actions_with_removals(
+    dir: &Path,
+    snapshot: &Snapshot,
+    ids: &BTreeSet<String>,
+    removed_ids: &BTreeSet<String>,
+) -> Result<()> {
     let path = dir.join("ledger.json"); checked_file(&path)?;
     let Some(mut head) = crate::data_store::read_head(&path)? else {return write(dir,snapshot);};
     ensure!(head.value.get("revision").and_then(serde_json::Value::as_u64) == snapshot.revision.checked_sub(1), "行动状态已变化，请刷新后再操作；未覆盖新状态");
     let mut changes = Vec::new();
-    let mut added_bytes = 0usize;
+    let mut net_bytes = 0isize;
     for action in snapshot.actions.iter().filter(|action|ids.contains(&action.id)) {
         let value=serde_json::to_value(action)?;
         let old_size=crate::data_store::record(&path,"actions",&action.id)?.map(|old|serde_json::to_vec(&old).map(|bytes|bytes.len())).transpose()?.unwrap_or(0);
-        added_bytes=added_bytes.saturating_add(serde_json::to_vec(&value)?.len().saturating_sub(old_size));
+        let new_size=serde_json::to_vec(&value)?.len();
+        net_bytes = net_bytes.saturating_add(new_size as isize - old_size as isize);
         changes.push(crate::data_store::RecordChange {section:"actions",id:&action.id,position:None,value});
+    }
+    let mut deletes = Vec::with_capacity(removed_ids.len());
+    for rem_id in removed_ids {
+        ensure!(
+            !ids.contains(rem_id) && !snapshot.actions.iter().any(|a| &a.id == rem_id),
+            "行动删除集合与保留记录冲突，原记录未覆盖"
+        );
+        let old_size = crate::data_store::record(&path, "actions", rem_id)?
+            .map(|old| serde_json::to_vec(&old).map(|bytes| bytes.len()))
+            .transpose()?
+            .unwrap_or(0);
+        net_bytes = net_bytes.saturating_sub(old_size as isize);
+        deletes.push(("actions", rem_id.as_str()));
     }
     ensure!(changes.len()==ids.len() && snapshot.actions.len()<=MAX_ACTIONS,"行动变更集合无效或达到容量上限，原记录未覆盖");
     let name = crate::data_store::key(&path)?;
     let stored_bytes: i64 = crate::data_store::with_connection(&crate::data_store::database_for(&path), |c| Ok(c.query_row(
         "SELECT COALESCE(SUM(length(CAST(body AS BLOB))),0)+count(*) FROM records WHERE snapshot=?",[name],|r|r.get(0))?))?;
-    ensure!(stored_bytes as u64 + added_bytes as u64 + serde_json::to_vec(&head.value)?.len() as u64 + 1024 <= MAX_BYTES, "行动账本达到容量上限，原记录未覆盖");
+    let projected = (stored_bytes.saturating_add(net_bytes as i64)).max(0) as u64;
+    ensure!(projected + serde_json::to_vec(&head.value)?.len() as u64 + 1024 <= MAX_BYTES, "行动账本达到容量上限，原记录未覆盖");
     head.value["revision"] = snapshot.revision.into();
     head.value["progress_revision"] = snapshot.progress_revision.into();
     head.value["updated_ms"] = snapshot.updated_ms.into();
-    crate::data_store::apply_delta(&path,head.revision,Some(&head.value),&changes,&[])?;
+    crate::data_store::apply_delta(&path,head.revision,Some(&head.value),&changes,&deletes)?;
     Ok(())
+}
+fn write_actions(dir: &Path, snapshot: &Snapshot, ids: &BTreeSet<String>) -> Result<()> {
+    write_actions_with_removals(dir, snapshot, ids, &BTreeSet::new())
 }
 fn write_action(dir:&Path,snapshot:&Snapshot,id:&str)->Result<()> {
     write_actions(dir,snapshot,&BTreeSet::from([id.to_owned()]))
@@ -234,8 +258,15 @@ pub(crate) fn sync_validated_draft(root: &Path, device: &str, account: Option<&s
     let scope = scope(device, account)?;
     ensure!(request.scope_id == scope, "候选行动不属于当前设备和账号");
     let dir = checked_dir(root, &scope, true)?.expect("created"); let _lock = lock(&dir)?;
-    let mut snapshot = read(&dir, &scope)?; let mut changed = BTreeSet::new(); let mut progress_changed = false;
-    let source_view=context_ledger::action_source_view(root,device,account)?;
+    let mut snapshot = read(&dir, &scope)?;
+    let mut changed = BTreeSet::new();
+    let mut removed = BTreeSet::new();
+    let mut progress_changed = false;
+    let source_view = context_ledger::action_source_view(root, device, account)?;
+    let target_key = request.target.key();
+
+    let mut prepared = Vec::with_capacity(draft.todos.len());
+    let mut matched_ids = BTreeSet::new();
     for todo in &draft.todos {
         let mut matters: Vec<String> = todo.evidence.iter().filter_map(|reference|
             request.sources.iter().find(|source| source.id == reference.id)
@@ -244,6 +275,45 @@ pub(crate) fn sync_validated_draft(root: &Path, device: &str, account: Option<&s
         // A previous generated action/status cannot propose another action by itself.
         if matters.is_empty() { continue; }
         let id = action_id(&scope, &matters, &todo.action);
+        matched_ids.insert(id.clone());
+        prepared.push((id, matters, todo));
+    }
+
+    // 1. Prune Candidate/Dismissed entries older than 90 days, AND retire unconfirmed
+    //    State::Candidate entries whose origins belong exclusively to request.target
+    //    from an older input_revision and are no longer matched in the new draft.
+    let on_disk_ids: BTreeSet<String> = snapshot.actions.iter().map(|a| a.id.clone()).collect();
+    snapshot.actions.retain(|action| {
+        if matched_ids.contains(&action.id) {
+            return true;
+        }
+        let last_touch_ms = action
+            .history
+            .last()
+            .map(|c| c.at_ms)
+            .unwrap_or(action.last_seen_ms)
+            .max(action.last_seen_ms);
+        let expired_unconfirmed = matches!(action.state, State::Candidate | State::Dismissed)
+            && at_ms > 0
+            && last_touch_ms > 0
+            && at_ms.saturating_sub(last_touch_ms) > UNCONFIRMED_RETENTION_MS;
+        let superseded_same_target_candidate = action.state == State::Candidate
+            && !action.origins.is_empty()
+            && action
+                .origins
+                .iter()
+                .all(|o| o.target == target_key && o.input_revision != request.input_revision);
+        if expired_unconfirmed || superseded_same_target_candidate {
+            if on_disk_ids.contains(&action.id) {
+                removed.insert(action.id.clone());
+            }
+            false
+        } else {
+            true
+        }
+    });
+
+    for (id, matters, todo) in prepared {
         let mut references = todo.evidence.iter().map(|r|(&r.id,&r.quote,&r.version)).collect::<Vec<_>>(); references.sort();
         let mut sources = todo.evidence.iter().filter_map(|reference| request.sources.iter().find(|s|s.id==reference.id))
             .map(|source|(&source.id,&source.text)).collect::<Vec<_>>(); sources.sort(); sources.dedup();
@@ -260,33 +330,73 @@ pub(crate) fn sync_validated_draft(root: &Path, device: &str, account: Option<&s
                 ensure!(existing.source_history.len() < 256, "行动来源修订达到容量上限，原记录保留");
                 existing.source_history.push(SourceVersion { revision: existing.source_revision.clone(), observed_ms:existing.last_seen_ms,
                     owner:existing.owner.clone(),due:existing.due.clone(),evidence:existing.evidence.clone() });
-                if existing.state.confirmed() { existing.needs_review = true; progress_changed = true; }
-                existing.action = todo.action.clone(); existing.kind = todo.kind.clone();
-                existing.owner = todo.owner.clone(); existing.due = todo.due.clone(); existing.evidence = todo.evidence.clone();
-                existing.source_revision = fingerprint; existing.last_seen_ms = at_ms; changed.insert(id.clone());
+                if existing.state.confirmed() {
+                    // Never silently overwrite user-confirmed owner or due on source change;
+                    // preserve them and flag needs_review while recording the new source revision.
+                    existing.needs_review = true;
+                    progress_changed = true;
+                } else {
+                    existing.action = todo.action.clone();
+                    existing.kind = todo.kind.clone();
+                    existing.owner = todo.owner.clone();
+                    existing.due = todo.due.clone();
+                }
+                existing.evidence = todo.evidence.clone();
+                existing.source_revision = fingerprint;
+                existing.last_seen_ms = at_ms;
+                changed.insert(id.clone());
             }
-            let target = request.target.key();
-            if let Some(origin) = existing.origins.iter_mut().find(|o|o.target == target) {
+            if let Some(origin) = existing.origins.iter_mut().find(|o|o.target == target_key) {
                 if origin.input_revision != request.input_revision { origin.input_revision = request.input_revision.clone(); changed.insert(id.clone()); }
-            } else { existing.origins.push(Origin { target, input_revision: request.input_revision.clone() }); changed.insert(id.clone()); }
+            } else { existing.origins.push(Origin { target: target_key.clone(), input_revision: request.input_revision.clone() }); changed.insert(id.clone()); }
         } else {
-            ensure!(snapshot.actions.len() < MAX_ACTIONS, "候选行动达到容量上限，已有记录保留");
+            if snapshot.actions.len() >= MAX_ACTIONS {
+                // Evict oldest Dismissed first, then oldest unconfirmed Candidate (not matched in this draft),
+                // so unconfirmed backlog never bricks outcomes::save at 2048 actions.
+                let evict_idx = snapshot
+                    .actions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, a)| a.state == State::Dismissed && !matched_ids.contains(&a.id))
+                    .min_by_key(|(_, a)| (a.last_seen_ms, a.first_seen_ms))
+                    .map(|(idx, _)| idx)
+                    .or_else(|| {
+                        snapshot
+                            .actions
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, a)| {
+                                a.state == State::Candidate && !matched_ids.contains(&a.id)
+                            })
+                            .min_by_key(|(_, a)| (a.last_seen_ms, a.first_seen_ms))
+                            .map(|(idx, _)| idx)
+                    });
+                if let Some(idx) = evict_idx {
+                    let evicted = snapshot.actions.remove(idx);
+                    changed.remove(&evicted.id);
+                    if on_disk_ids.contains(&evicted.id) {
+                        removed.insert(evicted.id);
+                    }
+                }
+            }
+            ensure!(snapshot.actions.len() < MAX_ACTIONS, "已确认行动达到容量上限，已有记录保留");
             let source_check_revision=source_view.revision_for(&matters)?;
             snapshot.actions.push(ActionRecord { id:id.clone(), matter_ids: matters, action: todo.action.clone(), kind: todo.kind.clone(),
                 owner: todo.owner.clone(), due: todo.due.clone(), evidence: todo.evidence.clone(), source_revision: fingerprint,
                 first_seen_ms: at_ms, last_seen_ms: at_ms, state: State::Candidate, needs_review: false, history: vec![],
                 source_check_revision,
-                origins: vec![Origin { target: request.target.key(), input_revision: request.input_revision.clone() }], source_history:vec![] });
+                origins: vec![Origin { target: target_key.clone(), input_revision: request.input_revision.clone() }], source_history:vec![] });
+            removed.remove(&id);
             changed.insert(id.clone());
         }
     }
-    if !changed.is_empty() {
+    if !changed.is_empty() || !removed.is_empty() {
         snapshot.revision += 1;
         if progress_changed {
             snapshot.progress_revision += 1;
             snapshot.updated_ms = snapshot.updated_ms.max(at_ms);
         }
-        write_actions(&dir, &snapshot, &changed)?;
+        write_actions_with_removals(&dir, &snapshot, &changed, &removed)?;
     }
     Ok(snapshot)
 }
@@ -435,9 +545,15 @@ mod tests {
     fn candidate_refresh_updates_only_the_changed_action_and_revisions() {
         let root=tempfile::tempdir().unwrap(); let(mut request,mut draft)=packet();
         let todo=draft.todos[0].clone();
-        draft.todos=(0..20).map(|index|{let mut item=todo.clone();item.action=format!("整理第{index}项会议资料");item}).collect();
+        // Seed 19 candidates belonging to another item target so refreshing `matter`
+        // keeps them untouched while updating only the single changed candidate row.
+        let mut other_request=request.clone();
+        other_request.target=Target::Item("other-matter".into());
+        draft.todos=(1..20).map(|index|{let mut item=todo.clone();item.action=format!("整理第{index}项会议资料");item}).collect();
+        sync_validated_draft(root.path(),"phone",Some("account"),&other_request,&draft,10).unwrap();
+        draft.todos=vec![{let mut item=todo;item.action="整理第0项会议资料".into();item}];
         let before=sync_validated_draft(root.path(),"phone",Some("account"),&request,&draft,10).unwrap();
-        draft.todos.truncate(1); request.input_revision="next-origin".into();
+        request.input_revision="next-origin".into();
         let path=checked_dir(root.path(),&before.scope_id,false).unwrap().unwrap().join("ledger.json");
         let db=crate::data_store::database_for(&path);
         let old_changes=crate::data_store::with_connection(&db,|c|Ok(c.total_changes())).unwrap();
@@ -445,8 +561,158 @@ mod tests {
         let new_changes=crate::data_store::with_connection(&db,|c|Ok(c.total_changes())).unwrap();
         assert_eq!(new_changes-old_changes,3,"one candidate, logical revision head, storage revision");
         assert_eq!(after.actions.len(),20);
-        assert_eq!(after.actions[0].origins[0].input_revision,"next-origin");
-        assert!(after.actions.iter().skip(1).all(|action|action.origins[0].input_revision=="one"));
+        let updated_item=after.actions.iter().find(|a|a.action=="整理第0项会议资料").unwrap();
+        assert_eq!(updated_item.origins[0].input_revision,"next-origin");
+        assert!(after.actions.iter().filter(|a|a.action!="整理第0项会议资料").all(|action|action.origins[0].input_revision=="one"));
+    }
+
+    #[test]
+    fn sync_validated_draft_retires_superseded_candidates_prunes_90d_and_evicts_at_2048() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut request, mut draft) = packet();
+        let todo = draft.todos[0].clone();
+        draft.todos = vec![
+            {
+                let mut t = todo.clone();
+                t.action = "旧版待淘汰候选".into();
+                t
+            },
+            {
+                let mut t = todo.clone();
+                t.action = "保留的已采纳事项".into();
+                t
+            },
+        ];
+        let initial =
+            sync_validated_draft(root.path(), "phone", Some("account"), &request, &draft, 1_000)
+                .unwrap();
+        let accepted_id = initial
+            .actions
+            .iter()
+            .find(|a| a.action == "保留的已采纳事项")
+            .unwrap()
+            .id
+            .clone();
+        set_state(
+            root.path(),
+            "phone",
+            Some("account"),
+            &accepted_id,
+            initial.revision,
+            State::Accepted,
+            "",
+            1_500,
+        )
+        .unwrap();
+
+        // New input_revision on the same target replaces unmatched Candidate while keeping Accepted.
+        request.input_revision = "rev-2".into();
+        draft.todos = vec![{
+            let mut t = todo.clone();
+            t.action = "新版候选待办".into();
+            t
+        }];
+        let refreshed =
+            sync_validated_draft(root.path(), "phone", Some("account"), &request, &draft, 2_000)
+                .unwrap();
+        assert!(refreshed.actions.iter().any(|a| a.action == "保留的已采纳事项"));
+        assert!(refreshed.actions.iter().any(|a| a.action == "新版候选待办"));
+        assert!(!refreshed.actions.iter().any(|a| a.action == "旧版待淘汰候选"));
+
+        // Seed another target candidate at t=2_000, then advance past 90 days: stale candidate is pruned,
+        // while the Accepted item is preserved.
+        let mut other_req = request.clone();
+        other_req.target = Target::Item("stale-matter".into());
+        draft.todos = vec![{
+            let mut t = todo.clone();
+            t.action = "九十天前的旧候选".into();
+            t
+        }];
+        sync_validated_draft(root.path(), "phone", Some("account"), &other_req, &draft, 2_000)
+            .unwrap();
+        let after_91d = 2_000 + 91 * 86_400_000;
+        request.input_revision = "rev-3".into();
+        draft.todos = vec![{
+            let mut t = todo.clone();
+            t.action = "九十一天后的新候选".into();
+            t
+        }];
+        let pruned = sync_validated_draft(
+            root.path(),
+            "phone",
+            Some("account"),
+            &request,
+            &draft,
+            after_91d,
+        )
+        .unwrap();
+        assert!(!pruned.actions.iter().any(|a| a.action == "九十天前的旧候选"));
+        assert!(pruned.actions.iter().any(|a| a.action == "保留的已采纳事项"));
+
+        // Fill up to MAX_ACTIONS (2048) with other-target candidates + 1 Dismissed item, then verify
+        // inserting one more candidate evicts the Dismissed item instead of failing!
+        let mut fill_req = request.clone();
+        fill_req.target = Target::Item("bulk-matter".into());
+        let needed = MAX_ACTIONS - pruned.actions.len();
+        draft.todos = (0..needed)
+            .map(|idx| {
+                let mut t = todo.clone();
+                t.action = format!("批量填充候选-{idx}");
+                t
+            })
+            .collect();
+        let full = sync_validated_draft(
+            root.path(),
+            "phone",
+            Some("account"),
+            &fill_req,
+            &draft,
+            after_91d + 10,
+        )
+        .unwrap();
+        assert_eq!(full.actions.len(), MAX_ACTIONS);
+        let dismiss_id = full
+            .actions
+            .iter()
+            .find(|a| a.action == "批量填充候选-0")
+            .unwrap()
+            .id
+            .clone();
+        let after_dismiss = set_state(
+            root.path(),
+            "phone",
+            Some("account"),
+            &dismiss_id,
+            full.revision,
+            State::Dismissed,
+            "",
+            after_91d + 20,
+        )
+        .unwrap();
+        assert_eq!(after_dismiss.actions.len(), MAX_ACTIONS);
+
+        let mut overflow_req = request.clone();
+        overflow_req.target = Target::Item("overflow-matter".into());
+        draft.todos = vec![{
+            let mut t = todo;
+            t.action = "突破2048上限的新候选".into();
+            t
+        }];
+        let evicted = sync_validated_draft(
+            root.path(),
+            "phone",
+            Some("account"),
+            &overflow_req,
+            &draft,
+            after_91d + 30,
+        )
+        .unwrap();
+        assert_eq!(evicted.actions.len(), MAX_ACTIONS);
+        assert!(!evicted.actions.iter().any(|a| a.id == dismiss_id));
+        assert!(evicted
+            .actions
+            .iter()
+            .any(|a| a.action == "突破2048上限的新候选"));
     }
     #[test]
     fn proposals_are_not_progress_and_stale_clicks_do_not_overwrite_user_edits() {
@@ -556,7 +822,10 @@ mod tests {
         let updated=sync_validated_draft(root.path(),"phone",Some("account"),&request,&draft,40).unwrap();
         assert_eq!(updated.actions[0].id,id);assert_eq!(updated.actions[0].state,State::Completed);assert!(updated.actions[0].needs_review);
         assert_eq!(updated.actions[0].source_history[0].due.as_ref().unwrap().value,"周五前");
-        assert_eq!(updated.actions[0].due.as_ref().unwrap().value,"周六前");assert!(updated.progress_revision>snapshot.progress_revision);
+        assert_eq!(updated.actions[0].due.as_ref().unwrap().value,"周五前");
+        assert_eq!(updated.actions[0].owner.as_ref().unwrap().value,"我");
+        assert_ne!(updated.actions[0].source_revision,snapshot.actions[0].source_revision);
+        assert!(updated.progress_revision>snapshot.progress_revision);
         assert_eq!(summarize_period(root.path(),"phone",Some("account"),0,100).unwrap().completed_in_period,0);
     }
     #[test]

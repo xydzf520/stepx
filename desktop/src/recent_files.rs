@@ -427,27 +427,39 @@ pub fn clean_thumbnails(root: &Path, now: SystemTime) -> Result<(usize, u64)> {
     Ok((removed, bytes))
 }
 
+fn phone_scan_script(base: &str) -> String {
+    const PER_ROOT_LIMIT: usize = 1000;
+    let roots = [
+        "Download",
+        "Documents",
+        "Movies",
+        "Recordings",
+        "Pictures",
+        "Music",
+        "Bluetooth",
+        "tencent/MicroMsg/Download",
+        "Android/media/com.tencent.mm/MicroMsg/Download",
+        "DCIM",
+        "Android/media",
+    ];
+    let base = base.trim_end_matches('/');
+    let roots = roots
+        .iter()
+        .map(|s| shell_quote(&format!("{base}/{s}")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "for d in {roots}; do if [ -d \"$d\" ]; then find \"$d\" -maxdepth 6 \\( -name '.*' -o -name cache -o -name thumbnails -o -name Databases -o -name Backups \\) -prune -o -type f -exec stat -c '%Y %Z %s %n' '{{}}' + 2>/dev/null | sort -k2,2rn -k1,1rn | head -n {} | {{ n=0; while IFS= read -r line; do n=$((n+1)); if [ \"$n\" -le {PER_ROOT_LIMIT} ]; then printf '%s\\n' \"$line\"; else printf '#LIMITED\\n'; break; fi; done; }}; fi; done | head -n {}",
+        PER_ROOT_LIMIT + 1,
+        VISIT_LIMIT + 1
+    )
+}
+
 pub fn phone_files(adb: &Adb, device: &Device) -> Result<Scan> {
     let transport = device.resolve_active_transport(adb)?;
     // Native filemanager_search_file launches a phone screen, not a metadata query.
     // Public shared folders only; no private app data, no wake/screen automation.
-    let roots = [
-        "Download",
-        "DCIM",
-        "Pictures",
-        "Documents",
-        "Movies",
-        "Music",
-        "Bluetooth",
-        "Android/media",
-        "tencent/MicroMsg/Download",
-    ];
-    let roots = roots
-        .iter()
-        .map(|s| shell_quote(&format!("/sdcard/{s}")))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let script = format!("for d in {roots}; do if [ -d \"$d\" ]; then find \"$d\" -maxdepth 6 \\( -name '.*' -o -name cache -o -name thumbnails -o -name Databases -o -name Backups \\) -prune -o -type f -exec stat -c '%Y %Z %s %n' '{{}}' +; fi; done | head -n {}", VISIT_LIMIT+1);
+    let script = phone_scan_script("/sdcard");
     let output = adb.run_timeout(
         &["-s", &transport, "shell", &script],
         Duration::from_secs(12),
@@ -460,6 +472,10 @@ fn parse_phone(raw: &str, device: &str, now: i64) -> Scan {
         ..Default::default()
     };
     for line in raw.lines().take(VISIT_LIMIT) {
+        if line == "#LIMITED" {
+            scan.limited = true;
+            continue;
+        }
         let mut parts = line.splitn(4, ' ');
         let (Some(m), Some(c), Some(b), Some(path)) =
             (parts.next(), parts.next(), parts.next(), parts.next())
@@ -500,6 +516,30 @@ fn parse_phone(raw: &str, device: &str, now: i64) -> Scan {
     scan
 }
 
+fn parse_sha256_output(raw: &str) -> Option<&str> {
+    let token = raw.trim_start().split_whitespace().next()?;
+    let digest = token.strip_prefix('\\').unwrap_or(token);
+    (digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())).then_some(digest)
+}
+
+fn file_uri_for_android_path(path: &str) -> String {
+    let canonical = if let Some(rest) = path.strip_prefix("/sdcard/") {
+        format!("/storage/emulated/0/{rest}")
+    } else {
+        path.to_owned()
+    };
+    let mut uri = String::from("file://");
+    for &b in canonical.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.' | b'~') {
+            uri.push(b as char);
+        } else {
+            use std::fmt::Write;
+            let _ = write!(&mut uri, "%{b:02X}");
+        }
+    }
+    uri
+}
+
 /// A dedicated directory per delivery keeps original filenames without replacing anything.
 pub fn send_to_phone(adb: &Adb, device: &Device, file: &RecentFile) -> Result<String> {
     ensure!(file.device.is_none(), "请选择电脑文件");
@@ -535,16 +575,13 @@ pub fn send_to_phone(adb: &Adb, device: &Device, file: &RecentFile) -> Result<St
         adb.transfer(&transport, "push", &file.path, Path::new(&pending))?;
         let remote = adb.shell(&transport, &["sha256sum", &pending])?;
         ensure!(
-            remote.split_whitespace().next() == Some(hash.as_str())
+            parse_sha256_output(&remote).is_some_and(|d| d.eq_ignore_ascii_case(&hash))
                 && sha256_file(&file.path)? == hash,
             "文件在传输期间变化，未完成导入，请重试"
         );
         adb.shell(&transport, &["mv", &pending, &target])?;
         // Index the final path for Gallery/Files. This broadcast never brings an app forward.
-        let uri = format!(
-            "file://{}",
-            target.replace("/sdcard/", "/storage/emulated/0/")
-        );
+        let uri = file_uri_for_android_path(&target);
         let _ = adb.shell(
             &transport,
             &[
@@ -585,25 +622,29 @@ pub fn save_to_desktop(
         "文件不在手机共享目录"
     );
     let before = adb.shell(&transport, &["sha256sum", canonical])?;
-    let hash = before
-        .split_whitespace()
-        .next()
-        .context("无法校验手机文件")?;
+    let hash = parse_sha256_output(&before)
+        .context("无法校验手机文件")?
+        .to_ascii_lowercase();
     fs::create_dir_all(destination)?;
-    let temp = tempfile::tempdir_in(destination)?;
-    let local = temp.path().join(file.name());
-    adb.transfer(&transport, "pull", Path::new(canonical), &local)?;
+    // Pull directly into a sibling temp file in `destination` and persist atomically
+    // without copying the file a second time on disk.
+    let temp = tempfile::Builder::new()
+        .prefix(".stepx-recent-")
+        .tempfile_in(destination)?
+        .into_temp_path();
+    adb.transfer(&transport, "pull", Path::new(canonical), &temp)?;
     let after = adb.shell(&transport, &["sha256sum", canonical])?;
     ensure!(
-        sha256_file(&local)? == hash && after.split_whitespace().next() == Some(hash),
+        sha256_file(&temp)? == hash
+            && parse_sha256_output(&after).is_some_and(|d| d.eq_ignore_ascii_case(&hash)),
         "手机文件在传输期间变化，请重试"
     );
-    let final_path = destination.join(file.name());
-    // persist_noclobber is atomic even when another app writes the same filename.
-    let mut output = tempfile::NamedTempFile::new_in(destination)?;
-    std::io::copy(&mut fs::File::open(&local)?, output.as_file_mut())?;
-    output.as_file().sync_all()?;
-    let final_path = if final_path.exists() {
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&temp)?
+        .sync_all()?;
+    let candidate = destination.join(file.name());
+    let final_path = if fs::symlink_metadata(&candidate).is_ok() {
         destination.join(format!(
             "{}-{:08x}-{}",
             chrono::Local::now().format("%H%M%S"),
@@ -611,10 +652,9 @@ pub fn save_to_desktop(
             file.name()
         ))
     } else {
-        final_path
+        candidate
     };
-    output
-        .persist_noclobber(&final_path)
+    temp.persist_noclobber(&final_path)
         .context("目标文件已存在，未覆盖，请重试")?;
     Ok(final_path)
 }
@@ -766,5 +806,150 @@ mod tests {
         };
         p.save().unwrap();
         assert_eq!(Preferences::load().folders, p.folders);
+    }
+
+    #[test]
+    fn sha256sum_leading_backslash_and_media_scanner_uri_encoding() {
+        let hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        assert_eq!(
+            parse_sha256_output(&format!("\\{hex}  /storage/emulated/0/a\\\\b.pdf\n")),
+            Some(hex)
+        );
+        assert_eq!(
+            parse_sha256_output(&format!("{hex}  /storage/emulated/0/a.pdf\n")),
+            Some(hex)
+        );
+        assert!(parse_sha256_output("not-a-valid-hash  file").is_none());
+
+        let uri = file_uri_for_android_path("/sdcard/Download/StepX/新 报告 #1?v=2%ok.pdf");
+        assert_eq!(
+            uri,
+            "file:///storage/emulated/0/Download/StepX/%E6%96%B0%20%E6%8A%A5%E5%91%8A%20%231%3Fv%3D2%25ok.pdf"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn huge_dcim_does_not_starve_documents_recordings_movies_or_wechat_and_save_is_atomic() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_sdcard = dir.path().join("sdcard");
+        for sub in [
+            "DCIM",
+            "Download",
+            "Documents",
+            "Movies",
+            "Recordings",
+            "tencent/MicroMsg/Download",
+            "Android/media/com.tencent.mm/MicroMsg/Download",
+        ] {
+            fs::create_dir_all(fake_sdcard.join(sub)).unwrap();
+        }
+        // Populate > 1,100 historical photos in DCIM (exceeding per-root cap).
+        for i in 0..1150 {
+            fs::write(fake_sdcard.join(format!("DCIM/IMG_{i:05}.jpg")), b"img").unwrap();
+        }
+        // Advance past the 1-second `stat -c '%Y %Z'` boundary so recent non-DCIM files
+        // have strictly newer arrival timestamps than the historical DCIM archive.
+        let dcim_sec = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        while SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            <= dcim_sec
+        {
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        fs::write(fake_sdcard.join("Download/dl.pdf"), b"dl").unwrap();
+        fs::write(fake_sdcard.join("Documents/doc.docx"), b"doc").unwrap();
+        fs::write(fake_sdcard.join("Movies/clip.mp4"), b"mov").unwrap();
+        fs::write(fake_sdcard.join("Recordings/voice.m4a"), b"rec").unwrap();
+        fs::write(
+            fake_sdcard.join("tencent/MicroMsg/Download/wechat.xlsx"),
+            b"wx",
+        )
+        .unwrap();
+        fs::write(
+            fake_sdcard.join("Android/media/com.tencent.mm/MicroMsg/Download/wx_modern.pdf"),
+            b"wx2",
+        )
+        .unwrap();
+
+        let script = phone_scan_script(fake_sdcard.to_str().unwrap());
+        let out = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        let rewritten = stdout.replace(fake_sdcard.to_str().unwrap(), "/sdcard");
+        let scan = parse_phone(&rewritten, "phone-1", i64::MAX / 2);
+        assert!(scan.limited);
+        let names: HashSet<_> = scan.files.iter().map(|f| f.name()).collect();
+        for expected in [
+            "dl.pdf",
+            "doc.docx",
+            "clip.mp4",
+            "voice.m4a",
+            "wechat.xlsx",
+            "wx_modern.pdf",
+        ] {
+            assert!(names.contains(expected), "missing {expected} due to starvation");
+        }
+
+        // Verify save_to_desktop handles `\sha256` output and saves atomically with no leftover temp files.
+        let src_bytes = b"single-copy-verified-content";
+        let remote_copy = dir.path().join("remote_doc.pdf");
+        fs::write(&remote_copy, src_bytes).unwrap();
+        let sha = sha256_file(&remote_copy).unwrap();
+        let adb_bin = dir.path().join("mock-adb");
+        let q_remote_copy = shell_quote(remote_copy.to_str().unwrap());
+        fs::write(
+            &adb_bin,
+            format!(
+                r#"#!/bin/sh
+set -eu
+case "$*" in
+  *ro.serialno*) echo phone-1 ;;
+  *get-state*) echo device ;;
+  *readlink*) echo /storage/emulated/0/Documents/doc.pdf ;;
+  *sha256sum*) printf '\\%s  /storage/emulated/0/Documents/doc.pdf\n' '{sha}' ;;
+  *\ pull\ *)
+    eval "dst=\${{$#}}"
+    cp {q_remote_copy} "$dst"
+    ;;
+  *) exit 0 ;;
+esac
+"#
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&adb_bin, fs::Permissions::from_mode(0o700)).unwrap();
+        let adb = Adb { path: adb_bin };
+        let dev = Device {
+            transport: "phone-1".into(),
+            serial: "phone-1".into(),
+            model: "PZ".into(),
+            android: "16".into(),
+            product: "pandora".into(),
+        };
+        let dest = dir.path().join("desktop_out");
+        let rf = RecentFile {
+            path: PathBuf::from("/sdcard/Documents/doc.pdf"),
+            device: Some("phone-1".into()),
+            bytes: src_bytes.len() as u64,
+            at: 1000,
+            modified: 1000,
+            kind: Kind::Pdf,
+            folder: "Documents".into(),
+            thumbnail: None,
+        };
+        let saved = save_to_desktop(&adb, &dev, &rf, &dest).unwrap();
+        assert_eq!(fs::read(&saved).unwrap(), src_bytes);
+        assert_eq!(fs::read_dir(&dest).unwrap().count(), 1);
     }
 }

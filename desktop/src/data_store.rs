@@ -7,13 +7,15 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
     time::Duration,
 };
 
 const SCHEMA: i64 = 1;
+pub const CACHE_APPLICATION_ID: i64 = 0x5354_5843;
 const SNAPSHOT_CACHE_LIMIT: usize = 16 * 1024 * 1024;
 const SNAPSHOT_READ_LIMIT: u64 = 128 * 1024 * 1024;
 struct Span {
@@ -62,8 +64,102 @@ struct CachedConnection {
     read_cache: Option<ReadCache>,
 }
 thread_local! { static CONNECTIONS: RefCell<HashMap<PathBuf, CachedConnection>> = RefCell::new(HashMap::new()); }
-pub fn default_path() -> PathBuf {
+static PRIMARY_DB_FALLBACKS: OnceLock<Mutex<HashMap<PathBuf, PathBuf>>> = OnceLock::new();
+static QUICK_CHECKED_DBS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+pub(crate) fn invalidate_quick_check(path: &Path) {
+    if let Some(lock) = QUICK_CHECKED_DBS.get() {
+        let mut set = lock.lock().unwrap_or_else(|p| p.into_inner());
+        set.remove(path);
+        if let Ok(canon) = path.canonicalize() {
+            set.remove(&canon);
+        }
+    }
+}
+
+fn primary_default_path() -> PathBuf {
     crate::resources::user_state().join("database/stepx.sqlite3")
+}
+
+fn fallback_database_path() -> PathBuf {
+    #[cfg(unix)]
+    {
+        let uid = unsafe { libc::geteuid() };
+        std::env::temp_dir()
+            .join(format!("stepx-companion-db-{uid}"))
+            .join("fallback.sqlite3")
+    }
+    #[cfg(not(unix))]
+    {
+        let user = std::env::var("USERNAME")
+            .ok()
+            .filter(|s| {
+                !s.is_empty()
+                    && s.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            })
+            .unwrap_or_else(|| "default".into());
+        std::env::temp_dir()
+            .join(format!("stepx-companion-db-{user}"))
+            .join("fallback.sqlite3")
+    }
+}
+
+fn active_fallback_for(primary: &Path) -> Option<PathBuf> {
+    PRIMARY_DB_FALLBACKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(primary)
+        .cloned()
+}
+
+fn note_primary_fallback(primary: &Path, err: &anyhow::Error) -> PathBuf {
+    let fallback = fallback_database_path();
+    let mut map = PRIMARY_DB_FALLBACKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if !map.contains_key(primary) {
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr(),
+            "warning: failed to open primary SQLite DB at {} ({err:#}); falling back to {}",
+            primary.display(),
+            fallback.display()
+        );
+        map.insert(primary.to_path_buf(), fallback.clone());
+    }
+    fallback
+}
+
+fn can_fallback_primary_db(primary: &Path) -> bool {
+    // Never fall back if the primary DB file (or even a symlink at its path)
+    // already exists on disk; transient open/write/lock/schema errors must
+    // surface directly rather than silently split-braining onto a temp DB.
+    if fs::symlink_metadata(primary).is_ok() {
+        return false;
+    }
+    let Some(parent) = primary.parent() else {
+        return false;
+    };
+    if fs::symlink_metadata(parent.join("restore-pending")).is_ok() {
+        return false;
+    }
+    // Only allow fallback when `primary` does not exist AND its parent directory
+    // genuinely cannot be created or written (e.g. read-only $HOME in sandboxes).
+    if fs::create_dir_all(parent).is_ok()
+        && fs::symlink_metadata(parent).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+        && tempfile::NamedTempFile::new_in(parent).is_ok()
+    {
+        return false;
+    }
+    true
+}
+
+pub fn default_path() -> PathBuf {
+    let primary = primary_default_path();
+    active_fallback_for(&primary).unwrap_or(primary)
 }
 pub fn database_for(legacy: &Path) -> PathBuf {
     if legacy.starts_with(crate::resources::user_state())
@@ -89,7 +185,10 @@ pub(crate) fn key(path: &Path) -> Result<String> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        std::env::current_dir()?.join(path)
+        match std::env::current_dir() {
+            Ok(dir) if dir != Path::new("/") => dir.join(path),
+            _ => crate::resources::user_config().join(path),
+        }
     };
     let name = absolute.to_string_lossy().into_owned();
     #[cfg(windows)]
@@ -182,16 +281,80 @@ fn protect(path: &Path, directory: bool) -> Result<()> {
     }
     Ok(())
 }
-pub fn open(path: &Path) -> Result<Connection> {
+fn ensure_private_fallback_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+        let uid = unsafe { libc::geteuid() };
+        if fs::symlink_metadata(dir).is_err() {
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(true).mode(0o700);
+            builder.create(dir)?;
+        }
+        let meta = fs::symlink_metadata(dir)?;
+        ensure!(
+            !meta.file_type().is_symlink() && meta.is_dir(),
+            "回退数据库目录不能是链接或普通文件"
+        );
+        ensure!(meta.uid() == uid, "回退数据库目录归属用户不匹配");
+        if (meta.mode() & 0o777) != 0o700 {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        }
+        let verified = fs::symlink_metadata(dir)?;
+        ensure!(
+            !verified.file_type().is_symlink()
+                && verified.is_dir()
+                && verified.uid() == uid
+                && (verified.mode() & 0o777) == 0o700,
+            "回退数据库目录权限不安全"
+        );
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(dir)?;
+        protect(dir, true)
+    }
+}
+
+pub(crate) fn open_lock_nofollow(lock_path: &Path) -> Result<fs::File> {
+    if let Ok(meta) = fs::symlink_metadata(lock_path) {
+        ensure!(
+            !meta.file_type().is_symlink() && meta.is_file(),
+            "数据库锁文件不能是链接"
+        );
+    }
+    let mut opts = fs::OpenOptions::new();
+    opts.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = opts
+        .open(lock_path)
+        .context("无法安全打开数据库锁文件（禁止符号链接）")?;
+    ensure!(file.metadata()?.is_file(), "数据库锁文件不是普通文件");
+    Ok(file)
+}
+
+fn open_sqlite_file(path: &Path, is_temp_fallback: bool) -> Result<Connection> {
     let parent = path.parent().context("数据库目录无效")?;
-    fs::create_dir_all(parent)?;
-    protect(parent, true)?;
-    ensure!(
-        !parent.join("restore-pending").exists(),
-        "数据库恢复尚未完成，请退出客户端并重新执行 --restore-database"
-    );
-    if path.exists() {
+    if is_temp_fallback {
+        ensure_private_fallback_dir(parent)?;
+    } else {
+        fs::create_dir_all(parent)?;
+        protect(parent, true)?;
+        ensure!(
+            fs::symlink_metadata(parent.join("restore-pending")).is_err(),
+            "数据库恢复尚未完成，请退出客户端并重新执行 --restore-database"
+        );
+    }
+    let existed_before = fs::symlink_metadata(path).is_ok();
+    if existed_before {
         protect(path, false)?;
+    } else {
+        invalidate_quick_check(path);
     }
     let conn = Connection::open(path).context("无法打开本机数据库；原数据保留")?;
     protect(path, false)?;
@@ -223,45 +386,113 @@ pub fn open(path: &Path) -> Result<Connection> {
     }
     #[cfg(windows)]
     migrate_windows_keys(&conn)?;
-    let check: String = conn.query_row("PRAGMA quick_check(1)", [], |r| r.get(0))?;
-    ensure!(
-        check == "ok",
-        "数据库完整性检查失败；停止写入，保留数据库和迁移前备份"
-    );
+    let check_key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let already_checked = QUICK_CHECKED_DBS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains(&check_key);
+    if !already_checked {
+        let check: String = conn.query_row("PRAGMA quick_check(1)", [], |r| r.get(0))?;
+        ensure!(
+            check == "ok",
+            "数据库完整性检查失败；停止写入，保留数据库和迁移前备份"
+        );
+        let mut checked = QUICK_CHECKED_DBS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if checked.len() >= 4096 {
+            checked.clear();
+        }
+        checked.insert(check_key);
+    }
     Ok(conn)
 }
+pub fn open(path: &Path) -> Result<Connection> {
+    let fallback = fallback_database_path();
+    if path == fallback {
+        return open_sqlite_file(path, true);
+    }
+    let primary = primary_default_path();
+    if path == primary {
+        if let Some(fb) = active_fallback_for(&primary) {
+            return open_sqlite_file(&fb, true);
+        }
+        let existed_initially = fs::symlink_metadata(&primary).is_ok();
+        match open_sqlite_file(path, false) {
+            Ok(conn) => return Ok(conn),
+            Err(err) if !existed_initially && can_fallback_primary_db(&primary) => {
+                let fb = note_primary_fallback(&primary, &err);
+                return open_sqlite_file(&fb, true);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    open_sqlite_file(path, false)
+}
+fn open_cached_entry(path: &Path, is_temp_fallback: bool) -> Result<CachedConnection> {
+    let parent = path.parent().context("数据库目录无效")?;
+    if is_temp_fallback {
+        ensure_private_fallback_dir(parent)?;
+    } else {
+        fs::create_dir_all(parent)?;
+        protect(parent, true)?;
+    }
+    let lock_path = parent.join("database-use.lock");
+    let gate = open_lock_nofollow(&lock_path)?;
+    gate.try_lock_shared()
+        .context("数据库正在恢复，请稍后打开客户端")?;
+    let gate = DatabaseUseGate(gate);
+    Ok(CachedConnection {
+        conn: open_sqlite_file(path, is_temp_fallback)?,
+        _gate: gate,
+        write_cache: None,
+        read_cache: None,
+    })
+}
 fn with_cached<T>(path: &Path, f: impl FnOnce(&mut CachedConnection) -> Result<T>) -> Result<T> {
+    let primary = primary_default_path();
+    let fallback = fallback_database_path();
+    let target = if path == primary {
+        active_fallback_for(&primary).unwrap_or_else(|| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    };
     CONNECTIONS.with(|pool| {
         let mut pool = pool.borrow_mut();
-        if !path.exists() {
-            pool.remove(path);
+        if fs::symlink_metadata(&target).is_err() {
+            pool.remove(&target);
         }
-        if !pool.contains_key(path) {
+        let effective = if !pool.contains_key(&target) {
             if pool.len() >= 8 {
                 pool.clear();
             }
-            let parent = path.parent().context("数据库目录无效")?;
-            fs::create_dir_all(parent)?;
-            let gate = fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(parent.join("database-use.lock"))?;
-            gate.try_lock_shared()
-                .context("数据库正在恢复，请稍后打开客户端")?;
-            let gate = DatabaseUseGate(gate);
-            pool.insert(
-                path.to_path_buf(),
-                CachedConnection {
-                    conn: open(path)?,
-                    _gate: gate,
-                    write_cache: None,
-                    read_cache: None,
-                },
-            );
-        }
-        f(pool.get_mut(path).expect("opened"))
+            let is_fb = target == fallback;
+            let existed_initially = target == primary && fs::symlink_metadata(&primary).is_ok();
+            match open_cached_entry(&target, is_fb) {
+                Ok(entry) => {
+                    pool.insert(target.clone(), entry);
+                    target
+                }
+                Err(err)
+                    if target == primary
+                        && !existed_initially
+                        && can_fallback_primary_db(&primary) =>
+                {
+                    let fb = note_primary_fallback(&primary, &err);
+                    if !pool.contains_key(&fb) {
+                        let entry = open_cached_entry(&fb, true)?;
+                        pool.insert(fb.clone(), entry);
+                    }
+                    fb
+                }
+                Err(err) => return Err(err),
+            }
+        } else {
+            target
+        };
+        f(pool.get_mut(&effective).expect("opened"))
     })
 }
 pub fn with_connection<T>(path: &Path, f: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
@@ -430,11 +661,11 @@ fn assemble_raw_limited(conn: &Connection, name: &str, limit: u64) -> Result<Opt
     let mut out = if shape.root_array {
         String::new()
     } else {
-        head.trim_end_matches('}').to_owned()
+        head.strip_suffix('}').context("快照头结构无效")?.to_owned()
     };
     for (section, array) in &shape.sections {
         if !shape.root_array {
-            if out.len() > 1 {
+            if !out.trim_start_matches('{').trim().is_empty() {
                 append_snapshot(&mut out, ",", limit)?;
             }
             append_snapshot(&mut out, &serde_json::to_string(section)?, limit)?;
@@ -966,8 +1197,10 @@ pub fn remove_scope(directory: &Path) -> Result<()> {
 pub fn remove_snapshot(path: &Path) -> Result<()> {
     let name = key(path)?;
     with_connection(&database_for(path), |c| {
-        c.execute("DELETE FROM snapshots WHERE name=?", [&name])?;
-        c.execute("DELETE FROM migrations WHERE name=?", [&name])?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("DELETE FROM snapshots WHERE name=?", [&name])?;
+        tx.execute("DELETE FROM migrations WHERE name=?", [&name])?;
+        tx.commit()?;
         Ok(())
     })
 }
@@ -1890,5 +2123,135 @@ mod incremental_consumer_tests {
         fs::write(&path, "corrupt legacy remains untouched after migration").unwrap();
         assert!(ensure_imported(&path, 1).unwrap());
         assert_eq!(count(&path, "rows").unwrap(), 1);
+    }
+
+    #[test]
+    fn nested_head_objects_survive_apply_delta_and_cold_read_without_brace_stripping() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("nested_head.json");
+        write(
+            &path,
+            &json!({"revision": 1, "rows": [{"id": "r1", "text": "hello"}]}),
+        )
+        .unwrap();
+        let head = read_head(&path).unwrap().unwrap();
+        let nested_head = json!({
+            "revision": 2,
+            "meta": {"k": 1, "inner": {"deep": true}},
+            "zz_empty": {}
+        });
+        let delta = [RecordChange {
+            section: "rows",
+            id: "r2",
+            position: None,
+            value: json!({"id": "r2", "text": "world"}),
+        }];
+        apply_delta(&path, head.revision, Some(&nested_head), &delta, &[]).unwrap();
+        close_thread_connections();
+        let assembled: Value = read(&path, 65536).unwrap().unwrap();
+        assert_eq!(
+            assembled,
+            json!({
+                "revision": 2,
+                "meta": {"k": 1, "inner": {"deep": true}},
+                "zz_empty": {},
+                "rows": [
+                    {"id": "r1", "text": "hello"},
+                    {"id": "r2", "text": "world"}
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn remove_snapshot_is_transactional_and_quick_check_runs_once_per_db_path() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join("tx_remove.json");
+        fs::write(&legacy, br#"{"rows":[{"id":"one"}]}"#).unwrap();
+        let _: Option<Value> = read(&legacy, 4096).unwrap();
+        let db = database_for(&legacy);
+        with_connection(&db, |c| {
+            c.execute_batch(
+                "CREATE TEMP TRIGGER abort_migration_delete BEFORE DELETE ON migrations BEGIN SELECT RAISE(ABORT,'migration delete failed'); END;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(remove_snapshot(&legacy).is_err());
+        assert!(
+            has_snapshot(&legacy).unwrap(),
+            "Immediate transaction must roll back snapshots DELETE when migrations DELETE fails"
+        );
+        with_connection(&db, |c| {
+            c.execute_batch("DROP TRIGGER abort_migration_delete;")?;
+            Ok(())
+        })
+        .unwrap();
+        remove_snapshot(&legacy).unwrap();
+        assert!(!has_snapshot(&legacy).unwrap());
+
+        // Verify PRAGMA quick_check runs once per DB path across threads.
+        let check_key = db.canonicalize().unwrap_or_else(|_| db.clone());
+        assert!(QUICK_CHECKED_DBS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .contains(&check_key));
+        let db_for_thread = db.clone();
+        std::thread::spawn(move || {
+            let _c = open(&db_for_thread).unwrap();
+        })
+        .join()
+        .unwrap();
+        assert!(QUICK_CHECKED_DBS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .contains(&check_key));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_primary_never_falls_back_and_lockfile_rejects_symlinks() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        let existing_db = root.path().join("database/stepx.sqlite3");
+        fs::create_dir_all(existing_db.parent().unwrap()).unwrap();
+        fs::write(&existing_db, b"existing-unreadable-or-corrupt").unwrap();
+        fs::set_permissions(&existing_db, fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(
+            !can_fallback_primary_db(&existing_db),
+            "existing primary DB must never split-brain onto /tmp"
+        );
+        fs::set_permissions(&existing_db, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let dangling = root.path().join("database/dangling.sqlite3");
+        std::os::unix::fs::symlink("/nonexistent/stepx.sqlite3", &dangling).unwrap();
+        assert!(
+            !can_fallback_primary_db(&dangling),
+            "symlinked primary DB must never fall back"
+        );
+
+        let writable_missing = root.path().join("writable-parent/stepx.sqlite3");
+        assert!(
+            !can_fallback_primary_db(&writable_missing),
+            "writable parent directory must not trigger /tmp fallback"
+        );
+
+        let fb = fallback_database_path();
+        ensure_private_fallback_dir(fb.parent().unwrap()).unwrap();
+        let fb_meta = fs::symlink_metadata(fb.parent().unwrap()).unwrap();
+        assert!(fb_meta.is_dir() && !fb_meta.file_type().is_symlink());
+        assert_eq!(fb_meta.uid(), unsafe { libc::geteuid() });
+        assert_eq!(fb_meta.mode() & 0o777, 0o700);
+
+        // Lockfiles must refuse symlinks.
+        let target_file = root.path().join("victim.txt");
+        fs::write(&target_file, b"untouched").unwrap();
+        let symlink_lock = root.path().join("database-use.lock");
+        std::os::unix::fs::symlink(&target_file, &symlink_lock).unwrap();
+        assert!(open_lock_nofollow(&symlink_lock).is_err());
+        assert_eq!(fs::read(&target_file).unwrap(), b"untouched");
     }
 }

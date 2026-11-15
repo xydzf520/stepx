@@ -276,9 +276,9 @@ pub struct PhoneVersion {
     pub has_update_page: bool,
 }
 pub fn phone_version(adb: &Adb, device: &Device) -> Result<PhoneVersion> {
-    device.verify(adb)?;
+    let transport = device.resolve_active_transport(adb)?;
     let raw = adb.script(
-        &device.transport,
+        &transport,
         "v=$(getprop ro.build.aios_version); if [ -z \"$v\" ]; then v=$(getprop ro.build.display.id); fi; printf '%s\\n' \"$v\"; getprop ro.build.version.security_patch; cmd package resolve-activity --brief -a stepos.settings.SYSTEM_UPDATE_SETTINGS 2>/dev/null || true",
     )?;
     let mut lines = raw.lines();
@@ -292,9 +292,9 @@ pub fn phone_version(adb: &Adb, device: &Device) -> Result<PhoneVersion> {
     })
 }
 pub fn open_phone_update(adb: &Adb, device: &Device) -> Result<()> {
-    device.verify(adb)?;
+    let transport = device.resolve_active_transport(adb)?;
     let result = adb.shell(
-        &device.transport,
+        &transport,
         &[
             "am",
             "start",

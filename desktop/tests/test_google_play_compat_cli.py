@@ -139,16 +139,19 @@ class CliTests(unittest.TestCase):
         self.assertEqual(self.transport.calls, [("check",), ("gms", "status"), ("play", "status")])
 
     def test_existing_receipt_with_new_state_is_not_rebased_or_overwritten(self):
-        result = self.execute("apply")
-        path = self.directory / result["receipt_id"] / "manifest.json"
+        first = self.execute("apply")
+        path = self.directory / first["receipt_id"] / "manifest.json"
         original = path.read_bytes()
         self.transport.active["play"] = False
         self.transport.calls.clear()
-        with self.assertRaises(compat.RepairError) as raised:
-            self.execute("apply")
-        self.assertEqual(raised.exception.code, "recovery_required")
+        second = self.execute("apply")
+        self.assertTrue(second["active"])
+        self.assertNotEqual(second["receipt_id"], first["receipt_id"])
         self.assertEqual(path.read_bytes(), original)
-        self.assertNotIn(("stop",), self.transport.calls)
+        second_manifest = compat._read_private(self.directory / second["receipt_id"] / "manifest.json")
+        self.assertEqual(second_manifest["superseded_receipt_id"], first["receipt_id"])
+        old_events = [compat._read_private(p) for p in (self.directory / first["receipt_id"]).glob("*.json")]
+        self.assertTrue(any(e.get("phase") == "receipt_superseded" for e in old_events))
 
     def test_second_scope_failure_rolls_back_both_scopes(self):
         self.transport.fail_apply = "play"

@@ -2,7 +2,11 @@ use crate::{adb::Adb, bridge::call_bridge, device::Device};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::time::Duration;
+use std::{
+    collections::HashSet,
+    sync::{Mutex, OnceLock},
+    time::Duration,
+};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -28,35 +32,123 @@ impl LiveCall {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CallControl { Answer, Hangup }
 
-pub fn control_call(adb: &Adb, device: &Device, expected_id: &str, action: CallControl) -> Result<LiveCall> {
-    // Discovery is read-only. A failed catalog can use the fixed system adapter.
-    // Once a tool is dispatched, an uncertain result never switches route.
-    let (catalog_tx, catalog_rx) = std::sync::mpsc::channel();
+static INFLIGHT_CATALOG_PROBES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+struct CatalogProbeSlot {
+    key: String,
+}
+
+impl CatalogProbeSlot {
+    fn try_acquire(device_key: &str) -> Option<Self> {
+        let key = device_key.trim();
+        let normalized = if key.is_empty() { "<default>" } else { key };
+        let set = INFLIGHT_CATALOG_PROBES.get_or_init(|| Mutex::new(HashSet::new()));
+        let mut guard = set.lock().ok()?;
+        if !guard.insert(normalized.to_string()) {
+            return None;
+        }
+        Some(Self {
+            key: normalized.to_string(),
+        })
+    }
+}
+
+impl Drop for CatalogProbeSlot {
+    fn drop(&mut self) {
+        if let Some(set) = INFLIGHT_CATALOG_PROBES.get() {
+            if let Ok(mut guard) = set.lock() {
+                guard.remove(&self.key);
+            }
+        }
+    }
+}
+
+fn probe_native_catalog_bounded(adb: &Adb, device: &Device) -> Option<crate::native_mcp::Client> {
+    let probe_key = if !device.serial.trim().is_empty() {
+        device.serial.as_str()
+    } else {
+        device.transport.as_str()
+    };
+    let slot = CatalogProbeSlot::try_acquire(probe_key)?;
+    let (catalog_tx, catalog_rx) = std::sync::mpsc::sync_channel(1);
     let discovery_adb = adb.clone();
     let discovery_device = device.clone();
-    std::thread::spawn(move || {
-        // Only a read-only catalog probe may outlive this short UI deadline.
-        let _ = catalog_tx.send(crate::native_mcp::Client::connect(&discovery_adb, &discovery_device));
-    });
-    let mut native = catalog_rx.recv_timeout(Duration::from_millis(500)).ok().and_then(Result::ok);
-    let current = crate::push::fetch_live_call(adb, &device.resolve_active_transport(adb)?)?;
+    let handle = std::thread::Builder::new()
+        .name("stepx-call-mcp-probe".into())
+        .spawn(move || {
+            let _slot = slot;
+            let _ = catalog_tx.send(crate::native_mcp::Client::connect(
+                &discovery_adb,
+                &discovery_device,
+            ));
+        })
+        .ok()?;
+
+    match catalog_rx.recv_timeout(Duration::from_millis(500)) {
+        Ok(res) => {
+            drop(catalog_rx);
+            let _ = handle.join();
+            res.ok()
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = handle.join();
+            None
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            // Drop receiver immediately so if the bounded probe finishes later, any
+            // connected AgentBus client is dropped at once instead of lingering.
+            drop(catalog_rx);
+            None
+        }
+    }
+}
+
+fn check_call_control_confirmation(
+    action: CallControl,
+    expected_id: &str,
+    state: &LiveCall,
+) -> Result<bool> {
+    match action {
+        CallControl::Hangup => Ok(
+            state.state == "idle" || (!expected_id.is_empty() && state.id != expected_id),
+        ),
+        CallControl::Answer => {
+            if state.id == expected_id && state.state == "active" {
+                return Ok(true);
+            }
+            if state.state == "idle" || (!state.id.is_empty() && state.id != expected_id) {
+                bail!("通话已变化，请核对手机当前状态");
+            }
+            Ok(false)
+        }
+    }
+}
+
+pub fn control_call(adb: &Adb, device: &Device, expected_id: &str, action: CallControl) -> Result<LiveCall> {
+    let transport = device.resolve_active_transport(adb)?;
+    let current = crate::push::fetch_live_call(adb, &transport)?;
     ensure_current_call(&current, expected_id, action, chrono::Utc::now().timestamp_millis())?;
+
+    // Discovery is read-only and bounded to at most one probe per device.
+    // A failed or timed-out catalog uses the fixed system adapter; once dispatched, never switch route.
+    let mut native = probe_native_catalog_bounded(adb, device);
     let method = match action { CallControl::Answer => "dialer_accept_call", CallControl::Hangup => "dialer_hangup_call" };
     let _mutation = crate::device::protect_transport_mutation(&device.serial)?;
     if let Some(client) = native.as_mut().filter(|client| client.supports(method)) {
-        client.call(method, json!({}))?;
+        let res = client.call(method, json!({}));
+        drop(native);
+        res?;
     } else {
+        drop(native);
         call_bridge(adb, device, &json!({"op":"phone_control", "action":if action == CallControl::Answer {"answer"} else {"hangup"}, "state":current.state}), Duration::from_secs(12))?;
     }
     // The command receipt alone cannot establish that the call changed state.
     for _ in 0..12 {
-        let state = crate::push::fetch_live_call(adb, &device.resolve_active_transport(adb)?)?;
-        let confirmed = match action {
-            CallControl::Answer => state.id == expected_id && state.state == "active",
-            CallControl::Hangup => state.available && state.state == "idle",
-        };
-        if confirmed { return Ok(state); }
-        if !state.id.is_empty() && state.id != expected_id { bail!("通话已变化，请核对手机当前状态") }
+        let next_transport = device.resolve_active_transport(adb)?;
+        let state = crate::push::fetch_live_call(adb, &next_transport)?;
+        if check_call_control_confirmation(action, expected_id, &state)? {
+            return Ok(state);
+        }
         std::thread::sleep(Duration::from_millis(200));
     }
     bail!("手机尚未确认通话状态，请查看手机后重试")
@@ -210,5 +302,183 @@ mod tests {
         ] {
             assert!(normalize_number(input).is_err(), "accepted {input:?}");
         }
+    }
+
+    #[test]
+    fn hangup_confirms_on_idle_or_replaced_call_id_and_bounds_catalog_probes() {
+        use super::*;
+
+        // 1. Hangup immediately confirms on `state == "idle"` regardless of `available`
+        let idle_unavailable = LiveCall {
+            available: false,
+            id: String::new(),
+            state: "idle".into(),
+            ..Default::default()
+        };
+        assert!(check_call_control_confirmation(CallControl::Hangup, "call-1", &idle_unavailable).unwrap());
+
+        // 2. Hangup immediately confirms when `state.id != expected_id` (e.g., new incoming call arrived or id cleared)
+        let next_ringing = LiveCall {
+            available: true,
+            id: "call-2".into(),
+            state: "ringing".into(),
+            ..Default::default()
+        };
+        assert!(check_call_control_confirmation(CallControl::Hangup, "call-1", &next_ringing).unwrap());
+
+        let cleared_id = LiveCall {
+            available: true,
+            id: String::new(),
+            state: "disconnecting".into(),
+            ..Default::default()
+        };
+        assert!(check_call_control_confirmation(CallControl::Hangup, "call-1", &cleared_id).unwrap());
+
+        // 3. Hangup keeps polling while same `expected_id` is still active
+        let still_active = LiveCall {
+            available: true,
+            id: "call-1".into(),
+            state: "active".into(),
+            ..Default::default()
+        };
+        assert!(!check_call_control_confirmation(CallControl::Hangup, "call-1", &still_active).unwrap());
+
+        // 4. Answer confirms only when `expected_id` reaches `"active"` and errors if call changed or ended
+        assert!(check_call_control_confirmation(CallControl::Answer, "call-1", &still_active).unwrap());
+        let still_ringing = LiveCall {
+            state: "ringing".into(),
+            ..still_active
+        };
+        assert!(!check_call_control_confirmation(CallControl::Answer, "call-1", &still_ringing).unwrap());
+        assert!(check_call_control_confirmation(CallControl::Answer, "call-1", &next_ringing).is_err());
+        assert!(check_call_control_confirmation(CallControl::Answer, "call-1", &idle_unavailable).is_err());
+
+        // 5. CatalogProbeSlot bounds concurrent discovery probes to at most 1 per device
+        let slot1 = CatalogProbeSlot::try_acquire("PHONE-PROBE-DEV-1").expect("first slot should acquire");
+        assert!(
+            CatalogProbeSlot::try_acquire("PHONE-PROBE-DEV-1").is_none(),
+            "duplicate concurrent probe on same device must be rejected"
+        );
+        assert!(
+            CatalogProbeSlot::try_acquire("PHONE-PROBE-DEV-2").is_some(),
+            "different device must remain independent"
+        );
+        drop(slot1);
+        assert!(
+            CatalogProbeSlot::try_acquire("PHONE-PROBE-DEV-1").is_some(),
+            "slot must release cleanly on drop"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_call_hangup_succeeds_when_new_call_arrives_without_false_failure() {
+        use super::*;
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let call_state_polls = Arc::new(AtomicUsize::new(0));
+        let polls_clone = call_state_polls.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.clone();
+        listener.set_nonblocking(true).unwrap();
+
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(8);
+            while !stop_clone.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                let stream = match listener.accept() {
+                    Ok((s, _)) => s,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let poll_idx = polls_clone.fetch_add(1, Ordering::SeqCst);
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                // Poll 0 (pre-hangup check): call-old is active.
+                // Poll 1 (post-hangup check): call-old ended and call-new is already ringing!
+                let resp = if poll_idx == 0 {
+                    json!({
+                        "ok": true,
+                        "available": true,
+                        "id": "call-old",
+                        "state": "active",
+                        "multiple_calls": false,
+                        "observed_ms": now_ms
+                    })
+                } else {
+                    json!({
+                        "ok": true,
+                        "available": true,
+                        "id": "call-new",
+                        "state": "ringing",
+                        "multiple_calls": false,
+                        "observed_ms": now_ms
+                    })
+                };
+                let mut out = serde_json::to_vec(&resp).unwrap();
+                out.push(b'\n');
+                let _ = (&stream).write_all(&out);
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_adb = dir.path().join("adb");
+        let serial = "PHONEHANGUPTEST01";
+        std::fs::write(
+            &fake_adb,
+            format!(
+                r#"#!/bin/sh
+case "$*" in
+  *"shell getprop ro.serialno"*)
+    printf '{serial}\n'
+    exit 0
+    ;;
+  *"forward tcp:0 localabstract:stepx_push_v1"*)
+    printf '{port}\n'
+    exit 0
+    ;;
+  *"stat -c %s"*)
+    printf 'READY'
+    exit 0
+    ;;
+  *"com.stepx.companion.Bridge"*)
+    printf 'STEPX_RESULT:{{"ok":true}}\n'
+    exit 0
+    ;;
+esac
+exit 1
+"#
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_adb, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        crate::bridge::mark_bridge_jar_cached(serial);
+        let device = Device {
+            transport: serial.into(),
+            serial: serial.into(),
+            ..Default::default()
+        };
+        let confirmed_state =
+            control_call(&Adb { path: fake_adb }, &device, "call-old", CallControl::Hangup)
+                .expect("hangup must confirm success when old call disappears and new call arrives");
+        assert_eq!(confirmed_state.id, "call-new");
+
+        stop.store(true, Ordering::Release);
+        let _ = server.join();
     }
 }

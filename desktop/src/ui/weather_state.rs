@@ -64,6 +64,30 @@ impl WeatherFetchState {
 }
 
 impl Companion {
+    pub(in crate::ui) fn apply_weather_select_day(&mut self, day_idx: usize) {
+        self.error = false;
+        let max_idx = self.weather_snapshot.daily.len().saturating_sub(1);
+        self.weather_selected_day = day_idx.min(max_idx);
+        if let Some(day) = self
+            .weather_snapshot
+            .daily
+            .get(self.weather_selected_day)
+            .cloned()
+        {
+            // Selecting a forecast day must only switch the active weather day
+            // and status feedback, never clobbering the user's F_HOME_COMMAND draft.
+            self.status = format!(
+                "已选中「{} · {}」：{} {}°~{}°C（{}）",
+                self.weather_snapshot.city,
+                day.date_label,
+                day.condition,
+                day.low_c,
+                day.high_c,
+                day.advice
+            );
+        }
+    }
+
     pub(in crate::ui) fn spawn_live_weather_fetch(
         &mut self,
         city: &str,
@@ -104,11 +128,20 @@ impl Companion {
         };
         let selection_revision = weather::weather_selection_revision();
         let requested_device = self.selected.clone();
-        let device_for_fetch = requested_device.clone();
+        let mut device_for_fetch = requested_device.clone();
         let city_for_fetch = request.city;
         let report_status = request.report_status;
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
+            if let Some(dev) = device_for_fetch.as_mut() {
+                if let Ok(adb) = stepx_companion::adb::Adb::discover() {
+                    if let Ok(active) = dev.resolve_active_transport(&adb) {
+                        dev.transport = active;
+                    }
+                } else {
+                    dev.transport = super::active_transport_for(&dev.serial, &dev.transport);
+                }
+            }
             let city = if city_for_fetch.is_empty() {
                 weather::load_preferred_city()
             } else {
@@ -242,5 +275,21 @@ mod tests {
         );
         state.finish();
         assert!(state.begin().is_none());
+    }
+
+    #[test]
+    fn weather_select_day_preserves_home_command_draft() {
+        let mut app = Companion::new_for_test();
+        app.fields[super::super::F_HOME_COMMAND].set("给王总回复明早十点评审议程");
+        app.focus = Some(super::super::F_HOME_COMMAND);
+        let max_idx = app.weather_snapshot.daily.len().saturating_sub(1);
+        let target_day = 1.min(max_idx);
+        app.apply_weather_select_day(target_day);
+        assert_eq!(app.weather_selected_day, target_day);
+        assert_eq!(
+            app.fields[super::super::F_HOME_COMMAND].text,
+            "给王总回复明早十点评审议程",
+            "selecting a weather forecast day must never overwrite F_HOME_COMMAND"
+        );
     }
 }

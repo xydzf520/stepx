@@ -1035,7 +1035,7 @@ pub struct ReplyReceipt {
     pub timestamp_ms: i64,
 }
 
-const SOCKET_MISS_TTL: Duration = Duration::from_secs(15);
+const SOCKET_MISS_TTL: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, Debug)]
 struct ForwardCacheEntry {
@@ -1048,12 +1048,28 @@ fn forward_cache() -> &'static Mutex<HashMap<String, ForwardCacheEntry>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn invalidate_cached_port(serial: &str) {
+#[allow(dead_code)]
+pub(crate) fn invalidate_cached_port(serial: &str) {
     if let Ok(mut guard) = forward_cache().lock() {
         guard.remove(serial);
     }
 }
 
+pub(crate) fn invalidate_cached_port_for_adb(adb: &Adb, serial: &str) {
+    let old_port = forward_cache()
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.remove(serial))
+        .and_then(|entry| entry.port);
+    if let Some(old_port) = old_port {
+        let _ = adb.run_timeout(
+            &["-s", serial, "forward", "--remove", &format!("tcp:{old_port}")],
+            Duration::from_millis(800),
+        );
+    }
+}
+
+#[allow(dead_code)]
 fn mark_socket_unavailable(serial: &str) {
     if let Ok(mut guard) = forward_cache().lock() {
         guard.insert(
@@ -1063,6 +1079,36 @@ fn mark_socket_unavailable(serial: &str) {
                 updated_at: Instant::now(),
             },
         );
+    }
+}
+
+fn mark_socket_unavailable_for_adb(adb: &Adb, serial: &str) {
+    let old_port = forward_cache()
+        .lock()
+        .ok()
+        .and_then(|mut guard| {
+            guard.insert(
+                serial.to_string(),
+                ForwardCacheEntry {
+                    port: None,
+                    updated_at: Instant::now(),
+                },
+            )
+        })
+        .and_then(|entry| entry.port);
+    if let Some(old_port) = old_port {
+        let _ = adb.run_timeout(
+            &["-s", serial, "forward", "--remove", &format!("tcp:{old_port}")],
+            Duration::from_millis(800),
+        );
+    }
+}
+
+fn clear_socket_miss_cache(serial: &str) {
+    if let Ok(mut guard) = forward_cache().lock() {
+        if guard.get(serial).is_some_and(|entry| entry.port.is_none()) {
+            guard.remove(serial);
+        }
     }
 }
 
@@ -1080,17 +1126,23 @@ fn is_socket_recently_unavailable(serial: &str, now: Instant) -> bool {
 }
 
 fn obtain_forwarded_port(adb: &Adb, serial: &str, force_refresh: bool) -> Result<(u16, bool)> {
-    if !force_refresh {
-        if let Ok(guard) = forward_cache().lock() {
-            if let Some(entry) = guard.get(serial) {
-                if let Some(port) = entry.port {
-                    // Re-establish forward if the laptop likely slept or the port is older than 5 minutes.
-                    if entry.updated_at.elapsed() <= Duration::from_secs(300) {
-                        return Ok((port, true));
-                    }
+    let mut old_port_to_remove = None;
+    if let Ok(mut guard) = forward_cache().lock() {
+        if let Some(entry) = guard.get(serial) {
+            if let Some(port) = entry.port {
+                if !force_refresh && entry.updated_at.elapsed() <= Duration::from_secs(300) {
+                    return Ok((port, true));
                 }
+                old_port_to_remove = Some(port);
+                guard.remove(serial);
             }
         }
+    }
+    if let Some(old_port) = old_port_to_remove {
+        let _ = adb.run_timeout(
+            &["-s", serial, "forward", "--remove", &format!("tcp:{old_port}")],
+            Duration::from_millis(800),
+        );
     }
 
     let is_wireless = crate::adb::is_wireless_transport(serial);
@@ -1103,13 +1155,24 @@ fn obtain_forwarded_port(adb: &Adb, serial: &str, force_refresh: bool) -> Result
         .find_map(|line| line.trim().parse::<u16>().ok())
         .context("无法解析 adb forward 分配的本地端口")?;
 
-    if let Ok(mut guard) = forward_cache().lock() {
-        guard.insert(
-            serial.to_string(),
-            ForwardCacheEntry {
-                port: Some(port),
-                updated_at: Instant::now(),
-            },
+    let displaced_port = forward_cache()
+        .lock()
+        .ok()
+        .and_then(|mut guard| {
+            guard.insert(
+                serial.to_string(),
+                ForwardCacheEntry {
+                    port: Some(port),
+                    updated_at: Instant::now(),
+                },
+            )
+        })
+        .and_then(|entry| entry.port)
+        .filter(|&p| p != port);
+    if let Some(old_port) = displaced_port {
+        let _ = adb.run_timeout(
+            &["-s", serial, "forward", "--remove", &format!("tcp:{old_port}")],
+            Duration::from_millis(800),
         );
     }
     Ok((port, false))
@@ -1122,6 +1185,7 @@ fn socket_read_timeout(request: &Value, serial: &str) -> Duration {
         Some("sync_window" | "sync_im_list" | "open_push") => {
             Duration::from_millis(if is_wireless { 12000 } else { 10000 })
         }
+        Some("snapshot") => Duration::from_millis(if is_wireless { 4000 } else { 3500 }),
         _ => Duration::from_millis(if is_wireless { 4000 } else { 1800 }),
     }
 }
@@ -1160,13 +1224,14 @@ fn try_call_local_socket(adb: &Adb, serial: &str, request: &Value) -> Result<Val
         let (port, from_cache) = match obtain_forwarded_port(adb, serial, force_refresh) {
             Ok(res) => res,
             Err(e) => {
-                mark_socket_unavailable(serial);
+                mark_socket_unavailable_for_adb(adb, serial);
                 return Err(e);
             }
         };
 
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
         let mut write_started = false;
+        let mut immediate_eof = false;
         let io_result = (|| -> Result<Value> {
             let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(1500))
                 .context("连接本地推送流端口超时")?;
@@ -1180,7 +1245,10 @@ fn try_call_local_socket(adb: &Adb, serial: &str, request: &Value) -> Result<Val
             let mut reader = BufReader::new(stream);
             let mut line = String::new();
             let n = reader.read_line(&mut line)?;
-            ensure!(n > 0, "本地推送流已断开 (EOF)");
+            if n == 0 {
+                immediate_eof = true;
+                anyhow::bail!("本地推送流已断开 (EOF)");
+            }
             let mut value: Value =
                 serde_json::from_str(line.trim()).context("解析推送流 JSON 失败")?;
             if let Some(obj) = value.as_object_mut() {
@@ -1202,14 +1270,24 @@ fn try_call_local_socket(adb: &Adb, serial: &str, request: &Value) -> Result<Val
             }
             Err(err) => {
                 if write_started && !replay_safe(request) {
-                    invalidate_cached_port(serial);
+                    invalidate_cached_port_for_adb(adb, serial);
                     return Err(err.context(UncertainPushWrite));
                 }
-                if !from_cache || attempt == 1 {
-                    mark_socket_unavailable(serial);
+                let timed_out = err.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io_err| {
+                            matches!(
+                                io_err.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            )
+                        })
+                });
+                if !from_cache || attempt == 1 || immediate_eof || timed_out {
+                    mark_socket_unavailable_for_adb(adb, serial);
                     return Err(err);
                 }
-                invalidate_cached_port(serial);
+                invalidate_cached_port_for_adb(adb, serial);
             }
         }
     }
@@ -1270,15 +1348,84 @@ fn message_read_health() -> &'static std::sync::Mutex<std::collections::HashMap<
 }
 fn observe_message_read(serial: &str, started: Instant, success: bool) {
     let mut map = message_read_health().lock().unwrap_or_else(|error| error.into_inner());
-    let health = map.entry(serial.into()).or_default();
-    if success { health.succeeded = Some(Instant::now()); health.failed = None; }
-    else if health.succeeded.is_none_or(|at| at < started) { health.failed = Some(Instant::now()); }
+    let now = Instant::now();
+    let mut targets = vec![serial.to_string()];
+    if success {
+        let mut lookup_keys = vec![serial];
+        let hw = crate::device::canonical_serial_from_transport(serial);
+        if let Some(ref hw) = hw {
+            if !hw.is_empty() {
+                if !targets.contains(hw) {
+                    targets.push(hw.clone());
+                }
+                lookup_keys.push(hw.as_str());
+            }
+        }
+        for peer in crate::device::backup_transports_for(&lookup_keys) {
+            if !peer.is_empty() && !targets.contains(&peer) {
+                targets.push(peer);
+            }
+        }
+    }
+    for target in targets {
+        let health = map.entry(target).or_default();
+        if success {
+            health.succeeded = Some(now);
+            health.failed = None;
+        } else if health.succeeded.is_none_or(|at| at < started) {
+            health.failed = Some(now);
+        }
+    }
 }
+
+pub fn clear_message_read_failure_on_failover(serial: &str, active_transport: &str) {
+    let now = Instant::now();
+    let mut targets = Vec::new();
+    for s in [serial.trim(), active_transport.trim()] {
+        if !s.is_empty() && !targets.iter().any(|t| t == s) {
+            targets.push(s.to_string());
+        }
+        if let Some(hw) = crate::device::canonical_serial_from_transport(s) {
+            if !hw.is_empty() && !targets.contains(&hw) {
+                targets.push(hw);
+            }
+        }
+    }
+    for peer in crate::device::backup_transports_for(&[serial, active_transport]) {
+        if !peer.is_empty() && !targets.contains(&peer) {
+            targets.push(peer);
+        }
+    }
+    let mut map = message_read_health().lock().unwrap_or_else(|error| error.into_inner());
+    for target in targets {
+        let health = map.entry(target).or_default();
+        health.succeeded = Some(now);
+        health.failed = None;
+    }
+}
+
 pub fn message_data_stalled(device: &crate::device::Device) -> bool {
     let map = message_read_health().lock().unwrap_or_else(|error| error.into_inner());
+    let active = crate::device::active_transport_for(&device.serial, &device.transport);
+    if !active.is_empty() {
+        if let Some(active_health) = map.get(&active) {
+            if active_health.succeeded.is_some()
+                && active_health
+                    .failed
+                    .is_none_or(|f| active_health.succeeded >= Some(f))
+            {
+                return false;
+            }
+        }
+    }
     let records: Vec<_> = device.all_known_transports().iter().chain(std::iter::once(&device.serial)).filter_map(|target| map.get(target)).collect();
     let success = records.iter().filter_map(|health| health.succeeded).max();
     records.iter().filter_map(|health| health.failed).max().is_some_and(|failed| success.is_none_or(|at| at < failed))
+}
+
+fn is_push_transport_failure(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<UncertainPushWrite>().is_none()
+        && crate::adb::is_data_transport_failure(error)
 }
 
 pub fn call_push_provider(adb: &Adb, serial: &str, request: Value) -> Result<Value> {
@@ -1286,94 +1433,152 @@ pub fn call_push_provider(adb: &Adb, serial: &str, request: Value) -> Result<Val
     let message_read = request["op"] == "snapshot";
     let read_only = request_is_read_only(&request);
     let _mutation = if !read_only { Some(crate::device::protect_transport_mutation(serial)?) } else { None };
-    let result = call_push_provider_once(adb, serial, &request);
-    if message_read && (result.is_ok() || result.as_ref().is_err_and(crate::adb::is_data_transport_failure)) {
-        observe_message_read(serial, started, result.is_ok());
+    let (active_serial, first_result) = call_push_provider_once(adb, serial, &request);
+    if let Ok(val) = first_result {
+        if message_read {
+            observe_message_read(serial, started, true);
+            if active_serial != serial {
+                observe_message_read(&active_serial, started, true);
+            }
+        }
+        return Ok(val);
     }
-    if !read_only || !crate::adb::is_wireless_transport(serial)
-        || !result.as_ref().is_err_and(crate::adb::is_data_transport_failure) { return result; }
+    let err = first_result.unwrap_err();
+    let is_transport_err = is_push_transport_failure(&err);
+    if !read_only || !is_transport_err {
+        if message_read && is_transport_err {
+            observe_message_read(&active_serial, started, false);
+        }
+        return Err(err);
+    }
     // A listed device and a cached forward do not prove that data still flows.
     // Only verified reads may recover and repeat; sends and unknown operations
     // return their original uncertain receipt without resetting/replaying them.
-    crate::device::invalidate_verified_transport(serial);
-    invalidate_cached_port(serial);
-    if let Some(recovered) = crate::device::recover_transport(adb, serial, Duration::from_secs(6)) {
-        invalidate_cached_port(&recovered);
-        let result = call_push_provider_once(adb, &recovered, &request);
-        if message_read && result.is_ok() { observe_message_read(serial, started, true); observe_message_read(&recovered, started, true); }
-        return result;
+    crate::device::invalidate_verified_transport(&active_serial);
+    adb.invalidate_forwards_for_transport(&active_serial);
+    invalidate_cached_port_for_adb(adb, &active_serial);
+    if active_serial != serial {
+        crate::device::invalidate_verified_transport(serial);
+        adb.invalidate_forwards_for_transport(serial);
+        invalidate_cached_port_for_adb(adb, serial);
     }
-    result
-}
-
-fn call_push_provider_once(adb: &Adb, serial: &str, request: &Value) -> Result<Value> {
-    let active_serial = crate::device::resolve_online_transport(adb, serial, "", "", &[])
-        .unwrap_or_else(|_| serial.to_string());
-    let serial = active_serial.as_str();
-    if socket_supported(&request) {
-        let socket_result = try_call_local_socket(adb, serial, &request);
-        if let Err(error) = &socket_result {
-            if error.downcast_ref::<UncertainPushWrite>().is_some() {
-                return socket_result;
+    let recovered = crate::device::recover_transport(adb, &active_serial, Duration::from_secs(6))
+        .or_else(|| {
+            (active_serial != serial)
+                .then(|| crate::device::recover_transport(adb, serial, Duration::from_secs(6)))
+                .flatten()
+        })
+        .or_else(|| crate::device::resolve_online_transport(adb, serial, "", "", &[]).ok());
+    if let Some(recovered) = recovered {
+        invalidate_cached_port_for_adb(adb, &recovered);
+        let (retry_active, retry_result) = call_push_provider_once(adb, &recovered, &request);
+        match retry_result {
+            Ok(val) => {
+                if message_read {
+                    observe_message_read(serial, started, true);
+                    observe_message_read(&recovered, started, true);
+                    if retry_active != recovered {
+                        observe_message_read(&retry_active, started, true);
+                    }
+                }
+                return Ok(val);
+            }
+            Err(retry_err) => {
+                if message_read && is_push_transport_failure(&retry_err) {
+                    observe_message_read(&retry_active, started, false);
+                    observe_message_read(serial, started, false);
+                }
+                return Err(retry_err);
             }
         }
-        if let Ok(response) = socket_result {
-            ensure!(
-                response.get("ok").and_then(Value::as_bool).unwrap_or(true),
-                "{}",
-                response["error"].as_str().unwrap_or("手机推送服务返回错误")
-            );
-            return Ok(response);
-        }
     }
+    if message_read {
+        observe_message_read(&active_serial, started, false);
+        observe_message_read(serial, started, false);
+    }
+    Err(err)
+}
 
-    let encoded = STANDARD.encode(serde_json::to_vec(request)?);
-    ensure!(encoded.len() <= 32768, "推送请求过长");
-    let call_timeout = socket_read_timeout(&request, serial).max(Duration::from_secs(8));
-    let result = adb
-        .run_timeout(
-            &[
-                "-s",
-                serial,
-                "shell",
-                "content",
-                "call",
-                "--user",
-                "0",
-                "--uri",
-                PUSH_PROVIDER_URI,
-                "--method",
-                "request",
-                "--arg",
-                &encoded,
-            ],
-            call_timeout,
-        )
-        .map_err(|error| uncertain_write_error(error, &request))?;
-    let parse_response = || -> Result<Value> {
-        let raw = result
-            .split("result=")
-            .nth(1)
-            .context("手机没有返回推送服务响应，请安装或更新新版 StepX伴侣")?
-            .split(|c: char| !c.is_ascii_alphanumeric() && !"+/=".contains(c))
-            .next()
-            .unwrap_or("");
-        let value: Value =
-            serde_json::from_slice(&STANDARD.decode(raw).context("推送响应 Base64 解码失败")?)
-                .context("推送响应 JSON 解析失败")?;
+fn call_push_provider_once(adb: &Adb, serial: &str, request: &Value) -> (String, Result<Value>) {
+    let started = Instant::now();
+    let active_serial = crate::device::resolve_online_transport(adb, serial, "", "", &[])
+        .unwrap_or_else(|_| serial.to_string());
+    let resolved_differs = active_serial != serial;
+    let outcome = (|| -> Result<Value> {
+        let serial = active_serial.as_str();
+        if socket_supported(request) {
+            let socket_result = try_call_local_socket(adb, serial, request);
+            if let Err(error) = &socket_result {
+                if error.downcast_ref::<UncertainPushWrite>().is_some() {
+                    return socket_result;
+                }
+            }
+            if let Ok(response) = socket_result {
+                ensure!(
+                    response.get("ok").and_then(Value::as_bool).unwrap_or(true),
+                    "{}",
+                    response["error"].as_str().unwrap_or("手机推送服务返回错误")
+                );
+                if resolved_differs && request["op"] == "snapshot" {
+                    observe_message_read(serial, started, true);
+                }
+                return Ok(response);
+            }
+        }
+
+        let encoded = STANDARD.encode(serde_json::to_vec(request)?);
+        ensure!(encoded.len() <= 32768, "推送请求过长");
+        let call_timeout = socket_read_timeout(request, serial).max(Duration::from_secs(8));
+        let result = adb
+            .run_timeout(
+                &[
+                    "-s",
+                    serial,
+                    "shell",
+                    "content",
+                    "call",
+                    "--user",
+                    "0",
+                    "--uri",
+                    PUSH_PROVIDER_URI,
+                    "--method",
+                    "request",
+                    "--arg",
+                    &encoded,
+                ],
+                call_timeout,
+            )
+            .map_err(|error| uncertain_write_error(error, request))?;
+        let parse_response = || -> Result<Value> {
+            let raw = result
+                .split("result=")
+                .nth(1)
+                .context("手机没有返回推送服务响应，请安装或更新新版 StepX伴侣")?
+                .split(|c: char| !c.is_ascii_alphanumeric() && !"+/=".contains(c))
+                .next()
+                .unwrap_or("");
+            let value: Value =
+                serde_json::from_slice(&STANDARD.decode(raw).context("推送响应 Base64 解码失败")?)
+                    .context("推送响应 JSON 解析失败")?;
+            Ok(value)
+        };
+        let mut value = parse_response().map_err(|error| uncertain_write_error(error, request))?;
+        ensure!(
+            value.get("ok").and_then(Value::as_bool).unwrap_or(true),
+            "{}",
+            value["error"].as_str().unwrap_or("手机推送操作未完成")
+        );
+        clear_socket_miss_cache(serial);
+        if let Some(obj) = value.as_object_mut() {
+            obj.entry("transport_mode".to_string())
+                .or_insert_with(|| Value::String("content_provider".to_string()));
+        }
+        if resolved_differs && request["op"] == "snapshot" {
+            observe_message_read(serial, started, true);
+        }
         Ok(value)
-    };
-    let mut value = parse_response().map_err(|error| uncertain_write_error(error, &request))?;
-    ensure!(
-        value.get("ok").and_then(Value::as_bool).unwrap_or(true),
-        "{}",
-        value["error"].as_str().unwrap_or("手机推送操作未完成")
-    );
-    if let Some(obj) = value.as_object_mut() {
-        obj.entry("transport_mode".to_string())
-            .or_insert_with(|| Value::String("content_provider".to_string()));
-    }
-    Ok(value)
+    })();
+    (active_serial, outcome)
 }
 
 pub fn ensure_apex_bridge_ready(adb: &Adb, serial: &str) {
@@ -4991,7 +5196,10 @@ pub fn fetch_snapshot(adb: &Adb, serial: &str, since_revision: u64) -> Result<Pu
         allowed
     };
     if allow_dumpsys_enrichment {
-        if let Ok(raw_dumpsys) = adb.shell(serial, &["dumpsys", "notification", "--noredact"]) {
+        if let Ok(raw_dumpsys) = adb.run_timeout(
+            &["-s", serial, "shell", "dumpsys", "notification", "--noredact"],
+            Duration::from_secs(4),
+        ) {
             let (dump_notifs, dump_threads) = parse_dumpsys_notifications(&raw_dumpsys);
             for dn in dump_notifs {
                 if !snapshot.notifications.iter().any(|n| n.key == dn.key) {
@@ -5113,15 +5321,137 @@ fn reply_thread_matches_target(
                 && normalize_conversation_title(&thread.title) == title))
 }
 
+const EXPIRED_DIRECT_REPLY_ERR: &str = "该通知的直接回复通道已失效，请在手机端打开应用回复";
+
 fn ensure_specific_ui_reply_target(title: &str, notif_key: &str) -> Result<()> {
     if !notif_key.trim().is_empty() && !notif_key.starts_with("ui_window::") {
         return Ok(());
     }
     ensure!(
         !is_generic_im_title(title),
-        "无法确认具体回复会话，消息未通过看屏通道发送；请打开明确的联系人或群聊后重试"
+        "{EXPIRED_DIRECT_REPLY_ERR}"
     );
     Ok(())
+}
+
+fn match_reply_target_in_snapshot(
+    snap: &PushSnapshot,
+    package_name: &str,
+    resolved_thread_id: &mut String,
+    resolved_title: &mut String,
+    resolved_notif_key: &mut String,
+) -> Option<String> {
+    let mut matched_any = false;
+    if let Some(matched) = snap.threads.iter().find(|thread| {
+        reply_thread_matches_target(thread, package_name, resolved_thread_id, resolved_title)
+    }) {
+        matched_any = true;
+        if title_specificity_rank(&matched.title) > title_specificity_rank(resolved_title) {
+            *resolved_title = normalize_conversation_title(&matched.title);
+            *resolved_thread_id = matched.thread_id.clone();
+        }
+        let key = matched.notification_key.trim();
+        let explicitly_inactive = !key.is_empty()
+            && snap
+                .notifications
+                .iter()
+                .any(|n| n.key == key && (!n.active || n.dismissed));
+        if !key.is_empty() && !key.starts_with("ui_window::") && !explicitly_inactive {
+            *resolved_notif_key = key.to_string();
+        }
+    }
+
+    if resolved_notif_key.is_empty() {
+        if let Some(notif) = snap.notifications.iter().find(|n| {
+            if !n.active || n.dismissed || n.package_name != package_name {
+                return false;
+            }
+            if !resolved_thread_id.is_empty() && n.key == *resolved_thread_id {
+                return true;
+            }
+            let norm_notif_title = normalize_conversation_title(&n.title);
+            let norm_target_title = normalize_conversation_title(resolved_title);
+            let specific_notif_title =
+                !norm_notif_title.is_empty() && !is_generic_im_title(&norm_notif_title);
+            let specific_target_title =
+                !norm_target_title.is_empty() && !is_generic_im_title(&norm_target_title);
+
+            if !resolved_thread_id.is_empty()
+                && !n.thread_id.trim().is_empty()
+                && n.thread_id == *resolved_thread_id
+                && (specific_notif_title || specific_target_title)
+            {
+                return true;
+            }
+            if specific_notif_title
+                && format!("{}::{}", n.package_name.trim(), n.title.trim()) == *resolved_thread_id
+            {
+                return true;
+            }
+            if specific_target_title && norm_notif_title == norm_target_title {
+                return true;
+            }
+            let norm_sender = normalize_conversation_title(&n.sender);
+            if specific_target_title
+                && !specific_notif_title
+                && !norm_sender.is_empty()
+                && norm_sender == norm_target_title
+            {
+                return true;
+            }
+            false
+        }) {
+            matched_any = true;
+            *resolved_notif_key = notif.key.clone();
+            if title_specificity_rank(&notif.title) > title_specificity_rank(resolved_title) {
+                *resolved_title = normalize_conversation_title(&notif.title);
+                *resolved_thread_id = if !notif.thread_id.trim().is_empty() {
+                    notif.thread_id.clone()
+                } else {
+                    format!("{}::{}", package_name, resolved_title)
+                };
+            }
+        }
+    }
+
+    if !resolved_notif_key.is_empty() {
+        Some(resolved_notif_key.clone())
+    } else if matched_any && !is_generic_im_title(resolved_title) {
+        Some(resolved_thread_id.clone())
+    } else {
+        None
+    }
+}
+
+enum SnapshotReplyResolution {
+    Matched(String),
+    Unmatched { snapshot_populated: bool },
+    SnapshotUnavailable,
+}
+
+fn resolve_reply_target_from_snapshot_detail(
+    adb: &Adb,
+    serial: &str,
+    package_name: &str,
+    resolved_thread_id: &mut String,
+    resolved_title: &mut String,
+    resolved_notif_key: &mut String,
+) -> SnapshotReplyResolution {
+    let Ok(snap) = fetch_snapshot(adb, serial, 0) else {
+        return SnapshotReplyResolution::SnapshotUnavailable;
+    };
+    let snapshot_populated =
+        snap.listener_connected || !snap.notifications.is_empty() || !snap.threads.is_empty();
+    match match_reply_target_in_snapshot(
+        &snap,
+        package_name,
+        resolved_thread_id,
+        resolved_title,
+        resolved_notif_key,
+    ) {
+        Some(target) => SnapshotReplyResolution::Matched(target),
+        None => SnapshotReplyResolution::Unmatched { snapshot_populated },
+    }
 }
 
 fn resolve_reply_target_from_snapshot(
@@ -5131,50 +5461,18 @@ fn resolve_reply_target_from_snapshot(
     resolved_thread_id: &mut String,
     resolved_title: &mut String,
     resolved_notif_key: &mut String,
-) {
-    let Ok(snap) = fetch_snapshot(adb, serial, 0) else {
-        return;
-    };
-    if let Some(matched) = snap.threads.iter().find(|thread| {
-        reply_thread_matches_target(thread, package_name, resolved_thread_id, resolved_title)
-    }) {
-        if title_specificity_rank(&matched.title) > title_specificity_rank(resolved_title) {
-            *resolved_title = normalize_conversation_title(&matched.title);
-            *resolved_thread_id = matched.thread_id.clone();
-        }
-        if !matched.notification_key.trim().is_empty()
-            && !matched.notification_key.starts_with("ui_window::")
-        {
-            *resolved_notif_key = matched.notification_key.clone();
-        }
-    }
-    if resolved_notif_key.is_empty() {
-        if let Some(notif) = snap
-            .notifications
-            .iter()
-            .find(|n| {
-                n.active
-                    && n.package_name == package_name
-                    && (n.key == *resolved_thread_id
-                        || n.thread_id == *resolved_thread_id
-                        || format!("{}::{}", n.package_name.trim(), n.title.trim())
-                            == *resolved_thread_id
-                        || (!resolved_title.trim().is_empty()
-                            && normalize_conversation_title(&n.title)
-                                == normalize_conversation_title(resolved_title)))
-            })
-            .or_else(|| {
-                snap.notifications
-                    .iter()
-                    .find(|n| n.active && n.package_name == package_name)
-            })
-        {
-            *resolved_notif_key = notif.key.clone();
-            if title_specificity_rank(&notif.title) > title_specificity_rank(resolved_title) {
-                *resolved_title = normalize_conversation_title(&notif.title);
-                *resolved_thread_id = format!("{}::{}", package_name, resolved_title);
-            }
-        }
+) -> Option<String> {
+    match resolve_reply_target_from_snapshot_detail(
+        adb,
+        serial,
+        package_name,
+        resolved_thread_id,
+        resolved_title,
+        resolved_notif_key,
+    ) {
+        SnapshotReplyResolution::Matched(target) => Some(target),
+        SnapshotReplyResolution::Unmatched { .. }
+        | SnapshotReplyResolution::SnapshotUnavailable => None,
     }
 }
 
@@ -5541,7 +5839,7 @@ pub fn reply_im(
     let mut snapshot_resolved = false;
 
     if is_generic_im_title(&resolved_title) {
-        resolve_reply_target_from_snapshot(
+        let resolution = resolve_reply_target_from_snapshot_detail(
             adb,
             serial,
             package_name,
@@ -5550,6 +5848,20 @@ pub fn reply_im(
             &mut resolved_notif_key,
         );
         snapshot_resolved = true;
+        let known_expired_or_ambiguous = match resolution {
+            SnapshotReplyResolution::Matched(_) => false,
+            SnapshotReplyResolution::Unmatched { snapshot_populated } => {
+                snapshot_populated || !resolved_thread_id.contains('|')
+            }
+            SnapshotReplyResolution::SnapshotUnavailable => !resolved_thread_id.contains('|'),
+        };
+        if known_expired_or_ambiguous
+            && is_generic_im_title(&resolved_title)
+            && !is_sms_package_or_thread(package_name, thread_id)
+            && !is_sms_package_or_thread(package_name, &resolved_thread_id)
+        {
+            anyhow::bail!("{EXPIRED_DIRECT_REPLY_ERR}");
+        }
     }
     if resolved_title.is_empty() {
         resolved_title = title.trim().to_string();
@@ -5599,11 +5911,21 @@ pub fn reply_im(
                     &resolved_title,
                     title,
                 ) {
+                    let hw_serial = adb
+                        .run_timeout(
+                            &["-s", serial, "shell", "getprop", "ro.serialno"],
+                            Duration::from_secs(3),
+                        )
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| serial.trim().to_string());
                     let device = crate::device::Device {
                         transport: serial.to_string(),
-                        serial: String::new(),
+                        serial: hw_serial.clone(),
                         ..Default::default()
                     };
+                    let _sms_mutation = crate::device::protect_transport_mutation(&hw_serial)?;
                     if let Ok(plan) =
                         crate::bridge::sms_prepare(adb, &device, &sms_number, trimmed, None)
                     {
@@ -5635,9 +5957,7 @@ pub fn reply_im(
             }
 
             if mode != ReplyMode::UiBridgeFallback {
-                return Err(
-                    first_err.context("后台回复未完成；未唤醒手机或切换 App，也未改发到其他会话")
-                );
+                return Err(first_err.context(EXPIRED_DIRECT_REPLY_ERR));
             }
             ensure_specific_ui_reply_target(&resolved_title, &resolved_notif_key)?;
 
@@ -6036,34 +6356,235 @@ pub fn is_career_or_recruitment_signal(pkg: &str, app_name: &str, title: &str, t
         })
 }
 
-/// Extracts a 4 to 8 digit verification code (OTP) when verification keywords are present.
+/// Alias for `extract_otp_code` to extract 4–8 digit verification codes (OTPs).
+pub fn extract_verification_code(text: &str) -> Option<String> {
+    extract_otp_code(text)
+}
+
+/// Extracts a 4 to 8 digit verification code (OTP) when verification keywords or
+/// unambiguous vendor OTP prefixes (`G-123456`, `M-123456`) are present.
 pub fn extract_otp_code(text: &str) -> Option<String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return None;
     }
-    let lower = trimmed.to_ascii_lowercase();
+    // `mask_non_otp_spans` blanks URLs, emails, and query paths with ASCII spaces (`0x20`)
+    // on exact UTF-8 char boundaries, and `to_ascii_lowercase()` strictly preserves byte
+    // lengths (unlike Unicode `to_lowercase()` on chars like `İ`).
+    let masked = mask_non_otp_spans(trimmed);
+    let lower = masked.to_ascii_lowercase();
+    debug_assert_eq!(masked.len(), lower.len());
+
+    let kw_spans = collect_otp_keyword_spans(&masked, &lower);
+    if kw_spans.is_empty() {
+        return None;
+    }
+
+    let candidates = collect_digit_candidates(&masked);
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let mut best: Option<(i32, String)> = None;
+    for (start, end, code) in candidates {
+        let score = score_otp_candidate(&masked, &lower, start, end, &kw_spans);
+        if score <= 0 {
+            continue;
+        }
+        if best.as_ref().is_none_or(|(prev_score, _)| score > *prev_score) {
+            best = Some((score, code));
+        }
+    }
+    best.map(|(_, code)| code)
+}
+
+fn find_non_otp_span_end(text: &str, start: usize) -> usize {
+    text[start..]
+        .find(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    ')' | ']'
+                        | '>'
+                        | '"'
+                        | '\''
+                        | '，'
+                        | '。'
+                        | '；'
+                        | '！'
+                        | '？'
+                        | '、'
+                        | '”'
+                        | '’'
+                        | '】'
+                        | '》'
+                        | '（'
+                        | '）'
+                )
+        })
+        .map(|rel| start + rel)
+        .unwrap_or(text.len())
+}
+
+fn blank_char_boundary_span(buf: &mut [u8], text: &str, start: usize, end: usize) {
+    if start < end && end <= buf.len() && text.is_char_boundary(start) && text.is_char_boundary(end)
+    {
+        buf[start..end].fill(b' ');
+    }
+}
+
+fn mask_non_otp_spans(text: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    let raw_bytes = lower.as_bytes();
+    let mut masked = text.as_bytes().to_vec();
+
+    // 1. Mask `https://...`, `http://...`, and `www....` URLs.
+    for prefix in ["https://", "http://", "www."] {
+        let mut offset = 0usize;
+        while let Some(rel) = lower[offset..].find(prefix) {
+            let start = offset + rel;
+            let boundary_ok = prefix != "www."
+                || text[..start]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_');
+            let end = find_non_otp_span_end(text, start);
+            if boundary_ok && end > start + prefix.len() {
+                blank_char_boundary_span(&mut masked, text, start, end);
+                offset = end;
+            } else {
+                offset = start + prefix.len();
+            }
+        }
+    }
+
+    // 2. Mask email addresses (`user1234@example.com`), bare domain URLs (`stepx.ai/v?code=123456`),
+    //    and URL path/query strings (`/callback?code=123456`, `?otp=839201`, `&code=123456`).
+    let mut i = 0usize;
+    while i < raw_bytes.len() {
+        if raw_bytes[i] == b'@' {
+            let mut l = i;
+            while l > 0
+                && (raw_bytes[l - 1].is_ascii_alphanumeric()
+                    || matches!(raw_bytes[l - 1], b'.' | b'_' | b'%' | b'+' | b'-'))
+            {
+                l -= 1;
+            }
+            let mut r = i + 1;
+            let mut saw_dot = false;
+            while r < raw_bytes.len()
+                && (raw_bytes[r].is_ascii_alphanumeric() || matches!(raw_bytes[r], b'.' | b'-'))
+            {
+                if raw_bytes[r] == b'.' {
+                    saw_dot = true;
+                }
+                r += 1;
+            }
+            if l < i && r > i + 3 && saw_dot {
+                let end = find_non_otp_span_end(text, r);
+                blank_char_boundary_span(&mut masked, text, l, end);
+                i = end;
+                continue;
+            }
+        } else if raw_bytes[i] == b'.' && i > 0 && raw_bytes[i - 1].is_ascii_alphanumeric() {
+            let mut tld_end = i + 1;
+            while tld_end < raw_bytes.len() && raw_bytes[tld_end].is_ascii_alphabetic() {
+                tld_end += 1;
+            }
+            let tld_len = tld_end - (i + 1);
+            if (2..=10).contains(&tld_len)
+                && tld_end < raw_bytes.len()
+                && matches!(raw_bytes[tld_end], b'/' | b'?')
+            {
+                let mut dom_start = i;
+                while dom_start > 0
+                    && (raw_bytes[dom_start - 1].is_ascii_alphanumeric()
+                        || matches!(raw_bytes[dom_start - 1], b'.' | b'-'))
+                {
+                    dom_start -= 1;
+                }
+                let end = find_non_otp_span_end(text, tld_end);
+                blank_char_boundary_span(&mut masked, text, dom_start, end);
+                i = end;
+                continue;
+            }
+        } else if matches!(raw_bytes[i], b'/' | b'?' | b'&') {
+            let prev_ok = i == 0
+                || raw_bytes[i] != b'/'
+                || !raw_bytes[i - 1].is_ascii_digit();
+            let end = find_non_otp_span_end(text, i);
+            let seg = &lower[i..end];
+            let is_query_or_url_path = (raw_bytes[i] == b'/' && seg.contains('?') && seg.contains('='))
+                || (matches!(raw_bytes[i], b'?' | b'&')
+                    && seg.len() > 2
+                    && seg[1..]
+                        .bytes()
+                        .next()
+                        .is_some_and(|b| b.is_ascii_alphabetic())
+                    && seg.contains('='));
+            if prev_ok && is_query_or_url_path {
+                blank_char_boundary_span(&mut masked, text, i, end);
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    String::from_utf8(masked).unwrap_or_else(|_| text.to_string())
+}
+
+fn is_non_otp_code_context(masked: &str, lower: &str, idx: usize, end: usize) -> bool {
+    let before = lower[..idx].trim_end_matches([' ', '\t', '-']);
+    for non_otp in [
+        "vs", "claude", "qr", "zip", "postal", "area", "country", "error", "status", "exit",
+        "source", "clean", "low", "no", "bar", "http",
+    ] {
+        if let Some(prefix) = before.strip_suffix(non_otp) {
+            if prefix
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
+            {
+                return true;
+            }
+        }
+    }
+    let after = masked[end..].trim_start();
+    after.starts_with("编辑器") || after.starts_with("仓库")
+}
+
+fn collect_otp_keyword_spans(masked: &str, lower: &str) -> Vec<(usize, usize)> {
     let keywords = [
         "验证码",
         "校验码",
         "动态码",
         "确认码",
+        "提货码",
         "安全码",
         "授权码",
         "认证码",
         "登录码",
         "提取码",
+        "短信码",
+        "随机码",
+        "交易码",
+        "激活码",
+        "核销码",
         "verification",
         "passcode",
         "security code",
         "auth code",
+        "login code",
+        "confirmation code",
+        "access code",
         "one-time",
         "otp",
-        "code is",
-        "code:",
+        "code",
+        "pin",
     ];
 
-    let mut keyword_end_byte: Option<usize> = None;
+    let mut spans = Vec::new();
     for kw in keywords {
         let mut offset = 0usize;
         while let Some(rel) = lower[offset..].find(kw) {
@@ -6079,35 +6600,66 @@ pub fn extract_otp_code(text: &str) -> Option<String> {
                         .chars()
                         .next()
                         .is_none_or(|c| !c.is_ascii_alphabetic() && c != '_');
-                prev_ok && next_ok
+                let context_ok = match kw {
+                    "code" => !is_non_otp_code_context(masked, lower, idx, end),
+                    "pin" => !lower[..idx]
+                        .trim_end_matches([' ', '\t', '-'])
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_ascii_digit()),
+                    _ => true,
+                };
+                prev_ok && next_ok && context_ok
             } else {
                 true
             };
             if boundary_ok {
-                keyword_end_byte = Some(match keyword_end_byte {
-                    Some(prev) => prev.min(end),
-                    None => end,
-                });
-                break;
+                spans.push((idx, end));
             }
             offset = end;
         }
     }
-    let kw_end = keyword_end_byte?;
 
-    let candidates = collect_digit_candidates(trimmed);
-    if candidates.is_empty() {
-        return None;
+    // Standalone Google (`G-123456`) and Microsoft (`M-123456`) vendor-prefixed OTP tokens.
+    let bytes = masked.as_bytes();
+    let mut i = 0usize;
+    while i + 5 < bytes.len() {
+        if matches!(bytes[i], b'G' | b'M') && bytes[i + 1] == b'-' && bytes[i + 2].is_ascii_digit()
+        {
+            let prev_ok = masked[..i]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_ascii_alphanumeric() && !matches!(c, '_' | '-' | ':'));
+            let mut d = i + 2;
+            while d < bytes.len() && bytes[d].is_ascii_digit() {
+                d += 1;
+            }
+            let digit_len = d - (i + 2);
+            let next_ok = (4..=8).contains(&digit_len)
+                && masked[d..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !c.is_ascii_alphanumeric() && !matches!(c, '-' | '/' | ':'));
+            if prev_ok && next_ok {
+                spans.push((i, i + 2));
+                i = d;
+                continue;
+            }
+        }
+        i += 1;
     }
 
-    // Prefer the first valid candidate appearing after the keyword, otherwise the closest one before it.
-    if let Some((_, code)) = candidates.iter().find(|(start, _)| *start >= kw_end) {
-        return Some(code.clone());
-    }
-    candidates.last().map(|(_, code)| code.clone())
+    spans
 }
 
-fn collect_digit_candidates(text: &str) -> Vec<(usize, String)> {
+fn is_explicit_ascii_otp_prefix(prefix: &str) -> bool {
+    matches!(
+        prefix.to_ascii_lowercase().as_str(),
+        "code" | "otp" | "pin" | "passcode"
+    )
+}
+
+fn collect_digit_candidates(text: &str) -> Vec<(usize, usize, String)> {
     let bytes = text.as_bytes();
     let mut results = Vec::new();
     let mut i = 0;
@@ -6118,11 +6670,12 @@ fn collect_digit_candidates(text: &str) -> Vec<(usize, String)> {
             while i < bytes.len() && bytes[i].is_ascii_digit() {
                 i += 1;
             }
-            let len = i - start;
+            let end = i;
+            let len = end - start;
             if (4..=8).contains(&len) {
                 let prev_char = text[..start].chars().next_back();
-                let next_char = text[i..].chars().next();
-                let after_str = text[i..].trim_start();
+                let next_char = text[end..].chars().next();
+                let after_str = text[end..].trim_start();
 
                 let prev_is_decimal = prev_char == Some('.')
                     && text[..start.saturating_sub(1)]
@@ -6130,25 +6683,84 @@ fn collect_digit_candidates(text: &str) -> Vec<(usize, String)> {
                         .next_back()
                         .is_some_and(|c| c.is_ascii_digit());
                 let next_is_decimal = next_char == Some('.')
-                    && text[i + 1..]
+                    && text[end + 1..]
                         .chars()
                         .next()
                         .is_some_and(|c| c.is_ascii_digit());
-                let boundary_invalid = matches!(prev_char, Some('-' | '/' | ':'))
-                    || matches!(next_char, Some('-' | '/' | ':'))
-                    || prev_is_decimal
-                    || next_is_decimal;
+
+                let prev_invalid = match prev_char {
+                    Some('/') => true,
+                    Some(':') => {
+                        let before_colon = &text[..start - 1];
+                        let prev_before_colon = before_colon.chars().next_back();
+                        prev_before_colon.is_some_and(|c| c.is_ascii_digit())
+                            || {
+                                let hex_len = before_colon
+                                    .bytes()
+                                    .rev()
+                                    .take_while(|b| b.is_ascii_hexdigit())
+                                    .count();
+                                hex_len >= 2
+                                    && before_colon[..before_colon.len() - hex_len].ends_with(':')
+                            }
+                    }
+                    Some('-') => {
+                        let before_dash = &text[..start - 1];
+                        let alnum_len = before_dash
+                            .bytes()
+                            .rev()
+                            .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+                            .count();
+                        if alnum_len == 0 {
+                            before_dash
+                                .chars()
+                                .next_back()
+                                .is_some_and(|c| matches!(c, '-' | '/' | '.'))
+                        } else {
+                            let prefix = &before_dash[before_dash.len() - alnum_len..];
+                            let before_prefix = before_dash[..before_dash.len() - alnum_len]
+                                .chars()
+                                .next_back();
+                            let prefix_boundary_ok =
+                                !before_prefix.is_some_and(|c| matches!(c, '-' | ':' | '.' | '/'));
+                            let single_upper_vendor =
+                                prefix.len() == 1 && prefix.as_bytes()[0].is_ascii_uppercase();
+                            !(prefix_boundary_ok
+                                && (single_upper_vendor || is_explicit_ascii_otp_prefix(prefix)))
+                        }
+                    }
+                    Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+                        let before_digits = &text[..start];
+                        let prefix_len = before_digits
+                            .bytes()
+                            .rev()
+                            .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+                            .count();
+                        let prefix = &before_digits[before_digits.len() - prefix_len..];
+                        !is_explicit_ascii_otp_prefix(prefix)
+                    }
+                    _ => false,
+                };
+
+                let next_invalid = match next_char {
+                    Some('/') => true,
+                    Some(c) if c.is_ascii_alphabetic() || c == '_' => true,
+                    Some('-') | Some(':') => text[end + 1..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_alphanumeric()),
+                    _ => false,
+                };
+
                 let unit_invalid = [
-                    "元", "分钟", "秒", "小时", "年", "月", "日", "条", "人", "个", "%", "MB", "GB",
+                    "元", "块", "分钟", "秒", "小时", "年", "月", "日", "号", "条", "人", "个",
+                    "次", "件", "笔", "折", "%", "MB", "GB", "KB", "TB",
                 ]
                 .iter()
                 .any(|unit| after_str.starts_with(unit));
-                let tail_number_context = text[..start].trim_end().ends_with("尾号")
-                    || text[..start].trim_end().ends_with("卡号")
-                    || text[..start].trim_end().ends_with("账户");
 
-                if !boundary_invalid && !unit_invalid && !tail_number_context {
-                    results.push((start, text[start..i].to_string()));
+                if !prev_is_decimal && !next_is_decimal && !prev_invalid && !next_invalid && !unit_invalid {
+                    results.push((start, end, text[start..end].to_string()));
                 }
             }
         } else {
@@ -6156,6 +6768,138 @@ fn collect_digit_candidates(text: &str) -> Vec<(usize, String)> {
         }
     }
     results
+}
+
+fn has_immediate_negative_otp_prefix(masked: &str, lower: &str, effective_start: usize) -> bool {
+    let before = masked[..effective_start]
+        .trim_end_matches(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    ':' | '：' | '=' | '#' | '(' | '（' | '[' | '【' | '"' | '\'' | '“' | '「'
+                )
+        })
+        .trim_end_matches(['是', '为'])
+        .trim_end();
+    if [
+        "尾号", "卡号", "账号", "账户", "订单号", "订单", "运单号", "运单", "快递单号", "快递单",
+        "单号", "编号", "流水号", "工单号", "金额", "余额", "人民币", "消费", "支出", "元", "¥",
+        "￥", "$", "客服", "热线", "电话", "致电", "拨打", "分机",
+    ]
+    .iter()
+    .any(|neg| before.ends_with(neg))
+    {
+        return true;
+    }
+
+    let before_lower = lower[..effective_start].trim_end_matches(|c: char| {
+        c.is_whitespace() || matches!(c, ':' | '=' | '#' | '(' | '[' | '"' | '\'')
+    });
+    for neg_ascii in [
+        "order", "order id", "order no", "tracking", "amount", "balance", "rmb", "usd", "hkd",
+        "cny", "eur", "tel",
+    ] {
+        if let Some(rest) = before_lower.strip_suffix(neg_ascii) {
+            if rest
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn score_otp_candidate(
+    masked: &str,
+    lower: &str,
+    start: usize,
+    end: usize,
+    kw_spans: &[(usize, usize)],
+) -> i32 {
+    let bytes = masked.as_bytes();
+    let effective_start =
+        if start >= 2 && bytes[start - 1] == b'-' && bytes[start - 2].is_ascii_uppercase() {
+            start - 2
+        } else {
+            start
+        };
+
+    let mut penalty = 0i32;
+    if has_immediate_negative_otp_prefix(masked, lower, effective_start) {
+        penalty -= 1000;
+    }
+
+    let mut best_kw_score = 0i32;
+    for &(kw_start, kw_end) in kw_spans {
+        let kw_score = if effective_start >= kw_end || start >= kw_end {
+            let bind_start = effective_start.max(kw_end);
+            let between = &masked[kw_end..bind_start];
+            let char_dist = between.chars().count() as i32;
+            let between_clean = between.trim_matches(|c: char| {
+                c.is_whitespace()
+                    || matches!(
+                        c,
+                        ':' | '：'
+                            | '='
+                            | '-'
+                            | '#'
+                            | '['
+                            | '【'
+                            | '('
+                            | '（'
+                            | '"'
+                            | '\''
+                            | '“'
+                            | '「'
+                    )
+            });
+            let is_direct = between_clean.is_empty()
+                || matches!(
+                    between_clean.to_ascii_lowercase().as_str(),
+                    "is" | "are" | "为" | "是" | "为:" | "为：" | "是:" | "是："
+                );
+            if is_direct {
+                500 - char_dist * 4
+            } else if !between.contains(['。', '！', '？', '\n', ';', '；']) && char_dist <= 36 {
+                260 - char_dist * 4
+            } else {
+                (140 - char_dist * 2).max(20)
+            }
+        } else if end <= kw_start {
+            let between = &masked[end..kw_start];
+            let char_dist = between.chars().count() as i32;
+            let between_lower = &lower[end..kw_start];
+            let has_copula = between_lower.contains("is ")
+                || between_lower.contains("as ")
+                || between.contains('是')
+                || between.contains('为');
+            if !between.contains(['。', '！', '？', '\n', ';', '；'])
+                && has_copula
+                && char_dist <= 40
+            {
+                340 - char_dist * 3
+            } else if !between.contains(['。', '！', '？', '\n', ';', '；']) && char_dist <= 24 {
+                200 - char_dist * 4
+            } else {
+                (90 - char_dist * 2).max(10)
+            }
+        } else {
+            0
+        };
+        best_kw_score = best_kw_score.max(kw_score);
+    }
+
+    let len = end - start;
+    let len_bonus = match len {
+        6 => 20,
+        4 | 5 | 8 => 10,
+        _ => 5,
+    };
+
+    best_kw_score + len_bonus + penalty
 }
 
 /// Extracts the first `https://` or `http://` URL from notification or chat text.
@@ -7709,6 +8453,64 @@ mod tests {
             .iter()
             .any(|b| b.code == "889900" && b.source_app == "网易邮箱大师"));
     }
+
+    #[test]
+    fn wireless_failure_clears_stalled_state_on_usb_failover_or_read() {
+        let usb = "USB_SERIAL_164";
+        let wireless = "192.0.2.164:42959";
+        let mut device = crate::device::Device {
+            transport: wireless.into(),
+            serial: usb.into(),
+            model: "PZ261A".into(),
+            android: "16".into(),
+            product: "pandora".into(),
+        };
+        device.set_backup_transports(vec![usb.into()]);
+
+        let started = Instant::now();
+        observe_message_read(wireless, started, false);
+        assert!(
+            message_data_stalled(&device),
+            "wireless read failure before failover should mark device stalled"
+        );
+
+        // 1. Failover to USB immediately clears the stalled banner state
+        device.transport = usb.into();
+        device.set_backup_transports(vec![wireless.into()]);
+        crate::device::promote_active_transport(usb, usb);
+        clear_message_read_failure_on_failover(wireless, usb);
+        clear_message_read_failure_on_failover(usb, usb);
+        assert!(
+            !message_data_stalled(&device),
+            "failover to active USB transport must clear message_data_stalled immediately"
+        );
+
+        // 2. Late wireless failure on an inactive backup does not re-stall an active healthy USB transport
+        observe_message_read(wireless, Instant::now(), false);
+        assert!(
+            !message_data_stalled(&device),
+            "late wireless failure on inactive peer must not mark healthy active USB device stalled"
+        );
+
+        // 3. Before any USB read has succeeded, a peer wireless failure stalls until USB read succeeds
+        let usb_unverified = "USB_SERIAL_165";
+        let wireless_unverified = "192.0.2.165:42959";
+        let unverified_device = crate::device::Device {
+            transport: usb_unverified.into(),
+            serial: usb_unverified.into(),
+            model: "PZ261A".into(),
+            android: "16".into(),
+            product: "pandora".into(),
+        };
+        unverified_device.set_backup_transports(vec![wireless_unverified.into()]);
+        observe_message_read(wireless_unverified, Instant::now(), false);
+        assert!(message_data_stalled(&unverified_device));
+        observe_message_read(usb_unverified, Instant::now(), true);
+        assert!(
+            !message_data_stalled(&unverified_device),
+            "successful read on USB serial must clear stale wireless failure on peer transport"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -8201,7 +9003,7 @@ mod reply_merge_tests {
         mark_socket_unavailable(serial);
         assert!(is_socket_recently_unavailable(
             serial,
-            now + Duration::from_secs(5)
+            now + SOCKET_MISS_TTL / 2
         ));
         assert!(!is_socket_recently_unavailable(
             serial,
@@ -9602,5 +10404,548 @@ mod reply_merge_tests {
                 .is_empty(),
             "missing message media must not scan gallery or screenshots"
         );
+    }
+
+    #[test]
+    fn match_reply_target_never_falls_back_to_other_contact_in_same_im_app() {
+        let snap = PushSnapshot {
+            listener_connected: true,
+            threads: vec![ImThread {
+                thread_id: "com.tencent.mm::Alice".into(),
+                notification_key: "0|com.tencent.mm|101|null|10000".into(),
+                package_name: "com.tencent.mm".into(),
+                app_name: "微信".into(),
+                title: "Alice".into(),
+                ..Default::default()
+            }],
+            notifications: vec![
+                PushNotification {
+                    key: "0|com.tencent.mm|101|null|10000".into(),
+                    thread_id: "com.tencent.mm::Alice".into(),
+                    package_name: "com.tencent.mm".into(),
+                    app_name: "微信".into(),
+                    title: "Alice".into(),
+                    text: "早安".into(),
+                    active: false,
+                    dismissed: true,
+                    can_reply: true,
+                    ..Default::default()
+                },
+                PushNotification {
+                    key: "0|com.tencent.mm|202|null|10000".into(),
+                    thread_id: "com.tencent.mm::Bob".into(),
+                    package_name: "com.tencent.mm".into(),
+                    app_name: "微信".into(),
+                    title: "Bob".into(),
+                    text: "在吗".into(),
+                    active: true,
+                    dismissed: false,
+                    can_reply: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        // 1. Expired generic notification SBN key must return None and never select Bob's active notification.
+        let mut tid = "0|com.tencent.mm|101|null|10000".to_string();
+        let mut title = "微信".to_string();
+        let mut notif_key = String::new();
+        assert_eq!(
+            match_reply_target_in_snapshot(
+                &snap,
+                "com.tencent.mm",
+                &mut tid,
+                &mut title,
+                &mut notif_key
+            ),
+            None
+        );
+        assert!(notif_key.is_empty());
+        assert_ne!(title, "Bob");
+
+        // 2. Dismissed contact notification for Alice must never populate Bob's active SBN key.
+        let mut tid = "com.tencent.mm::Alice".to_string();
+        let mut title = "Alice".to_string();
+        let mut notif_key = String::new();
+        let matched = match_reply_target_in_snapshot(
+            &snap,
+            "com.tencent.mm",
+            &mut tid,
+            &mut title,
+            &mut notif_key,
+        );
+        assert_eq!(matched.as_deref(), Some("com.tencent.mm::Alice"));
+        assert!(
+            notif_key.is_empty(),
+            "expired notification for Alice must not borrow Bob's active SBN key: {notif_key}"
+        );
+
+        // 3. Same-contact active notification (including DM sender under generic banner title) still matches safely.
+        let mut snap_same_contact = snap.clone();
+        snap_same_contact.notifications.push(PushNotification {
+            key: "0|com.tencent.mm|303|null|10000".into(),
+            thread_id: "com.tencent.mm::微信".into(),
+            package_name: "com.tencent.mm".into(),
+            app_name: "微信".into(),
+            title: "微信".into(),
+            sender: "Alice".into(),
+            text: "刚又发了一条".into(),
+            active: true,
+            dismissed: false,
+            can_reply: true,
+            ..Default::default()
+        });
+        let mut tid = "com.tencent.mm::Alice".to_string();
+        let mut title = "Alice".to_string();
+        let mut notif_key = String::new();
+        assert_eq!(
+            match_reply_target_in_snapshot(
+                &snap_same_contact,
+                "com.tencent.mm",
+                &mut tid,
+                &mut title,
+                &mut notif_key
+            )
+            .as_deref(),
+            Some("0|com.tencent.mm|303|null|10000")
+        );
+        assert_eq!(notif_key, "0|com.tencent.mm|303|null|10000");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_im_notification_reply_reports_clear_error_and_never_hijacks_other_contact() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::os::unix::fs::PermissionsExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock push socket");
+        let port = listener.local_addr().unwrap().port();
+        let observed_reqs = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let reqs_clone = observed_reqs.clone();
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_server = stop.clone();
+        listener.set_nonblocking(true).unwrap();
+        let server_handle = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            while !stop_server.load(std::sync::atomic::Ordering::Acquire)
+                && Instant::now() < deadline
+            {
+                let stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let req: Value = serde_json::from_str(line.trim()).unwrap_or_default();
+                let op = req["op"].as_str().unwrap_or("").to_string();
+                reqs_clone.lock().unwrap().push(req.clone());
+
+                let resp = match op.as_str() {
+                    "snapshot" => json!({
+                        "ok": true,
+                        "snapshot": {
+                            "revision": 11,
+                            "listenerConnected": true,
+                            "threads": [{
+                                "threadId": "com.tencent.mm::Bob",
+                                "notificationKey": "0|com.tencent.mm|202|null|10000",
+                                "packageName": "com.tencent.mm",
+                                "appName": "微信",
+                                "title": "Bob"
+                            }],
+                            "notifications": [
+                                {
+                                    "key": "0|com.tencent.mm|101|null|10000",
+                                    "threadId": "com.tencent.mm::微信",
+                                    "packageName": "com.tencent.mm",
+                                    "appName": "微信",
+                                    "title": "微信",
+                                    "active": false,
+                                    "dismissed": true,
+                                    "canReply": true
+                                },
+                                {
+                                    "key": "0|com.tencent.mm|202|null|10000",
+                                    "threadId": "com.tencent.mm::Bob",
+                                    "packageName": "com.tencent.mm",
+                                    "appName": "微信",
+                                    "title": "Bob",
+                                    "text": "你好",
+                                    "active": true,
+                                    "dismissed": false,
+                                    "canReply": true
+                                }
+                            ]
+                        }
+                    }),
+                    "reply_im" => {
+                        let tid = req["thread_id"].as_str().unwrap_or("");
+                        let title = req["title"].as_str().unwrap_or("");
+                        if tid.contains("Bob") || tid.contains("202") || title == "Bob" {
+                            json!({
+                                "ok": true,
+                                "receipt": { "ok": true, "via": "remote_input", "threadId": "com.tencent.mm::Bob" }
+                            })
+                        } else {
+                            json!({
+                                "ok": false,
+                                "error": "handle_expired"
+                            })
+                        }
+                    }
+                    _ => json!({ "ok": true }),
+                };
+                let mut out = serde_json::to_vec(&resp).unwrap();
+                out.push(b'\n');
+                let _ = (&stream).write_all(&out);
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake_adb.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/usr/bin/env bash\ncase \"$*\" in\n  *\"forward tcp:0 localabstract:stepx_push_v1\"*) echo \"{port}\"; exit 0;;\nesac\nexit 0\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let adb = Adb { path: script };
+
+        // Case 1: Generic-title notification whose SBN key was dismissed while Bob has an active notification.
+        let generic_err = reply_im(
+            &adb,
+            "hijack-guard-serial",
+            "0|com.tencent.mm|101|null|10000",
+            "com.tencent.mm",
+            "微信",
+            "发给Alice的私密回复",
+            ReplyMode::Auto,
+            "cid-generic-1",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{generic_err:#}").contains("该通知的直接回复通道已失效，请在手机端打开应用回复"),
+            "unexpected error: {generic_err:#}"
+        );
+
+        // Case 2: Named contact notification whose direct reply handle expired while Bob has an active notification.
+        let specific_err = reply_im(
+            &adb,
+            "hijack-guard-serial",
+            "com.tencent.mm::Alice",
+            "com.tencent.mm",
+            "Alice",
+            "发给Alice的私密回复",
+            ReplyMode::RemoteInputOnly,
+            "cid-alice-1",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{specific_err:#}").contains("该通知的直接回复通道已失效，请在手机端打开应用回复"),
+            "unexpected error: {specific_err:#}"
+        );
+
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        let _ = server_handle.join();
+
+        let reqs = observed_reqs.lock().unwrap();
+        assert!(
+            !reqs.iter().any(|r| {
+                r["op"] == "reply_im"
+                    && (r["title"] == "Bob"
+                        || r["thread_id"]
+                            .as_str()
+                            .is_some_and(|s| s.contains("Bob") || s.contains("202")))
+            }),
+            "must never hijack Bob's active notification: {reqs:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sms_reply_fallback_resolves_real_hardware_serial_for_transport_mutation() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::os::unix::fs::PermissionsExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock push socket");
+        let port = listener.local_addr().unwrap().port();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_server = stop.clone();
+        listener.set_nonblocking(true).unwrap();
+        let server_handle = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            while !stop_server.load(std::sync::atomic::Ordering::Acquire)
+                && Instant::now() < deadline
+            {
+                let stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let req: Value = serde_json::from_str(line.trim()).unwrap_or_default();
+                let resp = match req["op"].as_str() {
+                    Some("snapshot") => json!({
+                        "ok": true,
+                        "snapshot": { "revision": 1, "threads": [], "notifications": [] }
+                    }),
+                    _ => json!({ "ok": false, "error": "no_remote_input" }),
+                };
+                let mut out = serde_json::to_vec(&resp).unwrap();
+                out.push(b'\n');
+                let _ = (&stream).write_all(&out);
+            }
+        });
+
+        let transport = "192.0.2.211:5555";
+        let hw_serial = "STEPXHWSERIAL7788";
+        crate::bridge::invalidate_bridge_cache(transport);
+        crate::bridge::invalidate_bridge_cache(hw_serial);
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("adb_sms.log");
+        let in_sms_marker = dir.path().join("in_sms_prepare");
+        let release_sms_marker = dir.path().join("release_sms_prepare");
+        let script = dir.path().join("fake_adb_sms.sh");
+        std::fs::write(
+            &script,
+            format!(
+                r#"#!/usr/bin/env bash
+printf '%s\n' "$*" >> "{log}"
+case "$*" in
+  "devices -l")
+    printf 'List of devices attached\n{transport} device\n'
+    exit 0
+    ;;
+  *"forward tcp:0 localabstract:stepx_push_v1"*)
+    echo "{port}"
+    exit 0
+    ;;
+  *"shell getprop ro.serialno"*)
+    printf "{hw_serial}\r\n"
+    exit 0
+    ;;
+  *"stat -c %s"*)
+    printf "READY"
+    exit 0
+    ;;
+  *"com.stepx.companion.Bridge"*)
+    read -r payload
+    case "$payload" in
+      *'"op":"sms_prepare"'*)
+        touch "{in_sms}"
+        for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+          [ -f "{rel_sms}" ] && break
+          sleep 0.02
+        done
+        printf 'STEPX_RESULT:{{"ok":true,"subscription":2,"parts":1,"subscription_label":"CMCC"}}\n'
+        ;;
+      *'"op":"sms_send"'*)
+        printf 'STEPX_RESULT:{{"ok":true,"id":"sms-req-1","state":"sent","parts":1,"completed":1,"updated_ms":1760000000123}}\n'
+        ;;
+    esac
+    exit 0
+    ;;
+esac
+exit 0
+"#,
+                log = log_path.display(),
+                transport = transport,
+                port = port,
+                hw_serial = hw_serial,
+                in_sms = in_sms_marker.display(),
+                rel_sms = release_sms_marker.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let adb = Adb { path: script };
+
+        // Start SMS fallback in background thread; once inside `sms_prepare`, verify that
+        // `recover_transport` on an unresponsive session for the SAME `hw_serial` is blocked
+        // (proving `protect_transport_mutation` was acquired on `hw_serial`, not empty `""`!).
+        let repair_dir = tempfile::tempdir().unwrap();
+        let repair_script = repair_dir.path().join("repair_adb.sh");
+        std::fs::write(
+            &repair_script,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in\n  'devices -l') printf 'List of devices attached\\n{transport} device\\n';;\n  *) exit 1;;\nesac\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&repair_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let repair_adb = Adb { path: repair_script };
+
+        let adb_for_reply = adb.clone();
+        let reply_thread = std::thread::spawn(move || {
+            reply_im(
+                &adb_for_reply,
+                transport,
+                "sms:13800009367",
+                "com.android.mms",
+                "13800009367",
+                "测试短信回复",
+                ReplyMode::RemoteInputOnly,
+                "cid-sms-ok",
+            )
+        });
+
+        let wait_deadline = Instant::now() + Duration::from_secs(3);
+        while !in_sms_marker.exists() && Instant::now() < wait_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(in_sms_marker.exists(), "SMS fallback did not enter sms_prepare");
+        assert!(
+            crate::device::recover_transport(&repair_adb, transport, Duration::from_millis(400))
+                .is_none(),
+            "host session reset on {hw_serial} must be blocked while SMS fallback mutation is in flight"
+        );
+        std::fs::write(&release_sms_marker, b"go").unwrap();
+
+        let receipt = reply_thread
+            .join()
+            .unwrap()
+            .expect("SMS fallback should succeed");
+        assert_eq!(receipt.via, "sms_bridge");
+        assert_eq!(receipt.delivery_status, "sent");
+        assert!(
+            crate::bridge::is_bridge_jar_cached(hw_serial),
+            "Device constructed in SMS fallback must carry non-empty ro.serialno"
+        );
+
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        let _ = server_handle.join();
+
+        let log_content = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            log_content.contains("shell getprop ro.serialno"),
+            "must query ro.serialno via adb: {log_content}"
+        );
+    }
+
+    #[test]
+    fn otp_extraction_handles_separators_vendor_prefixes_urls_tracking_utf8_and_proximity() {
+        // 1. Valid separators & vendor prefixes
+        for (input, expected) in [
+            ("验证码:123456", "123456"),
+            ("验证码：123456", "123456"),
+            ("您的验证码: 908172，5分钟内有效。", "908172"),
+            ("Your verification code:123456", "123456"),
+            ("code:123456", "123456"),
+            ("code123456", "123456"),
+            ("OTP=839201", "839201"),
+            ("PIN: 4829", "4829"),
+            ("G-123456", "123456"),
+            ("M-123456", "123456"),
+            ("G-654321 is your Google verification code.", "654321"),
+            ("Microsoft 账户安全代码：M-847291", "847291"),
+        ] {
+            assert_eq!(
+                extract_verification_code(input).as_deref(),
+                Some(expected),
+                "expected {expected} for {input:?}"
+            );
+        }
+
+        // 2. Reject timestamps, dates, phone numbers, UUID hex runs, URLs, query params, and tracking/order prefixes
+        for non_otp in [
+            "会议时间 12:34:56，请准时参加（无需验证码）",
+            "账单日期 2026-11-11，验证码已过期请重发",
+            "客服热线 400-800-1234，请勿向他人泄露验证码",
+            "请求追踪 ID a1b2-345678，verification failed",
+            "【菜鸟驿站】凭4-2-1088到驿站取件",
+            "点击链接完成登录验证码校验：https://auth.example.com/callback?code=123456&state=998877",
+            "请访问 www.stepx.ai/verify/839201 获取动态码",
+            "回调路径 /oauth/callback?code=654321&otp=112233 验证失败",
+            "顺丰速运运单 SF12345678 已揽收，凭提货码取件请留意后续短信",
+            "圆通快递 YT89234123 派送中，请准备好验证码",
+            "京东订单 JD123456 已发货，安全码将在签收时发送",
+            "CLI 版本1.4.12于2026-10-28发布，Code 编辑器更新日期10-28。",
+            "凭此指南配置 VS Code 2026.1028，与快递无关。",
+            "尾号8848银行卡正在申请验证码，请确认是否本人操作",
+        ] {
+            assert_eq!(
+                extract_verification_code(non_otp),
+                None,
+                "must reject false-positive in {non_otp:?}"
+            );
+        }
+
+        // 3. UTF-8 multibyte case-folding safety (e.g. 'İ' U+0130 expands in Unicode `.to_lowercase()`)
+        for (utf8_input, expected) in [
+            ("İSTANBUL 银行提醒：尾号8848卡消费提醒，验证码:654321", "654321"),
+            ("İİİİ Login OTP=839201 (do not share)", "839201"),
+            ("İzmir G-492018 verification code", "492018"),
+        ] {
+            assert_eq!(
+                extract_verification_code(utf8_input).as_deref(),
+                Some(expected),
+                "UTF-8 multibyte input failed: {utf8_input:?}"
+            );
+        }
+
+        // 4. Keyword proximity ranking & negative prefix weighting when multiple 4-8 digit tokens exist
+        for (multi_input, expected) in [
+            (
+                "【招商银行】您尾号8848的储蓄卡正在交易，验证码654321，请勿泄露。",
+                "654321",
+            ),
+            (
+                "您的订单20261111已提交，校验码 394812，请尽快核对。",
+                "394812",
+            ),
+            (
+                "工单单号88776655处理中，动态码 192837，5分钟内有效。",
+                "192837",
+            ),
+            (
+                "交易金额5000元，当前余额12345元，本次认证码908172。",
+                "908172",
+            ),
+            (
+                "您正在支付 ¥1680，安全码 334455，切勿告知他人。",
+                "334455",
+            ),
+            (
+                "验证码 774411（尾号9527账户登录确认，订单88990011）",
+                "774411",
+            ),
+            (
+                "登录链接 https://example.com/login?code=999999 ，您的短信验证码为 445566",
+                "445566",
+            ),
+        ] {
+            assert_eq!(
+                extract_verification_code(multi_input).as_deref(),
+                Some(expected),
+                "expected proximity winner {expected} in {multi_input:?}"
+            );
+        }
     }
 }

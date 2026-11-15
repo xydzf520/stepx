@@ -1,5 +1,6 @@
 use std::ffi::OsStr;
 use std::os::windows::process::CommandExt as _;
+use std::sync::OnceLock;
 
 use anyhow::Result;
 
@@ -51,6 +52,35 @@ pub struct JobObject {
     kill_children_on_close: bool,
 }
 
+fn get_or_create_job(kill_children_on_close: bool) -> Result<&'static win32job::Job, win32job::JobError> {
+    static KILL_CHILDREN_JOB: OnceLock<win32job::Job> = OnceLock::new();
+    static KILL_PROCESS_JOB: OnceLock<win32job::Job> = OnceLock::new();
+
+    let cell = if kill_children_on_close {
+        &KILL_CHILDREN_JOB
+    } else {
+        &KILL_PROCESS_JOB
+    };
+
+    if let Some(job) = cell.get() {
+        return Ok(job);
+    }
+
+    let job = win32job::Job::create()?;
+    let mut info = job.query_extended_limit_info()?;
+    // Mark the job as "kill on job close", so all processes associated with
+    // the job are killed when the handle to the job is closed.
+    info.limit_kill_on_job_close();
+    info.limit_breakaway_ok();
+    if !kill_children_on_close {
+        info.limit_silent_breakaway_ok();
+    }
+    job.set_extended_limit_info(&info)?;
+
+    let _ = cell.set(job);
+    Ok(cell.get().expect("job OnceLock initialized"))
+}
+
 impl JobObject {
     pub fn new() -> Self {
         Self::default()
@@ -79,17 +109,7 @@ impl JobObject {
     }
 
     fn create_internal(self) -> Result<(), win32job::JobError> {
-        let job = win32job::Job::create()?;
-
-        let mut info = job.query_extended_limit_info()?;
-        // Mark the job as "kill on job close", so all processes associated with
-        // the job are killed when the handle to the job is closed.
-        info.limit_kill_on_job_close();
-        info.limit_breakaway_ok();
-        if !self.kill_children_on_close {
-            info.limit_silent_breakaway_ok();
-        }
-        job.set_extended_limit_info(&info)?;
+        let job = get_or_create_job(self.kill_children_on_close)?;
 
         if self.assign_current_process {
             job.assign_current_process()?;
@@ -98,7 +118,6 @@ impl JobObject {
             job.assign_process(process)?;
         }
 
-        Box::leak(Box::new(job));
         Ok(())
     }
 

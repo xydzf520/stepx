@@ -106,7 +106,7 @@ final class BackScreenMcpTools {
     private static void saveRestoreStateIfNeeded(IBinder binder) {
         try {
             if (RESTORE_FILE.isFile()) return;
-            DIR.mkdirs();
+            ensurePrivateDir();
             JSONObject saved = new JSONObject()
                     .put("mode", getInt(binder, 20))
                     .put("brightness", getInt(binder, 16))
@@ -170,11 +170,31 @@ final class BackScreenMcpTools {
         setInt(binder, 21, 1);          // display_mode = 1 (always -> basicAlwaysOnGateBypass=true)
     }
 
-    private static void writeAtomic(File target, String content) throws IOException {
+    private static void ensurePrivateDir() {
         DIR.mkdirs();
+        DIR.setReadable(false, false);
+        DIR.setWritable(false, false);
+        DIR.setExecutable(false, false);
+        DIR.setReadable(true, true);
+        DIR.setWritable(true, true);
+        DIR.setExecutable(true, true);
+    }
+
+    private static void setOwnerReadWriteOnly(File f) {
+        f.setReadable(false, false);
+        f.setWritable(false, false);
+        f.setExecutable(false, false);
+        f.setReadable(true, true);
+        f.setWritable(true, true);
+    }
+
+    private static void writeAtomic(File target, String content) throws IOException {
+        ensurePrivateDir();
         File tmp = new File(DIR, target.getName() + ".tmp." + System.nanoTime());
         Files.write(tmp.toPath(), content.getBytes(StandardCharsets.UTF_8));
+        setOwnerReadWriteOnly(tmp);
         Files.move(tmp.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        setOwnerReadWriteOnly(target);
     }
 
     private static String readActiveJobId() {

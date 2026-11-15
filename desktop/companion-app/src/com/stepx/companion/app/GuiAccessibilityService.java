@@ -107,11 +107,11 @@ public final class GuiAccessibilityService extends AccessibilityService {
             if(op.equals("status")){answer.complete(status());return;}
             if(op.equals("user_pause")){task.userPause(id,now);PhoneGuiAgent.controlChanged("pause");answer.complete(status());return;}
             if(op.equals("user_resume")){unlocked();task.userContinue(id,now);scheduleWatchdog();PhoneGuiAgent.controlChanged("resume");answer.complete(status());return;}
-            if(op.equals("user_stop")){task.userStop(id);scheduleWatchdog();PhoneGuiAgent.controlChanged("stop");new File(getExternalFilesDir(null),"gui-screen.png").delete();File[] captures=getExternalFilesDir(null).listFiles((dir,name)->name.matches("mcp-screen-[a-f0-9]{32}\\.jpg"));if(captures!=null)for(File file:captures)file.delete();answer.complete(status());return;}
+            if(op.equals("user_stop")){task.userStop(id);scheduleWatchdog();PhoneGuiAgent.controlChanged("stop");File ext=getExternalFilesDir(null);if(ext!=null)new File(ext,"gui-screen.png").delete();NativeMcpService.clearAllMcpCaptures(this);answer.complete(status());return;}
             if(op.equals("start")){unlocked();task.start(id,q.getString("goal"),now);scheduleWatchdog();answer.complete(status());return;}
             if(op.equals("pause")){task.pause(id,now);scheduleWatchdog();answer.complete(status());return;}
             if(op.equals("resume")){unlocked();task.resume(id,now);scheduleWatchdog();answer.complete(status());return;}
-            if(op.equals("stop")){task.stop(id,"已停止操作");scheduleWatchdog();new File(getExternalFilesDir(null),"gui-screen.png").delete();answer.complete(status());return;}
+            if(op.equals("stop")){task.stop(id,"已停止操作");scheduleWatchdog();File ext=getExternalFilesDir(null);if(ext!=null)new File(ext,"gui-screen.png").delete();NativeMcpService.deleteMcpCapture(this,id);answer.complete(status());return;}
             if(op.equals("heartbeat")){task.renew(id,now);answer.complete(status());return;}
             task.require(id,now); unlocked();
             if(!task.phase.equals("running"))throw new IllegalStateException("任务已暂停");

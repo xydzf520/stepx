@@ -11,8 +11,21 @@ STATE='/var/lib/stepx-companion'
 HOOK='/usr/local/lib/stepx-gms/boot.py'
 STOCK_SHA='5cfe5a88a97eca424bd4922fe813e0cc553adad0e8623105311ec1514022152f'
 ORIGINAL_SHA=python_source_sha256(p.WORKFLOW/'module/boot.py')
-STATE_LOCAL=p.STATE.parent/'boot'
+_DEFAULT_STATE_LOCAL=p.user_state_root()/'boot'
+STATE_LOCAL=_DEFAULT_STATE_LOCAL
 GROUP=(p.PERMISSION,)+p.CONNECTION_PERMISSIONS+p.WAKE_PERMISSIONS
+
+def _ensure_state_local():
+    if STATE_LOCAL==_DEFAULT_STATE_LOCAL and not os.environ.get('STEPX_STATE_DIR') and not STATE_LOCAL.exists():
+        home=p.optional_tool_home()
+        if home is not None:
+            legacy_base=Path(os.environ.get('XDG_STATE_HOME') or (home/'.local/state'))
+            legacy=legacy_base/'stepx-companion/boot'
+            if legacy!=STATE_LOCAL and legacy.exists():
+                p.migrate_legacy_state(legacy,STATE_LOCAL)
+    STATE_LOCAL.mkdir(parents=True,exist_ok=True,mode=0o700)
+    if os.name!='nt':STATE_LOCAL.chmod(0o700)
+    return STATE_LOCAL
 
 class MissingPermissionBaselines(RuntimeError):
     pass
@@ -22,13 +35,30 @@ class LegacyPermissionBaseline(RuntimeError):
     pass
 
 def digest(data):return hashlib.sha256(data).hexdigest()
+
+def _ensure_usb_fallback():
+    if getattr(p.inspect,'__module__','')!=p.__name__:return
+    device_serial=os.environ.get('STEPX_DEVICE_SERIAL','').strip()
+    if not device_serial:return
+    transport=p.ADB[-1]
+    if ':' in transport or '._adb-' in transport or transport.startswith('adb-'):
+        try:
+            if p.run(p.ADB+['get-state'],timeout=15).strip()=='device':
+                p.AUTHORIZED_SERIAL=p.ADB[-1]
+                return
+        except Exception:pass
+        if p.common.recover_active_transport(device_serial):
+            p.AUTHORIZED_SERIAL=p.ADB[-1]
+    elif p.ADB[-1]==device_serial:
+        p.AUTHORIZED_SERIAL=device_serial
+
 def verified_fingerprint():
     actual=p.shell('getprop','ro.build.fingerprint')
     if actual not in p.ALLOWED_FINGERPRINTS:raise RuntimeError('Current firmware was not reviewed')
     return actual
 
 def private(value,name):
-    STATE_LOCAL.mkdir(parents=True,exist_ok=True,mode=0o700)
+    _ensure_state_local()
     p.private_json(STATE_LOCAL/name,value)
 
 def sync_parent(path):
@@ -70,7 +100,7 @@ def validate_baseline_evidence(value,cert,uid,names):
     if value.get('serial')!=p.device_key() or value.get('scope')!=scope or (names==p.WAKE_PERMISSIONS and value.get('owner')!=p.WAKE_OWNER):raise RuntimeError(failure)
     evidence=Path(value.get('snapshot_proof',''))
     if evidence.parent.resolve()!=p.STATE.resolve() or evidence.is_symlink() or not evidence.is_file() or evidence.stat().st_size>1048576:raise RuntimeError(failure)
-    record=json.loads(evidence.read_text())
+    record=json.loads(evidence.read_text(encoding='utf-8'))
     if (record.get('signer')!=cert or record.get('uid')!=uid or record.get('serial')!=p.device_key()
             or record.get('fingerprint')!=value.get('fingerprint') or record.get('fingerprint') not in p.ALLOWED_FINGERPRINTS
             or record.get('origin')!=value.get('origin') or record.get('permission_changes') is not False
@@ -92,10 +122,11 @@ def validate_baseline_evidence(value,cert,uid,names):
 def baseline_for(cert,uid,require_exact=True):
     # No default zero flags: absence of a recovery record is not evidence that a
     # permission was previously denied. All callers now require measured state.
+    getattr(p,'_ensure_state_dir',lambda:None)()
     files=[p.baseline_path(cert,uid),p.connection_baseline_path(cert,uid),p.wake_baseline_path(cert,uid)]
     if not all(f.is_file() and not f.is_symlink() for f in files):
         raise MissingPermissionBaselines('Rebinding requires exact saved permission baselines for the new signer and UID; run capture-baselines first')
-    values=[json.loads(f.read_text()) for f in files]
+    values=[json.loads(f.read_text(encoding='utf-8')) for f in files]
     for value,names in zip(values,[(p.PERMISSION,),p.CONNECTION_PERMISSIONS,p.WAKE_PERMISSIONS]):
         p.validate_baseline(value,cert,uid)
         if value.get('serial',p.device_key())!=p.device_key():raise RuntimeError('New permission baseline belongs to another device')
@@ -114,9 +145,11 @@ def capture_baselines(apk,origin='before_rebind_snapshot',force_refresh=False):
     """
     if origin not in ('before_rebind_snapshot','before_activation'):raise RuntimeError('Unsupported baseline observation boundary')
     if force_refresh and origin!='before_activation':raise RuntimeError('--force-refresh requires --origin before_activation')
+    _ensure_usb_fallback()
     initial=p.inspect(apk);p.guard(native=True)
     if not initial.get('installed') or initial.get('signature_verified') is not True:raise RuntimeError('Verified installed companion is required for baseline capture')
     cert=p.signer(apk);uid=initial['uid'];serial=p.device_key();fingerprint=verified_fingerprint()
+    getattr(p,'_ensure_state_dir',lambda:None)()
     paths=[p.baseline_path(cert,uid),p.connection_baseline_path(cert,uid),p.wake_baseline_path(cert,uid)]
     groups=[(p.PERMISSION,),p.CONNECTION_PERMISSIONS,p.WAKE_PERMISSIONS]
     scopes=['backscreen_permission_v1',p.CONNECTION_SCOPE,p.WAKE_SCOPE]
@@ -126,7 +159,7 @@ def capture_baselines(apk,origin='before_rebind_snapshot',force_refresh=False):
         if path.is_symlink() or not path.is_file():raise RuntimeError('Invalid existing permission baseline file')
         previous[index]=path.read_bytes()
         try:
-            prior=json.loads(path.read_text());p.validate_baseline(prior,cert,uid)
+            prior=json.loads(path.read_text(encoding='utf-8'));p.validate_baseline(prior,cert,uid)
             if prior.get('serial',serial)!=serial:raise RuntimeError('Existing permission baseline belongs to another device')
             flags={p.PERMISSION:prior.get('before_flags')} if index==0 else prior.get('before_flags')
             if not isinstance(flags,dict) or set(flags)!=set(groups[index]) or any(type(v)is not int or not -(2**31)<=v<2**31 for v in flags.values()):raise RuntimeError('Existing permission baseline is invalid; no overwrite')
@@ -198,6 +231,7 @@ def current_permissions_ready(initial):
     return all(initial.get(key) is True for key in ('installed','signature_verified','granted','connection_permissions_granted','wake_permissions_granted'))
 
 def status(apk):
+    _ensure_usb_fallback()
     initial=p.inspect(apk);cert=p.signer(apk)
     result=p.root_json('''import json,os,hashlib
 b='/usr/local/lib/stepx-companion';s='/var/lib/stepx-companion';h='/usr/local/lib/stepx-gms/boot.py'
@@ -226,7 +260,16 @@ print(json.dumps(result))''')
     result.update(status='success' if result['current_boot_ready'] else 'needs_repair',scope='companion_boot_v1',package=p.PACKAGE)
     return result
 
+_active_gateway_session=None
+
 def gateway_command(command):
+    if _active_gateway_session is not None:
+        status_code,raw=_active_gateway_session({'command':command,'timeoutMs':15000},http_timeout=30)
+        try:answer=json.loads(raw) if status_code==200 else None
+        except ValueError:answer=None
+        if not isinstance(answer,dict):raise RuntimeError('Boot staging gateway returned no valid result')
+        if status_code!=200 or answer.get('exitCode')!=0:raise RuntimeError('Boot staging command failed; system files were not activated')
+        return answer
     result=subprocess.run([sys.executable,str(p.WORKFLOW/'tools/gateway.py')],
         input=json.dumps({'command':command,'timeoutMs':15000}),capture_output=True,text=True,timeout=45,
         **p.subprocess_options())
@@ -234,6 +277,8 @@ def gateway_command(command):
     except ValueError:raise RuntimeError('Boot staging gateway returned no valid result') from None
     if result.returncode or answer.get('exitCode')!=0:raise RuntimeError('Boot staging command failed; system files were not activated')
     return answer
+
+_DEFAULT_GATEWAY_COMMAND=gateway_command
 
 def stage_file(path,data):
     # Bound argv and gateway body size on every OS; a DEX encoded inside a Python
@@ -244,6 +289,7 @@ def stage_file(path,data):
         gateway_command(['python3','-c',"import os,base64;fd=os.open("+repr(path)+",os.O_WRONLY|os.O_APPEND|os.O_NOFOLLOW);f=os.fdopen(fd,'ab');f.write(base64.b64decode("+repr(chunk)+"));f.close()"])
 
 def install(apk,rebind=False):
+    _ensure_usb_fallback()
     initial=p.inspect(apk);p.guard(native=True)
     if not initial.get('signature_verified'):raise RuntimeError('Companion signing trust is required')
     cert=p.signer(apk);uid=initial['uid'];fingerprint=verified_fingerprint();baseline=activation_baseline(apk,cert,uid,rebind)
@@ -398,24 +444,39 @@ with os.fdopen(lockfd,'r+b') as lock:
 '''
 
     # Stage large artifacts unprivileged, then copy only hash-verified regular files as root.
+    global _active_gateway_session
+    from contextlib import ExitStack
     stage='/tmp/stepx-companion-boot-'+uuid.uuid4().hex
-    gateway_command(['python3','-c',"import os;os.mkdir("+repr(stage)+",0o700)"])
-    for name,data in files.items():stage_file(stage+'/'+name,data)
-    hashes={name:digest(data) for name,data in files.items()}
-    read='import os,stat,hashlib,base64\nDATA={}\n'
-    read+='for name,expected in '+repr(hashes)+'.items():\n'
-    read+=' fd=os.open('+repr(stage)+"+'/'+name,os.O_RDONLY|os.O_NOFOLLOW)\n"
-    read+=" with os.fdopen(fd,'rb') as f:\n  assert stat.S_ISREG(os.fstat(f.fileno()).st_mode);data=f.read(262144)\n"
-    read+=" if hashlib.sha256(data).hexdigest()!=expected:raise RuntimeError('Staged boot artifact mismatch')\n"
-    read+=' DATA[name]=base64.b64encode(data).decode()\n'
-    operation=('ORIGINAL='+repr(config['original_sha256'])+'\nCONFIG='+repr(config)+'\nALLOW_REBIND='+repr(bool(rebind))+'\nALLOWED_FINGERPRINTS='+repr(tuple(p.ALLOWED_FINGERPRINTS))+'\n'+read+code).encode()
-    if len(operation)>32768:raise RuntimeError('Boot transaction exceeds verified size bound')
-    operation_path=stage+'/install.py'
-    stage_file(operation_path,operation)
-    # Keep the bounded root bridge request small; verify the complete transaction before executing it.
-    proof=p.root_json('import os,hashlib,stat\np='+repr(operation_path)+"\nfd=os.open(p,os.O_RDONLY|os.O_NOFOLLOW)\nwith os.fdopen(fd,'rb') as f:\n assert stat.S_ISREG(os.fstat(f.fileno()).st_mode); code=f.read(32768)\nassert hashlib.sha256(code).hexdigest()=="+repr(digest(operation))+"\nexec(compile(code,'verified-companion-install','exec'))")
-    cleanup="import os; p="+repr(stage)+"\nfor name in "+repr(list(files)+['install.py'])+": os.unlink(p+'/'+name)\nos.rmdir(p)"
-    subprocess.run([sys.executable,str(p.WORKFLOW/'tools/gateway.py')],input=json.dumps({'command':['python3','-c',cleanup],'timeoutMs':15000}),capture_output=True,text=True,timeout=45)
+    with ExitStack() as session_stack:
+        if gateway_command is _DEFAULT_GATEWAY_COMMAND:
+            from gateway import gateway_session
+            _active_gateway_session=session_stack.enter_context(gateway_session())
+            session_stack.callback(lambda:globals().__setitem__('_active_gateway_session',None))
+        try:
+            gateway_command(['python3','-c',"import os;os.mkdir("+repr(stage)+",0o700)"])
+            for name,data in files.items():stage_file(stage+'/'+name,data)
+            hashes={name:digest(data) for name,data in files.items()}
+            read='import os,stat,hashlib,base64\nDATA={}\n'
+            read+='for name,expected in '+repr(hashes)+'.items():\n'
+            read+=' fd=os.open('+repr(stage)+"+'/'+name,os.O_RDONLY|os.O_NOFOLLOW)\n"
+            read+=" with os.fdopen(fd,'rb') as f:\n  assert stat.S_ISREG(os.fstat(f.fileno()).st_mode);data=f.read(262144)\n"
+            read+=" if hashlib.sha256(data).hexdigest()!=expected:raise RuntimeError('Staged boot artifact mismatch')\n"
+            read+=' DATA[name]=base64.b64encode(data).decode()\n'
+            operation=('ORIGINAL='+repr(config['original_sha256'])+'\nCONFIG='+repr(config)+'\nALLOW_REBIND='+repr(bool(rebind))+'\nALLOWED_FINGERPRINTS='+repr(tuple(p.ALLOWED_FINGERPRINTS))+'\n'+read+code).encode()
+            if len(operation)>32768:raise RuntimeError('Boot transaction exceeds verified size bound')
+            operation_path=stage+'/install.py'
+            stage_file(operation_path,operation)
+            # Keep the bounded root bridge request small; verify the complete transaction before executing it.
+            proof=p.root_json('import os,hashlib,stat\np='+repr(operation_path)+"\nfd=os.open(p,os.O_RDONLY|os.O_NOFOLLOW)\nwith os.fdopen(fd,'rb') as f:\n assert stat.S_ISREG(os.fstat(f.fileno()).st_mode); code=f.read(32768)\nassert hashlib.sha256(code).hexdigest()=="+repr(digest(operation))+"\nexec(compile(code,'verified-companion-install','exec'))")
+        finally:
+            cleanup="import shutil; shutil.rmtree("+repr(stage)+", ignore_errors=True)"
+            try:
+                if _active_gateway_session is not None:
+                    _active_gateway_session({'command':['python3','-c',cleanup],'timeoutMs':15000},http_timeout=20)
+                else:
+                    subprocess.run([sys.executable,str(p.WORKFLOW/'tools/gateway.py')],input=json.dumps({'command':['python3','-c',cleanup],'timeoutMs':15000}),capture_output=True,text=True,timeout=45,**p.subprocess_options())
+            except Exception:
+                pass
 
 
     if proof.get('status')=='install_failed':
@@ -455,6 +516,7 @@ print(json.dumps({'status':'removed','original_sha256':sha(hook),'reboot_require
 
 def activate(apk,rebind=False):
     """Activate the fixed signed-companion service now, then persist its reviewed boot payload."""
+    _ensure_usb_fallback()
     initial=p.inspect(apk);p.guard(native=True)
     if not initial.get('signature_verified'):raise RuntimeError('Companion signing trust is required')
     cert=p.signer(apk);uid=initial['uid']
@@ -512,7 +574,7 @@ def main():
     if args.rebind and args.command not in ('install','activate'):parser.error('--rebind is only valid with install or activate')
     if (args.origin or args.force_refresh) and args.command!='capture-baselines':parser.error('--origin/--force-refresh require capture-baselines')
     if args.force_refresh and args.origin!='before_activation':parser.error('--force-refresh requires --origin before_activation')
-    STATE_LOCAL.mkdir(parents=True,exist_ok=True,mode=0o700)
+    _ensure_state_local()
     with p.file_lock(STATE_LOCAL/'operation.lock'):
         if args.command in ('install','activate'):result={'install':install,'activate':activate}[args.command](args.apk,rebind=args.rebind)
         elif args.command=='capture-baselines':result=capture_baselines(args.apk,origin=args.origin or 'before_rebind_snapshot',force_refresh=args.force_refresh)

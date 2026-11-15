@@ -48,10 +48,10 @@ fn request(text: &str, nonce: &str, user: &str) -> Result<Value> {
     );
     let raw = text
         .split_once(OPEN)
-        .unwrap()
+        .context("Amoo 未调用 GUI 工具")?
         .1
         .split_once(CLOSE)
-        .unwrap()
+        .context("Amoo GUI 工具请求标记不完整")?
         .0;
     ensure!(raw.len() < 16000, "工具请求过长");
     let v: Value = serde_json::from_str(raw)?;
@@ -125,6 +125,71 @@ fn await_reply(bus: &mut AgentBus, pending: &PendingReply, control: &Control) ->
         std::thread::sleep(Duration::from_millis(700));
     }
 }
+fn fallback_narration_from_outcome(result: &GuiRunResult) -> String {
+    let step_summaries: Vec<String> = result
+        .raw_result
+        .as_ref()
+        .and_then(|raw| raw["steps"].as_array())
+        .map(|steps| {
+            steps
+                .iter()
+                .filter_map(|step| {
+                    step["summary"]
+                        .as_str()
+                        .or_else(|| step["description"].as_str())
+                        .or_else(|| step["action"].as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let step_count = result
+        .raw_result
+        .as_ref()
+        .and_then(|raw| raw["steps"].as_array())
+        .map_or(step_summaries.len(), Vec::len);
+    let prefix = match result.state {
+        crate::amoo_gui::GuiRunState::Completed => "已完成手机界面操作",
+        _ => "手机界面操作未完全确认",
+    };
+    let mut parts = vec![prefix.to_string()];
+    if step_count > 0 {
+        parts.push(format!("共执行 {step_count} 步"));
+    }
+    if !step_summaries.is_empty() {
+        let tail: Vec<_> = step_summaries
+            .iter()
+            .rev()
+            .take(2)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        parts.push(format!("关键步骤：{}", tail.join(" → ")));
+    } else if !result.message.trim().is_empty() {
+        parts.push(result.message.trim().to_string());
+    }
+    format!("{}（会话润色回传暂不可用，已展示本地真实执行摘要）", parts.join("；"))
+}
+
+fn reconcile_post_action_narration(
+    mut outcome: Result<GuiRunResult>,
+    narration: Result<String>,
+    emit: &mut dyn FnMut(ScreenEvent),
+) -> Result<Option<GuiRunResult>> {
+    if narration.is_err() {
+        if let Ok(result) = &mut outcome {
+            let fallback = fallback_narration_from_outcome(result);
+            result.message = fallback.clone();
+            emit(ScreenEvent::Status(fallback));
+        }
+    }
+    outcome.map(Some)
+}
+
 pub fn finish(
     adb: &Adb,
     device: &Device,
@@ -149,10 +214,11 @@ pub fn finish(
     emit(ScreenEvent::Status(
         "Amoo 已调用 StepX伴侣，开始看屏操作".into(),
     ));
+    let app = call["app"].as_str().context("缺少应用")?;
     let outcome = gui_agent::run(
         adb,
         device,
-        call["app"].as_str().unwrap(),
+        app,
         &pending.text,
         control,
         &mut emit,
@@ -165,10 +231,11 @@ pub fn finish(
     };
     // Return real results to the original phone-synchronized conversation.
     let feedback=format!("<stepx_gui_receipt>\nStepX伴侣执行回执：{}\n这是刚才工具调用的结果，不是新的用户请求。请用简短自然语言告知用户实际结果；失败或未验证不能说完成，不再调用工具。\n</stepx_gui_receipt>",data);
-    let next = bus.send(&pending.key, &feedback)?;
-    let _ = await_reply(&mut bus, &next, &Control::default())?;
+    let narration = bus
+        .send(&pending.key, &feedback)
+        .and_then(|next| await_reply(&mut bus, &next, control));
 
-    outcome.map(Some)
+    reconcile_post_action_narration(outcome, narration, &mut emit)
 }
 #[cfg(test)]
 mod tests {
@@ -179,6 +246,14 @@ mod tests {
         assert!(request(t, "n", "打开京东，我的订单").is_ok());
         assert!(request(t, "wrong", "打开京东，我的订单").is_err());
         assert!(request(t, "n", "分析这个网页").is_err());
+        assert!(
+            request(
+                "</stepx_gui_request>{\"nonce\":\"n\"}<stepx_gui_request>",
+                "n",
+                "打开京东，我的订单"
+            )
+            .is_err()
+        );
         assert!(!eligible("怎么打开京东"));
         assert!(eligible("打开京东，我的订单"));
     }
@@ -189,6 +264,34 @@ mod tests {
             "打开京东"
         );
     }
+
+    #[test]
+    fn post_action_narration_failure_keeps_gui_outcome_with_deterministic_summary() {
+        let outcome = Ok(GuiRunResult {
+            state: crate::amoo_gui::GuiRunState::Completed,
+            message: "已打开订单列表".into(),
+            invocation_id: "inv-1".into(),
+            raw_result: Some(json!({
+                "steps": [
+                    {"summary": "启动京东"},
+                    {"summary": "点击我的订单"}
+                ]
+            })),
+            elapsed_ms: 1200,
+        });
+        let mut emitted = Vec::new();
+        let preserved = reconcile_post_action_narration(
+            outcome,
+            Err(anyhow::anyhow!("AgentBus disconnected during post-action send")),
+            &mut |ev| emitted.push(ev),
+        )
+        .unwrap()
+        .expect("GUI outcome must not be discarded");
+        assert_eq!(preserved.state, crate::amoo_gui::GuiRunState::Completed);
+        assert!(preserved.message.contains("共执行 2 步"));
+        assert!(preserved.message.contains("点击我的订单"));
+        assert_eq!(emitted.len(), 1);
+    }
 }
 
 fn claim(id: &str) -> bool {
@@ -196,7 +299,7 @@ fn claim(id: &str) -> bool {
         std::sync::OnceLock::new();
     SEEN.get_or_init(Default::default)
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .insert(id.into())
 }
 pub fn cloud_nonce(adb: &Adb, device: &Device) -> Result<String> {

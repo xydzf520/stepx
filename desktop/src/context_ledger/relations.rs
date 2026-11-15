@@ -190,7 +190,10 @@ fn anchors(text: &str) -> BTreeSet<String> {
             let label = normalized(label);
             if !["项目", "事项", "project", "matter"].contains(&label.as_str()) { continue; }
             let value = normalized(value);
-            if (3..=80).contains(&value.chars().count()) && !["default", "general", "日常工作", "项目名称"].contains(&value.as_str()) {
+            if (3..=80).contains(&value.chars().count())
+                && !["default", "general", "日常工作", "项目名称"].contains(&value.as_str())
+                && !is_generic_bracket_or_suffix(&value)
+            {
                 found.insert(format!("project:{value}"));
             }
         }
@@ -287,10 +290,384 @@ impl Groups {
     }
 }
 
-fn distinctive_words(text: &str) -> BTreeSet<String> {
-    normalized(text).split(|c: char| !c.is_alphanumeric()).filter(|word| word.chars().count() >= 4
-        && !["方案讨论", "客户方案", "项目评审", "项目讨论", "会议纪要", "工作安排", "明天", "今天", "please", "project", "meeting"].contains(word))
-        .map(str::to_owned).collect()
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RelationDecision {
+    Separate,
+    Merge(String),
+    Candidate(String),
+}
+
+fn is_cjk_char(ch: char) -> bool {
+    ('\u{4e00}'..='\u{9fff}').contains(&ch)
+}
+
+fn is_generic_bracket_or_suffix(raw: &str) -> bool {
+    let trimmed = normalized(raw)
+        .trim_matches(|c: char| {
+            matches!(
+                c,
+                '[' | ']' | '【' | '】' | '《' | '》' | '(' | ')' | '（' | '）' | ':' | '：' | '-' | '_'
+            ) || c.is_whitespace()
+        })
+        .to_string();
+    if trimmed.is_empty() {
+        return true;
+    }
+    if trimmed.ends_with("银行")
+        || trimmed.starts_with("顺丰")
+        || trimmed.starts_with("菜鸟")
+    {
+        return true;
+    }
+    matches!(
+        trimmed.as_str(),
+        "支付宝"
+            | "微信支付"
+            | "微信"
+            | "京东"
+            | "美团"
+            | "拼多多"
+            | "淘宝"
+            | "天猫"
+            | "抖音"
+            | "本周活动"
+            | "工作群"
+            | "项目组"
+            | "日常工作"
+            | "项目名称"
+            | "方案讨论"
+            | "客户方案"
+            | "项目评审"
+            | "项目讨论"
+            | "会议纪要"
+            | "工作安排"
+            | "本周工作"
+            | "部门群"
+            | "内部群"
+            | "通知群"
+            | "待确认"
+            | "请确认"
+            | "已完成"
+            | "状态通知"
+            | "付款通知"
+            | "账单提醒"
+            | "验证码"
+            | "通知"
+            | "提醒"
+            | "公告"
+    )
+}
+
+fn extract_named_entities(text: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for (open, close) in [('【', '】'), ('《', '》')] {
+        for part in text.split(open).skip(1) {
+            let Some((raw_entity, _)) = part.split_once(close) else {
+                continue;
+            };
+            if raw_entity.contains(':') || raw_entity.contains('：') {
+                continue;
+            }
+            let clean = normalized(raw_entity);
+            let char_len = clean.chars().count();
+            if !(2..=40).contains(&char_len) || is_generic_bracket_or_suffix(&clean) {
+                continue;
+            }
+            if clean.ends_with("工作群")
+                || clean.ends_with("项目组")
+                || clean.ends_with("本周活动")
+            {
+                let stem = clean
+                    .trim_end_matches("工作群")
+                    .trim_end_matches("项目组")
+                    .trim_end_matches("本周活动")
+                    .trim();
+                if stem.chars().count() < 2 || is_generic_bracket_or_suffix(stem) {
+                    continue;
+                }
+            }
+            if clean.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            out.insert(clean);
+        }
+    }
+    out
+}
+
+fn normalize_amount_digits(raw: &str) -> Option<String> {
+    let clean: String = raw.chars().filter(|c| *c != ',').collect();
+    if clean.is_empty() || !clean.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return None;
+    }
+    if clean.matches('.').count() > 1 {
+        return None;
+    }
+    let normalized_num = if let Some((int_part, frac_part)) = clean.split_once('.') {
+        let int_trimmed = int_part.trim_start_matches('0');
+        let int_norm = if int_trimmed.is_empty() { "0" } else { int_trimmed };
+        let frac_trimmed = frac_part.trim_end_matches('0');
+        if frac_trimmed.is_empty() {
+            int_norm.to_string()
+        } else {
+            format!("{int_norm}.{frac_trimmed}")
+        }
+    } else {
+        let int_trimmed = clean.trim_start_matches('0');
+        if int_trimmed.is_empty() {
+            return None;
+        }
+        int_trimmed.to_string()
+    };
+    if normalized_num == "0" {
+        return None;
+    }
+    Some(normalized_num)
+}
+
+fn extract_date_amount_tokens(text: &str) -> BTreeSet<String> {
+    let mut tokens = BTreeSet::new();
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+    while i < len {
+        // Currency prefix: ¥, ￥, $
+        if matches!(chars[i], '¥' | '￥' | '$') {
+            let mut j = i + 1;
+            while j < len && chars[j].is_whitespace() {
+                j += 1;
+            }
+            let start = j;
+            while j < len && (chars[j].is_ascii_digit() || matches!(chars[j], ',' | '.')) {
+                j += 1;
+            }
+            if j > start {
+                let raw_num: String = chars[start..j].iter().collect();
+                let unit = if j < len && chars[j] == '万' { "万" } else { "" };
+                if let Some(norm) = normalize_amount_digits(&raw_num) {
+                    tokens.insert(format!("amount:{norm}{unit}"));
+                }
+                i = j;
+                continue;
+            }
+        }
+        if chars[i].is_ascii_digit() {
+            let start = i;
+            while i < len && chars[i].is_ascii_digit() {
+                i += 1;
+            }
+            let first_digits: String = chars[start..i].iter().collect();
+            // Check YYYY-MM-DD / YYYY/MM/DD / YYYY.MM.DD
+            if first_digits.len() == 4
+                && i < len
+                && matches!(chars[i], '-' | '/' | '.' | '年')
+            {
+                let sep = chars[i];
+                let m_start = i + 1;
+                let mut m_end = m_start;
+                while m_end < len && chars[m_end].is_ascii_digit() {
+                    m_end += 1;
+                }
+                let expected_second = if sep == '年' { '月' } else { sep };
+                if m_end > m_start && m_end < len && chars[m_end] == expected_second {
+                    let d_start = m_end + 1;
+                    let mut d_end = d_start;
+                    while d_end < len && chars[d_end].is_ascii_digit() {
+                        d_end += 1;
+                    }
+                    let valid_tail = if sep == '年' {
+                        d_end > d_start && d_end < len && matches!(chars[d_end], '日' | '号')
+                    } else {
+                        d_end > d_start && (d_end == len || !chars[d_end].is_ascii_digit())
+                    };
+                    if valid_tail {
+                        if let (Ok(y), Ok(m), Ok(d)) = (
+                            first_digits.parse::<u32>(),
+                            chars[m_start..m_end].iter().collect::<String>().parse::<u32>(),
+                            chars[d_start..d_end].iter().collect::<String>().parse::<u32>(),
+                        ) {
+                            if (2000..=2100).contains(&y) && (1..=12).contains(&m) && (1..=31).contains(&d) {
+                                tokens.insert(format!("date:{y:04}-{m:02}-{d:02}"));
+                                tokens.insert(format!("date:{m:02}-{d:02}"));
+                                i = if sep == '年' { d_end + 1 } else { d_end };
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            // Check M月D日 / M月D号
+            if (1..=2).contains(&first_digits.len()) && i < len && chars[i] == '月' {
+                let d_start = i + 1;
+                let mut d_end = d_start;
+                while d_end < len && chars[d_end].is_ascii_digit() {
+                    d_end += 1;
+                }
+                if (1..=2).contains(&(d_end - d_start))
+                    && d_end < len
+                    && matches!(chars[d_end], '日' | '号')
+                {
+                    if let (Ok(m), Ok(d)) = (
+                        first_digits.parse::<u32>(),
+                        chars[d_start..d_end].iter().collect::<String>().parse::<u32>(),
+                    ) {
+                        if (1..=12).contains(&m) && (1..=31).contains(&d) {
+                            tokens.insert(format!("date:{m:02}-{d:02}"));
+                            i = d_end + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+            // Check numeric amount followed by 元 / 万元 / 万
+            let mut j = i;
+            while j < len && matches!(chars[j], ',' | '.') || (j < len && chars[j].is_ascii_digit()) {
+                j += 1;
+            }
+            let raw_num: String = chars[start..j].iter().collect();
+            let mut u = j;
+            while u < len && chars[u].is_whitespace() {
+                u += 1;
+            }
+            if u < len && chars[u] == '万' {
+                if let Some(norm) = normalize_amount_digits(&raw_num) {
+                    tokens.insert(format!("amount:{norm}万"));
+                }
+                i = u + 1;
+                continue;
+            } else if u < len && chars[u] == '元' {
+                if let Some(norm) = normalize_amount_digits(&raw_num) {
+                    tokens.insert(format!("amount:{norm}"));
+                }
+                i = u + 1;
+                continue;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    tokens
+}
+
+fn extract_identifiers(text: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for token in normalized(text).split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_')) {
+        let token = token.trim_matches(|c: char| c == '-' || c == '_');
+        if !(4..=64).contains(&token.len()) {
+            continue;
+        }
+        let has_alpha = token.chars().any(|c| c.is_ascii_alphabetic());
+        let has_digit = token.chars().any(|c| c.is_ascii_digit());
+        if has_alpha && has_digit {
+            // Skip bare generic short prefixes like dev-12 / usb-23 unless >= 7 chars.
+            if token.len() >= 7 {
+                out.insert(token.to_string());
+            }
+        } else if has_alpha
+            && token.len() >= 5
+            && !matches!(
+                token,
+                "please"
+                    | "project"
+                    | "meeting"
+                    | "https"
+                    | "default"
+                    | "general"
+                    | "group"
+                    | "today"
+                    | "update"
+                    | "review"
+            )
+        {
+            out.insert(token.to_string());
+        }
+    }
+    out
+}
+
+fn extract_cjk_phrases(text: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut current = String::new();
+    for ch in normalized(text).chars().chain(std::iter::once(' ')) {
+        if is_cjk_char(ch) {
+            current.push(ch);
+        } else if !current.is_empty() {
+            let run = std::mem::take(&mut current);
+            let chars: Vec<char> = run.chars().collect();
+            // Require >= 3-char non-generic CJK phrases; 2-char bigrams are never sufficient.
+            if (3..=32).contains(&chars.len()) && !is_generic_bracket_or_suffix(&run) {
+                out.insert(run);
+            }
+        }
+    }
+    out
+}
+
+fn slice_human_text(slice: &SourceSlice<'_>) -> String {
+    let mut parts = vec![slice.meta.title.as_str()];
+    for entry in &slice.entries {
+        if !entry.current
+            || entry.author.starts_with("AI 回复")
+            || matches!(entry.kind, Kind::Artifact | Kind::Receipt)
+        {
+            continue;
+        }
+        parts.push(entry.title.as_str());
+        parts.push(entry.text.as_str());
+    }
+    parts.join("\n")
+}
+
+fn classify_cross_app_relation(left: &SourceSlice<'_>, right: &SourceSlice<'_>) -> RelationDecision {
+    let left_text = slice_human_text(left);
+    let right_text = slice_human_text(right);
+    let left_entities = extract_named_entities(&left_text);
+    let right_entities = extract_named_entities(&right_text);
+
+    // Single-entity cross-app auto-Merge requires a single shared non-generic entity
+    // AND matching specific normalized date/amount tokens (never merely both non-empty).
+    if left_entities.len() == 1 && right_entities.len() == 1 && left_entities == right_entities {
+        let entity = left_entities.iter().next().unwrap();
+        let left_tokens = extract_date_amount_tokens(&left_text);
+        let right_tokens = extract_date_amount_tokens(&right_text);
+        let shared_tokens: Vec<_> = left_tokens.intersection(&right_tokens).cloned().collect();
+        if !shared_tokens.is_empty() {
+            return RelationDecision::Merge(format!(
+                "跨应用共享明确主体“{entity}”且日期/金额吻合（{}）",
+                shared_tokens.join("、")
+            ));
+        }
+    }
+
+    let shared_entities: Vec<_> = left_entities.intersection(&right_entities).cloned().collect();
+    if !shared_entities.is_empty() {
+        return RelationDecision::Candidate(format!(
+            "共有明确主体“{}”；仅作为待确认线索，未自动关联",
+            shared_entities.join("、")
+        ));
+    }
+
+    let left_ids = extract_identifiers(&left.meta.title);
+    let right_ids = extract_identifiers(&right.meta.title);
+    let shared_ids: Vec<_> = left_ids.intersection(&right_ids).cloned().collect();
+    if !shared_ids.is_empty() {
+        return RelationDecision::Candidate(format!(
+            "标题共有标识“{}”；仅作为待确认线索，未自动关联",
+            shared_ids.join("、")
+        ));
+    }
+
+    let left_phrases = extract_cjk_phrases(&left.meta.title);
+    let right_phrases = extract_cjk_phrases(&right.meta.title);
+    let shared_phrases: Vec<_> = left_phrases.intersection(&right_phrases).cloned().collect();
+    if !shared_phrases.is_empty() {
+        return RelationDecision::Candidate(format!(
+            "标题共有“{}”；仅作为待确认线索，未自动关联",
+            shared_phrases.join("、")
+        ));
+    }
+
+    RelationDecision::Separate
 }
 
 pub(super) fn reconcile(ledger: &mut Ledger) {
@@ -340,6 +717,34 @@ pub(super) fn resolve(ledger: &Ledger) -> Resolution<'_> {
             }
         }
     }
+    let mut recent: Vec<_> = slices.values().filter(|s| s.entries.iter().any(|e| e.current)).collect();
+    recent.sort_by_key(|s| std::cmp::Reverse(s.entries.iter().map(|e| e.changed_ms).max().unwrap_or(0)));
+    recent.truncate(64);
+    for (i, left) in recent.iter().enumerate() {
+        for right in recent.iter().skip(i + 1) {
+            if components.component(&left.meta.id) == components.component(&right.meta.id)
+                || ledger.relations.rejected.contains(&Pair::new(&left.meta.id, &right.meta.id))
+            {
+                continue;
+            }
+            if left.meta.source == right.meta.source
+                || left.meta.app_id().is_some_and(|app| right.meta.app_id().as_ref() == Some(&app))
+            {
+                continue;
+            }
+            if !left.anchors.is_empty()
+                && !right.anchors.is_empty()
+                && left.anchors.is_disjoint(&right.anchors)
+            {
+                continue;
+            }
+            if let RelationDecision::Merge(reason) = classify_cross_app_relation(left, right) {
+                if components.join(&left.meta.id, &right.meta.id) {
+                    reasons.push((Pair::new(&left.meta.id, &right.meta.id), reason));
+                }
+            }
+        }
+    }
     let mut grouped: BTreeMap<usize, Vec<&SourceSlice<'_>>> = BTreeMap::new();
     for (id,slice) in &slices { grouped.entry(components.component(id)).or_default().push(slice); }
     let mut matters = vec![];
@@ -366,20 +771,18 @@ pub(super) fn resolve(ledger: &Ledger) -> Resolution<'_> {
     let mut candidates = vec![];
     // Candidate comparison is bounded and operates on source summaries, not all
     // pairwise messages. Only explicit shared descriptive phrases are surfaced.
-    let mut recent: Vec<_> = slices.values().filter(|s| s.entries.iter().any(|e| e.current)).collect();
-    recent.sort_by_key(|s| std::cmp::Reverse(s.entries.iter().map(|e| e.changed_ms).max().unwrap_or(0)));
-    recent.truncate(64);
     for (i,left) in recent.iter().enumerate() {
         for right in recent.iter().skip(i+1) {
             if components.component(&left.meta.id) == components.component(&right.meta.id) || ledger.relations.rejected.contains(&Pair::new(&left.meta.id,&right.meta.id)) { continue; }
             if left.meta.source == right.meta.source || left.meta.app_id().is_some_and(|app|right.meta.app_id().as_ref()==Some(&app)) { continue; }
             // Conflicting explicit project IDs are not a useful weak suggestion.
             if !left.anchors.is_empty() && !right.anchors.is_empty() && left.anchors.is_disjoint(&right.anchors) { continue; }
-            let a = distinctive_words(&left.meta.title); let b = distinctive_words(&right.meta.title);
-            let shared: Vec<_> = a.intersection(&b).cloned().collect();
-            if shared.is_empty() { continue; }
+            let reason = match classify_cross_app_relation(left, right) {
+                RelationDecision::Candidate(reason) | RelationDecision::Merge(reason) => reason,
+                RelationDecision::Separate => continue,
+            };
             candidates.push(LinkCandidate { left_object:left.meta.id.clone(),right_object:right.meta.id.clone(),left_title:left.meta.title.clone(),right_title:right.meta.title.clone(),
-                reason: format!("标题共有“{}”；仅作为待确认线索，未自动关联", shared.join("、")) });
+                reason });
             if candidates.len() >= 12 { break; }
         }
         if candidates.len() >= 12 { break; }
@@ -630,6 +1033,67 @@ mod tests {
         let item=PreparedItem{source_objects:vec![native,mirror],relationship_notes:vec!["用户已确认属于同一事项".into()],..Default::default()};
         assert_eq!(item.distinct_app_count(),1);assert!(!item.has_cross_app_context());
         assert_ne!(SourceObject{id:"im:com.tencent.mm:t".into(),..Default::default()}.app_id(),SourceObject{id:"im:com.ss.android.lark:t".into(),..Default::default()}.app_id());
+    }
+
+    #[test]
+    fn generic_platform_headers_disjoint_dates_and_two_char_bigrams_never_false_merge_or_suggest() {
+        for header in [
+            "【招商银行】",
+            "【工商银行】",
+            "【支付宝】",
+            "【微信支付】",
+            "【顺丰速运】",
+            "【京东】",
+            "【美团】",
+            "【菜鸟驿站】",
+            "【本周活动】",
+            "【工作群】",
+            "【项目组】",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let mut c = capture();
+            let mut t = task(&c);
+            t.title = format!("{header} 账单处理");
+            t.turns[0].text = format!("{header} 2026-05-18 支出 500.00元，请确认是否报销？");
+            c.tasks = vec![t];
+            c.push = Some(chat(&c, &format!("{header} 2026-05-18 消费 ¥500，请核对明细？")));
+            c.push.as_mut().unwrap().threads[0].title = format!("{header} 通知确认");
+            let o = process(root.path(), &c).unwrap();
+            assert_eq!(o.items.len(), 2, "generic header {header} must never auto-merge");
+            assert!(o.link_candidates.is_empty(), "generic header {header} must not suggest link");
+        }
+
+        // Non-generic single entity WITH disjoint date/amount tokens must NOT auto-merge.
+        let root = tempfile::tempdir().unwrap();
+        let mut c = capture();
+        let mut t = task(&c);
+        t.title = "采购审批".into();
+        t.turns[0].text = "《星海二期采购合同》 2026-05-18 付款 50000元，请确认？".into();
+        c.tasks = vec![t];
+        c.push = Some(chat(&c, "《星海二期采购合同》 2026-06-02 付款 80000元，请确认？"));
+        c.push.as_mut().unwrap().threads[0].title = "财务审批".into();
+        let disjoint = process(root.path(), &c).unwrap();
+        assert_eq!(disjoint.items.len(), 2);
+        assert_eq!(disjoint.link_candidates.len(), 1);
+
+        // Non-generic single entity WITH matching specific date/amount token merges cleanly.
+        c.push.as_mut().unwrap().threads[0].messages[0].text =
+            "《星海二期采购合同》 2026年5月18日 付款 ¥50,000.00，请确认？".into();
+        c.now_ms += 1000;
+        let matched = process(root.path(), &c).unwrap();
+        assert_eq!(matched.items.len(), 1);
+
+        // Two generic 2-char bigrams must stay Separate (not Candidate).
+        let root2 = tempfile::tempdir().unwrap();
+        let mut c2 = capture();
+        let mut t2 = task(&c2);
+        t2.title = "预算 评审".into();
+        c2.tasks = vec![t2];
+        c2.push = Some(chat(&c2, "请确认安排？"));
+        c2.push.as_mut().unwrap().threads[0].title = "预算 评审".into();
+        let two_char = process(root2.path(), &c2).unwrap();
+        assert_eq!(two_char.items.len(), 2);
+        assert!(two_char.link_candidates.is_empty());
     }
 
 }

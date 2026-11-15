@@ -148,20 +148,30 @@ impl Companion {
                     "正在刷新首页消息、日程与手机状态…",
                     |adb, d| {
                         let (summary_res, caps, sms, call_logs, contacts) =
-                            std::thread::scope(|s| {
+                            std::thread::scope(|s| -> anyhow::Result<_> {
                                 let h_sum = s.spawn(|| d.summary(adb));
                                 let h_cap = s.spawn(|| bridge::capabilities(adb, &d).ok());
                                 let h_sms = s.spawn(|| read_result(d.messages(adb)));
                                 let h_log = s.spawn(|| read_result(d.call_logs(adb)));
                                 let h_con = s.spawn(|| read_result(d.contacts(adb)));
-                                (
-                                    h_sum.join().unwrap(),
-                                    h_cap.join().unwrap(),
-                                    h_sms.join().unwrap(),
-                                    h_log.join().unwrap(),
-                                    h_con.join().unwrap(),
-                                )
-                            });
+                                Ok((
+                                    h_sum
+                                        .join()
+                                        .map_err(|_| anyhow::anyhow!("后台同步子线程异常退出"))?,
+                                    h_cap
+                                        .join()
+                                        .map_err(|_| anyhow::anyhow!("后台同步子线程异常退出"))?,
+                                    h_sms
+                                        .join()
+                                        .map_err(|_| anyhow::anyhow!("后台同步子线程异常退出"))?,
+                                    h_log
+                                        .join()
+                                        .map_err(|_| anyhow::anyhow!("后台同步子线程异常退出"))?,
+                                    h_con
+                                        .join()
+                                        .map_err(|_| anyhow::anyhow!("后台同步子线程异常退出"))?,
+                                ))
+                            })?;
                         Ok(Outcome::HomeRefreshed(
                             summary_res?,
                             caps,
@@ -245,6 +255,17 @@ impl Companion {
     }
 
     pub(super) fn clear_device_state(&mut self) {
+        if let Some(prev) = &self.selected {
+            stepx_companion::amoo_usage::invalidate_account_scope(&prev.serial);
+            stepx_companion::desktop_work::clear_device_closed_cache(&prev.serial);
+        }
+        if let Some(last) = &self.last_connected_serial {
+            stepx_companion::amoo_usage::invalidate_account_scope(last);
+        }
+        self.device_epoch = self.device_epoch.wrapping_add(1);
+        self.sms_sending_in_flight = false;
+        self.pending_outcome_in_flight = None;
+        self.amoo_in_flight_by_session.clear();
         self.doctor_report = None;
         self.doctor_running = false;
         self.auto_sync.on_device_disconnected();
@@ -260,11 +281,9 @@ impl Companion {
         self.bulk_started_at = None;
         let mode = self.push.shell_mode;
         let pin = self.push.pin_window;
-        let prev_seen_toasts = std::mem::take(&mut self.push.seen_toast_keys);
         self.push = PushUiState::default();
         self.push.shell_mode = mode;
         self.push.pin_window = pin;
-        self.push.seen_toast_keys = prev_seen_toasts;
         for index in [F_IM_REPLY, F_PUSH_REPLY, F_TOAST_REPLY] {
             self.fields[index].clear();
         }
@@ -308,15 +327,19 @@ impl Companion {
         self.amoo_cron_jobs.clear();
         self.amoo_gateway_online = false;
         self.work.disconnect();
-        let prev_clip = self.back_screen.last_synced_phone_clip.clone();
         let prev_dismissed = std::mem::take(&mut self.back_screen.dismissed_capsule_ids);
         self.back_screen = BackScreenUiState::default();
-        self.back_screen.last_synced_phone_clip = prev_clip;
         self.back_screen.dismissed_capsule_ids = prev_dismissed;
         self.updates = UpdateState::default();
         if !self.demo_mode {
             self.amoo_sessions.clear();
             self.amoo_skills.clear();
+            self.amoo_memories.retain(|m| {
+                (m.sub.starts_with("关于我 ·")
+                    || m.sub.starts_with("交流偏好 ·")
+                    || m.sub.starts_with("备忘事项 ·"))
+                    && !m.sub.contains("手机")
+            });
             self.amoo_cron_count = 0;
             self.amoo_total_skills = 0;
             self.amoo_bm25_entries = 0;
@@ -325,6 +348,7 @@ impl Companion {
         self.pending_sms_plan = None;
         self.last_sms_status = None;
         self.selected_thread = None;
+        self.read_sms_addresses.clear();
         self.content.clear();
         self.sms.clear();
         self.local_sent_sms.clear();
@@ -352,9 +376,16 @@ impl Companion {
         }
         self.summary.clear();
         self.files.clear();
+        self.trashed = None;
+        self.selected_file_preview_path = None;
+        self.selected_file_preview_text = None;
+        self.selected_file_preview_image = None;
         self.apps.clear();
         self.apps_loaded = false;
         self.apps_error = None;
+        self.selected_app = None;
+        self.selected_app_details = None;
+        self.selected_app_loading = false;
         self.pending_app_uninstall = None;
         self.live_screen_rx = None;
         self.live_screen_stream = false;
@@ -408,10 +439,19 @@ impl Companion {
         self.demote_busy_if_background();
         if !self.busy && self.mirror.is_none() {
             let options = self.mirror_options;
+            let fallback_transport = self.active_transport();
             self.with_device("正在开启投屏…", move |adb, d| {
                 let active_transport = d
                     .resolve_active_transport(adb)
-                    .unwrap_or_else(|_| d.transport.clone());
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| {
+                        if !fallback_transport.is_empty() {
+                            fallback_transport
+                        } else {
+                            d.transport.clone()
+                        }
+                    });
                 let session =
                     stepx_companion::mirror::start_with_options(adb, &active_transport, options)?;
                 Ok(Outcome::Mirror(d.serial, active_transport, session))
@@ -425,12 +465,21 @@ impl Companion {
         if self.mirror.is_some() && !self.busy {
             self.stop_mirror();
             let options = self.mirror_options;
+            let fallback_transport = self.active_transport();
             self.with_device(
                 &format!("{status_prefix}，正在无缝切换投屏通道…"),
                 move |adb, d| {
                     let active_transport = d
                         .resolve_active_transport(adb)
-                        .unwrap_or_else(|_| d.transport.clone());
+                        .ok()
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or_else(|| {
+                            if !fallback_transport.is_empty() {
+                                fallback_transport
+                            } else {
+                                d.transport.clone()
+                            }
+                        });
                     let session = stepx_companion::mirror::start_with_options(
                         adb,
                         &active_transport,
@@ -519,20 +568,17 @@ impl Companion {
             .map(stepx_companion::sms::normalize_address)
             .unwrap_or_default();
         let mut threads: Vec<SmsThread> = Vec::new();
-        let mut thread_flags: Vec<(bool, bool)> = Vec::new();
+        let mut thread_flags: Vec<(bool, bool, bool)> = Vec::new();
         let mut thread_indices: HashMap<String, usize> = HashMap::new();
         for m in &self.sms {
             let addr = m.address.trim();
             let norm_addr = stepx_companion::sms::normalize_address(addr);
-            if !query.is_empty()
-                && !m.address.to_lowercase().contains(&query)
-                && !m.body.to_lowercase().contains(&query)
-                && !contact_names
+            let msg_matches_query = query.is_empty()
+                || m.address.to_lowercase().contains(&query)
+                || m.body.to_lowercase().contains(&query)
+                || contact_names
                     .get(&norm_addr)
-                    .is_some_and(|names| names.contains(&query))
-            {
-                continue;
-            }
+                    .is_some_and(|names| names.contains(&query));
             let is_in = m.kind == 1 && !m.outgoing;
             let is_out = m.kind == 2 || m.outgoing;
             if let Some(&idx) = thread_indices.get(&norm_addr) {
@@ -541,13 +587,14 @@ impl Companion {
                 t.unread |= is_in && !m.read;
                 thread_flags[idx].0 |= is_in;
                 thread_flags[idx].1 |= is_out;
+                thread_flags[idx].2 |= msg_matches_query;
                 if m.date_ms >= t.last_ms {
                     t.last_ms = m.date_ms;
                     t.last_body = m.body.clone();
                 }
             } else {
                 thread_indices.insert(norm_addr, threads.len());
-                thread_flags.push((is_in, is_out));
+                thread_flags.push((is_in, is_out, msg_matches_query));
                 threads.push(SmsThread {
                     address: addr.to_string(),
                     count: 1,
@@ -560,7 +607,10 @@ impl Companion {
         let mut filtered: Vec<SmsThread> = threads
             .into_iter()
             .zip(thread_flags)
-            .filter_map(|(t, (has_in, has_out))| {
+            .filter_map(|(t, (has_in, has_out, matches_query))| {
+                if !query.is_empty() && !matches_query {
+                    return None;
+                }
                 let norm = stepx_companion::sms::normalize_address(&t.address);
                 let is_selected = !selected_norm.is_empty() && norm == selected_norm;
                 let matches_filter = match self.sms_filter {
@@ -602,6 +652,7 @@ impl Companion {
     }
 
     pub(super) fn save_preferences(&mut self, ok: &str) {
+        self.prefs = self.preferences.clone();
         match self.preferences.save() {
             Ok(()) => {
                 self.status = ok.into();
@@ -611,6 +662,133 @@ impl Companion {
                 self.status = e.to_string();
                 self.error = true;
             }
+        }
+    }
+
+    pub(super) fn remove_remembered_device(&mut self, serial: &str) -> Vec<String> {
+        let target = serial.trim();
+        self.preferences.devices.retain(|d| d.serial != target);
+
+        let mut wireless_endpoints: Vec<String> = Vec::new();
+        if let Some(removed) = self.preferences.wireless.remove(target) {
+            let ep = removed.endpoint.trim().to_string();
+            if !ep.is_empty() {
+                wireless_endpoints.push(ep);
+            }
+        }
+        let matching_keys: Vec<String> = self
+            .preferences
+            .wireless
+            .iter()
+            .filter(|(_, w)| w.endpoint.trim() == target)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in matching_keys {
+            if let Some(removed) = self.preferences.wireless.remove(&key) {
+                let ep = removed.endpoint.trim().to_string();
+                if !ep.is_empty() {
+                    wireless_endpoints.push(ep);
+                }
+            }
+        }
+        if is_wireless(target) {
+            wireless_endpoints.push(target.to_string());
+        }
+        wireless_endpoints.sort();
+        wireless_endpoints.dedup();
+
+        for ep in &wireless_endpoints {
+            if let Ok(addr) = pairing::validate_endpoint(ep) {
+                self.pairing_hosts.retain(|ip| *ip != addr.ip());
+            }
+        }
+
+        if self.preferences.selected_serial.as_deref() == Some(target) {
+            self.preferences.selected_serial =
+                self.preferences.devices.first().map(|d| d.serial.clone());
+        }
+        if self.connection_watch.detached_serial.as_deref() == Some(target) {
+            self.connection_watch.detached_serial = None;
+        }
+        if self
+            .selected
+            .as_ref()
+            .is_some_and(|d| d.serial == target || d.transport == target)
+        {
+            self.selected = None;
+            self.clear_device_state();
+        }
+        self.devices.retain(|t| t.id != target);
+        stepx_companion::device::forget_known_serial(target);
+        stepx_companion::desktop_work::clear_device_closed_cache(target);
+        stepx_companion::amoo_usage::invalidate_account_scope(target);
+        for ep in &wireless_endpoints {
+            stepx_companion::device::forget_known_serial(ep);
+        }
+        self.save_preferences("已移除");
+
+        if !wireless_endpoints.is_empty() && !cfg!(test) {
+            let endpoints_bg = wireless_endpoints.clone();
+            std::thread::spawn(move || {
+                if let Ok(adb) = Adb::discover() {
+                    for ep in endpoints_bg {
+                        let _ = adb.run_timeout(&["disconnect", &ep], Duration::from_secs(3));
+                    }
+                }
+            });
+        }
+        wireless_endpoints
+    }
+
+    pub(super) fn reconnect_remembered_device(&mut self, serial: &str) {
+        let target = serial.trim();
+        if target.is_empty() {
+            return;
+        }
+        self.connection_watch.user_paused = false;
+        self.connection_watch.reset_wireless_backoff();
+        self.preferences.selected_serial = Some(target.to_string());
+        self.prefs = self.preferences.clone();
+        let wireless_endpoint = self
+            .preferences
+            .wireless
+            .get(target)
+            .map(|w| w.endpoint.trim().to_string())
+            .filter(|ep| !ep.is_empty())
+            .or_else(|| is_wireless(target).then(|| target.to_string()));
+        if let Some(ep) = wireless_endpoint {
+            if cfg!(test) {
+                self.status = format!("正在重连 {ep}…");
+                self.error = false;
+            } else {
+                self.submit(&format!("正在重连 {ep}…"), move |adb| {
+                    let _ = adb.run_timeout(&["connect", &ep], Duration::from_secs(4));
+                    Ok(Outcome::Paired(ep))
+                });
+            }
+        } else if let Some(transport_id) = self
+            .devices
+            .iter()
+            .find(|t| {
+                t.state == "device"
+                    && (t.id == target
+                        || stepx_companion::device::canonical_serial_from_transport(&t.id)
+                            .as_deref()
+                            == Some(target))
+            })
+            .map(|t| t.id.clone())
+        {
+            if cfg!(test) {
+                self.status = format!("正在验证设备 {transport_id}…");
+                self.error = false;
+            } else {
+                self.select(transport_id);
+            }
+        } else if cfg!(test) {
+            self.status = "正在查找设备…".into();
+            self.error = false;
+        } else {
+            self.refresh();
         }
     }
 
@@ -749,6 +927,8 @@ impl Companion {
                 self.qr = None;
                 self.connection_watch.detached_serial = None;
                 if let Some(device) = self.selected.take() {
+                    stepx_companion::amoo_usage::invalidate_account_scope(&device.serial);
+                    stepx_companion::desktop_work::clear_device_closed_cache(&device.serial);
                     self.last_connected_serial = Some(device.serial);
                 }
                 self.clear_device_state();
@@ -814,10 +994,19 @@ impl Companion {
                 self.demote_busy_if_background();
                 if !self.busy && self.mirror.is_none() {
                     let options = self.mirror_options;
+                    let fallback_transport = self.active_transport();
                     self.with_device("正在开启投屏…", move |adb, d| {
                         let active_transport = d
                             .resolve_active_transport(adb)
-                            .unwrap_or_else(|_| d.transport.clone());
+                            .ok()
+                            .filter(|s| !s.trim().is_empty())
+                            .unwrap_or_else(|| {
+                                if !fallback_transport.is_empty() {
+                                    fallback_transport
+                                } else {
+                                    d.transport.clone()
+                                }
+                            });
                         let session = stepx_companion::mirror::start_with_options(
                             adb,
                             &active_transport,
@@ -1038,19 +1227,27 @@ impl Companion {
                 });
             }
             Action::PrepareDirectSms => {
+                if self.sms_sending_in_flight {
+                    self.status = "上一条短信正在发送中，请稍候…".into();
+                    return;
+                }
                 let to = if self.fields[F_SMS_TO].text.trim().is_empty() {
                     self.selected_thread
                         .as_deref()
-                        .filter(|s| *s != "__new__" && !s.trim().is_empty())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty() && *s != "__new__")
                         .map(str::to_string)
-                        .or_else(|| self.sms_threads().first().map(|t| t.address.clone()))
-                        .or_else(|| self.demo_mode.then(|| "10086".to_string()))
                         .unwrap_or_default()
                 } else {
                     self.fields[F_SMS_TO].text.trim().to_string()
                 };
+                if to.is_empty() {
+                    self.status = "请先输入收件人号码".into();
+                    self.error = true;
+                    return;
+                }
                 let raw_body = self.fields[F_SMS_BODY].text.trim().to_string();
-                if to.is_empty() || raw_body.is_empty() {
+                if raw_body.is_empty() {
                     self.status = "请填写收件人号码和短信内容".into();
                     self.error = true;
                     return;
@@ -1070,22 +1267,26 @@ impl Companion {
                     raw_body
                 };
                 let now_ms = chrono::Utc::now().timestamp_millis();
+                let temp_id = self.next_temp_sms_id;
+                self.next_temp_sms_id -= 1;
                 let optimistic_msg = stepx_companion::sms::Message {
-                    provider_id: Some(now_ms),
+                    provider_id: Some(if self.demo_mode { now_ms } else { temp_id }),
                     address: to.clone(),
                     body: body.clone(),
                     date_ms: now_ms,
                     outgoing: true,
-                    kind: 2,
+                    kind: if self.demo_mode { 2 } else { 6 },
                     read: true,
                     subscription: self.selected_sim,
                 };
+                let mut confirmed_candidate = optimistic_msg.clone();
+                confirmed_candidate.kind = 2;
                 self.fields[F_SMS_TO].set(&to);
 
                 self.pending_sms_plan = None;
                 self.selected_thread = Some(to.clone());
                 self.sms.insert(0, optimistic_msg.clone());
-                self.local_sent_sms.insert(0, optimistic_msg.clone());
+                self.local_sent_sms.insert(0, optimistic_msg);
                 self.fields[F_SMS_BODY].clear();
                 Self::scroll_to_end(&self.sms_messages_scroll);
                 if self.demo_mode {
@@ -1093,52 +1294,103 @@ impl Companion {
                     self.error = false;
                     return;
                 }
+                self.sms_sending_in_flight = true;
                 self.status = format!("正在向 {to} 发送短信，等待手机确认…");
                 self.error = false;
                 let sim = self.selected_sim;
                 if let Some(mut device) = self.selected.clone() {
+                    let captured_epoch = self.device_epoch;
+                    let captured_serial = device.serial.clone();
+                    let in_flight = Some(outcome_apply::OutcomeApplyInFlight::SmsSend {
+                        temp_id,
+                        to: to.clone(),
+                        body: body.clone(),
+                    });
                     let (tx, rx) = mpsc::channel();
                     self.bg_receivers.push((Page::Sms, None, rx));
                     std::thread::spawn(move || {
-                        let outcome = Adb::discover().and_then(|adb| {
+                        let result = Adb::discover().and_then(|adb| {
                             device.transport = device.resolve_active_transport(&adb)?;
                             let plan = bridge::sms_prepare(&adb, &device, &to, &body, sim)?;
                             let status = bridge::sms_send(&adb, &device, &plan)?;
                             let mut messages = read_result(device.messages(&adb));
-                            merge_confirmed_sms(&mut messages, &status, optimistic_msg);
+                            merge_confirmed_sms(&mut messages, &status, confirmed_candidate);
                             Ok(Outcome::SmsSent(status, messages))
                         });
-                        let _ = tx.send(outcome);
+                        let wrapped = match result {
+                            Ok(inner) => Ok(Outcome::DeviceScoped {
+                                epoch: captured_epoch,
+                                serial: captured_serial,
+                                in_flight,
+                                outcome: Box::new(inner),
+                            }),
+                            Err(error) => Ok(Outcome::DeviceScopedError {
+                                epoch: captured_epoch,
+                                serial: captured_serial,
+                                page: Page::Sms,
+                                tool: None,
+                                in_flight,
+                                error,
+                            }),
+                        };
+                        let _ = tx.send(wrapped);
                     });
+                } else {
+                    self.sms_sending_in_flight = false;
                 }
             }
             Action::ConfirmDirectSms => {
+                if self.sms_sending_in_flight {
+                    self.status = "上一条短信正在发送中，请稍候…".into();
+                    return;
+                }
+                if !self.demo_mode && self.selected.is_none() {
+                    self.status = "手机已断开，短信未发送；请恢复连接后重试".into();
+                    self.error = true;
+                    return;
+                }
                 let Some(plan) = self.pending_sms_plan.take() else {
                     self.status = "请先准备短信并确认收件人和 SIM 卡".into();
                     self.error = true;
                     return;
                 };
                 let now_ms = chrono::Utc::now().timestamp_millis();
+                let temp_id = self.next_temp_sms_id;
+                self.next_temp_sms_id -= 1;
                 let optimistic_msg = stepx_companion::sms::Message {
-                    provider_id: Some(now_ms),
+                    provider_id: Some(if self.demo_mode { now_ms } else { temp_id }),
                     address: plan.number.clone(),
                     body: plan.body.clone(),
                     date_ms: now_ms,
                     outgoing: true,
-                    kind: 2,
+                    kind: if self.demo_mode { 2 } else { 6 },
                     read: true,
                     subscription: self.selected_sim,
                 };
+                let mut confirmed_candidate = optimistic_msg.clone();
+                confirmed_candidate.kind = 2;
                 self.selected_thread = Some(plan.number.clone());
                 self.sms.insert(0, optimistic_msg.clone());
-                self.local_sent_sms.insert(0, optimistic_msg.clone());
+                self.local_sent_sms.insert(0, optimistic_msg);
                 self.fields[F_SMS_BODY].clear();
                 Self::scroll_to_end(&self.sms_messages_scroll);
+                if self.demo_mode {
+                    self.status = format!("已发送短信至 {}（演示模式）", plan.number);
+                    self.error = false;
+                    return;
+                }
+                self.sms_sending_in_flight = true;
+                self.pending_outcome_in_flight =
+                    Some(outcome_apply::OutcomeApplyInFlight::SmsSend {
+                        temp_id,
+                        to: plan.number.clone(),
+                        body: plan.body.clone(),
+                    });
                 // Consume the confirmation once; never fabricate a send plan or retry a timed-out send.
                 self.with_device("正在通过手机发送短信…", move |adb, d| {
                     let status = bridge::sms_send(adb, &d, &plan)?;
                     let mut messages = read_result(d.messages(adb));
-                    merge_confirmed_sms(&mut messages, &status, optimistic_msg);
+                    merge_confirmed_sms(&mut messages, &status, confirmed_candidate);
                     Ok(Outcome::SmsSent(status, messages))
                 });
             }
@@ -1239,6 +1491,9 @@ impl Companion {
                 });
             }
             Action::Download => {
+                if self.busy {
+                    return;
+                }
                 let Some(entry) = self.selected_file.and_then(|i| self.files.get(i)).cloned()
                 else {
                     self.status = "请先选择文件".into();
@@ -1248,20 +1503,31 @@ impl Companion {
                     self.status = "暂不支持下载文件夹".into();
                     return;
                 }
-                self.with_device("选择保存位置…", move |adb, d| {
-                    match stepx_companion::file_dialog::FileDialog::new()
+                let Some(expected_serial) = self.selected.as_ref().map(|d| d.serial.clone()) else {
+                    self.page = Page::Connect;
+                    self.status = "请先连接设备".into();
+                    self.error = true;
+                    return;
+                };
+                let expected = Some(expected_serial);
+                let remote_path = entry.path.clone();
+                self.choose_path(
+                    stepx_companion::file_dialog::FileDialog::new()
                         .set_title("下载到电脑")
                         .set_filename(&entry.name)
-                        .set_location(&stepx_companion::settings::downloads())
-                        .show_save_single_file()?
-                    {
-                        Some(path) => {
-                            storage::pull(adb, &d, &entry.path, &path)?;
+                        .set_location(&stepx_companion::settings::downloads()),
+                    DialogKind::SaveFile,
+                    move |app, path, _| {
+                        app.ensure_file_dialog_device(&expected)?;
+                        anyhow::ensure!(!app.busy, "当前操作尚未完成，请重新选择保存位置");
+                        let remote_path = remote_path.clone();
+                        app.with_device("正在下载文件…", move |adb, d| {
+                            storage::pull_overwrite(adb, &d, &remote_path, &path)?;
                             Ok(Outcome::Notice(format!("已下载到 {}", path.display())))
-                        }
-                        None => Ok(Outcome::Notice("已取消".into())),
-                    }
-                });
+                        });
+                        Ok(())
+                    },
+                );
             }
             Action::ConfirmTrash => {
                 let Some(entry) = self.selected_file.and_then(|i| self.files.get(i)).cloned()
@@ -1306,19 +1572,30 @@ impl Companion {
                 if self.bulk_busy {
                     return;
                 }
+                let Some(expected_serial) = self.selected.as_ref().map(|d| d.serial.clone()) else {
+                    self.page = Page::Connect;
+                    self.status = "请先连接设备".into();
+                    self.error = true;
+                    return;
+                };
+                let expected = Some(expected_serial);
                 let pkg = pkg.clone();
-                self.with_device_bulk("选择 APK 导出目录…", move |adb, d| {
-                    match stepx_companion::file_dialog::FileDialog::new()
-                        .set_title("选择 APK 导出目录")
-                        .show_open_single_dir()?
-                    {
-                        Some(dir) => Ok(Outcome::Notice(format!(
-                            "已导出完整安装包：{}",
-                            apps::export_apks(adb, &d, &pkg, &dir)?.display()
-                        ))),
-                        None => Ok(Outcome::Notice("已取消导出".into())),
-                    }
-                });
+                self.choose_path(
+                    stepx_companion::file_dialog::FileDialog::new().set_title("选择 APK 导出目录"),
+                    DialogKind::OpenFolder,
+                    move |app, dir, _| {
+                        app.ensure_file_dialog_device(&expected)?;
+                        anyhow::ensure!(!app.bulk_busy, "当前导出任务尚未完成，请稍后重试");
+                        let pkg = pkg.clone();
+                        app.with_device_bulk("正在导出应用安装包…", move |adb, d| {
+                            Ok(Outcome::Notice(format!(
+                                "已导出完整安装包：{}",
+                                apps::export_apks(adb, &d, &pkg, &dir)?.display()
+                            )))
+                        });
+                        Ok(())
+                    },
+                );
             }
             Action::AppSettings(pkg) => {
                 let pkg = pkg.clone();
@@ -1507,7 +1784,7 @@ impl Companion {
                         .and_then(|s| s.to_str())
                         .unwrap_or("preview.bin");
                     let dest = folder.join(format!("inline-{}", safe_name));
-                    storage::pull(adb, &d, &entry.path, &dest)?;
+                    storage::pull_overwrite(adb, &d, &entry.path, &dest)?;
                     if is_img {
                         Ok(Outcome::FilePreviewLoaded {
                             path: entry.path,
@@ -1536,8 +1813,10 @@ impl Companion {
                     let folder = stepx_companion::resources::user_state().join("apk-staging");
                     std::fs::create_dir_all(&folder)?;
                     let local_apk = folder.join("staged_remote.apk");
-                    storage::pull(adb, &d, &remote_path, &local_apk)?;
-                    let msg = d.install_apk(adb, &local_apk)?;
+                    storage::pull_overwrite(adb, &d, &remote_path, &local_apk)?;
+                    let msg = d
+                        .install_apk(adb, &local_apk)
+                        .map_err(friendly_apk_install_error)?;
                     let apps = apps::catalog(adb, &d)?;
                     Ok(Outcome::ApkInstalled(msg, apps))
                 });
@@ -1564,20 +1843,34 @@ impl Companion {
                 });
             }
             Action::InstallApk => {
-                self.with_device("选择 APK…", move |adb, d| {
-                    match stepx_companion::file_dialog::FileDialog::new()
+                if self.busy {
+                    return;
+                }
+                let Some(expected_serial) = self.selected.as_ref().map(|d| d.serial.clone()) else {
+                    self.page = Page::Connect;
+                    self.status = "请先连接设备".into();
+                    self.error = true;
+                    return;
+                };
+                let expected = Some(expected_serial);
+                self.choose_path(
+                    stepx_companion::file_dialog::FileDialog::new()
                         .set_title("安装 APK")
-                        .add_filter("Android APK", &["apk"])
-                        .show_open_single_file()?
-                    {
-                        Some(path) => {
-                            let msg = d.install_apk(adb, &path)?;
+                        .add_filter("Android APK", &["apk"]),
+                    DialogKind::OpenFile,
+                    move |app, path, _| {
+                        app.ensure_file_dialog_device(&expected)?;
+                        anyhow::ensure!(!app.busy, "当前操作尚未完成，请重新选择要安装的 APK");
+                        app.with_device("正在安装 APK…", move |adb, d| {
+                            let msg = d
+                                .install_apk(adb, &path)
+                                .map_err(friendly_apk_install_error)?;
                             let apps = apps::catalog(adb, &d)?;
                             Ok(Outcome::ApkInstalled(msg, apps))
-                        }
-                        None => Ok(Outcome::Notice("已取消".into())),
-                    }
-                });
+                        });
+                        Ok(())
+                    },
+                );
             }
             Action::OpenApp(package) => {
                 let package = package.clone();
@@ -1591,6 +1884,7 @@ impl Companion {
                 let package = package.clone();
                 let need_mirror = self.mirror.is_none();
                 let options = self.mirror_options;
+                let fallback_transport = self.active_transport();
                 self.with_device(
                     "正在手机打开应用并启动电脑投屏…",
                     move |adb, d| {
@@ -1598,7 +1892,15 @@ impl Companion {
                         if need_mirror {
                             let active_transport = d
                                 .resolve_active_transport(adb)
-                                .unwrap_or_else(|_| d.transport.clone());
+                                .ok()
+                                .filter(|s| !s.trim().is_empty())
+                                .unwrap_or_else(|| {
+                                    if !fallback_transport.is_empty() {
+                                        fallback_transport
+                                    } else {
+                                        d.transport.clone()
+                                    }
+                                });
                             let session = stepx_companion::mirror::start_with_options(
                                 adb,
                                 &active_transport,
@@ -2069,7 +2371,7 @@ impl Companion {
                     }
                 }
                 let progress = self.google_progress.clone();
-                *progress.lock().unwrap() = if rollback {
+                *progress.lock().unwrap_or_else(|p| p.into_inner()) = if rollback {
                     "核对兼容补丁备份…".into()
                 } else {
                     "核对 Google 组件版本与适配条件…".into()
@@ -2084,7 +2386,7 @@ impl Companion {
                     move |adb, d| {
                         if !rollback {
                             let result = stepx_companion::google::install(&d, adb, |label| {
-                                if let Ok(mut value) = progress.lock() { *value = label.into(); }
+                                *progress.lock().unwrap_or_else(|p| p.into_inner()) = label.into();
                             })?;
                             return Ok(Outcome::GoogleSuite(result.google, result.companion, result.message));
                         }
@@ -2093,9 +2395,7 @@ impl Companion {
                             adb,
                             rollback,
                             |label| {
-                                if let Ok(mut value) = progress.lock() {
-                                    *value = label.into();
-                                }
+                                *progress.lock().unwrap_or_else(|p| p.into_inner()) = label.into();
                             },
                         )?;
                         let companion =
@@ -2114,14 +2414,13 @@ impl Companion {
                 // refresh after success or failure instead of flashing "unknown".
                 self.google_recovery.inspect_requested = true;
                 let progress = self.google_progress.clone();
-                *progress.lock().unwrap() = "检查 Google Play 与 StepX伴侣安装条件…".into();
+                *progress.lock().unwrap_or_else(|p| p.into_inner()) =
+                    "检查 Google Play 与 StepX伴侣安装条件…".into();
                 self.with_device(
                     "正在安装 Google Play 与 StepX伴侣，请保持连接…",
                     move |adb, d| {
                         let result = stepx_companion::google::install(&d, adb, |label| {
-                            if let Ok(mut value) = progress.lock() {
-                                *value = label.into();
-                            }
+                            *progress.lock().unwrap_or_else(|p| p.into_inner()) = label.into();
                         })?;
                         Ok(Outcome::GoogleSuite(
                             result.google,
@@ -2215,7 +2514,7 @@ impl Companion {
                     return;
                 }
                 self.companion_status = CompanionStatus::default();
-                *self.google_progress.lock().unwrap() = String::new();
+                *self.google_progress.lock().unwrap_or_else(|p| p.into_inner()) = String::new();
                 self.with_device_bulk("正在检测 StepX伴侣与实际授权…", |adb, d| {
                     let companion = companion_app::inspect(adb, &d)?;
                     let message = companion.message.clone();
@@ -2224,14 +2523,13 @@ impl Companion {
             }
             Action::CompanionInstall => {
                 let progress = self.google_progress.clone();
-                *progress.lock().unwrap() = "正在检查 StepX伴侣安装条件…".into();
+                *progress.lock().unwrap_or_else(|p| p.into_inner()) =
+                    "正在检查 StepX伴侣安装条件…".into();
                 self.with_device(
                     "正在安装或修复 StepX伴侣，请保持连接…",
                     move |adb, d| {
                         let companion = companion_app::install(adb, &d, |label| {
-                            if let Ok(mut text) = progress.lock() {
-                                *text = label.into();
-                            }
+                            *progress.lock().unwrap_or_else(|p| p.into_inner()) = label.into();
                         })?;
                         let message = companion.message.clone();
                         Ok(Outcome::CompanionStatus(companion, message))
@@ -2869,6 +3167,29 @@ pub(super) fn build_amoo_reply(prompt: &str, agent: &str) -> AmooChatItem {
     }
 }
 
+pub(super) fn friendly_apk_install_error(err: anyhow::Error) -> anyhow::Error {
+    let raw = format!("{err:#}");
+    if raw.contains("INSTALL_FAILED_UPDATE_INCOMPATIBLE") {
+        anyhow::anyhow!(
+            "签名不一致：手机上已安装来自其他渠道签名的同名应用，请切换原渠道或备份数据后手动卸载再安装"
+        )
+    } else if raw.contains("INSTALL_FAILED_NO_MATCHING_ABIS") {
+        anyhow::anyhow!(
+            "架构不兼容：该安装包不支持当前手机的 CPU 架构，请更换适配 ARM64 的安装包后重试"
+        )
+    } else if raw.contains("INSTALL_FAILED_INSUFFICIENT_STORAGE") {
+        anyhow::anyhow!(
+            "手机存储空间不足：当前剩余存储空间无法完成安装，请先清理手机空间后重试"
+        )
+    } else if raw.contains("INSTALL_FAILED_VERSION_DOWNGRADE") {
+        anyhow::anyhow!(
+            "版本降级受限：手机上已安装更高版本的同名应用，如需安装旧版请备份数据后先卸载"
+        )
+    } else {
+        err
+    }
+}
+
 pub(super) fn parent_dir(dir: &str) -> String {
     dir.trim_end_matches('/')
         .rsplit_once('/')
@@ -2957,5 +3278,203 @@ mod messaging_receipt_tests {
         assert!(app.error && app.status.contains("未发送"));
         assert_eq!(app.fields[F_SMS_BODY].text, "keep this reply");
         assert_eq!(app.sms.len(), before);
+    }
+
+    #[test]
+    fn new_sms_thread_with_empty_recipient_never_falls_back_to_first_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = crate::ui::TestUiConfigDirGuard::set(dir.path());
+        let mut app = Companion::new_for_test();
+        app.demo_mode = true;
+        app.sms = vec![stepx_companion::sms::Message {
+            provider_id: Some(42),
+            address: "10086".into(),
+            body: "existing bill notice".into(),
+            date_ms: 10_000,
+            outgoing: false,
+            kind: 1,
+            read: true,
+            subscription: None,
+        }];
+        for selected in [Some("__new__".to_string()), None] {
+            app.selected_thread = selected;
+            app.fields[F_SMS_TO].set("   ");
+            app.fields[F_SMS_BODY].set("confidential message");
+            app.handle_device_action(&Action::PrepareDirectSms);
+            assert!(app.error);
+            assert_eq!(app.status, "请先输入收件人号码");
+            assert_eq!(app.sms.len(), 1);
+            assert_eq!(app.sms[0].address, "10086");
+            assert_eq!(app.fields[F_SMS_BODY].text, "confidential message");
+        }
+    }
+
+    #[test]
+    fn sms_in_flight_dedup_and_unconfirmed_reconciliation_restore_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = crate::ui::TestUiConfigDirGuard::set(dir.path());
+        let mut app = Companion::new_for_test();
+        app.demo_mode = false;
+        app.selected = Some(Device {
+            serial: "STEPX-SMS-01".into(),
+            transport: "STEPX-SMS-01".into(),
+            model: "StepX".into(),
+            android: "16".into(),
+            product: "pandora".into(),
+        });
+        app.sms_sending_in_flight = true;
+        app.fields[F_SMS_TO].set("10010");
+        app.fields[F_SMS_BODY].set("do not duplicate");
+        let before = app.sms.len();
+        app.handle_device_action(&Action::PrepareDirectSms);
+        assert_eq!(app.sms.len(), before);
+        assert!(app.status.contains("上一条短信正在发送中"));
+
+        // Optimistic kind=6 with negative temp_id reconciles cleanly on unconfirmed/unknown status
+        app.sms_sending_in_flight = true;
+        let temp_id = -77i64;
+        let opt = stepx_companion::sms::Message {
+            provider_id: Some(temp_id),
+            address: "10010".into(),
+            body: "draft to recover".into(),
+            date_ms: 20_000,
+            outgoing: true,
+            kind: 6,
+            read: true,
+            subscription: None,
+        };
+        app.sms = vec![opt.clone()];
+        app.local_sent_sms = vec![opt];
+        app.fields[F_SMS_BODY].clear();
+        let epoch = app.device_epoch;
+        app.apply(Outcome::DeviceScoped {
+            epoch,
+            serial: "STEPX-SMS-01".into(),
+            in_flight: Some(outcome_apply::OutcomeApplyInFlight::SmsSend {
+                temp_id,
+                to: "10010".into(),
+                body: "draft to recover".into(),
+            }),
+            outcome: Box::new(Outcome::SmsSent(
+                stepx_companion::bridge::SmsSendStatus {
+                    id: "req-1".into(),
+                    state: "unknown".into(),
+                    parts: 1,
+                    completed: 0,
+                    error_code: None,
+                    error: None,
+                    updated_ms: None,
+                },
+                Ok(vec![]),
+            )),
+        });
+        assert!(!app.sms_sending_in_flight);
+        assert!(app.local_sent_sms.is_empty());
+        assert_eq!(app.fields[F_SMS_BODY].text, "draft to recover");
+    }
+
+    #[test]
+    fn sms_threads_groups_all_messages_before_filtering_by_search_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = crate::ui::TestUiConfigDirGuard::set(dir.path());
+        let mut app = Companion::new_for_test();
+        app.sms = vec![
+            stepx_companion::sms::Message {
+                provider_id: Some(3),
+                address: "13800009367".into(),
+                body: "谢谢".into(),
+                date_ms: 3_000,
+                outgoing: true,
+                kind: 2,
+                read: true,
+                subscription: None,
+            },
+            stepx_companion::sms::Message {
+                provider_id: Some(2),
+                address: "13800009367".into(),
+                body: "您的验证码是 829104".into(),
+                date_ms: 2_000,
+                outgoing: false,
+                kind: 1,
+                read: false,
+                subscription: None,
+            },
+            stepx_companion::sms::Message {
+                provider_id: Some(1),
+                address: "13800009367".into(),
+                body: "你好".into(),
+                date_ms: 1_000,
+                outgoing: false,
+                kind: 1,
+                read: true,
+                subscription: None,
+            },
+        ];
+        app.fields[F_SMS_SEARCH].set("验证码");
+        let threads = app.sms_threads();
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].count, 3);
+        assert_eq!(threads[0].last_body, "谢谢");
+    }
+
+    #[test]
+    fn clear_device_state_and_remove_remembered_device_clean_all_scoped_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = crate::ui::TestUiConfigDirGuard::set(dir.path());
+        let mut app = Companion::new_for_test();
+        app.demo_mode = false;
+        let epoch_before = app.device_epoch;
+        app.amoo_memories = vec![
+            AmooMemoryEntry {
+                title: "phone-synced-mem".into(),
+                sub: "手机端 OpenClaw 记忆库".into(),
+            },
+            AmooMemoryEntry {
+                title: "desktop-local-mem".into(),
+                sub: "备忘事项 · 重要记录 · 桌面新增".into(),
+            },
+        ];
+        app.read_sms_addresses.insert("10086".into());
+        app.selected_file_preview_path = Some("/sdcard/a.txt".into());
+        app.selected_file_preview_text = Some("secret".into());
+        app.selected_app = Some("com.example.app".into());
+        app.push.seen_toast_keys.insert("toast-1".into());
+        app.back_screen.last_synced_phone_clip = "clip-secret".into();
+        app.active_call_number = Some("13800009367".into());
+
+        app.clear_device_state();
+        assert_eq!(app.device_epoch, epoch_before.wrapping_add(1));
+        assert_eq!(app.amoo_memories.len(), 1);
+        assert_eq!(app.amoo_memories[0].title, "desktop-local-mem");
+        assert!(app.read_sms_addresses.is_empty());
+        assert!(app.selected_file_preview_path.is_none());
+        assert!(app.selected_file_preview_text.is_none());
+        assert!(app.selected_app.is_none());
+        assert!(app.push.seen_toast_keys.is_empty());
+        assert!(app.back_screen.last_synced_phone_clip.is_empty());
+        assert!(app.active_call_number.is_none());
+
+        app.preferences.wireless.insert(
+            "SER-WIFI-1".into(),
+            stepx_companion::pairing::WirelessIdentity {
+                endpoint: "192.168.1.77:5555".into(),
+                guid: "adb-SER-WIFI-1".into(),
+                wlan_mac: String::new(),
+                wifi_ip: "192.168.1.77".into(),
+            },
+        );
+        let removed_eps = app.remove_remembered_device("SER-WIFI-1");
+        assert_eq!(removed_eps, vec!["192.168.1.77:5555".to_string()]);
+        assert!(!app.preferences.wireless.contains_key("SER-WIFI-1"));
+
+        let incompat = friendly_apk_install_error(anyhow::anyhow!(
+            "adb install failed: Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE: Signatures do not match]"
+        ));
+        assert!(incompat.to_string().contains("签名不一致"));
+        let abi = friendly_apk_install_error(anyhow::anyhow!("INSTALL_FAILED_NO_MATCHING_ABIS"));
+        assert!(abi.to_string().contains("架构不兼容"));
+        let space =
+            friendly_apk_install_error(anyhow::anyhow!("INSTALL_FAILED_INSUFFICIENT_STORAGE"));
+        assert!(space.to_string().contains("存储空间不足"));
     }
 }

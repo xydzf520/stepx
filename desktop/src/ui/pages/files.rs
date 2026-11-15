@@ -273,7 +273,7 @@ impl Companion {
 
     fn received_transfers(&self) -> Vec<(String, std::path::PathBuf, u64)> {
         type ReceivedTransferItem = (String, std::path::PathBuf, u64);
-        type ReceivedCacheKey = (usize, Option<String>, bool, String);
+        type ReceivedCacheKey = (usize, Option<String>, bool);
         static RECEIVED_TRANSFERS_CACHE: std::sync::OnceLock<
             std::sync::Mutex<
                 Option<(
@@ -288,24 +288,30 @@ impl Companion {
             self.files.len(),
             self.expansion.files_preview_path.clone(),
             self.demo_mode,
-            self.status.clone(),
         );
         let cache = RECEIVED_TRANSFERS_CACHE.get_or_init(|| std::sync::Mutex::new(None));
         if let Ok(guard) = cache.lock() {
             if let Some((at, key, cached)) = guard.as_ref() {
-                if at.elapsed() < std::time::Duration::from_millis(1500) && *key == cache_key {
+                if at.elapsed() < std::time::Duration::from_secs(3) && *key == cache_key {
                     return cached.clone();
                 }
             }
         }
 
+        let previews_dir = stepx_companion::resources::user_state().join("file-previews");
         let mut items = Vec::new();
         let mut scan_dir = |root: &std::path::Path| {
+            if root.starts_with(&previews_dir) {
+                return;
+            }
             let Ok(rd) = std::fs::read_dir(root) else {
                 return;
             };
             for entry in rd.take(64).flatten() {
                 let path = entry.path();
+                if path.starts_with(&previews_dir) {
+                    continue;
+                }
                 if path.is_file() {
                     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                         if !name.starts_with('.')
@@ -320,6 +326,9 @@ impl Companion {
                     if let Ok(sub) = std::fs::read_dir(&path) {
                         for sub_entry in sub.take(8).flatten() {
                             let sp = sub_entry.path();
+                            if sp.starts_with(&previews_dir) {
+                                continue;
+                            }
                             if sp.is_file() {
                                 if let Some(name) = sp.file_name().and_then(|n| n.to_str()) {
                                     if !name.starts_with('.')
@@ -340,8 +349,6 @@ impl Companion {
         if let Ok(dl) = stepx_companion::companion_link::receive_directory() {
             scan_dir(&dl);
         }
-        let previews_dir = stepx_companion::resources::user_state().join("file-previews");
-        scan_dir(&previews_dir);
 
         if items.is_empty() && self.demo_mode {
             for (demo_name, rel_path, fallback_bytes) in [
@@ -863,8 +870,11 @@ impl Companion {
                 let row_hovered = {
                     let map = self.hover_states.borrow();
                     hover_keys.iter().any(|k| {
-                        map.get(k.as_str())
-                            .is_some_and(|(_, h)| h.lock().unwrap().is_mouse_over_element())
+                        map.get(k.as_str()).is_some_and(|(_, h)| {
+                            h.lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .is_mouse_over_element()
+                        })
                     })
                 };
                 let mut act_links = vec![self.link(
@@ -1024,8 +1034,11 @@ impl Companion {
                 let row_hovered = {
                     let map = self.hover_states.borrow();
                     hover_keys.iter().any(|k| {
-                        map.get(k.as_str())
-                            .is_some_and(|(_, h)| h.lock().unwrap().is_mouse_over_element())
+                        map.get(k.as_str()).is_some_and(|(_, h)| {
+                            h.lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .is_mouse_over_element()
+                        })
                     })
                 };
                 let mut act_links = vec![self.link(
@@ -1320,6 +1333,12 @@ impl Companion {
                     Btn::Secondary,
                 ),
                 self.button(
+                    format!("rx-amoo-{idx}"),
+                    "去 Amoo 分析",
+                    Action::Expansion(EA::AnalyzeWithAmoo(path_str.clone())),
+                    Btn::Secondary,
+                ),
+                self.button(
                     format!("rx-copy-{idx}"),
                     "复制路径",
                     Action::CopyText(path_str.clone(), "已复制电脑接收文件路径".into()),
@@ -1377,17 +1396,33 @@ impl Companion {
                     || lower_sel.ends_with(".jpeg")
                     || lower_sel.ends_with(".webp")
                     || lower_sel.ends_with(".gif"));
-            let matched_local_rx = received_transfers
-                .iter()
-                .find(|(n, _, _)| n == &entry.name)
-                .map(|(_, p, _)| p.to_string_lossy().into_owned())
-                .or_else(|| {
-                    if sel_is_image && self.demo_mode {
-                        Some("desktop/assets/stepx_home_screen.png".into())
-                    } else {
-                        None
-                    }
-                });
+            let real_local_rx = if !self.demo_mode {
+                received_transfers
+                    .iter()
+                    .find(|(n, _, _)| n == &entry.name)
+                    .map(|(_, p, _)| p.to_string_lossy().into_owned())
+                    .or_else(|| {
+                        let dl_candidate =
+                            stepx_companion::settings::downloads().join(&entry.name);
+                        cached_is_file(&dl_candidate)
+                            .then(|| dl_candidate.to_string_lossy().into_owned())
+                    })
+            } else {
+                None
+            };
+            let matched_local_rx = real_local_rx.clone().or_else(|| {
+                received_transfers
+                    .iter()
+                    .find(|(n, _, _)| n == &entry.name)
+                    .map(|(_, p, _)| p.to_string_lossy().into_owned())
+                    .or_else(|| {
+                        if sel_is_image && self.demo_mode {
+                            Some("desktop/assets/stepx_home_screen.png".into())
+                        } else {
+                            None
+                        }
+                    })
+            });
 
             let mut cross_actions: Vec<El> = Vec::new();
             if !entry.directory {
@@ -1434,10 +1469,13 @@ impl Companion {
                         Btn::Secondary,
                     ));
                 }
+                let analyze_target = real_local_rx
+                    .clone()
+                    .unwrap_or_else(|| entry.path.clone());
                 cross_actions.push(self.button(
                     "file-detail-to-amoo",
                     "去 Amoo 分析",
-                    Action::Expansion(EA::AnalyzeWithAmoo(entry.path.clone())),
+                    Action::Expansion(EA::AnalyzeWithAmoo(analyze_target)),
                     Btn::Secondary,
                 ));
             } else {

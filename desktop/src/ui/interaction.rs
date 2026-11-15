@@ -471,6 +471,15 @@ impl Companion {
             }
             return false;
         }
+        if matches!(action, Action::GoogleSuiteInspect) {
+            self.google_recovery.request_manual_inspect();
+        } else if matches!(action, Action::GoogleAutoRepairNow) {
+            self.connection_watch.user_paused = false;
+            self.google_recovery.request_manual_repair();
+        } else if matches!(action, Action::GoogleSuiteMaintain) {
+            self.connection_watch.user_paused = false;
+            self.google_recovery.clear_manual_cooldown();
+        }
         self.review_effect(action, ctx)
     }
     fn review_effect(&mut self, action: &Action, ctx: &mut ViewContext<Self>) -> bool {
@@ -487,11 +496,102 @@ impl Companion {
                 self.review_action(&Action::ConfirmUninstallApp(pkg.clone()),"卸载手机应用？",phone,vec![format!("应用：{pkg}"),"会删除手机当前用户中的应用及其数据。此操作不能通过伴侣撤销。".into()],"确认卸载",true,false);ctx.notify();return true;
             },
             Action::Trash|Action::DeleteFile=>{
+                if self.page == Page::Gallery && self.focus.is_none() && !self.busy {
+                    let indices = self.filtered_gallery_indices();
+                    if let Some(item) = indices
+                        .iter()
+                        .find(|&&i| i == self.back_screen.gallery_selected)
+                        .or_else(|| indices.first())
+                        .and_then(|&i| self.back_screen.gallery_items.get(i))
+                    {
+                        if item.category != "expansion" {
+                            let target_action = Action::BackScreen(
+                                BackScreenAction::GalleryDelete(item.remote_path.clone()),
+                            );
+                            self.review_action(
+                                &target_action,
+                                "删除手机相册照片？",
+                                phone,
+                                vec![
+                                    format!("照片：{}", item.name),
+                                    format!("路径：{}", item.remote_path),
+                                    "将从手机相册中删除该照片，此操作无法通过桌面端直接撤销。"
+                                        .into(),
+                                ],
+                                "确认删除",
+                                true,
+                                false,
+                            );
+                            ctx.notify();
+                            return true;
+                        }
+                    }
+                    return false;
+                }
                 if self.page!=Page::Files||self.recent_files_view||self.busy{return false;}
                 let Some(entry)=self.selected_file.and_then(|i|self.files.get(i))else{return false;};
                 let path=entry.path.clone();self.trash_confirm=true;self.permanent_delete=matches!(action,Action::DeleteFile);
                 self.review_action(&Action::ConfirmTrash,if self.permanent_delete{"永久删除手机文件？"}else{"移到手机回收站？"},phone,vec![format!("文件：{path}"),if self.permanent_delete{"删除后无法恢复，请确认已不再需要。".into()}else{"优先移到手机系统回收站；旧系统使用 StepX 回收站。需要时可恢复，此操作不会立即释放文件空间。".into()}],if self.permanent_delete{"确认永久删除"}else{"移到回收站"},true,false);ctx.notify();return true;
             },
+            Action::BackScreen(BackScreenAction::GalleryDelete(path)) => {
+                if self
+                    .back_screen
+                    .gallery_items
+                    .iter()
+                    .any(|i| i.remote_path == *path && i.category == "expansion")
+                {
+                    return false;
+                }
+                let name = self
+                    .back_screen
+                    .gallery_items
+                    .iter()
+                    .find(|i| i.remote_path == *path)
+                    .map(|i| i.name.clone())
+                    .unwrap_or_else(|| path.clone());
+                (
+                    "删除手机相册照片？",
+                    vec![
+                        format!("照片：{name}"),
+                        format!("路径：{path}"),
+                        "将从手机相册中删除该照片，此操作无法通过桌面端直接撤销。".into(),
+                    ],
+                    "确认删除",
+                    true,
+                )
+            }
+            Action::BackScreen(BackScreenAction::TriggerMcpQuickAction(cmd))
+                if (cmd == "toggle_wifi"
+                    && (self.back_screen.stepos_suite.controls.wifi_on
+                        || !self.back_screen.stepos_suite.checked))
+                    || cmd == "set_wifi_off"
+                    || cmd.contains("airplane") =>
+            {
+                let active_transport = self
+                    .selected
+                    .as_ref()
+                    .map(|d| self.online_device_active_transport(d))
+                    .unwrap_or_default();
+                if active_transport.contains(':') || active_transport.starts_with("adb-") {
+                    let op_desc = if cmd.contains("airplane") {
+                        "开启飞行模式"
+                    } else {
+                        "关闭手机 Wi-Fi"
+                    };
+                    (
+                        "操作将中断当前无线连接？",
+                        vec![
+                            format!("当前连接通道：{active_transport}（无线 ADB）"),
+                            format!("{op_desc}会立即断开当前无线调试连接，导致正在进行的同步、投屏或文件传输中断。"),
+                            "建议先接入 USB 数据线后再执行该操作。".into(),
+                        ],
+                        "仍要继续",
+                        true,
+                    )
+                } else {
+                    return false;
+                }
+            }
             Action::PrepareUtility(inner)=>return self.review_effect(inner,ctx),
             Action::Settings(SettingsAction::Apply) => {
                 if !self.settings_dirty(){return true;}
@@ -568,6 +668,15 @@ impl Companion {
                     .and_then(|i| self.files.get(i))
                     .map(|e| &e.path),
                 self.permanent_delete
+            ),
+            Action::BackScreen(BackScreenAction::GalleryDelete(path)) => path.clone(),
+            Action::BackScreen(BackScreenAction::TriggerMcpQuickAction(cmd)) => format!(
+                "{cmd}|{}|{}",
+                self.back_screen.stepos_suite.controls.wifi_on,
+                self.selected
+                    .as_ref()
+                    .map(|d| self.online_device_active_transport(d))
+                    .unwrap_or_default()
             ),
             Action::BackScreen(_) => format!(
                 "{}|{}|{}|{}|{}",

@@ -106,6 +106,14 @@ pub enum CustomEvent {
     MomentumScroll {
         window_id: winit::window::WindowId,
     },
+    /// Asynchronously cancel active IME composition for a window after focus changes.
+    CloseIme {
+        window_id: crate::WindowId,
+    },
+    /// Retry recreating the wgpu renderer after a bounded backoff delay.
+    RetryRecreateRenderer {
+        window_id: winit::window::WindowId,
+    },
 }
 
 #[derive(Debug)]
@@ -185,6 +193,11 @@ impl App {
             force_x11,
         } = self;
 
+        // Ensure `XCURSOR_THEME` is populated (if the process is still single-threaded) before
+        // winit and graphics drivers spawn worker threads.
+        #[cfg(target_os = "linux")]
+        super::linux::ensure_cursor_theme();
+
         let mut event_loop_builder = winit::event_loop::EventLoop::with_user_event();
 
         #[cfg(target_os = "linux")]
@@ -203,7 +216,6 @@ impl App {
         cfg_if::cfg_if! {
             if #[cfg(target_os = "linux")] {
                 super::linux::maybe_register_xlib_error_hook(&event_loop);
-                super::linux::ensure_cursor_theme();
             } else if #[cfg(target_family = "wasm")] {
                 crate::platform::wasm::add_paste_listener(event_loop.create_proxy());
                 if callbacks.on_internet_reachability_changed.is_some() {
@@ -218,7 +230,7 @@ impl App {
         // application event loop).
         super::delegate::mark_current_thread_as_main();
 
-        let ui_app = Self::construct_ui_app(assets, is_integration_test, &event_loop);
+        let (ui_app, ime_state) = Self::construct_ui_app(assets, is_integration_test, &event_loop);
         let inner_event_loop = super::EventLoop::new(
             ui_app,
             callbacks,
@@ -227,6 +239,7 @@ impl App {
             #[cfg(target_os = "linux")]
             window_icon,
             event_loop.create_proxy(),
+            ime_state,
         );
 
         // Prevent dropping of our internal event loop state structure during
@@ -254,16 +267,21 @@ impl App {
         assets: Box<dyn AssetProvider>,
         is_integration_test: bool,
         event_loop: &winit::event_loop::EventLoop<CustomEvent>,
-    ) -> crate::App {
-        let platform_delegate: Box<dyn platform::Delegate> = if is_integration_test {
+    ) -> (crate::App, std::sync::Arc<super::delegate::ImeSharedState>) {
+        let (platform_delegate, ime_state): (
+            Box<dyn platform::Delegate>,
+            std::sync::Arc<super::delegate::ImeSharedState>,
+        ) = if is_integration_test {
             let delegate = super::delegate::IntegrationTestDelegate::new(event_loop.create_proxy())
                 .expect("should not fail to create platform delegate");
-            Box::new(delegate)
+            let ime_state = delegate.ime_state();
+            (Box::new(delegate), ime_state)
         } else {
             let mut delegate = super::delegate::AppDelegate::new(event_loop.create_proxy())
                 .expect("should not fail to create platform delegate");
             delegate.use_platform_clipboard();
-            Box::new(delegate)
+            let ime_state = delegate.ime_state();
+            (Box::new(delegate), ime_state)
         };
 
         let display_handle = event_loop.owned_display_handle();
@@ -279,12 +297,14 @@ impl App {
             ))
         };
 
-        crate::App::new(
+        let app = crate::App::new(
             platform_delegate,
             window_manager,
             Box::new(super::fonts::FontDB::new()),
             assets,
         )
-        .expect("should not fail to construct application")
+        .expect("should not fail to construct application");
+
+        (app, ime_state)
     }
 }

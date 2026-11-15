@@ -219,17 +219,26 @@ fn checked_base(adb: &Adb, device: &Device) -> Result<String> {
             }
         }
     }
-    ensure!(
-        adb.shell(
-            &transport,
-            &["pm", "path", "com.stepx.companion.app"]
-        )?
-        .contains("package:"),
-        "请先安装 StepX伴侣"
-    );
-    let root = shell_quote(BASE);
-    let out = adb.script(&transport, &format!("test ! -L {root} && test ! -L {root}/transfers && test ! -L {root}/transfers/inbox && test ! -L {root}/transfers/outbox && mkdir -p {root}/transfers/inbox {root}/transfers/outbox && echo ready"))?;
-    ensure!(out.trim() == "ready", "手机传输目录无效");
+    let check_res = (|| -> Result<()> {
+        ensure!(
+            adb.shell(
+                &transport,
+                &["pm", "path", "com.stepx.companion.app"]
+            )?
+            .contains("package:"),
+            "请先安装 StepX伴侣"
+        );
+        let root = shell_quote(BASE);
+        let out = adb.script(&transport, &format!("test ! -L {root} && test ! -L {root}/transfers && test ! -L {root}/transfers/inbox && test ! -L {root}/transfers/outbox && mkdir -p {root}/transfers/inbox {root}/transfers/outbox && echo ready"))?;
+        ensure!(out.trim() == "ready", "手机传输目录无效");
+        Ok(())
+    })();
+    if let Err(err) = check_res {
+        if crate::adb::is_data_transport_failure(&err) {
+            crate::device::invalidate_verified_transport(&transport);
+        }
+        return Err(err);
+    }
     if let Ok(mut guard) = checked_base_cache().lock() {
         guard.insert(cache_key, (Instant::now(), expected_base));
     }
@@ -276,7 +285,10 @@ pub fn send_files(adb: &Adb, device: &Device, paths: &[PathBuf]) -> Result<usize
             transport = device.resolve_active_transport(adb)?;
         }
         let id = uuid();
-        let name = path.file_name().unwrap().to_str().unwrap();
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .context("文件名包含非 UTF-8 字符")?;
         let size = fs::metadata(path)?.len();
         let hash = digest(path)?;
         let dir = format!("{BASE}/transfers/inbox/{id}");
@@ -484,9 +496,68 @@ pub(crate) fn read_json(adb: &Adb, device: &Device, path: &str) -> Result<Value>
     ensure!(s.len() <= 32768, "传输记录过大");
     serde_json::from_str(&s).context("传输记录无效")
 }
+fn unique_destination(
+    directory: &Path,
+    name: &str,
+    expected_size: u64,
+    expected_hash: &str,
+) -> Result<Option<PathBuf>> {
+    let primary = directory.join(name);
+    match fs::symlink_metadata(&primary) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Some(primary)),
+        Ok(meta) => {
+            if meta.is_file()
+                && fs::metadata(&primary).is_ok_and(|m| m.len() == expected_size)
+                && digest(&primary).is_ok_and(|h| h == expected_hash)
+            {
+                return Ok(None);
+            }
+        }
+        Err(e) => return Err(e.into()),
+    }
+    let path_obj = Path::new(name);
+    let stem = path_obj
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(name);
+    let ext = path_obj.extension().and_then(|e| e.to_str()).unwrap_or("");
+    for idx in 1..=1000u32 {
+        let candidate_name = if ext.is_empty() {
+            format!("{stem} ({idx})")
+        } else {
+            format!("{stem} ({idx}).{ext}")
+        };
+        let candidate = directory.join(candidate_name);
+        match fs::symlink_metadata(&candidate) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Some(candidate)),
+            Ok(meta)
+                if meta.is_file()
+                    && fs::metadata(&candidate).is_ok_and(|m| m.len() == expected_size)
+                    && digest(&candidate).is_ok_and(|h| h == expected_hash) =>
+            {
+                return Ok(None);
+            }
+            Ok(_) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    bail!("接收目录同名文件过多，请清理后重试")
+}
+
 pub fn receive_pending(adb: &Adb, device: &Device) -> Result<usize> {
-    let _guard = RECEIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let transport = checked_base(adb, device)?;
+    receive_pending_cancelable(adb, device, &AtomicBool::new(false))
+}
+
+pub fn receive_pending_cancelable(
+    adb: &Adb,
+    device: &Device,
+    stop: &AtomicBool,
+) -> Result<usize> {
+    if stop.load(Ordering::Acquire) {
+        return Ok(0);
+    }
+    let mut transport = checked_base(adb, device)?;
     let desktop = desktop_id()?;
     let root_dir = crate::settings::downloads();
     let use_received_cache = adb
@@ -501,7 +572,7 @@ pub fn receive_pending(adb: &Adb, device: &Device) -> Result<usize> {
         &["ls", "-1", &format!("{BASE}/transfers/outbox")],
     )?;
     for id in listing.lines().filter(|s| valid_id(s)).take(300) {
-        if count >= 10 {
+        if count >= 10 || stop.load(Ordering::Acquire) {
             break;
         }
         let cache_key = (root_dir.clone(), device.serial.clone(), id.to_string());
@@ -512,6 +583,7 @@ pub fn receive_pending(adb: &Adb, device: &Device) -> Result<usize> {
         {
             continue;
         }
+        transport = device.resolve_active_transport(adb)?;
         let dir = format!("{BASE}/transfers/outbox/{id}");
         let qdir = shell_quote(&dir);
         if adb
@@ -571,7 +643,10 @@ pub fn receive_pending(adb: &Adb, device: &Device) -> Result<usize> {
                 continue;
             }
         }
-        let received = (|| -> Result<()> {
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        let received = (|| -> Result<bool> {
             let source = format!("{dir}/{name}");
             let q = shell_quote(&source);
             ensure!(
@@ -586,37 +661,65 @@ pub fn receive_pending(adb: &Adb, device: &Device) -> Result<usize> {
             );
             let directory = receive_directory()?.join(id);
             private_dir(&directory)?;
-            let destination = directory.join(name);
-            if destination.exists() {
-                ensure!(
-                    fs::symlink_metadata(&destination)?.is_file()
-                        && digest(&destination)? == hash
-                        && fs::metadata(&destination)?.len() == size,
-                    "接收目录存在同名不同内容的文件"
-                );
-                return Ok(());
+            let existing = directory.join(name);
+            if fs::symlink_metadata(&existing).is_ok_and(|m| m.is_file())
+                && fs::metadata(&existing).is_ok_and(|m| m.len() == size)
+                && digest(&existing).is_ok_and(|h| h == hash)
+            {
+                return Ok(true);
             }
-            let temp = tempfile::NamedTempFile::new_in(&directory)?;
+            if stop.load(Ordering::Acquire) {
+                return Ok(false);
+            }
+            // Pull into a unique temp file WITHOUT holding `RECEIVE_LOCK` across
+            // slow ADB network I/O; acquire `RECEIVE_LOCK` only briefly to pick
+            // `unique_destination` and atomically rename into place.
+            let temp = tempfile::Builder::new()
+                .prefix(".stepx-recv-")
+                .suffix(".part")
+                .tempfile_in(&directory)?;
             adb.transfer(&transport, "pull", Path::new(&source), temp.path())?;
             ensure!(
                 fs::metadata(temp.path())?.len() == size && digest(temp.path())? == hash,
                 "文件校验失败，请重新发送"
             );
-            temp.persist_noclobber(destination).map_err(|e| e.error)?;
-            Ok(())
-        })();
-        let mut receipt = json!({"protocol":1,"id":id,"size":size,"sha256":hash,"receivedAt":phone_now(adb,device)?,"status":if received.is_ok(){"received"}else{"error"}});
-        if let Err(e) = received {
-            errors.push(format!("{name}：{e}"));
-            receipt["error"] = Value::String(e.to_string());
-            receipt["retryAfterMs"] = json!(phone_now(adb,device)? + 60_000);
-        }
-        json_write(adb, device, &format!("{dir}/receipt.json"), &receipt)?;
-        if receipt["status"] == "received" {
-            if use_received_cache {
-                remember_received_outbox(cache_key);
+            let _guard = RECEIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(destination) = unique_destination(&directory, name, size, hash)? {
+                temp.persist_noclobber(destination).map_err(|e| e.error)?;
             }
-            count += 1;
+            Ok(true)
+        })();
+        match received {
+            Ok(false) => break,
+            Ok(true) => {
+                let receipt = json!({
+                    "protocol": 1,
+                    "id": id,
+                    "size": size,
+                    "sha256": hash,
+                    "receivedAt": phone_now(adb, device)?,
+                    "status": "received",
+                });
+                json_write(adb, device, &format!("{dir}/receipt.json"), &receipt)?;
+                if use_received_cache {
+                    remember_received_outbox(cache_key);
+                }
+                count += 1;
+            }
+            Err(e) => {
+                errors.push(format!("{name}：{e}"));
+                let receipt = json!({
+                    "protocol": 1,
+                    "id": id,
+                    "size": size,
+                    "sha256": hash,
+                    "receivedAt": phone_now(adb, device)?,
+                    "status": "error",
+                    "error": e.to_string(),
+                    "retryAfterMs": phone_now(adb, device)? + 60_000,
+                });
+                json_write(adb, device, &format!("{dir}/receipt.json"), &receipt)?;
+            }
         }
     }
     if !errors.is_empty() {
@@ -652,11 +755,14 @@ impl Link {
                 let mut previous_error: Option<String> = None;
                 let mut previous_work_error: Option<String> = None;
                 let mut previous_work=String::new();
-                while !stop.load(Ordering::Relaxed) {
+                while !stop.load(Ordering::Acquire) {
                     let result = if heartbeat_only {
                         heartbeat(&adb, &device).map(|_| 0)
                     } else {
-                        let result = receive_pending(&adb, &device);
+                        let result = receive_pending_cancelable(&adb, &device, &stop);
+                        if stop.load(Ordering::Acquire) {
+                            return;
+                        }
                         match crate::desktop_work::poll(&adb, &device) {
                             Err(e) => {
                                 let message = format!("手机任务同步暂未完成：{e}");
@@ -666,6 +772,9 @@ impl Link {
                                 }
                             }
                             Ok(()) => { previous_work_error = None; }
+                        }
+                        if stop.load(Ordering::Acquire) {
+                            return;
                         }
                         match crate::work_sync::process(&adb, &device) {
                             Ok(n) if n > 0 => {
@@ -684,11 +793,17 @@ impl Link {
                             }
                             _ => {}
                         }
+                        if stop.load(Ordering::Acquire) {
+                            return;
+                        }
                         let tasks=crate::desktop_work::snapshot(&device.serial);
                         let fingerprint=serde_json::to_string(&tasks).unwrap_or_default();
                         if fingerprint!=previous_work {previous_work=fingerprint;if !tasks.is_empty(){let _=tx.send(LinkEvent{message:String::new(),error:false,phone_work:tasks});}}
                         result
                     };
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
                     match result {
                         Ok(n) => {
                             let recovered = previous_error.take().is_some();
@@ -733,7 +848,7 @@ impl Link {
                         }
                     }
                     for _ in 0..if heartbeat_only { 25 } else { 12 } {
-                        if stop.load(Ordering::Relaxed) {
+                        if stop.load(Ordering::Acquire) {
                             return;
                         }
                         thread::sleep(Duration::from_secs(1));
@@ -754,7 +869,7 @@ impl Link {
 }
 impl Drop for Link {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.stop.store(true, Ordering::Release);
     }
 }
 
@@ -922,5 +1037,149 @@ esac
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(digest(&path).unwrap(), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn receive_pending_releases_receive_lock_during_pull_and_stops_promptly_on_cancel() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_adb = dir.path().join("fake-recv-adb");
+        let pull_started = dir.path().join("pull-started");
+        let pull_continue = dir.path().join("pull-continue");
+        let id1 = "11111111-1111-1111-1111-111111111111";
+        let id2 = "22222222-2222-2222-2222-222222222222";
+        let payload1 = b"first incoming file";
+        let payload2 = b"second incoming file";
+        let sample1 = dir.path().join("sample1.bin");
+        let sample2 = dir.path().join("sample2.bin");
+        fs::write(&sample1, payload1).unwrap();
+        fs::write(&sample2, payload2).unwrap();
+        let hash1 = digest(&sample1).unwrap();
+        let hash2 = digest(&sample2).unwrap();
+        let desktop = desktop_id().unwrap();
+
+        let outbox1 = dir.path().join(format!("phone/transfers/outbox/{id1}"));
+        let outbox2 = dir.path().join(format!("phone/transfers/outbox/{id2}"));
+        fs::create_dir_all(&outbox1).unwrap();
+        fs::create_dir_all(&outbox2).unwrap();
+        fs::write(outbox1.join("doc.txt"), payload1).unwrap();
+        fs::write(
+            outbox1.join("manifest.json"),
+            serde_json::to_vec(&json!({
+                "protocol": 1,
+                "id": id1,
+                "name": "doc.txt",
+                "size": payload1.len(),
+                "sha256": hash1,
+                "status": "queued",
+                "targetDesktopId": desktop,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(outbox2.join("doc2.txt"), payload2).unwrap();
+        fs::write(
+            outbox2.join("manifest.json"),
+            serde_json::to_vec(&json!({
+                "protocol": 1,
+                "id": id2,
+                "name": "doc2.txt",
+                "size": payload2.len(),
+                "sha256": hash2,
+                "status": "queued",
+                "targetDesktopId": desktop,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let script = format!(
+            r#"#!/bin/sh
+cd {work}
+if [ "$3" = "pull" ]; then
+  src=$(printf '%s' "$4" | sed 's|{base}|phone|g')
+  touch '{started}'
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    [ -f '{cont}' ] && break
+    sleep 0.02
+  done
+  cp "$src" "$5"
+  exit 0
+fi
+case "$*" in
+  *ro.serialno*) echo recv-lock-phone;;
+  *pm*path*) echo package:/data/app/companion.apk;;
+  *date*+%s*) echo 1700000000;;
+  *) script=$(printf '%s' "$4" | sed 's|{base}|phone|g'); sh -c "$script";;
+esac
+"#,
+            work = shell_quote(dir.path().to_str().unwrap()),
+            base = BASE,
+            started = pull_started.display(),
+            cont = pull_continue.display(),
+        );
+        fs::write(&fake_adb, script).unwrap();
+        fs::set_permissions(&fake_adb, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let adb = Adb { path: fake_adb };
+        let device = Device {
+            serial: "recv-lock-phone".into(),
+            transport: "recv-lock-phone".into(),
+            model: "PZ261A".into(),
+            android: "16".into(),
+            product: "pandora".into(),
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_bg = stop.clone();
+        let adb_bg = adb.clone();
+        let dev_bg = device.clone();
+
+        // Pre-populate a colliding file with DIFFERENT bytes at `downloads/<id1>/doc.txt`
+        // to also verify `unique_destination` picks `doc (1).txt` under `RECEIVE_LOCK`.
+        let dest_dir1 = receive_directory().unwrap().join(id1);
+        let _ = fs::remove_dir_all(&dest_dir1);
+        private_dir(&dest_dir1).unwrap();
+        fs::write(dest_dir1.join("doc.txt"), b"different existing content").unwrap();
+        let dest_dir2 = receive_directory().unwrap().join(id2);
+        let _ = fs::remove_dir_all(&dest_dir2);
+
+        let handle = thread::spawn(move || receive_pending_cancelable(&adb_bg, &dev_bg, &stop_bg));
+        for _ in 0..100 {
+            if pull_started.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(pull_started.exists(), "first pull should have started");
+
+        // While `adb pull` is actively blocked in network I/O, `RECEIVE_LOCK` MUST be unlocked!
+        let lock_free_during_io = RECEIVE_LOCK.try_lock().is_ok();
+        assert!(
+            lock_free_during_io,
+            "RECEIVE_LOCK must NOT be held across slow pull I/O"
+        );
+
+        // Request cancellation before the second file starts pulling
+        stop.store(true, Ordering::Release);
+        fs::write(&pull_continue, b"go").unwrap();
+
+        let count = handle.join().unwrap().unwrap();
+        assert_eq!(
+            count, 1,
+            "stop flag must cancel before pulling the second file"
+        );
+        assert_eq!(
+            fs::read(dest_dir1.join("doc (1).txt")).unwrap(),
+            payload1,
+            "unique_destination should save colliding file as `doc (1).txt`"
+        );
+        assert!(
+            !dest_dir2.join("doc2.txt").exists(),
+            "second file must not be pulled after stop=true"
+        );
+        let _ = fs::remove_dir_all(&dest_dir1);
+        let _ = fs::remove_dir_all(&dest_dir2);
     }
 }

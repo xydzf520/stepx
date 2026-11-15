@@ -1125,7 +1125,7 @@ impl Line {
                 }
             }
 
-            Some(0)
+            Some(self.first_index())
         }
     }
 
@@ -1189,7 +1189,7 @@ impl Line {
                 }
             }
 
-            Some(0)
+            Some(self.first_index())
         }
     }
 

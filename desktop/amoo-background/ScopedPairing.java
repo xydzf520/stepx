@@ -20,8 +20,12 @@ public final class ScopedPairing {
         if(instance==null)return;ScopedPairing current=instance;instance=null;
         synchronized(current){try{current.cancelOwned();}catch(Exception ignored){}current.main.removeCallbacksAndMessages(null);}
     }
+    static boolean isAllowedCaller(int uid,String pkg,int sdkInt){
+        return sdkInt==36&&((uid==2000&&"com.android.shell".equals(pkg))
+            ||(uid==1000&&("android".equals(pkg)||"com.stepos.agentbus".equals(pkg))));
+    }
     public static JSONObject handle(Context app,JSONObject request)throws Exception{
-        if(!((android.os.Process.myUid()==2000&&"com.android.shell".equals(app.getPackageName()))||(android.os.Process.myUid()==1000&&"android".equals(app.getPackageName())))||Build.VERSION.SDK_INT!=36)throw new SecurityException("不支持当前手机的安全扫码适配");
+        if(!isAllowedCaller(android.os.Process.myUid(),app.getPackageName(),Build.VERSION.SDK_INT))throw new SecurityException("不支持当前手机的安全扫码适配");
         String op=request.getString("op");
         if(!op.equals("pairing_status")&&!op.equals("pairing_enable")&&!op.equals("pairing_disable")&&!op.equals("pairing_begin")&&!op.equals("pairing_cancel"))throw new IllegalArgumentException("不支持的安全配对操作");
         ScopedPairing target;

@@ -11,11 +11,18 @@ mod clipboard_tests {
         LinuxClipboard::new().ok()
     }
 
+    /// Serialize tests that mutate the live X11/Wayland system clipboard so parallel test threads
+    /// do not overwrite each other's selection mid-test.
+    static CLIPBOARD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Helper function to avoid repetitive clipboard creation and early return logic.
     fn with_test_clipboard<F>(test_fn: F)
     where
         F: FnOnce(&mut LinuxClipboard),
     {
+        let _guard = CLIPBOARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut clipboard = match create_test_clipboard() {
             Some(clipboard) => clipboard,
             None => {

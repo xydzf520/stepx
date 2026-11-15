@@ -5,8 +5,11 @@ use std::{
     collections::HashMap,
     error,
     hash::{DefaultHasher, Hash, Hasher},
-    rc::Rc,
-    sync::{Arc, LazyLock},
+    rc::{Rc, Weak},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, LazyLock,
+    },
 };
 use strum_macros::EnumIter;
 
@@ -127,11 +130,13 @@ impl CustomImageHeader {
         height: u32,
         image_format: CustomImageFormat,
     ) -> Result<Vec<u8>, CustomHeaderCreationError> {
-        let bytes_per_pixel = match image_format {
+        let bytes_per_pixel: usize = match image_format {
             CustomImageFormat::Rgb => 3,
             CustomImageFormat::Rgba => 4,
         };
-        let expected_byte_count = (bytes_per_pixel * width * height) as usize;
+        let expected_byte_count = bytes_per_pixel
+            .saturating_mul(width as usize)
+            .saturating_mul(height as usize);
 
         if expected_byte_count != data.len() {
             return Err(CustomHeaderCreationError::ExpectedDataSizeMismatch {
@@ -244,11 +249,13 @@ impl CustomImageHeader {
             }
         };
 
-        let bytes_per_pixel = match image_type {
+        let bytes_per_pixel: usize = match image_type {
             CustomImageFormat::Rgb => 3,
             CustomImageFormat::Rgba => 4,
         };
-        let expected_byte_count = (bytes_per_pixel * width * height) as usize;
+        let expected_byte_count = bytes_per_pixel
+            .saturating_mul(width as usize)
+            .saturating_mul(height as usize);
 
         if expected_byte_count != data.len() {
             return Err(CustomHeaderParsingError::ExpectedDataSizeMismatch {
@@ -367,14 +374,20 @@ impl Asset for ImageType {
 
     fn size_in_bytes(&self) -> usize {
         match self {
-            ImageType::Svg { .. } => 0, // TODO: How do we calculate svg size in bytes?
+            ImageType::Svg { svg } => {
+                let size = svg.size();
+                let w = size.width().ceil().max(1.0) as usize;
+                let h = size.height().ceil().max(1.0) as usize;
+                w.saturating_mul(h)
+                    .saturating_mul(4)
+                    .clamp(4096, 16 * 1024 * 1024)
+            }
             ImageType::StaticBitmap { image } => image.rgba_bytes().len(),
             ImageType::AnimatedBitmap { image } => image
                 .frames
                 .iter()
                 .map(|frame| frame.image.rgba_bytes().len())
-                .reduce(|acc, bytes| acc + bytes)
-                .unwrap_or(0),
+                .fold(0usize, usize::saturating_add),
             ImageType::Unrecognized => 0,
         }
     }
@@ -385,6 +398,19 @@ impl Asset for ImageType {
 pub enum Image {
     Static(Arc<StaticImage>),
     Animated(Arc<AnimatedImage>),
+}
+
+impl Image {
+    pub fn size_in_bytes(&self) -> usize {
+        match self {
+            Image::Static(image) => image.rgba_bytes().len(),
+            Image::Animated(image) => image
+                .frames
+                .iter()
+                .map(|frame| frame.image.rgba_bytes().len())
+                .fold(0usize, usize::saturating_add),
+        }
+    }
 }
 
 /// A representation of an image in the asset cache.
@@ -550,6 +576,17 @@ fn resize_animated_image(
 
 fn svg_image(svg: &Rc<usvg::Tree>, bounds: Vector2I, fit_type: FitType) -> Result<Image> {
     let svg_size = &svg.size();
+    if bounds.x() <= 0
+        || bounds.y() <= 0
+        || svg_size.width() <= 0.0
+        || svg_size.height() <= 0.0
+    {
+        return Err(anyhow!(
+            "Invalid SVG or target bounds {:?} (svg size {:?})",
+            bounds,
+            svg_size
+        ));
+    }
 
     let svg_has_wider_ratio =
         svg_size.width() / svg_size.height() > bounds.x() as f32 / bounds.y() as f32;
@@ -574,9 +611,12 @@ fn svg_image(svg: &Rc<usvg::Tree>, bounds: Vector2I, fit_type: FitType) -> Resul
 }
 
 fn resize_image(img: &image::RgbaImage, bounds: Vector2I, fit_type: FitType) -> image::RgbaImage {
+    let target_width = bounds.x().max(1) as u32;
+    let target_height = bounds.y().max(1) as u32;
+
     // If the image dimensions match the target bounding box, return a simple
     // copy of it.
-    if bounds.x() as u32 == img.width() && bounds.y() as u32 == img.height() {
+    if target_width == img.width() && target_height == img.height() {
         return img.clone();
     }
 
@@ -584,8 +624,8 @@ fn resize_image(img: &image::RgbaImage, bounds: Vector2I, fit_type: FitType) -> 
     match fit_type {
         // This logic is adapted from image::DynamicImage::resize_to_fill().
         FitType::Cover => {
-            let nwidth = bounds.x() as u32;
-            let nheight = bounds.y() as u32;
+            let nwidth = target_width;
+            let nheight = target_height;
 
             // Resize the image, maintaining aspect ratio, such that the
             // smaller dimension equals its bounds.
@@ -599,9 +639,9 @@ fn resize_image(img: &image::RgbaImage, bounds: Vector2I, fit_type: FitType) -> 
             let aspect_ratio = u64::from(iwidth) * u64::from(nheight);
             let new_aspect_ratio = u64::from(nwidth) * u64::from(iheight);
             let img = if new_aspect_ratio > aspect_ratio {
-                intermediate.crop(0, (iheight - nheight) / 2, nwidth, nheight)
+                intermediate.crop(0, iheight.saturating_sub(nheight) / 2, nwidth, nheight)
             } else {
-                intermediate.crop((iwidth - nwidth) / 2, 0, nwidth, nheight)
+                intermediate.crop(iwidth.saturating_sub(nwidth) / 2, 0, nwidth, nheight)
             };
 
             img.into_rgba8()
@@ -610,8 +650,8 @@ fn resize_image(img: &image::RgbaImage, bounds: Vector2I, fit_type: FitType) -> 
             let (new_width, new_height) = resize_dimensions(
                 img.width(),
                 img.height(),
-                bounds.x() as u32,
-                bounds.y() as u32,
+                target_width,
+                target_height,
                 fit_type,
             );
             image::imageops::resize(img, new_width, new_height, filter)
@@ -637,6 +677,13 @@ pub fn resize_dimensions(
 ) -> (u32, u32) {
     use std::cmp::max;
 
+    if width == 0 || height == 0 {
+        return (nwidth.max(1), nheight.max(1));
+    }
+    if nwidth == 0 || nheight == 0 {
+        return (1, 1);
+    }
+
     let wratio = nwidth as f64 / width as f64;
     let hratio = nheight as f64 / height as f64;
 
@@ -648,7 +695,7 @@ pub fn resize_dimensions(
             f64::min(wratio, hratio)
         }
         // Stretch doesn't maintain the aspect ratio
-        FitType::Stretch => return (nwidth, nheight),
+        FitType::Stretch => return (nwidth.max(1), nheight.max(1)),
     };
 
     let nw = max((width as f64 * ratio).round() as u64, 1);
@@ -794,11 +841,99 @@ struct RenderedImageCacheKey {
     animated_image_behavior: AnimatedImageBehavior,
 }
 
-#[derive(Default)]
+const DEFAULT_MAX_IMAGE_CACHE_BYTES: usize = 160 * 1024 * 1024; // 160 MiB
+
+struct CachedRenderedImage {
+    image: Rc<Image>,
+    size_in_bytes: usize,
+    last_access: AtomicU64,
+}
+
+struct AssetImageEntries {
+    source: Weak<ImageType>,
+    entries: HashMap<RenderedImageCacheKey, CachedRenderedImage>,
+}
+
+struct ImageCacheState {
+    images: HashMap<u64, AssetImageEntries>,
+    total_bytes: usize,
+    max_bytes: usize,
+}
+
+impl Default for ImageCacheState {
+    fn default() -> Self {
+        Self {
+            images: HashMap::new(),
+            total_bytes: 0,
+            max_bytes: DEFAULT_MAX_IMAGE_CACHE_BYTES,
+        }
+    }
+}
+
+impl ImageCacheState {
+    fn remove_cache_key(&mut self, cache_key: u64) {
+        if let Some(asset_entries) = self.images.remove(&cache_key) {
+            let removed_bytes: usize = asset_entries
+                .entries
+                .values()
+                .map(|entry| entry.size_in_bytes)
+                .fold(0usize, usize::saturating_add);
+            self.total_bytes = self.total_bytes.saturating_sub(removed_bytes);
+        }
+    }
+
+    fn remove_rendered_key(&mut self, cache_key: u64, rendered_key: &RenderedImageCacheKey) {
+        if let Some(asset_entries) = self.images.get_mut(&cache_key) {
+            if let Some(removed) = asset_entries.entries.remove(rendered_key) {
+                self.total_bytes = self.total_bytes.saturating_sub(removed.size_in_bytes);
+            }
+            if asset_entries.entries.is_empty() {
+                self.images.remove(&cache_key);
+            }
+        }
+    }
+
+    fn evict_lru_to_fit(&mut self, incoming_bytes: usize) {
+        while self.total_bytes.saturating_add(incoming_bytes) > self.max_bytes {
+            let oldest = self
+                .images
+                .iter()
+                .flat_map(|(&cache_key, asset_entries)| {
+                    asset_entries
+                        .entries
+                        .iter()
+                        .map(move |(&rendered_key, entry)| {
+                            (
+                                cache_key,
+                                rendered_key,
+                                entry.last_access.load(Ordering::Relaxed),
+                            )
+                        })
+                })
+                .min_by_key(|&(_, _, last_access)| last_access);
+
+            let Some((oldest_cache_key, oldest_rendered_key, _)) = oldest else {
+                break;
+            };
+            self.remove_rendered_key(oldest_cache_key, &oldest_rendered_key);
+        }
+    }
+}
+
 pub struct ImageCache {
-    /// Map of images of any ImageType already scaled to a certain size.
-    /// Uses the hashed AssetSource and rendered-image properties as a key.
-    images: RwLock<HashMap<u64, HashMap<RenderedImageCacheKey, Rc<Image>>>>,
+    /// Map of images of any ImageType already scaled to a certain size,
+    /// bounded by an LRU byte cap.
+    state: RwLock<ImageCacheState>,
+    access_counter: AtomicU64,
+}
+
+impl Default for ImageCache {
+    fn default() -> Self {
+        Self {
+            state: RwLock::new(ImageCacheState::default()),
+            access_counter: AtomicU64::new(1),
+        }
+    }
 }
 
 impl ImageCache {
@@ -806,14 +941,33 @@ impl ImageCache {
         Self::default()
     }
 
-    pub fn evict_image(&self, asset_source: &AssetSource) {
-        let mut cache = self.images.write();
+    #[cfg(test)]
+    pub(crate) fn with_max_bytes(max_bytes: usize) -> Self {
+        Self {
+            state: RwLock::new(ImageCacheState {
+                images: HashMap::new(),
+                total_bytes: 0,
+                max_bytes,
+            }),
+            access_counter: AtomicU64::new(1),
+        }
+    }
 
+    #[cfg(test)]
+    pub(crate) fn total_cached_bytes(&self) -> usize {
+        self.state.read().total_bytes
+    }
+
+    fn next_access(&self) -> u64 {
+        self.access_counter.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub fn evict_image(&self, asset_source: &AssetSource) {
         let mut s = DefaultHasher::new();
         asset_source.hash(&mut s);
         let cache_key = s.finish();
 
-        cache.remove(&cache_key);
+        self.state.write().remove_cache_key(cache_key);
     }
 
     /// Removes a single cached size entry for an asset.
@@ -826,10 +980,7 @@ impl ImageCache {
     /// `bounds` must match the resolved bounds used as the cache key inside
     /// `image()` (i.e., after any `max_dimension` adjustment), not the
     /// originally requested bounds.
-    // Called by the debounce eviction pass added in the main changeset.
-    /// TODO(APP-3877): remove `#[allow(dead_code)]` once the debounce eviction pass wires this up.
-    #[allow(dead_code)]
-    fn evict_size(
+    pub fn evict_size(
         &self,
         asset_source: &AssetSource,
         bounds: Vector2I,
@@ -844,13 +995,9 @@ impl ImageCache {
             animated_image_behavior,
         };
 
-        let mut cache = self.images.write();
-        if let Some(inner_map) = cache.get_mut(&cache_key) {
-            inner_map.remove(&rendered_key);
-            if inner_map.is_empty() {
-                cache.remove(&cache_key);
-            }
-        }
+        self.state
+            .write()
+            .remove_rendered_key(cache_key, &rendered_key);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -873,6 +1020,13 @@ impl ImageCache {
             AssetState::Evicted => AssetState::Evicted,
             AssetState::FailedToLoad(err) => AssetState::FailedToLoad(err),
             AssetState::Loaded { data } => {
+                if bounds.x() <= 0 || bounds.y() <= 0 {
+                    return AssetState::FailedToLoad(Rc::new(anyhow!(
+                        "Requested non-positive image bounds {:?}",
+                        bounds
+                    )));
+                }
+
                 let (mut needs_resize, mut bounds) = match cache_option {
                     CacheOption::BySize => {
                         // Only store a resized copy of the source asset if a
@@ -894,6 +1048,13 @@ impl ImageCache {
                         (false, bounds)
                     }
                 };
+
+                if bounds.x() <= 0 || bounds.y() <= 0 {
+                    return AssetState::FailedToLoad(Rc::new(anyhow!(
+                        "Resolved non-positive image bounds {:?}",
+                        bounds
+                    )));
+                }
 
                 // If we need to ensure the image isn't larger than a given
                 // size along either dimension, check if a resize is needed
@@ -919,15 +1080,21 @@ impl ImageCache {
                     bounds,
                     animated_image_behavior,
                 };
+                let source_weak = Rc::downgrade(&data);
 
-                // If it's already in the image cache at the target size,
-                // return it.
-                let cache = self.images.upgradable_read();
-                if let Some(inner_map) = cache.get(&cache_key) {
-                    if let Some(image) = inner_map.get(&rendered_image_cache_key) {
-                        return AssetState::Loaded {
-                            data: image.clone(),
-                        };
+                // If it's already in the image cache at the target size and from
+                // the same underlying asset allocation, return it.
+                let cache = self.state.upgradable_read();
+                if let Some(asset_entries) = cache.images.get(&cache_key) {
+                    if Weak::ptr_eq(&asset_entries.source, &source_weak) {
+                        if let Some(entry) = asset_entries.entries.get(&rendered_image_cache_key) {
+                            entry
+                                .last_access
+                                .store(self.next_access(), Ordering::Relaxed);
+                            return AssetState::Loaded {
+                                data: entry.image.clone(),
+                            };
+                        }
                     }
                 }
 
@@ -939,11 +1106,40 @@ impl ImageCache {
                         Err(err) => return AssetState::FailedToLoad(Rc::new(err)),
                     };
                 if needs_resize {
-                    let mut images_cache = RwLockUpgradableReadGuard::upgrade(cache);
-                    images_cache
-                        .entry(cache_key)
-                        .or_default()
-                        .insert(rendered_image_cache_key, image.clone());
+                    let entry_bytes = image.size_in_bytes();
+                    let mut state = RwLockUpgradableReadGuard::upgrade(cache);
+                    // Purge any stale resized entries if the underlying asset was reloaded.
+                    if state
+                        .images
+                        .get(&cache_key)
+                        .is_some_and(|existing| !Weak::ptr_eq(&existing.source, &source_weak))
+                    {
+                        state.remove_cache_key(cache_key);
+                    }
+                    // Replace an existing entry for this exact rendered key if present.
+                    state.remove_rendered_key(cache_key, &rendered_image_cache_key);
+
+                    if entry_bytes <= state.max_bytes {
+                        state.evict_lru_to_fit(entry_bytes);
+                        let access = self.next_access();
+                        state
+                            .images
+                            .entry(cache_key)
+                            .or_insert_with(|| AssetImageEntries {
+                                source: source_weak,
+                                entries: HashMap::new(),
+                            })
+                            .entries
+                            .insert(
+                                rendered_image_cache_key,
+                                CachedRenderedImage {
+                                    image: image.clone(),
+                                    size_in_bytes: entry_bytes,
+                                    last_access: AtomicU64::new(access),
+                                },
+                            );
+                        state.total_bytes = state.total_bytes.saturating_add(entry_bytes);
+                    }
                 }
 
                 AssetState::Loaded { data: image }

@@ -93,39 +93,123 @@ fn append(path: &Path, mut batch: Vec<Entry>) -> Result<()> {
     crate::data_store::apply_delta(path, head.revision, None, &changes, &deletes)?;
     Ok(())
 }
+enum Message {
+    Entry(Entry),
+    Flush(mpsc::SyncSender<()>),
+}
+
+const FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+static ACTIVE_WRITERS: std::sync::OnceLock<Mutex<Vec<std::sync::Weak<mpsc::SyncSender<Message>>>>> =
+    std::sync::OnceLock::new();
+
+fn active_writers() -> &'static Mutex<Vec<std::sync::Weak<mpsc::SyncSender<Message>>>> {
+    ACTIVE_WRITERS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn flush_sender(tx: &mpsc::SyncSender<Message>, deadline: std::time::Instant) -> bool {
+    let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+    let mut pending_ack = Some(ack_tx);
+    while let Some(sender) = pending_ack.take() {
+        match tx.try_send(Message::Flush(sender)) {
+            Ok(()) => break,
+            Err(mpsc::TrySendError::Full(Message::Flush(returned))) => {
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                pending_ack = Some(returned);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(mpsc::TrySendError::Full(Message::Entry(_))) => unreachable!(),
+            Err(mpsc::TrySendError::Disconnected(_)) => return false,
+        }
+    }
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    ack_rx.recv_timeout(remaining).is_ok()
+}
+
+/// Flushes all active background diagnostic writers within a bounded 250ms budget
+/// so graceful shutdown writes queued events before process exit.
+pub fn flush() {
+    let writers: Vec<Arc<mpsc::SyncSender<Message>>> = {
+        let mut guard = active_writers().lock().unwrap_or_else(|e| e.into_inner());
+        guard.retain(|w| w.strong_count() > 0);
+        guard.iter().filter_map(|w| w.upgrade()).collect()
+    };
+    if writers.is_empty() {
+        return;
+    }
+    let deadline = std::time::Instant::now() + FLUSH_TIMEOUT;
+    for writer in writers {
+        let _ = flush_sender(&writer, deadline);
+    }
+}
+
 pub struct Writer {
-    tx: mpsc::SyncSender<Entry>,
+    tx: Arc<mpsc::SyncSender<Message>>,
     pub error: Arc<Mutex<Option<String>>>,
 }
 impl Writer {
     pub fn start(path: PathBuf) -> Self {
         let (tx, rx) = mpsc::sync_channel(256);
+        let tx = Arc::new(tx);
+        {
+            let mut guard = active_writers().lock().unwrap_or_else(|e| e.into_inner());
+            guard.retain(|w| w.strong_count() > 0);
+            guard.push(Arc::downgrade(&tx));
+        }
         let error = Arc::new(Mutex::new(None));
         let status = error.clone();
-        std::thread::spawn(move || {
-            // Prune at startup and hourly even when no new operation is recorded.
-            *status.lock().unwrap_or_else(|e| e.into_inner()) = append(&path, vec![])
-                .err()
-                .map(|e| format!("日志未保存：{e:#}"));
-            loop {
-                let mut batch = match rx.recv_timeout(std::time::Duration::from_secs(3600)) {
-                    Ok(first) => vec![first],
-                    Err(mpsc::RecvTimeoutError::Timeout) => vec![],
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                };
-                batch.extend(rx.try_iter().take(63));
-                let result = append(&path, batch);
-                *status.lock().unwrap_or_else(|e| e.into_inner()) =
-                    result.err().map(|e| format!("日志未保存：{e:#}"));
-            }
-        });
+        std::thread::Builder::new()
+            .name("diagnostics-writer".into())
+            .spawn(move || {
+                // Prune at startup and hourly even when no new operation is recorded.
+                *status.lock().unwrap_or_else(|e| e.into_inner()) = append(&path, vec![])
+                    .err()
+                    .map(|e| format!("日志未保存：{e:#}"));
+                loop {
+                    let mut batch = Vec::new();
+                    let mut flushes = Vec::new();
+                    let timed_out = match rx.recv_timeout(std::time::Duration::from_secs(3600)) {
+                        Ok(Message::Entry(entry)) => {
+                            batch.push(entry);
+                            false
+                        }
+                        Ok(Message::Flush(ack)) => {
+                            flushes.push(ack);
+                            false
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => true,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    };
+                    while let Ok(msg) = rx.try_recv() {
+                        match msg {
+                            Message::Entry(entry) => batch.push(entry),
+                            Message::Flush(ack) => flushes.push(ack),
+                        }
+                    }
+                    if !batch.is_empty() || timed_out {
+                        let result = append(&path, batch);
+                        *status.lock().unwrap_or_else(|e| e.into_inner()) =
+                            result.err().map(|e| format!("日志未保存：{e:#}"));
+                    }
+                    for ack in flushes {
+                        let _ = ack.try_send(());
+                    }
+                }
+            })
+            .expect("spawn diagnostics writer");
         Self { tx, error }
     }
     pub fn send(&self, entry: Entry) {
-        if self.tx.try_send(entry).is_err() {
+        if self.tx.try_send(Message::Entry(entry)).is_err() {
             *self.error.lock().unwrap_or_else(|e| e.into_inner()) =
                 Some("日志写入繁忙，部分记录仅保留在本次运行中".into());
         }
+    }
+    pub fn flush(&self) {
+        let deadline = std::time::Instant::now() + FLUSH_TIMEOUT;
+        let _ = flush_sender(&self.tx, deadline);
     }
 }
 pub fn sanitize(text: &str) -> String {
@@ -224,5 +308,28 @@ mod tests {
         let text=sanitize("失败\nAuthorization: Bearer SECRET\nhttps://user:pass@example.org/path?token=secret#private\nabcdefghijklmnopqrstuvwxyz0123456789");
         assert!(!text.contains("SECRET") && !text.contains("pass") && !text.contains("token="));
         assert!(text.contains("失败") && text.contains("https://example.org/path"));
+    }
+    #[test]
+    fn flush_persists_queued_writer_events_before_shutdown() {
+        // Calling flush() with no active writer is an immediate safe no-op.
+        flush();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("operations.json");
+        let writer = Writer::start(path.clone());
+        for idx in 0..80 {
+            writer.send(Entry::new(&format!("退出日志 {idx}"), "落盘保障"));
+        }
+        flush();
+        let saved = load(&path).unwrap();
+        assert_eq!(saved.len(), 80);
+        assert!(writer.error.lock().unwrap().is_none());
+
+        writer.send(Entry::new("最终退出记录", "单独刷新"));
+        writer.flush();
+        assert_eq!(load(&path).unwrap().len(), 81);
+        drop(writer);
+        // After dropping the writer, weak registry prunes cleanly on subsequent flush().
+        flush();
     }
 }

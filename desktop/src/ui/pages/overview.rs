@@ -2,7 +2,6 @@ use super::super::{
     icons::UiIcon, is_wireless, theme::*, widgets::*, Action, Companion, Page, F_OV_TEXT,
 };
 use facloud_ui::{color::ColorU, elements::*, fonts::Weight, platform::Cursor};
-use stepx_companion::device::DeviceMetrics;
 
 impl Companion {
     fn overview_metric_card(
@@ -155,7 +154,8 @@ impl Companion {
             );
         };
         let p = self.p();
-        let metrics = DeviceMetrics::from_summary(&self.summary);
+        let metrics = self.cached_device_metrics();
+        let companion_issue = self.companion_permission_issue();
 
         let battery_lvl = metrics.battery_level;
         let battery_val = battery_lvl
@@ -265,20 +265,28 @@ impl Companion {
                     self.hstack(
                         6.,
                         vec![
-                            self.line("Amoo 网关", CAPTION, p.text2),
-                            self.mono(
-                                if self.amoo_gateway_online {
-                                    "已连接"
-                                } else {
-                                    "未连接"
-                                },
-                                CAPTION,
-                                if self.amoo_gateway_online {
-                                    p.success
-                                } else {
-                                    p.text2
-                                },
-                            ),
+                            if let Some((warn_label, _, _)) = &companion_issue {
+                                self.pill_badge(*warn_label, p.warning, p.warning_soft)
+                            } else {
+                                self.line("Amoo 网关", CAPTION, p.text2)
+                            },
+                            if companion_issue.is_some() {
+                                Empty::new().finish()
+                            } else {
+                                self.mono(
+                                    if self.amoo_gateway_online {
+                                        "已连接"
+                                    } else {
+                                        "未连接"
+                                    },
+                                    CAPTION,
+                                    if self.amoo_gateway_online {
+                                        p.success
+                                    } else {
+                                        p.text2
+                                    },
+                                )
+                            },
                         ],
                     ),
                     quick_channel_action,
@@ -880,13 +888,39 @@ impl Companion {
 
         // The overview is a document-like dashboard. Its sections keep their
         // natural height; a short window scrolls rather than squeezing cards.
+        let mut sections = vec![top_metrics];
+        if let Some((warn_label, warn_desc, repair_action)) = companion_issue {
+            sections.push(
+                Container::new(self.between(
+                    self.hstack(
+                        S2,
+                        vec![
+                            self.pill_badge(warn_label, p.warning, p.warning_soft),
+                            self.text(warn_desc, CAPTION, p.text),
+                        ],
+                    ),
+                    self.button_icon(
+                        "ov-repair-companion",
+                        "一键修复",
+                        UiIcon::Tools,
+                        repair_action,
+                        Btn::Primary,
+                    ),
+                ))
+                .with_uniform_padding(S3)
+                .with_background_color(p.warning_soft)
+                .with_border(Border::all(1.).with_border_color(p.warning))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_PANEL)))
+                .finish(),
+            );
+        }
+        sections.push(self.overview_usage_card());
+        sections.push(lower);
         let content = Flex::column()
             .with_main_axis_size(MainAxisSize::Min)
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
             .with_spacing(S4)
-            .with_child(top_metrics)
-            .with_child(self.overview_usage_card())
-            .with_child(lower)
+            .with_children(sections)
             .finish();
         self.scrollable(self.scroll.clone(), content)
     }

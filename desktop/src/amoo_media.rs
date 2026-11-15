@@ -5,6 +5,70 @@ use serde_json::{json, Value};
 use std::{fs, io::Read, path::PathBuf};
 /// Maximum total attachment bytes in one native request (base64 fits its 16 MiB frame).
 pub const MAX_ATTACHMENT_BYTES: u64 = 8 * 1024 * 1024;
+/// Maximum staged/downloaded artifact size (32 MiB, aligned with amoo_download.py).
+pub const STAGE_LIMIT_BYTES: u64 = 32 * 1024 * 1024;
+const STALE_COMPANION_UPLOAD_MAX_AGE: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
+
+fn prune_stale_companion_uploads_in(
+    dir: &std::path::Path,
+    now: std::time::SystemTime,
+    max_age: std::time::Duration,
+) {
+    let Ok(meta) = fs::symlink_metadata(dir) else {
+        return;
+    };
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.take(256).flatten() {
+        let path = entry.path();
+        let Ok(entry_meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if entry_meta.file_type().is_symlink() {
+            continue;
+        }
+        let is_stale = entry_meta
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > max_age);
+        if entry_meta.is_file() && is_stale {
+            let _ = fs::remove_file(&path);
+        } else if entry_meta.is_dir() {
+            prune_stale_companion_uploads_in(&path, now, max_age);
+            if is_stale {
+                let _ = fs::remove_dir(&path);
+            }
+        }
+    }
+}
+
+fn best_effort_prune_companion_uploads() {
+    let now = std::time::SystemTime::now();
+    prune_stale_companion_uploads_in(
+        &std::env::temp_dir().join("stepx-companion-upload"),
+        now,
+        STALE_COMPANION_UPLOAD_MAX_AGE,
+    );
+    prune_stale_companion_uploads_in(
+        &crate::resources::user_state().join("stepx-companion-upload"),
+        now,
+        STALE_COMPANION_UPLOAD_MAX_AGE,
+    );
+}
+
+fn copy_into(reader: &mut impl Read, writer: &mut impl std::io::Write) -> Result<u64> {
+    let copied = std::io::copy(&mut reader.take(STAGE_LIMIT_BYTES + 1), writer)?;
+    if copied > STAGE_LIMIT_BYTES {
+        bail!("too_large");
+    }
+    Ok(copied)
+}
 pub fn mime_type(path: &std::path::Path) -> &'static str {
     match path
         .extension()
@@ -28,6 +92,7 @@ pub fn mime_type(path: &std::path::Path) -> &'static str {
     }
 }
 pub fn prepare_attachments(paths: &[PathBuf]) -> Result<Vec<Value>> {
+    best_effort_prune_companion_uploads();
     if paths.len() > 8 {
         bail!("每次最多上传 8 个附件")
     }
@@ -134,7 +199,7 @@ fn download_http_loopback(url: &str, dest: &std::path::Path) -> Result<()> {
     use std::io::Write;
     use std::net::{SocketAddr, TcpStream};
     use std::time::Duration;
-    const MAX_BYTES: usize = 8 * 1024 * 1024;
+    const MAX_BYTES: usize = STAGE_LIMIT_BYTES as usize;
     let parsed = url::Url::parse(url).map_err(|_| anyhow::anyhow!("invalid_url"))?;
     if parsed.scheme() != "http" || parsed.host_str() != Some("127.0.0.1") {
         bail!("invalid_url");
@@ -256,29 +321,37 @@ fn download_http_loopback(url: &str, dest: &std::path::Path) -> Result<()> {
         }
         out
     } else {
-        let mut out: Vec<u8> = buf.drain(header_end..).collect();
-        if out.len() > MAX_BYTES {
+        let mut out = fs::File::create(dest)?;
+        let prefix = &buf[header_end..];
+        if prefix.len() > MAX_BYTES {
             bail!("too_large");
         }
-        while content_length.is_none_or(|cl| out.len() < cl) {
-            let n = stream
-                .read(&mut tmp)
-                .map_err(|_| anyhow::anyhow!("network"))?;
-            if n == 0 {
-                break;
-            }
-            if out.len() + n > MAX_BYTES {
+        out.write_all(prefix)?;
+        let mut total = prefix.len() as u64;
+        if content_length.is_none_or(|cl| (total as usize) < cl) {
+            let remaining_limit = STAGE_LIMIT_BYTES.saturating_sub(total);
+            let mut chained = (&mut stream).take(remaining_limit + 1);
+            let copied = copy_into(&mut chained, &mut out)
+                .map_err(|e| if e.to_string() == "too_large" { e } else { anyhow::anyhow!("network") })?;
+            total = total.saturating_add(copied);
+            if total > STAGE_LIMIT_BYTES {
                 bail!("too_large");
             }
-            out.extend_from_slice(&tmp[..n]);
         }
         if let Some(cl) = content_length {
-            if out.len() < cl {
+            if (total as usize) < cl {
                 bail!("http");
             }
-            out.truncate(cl);
+            if total > cl as u64 {
+                out.set_len(cl as u64)?;
+                total = cl as u64;
+            }
         }
-        out
+        if total == 0 {
+            bail!("empty");
+        }
+        out.flush()?;
+        return Ok(());
     };
     if body.is_empty() {
         bail!("empty");
@@ -287,6 +360,25 @@ fn download_http_loopback(url: &str, dest: &std::path::Path) -> Result<()> {
     file.write_all(&body)?;
     file.flush()?;
     Ok(())
+}
+
+struct ForwardGuard<'a> {
+    adb: &'a crate::adb::Adb,
+    transport: String,
+    spec: String,
+}
+
+impl ForwardGuard<'_> {
+    fn remove_args(&self) -> [&str; 5] {
+        ["-s", &self.transport, "forward", "--remove", &self.spec]
+    }
+}
+
+impl Drop for ForwardGuard<'_> {
+    fn drop(&mut self) {
+        let args = self.remove_args();
+        let _ = self.adb.run(&args);
+    }
 }
 
 /// Save a returned artifact through the phone's local blob server or its real HTTPS URL.
@@ -298,7 +390,7 @@ pub fn download_artifact(
     output: &std::path::Path,
 ) -> Result<DownloadedArtifact> {
     use std::time::Duration;
-    device.verify(adb)?;
+    let transport = device.resolve_active_transport(adb)?;
     if output.exists() {
         bail!("目标文件已存在，请另选保存名称")
     }
@@ -315,7 +407,7 @@ pub fn download_artifact(
     if url.chars().any(char::is_control) {
         bail!("附件下载链接无效")
     }
-    let mut forwarded = None;
+    let mut _forward_guard = None;
     if let Some(rest) = url.strip_prefix("http://127.0.0.1:") {
         let (port, path) = rest.split_once('/').context("手机附件链接无效")?;
         let port: u16 = port.parse().context("手机附件端口无效")?;
@@ -326,7 +418,7 @@ pub fn download_artifact(
         let local = adb
             .run(&[
                 "-s",
-                &device.transport,
+                &transport,
                 "forward",
                 "tcp:0",
                 &format!("tcp:{port}"),
@@ -335,7 +427,11 @@ pub fn download_artifact(
             .to_string();
         let local_port: u16 = local.parse().context("无法转发手机附件")?;
         url = format!("http://127.0.0.1:{local_port}/{path}");
-        forwarded = Some(format!("tcp:{local_port}"));
+        _forward_guard = Some(ForwardGuard {
+            adb,
+            transport: transport.clone(),
+            spec: format!("tcp:{local_port}"),
+        });
     } else if !url.starts_with("https://") {
         bail!("手机尚未返回可下载的 HTTPS 附件链接")
     }
@@ -390,9 +486,7 @@ pub fn download_artifact(
             mime,
         })
     })();
-    if let Some(port) = forwarded {
-        let _ = adb.run(&["-s", &device.transport, "forward", "--remove", &port]);
-    }
+    drop(_forward_guard);
     download
 }
 
@@ -473,9 +567,13 @@ pub fn upload_attachments_with_bus(
 ) -> Result<UploadedAttachments> {
     use crate::adb::shell_quote;
     use std::io::Write;
-    if bus.is_none() {
-        device.verify(adb)?;
-    }
+    let transport = if bus.is_none() {
+        device.resolve_active_transport(adb)?
+    } else {
+        device
+            .resolve_active_transport(adb)
+            .unwrap_or_else(|_| crate::device::active_transport_for(&device.serial, &device.transport))
+    };
     // Reuse byte/count validation; this reads only explicitly selected local files.
     let prepared = prepare_attachments(paths)?;
     if prepared.is_empty() {
@@ -485,7 +583,7 @@ pub fn upload_attachments_with_bus(
         });
     }
     let directory = format!("/sdcard/Download/Amoo Work/{:032x}", rand::random::<u128>());
-    adb.shell(&device.transport, &["mkdir", "-p", "--", &directory])?;
+    adb.shell(&transport, &["mkdir", "-p", "--", &directory])?;
     let result = (|| -> Result<UploadedAttachments> {
         let mut items = Vec::new();
         for (index, attachment) in prepared.iter().enumerate() {
@@ -500,7 +598,7 @@ pub fn upload_attachments_with_bus(
             let sha = artifact_content_key(&data);
             let remote = format!("{directory}/{index:02}-{name}");
             adb.transfer(
-                &device.transport,
+                &transport,
                 "push",
                 snapshot.path(),
                 std::path::Path::new(&remote),
@@ -525,7 +623,7 @@ pub fn upload_attachments_with_bus(
                 .map(|item| shell_quote(&item.device_path))
                 .collect::<Vec<_>>()
                 .join(" ");
-            let actual = adb.script(&device.transport, &format!("sha256sum {quoted_paths}"))?;
+            let actual = adb.script(&transport, &format!("sha256sum {quoted_paths}"))?;
             let mut actual_sums = actual
                 .lines()
                 .filter_map(|line| line.split_whitespace().next());
@@ -554,7 +652,7 @@ pub fn upload_attachments_with_bus(
         })
     })();
     if result.is_err() {
-        let _ = adb.shell(&device.transport, &["rm", "-rf", "--", &directory]);
+        let _ = adb.shell(&transport, &["rm", "-rf", "--", &directory]);
     }
     result
 }
@@ -894,5 +992,49 @@ mod tests {
         let mut unsafe_url = valid;
         unsafe_url["payload"]["content"]["uploaded"][0]["url"] = json!("file:///tmp/image.png");
         assert!(native_upload_results(&unsafe_url, &paths).is_err());
+    }
+
+    #[test]
+    fn forward_guard_targets_transport_and_companion_uploads_prune_after_24h() {
+        let adb = crate::adb::Adb {
+            path: PathBuf::from("/bin/false"),
+        };
+        let guard = ForwardGuard {
+            adb: &adb,
+            transport: "192.168.1.8:5555".into(),
+            spec: "tcp:49152".into(),
+        };
+        assert_eq!(
+            guard.remove_args(),
+            ["-s", "192.168.1.8:5555", "forward", "--remove", "tcp:49152"]
+        );
+        drop(guard);
+
+        assert_eq!(STAGE_LIMIT_BYTES, 32 * 1024 * 1024);
+        let mut out = Vec::new();
+        let mut src = std::io::Cursor::new(vec![b'a'; 1024]);
+        assert_eq!(copy_into(&mut src, &mut out).unwrap(), 1024);
+
+        let dir = tempfile::tempdir().unwrap();
+        let stale = dir.path().join("old.bin");
+        let fresh = dir.path().join("fresh.bin");
+        fs::write(&stale, b"old").unwrap();
+        fs::write(&fresh, b"fresh").unwrap();
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(25 * 3600);
+        prune_stale_companion_uploads_in(
+            dir.path(),
+            future,
+            STALE_COMPANION_UPLOAD_MAX_AGE,
+        );
+        assert!(!stale.exists());
+        assert!(!fresh.exists());
+
+        fs::write(&fresh, b"fresh2").unwrap();
+        prune_stale_companion_uploads_in(
+            dir.path(),
+            std::time::SystemTime::now(),
+            STALE_COMPANION_UPLOAD_MAX_AGE,
+        );
+        assert!(fresh.exists());
     }
 }

@@ -217,15 +217,19 @@ fn valid_id(id: &str) -> bool {
 }
 
 pub fn phone_call(adb: &Adb, device: &Device, request: Value) -> Result<Value> {
-    device.verify(adb)?;
-    phone_call_unverified(adb, device, request)
+    let transport = device.resolve_active_transport(adb)?;
+    phone_call_on_transport(adb, &transport, request)
 }
 
-pub(crate) fn phone_call_unverified(adb: &Adb, device: &Device, request: Value) -> Result<Value> {
+pub(crate) fn phone_call_on_transport(
+    adb: &Adb,
+    transport: &str,
+    request: Value,
+) -> Result<Value> {
     let encoded = STANDARD.encode(serde_json::to_vec(&request)?);
     ensure!(encoded.len() <= 32768, "作品请求过长");
     let out = adb.shell(
-        &device.transport,
+        transport,
         &[
             "content",
             "call",
@@ -264,7 +268,7 @@ pub fn send(adb: &Adb, device: &Device, work: &Work) -> Result<Value> {
     Ok(receipt)
 }
 pub fn open_phone(adb: &Adb, device: &Device, mode: &str, id: Option<&str>) -> Result<String> {
-    device.verify(adb)?;
+    let transport = device.resolve_active_transport(adb)?;
     let mut args = vec!["am", "start", "-W", "-f", "0x14000000"];
     match mode {
         "library" => args.extend(["-n", "com.stepx.companion.app/.StudioActivity"]),
@@ -288,7 +292,7 @@ pub fn open_phone(adb: &Adb, device: &Device, mode: &str, id: Option<&str>) -> R
         ]),
         _ => bail!("未知手机操作"),
     }
-    let out = adb.shell(&device.transport, &args)?;
+    let out = adb.shell(&transport, &args)?;
     ensure!(
         !out.contains("Error:") && !out.contains("Exception") && out.contains("Status: ok"),
         "手机未打开入口：{}",
@@ -413,8 +417,8 @@ fn parse_web_snapshot(value: Value) -> Result<CloudLibrary> {
 }
 
 pub fn sync_cloud(adb: &Adb, device: &Device) -> Result<CloudLibrary> {
-    device.verify(adb)?;
-    sync_cloud_with(|request| phone_call_unverified(adb, device, request))
+    let transport = device.resolve_active_transport(adb)?;
+    sync_cloud_with(|request| phone_call_on_transport(adb, &transport, request))
 }
 fn sync_cloud_with(mut call: impl FnMut(Value) -> Result<Value>) -> Result<CloudLibrary> {
     let status = call(json!({"op":"cloud-status"}))?;
@@ -596,8 +600,8 @@ pub fn gui_skill_install_with(
 }
 
 pub fn gui_skill_install(adb: &Adb, device: &Device) -> Result<OfficialGuiSkillStatus> {
-    device.verify(adb)?;
-    gui_skill_install_with(|request| phone_call_unverified(adb, device, request))
+    let transport = device.resolve_active_transport(adb)?;
+    gui_skill_install_with(|request| phone_call_on_transport(adb, &transport, request))
 }
 
 #[cfg(test)]

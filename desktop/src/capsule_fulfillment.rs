@@ -76,6 +76,8 @@ pub struct Signal {
     pub id: String,
     /// Hash of the provider and order reference when one exists.
     pub(crate) strong: bool,
+    /// Previous local day's `tail:{tail}:{day - 1}` identity when emitted within 6h after local midnight.
+    pub(crate) prev_day_tail_id: Option<String>,
     pub cues: Vec<&'static str>,
 }
 
@@ -210,6 +212,43 @@ fn order_reference(text: &str) -> Option<String> {
     None
 }
 
+const CROSS_MIDNIGHT_TAIL_WINDOW_MS: i64 = 6 * 3_600_000;
+
+fn local_tz_offset_ms() -> i64 {
+    chrono::Local::now().offset().local_minus_utc() as i64 * 1000
+}
+
+fn extract_order_key_with_offset(
+    provider: &str,
+    parcel: bool,
+    tracking: Option<String>,
+    order_reference: Option<String>,
+    at: i64,
+    tz_offset_ms: i64,
+) -> (Option<String>, Option<String>) {
+    let Some(raw_ref) = tracking.or(order_reference) else {
+        return (None, None);
+    };
+    if raw_ref.starts_with("tail:") {
+        // Use local timezone day instead of raw UTC day so 08:00 AM (UTC+8)
+        // morning breakfast/coffee orders never split across a UTC midnight boundary.
+        let local_ms = at.saturating_add(tz_offset_ms);
+        let day = local_ms.div_euclid(86_400_000);
+        let local_tod_ms = local_ms.rem_euclid(86_400_000);
+        let prev_day_id = (local_tod_ms <= CROSS_MIDNIGHT_TAIL_WINDOW_MS).then(|| {
+            let prev_ref = format!("{raw_ref}:{}", day - 1);
+            if parcel {
+                digest(&["parcel", &prev_ref])
+            } else {
+                digest(&[provider, &prev_ref])
+            }
+        });
+        (Some(format!("{raw_ref}:{day}")), prev_day_id)
+    } else {
+        (Some(raw_ref), None)
+    }
+}
+
 pub fn classify(
     pkg: &str,
     app: &str,
@@ -219,6 +258,30 @@ pub fn classify(
     at: i64,
     seen: bool,
     now: i64,
+) -> Option<Signal> {
+    classify_with_tz_offset(
+        pkg,
+        app,
+        title,
+        body,
+        origin,
+        at,
+        seen,
+        now,
+        local_tz_offset_ms(),
+    )
+}
+
+fn classify_with_tz_offset(
+    pkg: &str,
+    app: &str,
+    title: &str,
+    body: &str,
+    origin: Origin,
+    at: i64,
+    seen: bool,
+    now: i64,
+    tz_offset_ms: i64,
 ) -> Option<Signal> {
     if at <= 0
         || at > now
@@ -320,6 +383,9 @@ pub fn classify(
             "交易完成",
             "行程已结束",
             "行程结束",
+            "已安全到达",
+            "到达目的地",
+            "感谢您的评价",
             "已下车",
             "已取消",
             "取消成功",
@@ -333,6 +399,7 @@ pub fn classify(
             "已拿取",
             "商品已取",
             "已取餐",
+            "取餐完成",
         ],
     ) || (parcel
         && is_completed_express_text(&text)
@@ -536,14 +603,14 @@ pub fn classify(
         })
         .and_then(|r| r.get(r.len().saturating_sub(4)..))
         .map(str::to_owned);
-    let reference = tracking.clone().or(order_reference).map(|reference| {
-        if reference.starts_with("tail:") {
-            // A short suffix can be reused by a merchant on another day.
-            format!("{reference}:{}", at / 86_400_000)
-        } else {
-            reference
-        }
-    });
+    let (reference, prev_day_tail_id) = extract_order_key_with_offset(
+        &provider,
+        parcel,
+        tracking.clone(),
+        order_reference,
+        at,
+        tz_offset_ms,
+    );
     let body_text = body
         .trim()
         .split_once('】')
@@ -604,6 +671,7 @@ pub fn classify(
         seen,
         id: identity,
         strong: reference.is_some(),
+        prev_day_tail_id,
         cues,
     })
 }
@@ -615,13 +683,30 @@ pub fn reconcile(mut signals: Vec<Signal>) -> Vec<Signal> {
     let mut orders: Vec<Signal> = Vec::new();
     for signal in signals {
         let same = orders.iter_mut().find(|order| {
-            order.id == signal.id
-                || (!order.strong
-                    && !signal.strong
-                    && order.provider == signal.provider
-                    && matches!(order.origin, Origin::Notification(_))
-                    && order.origin == signal.origin
-                    && order.at.abs_diff(signal.at) <= WEAK_WINDOW_MS as u64)
+            if order.id == signal.id {
+                return true;
+            }
+            let cross_midnight_tail = (order.prev_day_tail_id.as_deref() == Some(signal.id.as_str())
+                || signal.prev_day_tail_id.as_deref() == Some(order.id.as_str()))
+                && order.at.abs_diff(signal.at) <= CROSS_MIDNIGHT_TAIL_WINDOW_MS as u64
+                && {
+                    let (earlier, later) = if signal.at <= order.at {
+                        (&signal, &**order)
+                    } else {
+                        (&**order, &signal)
+                    };
+                    (earlier.stage < Stage::Arrived && later.stage >= earlier.stage)
+                        || (earlier.stage == Stage::Arrived && later.stage > earlier.stage)
+                };
+            if cross_midnight_tail {
+                return true;
+            }
+            !order.strong
+                && !signal.strong
+                && order.provider == signal.provider
+                && matches!(order.origin, Origin::Notification(_))
+                && order.origin == signal.origin
+                && order.at.abs_diff(signal.at) <= WEAK_WINDOW_MS as u64
         });
         let Some(order) = same else {
             orders.push(signal);
@@ -932,5 +1017,124 @@ mod tests {
         assert!(validate_agent_response(raw, &[&sent]).is_none());
         let duplicate = r#"{"decisions":[{"id":0,"direction":"receive","evidence":"送至您处"},{"id":0,"direction":"unknown","evidence":""}]}"#;
         assert!(validate_agent_response(duplicate, &[&candidate, &vague]).is_none());
+    }
+
+    #[test]
+    fn morning_0755_to_0805_cst_tail_order_does_not_split_across_utc_midnight() {
+        let cst_offset_ms = 8 * 3_600_000;
+        // 2026-04-19 23:55:00 UTC == 2026-04-20 07:55:00 CST (UTC+8)
+        // 2026-04-20 00:05:00 UTC == 2026-04-20 08:05:00 CST (UTC+8)
+        let utc_midnight_ms = 20_563 * 86_400_000i64;
+        let at_0755_cst = utc_midnight_ms - 5 * 60_000;
+        let at_0805_cst = utc_midnight_ms + 5 * 60_000;
+        let now = at_0805_cst + 60_000;
+
+        let preparing = classify_with_tz_offset(
+            "com.lucky.luckyclient",
+            "瑞幸",
+            "瑞幸咖啡",
+            "您的饮品正在制作中，订单尾号 6812",
+            Origin::Notification("luckin-1".into()),
+            at_0755_cst,
+            false,
+            now,
+            cst_offset_ms,
+        )
+        .unwrap();
+        let ready = classify_with_tz_offset(
+            "com.lucky.luckyclient",
+            "瑞幸",
+            "瑞幸咖啡",
+            "制作完成，请及时取餐，订单尾号 6812",
+            Origin::Notification("luckin-2".into()),
+            at_0805_cst,
+            false,
+            now,
+            cst_offset_ms,
+        )
+        .unwrap();
+        let picked_up = classify_with_tz_offset(
+            "com.lucky.luckyclient",
+            "瑞幸",
+            "瑞幸咖啡",
+            "已取餐，订单尾号 6812",
+            Origin::Notification("luckin-3".into()),
+            at_0805_cst + 30_000,
+            false,
+            now,
+            cst_offset_ms,
+        )
+        .unwrap();
+
+        assert_eq!(
+            preparing.id, ready.id,
+            "07:55 and 08:05 CST share the same local day and must produce identical tail key"
+        );
+        let merged = reconcile(vec![preparing, ready, picked_up]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].stage, Stage::Finished);
+        assert!(!merged[0].current(now, 3_600_000));
+    }
+
+    #[test]
+    fn cross_local_midnight_2350_to_0015_tail_order_reconciles_within_six_hours() {
+        let cst_offset_ms = 8 * 3_600_000;
+        // Local midnight in CST (UTC+8): local_ms = 20_564 * 86_400_000 => utc = local_ms - 8h
+        let local_midnight_utc_ms = 20_564 * 86_400_000i64 - cst_offset_ms;
+        let at_2350_local = local_midnight_utc_ms - 10 * 60_000;
+        let at_0015_local = local_midnight_utc_ms + 15 * 60_000;
+        let now = at_0015_local + 60_000;
+
+        let dispatching = classify_with_tz_offset(
+            "com.sankuai.meituan",
+            "美团外卖",
+            "美团外卖",
+            "骑手正在配送，订单尾号 4321",
+            Origin::Notification("mt-night-1".into()),
+            at_2350_local,
+            false,
+            now,
+            cst_offset_ms,
+        )
+        .unwrap();
+        let finished = classify_with_tz_offset(
+            "com.sankuai.meituan",
+            "美团外卖",
+            "美团外卖",
+            "订单已完成，订单尾号 4321",
+            Origin::Notification("mt-night-2".into()),
+            at_0015_local,
+            false,
+            now,
+            cst_offset_ms,
+        )
+        .unwrap();
+
+        assert_ne!(dispatching.id, finished.id);
+        let merged = reconcile(vec![dispatching.clone(), finished]);
+        assert_eq!(
+            merged.len(),
+            1,
+            "00:15 completion with tail:4321:day must retire 23:50 active tail:4321:(day-1)"
+        );
+        assert_eq!(merged[0].stage, Stage::Finished);
+        assert!(!merged[0].current(now, 3_600_000));
+
+        // Orders more than 6 hours apart on consecutive nights remain independent
+        let next_day_noon = local_midnight_utc_ms + 12 * 3_600_000;
+        let noon_order = classify_with_tz_offset(
+            "com.sankuai.meituan",
+            "美团外卖",
+            "美团外卖",
+            "订单已完成，订单尾号 4321",
+            Origin::Notification("mt-noon".into()),
+            next_day_noon,
+            false,
+            next_day_noon + 60_000,
+            cst_offset_ms,
+        )
+        .unwrap();
+        let separate = reconcile(vec![dispatching, noon_order]);
+        assert_eq!(separate.len(), 2);
     }
 }

@@ -734,7 +734,45 @@ fn decode_ldb_blocks(raw: &[u8]) -> Vec<u8> {
     combined
 }
 
-fn extract_json_objects_containing(haystack: &str, needle: &str) -> Vec<Value> {
+const TRUSTED_OPENCLAW_STORAGE_ORIGINS: [&str; 2] =
+    ["http://127.0.0.1:18789", "http://localhost:18789"];
+
+fn has_trusted_preceding_storage_origin(before_json: &str) -> bool {
+    let window_start = before_json
+        .char_indices()
+        .rev()
+        .nth(512)
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+    let window = &before_json[window_start..];
+    let last_http = window.rfind("http://");
+    let last_https = window.rfind("https://");
+    let origin_pos = match (last_http, last_https) {
+        (Some(a), Some(b)) => a.max(b),
+        (Some(a), None) => a,
+        (None, Some(b)) => b,
+        (None, None) => return false,
+    };
+    let tail = &window[origin_pos..];
+    let scheme_end = if tail.starts_with("https://") { 8 } else { 7 };
+    let host_port_len = tail[scheme_end..]
+        .find(|c: char| {
+            c == '/'
+                || c == '\0'
+                || c == '\x01'
+                || c == '"'
+                || c == '\''
+                || c.is_whitespace()
+                || c.is_control()
+        })
+        .unwrap_or(tail.len() - scheme_end);
+    let origin = &tail[..scheme_end + host_port_len];
+    TRUSTED_OPENCLAW_STORAGE_ORIGINS
+        .iter()
+        .any(|trusted| origin.eq_ignore_ascii_case(trusted))
+}
+
+fn extract_json_objects_for_trusted_openclaw_origins(haystack: &str, needle: &str) -> Vec<Value> {
     let mut out = Vec::new();
     let mut search_from = 0;
     while let Some(rel_pos) = haystack[search_from..].find(needle) {
@@ -743,6 +781,9 @@ fn extract_json_objects_containing(haystack: &str, needle: &str) -> Vec<Value> {
         let before = &haystack[..pos];
         for (brace_idx, ch) in before.char_indices().rev().take(800) {
             if ch == '{' {
+                if !has_trusted_preceding_storage_origin(&haystack[..brace_idx]) {
+                    continue;
+                }
                 let slice = &haystack[brace_idx..];
                 let mut depth = 0i32;
                 let mut in_str = false;
@@ -777,24 +818,92 @@ fn extract_json_objects_containing(haystack: &str, needle: &str) -> Vec<Value> {
     out
 }
 
-static CREDENTIALS_CACHE: OnceLock<Mutex<Option<(Instant, Option<OpenClawCredentials>)>>> =
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct PersistedOpenClawAuthStore {
+    #[serde(default)]
+    default: Option<OpenClawCredentials>,
+    #[serde(default)]
+    by_serial: HashMap<String, OpenClawCredentials>,
+}
+
+static CREDENTIALS_CACHE: OnceLock<
+    Mutex<HashMap<String, (Instant, Option<OpenClawCredentials>)>>,
+> = OnceLock::new();
+static INVALIDATED_CREDENTIAL_SERIALS: OnceLock<Mutex<std::collections::HashSet<String>>> =
     OnceLock::new();
 static ANDROID_ID_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
+fn device_serial_key(device: Option<&Device>) -> String {
+    let Some(d) = device else {
+        return String::new();
+    };
+    if !d.serial.trim().is_empty() {
+        d.serial.trim().to_string()
+    } else {
+        d.transport.trim().to_string()
+    }
+}
+
 pub fn load_openclaw_credentials() -> Option<OpenClawCredentials> {
-    let cache = CREDENTIALS_CACHE.get_or_init(|| Mutex::new(None));
+    load_openclaw_credentials_for_serial("")
+}
+
+pub fn load_openclaw_credentials_for_serial(serial: &str) -> Option<OpenClawCredentials> {
+    let key = serial.trim();
+    if !key.is_empty() {
+        if let Some(inv) = INVALIDATED_CREDENTIAL_SERIALS.get() {
+            if inv.lock().ok().is_some_and(|set| set.contains(key)) {
+                return None;
+            }
+        }
+    }
+    let cache = CREDENTIALS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(guard) = cache.lock() {
-        if let Some((cached_at, ref creds)) = *guard {
+        if let Some((cached_at, creds)) = guard.get(key) {
             if cached_at.elapsed() < Duration::from_secs(60) {
                 return creds.clone();
             }
         }
     }
-    let loaded = load_openclaw_credentials_uncached();
+    let loaded = load_openclaw_credentials_uncached_for_serial(key);
     if let Ok(mut guard) = cache.lock() {
-        *guard = Some((Instant::now(), loaded.clone()));
+        guard.insert(key.to_string(), (Instant::now(), loaded.clone()));
     }
     loaded
+}
+
+pub fn invalidate_openclaw_credentials_for_serial(serial: &str) {
+    let key = serial.trim();
+    if !key.is_empty() {
+        let inv =
+            INVALIDATED_CREDENTIAL_SERIALS.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+        if let Ok(mut set) = inv.lock() {
+            set.insert(key.to_string());
+        }
+    }
+    if let Some(cache) = CREDENTIALS_CACHE.get() {
+        if let Ok(mut guard) = cache.lock() {
+            guard.remove(key);
+            if key.is_empty() {
+                guard.clear();
+            }
+        }
+    }
+    if let Some((cache_path, _)) = current_openclaw_credential_paths() {
+        if let Ok(text) = fs::read_to_string(&cache_path) {
+            if !key.is_empty() {
+                if let Ok(mut store) = serde_json::from_str::<PersistedOpenClawAuthStore>(&text) {
+                    if store.by_serial.remove(key).is_some() {
+                        if let Ok(serialized) = serde_json::to_string_pretty(&store) {
+                            let _ = write_private_auth_file(&cache_path, &serialized);
+                        }
+                    }
+                }
+            } else {
+                let _ = fs::remove_file(&cache_path);
+            }
+        }
+    }
 }
 
 fn resolve_openclaw_credential_paths_from(
@@ -925,22 +1034,132 @@ fn current_openclaw_credential_paths() -> Option<(PathBuf, Vec<PathBuf>)> {
     )
 }
 
-pub fn save_openclaw_credentials(creds: &OpenClawCredentials) -> Result<()> {
-    let (cache_path, _) =
-        current_openclaw_credential_paths().context("缺少用户配置目录 (HOME/LOCALAPPDATA/APPDATA/USERPROFILE)")?;
+fn write_private_auth_file(cache_path: &std::path::Path, contents: &str) -> Result<()> {
     if let Some(parent) = cache_path.parent() {
         fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+        }
     }
-    fs::write(&cache_path, serde_json::to_string_pretty(creds)?)?;
+    let tmp_path = cache_path.with_extension(format!("json.tmp.{}", std::process::id()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)?;
+        f.write_all(contents.as_bytes())?;
+        f.sync_all()?;
+        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))?;
+        fs::rename(&tmp_path, cache_path)?;
+        fs::set_permissions(cache_path, fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(&tmp_path, contents)?;
+        if cache_path.exists() {
+            let _ = fs::remove_file(cache_path);
+        }
+        fs::rename(&tmp_path, cache_path)?;
+    }
+    Ok(())
+}
+
+pub fn save_openclaw_credentials(creds: &OpenClawCredentials) -> Result<()> {
+    save_openclaw_credentials_for_serial("", creds)
+}
+
+pub fn save_openclaw_credentials_for_serial(
+    serial: &str,
+    creds: &OpenClawCredentials,
+) -> Result<()> {
+    let (cache_path, _) = current_openclaw_credential_paths()
+        .context("缺少用户配置目录 (HOME/LOCALAPPDATA/APPDATA/USERPROFILE)")?;
+    let key = serial.trim();
+    if key.is_empty() {
+        write_private_auth_file(&cache_path, &serde_json::to_string_pretty(creds)?)?;
+    } else {
+        let mut store = fs::read_to_string(&cache_path)
+            .ok()
+            .and_then(|text| {
+                serde_json::from_str::<PersistedOpenClawAuthStore>(&text)
+                    .ok()
+                    .filter(|s| s.default.is_some() || !s.by_serial.is_empty())
+                    .or_else(|| {
+                        serde_json::from_str::<OpenClawCredentials>(&text)
+                            .ok()
+                            .filter(|c| !c.device_id.is_empty() && !c.device_token.is_empty())
+                            .map(|c| PersistedOpenClawAuthStore {
+                                default: Some(c),
+                                by_serial: HashMap::new(),
+                            })
+                    })
+            })
+            .unwrap_or_default();
+        store.by_serial.insert(key.to_string(), creds.clone());
+        write_private_auth_file(&cache_path, &serde_json::to_string_pretty(&store)?)?;
+        if let Some(inv) = INVALIDATED_CREDENTIAL_SERIALS.get() {
+            if let Ok(mut set) = inv.lock() {
+                set.remove(key);
+            }
+        }
+    }
     if let Some(cache) = CREDENTIALS_CACHE.get() {
         if let Ok(mut guard) = cache.lock() {
-            *guard = None;
+            guard.clear();
         }
     }
     Ok(())
 }
 
-fn load_openclaw_credentials_uncached() -> Option<OpenClawCredentials> {
+fn extract_openclaw_credentials_from_leveldb_bytes(
+    decoded: &[u8],
+    device_id: &mut String,
+    public_key: &mut String,
+    private_key: &mut String,
+    device_token: &mut String,
+) {
+    let text = String::from_utf8_lossy(decoded);
+    if device_id.is_empty() && text.contains("\"privateKey\"") {
+        for val in extract_json_objects_for_trusted_openclaw_origins(&text, "\"privateKey\"") {
+            if let (Some(id), Some(pk), Some(sk)) = (
+                val.get("deviceId").and_then(Value::as_str),
+                val.get("publicKey").and_then(Value::as_str),
+                val.get("privateKey").and_then(Value::as_str),
+            ) {
+                *device_id = id.to_string();
+                *public_key = pk.to_string();
+                *private_key = sk.to_string();
+                break;
+            }
+        }
+    }
+    if device_token.is_empty() && text.contains("operator.admin") {
+        for val in extract_json_objects_for_trusted_openclaw_origins(&text, "operator.admin") {
+            if let Some(tok) = val
+                .get("tokens")
+                .and_then(|t| t.get("operator"))
+                .and_then(|o| o.get("token"))
+                .and_then(Value::as_str)
+            {
+                *device_token = tok.to_string();
+                break;
+            } else if val.get("role").and_then(Value::as_str) == Some("operator") {
+                if let Some(tok) = val.get("token").and_then(Value::as_str) {
+                    *device_token = tok.to_string();
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn load_openclaw_credentials_uncached_for_serial(serial: &str) -> Option<OpenClawCredentials> {
     let (cache_path, leveldb_dirs) = current_openclaw_credential_paths()?;
     let mut candidate_cache_files = vec![cache_path];
     let mut push_unique = |p: PathBuf| {
@@ -960,8 +1179,23 @@ fn load_openclaw_credentials_uncached() -> Option<OpenClawCredentials> {
             push_unique(PathBuf::from(dir).join("stepx/openclaw_auth.json"));
         }
     }
+    let key = serial.trim();
     for path in &candidate_cache_files {
         if let Ok(text) = fs::read_to_string(path) {
+            if let Ok(store) = serde_json::from_str::<PersistedOpenClawAuthStore>(&text) {
+                if !key.is_empty() {
+                    if let Some(creds) = store.by_serial.get(key) {
+                        if !creds.device_id.is_empty() && !creds.device_token.is_empty() {
+                            return Some(creds.clone());
+                        }
+                    }
+                }
+                if let Some(creds) = store.default {
+                    if !creds.device_id.is_empty() && !creds.device_token.is_empty() {
+                        return Some(creds);
+                    }
+                }
+            }
             if let Ok(creds) = serde_json::from_str::<OpenClawCredentials>(&text) {
                 if !creds.device_id.is_empty() && !creds.device_token.is_empty() {
                     return Some(creds);
@@ -993,39 +1227,13 @@ fn load_openclaw_credentials_uncached() -> Option<OpenClawCredentials> {
             } else {
                 raw
             };
-            let text = String::from_utf8_lossy(&decoded);
-            if device_id.is_empty() && text.contains("\"privateKey\"") {
-                for val in extract_json_objects_containing(&text, "\"privateKey\"") {
-                    if let (Some(id), Some(pk), Some(sk)) = (
-                        val.get("deviceId").and_then(Value::as_str),
-                        val.get("publicKey").and_then(Value::as_str),
-                        val.get("privateKey").and_then(Value::as_str),
-                    ) {
-                        device_id = id.to_string();
-                        public_key = pk.to_string();
-                        private_key = sk.to_string();
-                        break;
-                    }
-                }
-            }
-            if device_token.is_empty() && text.contains("operator.admin") {
-                for val in extract_json_objects_containing(&text, "operator.admin") {
-                    if let Some(tok) = val
-                        .get("tokens")
-                        .and_then(|t| t.get("operator"))
-                        .and_then(|o| o.get("token"))
-                        .and_then(Value::as_str)
-                    {
-                        device_token = tok.to_string();
-                        break;
-                    } else if val.get("role").and_then(Value::as_str) == Some("operator") {
-                        if let Some(tok) = val.get("token").and_then(Value::as_str) {
-                            device_token = tok.to_string();
-                            break;
-                        }
-                    }
-                }
-            }
+            extract_openclaw_credentials_from_leveldb_bytes(
+                &decoded,
+                &mut device_id,
+                &mut public_key,
+                &mut private_key,
+                &mut device_token,
+            );
             if !device_id.is_empty() && !device_token.is_empty() {
                 break;
             }
@@ -1046,7 +1254,7 @@ fn load_openclaw_credentials_uncached() -> Option<OpenClawCredentials> {
             private_key,
             device_token,
         };
-        let _ = save_openclaw_credentials(&creds);
+        let _ = save_openclaw_credentials_for_serial(key, &creds);
         return Some(creds);
     }
     None
@@ -1069,24 +1277,67 @@ impl GatewayWs {
         let transport = device.resolve_active_transport(adb)?;
         let mut resolved_device = device.clone();
         resolved_device.transport = transport.clone();
+        let serial_key = device_serial_key(Some(&resolved_device));
+        let had_cached_creds = load_openclaw_credentials_for_serial(&serial_key).is_some();
         let (stream, port, was_cached) = adb
             .connect_forwarded_tcp(&transport, "tcp:18789", Duration::from_secs(3))
             .context("无法建立当前手机的 OpenClaw 后台连接")?;
-        match Self::connect_with_stream(adb, Some(&resolved_device), stream) {
+        match Self::connect_with_stream_mode(adb, Some(&resolved_device), stream, true) {
             Ok(ws) => Ok(ws),
-            Err(_) if was_cached => {
-                adb.invalidate_forwarded_tcp(&transport, "tcp:18789", Some(port));
-                let (fresh_stream, fresh_port, _) = adb
-                    .connect_forwarded_tcp(&transport, "tcp:18789", Duration::from_secs(3))
-                    .context("无法建立当前手机的 OpenClaw 后台连接")?;
-                Self::connect_with_stream(adb, Some(&resolved_device), fresh_stream).map_err(|e| {
-                    adb.invalidate_forwarded_tcp(&transport, "tcp:18789", Some(fresh_port));
-                    e
-                })
-            }
-            Err(e) => {
-                adb.invalidate_forwarded_tcp(&transport, "tcp:18789", Some(port));
-                Err(e)
+            Err(first_err) => {
+                if had_cached_creds {
+                    invalidate_openclaw_credentials_for_serial(&serial_key);
+                    if let Ok((retry_stream, retry_port, _)) = adb.connect_forwarded_tcp(
+                        &transport,
+                        "tcp:18789",
+                        Duration::from_secs(3),
+                    ) {
+                        if let Ok(ws) = Self::connect_with_stream_mode(
+                            adb,
+                            Some(&resolved_device),
+                            retry_stream,
+                            false,
+                        ) {
+                            return Ok(ws);
+                        }
+                        let _ = retry_port;
+                    }
+                }
+                if was_cached {
+                    adb.invalidate_forwarded_tcp(&transport, "tcp:18789", Some(port));
+                    crate::device::invalidate_verified_transport(&transport);
+                    let retry_transport = device
+                        .resolve_active_transport(adb)
+                        .unwrap_or_else(|_| transport.clone());
+                    if retry_transport != transport {
+                        adb.invalidate_forwards_for_transport(&transport);
+                        resolved_device.transport = retry_transport.clone();
+                    }
+                    let (fresh_stream, fresh_port, _) = adb
+                        .connect_forwarded_tcp(
+                            &retry_transport,
+                            "tcp:18789",
+                            Duration::from_secs(3),
+                        )
+                        .context("无法建立当前手机的 OpenClaw 后台连接")?;
+                    Self::connect_with_stream_mode(
+                        adb,
+                        Some(&resolved_device),
+                        fresh_stream,
+                        !had_cached_creds,
+                    )
+                    .map_err(|e| {
+                        adb.invalidate_forwarded_tcp(
+                            &retry_transport,
+                            "tcp:18789",
+                            Some(fresh_port),
+                        );
+                        e
+                    })
+                } else {
+                    adb.invalidate_forwarded_tcp(&transport, "tcp:18789", Some(port));
+                    Err(first_err)
+                }
             }
         }
     }
@@ -1097,12 +1348,28 @@ impl GatewayWs {
 
     fn connect_at(adb: &Adb, device: Option<&Device>, port: u16) -> Result<Self> {
         let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+        let serial_key = device_serial_key(device);
+        let had_cached_creds = load_openclaw_credentials_for_serial(&serial_key).is_some();
         let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))
             .context("无法连接手机 OpenClaw 网关 (127.0.0.1:18789)")?;
-        Self::connect_with_stream(adb, device, stream)
+        match Self::connect_with_stream_mode(adb, device, stream, true) {
+            Ok(ws) => Ok(ws),
+            Err(first_err) if had_cached_creds => {
+                invalidate_openclaw_credentials_for_serial(&serial_key);
+                let retry_stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))
+                    .map_err(|_| first_err)?;
+                Self::connect_with_stream_mode(adb, device, retry_stream, false)
+            }
+            Err(e) => Err(e),
+        }
     }
 
-    fn connect_with_stream(adb: &Adb, device: Option<&Device>, mut stream: TcpStream) -> Result<Self> {
+    fn connect_with_stream_mode(
+        adb: &Adb,
+        device: Option<&Device>,
+        mut stream: TcpStream,
+        allow_cached_creds: bool,
+    ) -> Result<Self> {
         stream.set_read_timeout(Some(Duration::from_secs(6)))?;
         stream.set_write_timeout(Some(Duration::from_secs(6)))?;
 
@@ -1164,7 +1431,13 @@ impl GatewayWs {
 
         // 2. Build connect request with device signature if credentials exist, else derived token
         let signed_at_ms = chrono::Utc::now().timestamp_millis();
-        let connect_req = if let Some(creds) = load_openclaw_credentials() {
+        let serial_key = device_serial_key(device);
+        let maybe_creds = if allow_cached_creds {
+            load_openclaw_credentials_for_serial(&serial_key)
+        } else {
+            None
+        };
+        let connect_req = if let Some(creds) = maybe_creds {
             let pk_bytes_vec = URL_SAFE_NO_PAD
                 .decode(creds.public_key.trim_end_matches('='))
                 .context("无效的 OpenClaw publicKey")?;
@@ -1368,8 +1641,16 @@ impl GatewayWs {
     }
 
     fn read_frame(&mut self) -> Result<String> {
+        self.read_ws_text_frame()
+    }
+
+    fn read_ws_text_frame(&mut self) -> Result<String> {
+        const MAX_WS_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+        let mut fragments: Vec<u8> = Vec::new();
+        let mut fragmenting = false;
         loop {
             let hdr = self.read_exact_buf(2)?;
+            let fin = (hdr[0] & 0x80) != 0;
             let opcode = hdr[0] & 0x0f;
             let masked = (hdr[1] & 0x80) != 0;
             let mut len = (hdr[1] & 0x7f) as usize;
@@ -1378,12 +1659,18 @@ impl GatewayWs {
                 len = u16::from_be_bytes([ext[0], ext[1]]) as usize;
             } else if len == 127 {
                 let ext = self.read_exact_buf(8)?;
-                len = u64::from_be_bytes([
+                let len_u64 = u64::from_be_bytes([
                     ext[0], ext[1], ext[2], ext[3], ext[4], ext[5], ext[6], ext[7],
-                ]) as usize;
+                ]);
+                if len_u64 > MAX_WS_MESSAGE_BYTES as u64 {
+                    bail!("OpenClaw WebSocket 数据帧超过 4 MiB 上限");
+                }
+                len = len_u64 as usize;
             }
-            if len > 16 * 1024 * 1024 {
-                bail!("OpenClaw WebSocket 数据帧过大");
+            if len > MAX_WS_MESSAGE_BYTES
+                || (opcode == 0x0 && fragments.len().saturating_add(len) > MAX_WS_MESSAGE_BYTES)
+            {
+                bail!("OpenClaw WebSocket 数据帧超过 4 MiB 上限");
             }
             let mask_key = if masked {
                 let m = self.read_exact_buf(4)?;
@@ -1400,11 +1687,30 @@ impl GatewayWs {
             match opcode {
                 0x8 => bail!("OpenClaw WebSocket 已关闭"),
                 0x9 => {
-                    // Ping -> Pong
+                    // Ping -> Pong (may interleave between fragments per RFC 6455)
                     let _ = self.write_frame(0x8A, &payload);
                 }
                 0xA => continue,
-                _ => return Ok(String::from_utf8_lossy(&payload).into_owned()),
+                0x1 | 0x2 => {
+                    if fragmenting {
+                        bail!("OpenClaw WebSocket 分片未完成即收到新消息帧");
+                    }
+                    if fin {
+                        return Ok(String::from_utf8_lossy(&payload).into_owned());
+                    }
+                    fragments = payload;
+                    fragmenting = true;
+                }
+                0x0 => {
+                    if !fragmenting {
+                        bail!("OpenClaw WebSocket 收到未匹配的续传分片帧");
+                    }
+                    fragments.extend_from_slice(&payload);
+                    if fin {
+                        return Ok(String::from_utf8_lossy(&fragments).into_owned());
+                    }
+                }
+                _ => bail!("OpenClaw WebSocket 收到不支持的操作码 ({opcode:#x})"),
             }
         }
     }
@@ -1791,11 +2097,17 @@ mod tests {
         use std::net::TcpListener;
         use std::os::unix::fs::PermissionsExt;
 
-        // Force load_openclaw_credentials() to return None so connect_with_stream exercises
-        // the android_id fallback token derivation path.
-        let cache = CREDENTIALS_CACHE.get_or_init(|| Mutex::new(None));
+        // Force load_openclaw_credentials_for_serial() to return None so connect_with_stream
+        // exercises the android_id fallback token derivation path.
+        let cache = CREDENTIALS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
         let prev_creds = cache.lock().unwrap().clone();
-        *cache.lock().unwrap() = Some((Instant::now(), None));
+        {
+            let mut guard = cache.lock().unwrap();
+            guard.insert(String::new(), (Instant::now(), None));
+            guard.insert("SERIAL-OPENCLAW-UNIT".into(), (Instant::now(), None));
+            guard.insert("usb-dead-openclaw-unit".into(), (Instant::now(), None));
+            guard.insert("10.0.1.99:15555".into(), (Instant::now(), None));
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let fake_adb = dir.path().join("adb");
@@ -2004,5 +2316,107 @@ exit 1
                 }
             }
         }
+    }
+
+    #[test]
+    fn browser_leveldb_extraction_accepts_only_local_openclaw_origins() {
+        let untrusted_blob = concat!(
+            "_https://evil.example\x00\x01openclaw_identity\x00\x01",
+            r#"{"deviceId":"evil-dev","publicKey":"evil-pk","privateKey":"evil-sk"}"#,
+            "_http://127.0.0.1:9999\x00\x01openclaw_auth\x00\x01",
+            r#"{"role":"operator","scopes":["operator.admin"],"token":"wrong-port-tok"}"#,
+        );
+        let mut dev_id = String::new();
+        let mut pk = String::new();
+        let mut sk = String::new();
+        let mut tok = String::new();
+        extract_openclaw_credentials_from_leveldb_bytes(
+            untrusted_blob.as_bytes(),
+            &mut dev_id,
+            &mut pk,
+            &mut sk,
+            &mut tok,
+        );
+        assert!(dev_id.is_empty(), "must reject https://evil.example");
+        assert!(tok.is_empty(), "must reject wrong port 9999");
+
+        let trusted_blob = concat!(
+            "_http://127.0.0.1:18789\x00\x01openclaw_identity\x00\x01",
+            r#"{"deviceId":"good-dev","publicKey":"good-pk","privateKey":"good-sk"}"#,
+            "_http://localhost:18789\x00\x01openclaw_auth\x00\x01",
+            r#"{"role":"operator","scopes":["operator.admin"],"token":"good-tok"}"#,
+        );
+        extract_openclaw_credentials_from_leveldb_bytes(
+            trusted_blob.as_bytes(),
+            &mut dev_id,
+            &mut pk,
+            &mut sk,
+            &mut tok,
+        );
+        assert_eq!(dev_id, "good-dev");
+        assert_eq!(pk, "good-pk");
+        assert_eq!(sk, "good-sk");
+        assert_eq!(tok, "good-tok");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_auth_file_uses_0600_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let auth_path = dir.path().join("stepx/openclaw_auth.json");
+        write_private_auth_file(&auth_path, r#"{"device_id":"d","public_key":"p","private_key":"s","device_token":"t"}"#).unwrap();
+        let mode = std::fs::metadata(&auth_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn read_ws_text_frame_reassembles_fragmented_continuations_and_caps_at_4mib() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            // Frame 1: FIN=0, opcode=0x1 (text), "Hello, "
+            conn.write_all(&[0x01, 7]).unwrap();
+            conn.write_all(b"Hello, ").unwrap();
+            // Interleaved Ping frame: FIN=1, opcode=0x9, "hi"
+            conn.write_all(&[0x89, 2]).unwrap();
+            conn.write_all(b"hi").unwrap();
+            // Frame 2: FIN=0, opcode=0x0 (continuation), "fragmented "
+            conn.write_all(&[0x00, 11]).unwrap();
+            conn.write_all(b"fragmented ").unwrap();
+            // Frame 3: FIN=1, opcode=0x0 (continuation), "OpenClaw!"
+            conn.write_all(&[0x80, 9]).unwrap();
+            conn.write_all(b"OpenClaw!").unwrap();
+
+            // Oversized > 4 MiB header (5 MiB)
+            let five_mib = (5u64 * 1024 * 1024).to_be_bytes();
+            let mut hdr = vec![0x81, 127];
+            hdr.extend_from_slice(&five_mib);
+            let _ = conn.write_all(&hdr);
+            let _ = conn.flush();
+            let _ = conn.shutdown(std::net::Shutdown::Write);
+            let mut sink = [0u8; 64];
+            let _ = conn.set_read_timeout(Some(Duration::from_millis(200)));
+            let _ = conn.read(&mut sink);
+        });
+
+        let client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut ws = GatewayWs {
+            stream: client,
+            buf: Vec::new(),
+            next_id: 1,
+            gateway_version: String::new(),
+            request_deadline: None,
+        };
+        let msg = ws.read_ws_text_frame().unwrap();
+        assert_eq!(msg, "Hello, fragmented OpenClaw!");
+        let err = ws.read_ws_text_frame().unwrap_err().to_string();
+        assert!(err.contains("4 MiB"), "unexpected error: {err}");
+        server.join().unwrap();
     }
 }

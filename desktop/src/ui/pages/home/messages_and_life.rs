@@ -188,6 +188,58 @@ mod home_pending_message_tests {
     }
 }
 
+pub(in crate::ui::pages) fn call_number_match_digits(raw: &str) -> String {
+    let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() > 11 {
+        digits[digits.len() - 11..].to_string()
+    } else {
+        digits
+    }
+}
+
+pub(in crate::ui::pages) fn call_numbers_match_7_to_11(a: &str, b: &str) -> bool {
+    let da = call_number_match_digits(a);
+    let db = call_number_match_digits(b);
+    if da.is_empty() || db.is_empty() {
+        let na = stepx_companion::home_reminder_governance::normalize_phone_or_addr(a);
+        let nb = stepx_companion::home_reminder_governance::normalize_phone_or_addr(b);
+        return !na.is_empty() && na == nb;
+    }
+    if da.len() >= 7 && db.len() >= 7 {
+        let overlap = da.len().min(db.len()).clamp(7, 11);
+        da[da.len() - overlap..] == db[db.len() - overlap..]
+    } else {
+        da == db
+    }
+}
+
+pub(in crate::ui::pages) fn is_unanswered_latest_missed_call(
+    missed: &stepx_companion::device::CallRecord,
+    missed_idx: usize,
+    all_calls: &[stepx_companion::device::CallRecord],
+) -> bool {
+    if missed.call_type != 3 {
+        return false;
+    }
+    for (idx, other) in all_calls.iter().enumerate() {
+        if idx == missed_idx || !call_numbers_match_7_to_11(&missed.number, &other.number) {
+            continue;
+        }
+        if other.date_ms > missed.date_ms
+            && ((other.call_type == 1 && other.duration_sec > 0) || other.call_type == 2)
+        {
+            return false;
+        }
+        if other.call_type == 3
+            && (other.date_ms > missed.date_ms
+                || (other.date_ms == missed.date_ms && idx < missed_idx))
+        {
+            return false;
+        }
+    }
+    true
+}
+
 impl Companion {
     // =========================================================================
     // ROW 3 LEFT: AVATAR-BASED IM & CALL DIRECT REPLY HUB
@@ -262,21 +314,115 @@ impl Companion {
             && !stepx_companion::home_hub::is_synthetic_e2e_probe_text(&format!("{} {}", n.title, n.text))
     }
 
-    pub(in crate::ui) fn resolve_home_actionable_reply_target(
+    fn current_reply_device_serial(&self) -> Option<String> {
+        self.selected.as_ref().map(|d| d.serial.clone())
+    }
+
+    fn is_home_reply_lock_engaged(&self) -> bool {
+        self.focus == Some(F_PUSH_REPLY) || !self.fields[F_PUSH_REPLY].text.is_empty()
+    }
+
+    pub(in crate::ui::pages::home) fn pin_home_reply_target(
+        &self,
+        key: &str,
+        thread_id: &str,
+        package_name: &str,
+        title: &str,
+    ) {
+        let target = LockedHomeReplyTarget {
+            key: key.to_string(),
+            thread_id: thread_id.to_string(),
+            package_name: package_name.to_string(),
+            title: title.to_string(),
+            device_serial: self.current_reply_device_serial(),
+        };
+        let mut reg = self.home_pointer_registry.borrow_mut();
+        reg.locked_reply_target = Some(target.clone());
+        reg.last_rendered_reply_target = Some(target);
+    }
+
+    pub(in crate::ui::pages::home) fn clear_home_reply_target_lock(&self) {
+        self.home_pointer_registry.borrow_mut().locked_reply_target = None;
+    }
+
+    fn resolve_locked_home_reply_target(
         &self,
         snapshot: &PushSnapshot,
+        locked: &LockedHomeReplyTarget,
     ) -> Option<(String, String, String, String)> {
+        if locked.device_serial != self.current_reply_device_serial() {
+            return None;
+        }
+        if let Some(number) = locked
+            .thread_id
+            .strip_prefix("sms:")
+            .or_else(|| locked.key.strip_prefix("sms:"))
+        {
+            let clean_num = number.trim();
+            if !clean_num.is_empty() {
+                let sms_handle = format!("sms:{clean_num}");
+                return Some((
+                    sms_handle.clone(),
+                    sms_handle,
+                    "com.android.mms".into(),
+                    if locked.title.trim().is_empty() {
+                        clean_num.to_string()
+                    } else {
+                        locked.title.clone()
+                    },
+                ));
+            }
+        }
+        let is_valid_thread = Self::home_thread_supports_background_reply;
+        if let Some(thread) = snapshot.threads.iter().find(|t| {
+            is_valid_thread(t)
+                && (locked.package_name.is_empty() || t.package_name == locked.package_name)
+                && ((!locked.thread_id.is_empty() && t.thread_id == locked.thread_id)
+                    || (!locked.key.is_empty()
+                        && (t.notification_key == locked.key || t.thread_id == locked.key)))
+        }) {
+            return Some((
+                if thread.notification_key.is_empty() {
+                    thread.thread_id.clone()
+                } else {
+                    thread.notification_key.clone()
+                },
+                thread.thread_id.clone(),
+                thread.package_name.clone(),
+                thread.title.clone(),
+            ));
+        }
+        if let Some(notif) = snapshot.notifications.iter().find(|n| {
+            Self::home_notification_supports_background_reply(n)
+                && (locked.package_name.is_empty() || n.package_name == locked.package_name)
+                && ((!locked.key.is_empty() && n.key == locked.key)
+                    || (!locked.thread_id.is_empty() && n.thread_id == locked.thread_id))
+        }) {
+            return Some((
+                notif.key.clone(),
+                notif.thread_id.clone(),
+                notif.package_name.clone(),
+                notif.title.clone(),
+            ));
+        }
+        None
+    }
+
+    fn resolve_home_explicit_reply_selection(
+        &self,
+        snapshot: &PushSnapshot,
+    ) -> Option<Option<(String, String, String, String)>> {
         let is_valid_thread = Self::home_thread_supports_background_reply;
         if let Some(sel_thread) = &self.push.selected_im_thread {
             if let Some(number) = sel_thread.strip_prefix("sms:") {
                 let clean_num = number.trim();
                 if !clean_num.is_empty() {
-                    return Some((
+                    return Some(Some((
                         sel_thread.clone(),
                         sel_thread.clone(),
                         "com.android.mms".into(),
                         clean_num.to_string(),
-                    ));
+                    )));
                 }
             }
             if let Some(thread) = snapshot
@@ -284,7 +430,7 @@ impl Companion {
                 .iter()
                 .find(|t| &t.thread_id == sel_thread && is_valid_thread(t))
             {
-                return Some((
+                return Some(Some((
                     if thread.notification_key.is_empty() {
                         thread.thread_id.clone()
                     } else {
@@ -293,15 +439,21 @@ impl Companion {
                     thread.thread_id.clone(),
                     thread.package_name.clone(),
                     thread.title.clone(),
-                ));
+                )));
             }
-            if let Some(notif) = snapshot.notifications.iter().find(|n|
-                &n.thread_id == sel_thread && Self::home_notification_supports_background_reply(n)) {
-                return Some((notif.key.clone(), notif.thread_id.clone(), notif.package_name.clone(), notif.title.clone()));
+            if let Some(notif) = snapshot.notifications.iter().find(|n| {
+                &n.thread_id == sel_thread && Self::home_notification_supports_background_reply(n)
+            }) {
+                return Some(Some((
+                    notif.key.clone(),
+                    notif.thread_id.clone(),
+                    notif.package_name.clone(),
+                    notif.title.clone(),
+                )));
             }
             // A stale explicit selection must not redirect the user's draft
             // to another conversation merely because it has an unread message.
-            return None;
+            return Some(None);
         }
 
         if let Some(sel_key) = self
@@ -313,18 +465,18 @@ impl Companion {
             if let Some(number) = sel_key.strip_prefix("sms:") {
                 let clean_num = number.trim();
                 if !clean_num.is_empty() {
-                    return Some((
+                    return Some(Some((
                         sel_key.clone(),
                         sel_key.clone(),
                         "com.android.mms".into(),
                         clean_num.to_string(),
-                    ));
+                    )));
                 }
             }
             if let Some(thread) = snapshot.threads.iter().find(|t| {
                 (&t.notification_key == sel_key || &t.thread_id == sel_key) && is_valid_thread(t)
             }) {
-                return Some((
+                return Some(Some((
                     if thread.notification_key.is_empty() {
                         thread.thread_id.clone()
                     } else {
@@ -333,29 +485,32 @@ impl Companion {
                     thread.thread_id.clone(),
                     thread.package_name.clone(),
                     thread.title.clone(),
-                ));
+                )));
             }
             if let Some(notif) = snapshot.notifications.iter().find(|n| {
                 &n.key == sel_key && Self::home_notification_supports_background_reply(n)
             }) {
-                return Some((
+                return Some(Some((
                     notif.key.clone(),
                     notif.thread_id.clone(),
                     notif.package_name.clone(),
                     notif.title.clone(),
-                ));
+                )));
             }
-            return None;
+            return Some(None);
         }
+        None
+    }
 
-        let is_replyable_thread = |t: &stepx_companion::push::ImThread| -> bool {
-            is_valid_thread(t)
-        };
-
+    fn resolve_home_passive_reply_candidate(
+        &self,
+        snapshot: &PushSnapshot,
+    ) -> Option<(String, String, String, String)> {
+        let is_valid_thread = Self::home_thread_supports_background_reply;
         if let Some(first_unread) = snapshot
             .threads
             .iter()
-            .filter(|t| is_replyable_thread(t))
+            .filter(|t| is_valid_thread(t))
             .find(|t| t.unread_count > 0)
             .or_else(|| {
                 snapshot
@@ -365,7 +520,7 @@ impl Companion {
             })
             .or_else(|| {
                 self.demo_mode
-                    .then(|| snapshot.threads.iter().find(|t| is_replyable_thread(t)))?
+                    .then(|| snapshot.threads.iter().find(|t| is_valid_thread(t)))?
             })
         {
             return Some((
@@ -379,9 +534,97 @@ impl Companion {
                 first_unread.title.clone(),
             ));
         }
-        snapshot.notifications.iter()
+        snapshot
+            .notifications
+            .iter()
             .find(|n| !n.read && Self::home_notification_supports_background_reply(n))
-            .map(|n| (n.key.clone(), n.thread_id.clone(), n.package_name.clone(), n.title.clone()))
+            .map(|n| {
+                (
+                    n.key.clone(),
+                    n.thread_id.clone(),
+                    n.package_name.clone(),
+                    n.title.clone(),
+                )
+            })
+    }
+
+    fn apply_reply_target_lock_policy(
+        &self,
+        snapshot: &PushSnapshot,
+        passive_fallback: impl FnOnce() -> Option<(String, String, String, String)>,
+    ) -> Option<(String, String, String, String)> {
+        let current_serial = self.current_reply_device_serial();
+        if self.is_home_reply_lock_engaged() {
+            let existing_lock = {
+                let mut reg = self.home_pointer_registry.borrow_mut();
+                if reg
+                    .locked_reply_target
+                    .as_ref()
+                    .is_some_and(|l| l.device_serial != current_serial)
+                {
+                    reg.locked_reply_target = None;
+                }
+                if reg
+                    .last_rendered_reply_target
+                    .as_ref()
+                    .is_some_and(|l| l.device_serial != current_serial)
+                {
+                    reg.last_rendered_reply_target = None;
+                }
+                reg.locked_reply_target.clone()
+            };
+            if let Some(locked) = existing_lock {
+                return self.resolve_locked_home_reply_target(snapshot, &locked);
+            }
+            if let Some(explicit_res) = self.resolve_home_explicit_reply_selection(snapshot) {
+                if let Some((ref k, ref tid, ref pkg, ref title)) = explicit_res {
+                    self.pin_home_reply_target(k, tid, pkg, title);
+                }
+                return explicit_res;
+            }
+            let last_rendered = self
+                .home_pointer_registry
+                .borrow()
+                .last_rendered_reply_target
+                .clone();
+            if let Some(last) = last_rendered {
+                self.home_pointer_registry.borrow_mut().locked_reply_target = Some(last.clone());
+                return self.resolve_locked_home_reply_target(snapshot, &last);
+            }
+            let initial = passive_fallback();
+            if let Some((ref k, ref tid, ref pkg, ref title)) = initial {
+                self.pin_home_reply_target(k, tid, pkg, title);
+            }
+            return initial;
+        }
+
+        // Draft is empty and F_PUSH_REPLY is unfocused: release any prior lock and
+        // record the passive target so focusing/typing immediately pins this sender.
+        let resolved = match self.resolve_home_explicit_reply_selection(snapshot) {
+            Some(explicit) => explicit,
+            None => passive_fallback(),
+        };
+        let mut reg = self.home_pointer_registry.borrow_mut();
+        reg.locked_reply_target = None;
+        reg.last_rendered_reply_target = resolved.as_ref().map(|(k, tid, pkg, title)| {
+            LockedHomeReplyTarget {
+                key: k.clone(),
+                thread_id: tid.clone(),
+                package_name: pkg.clone(),
+                title: title.clone(),
+                device_serial: current_serial,
+            }
+        });
+        resolved
+    }
+
+    pub(in crate::ui) fn resolve_home_actionable_reply_target(
+        &self,
+        snapshot: &PushSnapshot,
+    ) -> Option<(String, String, String, String)> {
+        self.apply_reply_target_lock_policy(snapshot, || {
+            self.resolve_home_passive_reply_candidate(snapshot)
+        })
     }
 
     pub(in crate::ui) fn render_channel_avatar(
@@ -504,7 +747,7 @@ impl Companion {
     // =========================================================================
     // MODULE 3: 待确认与消息直回 (跨端待确认问题/冲突核对 · 未接来电 · 未读消息免解锁直回)
     // =========================================================================
-    fn home_pending_im_threads<'a>(
+    pub(in crate::ui::pages::home) fn home_pending_im_threads<'a>(
         &self,
         snapshot: &'a PushSnapshot,
         now_ms: i64,
@@ -586,22 +829,28 @@ impl Companion {
         }
     }
 
-    fn home_issue_reply_target(
+    pub(in crate::ui::pages::home) fn home_issue_reply_target(
         &self,
         snapshot: &PushSnapshot,
         pending_threads: &[&stepx_companion::push::ImThread],
     ) -> Option<(String, String, String, String)> {
-        if self.push.selected_im_thread.is_some()
-            || self.push.replying_key.is_some()
-            || self.push.selected_key.is_some()
-        {
-            return self.resolve_home_actionable_reply_target(snapshot);
-        }
-        pending_threads.iter().find(|thread| Self::home_thread_supports_background_reply(thread))
-            .map(|thread| (
-                if thread.notification_key.is_empty() { thread.thread_id.clone() } else { thread.notification_key.clone() },
-                thread.thread_id.clone(), thread.package_name.clone(), thread.title.clone(),
-            ))
+        self.apply_reply_target_lock_policy(snapshot, || {
+            pending_threads
+                .iter()
+                .find(|thread| Self::home_thread_supports_background_reply(thread))
+                .map(|thread| {
+                    (
+                        if thread.notification_key.is_empty() {
+                            thread.thread_id.clone()
+                        } else {
+                            thread.notification_key.clone()
+                        },
+                        thread.thread_id.clone(),
+                        thread.package_name.clone(),
+                        thread.title.clone(),
+                    )
+                })
+        })
     }
 
     pub(in crate::ui) fn render_home_issues_and_reply_column(
@@ -734,8 +983,9 @@ impl Companion {
         let missed_calls_count = self
             .call_logs
             .iter()
-            .filter(|c| {
-                if c.call_type != 3 {
+            .enumerate()
+            .filter(|(idx, c)| {
+                if !is_unanswered_latest_missed_call(c, *idx, &self.call_logs) {
                     return false;
                 }
                 let norm =
@@ -1166,12 +1416,13 @@ impl Companion {
         });
         let dnd_on = self.back_screen.stepos_suite.controls.dnd_on;
 
-        // 3. Missed Calls (call_type == 3, within TTL)
+        // 3. Missed Calls (call_type == 3, unanswered, within TTL)
         for (idx, call) in self
             .call_logs
             .iter()
-            .filter(|c| {
-                if c.call_type != 3 {
+            .enumerate()
+            .filter(|(raw_idx, c)| {
+                if !is_unanswered_latest_missed_call(c, *raw_idx, &self.call_logs) {
                     return false;
                 }
                 let norm =
@@ -1192,6 +1443,7 @@ impl Companion {
                     || c.date_ms <= 0
                     || now_call_ms.saturating_sub(c.date_ms) <= call_ttl_ms
             })
+            .map(|(_, c)| c)
             .take(1)
             .enumerate()
         {
@@ -1688,50 +1940,70 @@ impl Companion {
                 ))
                 .finish();
 
+            let lock_header_action = Action::HomeSelectReplyTarget {
+                key: target_key.clone(),
+                thread_id: target_thread_id.clone(),
+                package_name: target_pkg.clone(),
+                title: target_title.clone(),
+            };
+            let header_identity_clickable = Hoverable::new(
+                self.mouse_state(format!("home-composer-target-pin:{target_thread_id}:{target_key}")),
+                |_| {
+                    Flex::row()
+                        .with_main_axis_size(MainAxisSize::Max)
+                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                        .with_spacing(6.)
+                        .with_child(self.render_channel_avatar(target_icon, ch_bg, ch_fg))
+                        .with_child(
+                            Expanded::new(
+                                1.,
+                                self.vstack(
+                                    1.,
+                                    vec![
+                                        {
+                                            let mut title_row = vec![self.line_w(
+                                                Self::truncate_chars(&target_title, title_budget.max(18)),
+                                                CAPTION,
+                                                p.text,
+                                                Weight::Semibold,
+                                            )];
+                                            if selected_unread > 0 {
+                                                title_row.push(self.pill_badge(
+                                                    format!("{selected_unread} 未读"),
+                                                    p.danger,
+                                                    p.danger_soft,
+                                                ));
+                                            }
+                                            self.hstack(4., title_row)
+                                        },
+                                        self.line(
+                                            if selected_last_msg.trim().is_empty() {
+                                                ch_label.to_string()
+                                            } else {
+                                                Self::truncate_chars(
+                                                    selected_last_msg.trim(),
+                                                    summary_budget.max(30),
+                                                )
+                                            },
+                                            10.,
+                                            p.text2,
+                                        ),
+                                    ],
+                                ),
+                            )
+                            .finish(),
+                        )
+                        .finish()
+                },
+            )
+            .with_cursor(Cursor::PointingHand)
+            .on_click(move |ctx, _, _| ctx.dispatch_typed_action(lock_header_action.clone()))
+            .finish();
             let composer_header = Flex::row()
                 .with_main_axis_size(MainAxisSize::Max)
                 .with_cross_axis_alignment(CrossAxisAlignment::Center)
                 .with_spacing(6.)
-                .with_child(self.render_channel_avatar(target_icon, ch_bg, ch_fg))
-                .with_child(
-                    Expanded::new(
-                        1.,
-                        self.vstack(
-                            1.,
-                            vec![
-                                {
-                                    let mut title_row = vec![self.line_w(
-                                        Self::truncate_chars(&target_title, title_budget.max(18)),
-                                        CAPTION,
-                                        p.text,
-                                        Weight::Semibold,
-                                    )];
-                                    if selected_unread > 0 {
-                                        title_row.push(self.pill_badge(
-                                            format!("{selected_unread} 未读"),
-                                            p.danger,
-                                            p.danger_soft,
-                                        ));
-                                    }
-                                    self.hstack(4., title_row)
-                                },
-                                self.line(
-                                    if selected_last_msg.trim().is_empty() {
-                                        ch_label.to_string()
-                                    } else {
-                                        Self::truncate_chars(
-                                            selected_last_msg.trim(),
-                                            summary_budget.max(30),
-                                        )
-                                    },
-                                    10.,
-                                    p.text2,
-                                ),
-                            ],
-                        ),
-                    )
-                    .finish(),
-                )
+                .with_child(Expanded::new(1., header_identity_clickable).finish())
                 .with_child(ai_draft_chip)
                 .with_child(open_phone_chip)
                 .finish();

@@ -54,8 +54,8 @@ fn invalidate_ota_cache(transport: &str) {
     }
 }
 
-fn ensure_ota_jar(adb: &Adb, device: &Device) -> Result<()> {
-    if is_ota_jar_cached(&device.transport) {
+fn ensure_ota_jar(adb: &Adb, transport: &str) -> Result<()> {
+    if is_ota_jar_cached(transport) {
         return Ok(());
     }
     let expected_len = PROBE.len();
@@ -64,9 +64,9 @@ fn ensure_ota_jar(adb: &Adb, device: &Device) -> Result<()> {
         dir = shell_quote(REMOTE_DIR),
         jar = shell_quote(REMOTE_OTA_JAR),
     );
-    if let Ok(out) = adb.script(&device.transport, &check_cmd) {
+    if let Ok(out) = adb.script(transport, &check_cmd) {
         if out.trim() == "READY" {
-            mark_ota_jar_cached(&device.transport);
+            mark_ota_jar_cached(transport);
             return Ok(());
         }
     }
@@ -74,16 +74,16 @@ fn ensure_ota_jar(adb: &Adb, device: &Device) -> Result<()> {
     file.write_all(PROBE)?;
     file.as_file().sync_all()?;
     adb.transfer(
-        &device.transport,
+        transport,
         "push",
         file.path(),
         Path::new(REMOTE_OTA_JAR),
     )?;
     adb.script(
-        &device.transport,
+        transport,
         &format!("chmod 600 {}", shell_quote(REMOTE_OTA_JAR)),
     )?;
-    mark_ota_jar_cached(&device.transport);
+    mark_ota_jar_cached(transport);
     Ok(())
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -232,10 +232,10 @@ pub fn check_official(
     device: &Device,
     mut progress: impl FnMut(&str),
 ) -> Result<OtaReport> {
-    let payload = run_probe(adb, device, &mut progress, true)?;
+    let (payload, mut transport) = run_probe_with_transport(adb, device, &mut progress, true)?;
     let mut context: Value = serde_json::from_str(&payload)?;
     ensure!(context["error"].is_null(), "无法读取手机更新组件");
-    let stamp = adb.shell(&device.transport, &["date", "+%m-%d %H:%M:%S.%3N"])?;
+    let stamp = adb.shell(&transport, &["date", "+%m-%d %H:%M:%S.%3N"])?;
     let stamp = stamp.trim();
     ensure!(
         stamp.len() == 18
@@ -246,7 +246,7 @@ pub fn check_official(
     );
     progress("正在打开手机官方更新界面，由系统更新器检查…");
     let launched = adb.shell(
-        &device.transport,
+        &transport,
         &[
             "am",
             "start",
@@ -269,12 +269,22 @@ pub fn check_official(
          logcat -d -v brief -T {stamp_q} --pid=\"$pid\" StepOSUpdate:V *:S"
     );
     loop {
-        let logs = adb
-            .run_timeout(
-                &["-s", &device.transport, "shell", &poll_cmd],
-                Duration::from_secs(8),
-            )
-            .map_err(|_| anyhow::anyhow!("无法读取官方更新器本次检查结果"))?;
+        let logs = match adb.run_timeout(
+            &["-s", &transport, "shell", &poll_cmd],
+            Duration::from_secs(8),
+        ) {
+            Ok(logs) => logs,
+            Err(_) => {
+                transport = device
+                    .resolve_active_transport(adb)
+                    .map_err(|_| anyhow::anyhow!("无法读取官方更新器本次检查结果"))?;
+                adb.run_timeout(
+                    &["-s", &transport, "shell", &poll_cmd],
+                    Duration::from_secs(8),
+                )
+                .map_err(|_| anyhow::anyhow!("无法读取官方更新器本次检查结果"))?
+            }
+        };
         if logs.lines().any(|line| line.trim() == "STEPX_OTA_NO_PID") {
             anyhow::bail!("官方更新进程没有启动");
         }
@@ -416,7 +426,7 @@ pub fn install_status(adb: &Adb, device: &Device) -> Result<InstallStatus> {
     ensure!(data["error"].is_null(), "手机更新状态读取失败");
     Ok(parse_install_status(&data["install_status"]))
 }
-fn run_probe_once(adb: &Adb, device: &Device, context_only: bool) -> Result<String> {
+fn run_probe_once(adb: &Adb, transport: &str, context_only: bool) -> Result<String> {
     let remote = format!("/data/local/tmp/stepx-ota-{:032x}", rand::random::<u128>());
     let remote_q = shell_quote(&remote);
     let jar_q = shell_quote(REMOTE_OTA_JAR);
@@ -433,7 +443,7 @@ fn run_probe_once(adb: &Adb, device: &Device, context_only: bool) -> Result<Stri
     );
     let output = adb
         .run_timeout(
-            &["-s", &device.transport, "shell", &command],
+            &["-s", transport, "shell", &command],
             Duration::from_secs(135),
         )
         .context("官方 OTA 检查超时或手机连接中断，请重试")?;
@@ -462,30 +472,40 @@ fn run_probe(
     progress: &mut impl FnMut(&str),
     context_only: bool,
 ) -> Result<String> {
-    device.verify(adb)?;
+    run_probe_with_transport(adb, device, progress, context_only).map(|(payload, _)| payload)
+}
+
+fn run_probe_with_transport(
+    adb: &Adb,
+    device: &Device,
+    progress: &mut impl FnMut(&str),
+    context_only: bool,
+) -> Result<(String, String)> {
+    let mut transport = device.resolve_active_transport(adb)?;
     progress("正在读取手机系统版本与官方更新组件…");
-    let was_cached = is_ota_jar_cached(&device.transport);
-    ensure_ota_jar(adb, device)?;
+    let was_cached = is_ota_jar_cached(&transport);
+    ensure_ota_jar(adb, &transport)?;
     progress(if context_only {
         "正在读取官方更新组件权限与状态…"
     } else {
         "正在查询官方当前渠道、稳定版、测试版和每日构建…"
     });
-    let payload = match run_probe_once(adb, device, context_only) {
+    let payload = match run_probe_once(adb, &transport, context_only) {
         Ok(payload) => payload,
         Err(err)
             if was_cached
                 && err.to_string() != "手机未安装受支持的官方更新组件"
                 && err.to_string() != "更新组件路径不受支持" =>
         {
-            invalidate_ota_cache(&device.transport);
-            ensure_ota_jar(adb, device)?;
-            run_probe_once(adb, device, context_only)?
+            invalidate_ota_cache(&transport);
+            transport = device.resolve_active_transport(adb)?;
+            ensure_ota_jar(adb, &transport)?;
+            run_probe_once(adb, &transport, context_only)?
         }
         Err(err) => return Err(err),
     };
     progress("正在核对返回版本与本机系统…");
-    Ok(payload)
+    Ok((payload, transport))
 }
 
 fn safe_text(text: &str, limit: usize) -> String {

@@ -18,7 +18,7 @@ pub const CONTROL_KEY: u16 = 4096;
 
 extern "C" {
     fn charToKeyCodes(keyChar: id) -> id;
-    fn keyCodeToChar(keyCode: NSUInteger, shifted: BOOL) -> id;
+    fn keyCodeToChar(keyCode: u16, shifted: BOOL) -> id;
 }
 
 pub struct Keycode(pub u16);
@@ -30,14 +30,19 @@ impl Keycode {
             // in aarch machines but as i8 in intel machines so we need to call .into here.
             // But clippy isn't smart enough to know that so we silence it here for now.
             #[allow(clippy::useless_conversion)]
-            let key = keyCodeToChar(self.0 as u64, shift_key_pressed.into());
+            let key = keyCodeToChar(self.0, shift_key_pressed.into());
 
             if key == nil {
                 return None;
             }
 
-            let cstr = key.UTF8String() as *const u8;
-            std::str::from_utf8(slice::from_raw_parts(cstr, key.len()))
+            let ptr = key.UTF8String() as *const u8;
+            let len = key.len();
+            if ptr.is_null() || len == 0 {
+                return None;
+            }
+
+            std::str::from_utf8(slice::from_raw_parts(ptr, len))
                 .ok()
                 .map(|s| s.to_string())
         }

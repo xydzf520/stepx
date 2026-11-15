@@ -153,9 +153,9 @@ impl_offset!(ByteOffset);
 impl AddAssign<i32> for CharOffset {
     fn add_assign(&mut self, rhs: i32) {
         if rhs.is_positive() {
-            self.0 += rhs as usize;
+            self.0 = self.0.saturating_add(rhs as usize);
         } else {
-            self.0 -= rhs.unsigned_abs() as usize;
+            self.0 = self.0.saturating_sub(rhs.unsigned_abs() as usize);
         }
     }
 }

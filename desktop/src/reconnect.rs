@@ -16,17 +16,49 @@ pub type NetworkIdentity = WirelessIdentity;
 
 pub fn normalize_mac(raw: &str) -> Option<String> {
     for token in raw.split_whitespace() {
-        let trimmed = token.trim().to_ascii_lowercase();
-        let parts: Vec<&str> = trimmed.split(':').collect();
-        if parts.len() == 6
-            && parts
+        let cleaned = token
+            .trim_matches(|c: char| matches!(c, '(' | ')' | '[' | ']' | ',' | ';'))
+            .to_ascii_lowercase();
+        let sep = if cleaned.contains(':') {
+            ':'
+        } else if cleaned.contains('-') {
+            '-'
+        } else {
+            continue;
+        };
+        let parts: Vec<&str> = cleaned.split(sep).collect();
+        if parts.len() != 6
+            || !parts
                 .iter()
-                .all(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_hexdigit()))
-            && trimmed != "02:00:00:00:00:00"
-            && trimmed != "00:00:00:00:00:00"
-            && trimmed != "ff:ff:ff:ff:ff:ff"
+                .all(|p| (1..=2).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_hexdigit()))
         {
-            return Some(trimmed);
+            continue;
+        }
+        let mut bytes = [0u8; 6];
+        let mut ok = true;
+        for (i, part) in parts.iter().enumerate() {
+            match u8::from_str_radix(part, 16) {
+                Ok(v) => bytes[i] = v,
+                Err(_) => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            continue;
+        }
+        let normalized = format!(
+            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]
+        );
+        // Reject Android dummy MAC (02:00:00:00:00:00), all-zero, broadcast, and multicast MACs
+        if normalized != "02:00:00:00:00:00"
+            && normalized != "00:00:00:00:00:00"
+            && normalized != "ff:ff:ff:ff:ff:ff"
+            && (bytes[0] & 0x01) == 0
+        {
+            return Some(normalized);
         }
     }
     None
@@ -127,19 +159,15 @@ pub fn network_identity(adb: &Adb, device: &Device) -> Option<WirelessIdentity> 
     let ip: Option<IpAddr> = id.wifi_ip.parse().ok();
 
     // Some production firmware does not expose ADB's TLS properties to shell.
+    // Only trust `transport` itself (proven live by the shell query above); never
+    // copy unverified `device.transport` or `device.backup_transports()` when live
+    // USB `getprop` reported both TLS and TCP ports disabled (`<= 0` or unset).
     if id.endpoint.is_empty() {
-        let backups = device.backup_transports();
-        for cand_transport in std::iter::once(&transport)
-            .chain(std::iter::once(&device.transport))
-            .chain(backups.iter())
-        {
-            if let Ok(address) = validate_endpoint(cand_transport) {
-                if ip.is_none() || Some(address.ip()) == ip {
-                    id.endpoint = cand_transport.clone();
-                    if id.wifi_ip.is_empty() {
-                        id.wifi_ip = address.ip().to_string();
-                    }
-                    break;
+        if let Ok(address) = validate_endpoint(&transport) {
+            if ip.is_none() || Some(address.ip()) == ip {
+                id.endpoint = transport.clone();
+                if id.wifi_ip.is_empty() {
+                    id.wifi_ip = address.ip().to_string();
                 }
             }
         }
@@ -184,21 +212,60 @@ pub fn network_identity(adb: &Adb, device: &Device) -> Option<WirelessIdentity> 
     Some(id)
 }
 
+fn usable_arp_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            !v4.is_unspecified()
+                && !v4.is_loopback()
+                && !v4.is_multicast()
+                && !v4.is_broadcast()
+        }
+        IpAddr::V6(v6) => {
+            !v6.is_unspecified()
+                && !v6.is_loopback()
+                && !v6.is_multicast()
+                && (v6.segments()[0] & 0xffc0) != 0xfe80
+        }
+    }
+}
+
 pub fn parse_arp_output_for_mac(arp_text: &str, mac: &str) -> Option<IpAddr> {
     let target_mac = normalize_mac(mac)?;
     for line in arp_text.lines() {
         let tokens: Vec<&str> = line.split_whitespace().collect();
-        if tokens.len() < 4 {
+        if tokens.len() < 3 {
             continue;
         }
+
+        // macOS / BSD `arp -an` format:
+        // `? (192.168.1.55) at a:b:cc:dd:ee:f on en0 ifscope [ethernet]`
+        if tokens.len() >= 4 && tokens[2].eq_ignore_ascii_case("at") {
+            if tokens[3].eq_ignore_ascii_case("(incomplete)")
+                || line.to_ascii_lowercase().contains("(incomplete)")
+            {
+                continue;
+            }
+            if let Some(ip_str) = tokens[1].strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+                if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                    if usable_arp_ip(ip)
+                        && normalize_mac(tokens[3]).as_deref() == Some(target_mac.as_str())
+                    {
+                        return Some(ip);
+                    }
+                }
+            }
+            continue;
+        }
+
         let Ok(ip) = tokens[0].parse::<IpAddr>() else {
             continue;
         };
-        if ip.is_unspecified() || ip.is_loopback() {
+        if !usable_arp_ip(ip) {
             continue;
         }
-        // /proc/net/arp format: IP HW_type Flags HW_address Mask Device
-        if tokens[1].starts_with("0x") && tokens[2].starts_with("0x") {
+
+        // Linux `/proc/net/arp` format: IP HW_type Flags HW_address Mask Device
+        if tokens.len() >= 4 && tokens[1].starts_with("0x") && tokens[2].starts_with("0x") {
             if tokens[2] == "0x0" {
                 continue;
             }
@@ -207,9 +274,30 @@ pub fn parse_arp_output_for_mac(arp_text: &str, mac: &str) -> Option<IpAddr> {
             }
             continue;
         }
-        // `ip -4 neigh show` format: 10.0.1.28 dev wlan0 lladdr aa:bb:cc:dd:ee:ff REACHABLE
+
+        // Windows `arp -a` format:
+        // `  192.168.1.88          aa-bb-cc-dd-ee-ff     dynamic` (or localized `动态` / `无效`)
+        if tokens.len() == 3 {
+            let entry_type = tokens[2];
+            if entry_type.eq_ignore_ascii_case("invalid")
+                || entry_type.eq_ignore_ascii_case("incomplete")
+                || entry_type == "无效"
+            {
+                continue;
+            }
+            if normalize_mac(tokens[1]).as_deref() == Some(target_mac.as_str()) {
+                return Some(ip);
+            }
+            continue;
+        }
+
+        // Linux `ip -4 neigh show` format: `10.0.1.28 dev wlan0 lladdr aa:bb:cc:dd:ee:ff REACHABLE`
         if let Some(last) = tokens.last() {
-            if last.eq_ignore_ascii_case("FAILED") || last.eq_ignore_ascii_case("INCOMPLETE") {
+            if last.eq_ignore_ascii_case("FAILED")
+                || last.eq_ignore_ascii_case("INCOMPLETE")
+                || last.eq_ignore_ascii_case("invalid")
+                || *last == "无效"
+            {
                 continue;
             }
         }
@@ -225,22 +313,74 @@ pub fn parse_arp_output_for_mac(arp_text: &str, mac: &str) -> Option<IpAddr> {
 
 pub fn resolve_ip_by_mac(mac: &str) -> Option<IpAddr> {
     let target_mac = normalize_mac(mac)?;
-    if let Ok(arp_table) = std::fs::read_to_string("/proc/net/arp") {
-        if let Some(ip) = parse_arp_output_for_mac(&arp_table, &target_mac) {
-            return Some(ip);
-        }
-    }
-    let mut cmd = Command::new("ip");
-    cmd.args(["-4", "neigh", "show"]);
-    crate::resources::quiet_command(&mut cmd);
-    if let Ok(out) = crate::adb::run_process(cmd, None, Duration::from_millis(1500)) {
-        if out.status.success() {
-            let text = String::from_utf8_lossy(&out.stdout);
-            if let Some(ip) = parse_arp_output_for_mac(&text, &target_mac) {
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(arp_table) = std::fs::read_to_string("/proc/net/arp") {
+            if let Some(ip) = parse_arp_output_for_mac(&arp_table, &target_mac) {
                 return Some(ip);
             }
         }
+        let mut cmd = Command::new("ip");
+        cmd.args(["-4", "neigh", "show"]);
+        crate::resources::quiet_command(&mut cmd);
+        if let Ok(out) = crate::adb::run_process(cmd, None, Duration::from_millis(1500)) {
+            if out.status.success() {
+                let text = String::from_utf8_lossy(&out.stdout);
+                if let Some(ip) = parse_arp_output_for_mac(&text, &target_mac) {
+                    return Some(ip);
+                }
+            }
+        }
     }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut cmd = Command::new("arp");
+        cmd.arg("-an");
+        crate::resources::quiet_command(&mut cmd);
+        if let Ok(out) = crate::adb::run_process(cmd, None, Duration::from_millis(1500)) {
+            if out.status.success() {
+                let text = String::from_utf8_lossy(&out.stdout);
+                if let Some(ip) = parse_arp_output_for_mac(&text, &target_mac) {
+                    return Some(ip);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut cmd = Command::new("arp");
+        cmd.arg("-a").creation_flags(CREATE_NO_WINDOW);
+        crate::resources::quiet_command(&mut cmd);
+        if let Ok(out) = crate::adb::run_process(cmd, None, Duration::from_millis(1500)) {
+            if out.status.success() {
+                let text = String::from_utf8_lossy(&out.stdout);
+                if let Some(ip) = parse_arp_output_for_mac(&text, &target_mac) {
+                    return Some(ip);
+                }
+            }
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "linux"), not(target_os = "macos")))]
+    {
+        let mut cmd = Command::new("arp");
+        cmd.arg("-an");
+        crate::resources::quiet_command(&mut cmd);
+        if let Ok(out) = crate::adb::run_process(cmd, None, Duration::from_millis(1500)) {
+            if out.status.success() {
+                let text = String::from_utf8_lossy(&out.stdout);
+                if let Some(ip) = parse_arp_output_for_mac(&text, &target_mac) {
+                    return Some(ip);
+                }
+            }
+        }
+    }
+
     None
 }
 
@@ -288,6 +428,7 @@ fn verified_wireless_endpoint(adb: &Adb, device: &Device, candidates: &[String])
             )
             .is_ok_and(|s| s.trim() == device.serial)
         {
+            crate::device::record_verified_serial_for_transport(&device.serial, endpoint);
             let mut backups = device.backup_transports();
             if endpoint != &device.transport && !backups.contains(endpoint) {
                 backups.push(endpoint.clone());
@@ -309,13 +450,80 @@ pub fn enable_usb_wireless_bridge(adb: &Adb, device: &Device) -> Result<NetworkI
     if let Some(id) = ensure_usb_wireless_standby(adb, device) {
         return Ok(id);
     }
-    anyhow::ensure!(
-        !crate::adb::is_wireless_transport(&device.transport),
-        "当前无线连接尚未验证，请刷新发现或使用手机系统配对码；USB 设置需要数据线连接"
-    );
+    let backups = device.backup_transports();
+    let mut usb_candidates: Vec<String> = Vec::new();
+    for cand in [device.transport.as_str(), device.serial.as_str()]
+        .into_iter()
+        .chain(backups.iter().map(String::as_str))
+    {
+        let trimmed = cand.trim();
+        if !trimmed.is_empty()
+            && !trimmed.starts_with("model:")
+            && !crate::adb::is_wireless_transport(trimmed)
+            && !usb_candidates.iter().any(|c| c == trimmed)
+        {
+            usb_candidates.push(trimmed.to_string());
+        }
+    }
+    let mut usb_transport: Option<String> = None;
+    let mut identity_mismatch = false;
+    let mut last_usb_err: Option<anyhow::Error> = None;
+    for cand in &usb_candidates {
+        match adb.run_timeout(
+            &["-s", cand, "shell", "getprop", "ro.serialno"],
+            Duration::from_secs(3),
+        ) {
+            Ok(serial) if serial.trim() == device.serial => {
+                usb_transport = Some(cand.clone());
+                break;
+            }
+            Ok(_) => {
+                identity_mismatch = true;
+            }
+            Err(err) => {
+                last_usb_err = Some(err);
+            }
+        }
+    }
+    let usb_transport = match usb_transport {
+        Some(t) => t,
+        None if identity_mismatch && !crate::adb::is_wireless_transport(&device.transport) => {
+            anyhow::bail!("USB 手机身份发生变化，请重新选择设备");
+        }
+        None if crate::adb::is_wireless_transport(&device.transport) || usb_candidates.is_empty() => {
+            anyhow::bail!(
+                "当前无线连接尚未验证，请刷新发现或使用手机系统配对码；USB 设置需要数据线连接"
+            );
+        }
+        None if identity_mismatch => {
+            anyhow::bail!("USB 手机身份发生变化，请重新选择设备");
+        }
+        None => {
+            return Err(last_usb_err.unwrap_or_else(|| {
+                anyhow::anyhow!(
+                    "当前无线连接尚未验证，请刷新发现或使用手机系统配对码；USB 设置需要数据线连接"
+                )
+            }));
+        }
+    };
+    if usb_transport != device.transport {
+        crate::device::invalidate_verified_transport(&device.transport);
+        crate::device::promote_active_transport(&device.serial, &usb_transport);
+    }
+    let mut usb_device = device.clone();
+    usb_device.transport = usb_transport.clone();
+    let remember_verified_on_device = |verified: &NetworkIdentity| {
+        if device.transport != usb_device.transport && !verified.endpoint.is_empty() {
+            let mut updated = device.backup_transports();
+            if verified.endpoint != device.transport && !updated.contains(&verified.endpoint) {
+                updated.push(verified.endpoint.clone());
+                device.set_backup_transports(updated);
+            }
+        }
+    };
     let verify_usb = || -> Result<()> {
         let serial = adb.run_timeout(
-            &["-s", &device.transport, "shell", "getprop", "ro.serialno"],
+            &["-s", &usb_transport, "shell", "getprop", "ro.serialno"],
             Duration::from_secs(3),
         )?;
         anyhow::ensure!(
@@ -324,8 +532,7 @@ pub fn enable_usb_wireless_bridge(adb: &Adb, device: &Device) -> Result<NetworkI
         );
         Ok(())
     };
-    verify_usb()?;
-    let mut id = network_identity(adb, device)
+    let mut id = network_identity(adb, &usb_device)
         .ok_or_else(|| anyhow::anyhow!("未能读取手机无线地址，请确认手机已连接 Wi-Fi"))?;
     anyhow::ensure!(!id.wifi_ip.is_empty(), "请先将手机连接至与电脑互通的 Wi-Fi");
     // Never restart a running listener because authorization/discovery is still pending.
@@ -336,7 +543,7 @@ pub fn enable_usb_wireless_bridge(adb: &Adb, device: &Device) -> Result<NetworkI
     let enabled = adb.run_timeout(
         &[
             "-s",
-            &device.transport,
+            &usb_transport,
             "shell",
             "settings",
             "get",
@@ -350,7 +557,7 @@ pub fn enable_usb_wireless_bridge(adb: &Adb, device: &Device) -> Result<NetworkI
         adb.run_timeout(
             &[
                 "-s",
-                &device.transport,
+                &usb_transport,
                 "shell",
                 "settings",
                 "put",
@@ -363,10 +570,11 @@ pub fn enable_usb_wireless_bridge(adb: &Adb, device: &Device) -> Result<NetworkI
     }
     for _ in 0..6 {
         std::thread::sleep(Duration::from_millis(300));
-        if let Some(verified) = ensure_usb_wireless_standby(adb, device) {
+        if let Some(verified) = ensure_usb_wireless_standby(adb, &usb_device) {
+            remember_verified_on_device(&verified);
             return Ok(verified);
         }
-        if let Some(fresh) = network_identity(adb, device) {
+        if let Some(fresh) = network_identity(adb, &usb_device) {
             id = fresh;
         }
         if !id.endpoint.is_empty() {
@@ -382,7 +590,7 @@ pub fn enable_usb_wireless_bridge(adb: &Adb, device: &Device) -> Result<NetworkI
         adb.run_timeout(
             &[
                 "-s",
-                &device.transport,
+                &usb_transport,
                 "shell",
                 "settings",
                 "get",
@@ -397,13 +605,14 @@ pub fn enable_usb_wireless_bridge(adb: &Adb, device: &Device) -> Result<NetworkI
     );
     verify_usb()?;
     adb.run_timeout(
-        &["-s", &device.transport, "tcpip", "5555"],
+        &["-s", &usb_transport, "tcpip", "5555"],
         Duration::from_secs(5),
     )?;
     // adbd restarted: discard all pre-restart addresses, and wait for fresh identity.
     for _ in 0..10 {
         std::thread::sleep(Duration::from_millis(300));
-        if let Some(verified) = ensure_usb_wireless_standby(adb, device) {
+        if let Some(verified) = ensure_usb_wireless_standby(adb, &usb_device) {
+            remember_verified_on_device(&verified);
             return Ok(verified);
         }
     }
@@ -411,8 +620,21 @@ pub fn enable_usb_wireless_bridge(adb: &Adb, device: &Device) -> Result<NetworkI
 }
 
 pub fn targets(prefs: &Preferences, services: &[Service], paired_hosts: &[IpAddr]) -> Vec<String> {
-    let mut targets = Vec::new();
-    for service in services
+    let prioritized = crate::discovery::prioritize_and_dedup_services(services.to_vec());
+    let mut ipv4_targets = Vec::new();
+    let mut ipv6_targets = Vec::new();
+    let mut push_unique = |endpoint: String, is_ipv4: bool| {
+        if ipv4_targets.contains(&endpoint) || ipv6_targets.contains(&endpoint) {
+            return;
+        }
+        if is_ipv4 {
+            ipv4_targets.push(endpoint);
+        } else {
+            ipv6_targets.push(endpoint);
+        }
+    };
+
+    for service in prioritized
         .iter()
         .filter(|s| s.kind == "_adb-tls-connect._tcp")
     {
@@ -430,37 +652,35 @@ pub fn targets(prefs: &Preferences, services: &[Service], paired_hosts: &[IpAddr
             };
             matches(&d.serial) || identity.is_some_and(|i| matches(&i.guid))
         });
-        if (remembered || paired_hosts.contains(&address.ip()))
-            && !targets.contains(&service.endpoint)
-        {
-            targets.push(service.endpoint.clone());
+        if remembered || paired_hosts.contains(&address.ip()) {
+            push_unique(service.endpoint.clone(), address.is_ipv4());
         }
     }
     // A remembered address helps networks which suppress multicast. Never reuse a pairing port.
+    // Place IPv4 remembered & ARP endpoints ahead of secondary IPv6 aliases so `truncate(6)`
+    // never starves reachable IPv4 endpoints when dual-stack / temporary IPv6 is active.
     for d in &prefs.devices {
         if let Some(i) = prefs.wireless.get(&d.serial) {
             let old_addr = validate_endpoint(&i.endpoint).ok();
-            if old_addr.is_some() && !targets.contains(&i.endpoint) {
-                targets.push(i.endpoint.clone());
+            if let Some(addr) = old_addr {
+                push_unique(i.endpoint.clone(), addr.is_ipv4());
             }
             if !i.wlan_mac.is_empty() {
                 if let Some(arp_ip) = resolve_ip_by_mac(&i.wlan_mac) {
                     if old_addr.map(|a| a.ip()) != Some(arp_ip) {
-                        let arp_5555 = SocketAddr::new(arp_ip, 5555).to_string();
-                        if !targets.contains(&arp_5555) {
-                            targets.push(arp_5555);
-                        }
+                        let arp_5555 = SocketAddr::new(arp_ip, 5555);
+                        push_unique(arp_5555.to_string(), arp_5555.is_ipv4());
                         if let Some(addr) = old_addr {
-                            let arp_old_port = SocketAddr::new(arp_ip, addr.port()).to_string();
-                            if !targets.contains(&arp_old_port) {
-                                targets.push(arp_old_port);
-                            }
+                            let arp_old_port = SocketAddr::new(arp_ip, addr.port());
+                            push_unique(arp_old_port.to_string(), arp_old_port.is_ipv4());
                         }
                     }
                 }
             }
         }
     }
+    let mut targets = ipv4_targets;
+    targets.extend(ipv6_targets);
     targets.truncate(6);
     targets
 }
@@ -539,8 +759,10 @@ fn connect_remembered(
             &["-s", &endpoint, "shell", "getprop ro.serialno"],
             Duration::from_secs(3),
         ) {
+            let trimmed_serial = serial.trim();
             let paired = validate_endpoint(&endpoint).is_ok_and(|a| paired_hosts.contains(&a.ip()));
-            if prefs.devices.iter().any(|d| d.serial == serial.trim()) || paired {
+            if prefs.devices.iter().any(|d| d.serial == trimmed_serial) || paired {
+                crate::device::record_verified_serial_for_transport(trimmed_serial, &endpoint);
                 continue;
             }
         }
@@ -824,5 +1046,106 @@ IP address       HW type     Flags       HW address            Mask     Device
             parse_arp_output_for_mac(ip_neigh, "AA:BB:CC:DD:EE:FF"),
             Some("10.0.1.91".parse().unwrap())
         );
+
+        // macOS `arp -an` (including single-digit hex octets and `(incomplete)` skip)
+        let macos_arp = "\
+? (192.168.1.1) at 0:11:22:33:44:55 on en0 ifscope [ethernet]
+? (192.168.1.54) at (incomplete) on en0 ifscope [ethernet]
+? (192.168.1.55) at a:b:cc:d:ee:f on en0 ifscope [ethernet]
+? (192.168.1.255) at ff:ff:ff:ff:ff:ff on en0 ifscope [ethernet]
+";
+        assert_eq!(
+            parse_arp_output_for_mac(macos_arp, "0a:0b:cc:0d:ee:0f"),
+            Some("192.168.1.55".parse().unwrap())
+        );
+
+        // Windows `arp -a` (both English and Chinese locales, skipping invalid/multicast/broadcast)
+        let windows_arp_en = "\
+Interface: 192.168.1.10 --- 0xc
+  Internet Address      Physical Address      Type
+  192.168.1.1           00-11-22-33-44-55     dynamic
+  192.168.1.87          aa-bb-cc-dd-ee-ff     invalid
+  192.168.1.88          aa-bb-cc-dd-ee-ff     dynamic
+  224.0.0.22            01-00-5e-00-00-16     static
+  255.255.255.255       ff-ff-ff-ff-ff-ff     static
+";
+        assert_eq!(
+            parse_arp_output_for_mac(windows_arp_en, "aa:bb:cc:dd:ee:ff"),
+            Some("192.168.1.88".parse().unwrap())
+        );
+
+        let windows_arp_zh = "\
+接口: 192.168.31.12 --- 0x11
+  Internet 地址         物理地址              类型
+  192.168.31.65         aa-bb-cc-dd-ee-ff     无效
+  192.168.31.66         AA-BB-CC-DD-EE-FF     动态
+";
+        assert_eq!(
+            parse_arp_output_for_mac(windows_arp_zh, "aa:bb:cc:dd:ee:ff"),
+            Some("192.168.31.66".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn targets_prioritizes_ipv4_and_deduplicates_temp_ipv6_without_starving_remembered_ipv4() {
+        let mut prefs = Preferences::default();
+        prefs.remember("serial-dual".into(), "PZ261A".into());
+        prefs.wireless.insert(
+            "serial-dual".into(),
+            WirelessIdentity {
+                guid: "adb-serial-dual-guid".into(),
+                endpoint: "192.168.1.42:38111".into(),
+                ..Default::default()
+            },
+        );
+        let svc = |name: &str, ep: &str| Service {
+            name: name.into(),
+            kind: "_adb-tls-connect._tcp".into(),
+            endpoint: ep.into(),
+        };
+        let services = vec![
+            svc("adb-serial-dual-guid", "[fe80::1234]:41000"),
+            svc("adb-serial-dual-guid", "[2408:8207:1::a1]:41000"),
+            svc("adb-serial-dual-guid", "[2408:8207:1::a2]:41000"),
+            svc("adb-serial-dual-guid", "[2408:8207:1::a3]:41000"),
+            svc("adb-serial-dual-guid", "[2408:8207:1::a4]:41000"),
+            svc("adb-serial-dual-guid", "[2408:8207:1::a5]:41000"),
+            svc("adb-serial-dual-guid", "[2408:8207:1::a6]:41000"),
+            svc("adb-serial-dual-guid", "192.168.1.90:41000"),
+        ];
+        let list = targets(&prefs, &services, &[]);
+        assert_eq!(
+            list,
+            vec![
+                "192.168.1.90:41000".to_string(),
+                "192.168.1.42:38111".to_string(),
+                "[2408:8207:1::a1]:41000".to_string(),
+            ],
+            "IPv4 mDNS and remembered IPv4 must precede collapsed temporary IPv6: {list:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn usb_disabled_ports_do_not_copy_stale_backup_transports_and_wireless_handle_uses_plugged_usb() {
+        let (_dir, adb, usb_device) = wireless_fixture("bootstrap");
+        usb_device.set_backup_transports(vec!["192.0.2.44:41001".into()]);
+
+        let id = network_identity(&adb, &usb_device).expect("usb network identity");
+        assert!(
+            id.endpoint.is_empty(),
+            "stale backup wireless transport must not be copied when USB getprop ports are disabled"
+        );
+
+        let wireless_handle = Device {
+            serial: usb_device.serial.clone(),
+            transport: "192.0.2.44:41001".into(),
+            model: usb_device.model.clone(),
+            android: usb_device.android.clone(),
+            product: usb_device.product.clone(),
+        };
+        let bridged = enable_usb_wireless_bridge(&adb, &wireless_handle)
+            .expect("plugged-in USB transport should bootstrap wireless even when device.transport is wireless");
+        assert_eq!(bridged.endpoint, "192.0.2.99:5555");
     }
 }

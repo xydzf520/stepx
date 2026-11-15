@@ -294,6 +294,21 @@ pub fn process_clipboard_image(
     result
 }
 
+/// Decodes encoded clipboard [`crate::clipboard::ImageData`] bytes (PNG, JPEG, GIF, WebP)
+/// into raw RGBA pixels suitable for writing via [`arboard`].
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub fn decode_image_for_arboard(
+    image_data: &crate::clipboard::ImageData,
+) -> Option<arboard::ImageData<'static>> {
+    let rgba = image::load_from_memory(&image_data.data).ok()?.into_rgba8();
+    let (width, height) = rgba.dimensions();
+    Some(arboard::ImageData {
+        width: width as usize,
+        height: height as usize,
+        bytes: std::borrow::Cow::Owned(rgba.into_raw()),
+    })
+}
+
 /// Read image data from clipboard, checking for images before expensive filename extraction.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub fn read_images_from_clipboard(

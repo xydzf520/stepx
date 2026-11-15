@@ -346,7 +346,9 @@ impl Companion {
         ));
         if state.playing {
             parts.push(self.bs_button("stop", "停止并恢复", BsAction::Stop, Btn::Secondary));
-        } else if state.applied_to_phone && state.companion_mode != "native" {
+        } else if (state.applied_to_phone && state.companion_mode != "native")
+            || state.pomodoro_active
+        {
             parts.push(self.bs_button(
                 "stop-companion",
                 "停止并恢复",
@@ -668,7 +670,8 @@ impl Companion {
         let mut value = field.text.clone();
         let mut caret = 0;
         if focused {
-            let cursor = field.cursor.min(value.len());
+            let cursor =
+                crate::ui::keyboard_input::clamp_char_boundary(&value, field.cursor.min(value.len()));
             caret = value[..cursor].chars().count() + field.preedit.chars().count();
             value.insert_str(cursor, &field.preedit);
         }

@@ -35,7 +35,12 @@ public final class PushStore {
     public static final int MAX_MESSAGES_PER_THREAD = 100;
     public static final int MAX_NOTIFICATIONS = 500;
     public static final int MAX_HANDLES = 80;
+    public static final int MAX_PENDING_INTENT_ENTRIES = 512;
+    public static final int MAX_ALIAS_ENTRIES = 512;
+    public static final int MAX_DELETED_MESSAGES = 2048;
     public static final int MAX_CLIENT_MSG_IDS = 64;
+    public static final int MAX_BINDER_SNAPSHOT_CHARS = 180_000;
+    public static final int MAX_SOCKET_SNAPSHOT_CHARS = 350_000;
     public static final long ONGOING_THROTTLE_WINDOW_MS = 2000L;
     public static final long OTP_TTL_MS = 15L * 60L * 1000L;
 
@@ -57,15 +62,123 @@ public final class PushStore {
     private static volatile PushStore singleton;
 
     public static PushStore get(Context context) {
-        if (singleton == null) {
-            synchronized (PushStore.class) {
-                if (singleton == null) {
-                    File dir = context != null ? context.getExternalFilesDir(null) : null;
-                    singleton = new PushStore(dir);
+        PushStore existing = singleton;
+        if (existing != null) {
+            return existing;
+        }
+        if (context != null) {
+            android.os.UserManager um = context.getSystemService(android.os.UserManager.class);
+            if (um != null && !um.isUserUnlocked()) {
+                return new PushStore(null, null);
+            }
+        }
+        synchronized (PushStore.class) {
+            if (singleton == null) {
+                if (context == null) {
+                    singleton = new PushStore(null, null);
+                } else {
+                    android.os.UserManager um = context.getSystemService(android.os.UserManager.class);
+                    if (um != null && !um.isUserUnlocked()) {
+                        return new PushStore(null, null);
+                    }
+                    Context appCtx = context.getApplicationContext() != null
+                        ? context.getApplicationContext()
+                        : context;
+                    File dbFile = appCtx.getDatabasePath("push.sqlite3");
+                    File internalDir = dbFile != null ? dbFile.getParentFile() : null;
+                    File legacyExtDir = null;
+                    try {
+                        legacyExtDir = appCtx.getExternalFilesDir(null);
+                    } catch (Throwable ignored) {
+                    }
+                    migrateLegacyExternalDbIfNeeded(dbFile, legacyExtDir);
+                    singleton = new PushStore(internalDir, legacyExtDir != null ? legacyExtDir : internalDir);
                 }
             }
         }
         return singleton;
+    }
+
+    static void migrateLegacyExternalDbIfNeeded(File internalDbFile, File legacyExtDir) {
+        if (internalDbFile == null || legacyExtDir == null) return;
+        File internalDir = internalDbFile.getParentFile();
+        if (internalDir == null) return;
+        if (!internalDir.isDirectory() && !internalDir.mkdirs()) return;
+        File legacyDbFile = new File(legacyExtDir, "push.sqlite3");
+        if (internalDbFile.exists()) {
+            deleteLegacyExternalDbFiles(legacyExtDir);
+            return;
+        }
+        try {
+            if (!legacyDbFile.isFile() || java.nio.file.Files.isSymbolicLink(legacyDbFile.toPath())) {
+                return;
+            }
+            android.database.sqlite.SQLiteDatabase legacyDb = null;
+            try {
+                legacyDb = android.database.sqlite.SQLiteDatabase.openDatabase(
+                    legacyDbFile.getPath(), null, android.database.sqlite.SQLiteDatabase.OPEN_READWRITE
+                );
+                try (android.database.Cursor c = legacyDb.rawQuery("PRAGMA wal_checkpoint(TRUNCATE)", null)) {
+                    if (c != null) c.moveToFirst();
+                }
+                try (android.database.Cursor qc = legacyDb.rawQuery("PRAGMA quick_check(1)", null)) {
+                    if (qc == null || !qc.moveToFirst() || !"ok".equals(qc.getString(0))) {
+                        return;
+                    }
+                }
+            } finally {
+                if (legacyDb != null) {
+                    try { legacyDb.close(); } catch (Throwable ignored) {}
+                }
+            }
+            File tmpTarget = new File(internalDir, "push.sqlite3.migrating." + android.os.Process.myPid());
+            try (java.io.FileInputStream in = new java.io.FileInputStream(legacyDbFile);
+                 java.io.FileOutputStream out = new java.io.FileOutputStream(tmpTarget)) {
+                byte[] buf = new byte[16384];
+                int n;
+                while ((n = in.read(buf)) > 0) {
+                    out.write(buf, 0, n);
+                }
+                out.flush();
+                out.getFD().sync();
+            }
+            tmpTarget.setReadable(false, false);
+            tmpTarget.setReadable(true, true);
+            tmpTarget.setWritable(false, false);
+            tmpTarget.setWritable(true, true);
+            try {
+                java.nio.file.Files.move(
+                    tmpTarget.toPath(),
+                    internalDbFile.toPath(),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                    java.nio.file.StandardCopyOption.ATOMIC_MOVE
+                );
+            } catch (java.nio.file.AtomicMoveNotSupportedException fallback) {
+                java.nio.file.Files.move(
+                    tmpTarget.toPath(),
+                    internalDbFile.toPath(),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING
+                );
+            }
+            if (internalDbFile.isFile() && internalDbFile.length() > 0) {
+                deleteLegacyExternalDbFiles(legacyExtDir);
+            }
+        } catch (Throwable error) {
+            android.util.Log.w("StepXPushStore", "Legacy external DB migration deferred", error);
+        }
+    }
+
+    private static void deleteLegacyExternalDbFiles(File legacyExtDir) {
+        if (legacyExtDir == null) return;
+        for (String name : new String[]{"push.sqlite3", "push.sqlite3-wal", "push.sqlite3-shm", "push.sqlite3-journal"}) {
+            try {
+                File f = new File(legacyExtDir, name);
+                if (f.exists() && !java.nio.file.Files.isSymbolicLink(f.toPath())) {
+                    f.delete();
+                }
+            } catch (Throwable ignored) {
+            }
+        }
     }
 
     public static PushStore getInstance(Context context) {
@@ -659,29 +772,29 @@ public final class PushStore {
     private final Map<String, ThreadRecord> threadsById = new LinkedHashMap<String, ThreadRecord>();
     private final List<NotificationRecord> notifications = new ArrayList<NotificationRecord>();
 
-    // Soft-retained LRU caches for RemoteReplyHandle
-    private final Map<String, RemoteReplyHandle> handlesByThread = new LinkedHashMap<String, RemoteReplyHandle>(32, 0.75f, true) {
+    // Soft-retained bounded LRU caches for RemoteReplyHandle & PendingIntent
+    private final Map<String, RemoteReplyHandle> handlesByThread = new LinkedHashMap<String, RemoteReplyHandle>(64, 0.75f, true) {
         @Override
         protected boolean removeEldestEntry(Map.Entry<String, RemoteReplyHandle> eldest) {
-            return size() > MAX_HANDLES;
+            return size() > MAX_PENDING_INTENT_ENTRIES;
         }
     };
-    private final Map<String, RemoteReplyHandle> handlesByKey = new LinkedHashMap<String, RemoteReplyHandle>(32, 0.75f, true) {
+    private final Map<String, RemoteReplyHandle> handlesByKey = new LinkedHashMap<String, RemoteReplyHandle>(64, 0.75f, true) {
         @Override
         protected boolean removeEldestEntry(Map.Entry<String, RemoteReplyHandle> eldest) {
-            return size() > MAX_HANDLES;
+            return size() > MAX_PENDING_INTENT_ENTRIES;
         }
     };
     private final Map<String, PendingIntent> contentIntentsByKey = new LinkedHashMap<String, PendingIntent>(64, 0.75f, true) {
         @Override
         protected boolean removeEldestEntry(Map.Entry<String, PendingIntent> eldest) {
-            return size() > MAX_HANDLES * 2;
+            return size() > MAX_PENDING_INTENT_ENTRIES;
         }
     };
     private final Map<String, PendingIntent> contentIntentsByThread = new LinkedHashMap<String, PendingIntent>(64, 0.75f, true) {
         @Override
         protected boolean removeEldestEntry(Map.Entry<String, PendingIntent> eldest) {
-            return size() > MAX_HANDLES * 2;
+            return size() > MAX_PENDING_INTENT_ENTRIES;
         }
     };
 
@@ -693,14 +806,47 @@ public final class PushStore {
         }
     };
 
-    private final Map<String, ThrottleState> ongoingThrottle = new HashMap<String, ThrottleState>();
-    private final Map<String, String> resolvedGenericThreadAliases = new HashMap<String, String>();
-    private final Map<String, Long> deletedThreads = new LinkedHashMap<String, Long>();
-    private final Map<String, Long> clearedThreads = new LinkedHashMap<String, Long>();
-    private final java.util.Set<String> deletedMessages = new java.util.LinkedHashSet<String>();
+    private final Map<String, ThrottleState> ongoingThrottle = new LinkedHashMap<String, ThrottleState>(64, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, ThrottleState> eldest) {
+            return size() > MAX_PENDING_INTENT_ENTRIES;
+        }
+    };
+    private final Map<String, String> resolvedGenericThreadAliases = new LinkedHashMap<String, String>(64, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
+            return size() > MAX_ALIAS_ENTRIES;
+        }
+    };
+    private final Map<String, Long> deletedThreads = new LinkedHashMap<String, Long>(64, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, Long> eldest) {
+            return size() > MAX_ALIAS_ENTRIES;
+        }
+    };
+    private final Map<String, Long> clearedThreads = new LinkedHashMap<String, Long>(64, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, Long> eldest) {
+            return size() > MAX_ALIAS_ENTRIES;
+        }
+    };
+    private final java.util.Set<String> deletedMessages = java.util.Collections.newSetFromMap(
+        new LinkedHashMap<String, Boolean>(128, 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry<String, Boolean> eldest) {
+                return size() > MAX_DELETED_MESSAGES;
+            }
+        }
+    );
+    private final File legacyStorageDir;
 
     PushStore(File storageDir) {
+        this(storageDir, storageDir);
+    }
+
+    PushStore(File storageDir, File legacyStorageDir) {
         this.storageDir = storageDir;
+        this.legacyStorageDir = legacyStorageDir != null ? legacyStorageDir : storageDir;
         loadFromDisk();
         if (!threadsById.isEmpty() || !notifications.isEmpty()) {
             lastGapMs = System.currentTimeMillis();
@@ -1609,7 +1755,24 @@ public final class PushStore {
         notifications.add(0, entry);
         while (notifications.size() > MAX_NOTIFICATIONS) {
             historyTruncated = true;
-            notifications.remove(notifications.size() - 1);
+            NotificationRecord evicted = notifications.remove(notifications.size() - 1);
+            if (evicted != null && evicted.key != null && !evicted.key.isEmpty()) {
+                boolean keyStillActive = false;
+                for (int i = 0; i < notifications.size(); i++) {
+                    NotificationRecord rem = notifications.get(i);
+                    if (rem != null && evicted.key.equals(rem.key)) {
+                        keyStillActive = true;
+                        break;
+                    }
+                }
+                if (!keyStillActive) {
+                    ongoingThrottle.remove(evicted.key);
+                    contentIntentsByKey.remove(evicted.key);
+                    if (evicted.threadId == null || evicted.threadId.isEmpty() || handlesByThread.containsKey(evicted.threadId)) {
+                        handlesByKey.remove(evicted.key);
+                    }
+                }
+            }
         }
     }
 
@@ -1902,6 +2065,17 @@ public final class PushStore {
             ThreadRecord t = sorted.get(i);
             threadsById.put(t.threadId, t);
         }
+        for (int i = limit; i < sorted.size(); i++) {
+            ThreadRecord evicted = sorted.get(i);
+            if (evicted != null && evicted.threadId != null) {
+                handlesByThread.remove(evicted.threadId);
+                contentIntentsByThread.remove(evicted.threadId);
+                if (evicted.lastNotificationKey != null && !evicted.lastNotificationKey.isEmpty()) {
+                    handlesByKey.remove(evicted.lastNotificationKey);
+                    contentIntentsByKey.remove(evicted.lastNotificationKey);
+                }
+            }
+        }
     }
 
     /**
@@ -1941,6 +2115,14 @@ public final class PushStore {
                     affectedThreadId = n.threadId;
                 }
             }
+        }
+
+        // Prune per-notification key caches when not needed (soft-retain thread-scoped handles in handlesByThread!)
+        if (affectedThreadId == null || affectedThreadId.isEmpty() || contentIntentsByThread.containsKey(affectedThreadId)) {
+            contentIntentsByKey.remove(sbnKey);
+        }
+        if (affectedThreadId == null || affectedThreadId.isEmpty() || handlesByThread.containsKey(affectedThreadId)) {
+            handlesByKey.remove(sbnKey);
         }
 
         if (userOrAppRead) {
@@ -3480,7 +3662,134 @@ public final class PushStore {
         return modified;
     }
 
+    private static JSONObject copyJsonObjectWithout(JSONObject src, String omitA, String omitB) throws JSONException {
+        if (src == null) return null;
+        JSONObject dst = new JSONObject();
+        java.util.Iterator<String> keys = src.keys();
+        while (keys.hasNext()) {
+            String k = keys.next();
+            if (k == null || k.equals(omitA) || k.equals(omitB)) continue;
+            dst.put(k, src.opt(k));
+        }
+        return dst;
+    }
+
+    private static JSONArray stripThreadMessagesMediaNonMutating(JSONArray msgs) throws JSONException {
+        if (msgs == null) return null;
+        boolean hasAnyMedia = false;
+        for (int i = 0; i < msgs.length(); i++) {
+            JSONObject mj = msgs.optJSONObject(i);
+            if (mj != null && (mj.has("mediaB64") || mj.has("media_b64"))) {
+                hasAnyMedia = true;
+                break;
+            }
+        }
+        if (!hasAnyMedia) return msgs;
+        JSONArray out = new JSONArray();
+        for (int i = 0; i < msgs.length(); i++) {
+            JSONObject mj = msgs.optJSONObject(i);
+            if (mj != null && (mj.has("mediaB64") || mj.has("media_b64"))) {
+                out.put(copyJsonObjectWithout(mj, "mediaB64", "media_b64"));
+            } else {
+                out.put(msgs.opt(i));
+            }
+        }
+        return out;
+    }
+
+    static String trimSerializedPayloadIfNeeded(JSONObject root, int maxChars) {
+        if (root == null) return "{}";
+        String serialized = root.toString();
+        if (serialized.length() <= maxChars) return serialized;
+        try {
+            JSONObject clone = copyJsonObjectWithout(root, null, null);
+            JSONObject singleThread = clone.optJSONObject("thread");
+            if (singleThread != null) {
+                JSONObject tc = copyJsonObjectWithout(singleThread, "sender_avatars", null);
+                JSONArray msgs = stripThreadMessagesMediaNonMutating(tc.optJSONArray("messages"));
+                if (msgs != null) {
+                    tc.put("messages", msgs);
+                    if (clone.has("messages")) {
+                        clone.put("messages", msgs);
+                    }
+                }
+                clone.put("thread", tc);
+                serialized = clone.toString();
+                if (serialized.length() <= maxChars) return serialized;
+                tc.remove("avatar_b64");
+                serialized = clone.toString();
+                if (serialized.length() <= maxChars) return serialized;
+            }
+            JSONArray threadsArr = clone.optJSONArray("threads");
+            JSONArray feedArr = clone.optJSONArray("notifications");
+            if (threadsArr != null || feedArr != null) {
+                serialized = trimSnapshotArraysNonMutating(clone, threadsArr, feedArr, maxChars);
+            }
+        } catch (Throwable ignored) {
+        }
+        return serialized;
+    }
+
+    private static String trimSnapshotArraysNonMutating(
+            JSONObject container,
+            JSONArray srcThreads,
+            JSONArray srcFeed,
+            int maxChars) throws JSONException {
+        JSONArray threadsClone = new JSONArray();
+        if (srcThreads != null) {
+            for (int i = 0; i < srcThreads.length(); i++) {
+                JSONObject tj = srcThreads.optJSONObject(i);
+                threadsClone.put(tj != null ? copyJsonObjectWithout(tj, "sender_avatars", null) : srcThreads.opt(i));
+            }
+            container.put("threads", threadsClone);
+        }
+        if (srcFeed != null) {
+            JSONArray feedClone = new JSONArray();
+            for (int i = 0; i < srcFeed.length(); i++) {
+                JSONObject nj = srcFeed.optJSONObject(i);
+                feedClone.put(nj != null ? copyJsonObjectWithout(nj, "avatar_b64", null) : srcFeed.opt(i));
+            }
+            container.put("notifications", feedClone);
+        }
+        String serialized = container.toString();
+        if (serialized.length() <= maxChars) return serialized;
+
+        // Strip inline message media previews (mediaB64 / media_b64) without mutating MessageRecord.cachedJson
+        for (int i = 0; i < threadsClone.length(); i++) {
+            JSONObject tj = threadsClone.optJSONObject(i);
+            if (tj != null) {
+                JSONArray msgs = stripThreadMessagesMediaNonMutating(tj.optJSONArray("messages"));
+                if (msgs != null) {
+                    tj.put("messages", msgs);
+                }
+            }
+        }
+        serialized = container.toString();
+        if (serialized.length() <= maxChars) return serialized;
+
+        for (int i = threadsClone.length() - 1; i >= 8; i--) {
+            JSONObject tj = threadsClone.optJSONObject(i);
+            if (tj != null) {
+                tj.remove("avatar_b64");
+            }
+        }
+        serialized = container.toString();
+        if (serialized.length() <= maxChars) return serialized;
+
+        for (int i = Math.min(7, threadsClone.length() - 1); i >= 0; i--) {
+            JSONObject tj = threadsClone.optJSONObject(i);
+            if (tj != null) {
+                tj.remove("avatar_b64");
+            }
+        }
+        return container.toString();
+    }
+
     public synchronized JSONObject snapshot(long sinceRevision) throws JSONException {
+        return snapshot(sinceRevision, false);
+    }
+
+    public synchronized JSONObject snapshot(long sinceRevision, boolean viaBinder) throws JSONException {
         long now = System.currentTimeMillis();
         pruneLocked(now);
         boolean unchanged = isUnchangedSnapshot(sinceRevision);
@@ -3524,6 +3833,16 @@ public final class PushStore {
             copy.put("unreadImCount", cachedSnapshotObj.optInt("unreadImCount", 0));
             copy.put("activePushCount", cachedSnapshotObj.optInt("activePushCount", 0));
             copy.put("totalPushCount", cachedSnapshotObj.optInt("totalPushCount", 0));
+            if (viaBinder && (cachedSnapshotJson == null || cachedSnapshotJson.length() > MAX_BINDER_SNAPSHOT_CHARS)) {
+                if (copy.toString().length() > MAX_BINDER_SNAPSHOT_CHARS) {
+                    trimSnapshotArraysNonMutating(
+                        copy,
+                        copy.optJSONArray("threads"),
+                        copy.optJSONArray("notifications"),
+                        MAX_BINDER_SNAPSHOT_CHARS
+                    );
+                }
+            }
             return copy;
         }
 
@@ -3598,29 +3917,10 @@ public final class PushStore {
         out.put("activePushCount", activePushCount);
         out.put("totalPushCount", notifications.size());
         String serialized = out.toString();
-        if (serialized.length() > 350_000) {
-            for (int i = 0; i < threadsArr.length(); i++) {
-                JSONObject tj = threadsArr.optJSONObject(i);
-                if (tj != null) {
-                    tj.remove("sender_avatars");
-                }
-            }
-            for (int i = 0; i < feedArr.length(); i++) {
-                JSONObject nj = feedArr.optJSONObject(i);
-                if (nj != null) {
-                    nj.remove("avatar_b64");
-                }
-            }
-            serialized = out.toString();
-            if (serialized.length() > 350_000) {
-                for (int i = threadsArr.length() - 1; i >= 8; i--) {
-                    JSONObject tj = threadsArr.optJSONObject(i);
-                    if (tj != null) {
-                        tj.remove("avatar_b64");
-                    }
-                }
-                serialized = out.toString();
-            }
+        if (serialized.length() > MAX_SOCKET_SNAPSHOT_CHARS) {
+            serialized = trimSnapshotArraysNonMutating(out, threadsArr, feedArr, MAX_SOCKET_SNAPSHOT_CHARS);
+            threadsArr = out.optJSONArray("threads");
+            feedArr = out.optJSONArray("notifications");
         }
         cachedSnapshotRevision = revision;
         cachedSnapshotObj = out;
@@ -3637,6 +3937,9 @@ public final class PushStore {
         copy.put("unreadImCount", unreadImCount);
         copy.put("activePushCount", activePushCount);
         copy.put("totalPushCount", notifications.size());
+        if (viaBinder && serialized.length() > MAX_BINDER_SNAPSHOT_CHARS) {
+            trimSnapshotArraysNonMutating(copy, threadsArr, feedArr, MAX_BINDER_SNAPSHOT_CHARS);
+        }
         return copy;
     }
 
@@ -3660,97 +3963,105 @@ public final class PushStore {
         return out;
     }
 
-    public synchronized int deleteThreadRecord(
+    public int deleteThreadRecord(
             Context context,
             String threadId,
             String packageName,
             String rawTitle) {
-        String safeThreadId = threadId == null ? "" : threadId.trim();
-        String safePkg = packageName == null ? "" : packageName.trim();
-        String safeTitle = rawTitle == null ? "" : rawTitle.trim();
-        if (safePkg.isEmpty() && safeThreadId.contains("::")) {
-            safePkg = safeThreadId.substring(0, safeThreadId.indexOf("::")).trim();
-        }
-        if (safeTitle.isEmpty() && safeThreadId.contains("::")) {
-            safeTitle = safeThreadId.substring(safeThreadId.indexOf("::") + 2).trim();
-        }
-        String canonicalKey = canonicalThreadKey(safeThreadId, safePkg, safeTitle);
-        long nowMs = System.currentTimeMillis();
-
-        if (!safeThreadId.isEmpty()) {
-            deletedThreads.put(safeThreadId, nowMs);
-        }
-        if (!canonicalKey.isEmpty()) {
-            deletedThreads.put(canonicalKey, nowMs);
-        }
-
-        List<String> toRemove = new ArrayList<String>();
-        ThreadRecord direct = getThreadRecord(!safeThreadId.isEmpty() ? safeThreadId : canonicalKey);
-        if (direct != null) {
-            toRemove.add(direct.threadId);
-            if (safePkg.isEmpty()) safePkg = direct.packageName;
-            if (safeTitle.isEmpty()) safeTitle = direct.title;
-        }
-        for (ThreadRecord t : threadsById.values()) {
-            if (t == null) continue;
-            if (toRemove.contains(t.threadId)) continue;
-            if ((!safeThreadId.isEmpty() && safeThreadId.equals(t.threadId))
-                    || (!canonicalKey.isEmpty() && canonicalKey.equals(t.threadId))
-                    || (!safePkg.isEmpty() && safePkg.equals(t.packageName)
-                        && !safeTitle.isEmpty() && titlesReferToSameConversation(safePkg, t.title, safeTitle))) {
-                toRemove.add(t.threadId);
+        List<String> keysToDismiss = new ArrayList<String>();
+        int removedCount;
+        synchronized (this) {
+            String safeThreadId = threadId == null ? "" : threadId.trim();
+            String safePkg = packageName == null ? "" : packageName.trim();
+            String safeTitle = rawTitle == null ? "" : rawTitle.trim();
+            if (safePkg.isEmpty() && safeThreadId.contains("::")) {
+                safePkg = safeThreadId.substring(0, safeThreadId.indexOf("::")).trim();
             }
-        }
-
-        for (String tid : toRemove) {
-            threadsById.remove(tid);
-            handlesByThread.remove(tid);
-            contentIntentsByThread.remove(tid);
-            deletedThreads.put(tid, nowMs);
-        }
-
-        List<String> aliasKeysToRemove = new ArrayList<String>();
-        for (Map.Entry<String, String> entry : resolvedGenericThreadAliases.entrySet()) {
-            if (toRemove.contains(entry.getKey()) || toRemove.contains(entry.getValue())
-                    || safeThreadId.equals(entry.getKey()) || canonicalKey.equals(entry.getValue())) {
-                aliasKeysToRemove.add(entry.getKey());
+            if (safeTitle.isEmpty() && safeThreadId.contains("::")) {
+                safeTitle = safeThreadId.substring(safeThreadId.indexOf("::") + 2).trim();
             }
-        }
-        for (String k : aliasKeysToRemove) {
-            resolvedGenericThreadAliases.remove(k);
-        }
+            String canonicalKey = canonicalThreadKey(safeThreadId, safePkg, safeTitle);
+            long nowMs = System.currentTimeMillis();
 
-        for (NotificationRecord n : notifications) {
-            if (n == null) continue;
-            boolean match = (n.threadId != null && (toRemove.contains(n.threadId)
-                    || safeThreadId.equals(n.threadId)
-                    || canonicalKey.equals(n.threadId)))
-                || (!safePkg.isEmpty() && safePkg.equals(n.packageName)
-                    && !safeTitle.isEmpty() && titlesReferToSameConversation(safePkg, n.title, safeTitle));
-            if (match) {
-                if (n.active && n.key != null && !n.key.isEmpty()) {
-                    try {
-                        PushNotificationService.dismissNotification(context, n.key);
-                    } catch (Throwable ignored) {
+            if (!safeThreadId.isEmpty()) {
+                deletedThreads.put(safeThreadId, nowMs);
+            }
+            if (!canonicalKey.isEmpty()) {
+                deletedThreads.put(canonicalKey, nowMs);
+            }
+
+            List<String> toRemove = new ArrayList<String>();
+            ThreadRecord direct = getThreadRecord(!safeThreadId.isEmpty() ? safeThreadId : canonicalKey);
+            if (direct != null) {
+                toRemove.add(direct.threadId);
+                if (safePkg.isEmpty()) safePkg = direct.packageName;
+                if (safeTitle.isEmpty()) safeTitle = direct.title;
+            }
+            for (ThreadRecord t : threadsById.values()) {
+                if (t == null) continue;
+                if (toRemove.contains(t.threadId)) continue;
+                if ((!safeThreadId.isEmpty() && safeThreadId.equals(t.threadId))
+                        || (!canonicalKey.isEmpty() && canonicalKey.equals(t.threadId))
+                        || (!safePkg.isEmpty() && safePkg.equals(t.packageName)
+                            && !safeTitle.isEmpty() && titlesReferToSameConversation(safePkg, t.title, safeTitle))) {
+                    toRemove.add(t.threadId);
+                }
+            }
+
+            for (String tid : toRemove) {
+                threadsById.remove(tid);
+                handlesByThread.remove(tid);
+                contentIntentsByThread.remove(tid);
+                deletedThreads.put(tid, nowMs);
+            }
+
+            List<String> aliasKeysToRemove = new ArrayList<String>();
+            for (Map.Entry<String, String> entry : resolvedGenericThreadAliases.entrySet()) {
+                if (toRemove.contains(entry.getKey()) || toRemove.contains(entry.getValue())
+                        || safeThreadId.equals(entry.getKey()) || canonicalKey.equals(entry.getValue())) {
+                    aliasKeysToRemove.add(entry.getKey());
+                }
+            }
+            for (String k : aliasKeysToRemove) {
+                resolvedGenericThreadAliases.remove(k);
+            }
+
+            for (NotificationRecord n : notifications) {
+                if (n == null) continue;
+                boolean match = (n.threadId != null && (toRemove.contains(n.threadId)
+                        || safeThreadId.equals(n.threadId)
+                        || canonicalKey.equals(n.threadId)))
+                    || (!safePkg.isEmpty() && safePkg.equals(n.packageName)
+                        && !safeTitle.isEmpty() && titlesReferToSameConversation(safePkg, n.title, safeTitle));
+                if (match) {
+                    if (n.active && n.key != null && !n.key.isEmpty()) {
+                        keysToDismiss.add(n.key);
+                    }
+                    if (n.active || !n.dismissed || !n.read) {
+                        n.active = false;
+                        n.dismissed = true;
+                        n.read = true;
+                        n.cachedJson = null;
+                        feedDirty = true;
                     }
                 }
-                if (n.active || !n.dismissed || !n.read) {
-                    n.active = false;
-                    n.dismissed = true;
-                    n.read = true;
-                    n.cachedJson = null;
-                    feedDirty = true;
-                }
+            }
+
+            threadsDirty = true;
+            revision++;
+            saveToDisk();
+            removedCount = toRemove.size();
+        }
+        for (String key : keysToDismiss) {
+            try {
+                PushNotificationService.dismissNotification(context, key);
+            } catch (Throwable ignored) {
             }
         }
-
-        threadsDirty = true;
-        revision++;
-        saveToDisk();
-        return toRemove.size();
+        return removedCount;
     }
 
-    public synchronized JSONObject deleteThread(
+    public JSONObject deleteThread(
             Context context,
             String threadId,
             String packageName,
@@ -3758,65 +4069,76 @@ public final class PushStore {
         String safeThreadId = threadId == null ? "" : threadId.trim();
         String canonicalKey = canonicalThreadKey(safeThreadId, packageName, rawTitle);
         int removedCount = deleteThreadRecord(context, threadId, packageName, rawTitle);
+        long rev;
+        synchronized (this) {
+            rev = revision;
+        }
         return new JSONObject()
             .put("ok", true)
             .put("event", "thread_deleted")
             .put("threadId", !canonicalKey.isEmpty() ? canonicalKey : safeThreadId)
             .put("removedThreads", removedCount)
-            .put("revision", revision);
+            .put("revision", rev);
     }
 
-    public synchronized ThreadRecord markThreadReadRecord(
+    public ThreadRecord markThreadReadRecord(
             Context context,
             String threadId,
             String packageName,
             String rawTitle,
             boolean read) {
-        String safeThreadId = threadId == null ? "" : threadId.trim();
-        String safePkg = packageName == null ? "" : packageName.trim();
-        String safeTitle = rawTitle == null ? "" : rawTitle.trim();
-        String canonicalKey = canonicalThreadKey(safeThreadId, safePkg, safeTitle);
+        List<String> keysToDismiss = new ArrayList<String>();
+        ThreadRecord thread;
+        synchronized (this) {
+            String safeThreadId = threadId == null ? "" : threadId.trim();
+            String safePkg = packageName == null ? "" : packageName.trim();
+            String safeTitle = rawTitle == null ? "" : rawTitle.trim();
+            String canonicalKey = canonicalThreadKey(safeThreadId, safePkg, safeTitle);
 
-        ThreadRecord thread = getThreadRecord(!safeThreadId.isEmpty() ? safeThreadId : canonicalKey);
-        if (thread != null) {
-            thread.unreadCount = read ? 0 : Math.max(1, thread.unreadCount);
-            if (safePkg.isEmpty()) safePkg = thread.packageName;
-            if (safeTitle.isEmpty()) safeTitle = thread.title;
-            threadsDirty = true;
-        }
+            thread = getThreadRecord(!safeThreadId.isEmpty() ? safeThreadId : canonicalKey);
+            if (thread != null) {
+                thread.unreadCount = read ? 0 : Math.max(1, thread.unreadCount);
+                if (safePkg.isEmpty()) safePkg = thread.packageName;
+                if (safeTitle.isEmpty()) safeTitle = thread.title;
+                threadsDirty = true;
+            }
 
-        for (NotificationRecord n : notifications) {
-            if (n == null) continue;
-            boolean match = (n.threadId != null && (safeThreadId.equals(n.threadId)
-                    || canonicalKey.equals(n.threadId)
-                    || (thread != null && thread.threadId.equals(n.threadId))))
-                || (!safePkg.isEmpty() && safePkg.equals(n.packageName)
-                    && !safeTitle.isEmpty() && titlesReferToSameConversation(safePkg, n.title, safeTitle));
-            if (match) {
-                if (read) {
-                    if (n.active && n.key != null && !n.key.isEmpty()) {
-                        try {
-                            PushNotificationService.dismissNotification(context, n.key);
-                        } catch (Throwable ignored) {
+            for (NotificationRecord n : notifications) {
+                if (n == null) continue;
+                boolean match = (n.threadId != null && (safeThreadId.equals(n.threadId)
+                        || canonicalKey.equals(n.threadId)
+                        || (thread != null && thread.threadId.equals(n.threadId))))
+                    || (!safePkg.isEmpty() && safePkg.equals(n.packageName)
+                        && !safeTitle.isEmpty() && titlesReferToSameConversation(safePkg, n.title, safeTitle));
+                if (match) {
+                    if (read) {
+                        if (n.active && n.key != null && !n.key.isEmpty()) {
+                            keysToDismiss.add(n.key);
                         }
+                        n.read = true;
+                        n.active = false;
+                        n.dismissed = true;
+                    } else {
+                        n.read = false;
                     }
-                    n.read = true;
-                    n.active = false;
-                    n.dismissed = true;
-                } else {
-                    n.read = false;
+                    n.cachedJson = null;
+                    feedDirty = true;
                 }
-                n.cachedJson = null;
-                feedDirty = true;
+            }
+
+            revision++;
+            saveToDisk();
+        }
+        for (String key : keysToDismiss) {
+            try {
+                PushNotificationService.dismissNotification(context, key);
+            } catch (Throwable ignored) {
             }
         }
-
-        revision++;
-        saveToDisk();
         return thread;
     }
 
-    public synchronized JSONObject markThreadRead(
+    public JSONObject markThreadRead(
             Context context,
             String threadId,
             String packageName,
@@ -3825,17 +4147,19 @@ public final class PushStore {
         String safeThreadId = threadId == null ? "" : threadId.trim();
         String canonicalKey = canonicalThreadKey(safeThreadId, packageName, rawTitle);
         ThreadRecord thread = markThreadReadRecord(context, threadId, packageName, rawTitle, read);
-        JSONObject res = new JSONObject()
-            .put("ok", true)
-            .put("event", "thread_read_changed")
-            .put("threadId", thread != null ? thread.threadId : (!canonicalKey.isEmpty() ? canonicalKey : safeThreadId))
-            .put("read", read)
-            .put("unreadCount", thread != null ? thread.unreadCount : (read ? 0 : 1))
-            .put("revision", revision);
-        if (thread != null) {
-            res.put("thread", thread.toJson());
+        synchronized (this) {
+            JSONObject res = new JSONObject()
+                .put("ok", true)
+                .put("event", "thread_read_changed")
+                .put("threadId", thread != null ? thread.threadId : (!canonicalKey.isEmpty() ? canonicalKey : safeThreadId))
+                .put("read", read)
+                .put("unreadCount", thread != null ? thread.unreadCount : (read ? 0 : 1))
+                .put("revision", revision);
+            if (thread != null) {
+                res.put("thread", thread.toJson());
+            }
+            return res;
         }
-        return res;
     }
 
     public synchronized ThreadRecord clearThreadMessagesRecord(
@@ -3994,14 +4318,37 @@ public final class PushStore {
         return list;
     }
 
+    private static boolean isPermanentStorageCorruption(Throwable error) {
+        Throwable cur = error;
+        while (cur != null) {
+            if (cur instanceof android.database.sqlite.SQLiteDatabaseCorruptException) {
+                return true;
+            }
+            cur = cur.getCause();
+        }
+        return false;
+    }
+
     private void loadFromDisk() {
         if (storageDir == null) return;
         JSONObject[] stored;
+        PushDatabase openedDb = null;
         try {
-            database = new PushDatabase(storageDir);
-            stored = database.load(storageDir);
+            openedDb = new PushDatabase(storageDir);
+            stored = openedDb.load(legacyStorageDir != null ? legacyStorageDir : storageDir);
+            database = openedDb;
+            storageLoadFailed = false;
         } catch (Exception error) {
-            storageLoadFailed = true; persistenceError = true; historyTruncated = true;
+            if (openedDb != null) {
+                try {
+                    openedDb.close();
+                } catch (Throwable ignored) {
+                }
+            }
+            database = null;
+            storageLoadFailed = isPermanentStorageCorruption(error);
+            persistenceError = true;
+            historyTruncated = true;
             android.util.Log.e("StepXPushStore", "Message database unavailable; original data retained", error);
             return;
         }
@@ -4034,7 +4381,8 @@ public final class PushStore {
                 }
                 JSONArray delMsgArr = root.optJSONArray("deletedMessages");
                 if (delMsgArr != null) {
-                    for (int i = 0; i < delMsgArr.length() && i < 500; i++) {
+                    int startIdx = Math.max(0, delMsgArr.length() - MAX_DELETED_MESSAGES);
+                    for (int i = startIdx; i < delMsgArr.length(); i++) {
                         String mKey = delMsgArr.optString(i, "");
                         if (!mKey.isEmpty()) {
                             deletedMessages.add(mKey);
@@ -4152,7 +4500,7 @@ public final class PushStore {
                 }
             }
         } catch (Throwable ignored) {
-            historyTruncated = true; persistenceError = true; storageLoadFailed = true;
+            historyTruncated = true; persistenceError = true; storageLoadFailed = isPermanentStorageCorruption(ignored);
         }
 
         try {
@@ -4166,9 +4514,6 @@ public final class PushStore {
                     if (arr.length() > MAX_NOTIFICATIONS) historyTruncated = true;
                     for (int i = 0; i < arr.length() && i < MAX_NOTIFICATIONS; i++) {
                         JSONObject rawNotif = arr.getJSONObject(i);
-                        if (rawNotif.has("avatar_b64") || rawNotif.has("avatarB64")) {
-                            feedDirty = true;
-                        }
                         NotificationRecord n = NotificationRecord.fromJson(rawNotif);
                         if (n != null && ImAppCatalog.isNativeSmsPackage(n.packageName) && n.threadId != null && !n.threadId.isEmpty()) {
                             n.threadId = null;
@@ -4179,7 +4524,7 @@ public final class PushStore {
                 }
             }
         } catch (Throwable ignored) {
-            historyTruncated = true; persistenceError = true; storageLoadFailed = true;
+            historyTruncated = true; persistenceError = true; storageLoadFailed = isPermanentStorageCorruption(ignored);
         }
         pruneLocked(System.currentTimeMillis());
         if (threadsDirty || feedDirty) {
@@ -4219,6 +4564,56 @@ public final class PushStore {
 
     public void flushToDiskSync() {
         synchronized (diskCommitLock) {
+            if (storageDir != null && database == null && !storageLoadFailed) {
+                PushDatabase retryDb = null;
+                try {
+                    retryDb = new PushDatabase(storageDir);
+                    JSONObject[] existing = retryDb.load(storageDir);
+                    synchronized (this) {
+                        if (existing != null && existing.length >= 2) {
+                            JSONArray diskThreads = existing[0] != null ? existing[0].optJSONArray("threads") : null;
+                            if (diskThreads != null) {
+                                for (int i = 0; i < diskThreads.length() && threadsById.size() < MAX_THREADS; i++) {
+                                    ThreadRecord dt = ThreadRecord.fromJson(diskThreads.getJSONObject(i));
+                                    if (!dt.threadId.isEmpty()
+                                            && !isNativeSmsThread(dt)
+                                            && !threadsById.containsKey(dt.threadId)
+                                            && getDeletedAtMs(dt.threadId, dt.packageName, dt.title) <= 0L) {
+                                        threadsById.put(dt.threadId, dt);
+                                    }
+                                }
+                            }
+                            JSONArray diskNotifs = existing[1] != null ? existing[1].optJSONArray("notifications") : null;
+                            if (diskNotifs != null && notifications.isEmpty()) {
+                                for (int i = 0; i < diskNotifs.length() && notifications.size() < MAX_NOTIFICATIONS; i++) {
+                                    NotificationRecord dn = NotificationRecord.fromJson(diskNotifs.getJSONObject(i));
+                                    if (dn != null) notifications.add(dn);
+                                }
+                            }
+                        }
+                        database = retryDb;
+                        retryDb = null;
+                    }
+                } catch (Exception openErr) {
+                    if (retryDb != null) {
+                        try { retryDb.close(); } catch (Throwable ignored) {}
+                    }
+                    synchronized (this) {
+                        if (isPermanentStorageCorruption(openErr)) {
+                            storageLoadFailed = true;
+                        }
+                        persistenceError = true;
+                        if (!storageLoadFailed && (pendingSaveFuture == null || pendingSaveFuture.isDone())) {
+                            pendingSaveFuture = DISK_WRITER.schedule(
+                                new Runnable() { public void run() { flushToDiskSync(); } },
+                                30L,
+                                TimeUnit.SECONDS
+                            );
+                        }
+                    }
+                    return;
+                }
+            }
             JSONObject threadsRoot, feedRoot;
             long capturedRevision;
             synchronized (this) {
@@ -4235,7 +4630,12 @@ public final class PushStore {
                     for (Map.Entry<String,Long> e : deletedThreads.entrySet()) deleted.put(e.getKey(),e.getValue());
                     for (Map.Entry<String,Long> e : clearedThreads.entrySet()) cleared.put(e.getKey(),e.getValue());
                     threadsRoot.put("deletedThreads",deleted).put("clearedThreads",cleared);
-                    JSONArray removed = new JSONArray(); for (String id : deletedMessages) removed.put(id);
+                    JSONArray removed = new JSONArray();
+                    int skipDeleted = Math.max(0, deletedMessages.size() - MAX_DELETED_MESSAGES);
+                    int idxDeleted = 0;
+                    for (String id : deletedMessages) {
+                        if (idxDeleted++ >= skipDeleted) removed.put(id);
+                    }
                     threadsRoot.put("deletedMessages",removed);
                     feedRoot = new JSONObject().put("revision",revision).put("coverage",coverageJson()).put("nextSeqId",nextSeqId);
                     JSONArray feedArr = new JSONArray();
@@ -4245,13 +4645,20 @@ public final class PushStore {
             }
             // No PushStore monitor during SQLite transactions, fsync or checkpoint.
             boolean committed = false;
+            boolean permanentFailure = false;
             try {database.save(threadsRoot,feedRoot,false);committed = true;}
-            catch (Exception error) {android.util.Log.e("StepXPushStore","Message commit failed; will retry",error);}
+            catch (Exception error) {
+                permanentFailure = isPermanentStorageCorruption(error);
+                android.util.Log.e("StepXPushStore","Message commit failed; will retry",error);
+            }
             synchronized (this) {
+                if (permanentFailure) {
+                    storageLoadFailed = true;
+                }
                 persistenceError = !committed;
                 cachedSnapshotRevision = -1;
                 if (committed && persistenceGeneration == capturedRevision) {threadsDirty = false;feedDirty = false;}
-                if (threadsDirty || feedDirty) {
+                if ((threadsDirty || feedDirty) && !storageLoadFailed) {
                     if (committed) saveToDisk();
                     else if (pendingSaveFuture == null || pendingSaveFuture.isDone()) {
                         pendingSaveFuture = DISK_WRITER.schedule(new Runnable(){public void run(){flushToDiskSync();}},30L,TimeUnit.SECONDS);

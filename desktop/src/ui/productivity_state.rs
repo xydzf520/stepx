@@ -207,7 +207,7 @@ impl ProductivityUi {
         if self.scope == scope {
             return false;
         }
-        if let Some(worker) = self.worker.as_ref() {
+        if let Some(worker) = self.worker.take() {
             worker.cancel.store(true, Ordering::Relaxed);
         }
         self.generation = self.generation.wrapping_add(1);
@@ -225,6 +225,8 @@ impl ProductivityUi {
         self.feedback = None;
         self.last_refresh = None;
         self.last_phone_poll = None;
+        self.source_revision.clear();
+        self.show_dismissed = false;
         self.needs_refresh = true;
         true
     }
@@ -275,12 +277,48 @@ fn context_root() -> PathBuf {
     stepx_companion::resources::user_state().join("stepx-companion/context")
 }
 fn short(text: &str, limit: usize) -> String {
-    let value: String = text.chars().take(limit).collect();
-    if text.chars().count() > limit {
-        format!("{value}…")
-    } else {
-        value
+    let mut end = text.len();
+    let mut truncated = false;
+    for (idx, (byte_pos, _)) in text.char_indices().enumerate() {
+        if idx == limit {
+            end = byte_pos;
+            truncated = true;
+            break;
+        }
     }
+    if truncated {
+        format!("{}…", &text[..end])
+    } else {
+        text.to_owned()
+    }
+}
+
+fn paginate_utf8_slice(
+    text: &str,
+    requested_page: usize,
+    chars_per_page: usize,
+) -> (usize, usize, &str) {
+    let per_page = chars_per_page.max(1);
+    let total_chars = text.chars().count();
+    let pages = total_chars.div_ceil(per_page).max(1);
+    let page = requested_page.min(pages - 1);
+    let start_char = page * per_page;
+    let end_char = start_char.saturating_add(per_page);
+    let mut start_byte = text.len();
+    let mut end_byte = text.len();
+    for (char_idx, (byte_idx, _)) in text.char_indices().enumerate() {
+        if char_idx == start_char {
+            start_byte = byte_idx;
+        }
+        if char_idx == end_char {
+            end_byte = byte_idx;
+            break;
+        }
+    }
+    if start_char == 0 {
+        start_byte = 0;
+    }
+    (page, pages, &text[start_byte..end_byte.max(start_byte)])
 }
 fn progress_bounds(period: Period, now: chrono::DateTime<Local>) -> (i64, i64) {
     let date = now.date_naive();
@@ -457,7 +495,7 @@ impl Companion {
         self.productivity.preview.is_some()
     }
     pub(super) fn invalidate_productivity_for_clear(&mut self) {
-        if let Some(worker) = &self.productivity.worker {
+        if let Some(worker) = self.productivity.worker.take() {
             worker.cancel.store(true, Ordering::Relaxed);
         }
         self.productivity.generation = self.productivity.generation.wrapping_add(1);
@@ -470,6 +508,7 @@ impl Companion {
         self.productivity.phone_poll = None;
         self.productivity.needs_refresh = true;
         self.productivity.source_revision.clear();
+        self.productivity.show_dismissed = false;
         self.productivity.last_refresh = None;
         self.fields[F_PRODUCTIVITY_NOTE].clear();
         if self.focus == Some(F_PRODUCTIVITY_NOTE) {
@@ -1663,16 +1702,15 @@ impl Companion {
         let mut material_cards = Vec::new();
         for (n, item) in items.iter().skip(page * per_page).take(per_page).enumerate() {
             let mut buttons = vec![];
-            if item.state == inbox::MaterialState::Ready && item.error.is_some() {
-                buttons.push(self.productivity_button(
-                    format!("productivity-material-reindex-{n}"),
-                    "重试收录正文",
-                    UiIcon::Refresh,
-                    ProductivityAction::MaterialProcess(item.id.clone()),
-                    Btn::Secondary,
-                ));
-            }
             if item.state == inbox::MaterialState::Ready {
+                // Prioritize primary actionable buttons before width-based truncation.
+                buttons.push(self.productivity_button(
+                    format!("productivity-material-draft-{n}"),
+                    "生成方案与待办",
+                    UiIcon::Sparkles,
+                    ProductivityAction::MaterialDraft(item.id.clone()),
+                    Btn::Primary,
+                ));
                 buttons.push(self.productivity_button(
                     format!("productivity-material-read-{n}"),
                     "查看正文",
@@ -1680,12 +1718,25 @@ impl Companion {
                     ProductivityAction::MaterialRead(item.id.clone()),
                     Btn::Secondary,
                 ));
+                if item.error.is_some() {
+                    buttons.push(self.productivity_button(
+                        format!("productivity-material-reindex-{n}"),
+                        "重试收录正文",
+                        UiIcon::Refresh,
+                        ProductivityAction::MaterialProcess(item.id.clone()),
+                        Btn::Secondary,
+                    ));
+                }
                 buttons.push(self.productivity_button(
-                    format!("productivity-material-draft-{n}"),
-                    "生成方案与待办",
-                    UiIcon::Sparkles,
-                    ProductivityAction::MaterialDraft(item.id.clone()),
-                    Btn::Primary,
+                    format!("productivity-material-link-{n}"),
+                    if item.linked_item.is_some() {
+                        "调整关联事项"
+                    } else {
+                        "关联事项"
+                    },
+                    UiIcon::Layers,
+                    ProductivityAction::MaterialPickLink(item.id.clone()),
+                    Btn::Ghost,
                 ));
             } else {
                 buttons.push(self.productivity_button(
@@ -1699,27 +1750,15 @@ impl Companion {
                     ProductivityAction::MaterialProcess(item.id.clone()),
                     Btn::Primary,
                 ));
-            }
-            if item.state == inbox::MaterialState::Ready {
-                buttons.push(self.productivity_button(
-                    format!("productivity-material-link-{n}"),
-                    if item.linked_item.is_some() {
-                        "调整关联事项"
-                    } else {
-                        "关联事项"
-                    },
-                    UiIcon::Layers,
-                    ProductivityAction::MaterialPickLink(item.id.clone()),
-                    Btn::Ghost,
-                ));
-            } else if item.state != inbox::MaterialState::Processing {
-                buttons.push(self.productivity_button(
-                    format!("productivity-material-ignore-{n}"),
-                    "暂不处理",
-                    UiIcon::Close,
-                    ProductivityAction::MaterialIgnore(item.id.clone()),
-                    Btn::Ghost,
-                ));
+                if item.state != inbox::MaterialState::Processing {
+                    buttons.push(self.productivity_button(
+                        format!("productivity-material-ignore-{n}"),
+                        "暂不处理",
+                        UiIcon::Close,
+                        ProductivityAction::MaterialIgnore(item.id.clone()),
+                        Btn::Ghost,
+                    ));
+                }
             }
             buttons.truncate(max_buttons);
             let mut badges = vec![
@@ -1852,12 +1891,14 @@ impl Companion {
                 CAPTION,
                 p.text2,
             ));
-            rows.push(self.input(
-                F_PRODUCTIVITY_NOTE,
-                "填写进展或延期原因，再点击对应行动的按钮（500字内）",
-                None,
-            ));
         }
+        // Preserve the defer-reason / progress note input even in Compact height so
+        // deferring an action never hides or strands the required F_PRODUCTIVITY_NOTE draft.
+        rows.push(self.input(
+            F_PRODUCTIVITY_NOTE,
+            "填写进展或延期原因，再点击对应行动的按钮（500字内）",
+            None,
+        ));
         let mut progress_btns = vec![
             self.productivity_button(
                 "productivity-open-inbox",
@@ -1975,7 +2016,7 @@ impl Companion {
             .take(per_page)
             .enumerate()
         {
-            let set = |label: &str, state| {
+            let set = |label: &str, state, style: Btn| {
                 self.productivity_button(
                     format!("productivity-action-{n}-{state:?}"),
                     label,
@@ -1985,37 +2026,38 @@ impl Companion {
                         revision: snapshot.revision,
                         state,
                     },
-                    Btn::Secondary,
+                    style,
                 )
             };
+            // Order buttons by actionability priority (Primary -> Secondary -> Ghost)
+            // BEFORE truncating to max_buttons so narrow columns keep primary CTAs.
             let mut buttons = vec![];
             match action.state {
                 ActionState::Candidate => {
-                    buttons.push(set("核对后采纳", ActionState::Accepted));
-                    buttons.push(set("忽略", ActionState::Dismissed));
+                    buttons.push(set("核对后采纳", ActionState::Accepted, Btn::Primary));
+                    buttons.push(set("忽略", ActionState::Dismissed, Btn::Secondary));
                 }
                 ActionState::Accepted | ActionState::Deferred => {
-                    buttons.push(set("开始推进", ActionState::InProgress));
-                    buttons.push(set("确认完成", ActionState::Completed));
-                    buttons.push(set("延期", ActionState::Deferred));
+                    buttons.push(set("开始推进", ActionState::InProgress, Btn::Primary));
+                    buttons.push(set("确认完成", ActionState::Completed, Btn::Secondary));
+                    buttons.push(set("延期", ActionState::Deferred, Btn::Secondary));
                 }
                 ActionState::InProgress => {
-                    buttons.push(set("确认完成", ActionState::Completed));
-                    buttons.push(set("延期", ActionState::Deferred));
+                    buttons.push(set("确认完成", ActionState::Completed, Btn::Primary));
+                    buttons.push(set("延期", ActionState::Deferred, Btn::Secondary));
                 }
-                ActionState::Dismissed => buttons.push(set("恢复为候选", ActionState::Candidate)),
+                ActionState::Dismissed => {
+                    buttons.push(set("恢复为候选", ActionState::Candidate, Btn::Primary));
+                }
                 ActionState::Completed if action.needs_review => {
-                    buttons.push(set("重新核对后保持完成", ActionState::Completed))
+                    buttons.push(set(
+                        "重新核对后保持完成",
+                        ActionState::Completed,
+                        Btn::Primary,
+                    ));
                 }
                 _ => {}
             }
-            buttons.push(self.productivity_button(
-                format!("productivity-action-source-{n}"),
-                "来源与进展",
-                UiIcon::File,
-                ProductivityAction::ActionSource(action.id.clone()),
-                Btn::Ghost,
-            ));
             if action.state.confirmed() {
                 buttons.push(self.productivity_button(
                     format!("productivity-action-progress-{n}"),
@@ -2028,6 +2070,13 @@ impl Companion {
                     Btn::Secondary,
                 ));
             }
+            buttons.push(self.productivity_button(
+                format!("productivity-action-source-{n}"),
+                "来源与进展",
+                UiIcon::File,
+                ProductivityAction::ActionSource(action.id.clone()),
+                Btn::Ghost,
+            ));
             if !action.history.is_empty() {
                 buttons.push(self.productivity_button(
                     format!("productivity-action-undo-{n}"),
@@ -2617,7 +2666,17 @@ impl Companion {
                     10.,
                 )
             };
-            return self.vstack(S2, vec![self.wrap(summary_pills), top_card]);
+            let mut compact_rows = vec![self.wrap(summary_pills), top_card];
+            if !self.fields[F_PRODUCTIVITY_NOTE].text.trim().is_empty()
+                || self.focus == Some(F_PRODUCTIVITY_NOTE)
+            {
+                compact_rows.push(self.input(
+                    F_PRODUCTIVITY_NOTE,
+                    "填写进展或延期原因，再点击对应行动的按钮（500字内）",
+                    None,
+                ));
+            }
+            return self.vstack(S2, compact_rows);
         }
 
         let mut rows = Vec::new();
@@ -3043,10 +3102,7 @@ impl Companion {
             }
         }
         if let Some(preview) = &self.productivity.preview {
-            let chars: Vec<_> = preview.text.chars().collect();
-            let pages = chars.len().div_ceil(4200).max(1);
-            let page = preview.page.min(pages - 1);
-            let text: String = chars.iter().skip(page * 4200).take(4200).collect();
+            let (page, pages, page_slice) = paginate_utf8_slice(&preview.text, preview.page, 4200);
             let mut controls = vec![self.productivity_button(
                 "productivity-preview-close",
                 "返回",
@@ -3103,7 +3159,7 @@ impl Companion {
                 self.text(format!("第 {} / {pages} 页", page + 1), MICRO, p.text3),
                 self.card_box(
                     self.render_context_preview_text(
-                        &super::context_state::context_preview_plain_text(&text),
+                        &super::context_state::context_preview_plain_text(page_slice),
                     ),
                     p.surface,
                     p.border,
@@ -3369,7 +3425,40 @@ mod tests {
             account: Some("b".into())
         })));
         assert!(cancel.load(Ordering::Relaxed));
-        assert!(ui.preview.is_none() && ui.worker.is_some() && ui.materials.is_none());
+        assert!(ui.preview.is_none() && ui.worker.is_none() && ui.materials.is_none());
+    }
+
+    #[test]
+    fn paginate_utf8_slice_handles_multibyte_boundaries_without_allocating_vec_char() {
+        let sample = format!("{}🚀{}", "甲乙丙丁".repeat(1050), "戊己庚辛".repeat(200));
+        let (p0, total, s0) = paginate_utf8_slice(&sample, 0, 4200);
+        assert_eq!((p0, total), (0, 2));
+        assert_eq!(s0.chars().count(), 4200);
+        let (p1, _, s1) = paginate_utf8_slice(&sample, 9, 4200);
+        assert_eq!(p1, 1);
+        assert!(s1.starts_with('🚀'));
+        assert_eq!(s0.chars().count() + s1.chars().count(), sample.chars().count());
+    }
+
+    #[test]
+    fn compact_mode_preserves_defer_reason_draft_across_tabs() {
+        use super::super::pages::home::{HomeModuleHeight, HomeModuleId, HomeModuleWidth};
+        let mut app = Companion::new_for_test();
+        app.demo_mode = true;
+        app.init_demo_push();
+        app.home_modules
+            .set_module_width(HomeModuleId::ProductivityHub, HomeModuleWidth::OneThird);
+        app.home_modules
+            .set_module_height(HomeModuleId::ProductivityHub, HomeModuleHeight::Compact);
+        app.fields[F_PRODUCTIVITY_NOTE].set("等待后端接口联调完成后再推进");
+        for tab in [0u8, 2u8] {
+            app.productivity.tab = tab;
+            let _ = app.render_productivity_hub();
+            assert_eq!(
+                app.fields[F_PRODUCTIVITY_NOTE].text,
+                "等待后端接口联调完成后再推进"
+            );
+        }
     }
     #[test]
     fn navigation_tabs_stay_interactive_while_background_worker_runs() {

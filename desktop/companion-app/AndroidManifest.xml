@@ -1,4 +1,4 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.stepx.companion.app" android:versionCode="47" android:versionName="0.1.46">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.stepx.companion.app" android:versionCode="48" android:versionName="0.1.47">
   <uses-sdk android:minSdkVersion="33" android:targetSdkVersion="35" />
   <uses-permission android:name="com.stepos.permission.MANAGE_BACK_SCREEN" />
   <uses-permission android:name="com.stepos.cloud.push.permission.MESSAGE" />
@@ -95,7 +95,7 @@
         <data android:mimeType="image/*" />
       </intent-filter>
     </activity>
-    <activity android:name=".ExpansionActivity" android:exported="true" />
+    <activity android:name=".ExpansionActivity" android:exported="false" />
     <provider android:name=".ExpansionProvider" android:authorities="com.stepx.companion.app.expansion" android:exported="true" android:permission="android.permission.DUMP" />
     <provider android:name=".ExpansionDocumentsProvider" android:authorities="com.stepx.companion.app.expansion.documents" android:exported="true" android:grantUriPermissions="true" android:permission="android.permission.MANAGE_DOCUMENTS">
       <intent-filter><action android:name="android.content.action.DOCUMENTS_PROVIDER" /></intent-filter>

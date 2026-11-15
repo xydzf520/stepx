@@ -3,7 +3,7 @@ on:
   push:
     branches: [main]
     tags: ['v0.2.*']
-    paths: ['desktop/**', 'scripts/**', '.github/workflows/release.yml']
+    paths: ['desktop/**', 'vendor/**', 'handoff/**', 'scripts/**', 'docs/**', 'licenses/**', '.github/workflows/release.yml']
   workflow_dispatch:
 permissions:
   contents: read
@@ -12,6 +12,7 @@ env:
   PYTHONUTF8: '1'
   PYTHONIOENCODING: utf-8
   PYTHONDONTWRITEBYTECODE: '1'
+  MACOSX_DEPLOYMENT_TARGET: '11.0'
 concurrency:
   group: desktop-release-${{ github.repository }}
   # Main and an explicit version tag share one queue. A newer publication
@@ -80,6 +81,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: desktop
+          key: macos-min-${{ env.MACOSX_DEPLOYMENT_TARGET }}
           cache-on-failure: true
       - name: Linux dependencies
         if: runner.os == 'Linux'
@@ -140,8 +142,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
         run: |
-          CURRENT_HEAD=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
-          test "$CURRENT_HEAD" = "$GITHUB_SHA" || { echo 'Refusing to publish superseded source'; exit 1; }
+          if [ "${GITHUB_REF_TYPE:-}" != "tag" ]; then
+            CURRENT_HEAD=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+            test "$CURRENT_HEAD" = "$GITHUB_SHA" || { echo 'Refusing to publish superseded source'; exit 1; }
+          fi
           NOTES_FILE="docs/RELEASE_${RELEASE_VERSION//./_}.md"
           test -s "$NOTES_FILE"
           # Bugfix releases may link to the previous demonstrations. If new

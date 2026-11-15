@@ -113,7 +113,7 @@ final class StorageTools {
         for (Item item : items) {
             String name = item.path.getFileName().toString().toLowerCase(Locale.ROOT);
             if (name.endsWith(".gz")) name = name.substring(0, name.length() - 3);
-            if (FileTools.TEXT_EXT.contains(name.substring(name.lastIndexOf('.') + 1))) documents.put(item.json(root));
+            if (FileTools.TEXT_EXT.contains(ContextReadPolicy.fileExtension(name))) documents.put(item.json(root));
         }
         for (List<Item> group : duplicates) {
             JSONArray members = new JSONArray();

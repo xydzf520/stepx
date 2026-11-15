@@ -18,12 +18,32 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / 'scripts') not in sys.path:
+    sys.path.insert(0, str(ROOT / 'scripts'))
+from host_runtime import migrate_legacy_state, optional_tool_home, user_state_root
 spec = importlib.util.spec_from_file_location('companion_permissions', ROOT / 'scripts/companion-permissions.py')
 permissions = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(permissions)
 PACKAGE = 'com.stepx.companion.app'
-STATE = Path(os.environ.get('XDG_STATE_HOME', Path.home() / '.local/state')) / 'stepx-companion/power'
+_DEFAULT_STATE = user_state_root() / 'power'
+STATE = _DEFAULT_STATE
 SCOPE = 'companion_doze_user_whitelist_v1'
+
+
+def _ensure_state_dir():
+    if STATE == _DEFAULT_STATE and not os.environ.get('STEPX_STATE_DIR') and not STATE.exists():
+        home = optional_tool_home()
+        if home is not None:
+            legacy_base = Path(os.environ.get('XDG_STATE_HOME') or (home / '.local/state'))
+            legacy = legacy_base / 'stepx-companion/power'
+            if legacy != STATE and legacy.exists():
+                migrate_legacy_state(legacy, STATE)
+    STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if STATE.is_symlink() or not STATE.is_dir():
+        raise RuntimeError('Doze 恢复记录目录无效')
+    if os.name != 'nt':
+        STATE.chmod(0o700)
+    return STATE
 
 
 def parse_whitelist(text):
@@ -71,7 +91,7 @@ def load_state(path, identity):
         return None
     if path.is_symlink() or path.stat().st_size > 32768:
         raise RuntimeError('Doze 恢复记录无效')
-    previous = json.loads(path.read_text())
+    previous = json.loads(path.read_text(encoding='utf-8'))
     if previous.get('identity') != identity or previous.get('phase') not in ('prepared', 'applied', 'revoked'):
         raise RuntimeError('Doze 恢复记录与当前设备或安装不匹配')
     before = previous.get('before', {})
@@ -85,10 +105,7 @@ def load_state(path, identity):
 
 
 def save_state(path, value):
-    STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if STATE.is_symlink() or not STATE.is_dir():
-        raise RuntimeError('Doze 恢复记录目录无效')
-    STATE.chmod(0o700)
+    _ensure_state_dir()
     with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=STATE, delete=False) as file:
         temporary = Path(file.name)
         os.chmod(temporary, 0o600)
@@ -103,10 +120,7 @@ def save_state(path, value):
 
 @contextmanager
 def locked():
-    STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if STATE.is_symlink() or not STATE.is_dir():
-        raise RuntimeError('Doze 恢复记录目录无效')
-    STATE.chmod(0o700)
+    _ensure_state_dir()
     with permissions.file_lock(STATE / 'power.lock'):
         yield
 

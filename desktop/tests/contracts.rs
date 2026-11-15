@@ -1,13 +1,18 @@
+#[cfg(unix)]
 use std::{
     process::Command,
     time::{Duration, Instant},
 };
 use stepx_companion::{
-    adb::{run_process, shell_quote, Adb},
     bridge::{parse_amoo_snapshot, parse_bridge_output, parse_capabilities, parse_sms_status},
     device::{format_summary, friendly_app_name, parse_devices, visible_text, DeviceMetrics},
-    pairing::{pair_code, parse_services, validate_endpoint, Preferences, QrSession},
+    pairing::{parse_services, validate_endpoint, Preferences, QrSession},
     storage::{format_bytes, parse_entries, validate_entry_name, validate_path, Entry},
+};
+#[cfg(unix)]
+use stepx_companion::{
+    adb::{run_process, shell_quote, Adb},
+    pairing::pair_code,
 };
 
 #[test]

@@ -47,16 +47,24 @@ def listed(html, identity):
 
 def catalog(identity):
     now = time.time()
+    stale_cached = None
     try:
-        cached = json.loads((STATE / 'certification-catalog.json').read_text())
-        if cached.get('identity') == identity and 0 <= now - cached['checked_at'] < 86400 and isinstance(cached.get('listed'), bool):
-            return cached
+        cached = json.loads((STATE / 'certification-catalog.json').read_text(encoding='utf-8'))
+        if cached.get('identity') == identity and isinstance(cached.get('listed'), bool):
+            if 0 <= now - cached['checked_at'] < 86400:
+                return cached
+            stale_cached = cached
     except (OSError, ValueError, KeyError, TypeError):
         pass
-    with urllib.request.urlopen(SOURCE, timeout=12) as response:
-        content = response.read(8 * 1024 * 1024 + 1)
-        if len(content) > 8 * 1024 * 1024:
-            raise ValueError('Google 官方列表超过大小上限')
+    try:
+        with urllib.request.urlopen(SOURCE, timeout=4) as response:
+            content = response.read(8 * 1024 * 1024 + 1)
+            if len(content) > 8 * 1024 * 1024:
+                raise ValueError('Google 官方列表超过大小上限')
+    except Exception:
+        if stale_cached is not None:
+            return stale_cached
+        raise
     result = {'identity': identity, 'listed': listed(content.decode('utf-8'), identity), 'checked_at': now, 'source': SOURCE}
     save_json('certification-catalog.json', result)
     return result

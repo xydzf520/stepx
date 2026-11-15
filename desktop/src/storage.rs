@@ -193,39 +193,124 @@ pub fn parse_entries(text: &str, canonical: &str, logical: &str) -> Result<Vec<E
     Ok(entries)
 }
 
-pub fn pull(adb: &Adb, device: &Device, remote: &str, destination: &Path) -> Result<()> {
-    let (transport, canonical) = verified_path(adb, device, remote)?;
-    if destination.exists() {
-        bail!("本地目标已存在，请选择新文件名以避免覆盖");
+fn pull_inner(
+    adb: &Adb,
+    device: &Device,
+    remote: &str,
+    destination: &Path,
+    overwrite: bool,
+) -> Result<()> {
+    if !overwrite {
+        if std::fs::symlink_metadata(destination).is_ok() {
+            bail!("本地目标已存在，请选择新文件名以避免覆盖");
+        }
+    } else if let Ok(meta) = std::fs::symlink_metadata(destination) {
+        anyhow::ensure!(
+            !meta.file_type().is_symlink() && !meta.is_dir(),
+            "本地目标不能是链接或文件夹"
+        );
     }
-    adb.transfer(
-        &transport,
-        "pull",
-        Path::new(&canonical),
-        destination,
-    )
+    let (transport, canonical) = verified_path(adb, device, remote)?;
+    let q_canonical = shell_quote(&canonical);
+    let expected_size = adb
+        .script(
+            &transport,
+            &format!("test -f {q_canonical} && stat -c '%s' {q_canonical}"),
+        )
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok());
+
+    let parent = destination
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let temp = tempfile::NamedTempFile::new_in(parent)?.into_temp_path();
+    adb.transfer(&transport, "pull", Path::new(&canonical), &temp)?;
+
+    let pulled_meta =
+        std::fs::symlink_metadata(&temp).context("拉取文件未生成有效本地副本")?;
+    anyhow::ensure!(
+        pulled_meta.is_file() && !pulled_meta.file_type().is_symlink(),
+        "拉取文件类型无效"
+    );
+    if let Some(expected) = expected_size {
+        anyhow::ensure!(
+            pulled_meta.len() == expected,
+            "文件拉取不完整（预期 {expected} 字节，实际 {} 字节）",
+            pulled_meta.len()
+        );
+    }
+    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&temp) {
+        let _ = file.sync_all();
+    }
+    if overwrite {
+        temp.persist(destination).context("保存本地文件失败")?;
+    } else {
+        temp.persist_noclobber(destination).map_err(|e| {
+            if e.error.kind() == std::io::ErrorKind::AlreadyExists {
+                anyhow::anyhow!("本地目标已存在，请选择新文件名以避免覆盖")
+            } else {
+                anyhow::Error::new(e.error).context("保存本地文件失败")
+            }
+        })?;
+    }
+    Ok(())
+}
+
+pub fn pull(adb: &Adb, device: &Device, remote: &str, destination: &Path) -> Result<()> {
+    pull_inner(adb, device, remote, destination, false)
+}
+
+pub fn pull_overwrite(adb: &Adb, device: &Device, remote: &str, destination: &Path) -> Result<()> {
+    pull_inner(adb, device, remote, destination, true)
 }
 
 pub fn push(adb: &Adb, device: &Device, local: &Path, directory: &str) -> Result<()> {
     if !local.is_file() {
         bail!("请选择一个本地文件");
     }
+    let expected_bytes = local.metadata()?.len();
     let (transport, canonical) = verified_path(adb, device, directory)?;
     let name = local
         .file_name()
         .and_then(|n| n.to_str())
         .context("文件名必须是 UTF-8")?;
+    validate_entry_name(name)?;
     let target = format!("{canonical}/{name}");
+    let q_target = shell_quote(&target);
     adb.script(
         &transport,
-        &format!(
-            "test ! -e {} && test ! -L {}",
-            shell_quote(&target),
-            shell_quote(&target)
-        ),
+        &format!("test ! -e {q_target} && test ! -L {q_target}"),
     )
     .context("手机中已存在同名文件，请先重命名本地文件")?;
-    adb.transfer(&transport, "push", local, Path::new(&target))
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let staged = format!("{canonical}/.stepx-push-{pid}-{nanos}.part");
+    let q_staged = shell_quote(&staged);
+    let publish = (|| -> Result<()> {
+        adb.transfer(&transport, "push", local, Path::new(&staged))?;
+        anyhow::ensure!(
+            local.metadata()?.len() == expected_bytes,
+            "本地文件在传输期间发生变化，已取消推送"
+        );
+        adb.script(
+            &transport,
+            &format!(
+                "test -f {q_staged} && test ! -L {q_staged} && sz=$(stat -c '%s' {q_staged} 2>/dev/null || wc -c < {q_staged}) && [ \"$sz\" -eq {expected_bytes} ] && test ! -e {q_target} && test ! -L {q_target} && mv -n -- {q_staged} {q_target} && test ! -e {q_staged} && test -f {q_target}"
+            ),
+        )
+        .context("推送文件大小校验失败或手机中已存在同名文件")?;
+        Ok(())
+    })();
+    if let Err(err) = publish {
+        let _ = adb.script(&transport, &format!("rm -f -- {q_staged}"));
+        return Err(err);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -465,5 +550,158 @@ mod native_recycle_tests {
         let error=restore(&adb,&fixture.device(),&record).unwrap_err();
         assert!(error.to_string().contains("同名文件"));
         assert!(fixture.calls.lock().unwrap().is_empty());
+    }
+
+    fn mock_adb(dir: &Path, body: &str) -> (Adb, Device) {
+        use std::os::unix::fs::PermissionsExt;
+        let script_path = dir.join("mock-adb.sh");
+        std::fs::write(&script_path, format!("#!/bin/sh\nset -eu\n{body}\n")).unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        (
+            Adb { path: script_path },
+            Device {
+                transport: "mock-1".into(),
+                serial: "mock-1".into(),
+                model: "PZ".into(),
+                android: "16".into(),
+                product: "pandora".into(),
+            },
+        )
+    }
+
+    #[test]
+    fn pull_rejects_dangling_symlinks_verifies_size_and_supports_pull_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let phone_file = dir.path().join("remote.bin");
+        std::fs::write(&phone_file, b"hello-atomic-pull").unwrap();
+        let phone_str = shell_quote(phone_file.to_str().unwrap());
+
+        let (adb, dev) = mock_adb(
+            dir.path(),
+            &format!(
+                r#"
+case "$*" in
+  *ro.serialno*) echo mock-1 ;;
+  *get-state*) echo device ;;
+  *readlink*) echo /storage/emulated/0/Download/report.bin ;;
+  *stat\ -c*) wc -c < {phone_str} | tr -d '[:space:]'; echo ;;
+  *\ pull\ *)
+    eval "dst=\${{$#}}"
+    cp {phone_str} "$dst"
+    ;;
+  *) exit 0 ;;
+esac
+"#
+            ),
+        );
+
+        let dangling = dir.path().join("dangling.bin");
+        std::os::unix::fs::symlink("/nonexistent/missing", &dangling).unwrap();
+        assert!(
+            pull(&adb, &dev, "/sdcard/Download/report.bin", &dangling).is_err(),
+            "pull must reject dangling symlink destination"
+        );
+
+        let out = dir.path().join("out/report.bin");
+        pull(&adb, &dev, "/sdcard/Download/report.bin", &out).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"hello-atomic-pull");
+        assert!(
+            pull(&adb, &dev, "/sdcard/Download/report.bin", &out).is_err(),
+            "pull must noclobber existing file"
+        );
+
+        std::fs::write(&phone_file, b"updated-second-click-bytes").unwrap();
+        pull_overwrite(&adb, &dev, "/sdcard/Download/report.bin", &out).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"updated-second-click-bytes");
+
+        // Interrupted/short pull must never leave a partial file at destination.
+        let (bad_adb, bad_dev) = mock_adb(
+            dir.path(),
+            r#"
+case "$*" in
+  *ro.serialno*) echo mock-1 ;;
+  *get-state*) echo device ;;
+  *readlink*) echo /storage/emulated/0/Download/trunc.bin ;;
+  *stat\ -c*) echo 100 ;;
+  *\ pull\ *)
+    eval "dst=\${$#}"
+    printf 'short' > "$dst"
+    ;;
+  *) exit 0 ;;
+esac
+"#,
+        );
+        let never_created = dir.path().join("out/trunc.bin");
+        assert!(pull(&bad_adb, &bad_dev, "/sdcard/Download/trunc.bin", &never_created).is_err());
+        assert!(std::fs::symlink_metadata(&never_created).is_err());
+    }
+
+    #[test]
+    fn push_stages_part_file_verifies_bytes_and_cleans_up_on_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let phone_root = dir.path().join("phone_dl");
+        std::fs::create_dir_all(&phone_root).unwrap();
+        let local = dir.path().join("upload.txt");
+        std::fs::write(&local, b"verified-push-payload").unwrap();
+
+        let map_root = phone_root.to_str().unwrap().to_string();
+        let (adb, dev) = mock_adb(
+            dir.path(),
+            &format!(
+                r#"
+case "$*" in
+  *ro.serialno*) echo mock-1 ;;
+  *get-state*) echo device ;;
+  *readlink*) echo /storage/emulated/0/Download ;;
+  *\ push\ *)
+    src="$4"
+    dst=$(printf '%s' "$5" | sed 's|^/storage/emulated/0/Download|{map_root}|')
+    cp "$src" "$dst"
+    ;;
+  *\ shell\ *)
+    cmd=$(printf '%s' "$4" | sed 's|/storage/emulated/0/Download|{map_root}|g')
+    sh -c "$cmd"
+    ;;
+esac
+"#
+            ),
+        );
+
+        push(&adb, &dev, &local, "/sdcard/Download").unwrap();
+        assert_eq!(
+            std::fs::read(phone_root.join("upload.txt")).unwrap(),
+            b"verified-push-payload"
+        );
+        assert_eq!(std::fs::read_dir(&phone_root).unwrap().count(), 1);
+
+        // Simulated truncated transfer must fail and remove the `.part` file.
+        let local2 = dir.path().join("truncated.txt");
+        std::fs::write(&local2, b"full-length-bytes").unwrap();
+        let (trunc_adb, trunc_dev) = mock_adb(
+            dir.path(),
+            &format!(
+                r#"
+case "$*" in
+  *ro.serialno*) echo mock-1 ;;
+  *get-state*) echo device ;;
+  *readlink*) echo /storage/emulated/0/Download ;;
+  *\ push\ *)
+    dst=$(printf '%s' "$5" | sed 's|^/storage/emulated/0/Download|{map_root}|')
+    printf 'short' > "$dst"
+    ;;
+  *\ shell\ *)
+    cmd=$(printf '%s' "$4" | sed 's|/storage/emulated/0/Download|{map_root}|g')
+    sh -c "$cmd"
+    ;;
+esac
+"#
+            ),
+        );
+        assert!(push(&trunc_adb, &trunc_dev, &local2, "/sdcard/Download").is_err());
+        assert!(!phone_root.join("truncated.txt").exists());
+        for entry in std::fs::read_dir(&phone_root).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            assert!(!name.ends_with(".part"), "leftover .part file: {name}");
+        }
     }
 }

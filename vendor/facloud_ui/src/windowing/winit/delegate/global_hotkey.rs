@@ -12,7 +12,7 @@ use global_hotkey::{
 
 /// Responsible for registering system-wide (global) hotkeys with the platform.
 pub struct GlobalHotKeyHandler {
-    platform_manager: std::cell::OnceCell<GlobalHotKeyManager>,
+    platform_manager: std::cell::OnceCell<Option<GlobalHotKeyManager>>,
     /// Maps the [`global_hotkey::hotkey::HotKey::id`], an opaque, hash-based integer, to our
     /// [`keymap::Keystroke`].
     hotkey_map: Arc<Mutex<HashMap<u32, keymap::Keystroke>>>,
@@ -38,7 +38,13 @@ impl GlobalHotKeyHandler {
                 return;
             }
         };
-        self.platform_manager().register(hotkey);
+        let Some(manager) = self.platform_manager() else {
+            return;
+        };
+        if let Err(e) = manager.register(hotkey) {
+            log::warn!("failed to register global hotkey: {e:?}");
+            return;
+        }
         self.hotkey_map.lock().insert(hotkey.id(), shortcut);
     }
 
@@ -50,45 +56,57 @@ impl GlobalHotKeyHandler {
                 return;
             }
         };
-        self.platform_manager().unregister(hotkey);
+        if let Some(manager) = self.platform_manager() {
+            if let Err(e) = manager.unregister(hotkey) {
+                log::warn!("failed to unregister global hotkey: {e:?}");
+            }
+        }
         self.hotkey_map.lock().remove(&hotkey.id());
     }
 
-    /// Returns a reference to a lazily-instantiated [`GlobalHotKeyManager`].
+    /// Returns a reference to a lazily-instantiated [`GlobalHotKeyManager`], or `None` if the
+    /// current environment (e.g. Wayland or restricted sandbox) does not support global hotkeys.
     ///
     /// We do this lazily because the [`GlobalHotKeyManager`] can interfere
     /// with other libraries that use Xlib, leading to crashes.  We don't want
     /// to run the risk of this happening for users who haven't set any global
     /// hotkeys.
-    fn platform_manager(&self) -> &GlobalHotKeyManager {
-        self.platform_manager.get_or_init(|| {
-            let platform_manager =
-                GlobalHotKeyManager::new().expect("x11 implementation never actually fails");
-            let thread_hotkey_map = self.hotkey_map.clone();
-            // When global hotkeys are triggered, events get published to a crossbeam channel.
-            // Since crossbeam channels are not async, we don't want to receive this on our
-            // background executor's thread pool, as that would block a thread. Therefore, we spawn
-            // a dedicated thread for receiving these events.
-            let event_loop_proxy = self.event_loop_proxy.clone();
-            thread::spawn(move || {
-                while let Ok(event) = GlobalHotKeyEvent::receiver().recv() {
-                    // Trigger when the hotkey is released, _not_ pressed. This is due to an X11
-                    // quirk where focus is transferred out of Warp windows after a global hotkey
-                    // is pressed. This breaks our quake mode logic. However, focus is restored
-                    // when the hotkey is released.
-                    if event.state == HotKeyState::Released {
-                        // Lookup the hash-based hotkey ID to the actual keystroke from our
-                        // map.
-                        if let Some(keystroke) = thread_hotkey_map.lock().get(&event.id) {
-                            event_loop_proxy.send_event(CustomEvent::GlobalShortcutTriggered(
-                                keystroke.clone(),
-                            ));
+    fn platform_manager(&self) -> Option<&GlobalHotKeyManager> {
+        self.platform_manager
+            .get_or_init(|| {
+                let platform_manager = match GlobalHotKeyManager::new() {
+                    Ok(manager) => manager,
+                    Err(err) => {
+                        log::warn!("GlobalHotKeyManager unavailable on this session: {err:?}");
+                        return None;
+                    }
+                };
+                let thread_hotkey_map = self.hotkey_map.clone();
+                // When global hotkeys are triggered, events get published to a crossbeam channel.
+                // Since crossbeam channels are not async, we don't want to receive this on our
+                // background executor's thread pool, as that would block a thread. Therefore, we spawn
+                // a dedicated thread for receiving these events.
+                let event_loop_proxy = self.event_loop_proxy.clone();
+                thread::spawn(move || {
+                    while let Ok(event) = GlobalHotKeyEvent::receiver().recv() {
+                        // Trigger when the hotkey is released, _not_ pressed. This is due to an X11
+                        // quirk where focus is transferred out of Warp windows after a global hotkey
+                        // is pressed. This breaks our quake mode logic. However, focus is restored
+                        // when the hotkey is released.
+                        if event.state == HotKeyState::Released {
+                            // Lookup the hash-based hotkey ID to the actual keystroke from our
+                            // map.
+                            if let Some(keystroke) = thread_hotkey_map.lock().get(&event.id) {
+                                let _ = event_loop_proxy.send_event(
+                                    CustomEvent::GlobalShortcutTriggered(keystroke.clone()),
+                                );
+                            }
                         }
                     }
-                }
-            });
-            platform_manager
-        })
+                });
+                Some(platform_manager)
+            })
+            .as_ref()
     }
 }
 

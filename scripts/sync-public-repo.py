@@ -42,6 +42,7 @@ ALLOWLIST_DIRS: Tuple[str, ...] = (
     "desktop/neo-agent-adapter",
     "handoff/google-play-stepx/tools",
     "handoff/google-play-stepx/module",
+    "vendor",
 )
 
 ALLOWLIST_FILES: Tuple[str, ...] = (
@@ -298,7 +299,8 @@ def collect_sync_plan() -> Dict[str, Tuple[bytes, int]]:
                 paths.add(path.relative_to(ROOT).as_posix())
     allowed_code_suffixes = {'.rs', '.toml', '.lock', '.java', '.kt', '.xml', '.json', '.srt',
         '.md', '.txt', '.py', '.sh', '.ps1', '.js', '.cjs', '.mjs', '.svg', '.rc', '.yml', '.yaml',
-        '.dex', '.jar', '.apk', '.aar', '.so', '.ttf', '.otf', '.pro', '.gradle'}
+        '.dex', '.jar', '.apk', '.aar', '.so', '.ttf', '.otf', '.pro', '.gradle',
+        '.h', '.m', '.metal', '.wgsl', '.clang-format', '.gitignore'}
     allowed_code_suffixes.update({'.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico', '.mp4', '.h264'})
     for rel in sorted(paths):
         path = ROOT / rel
@@ -316,7 +318,7 @@ def collect_sync_plan() -> Dict[str, Tuple[bytes, int]]:
                 text = desensitize_script(rel, text)
             # The policy/manifest contain literal scanner expressions and reviewed
             # media hashes; these are not fixture text and must remain byte exact.
-            if rel not in {'scripts/public_release_policy.py', 'scripts/release-resources.json', 'scripts/sync-public-repo.py'}:
+            if not rel.startswith('vendor/') and rel not in {'scripts/public_release_policy.py', 'scripts/release-resources.json', 'scripts/sync-public-repo.py'}:
                 text = fixture_placeholders(rel, text)
             data = text.encode('utf-8')
         issues = content_problems(rel, data, policy)

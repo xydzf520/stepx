@@ -325,8 +325,9 @@ JSON schema: {{"kind":"preset|image|native|app","native_feature":"notifications|
         };
         if let Some(package) = plan.app_package.as_deref() {
             crate::apps::validate_package(package)?;
+            let transport = device.resolve_active_transport(adb)?;
             if !adb
-                .shell(&device.transport, &["pm", "path", package])?
+                .shell(&transport, &["pm", "path", package])?
                 .lines()
                 .any(|l| l.starts_with("package:"))
             {
@@ -884,7 +885,9 @@ pub fn sync_sprite_state_to_backscreen(
     state: AgentSpriteState,
     tick: usize,
 ) -> Result<String> {
+    device.verify(adb)?;
     let transport = device.resolve_active_transport(adb)?;
+    crate::backscreen::save_mcp_restore_state_if_needed(adb, device, &transport)?;
     let flat = sprite_frame_flat_391(state, tick);
     let matrix_csv = flat
         .iter()

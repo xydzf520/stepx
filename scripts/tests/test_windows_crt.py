@@ -113,16 +113,42 @@ class WindowsCrtTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'older than active MSVC'):
             crt.stage_crt(self.exe, self.redist, '14.44.35207', self.source,
                           version_reader=lambda p: (14, 43, 99999, 0))
+        with self.assertRaisesRegex(RuntimeError, 'older than active MSVC'):
+            crt.stage_crt(self.exe, self.redist, '14.44.35207', self.source,
+                          version_reader=lambda p: (15, 0, 10000, 0))
+
+    def test_servicing_patch_skew_and_in_place_minor_upgrade_accepted(self):
+        report_skew = crt.stage_crt(
+            self.exe, self.redist, '14.44.35217', self.source,
+            version_reader=lambda p: (14, 44, 35207, 0),
+        )
+        self.assertEqual(report_skew['files']['vcruntime140.dll']['version'], '14.44.35207.0')
+        report_minor = crt.stage_crt(
+            self.exe, self.redist, '14.44.35207', self.source,
+            version_reader=lambda p: (14, 45, 35300, 0),
+        )
+        self.assertEqual(report_minor['files']['vcruntime140.dll']['version'], '14.45.35300.0')
 
     def test_only_matching_installed_release_toolset_is_selected(self):
         installation = self.root / 'VS'
-        (installation / 'VC/Redist/MSVC/14.44.35220/x64/Microsoft.VC143.CRT').mkdir(parents=True)
-        (installation / 'VC/Redist/MSVC/14.45.99999/x64/Microsoft.VC143.CRT').mkdir(parents=True)
+        exact_dir = installation / 'VC/Redist/MSVC/14.44.35220/x64/Microsoft.VC143.CRT'
+        newer_minor_dir = installation / 'VC/Redist/MSVC/14.45.99999/x64/Microsoft.VC143.CRT'
+        exact_dir.mkdir(parents=True)
+        newer_minor_dir.mkdir(parents=True)
+        (installation / 'VC/Redist/MSVC/14.43.99999/x64/Microsoft.VC143.CRT').mkdir(parents=True)
         (installation / 'VC/Redist/MSVC/14.44.99999/debug_nonredist/x64/Microsoft.VC143.DebugCRT').mkdir(parents=True)
+        # Exact minor match is preferred over newer minor even when 14.45 is present.
         selected = crt.select_redist(installation, '14.44.35207')
         self.assertIn('14.44.35220', selected.parts)
+        # If VS upgraded 14.44 redist in place to 14.45, select the compatible 14.45 redist.
+        shutil.rmtree(installation / 'VC/Redist/MSVC/14.44.35211')
+        shutil.rmtree(installation / 'VC/Redist/MSVC/14.44.35220')
+        upgraded = crt.select_redist(installation, '14.44.35207')
+        self.assertIn('14.45.99999', upgraded.parts)
+        # Older minor families (14.43/14.45 < 14.46) and mismatched majors (15.x) are rejected.
+        (installation / 'VC/Redist/MSVC/15.0.10000/x64/Microsoft.VC150.CRT').mkdir(parents=True)
         with self.assertRaisesRegex(RuntimeError, 'Matching x64'):
-            crt.select_redist(installation, '14.42.11111')
+            crt.select_redist(installation, '14.46.11111')
 
     def test_x86_binary_is_rejected(self):
         (self.redist / 'VCRUNTIME140.dll').write_bytes(pe_image(machine=0x14c))
@@ -187,6 +213,20 @@ class WindowsCrtTests(unittest.TestCase):
         self.assertTrue(any('rogue.dll' in item for item in policy.audit_bundle(self.app)))
         (self.app / 'vcruntime140.dll').unlink()
         self.assertTrue(any('Windows app-local CRT verification failed' in item for item in policy.audit_bundle(self.app)))
+
+    def test_cli_main_stages_and_verifies_crt(self):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with mock.patch.object(crt, 'package_windows_crt', side_effect=lambda exe: self.stage()), \
+             contextlib.redirect_stdout(buf):
+            self.assertEqual(0, crt.main([str(self.exe)]))
+        staged = json.loads(buf.getvalue())
+        self.assertEqual(['vcruntime140.dll'], staged['dependencies'])
+        verify_buf = io.StringIO()
+        with contextlib.redirect_stdout(verify_buf):
+            self.assertEqual(0, crt.main([str(self.exe), '--verify-only']))
+        self.assertEqual(staged, json.loads(verify_buf.getvalue()))
 
     @unittest.skipUnless(os.name == 'nt', 'requires native Visual Studio installation')
     def test_native_visual_studio_redist_version_and_closure(self):

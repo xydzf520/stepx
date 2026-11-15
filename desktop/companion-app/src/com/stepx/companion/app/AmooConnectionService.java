@@ -51,12 +51,27 @@ public final class AmooConnectionService extends Service {
             else if(Intent.ACTION_SCREEN_OFF.equals(action))leases.screen(false,receivedAt);tick();});
     }};
     private final Runnable pulse=()->tick();
+    private boolean enterForeground(String text){
+        try{
+            NotificationManager nm=getSystemService(NotificationManager.class);
+            if(nm!=null)nm.createNotificationChannel(new NotificationChannel("amoo_connection","电脑后台协作",NotificationManager.IMPORTANCE_LOW));
+            startForeground(18,notification(text));
+            lastNotifiedText=text;
+            return true;
+        }catch(Throwable t){
+            lastError=t.getMessage()==null?t.getClass().getSimpleName():t.getMessage();
+            android.util.Log.w("StepXAmoo","startForeground failed",t);
+            writeStatus(SystemClock.elapsedRealtime(),lastError,"fgs_denied",0);
+            stopSelf();
+            return false;
+        }
+    }
     @Override public void onCreate(){
         super.onCreate();
         power=getSystemService(PowerManager.class);cpu=power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,"StepX:amoo-task");cpu.setReferenceCounted(false);
         try{
             android.net.wifi.WifiManager wm=getSystemService(android.net.wifi.WifiManager.class);
-            if(wm!=null){wifiLock=wm.createWifiLock(android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF,"StepX:amoo-wifi");wifiLock.setReferenceCounted(false);}
+            if(wm!=null){wifiLock=wm.createWifiLock(android.net.wifi.WifiManager.WIFI_MODE_FULL_LOW_LATENCY,"StepX:amoo-wifi");wifiLock.setReferenceCounted(false);}
         }catch(Exception ignored){}
         preferences=getSharedPreferences("amoo_connection",0);
         bootCount=Settings.Global.getInt(getContentResolver(),"boot_count",-1);
@@ -64,10 +79,9 @@ public final class AmooConnectionService extends Service {
         if(bootCount>=0&&preferences.getInt("wake_boot",-2)==bootCount)leases.restoreWake(preferences.getLong("wake_elapsed",-1),nowElapsed);
         boolean interactive=power.isInteractive();
         leases.screen(interactive,interactive?nowElapsed:Math.max(0L,nowElapsed-AmooLeaseState.OFF_SETTLE_MS));
-        getSystemService(NotificationManager.class).createNotificationChannel(new NotificationChannel("amoo_connection","电脑后台协作",NotificationManager.IMPORTANCE_LOW));
-        lastNotifiedText="正在检查任务连接…";
-        startForeground(18,notification(lastNotifiedText));
         workerThread=new HandlerThread("StepXAmooConnection");workerThread.start();worker=new Handler(workerThread.getLooper());
+        lastNotifiedText="正在检查任务连接…";
+        if(!enterForeground(lastNotifiedText))return;
         IntentFilter filter=new IntentFilter(Intent.ACTION_SCREEN_OFF);filter.addAction(Intent.ACTION_SCREEN_ON);
         registerReceiver(screen,filter,Context.RECEIVER_NOT_EXPORTED);registered=true;
     }
@@ -79,7 +93,8 @@ public final class AmooConnectionService extends Service {
     @Override public int onStartCommand(Intent intent,int flags,int startId){
         latestStart=startId;
         if(lastNotifiedText.isEmpty())lastNotifiedText="正在检查任务连接…";
-        startForeground(18,notification(lastNotifiedText));
+        if(!enterForeground(lastNotifiedText))return START_NOT_STICKY;
+        if(worker==null){try{stopForeground(STOP_FOREGROUND_REMOVE);}catch(Throwable ignored){}stopSelf(startId);return START_NOT_STICKY;}
         final String id=bounded(intent==null?null:intent.getStringExtra("request_id"),"local-"+System.currentTimeMillis());
         final String op=intent==null?"status":bounded(intent.getStringExtra("op"),"status");
         final String leaseId=intent==null?"":bounded(intent.getStringExtra("lease_id"),"");
@@ -170,7 +185,7 @@ public final class AmooConnectionService extends Service {
             // Idle grace observes only the existing native window. CPU lock is
             // already released above; no lease, wake request or deadline is added.
             worker.postDelayed(pulse,active?1000:Math.min(1000,grace));
-        }else{int start=latestStart;main.post(()->{if(latestStart==start){stopForeground(STOP_FOREGROUND_REMOVE);stopSelf(start);}});}
+        }else{int start=latestStart;main.post(()->{if(latestStart==start){try{stopForeground(STOP_FOREGROUND_REMOVE);}catch(Throwable ignored){}try{stopSelf(start);}catch(Throwable ignored){}}});}
     }
     private String statusMessage(long now){
         if(!lastError.isEmpty())return lastError;

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Build a portable package from the native release binary and verified upstream tools."""
-import argparse, hashlib, os, platform, plistlib, posixpath, re, shutil, subprocess, sys, tarfile, tempfile, urllib.parse, urllib.request, zipfile
+import argparse, hashlib, os, platform, plistlib, posixpath, re, shutil, stat, struct, subprocess, sys, tarfile, tempfile, urllib.parse, urllib.request, zipfile
 from pathlib import Path
 sys.dont_write_bytecode = True
 from public_release_policy import audit_bundle, content_problems, manifest, runtime_plan, safe_read
@@ -14,6 +14,175 @@ TOOLS = {
     'macos-x86_64': ('scrcpy-macos-x86_64-v5.0.1.tar.gz', '31a5467a9e907f162b093267cbbab1276b15c6e709c2ea8159566a8d165beb50', 620992832),
     'windows-x86_64': ('scrcpy-win64-v5.0.1.zip', 'b12a2c4ee8be317422451fc7dcf8ee20a71b5ea7ef9ad73ddd825a25316227a5', 620992965),
 }
+SINGLE_MACHO_MAGICS = frozenset({0xfeedface, 0xcefaedfe, 0xfeedfacf, 0xcffaedfe})
+FAT_MACHO_MAGICS = frozenset({0xcafebabe, 0xbebafeca, 0xcafebabf, 0xbfbafeca})
+LC_VERSION_MIN_MACOSX = 0x24
+LC_BUILD_VERSION = 0x32
+PLATFORM_MACOS = 1
+
+
+def macos_info_plist(version: str) -> dict:
+    return {
+        'CFBundleInfoDictionaryVersion': '6.0',
+        'CFBundleName': 'StepX Companion',
+        'CFBundleDisplayName': 'StepX Companion',
+        'CFBundleIdentifier': 'io.github.xydzf520.stepx',
+        'CFBundleExecutable': 'stepx-companion',
+        'CFBundlePackageType': 'APPL',
+        'CFBundleShortVersionString': version,
+        'CFBundleVersion': version,
+        'LSMinimumSystemVersion': '11.0',
+        'NSHighResolutionCapable': True,
+        'NSSupportsAutomaticGraphicsSwitching': True,
+        'NSMicrophoneUsageDescription': '用于语音输入',
+        'NSCameraUsageDescription': '用于扫码连接',
+        'NSLocalNetworkUsageDescription': '用于在局域网发现并连接您授权的手机。',
+        'NSBonjourServices': [
+            '_adb-tls-pairing._tcp',
+            '_adb-tls-connect._tcp',
+            '_adb._tcp',
+            '_airplay._tcp',
+            '_googlecast._tcp',
+            '_raop._tcp',
+        ],
+        'CFBundleIconFile': 'StepX.icns',
+    }
+
+
+def is_macho_file(path: Path) -> bool:
+    if path.is_symlink() or not path.is_file():
+        return False
+    try:
+        with path.open('rb') as handle:
+            hdr = handle.read(8)
+    except OSError:
+        return False
+    if len(hdr) < 8:
+        return False
+    magic = int.from_bytes(hdr[:4], 'big')
+    if magic in SINGLE_MACHO_MAGICS:
+        return True
+    if magic in FAT_MACHO_MAGICS:
+        endian = 'big' if hdr[:4] in (b'\xca\xfe\xba\xbe', b'\xca\xfe\xba\xbf') else 'little'
+        return 1 <= int.from_bytes(hdr[4:8], endian) <= 20
+    return False
+
+
+def macho_binaries(root: Path) -> list[Path]:
+    """Return regular non-symlink Mach-O files under root sorted deepest-first."""
+    root = Path(root)
+    matches = [path for path in root.rglob('*') if is_macho_file(path)]
+    return sorted(matches, key=lambda p: (-len(p.relative_to(root).parts), p.relative_to(root).as_posix()))
+
+
+def _slice_macos_minos(data: bytes, label: str) -> tuple[int, int, int]:
+    if len(data) < 28:
+        raise ValueError(f'{label}: truncated Mach-O slice')
+    raw_magic = data[:4]
+    if raw_magic == b'\xfe\xed\xfa\xce':
+        endian, header_size = '>', 28
+    elif raw_magic == b'\xce\xfa\xed\xfe':
+        endian, header_size = '<', 28
+    elif raw_magic == b'\xfe\xed\xfa\xcf':
+        endian, header_size = '>', 32
+    elif raw_magic == b'\xcf\xfa\xed\xfe':
+        endian, header_size = '<', 32
+    else:
+        raise ValueError(f'{label}: invalid single-arch Mach-O magic')
+    if len(data) < header_size:
+        raise ValueError(f'{label}: truncated Mach-O header')
+    ncmds, sizeofcmds = struct.unpack_from(endian + 'II', data, 16)
+    pos = header_size
+    end = pos + sizeofcmds
+    if end > len(data):
+        raise ValueError(f'{label}: Mach-O load commands exceed file size')
+    versions = []
+    for _ in range(ncmds):
+        if pos + 8 > end:
+            raise ValueError(f'{label}: truncated Mach-O load command')
+        cmd, cmdsize = struct.unpack_from(endian + 'II', data, pos)
+        if cmdsize < 8 or pos + cmdsize > end:
+            raise ValueError(f'{label}: invalid Mach-O load command size')
+        if cmd == LC_BUILD_VERSION:
+            if cmdsize < 24:
+                raise ValueError(f'{label}: truncated LC_BUILD_VERSION')
+            platform_id, raw_minos = struct.unpack_from(endian + 'II', data, pos + 8)
+            if platform_id == PLATFORM_MACOS:
+                versions.append((raw_minos >> 16, (raw_minos >> 8) & 0xff, raw_minos & 0xff))
+        elif cmd == LC_VERSION_MIN_MACOSX:
+            if cmdsize < 16:
+                raise ValueError(f'{label}: truncated LC_VERSION_MIN_MACOSX')
+            raw_minos, = struct.unpack_from(endian + 'I', data, pos + 8)
+            versions.append((raw_minos >> 16, (raw_minos >> 8) & 0xff, raw_minos & 0xff))
+        pos += cmdsize
+    if not versions:
+        raise RuntimeError(f'{label}: missing LC_BUILD_VERSION / LC_VERSION_MIN_MACOSX load command')
+    return max(versions)
+
+
+def verify_macos_minos(path: Path, max_minos: tuple[int, ...] = (11, 0)) -> list[tuple[int, int, int]]:
+    """Verify Mach-O LC_BUILD_VERSION / LC_VERSION_MIN_MACOSX minos <= max_minos."""
+    path = Path(path)
+    data = path.read_bytes()
+    if len(data) < 8:
+        raise ValueError(f'{path.name}: not a Mach-O executable')
+    raw_magic = data[:4]
+    magic = int.from_bytes(raw_magic, 'big')
+    slices = []
+    if magic in FAT_MACHO_MAGICS:
+        endian = '>' if raw_magic in (b'\xca\xfe\xba\xbe', b'\xca\xfe\xba\xbf') else '<'
+        fat64 = raw_magic in (b'\xca\xfe\xba\xbf', b'\xbf\xba\xfe\xca')
+        count, = struct.unpack_from(endian + 'I', data, 4)
+        if not (1 <= count <= 20):
+            raise ValueError(f'{path.name}: invalid Fat Mach-O architecture count')
+        stride = 32 if fat64 else 20
+        if len(data) < 8 + count * stride:
+            raise ValueError(f'{path.name}: truncated Fat Mach-O header')
+        for idx in range(count):
+            entry = 8 + idx * stride
+            offset, size = struct.unpack_from(endian + ('QQ' if fat64 else 'II'), data, entry + 8)
+            if offset + size > len(data) or size == 0:
+                raise ValueError(f'{path.name}: Fat Mach-O slice outside file')
+            slices.append(data[offset:offset + size])
+    elif magic in SINGLE_MACHO_MAGICS:
+        slices.append(data)
+    else:
+        raise ValueError(f'{path.name}: expected Mach-O executable')
+    limit = (*max_minos, 0, 0)[:3]
+    versions = [_slice_macos_minos(chunk, path.name) for chunk in slices]
+    for version in versions:
+        if version > limit:
+            rendered = '.'.join(map(str, version[:2] if version[2] == 0 else version))
+            target = '.'.join(map(str, limit[:2] if limit[2] == 0 else limit))
+            raise RuntimeError(f'{path.name}: macOS minos {rendered} exceeds {target}')
+    return versions
+
+
+def clean_tar_info(info: tarfile.TarInfo) -> tarfile.TarInfo:
+    """Strip host UID/GID and username/groupname from Linux release tarballs."""
+    info.uid = 0
+    info.gid = 0
+    info.uname = ''
+    info.gname = ''
+    return info
+
+
+def sign_macos_bundle(base: Path, binary_path: Path, resource_dir: Path, tools_dir: Path, tool_env: dict) -> list[Path]:
+    subprocess.run(['xattr','-cr',str(base/'StepX Companion.app')],check=True)
+    nested_machos = macho_binaries(resource_dir)
+    for macho in [*nested_machos, binary_path]:
+        mode = macho.stat().st_mode
+        if not (mode & stat.S_IWUSR):
+            macho.chmod(mode | stat.S_IWUSR)
+    for macho in nested_machos:
+        subprocess.run(['codesign', '--force', '--sign', '-', str(macho)], check=True)
+    subprocess.run(['codesign','--force','--deep','--sign','-',str(base/'StepX Companion.app')],check=True)
+    subprocess.run([str(binary_path),'--check-runtime'],check=True,env=verification_environment(),timeout=45)
+    subprocess.run([str(tools_dir/'scrcpy'),'--version'],check=True,env=tool_env,timeout=30)
+    for macho in nested_machos:
+        subprocess.run(['codesign', '--verify', '--strict', str(macho)], check=True)
+    subprocess.run(['codesign','--verify','--deep','--strict',str(base/'StepX Companion.app')],check=True)
+    return nested_machos
 
 def verification_environment():
     """Never let validation mutate the staged runtime or an inherited cache path."""
@@ -137,20 +306,19 @@ def main():
         if mac:
             bundle=base/'StepX Companion.app'/'Contents';binary_dir=bundle/'MacOS';resource_dir=bundle/'Resources'
             binary_dir.mkdir(parents=True);resource_dir.mkdir()
-            info={'CFBundleName':'StepX Companion','CFBundleDisplayName':'StepX Companion','CFBundleIdentifier':'io.github.xydzf520.stepx','CFBundleExecutable':'stepx-companion','CFBundlePackageType':'APPL','CFBundleShortVersionString':a.version,'CFBundleVersion':a.version,'NSHighResolutionCapable':True,'NSMicrophoneUsageDescription':'用于语音输入','NSCameraUsageDescription':'用于扫码连接'}
-            info['NSLocalNetworkUsageDescription']='用于在局域网发现并连接您授权的手机。'
-            info['NSBonjourServices']=['_adb-tls-pairing._tcp','_adb-tls-connect._tcp','_adb._tcp']
+            info=macos_info_plist(a.version)
             iconset=stage/'StepX.iconset';iconset.mkdir()
             for size in [16,32,128,256,512]:
                 for scale in [1,2]:
                     suffix='@2x' if scale==2 else ''
                     subprocess.run(['sips','-z',str(size*scale),str(size*scale),str(ROOT/'desktop/assets/stepx_companion_icon.png'),'--out',str(iconset/f'icon_{size}x{size}{suffix}.png')],check=True,stdout=subprocess.DEVNULL)
             subprocess.run(['iconutil','-c','icns',str(iconset),'-o',str(resource_dir/'StepX.icns')],check=True)
-            info['CFBundleIconFile']='StepX.icns'
             (bundle/'Info.plist').write_bytes(plistlib.dumps(info))
         else:binary_dir=resource_dir=base
         binary_name='stepx-companion'+('.exe' if windows else '')
         shutil.copy2(ROOT/'desktop'/'target'/'release'/binary_name,binary_dir/binary_name)
+        if mac:
+            verify_macos_minos(binary_dir/binary_name)
         if windows:
             crt = package_windows_crt(binary_dir/binary_name)
             print('App-local Visual C++ runtime:', ', '.join(crt['files']) or 'not required', flush=True)
@@ -166,7 +334,7 @@ def main():
         else:
             with tarfile.open(download) as t:t.extractall(unpack,filter='data')
         roots=list(unpack.iterdir());source=roots[0] if len(roots)==1 and roots[0].is_dir() else unpack
-        tools_dir=resource_dir/'tools/bin';shutil.copytree(source,tools_dir)
+        tools_dir=resource_dir/'tools/bin';shutil.copytree(source,tools_dir,symlinks=True)
         subprocess.run([sys.executable,'-B',str(ROOT/'scripts/package-runtime.py'),str(resource_dir),*(['--windows'] if windows else [])],check=True,env=verification_environment())
         tool_env=verification_environment();tool_env['LD_LIBRARY_PATH']=str(tools_dir)+os.pathsep+tool_env.get('LD_LIBRARY_PATH','')
         for executable,arg in [(binary_dir/binary_name,'--version'),(tools_dir/('adb.exe' if windows else 'adb'),'version'),(tools_dir/('scrcpy.exe' if windows else 'scrcpy'),'--version')]:
@@ -174,15 +342,13 @@ def main():
         python=resource_dir/'runtime/python/python.exe' if windows else resource_dir/'runtime/python/bin/python3'
         verify_runtime(python, resource_dir)
         if mac:
-            subprocess.run(['codesign','--force','--deep','--sign','-',str(base/'StepX Companion.app')],check=True)
-            subprocess.run([str(binary_dir/binary_name),'--check-runtime'],check=True,env=verification_environment(),timeout=45)
-            subprocess.run(['codesign','--verify','--deep','--strict',str(base/'StepX Companion.app')],check=True)
+            sign_macos_bundle(base, binary_dir/binary_name, resource_dir, tools_dir, tool_env)
         issues=audit_bundle(resource_dir)
         if issues: raise RuntimeError('Package privacy verification failed:\n'+'\n'.join(issues))
         if windows: verify_manifest(binary_dir/binary_name)
         if a.platform.startswith('linux'):
             output=dist/(name+'.tar.gz')
-            with tarfile.open(output,'w:gz') as t:t.add(base,arcname=name)
+            with tarfile.open(output,'w:gz') as t:t.add(base,arcname=name,filter=clean_tar_info)
         else:
             output=dist/(name+'.zip')
             if mac:subprocess.run(['ditto','-c','-k','--sequesterRsrc','--keepParent',str(base),str(output)],check=True)

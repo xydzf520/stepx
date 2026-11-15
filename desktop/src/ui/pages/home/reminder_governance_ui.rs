@@ -325,9 +325,11 @@ impl Companion {
                 },
             );
             let timer_primary_key = format!("timer:{}", timer.key);
+            let stable_cap_id = crate::ui::capsule_fulfillment_ui::stable_phone_timer_capsule_id(&timer);
             let mut timer_keys = vec![timer_primary_key.clone()];
             if !timer.key.is_empty() && timer.key != "desktop-pomodoro" {
                 timer_keys.push(format!("notif:{}", timer.key));
+                timer_keys.push(format!("capsule:{stable_cap_id}"));
                 timer_keys.push(format!("capsule:phone-timer-{idx}"));
             } else if timer.is_pomodoro {
                 timer_keys.push("capsule:desktop-pomodoro".into());
@@ -369,11 +371,7 @@ impl Companion {
                     timer.key.clone()
                 },
                 calendar_event_id: None,
-                capsule_id: if timer.is_pomodoro {
-                    "desktop-pomodoro".into()
-                } else {
-                    format!("phone-timer-{idx}")
-                },
+                capsule_id: stable_cap_id,
                 mute_source_key: String::new(),
                 mute_source_label: String::new(),
             };
@@ -546,7 +544,7 @@ impl Companion {
                     ),
                     self.button(
                         "home-gov-clear-btn",
-                        "清空记录",
+                        "恢复全部已屏蔽/已归档提醒",
                         Action::HomeReminder(HomeReminderAction::ClearAllGovernanceEntries),
                         Btn::Ghost,
                     ),
@@ -784,10 +782,13 @@ impl Companion {
                     .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
                     .finish()
                 } else {
-                    let rows: Vec<El> = self
-                        .reminder_governance
-                        .muted_sources
-                        .values()
+                    let mut sorted_sources: Vec<_> =
+                        self.reminder_governance.muted_sources.values().collect();
+                    sorted_sources.sort_by_key(|src| {
+                        (std::cmp::Reverse(src.muted_at_ms), src.source_key.as_str())
+                    });
+                    let rows: Vec<El> = sorted_sources
+                        .into_iter()
                         .enumerate()
                         .map(|(idx, src)| {
                             Container::new(row_between_expanded(
@@ -835,10 +836,16 @@ impl Companion {
                     .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
                     .finish()
                 } else {
-                    let rows: Vec<El> = self
-                        .reminder_governance
-                        .entries
-                        .values()
+                    let mut sorted_entries: Vec<_> =
+                        self.reminder_governance.entries.values().collect();
+                    sorted_entries.sort_by_key(|entry| {
+                        (
+                            std::cmp::Reverse(entry.created_at_ms),
+                            entry.spec.primary_key.as_str(),
+                        )
+                    });
+                    let rows: Vec<El> = sorted_entries
+                        .into_iter()
                         .take(16)
                         .enumerate()
                         .map(|(idx, entry)| {

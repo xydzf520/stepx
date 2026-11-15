@@ -25,6 +25,8 @@ pub(super) enum DesktopUpdateAction {
     Download,
     Cancel,
     Install,
+    #[allow(dead_code)]
+    RestartAndInstall,
     Resolve(Box<Action>),
 }
 
@@ -389,7 +391,7 @@ impl Companion {
             let _ = std::fs::create_dir_all(parent);
         }
         if let Ok(json) = serde_json::to_string_pretty(&state) {
-            let _ = std::fs::write(&path, json);
+            let _ = stepx_companion::local_store::write_if_changed(&path, json.as_bytes());
         }
     }
 
@@ -716,7 +718,7 @@ impl Companion {
                     self.desktop_update.error = "正在取消下载…".into();
                 }
             }
-            A::Install if self.desktop_update.phase == Phase::Ready => {
+            A::Install | A::RestartAndInstall if self.desktop_update.phase == Phase::Ready => {
                 let blockers = self.desktop_restart_blockers();
                 if !blockers.is_empty() {
                     // Show the live checklist below; do not turn a prerequisite
@@ -724,6 +726,7 @@ impl Companion {
                     self.desktop_update.error.clear();
                 } else if let Some(dir) = self.desktop_update.ready.clone() {
                     self.desktop_update.error.clear();
+                    self.shutdown_all(Some(ctx));
                     match updater::prepare(&dir) {
                         Ok(job) => {
                             self.desktop_update.job = Some(job);
@@ -853,10 +856,9 @@ impl Companion {
                     self.desktop_update.error.clear();
                 }
                 updater::Event::Prepared { job: _ } => {
-                    self.remember_window(ctx, true);
-                    self.cancel_backscreen();
-                    self.stop_mirror();
-                    self.close_mirror_controls(ctx);
+                    self.force_quitting = true;
+                    self.shutdown_all(Some(ctx));
+                    self.settings.tray = None;
                     ctx.close_window();
                 }
                 updater::Event::Cancelled => {

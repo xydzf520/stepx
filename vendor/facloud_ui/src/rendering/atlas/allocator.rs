@@ -20,7 +20,7 @@ const VERTICAL_PADDING: i32 = 1;
 ///                           (width, height)
 ///   ┌─────┬─────┬─────┬─────┬─────┐
 ///   │ 10  │     │     │     │     │ <- Empty spaces; can be filled while
-///   │     │     │     │     │     │    element_height < height - row_baseline
+///   │     │     │     │     │     │    element_height <= height - row_baseline
 ///   ├─────┼─────┼─────┼─────┼─────┤
 ///   │ 5   │ 6   │ 7   │ 8   │ 9   │
 ///   │     │     │     │     │     │
@@ -115,9 +115,8 @@ impl Allocator {
 
     /// Check if there's room in the current row for given element..
     fn room_in_row(&self, element_size: Vector2I) -> bool {
-        let next_extent = self.row_extent + element_size.x();
-        let enough_width = next_extent <= self.width;
-        let enough_height = element_size.y() < (self.height - self.row_baseline);
+        let enough_width = element_size.x() <= self.width - self.row_extent;
+        let enough_height = element_size.y() <= self.height - self.row_baseline;
 
         enough_width && enough_height
     }
@@ -134,5 +133,40 @@ impl Allocator {
         self.row_tallest = 0;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rendering::atlas::Manager;
+
+    #[test]
+    fn allocator_accepts_full_height_element_on_fresh_atlas() {
+        let mut allocator = Allocator::new(1024);
+        let allocated = allocator
+            .insert(vec2i(32, 1024))
+            .expect("element with y == height should fit in a fresh Allocator");
+        assert_eq!(allocated.pixel_region.origin(), vec2i(0, 0));
+        assert_eq!(allocated.pixel_region.size(), vec2i(32, 1024));
+
+        // Full width + full height should also fit on a fresh atlas.
+        let mut full_allocator = Allocator::new(512);
+        let full_region = full_allocator
+            .insert(vec2i(512, 512))
+            .expect("element with size == (width, height) should fit in a fresh Allocator");
+        assert_eq!(full_region.pixel_region.size(), vec2i(512, 512));
+
+        // Ensure Manager::insert does not recurse infinitely when advancing to a new atlas
+        // for a full-height element.
+        let mut manager = Manager::new(1024);
+        let first = manager
+            .insert(vec2i(600, 512))
+            .expect("initial element fits");
+        let second = manager
+            .insert(vec2i(600, 1024))
+            .expect("full-height element allocates a fresh atlas without infinite recursion");
+        assert_ne!(first.texture_id, second.texture_id);
+        assert_eq!(second.allocated_region.pixel_region.size(), vec2i(600, 1024));
     }
 }

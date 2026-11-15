@@ -4,10 +4,24 @@ fn main() {
     // The framework reads resource 0x101 for the Windows window/taskbar icon.
     // Embedding it also gives the portable executable its own Explorer icon.
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        let [major, minor, patch] = [
+            "CARGO_PKG_VERSION_MAJOR",
+            "CARGO_PKG_VERSION_MINOR",
+            "CARGO_PKG_VERSION_PATCH",
+        ]
+        .map(|name| {
+            std::env::var(name)
+                .unwrap_or_else(|_| panic!("{name} is missing"))
+                .parse::<u16>()
+                .unwrap_or_else(|_| panic!("{name} must fit in a Windows version field"))
+        });
+        let version = std::env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION");
+        let file_version_def = format!("STEPX_FILEVERSION={major},{minor},{patch},0");
+        let version_text_def = format!("STEPX_VERSION_TEXT={version}");
         embed_resource::compile_for(
             "assets/stepx_companion.rc",
-            &["stepx-companion"],
-            embed_resource::NONE,
+            ["stepx-companion"],
+            [file_version_def.as_str(), version_text_def.as_str()],
         )
         .manifest_required()
         .expect("compile StepX Companion Windows icon");
@@ -18,6 +32,7 @@ fn main() {
     for path in ["build.rs", "Cargo.toml", "Cargo.lock", "src", "assets"] {
         println!("cargo:rerun-if-changed={path}");
     }
+    println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
     let seconds = match std::env::var("SOURCE_DATE_EPOCH") {
         Ok(value) => value

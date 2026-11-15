@@ -2038,7 +2038,7 @@ impl Companion {
             }
             if proposal.steps.contains(&Executor::App) {
                 rows.push(self.text(
-                    if self.studio_lab.config.has_key {
+                    if !self.studio_lab_uses_phone() && self.studio_lab.config.has_key {
                         "做应用会用你自己设置的模型服务和额度。"
                     } else {
                         "做应用会用已连接手机的 Amoo，电脑负责保存和试运行检查。"
@@ -2284,8 +2284,14 @@ impl Companion {
                 Btn::Secondary
             },
         )];
-        if let Some(cat) = catalog {
-            for (idx, m) in cat.models.iter().take(6).enumerate() {
+        if let Some(cat) = catalog.filter(|c| c.can_select_model) {
+            for (idx, m) in cat
+                .models
+                .iter()
+                .filter(|m| m.is_verified_for(self.amoo_ui.account_scope.as_deref()))
+                .take(6)
+                .enumerate()
+            {
                 let active = selected_model == Some(m.id.as_str())
                     || (selected_model.is_none() && m.current);
                 let label = if m.name.trim().is_empty() {
@@ -2552,7 +2558,7 @@ impl Companion {
                         ],
                     ),
                     self.text(
-                        if self.studio_lab.config.has_key {
+                        if !self.studio_lab_uses_phone() && self.studio_lab.config.has_key {
                             format!("{} · 用于做应用", self.studio_lab.config.model)
                         } else if self.selected.is_some() {
                             "不用设置：连接手机后直接用手机 Amoo".into()

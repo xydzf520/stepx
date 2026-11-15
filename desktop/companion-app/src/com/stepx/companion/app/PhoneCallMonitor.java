@@ -2,9 +2,9 @@ package com.stepx.companion.app;
 
 import android.app.Notification;
 import android.app.Person;
-import android.content.Context;
+import android.content.pm.PackageManager;
 import android.os.Bundle;
-import android.telephony.PhoneStateListener;
+import android.telephony.TelephonyCallback;
 import android.telephony.TelephonyManager;
 import org.json.JSONObject;
 
@@ -17,28 +17,41 @@ final class PhoneCallMonitor {
     private String dialerPackage = "";
     private final PushNotificationService service;
     private TelephonyManager manager;
-    private PhoneStateListener listener;
+    private CallStateCallback callback;
+
+    private final class CallStateCallback extends TelephonyCallback implements TelephonyCallback.CallStateListener {
+        @Override
+        public void onCallStateChanged(int value) {
+            update(value, "");
+        }
+    }
 
     PhoneCallMonitor(PushNotificationService service) { this.service = service; }
 
     void start() {
         try {
             manager = service.getSystemService(TelephonyManager.class);
-            dialerPackage = service.getSystemService(android.telecom.TelecomManager.class).getDefaultDialerPackage();
-            listener = new PhoneStateListener() {
-                @Override public void onCallStateChanged(int value, String incomingNumber) {
-                    update(value, incomingNumber);
-                }
-            };
-            manager.listen(listener, PhoneStateListener.LISTEN_CALL_STATE);
+            android.telecom.TelecomManager telecom = service.getSystemService(android.telecom.TelecomManager.class);
+            String defaultDialer = telecom != null ? telecom.getDefaultDialerPackage() : "";
+            dialerPackage = defaultDialer == null ? "" : defaultDialer;
+            if (manager == null
+                    || service.checkSelfPermission(android.Manifest.permission.READ_PHONE_STATE)
+                        != PackageManager.PERMISSION_GRANTED) {
+                synchronized (PhoneCallMonitor.class) { available = false; state = "unknown"; }
+                return;
+            }
+            callback = new CallStateCallback();
+            manager.registerTelephonyCallback(service.getMainExecutor(), callback);
         } catch (Exception denied) {
+            callback = null;
             synchronized (PhoneCallMonitor.class) { available = false; state = "unknown"; }
         }
     }
 
     void stop() {
-        try { if (manager != null && listener != null) manager.listen(listener, PhoneStateListener.LISTEN_NONE); }
+        try { if (manager != null && callback != null) manager.unregisterTelephonyCallback(callback); }
         catch (Exception ignored) { }
+        callback = null;
         synchronized (PhoneCallMonitor.class) { available = false; state = "unknown"; }
     }
 

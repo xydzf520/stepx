@@ -191,20 +191,49 @@ pub(super) struct HomeAiUi {
     /// Device serial for which the last briefing was requested.
     pub(super) auto_for: Option<String>,
     device_serial: Option<String>,
+    account_scope: Option<String>,
 }
 
 impl HomeAiUi {
-    fn sync_device(&mut self, serial: Option<&str>) -> bool {
-        if self.device_serial.as_deref() == serial {
+    fn normalize_account(account: Option<&str>) -> Option<&str> {
+        account.map(str::trim).filter(|s| !s.is_empty())
+    }
+
+    pub(super) fn sync_scope(&mut self, serial: Option<&str>, account: Option<&str>) -> bool {
+        let normalized_account = Self::normalize_account(account);
+        if self.device_serial.as_deref() == serial
+            && self.account_scope.as_deref() == normalized_account
+        {
             return false;
         }
-        // Dropping Job signals cancellation before dropping its receiver. Any late
-        // worker response can no longer enter the newly selected device's state.
+        if let Some(job) = self.job.take() {
+            job.cancel();
+        }
+        // Dropping/cancelling Job signals cancellation before dropping its receiver. Any late
+        // worker response can no longer enter the newly selected device/account's state.
         *self = Self {
             device_serial: serial.map(str::to_string),
+            account_scope: normalized_account.map(str::to_string),
             ..Self::default()
         };
         true
+    }
+
+    fn sync_device(&mut self, serial: Option<&str>) -> bool {
+        let account = self.account_scope.clone();
+        self.sync_scope(
+            serial,
+            if serial.is_some() {
+                account.as_deref()
+            } else {
+                None
+            },
+        )
+    }
+
+    pub(super) fn matches_account_scope(&self, account: Option<&str>) -> bool {
+        let normalized_account = Self::normalize_account(account);
+        self.account_scope.as_deref() == normalized_account
     }
 
     pub(super) fn running(&self) -> bool {
@@ -320,8 +349,10 @@ impl Companion {
 
     /// Starts a phone-AI briefing. Returns a user-facing status message.
     pub(super) fn start_home_ai_brief(&mut self) -> String {
-        self.home_ai
-            .sync_device(self.selected.as_ref().map(|d| d.serial.as_str()));
+        self.home_ai.sync_scope(
+            self.selected.as_ref().map(|d| d.serial.as_str()),
+            self.amoo_ui.account_scope.as_deref(),
+        );
         if self.home_ai.running() {
             return "手机 Amoo 正在分析首页上下文…".into();
         }
@@ -366,6 +397,10 @@ impl Companion {
     }
 
     fn apply_demo_home_ai_brief(&mut self) {
+        self.home_ai.sync_scope(
+            self.selected.as_ref().map(|d| d.serial.as_str()),
+            self.amoo_ui.account_scope.as_deref(),
+        );
         if let Ok(brief) = home_ai::parse_brief(DEMO_BRIEF_REPLY, "手机 Amoo · 演示") {
             self.home_ai.brief = Some(brief);
             self.home_ai.brief_at = Some(Local::now());
@@ -374,9 +409,10 @@ impl Companion {
     }
 
     fn poll_home_ai(&mut self) -> bool {
-        let device_changed = self
-            .home_ai
-            .sync_device(self.selected.as_ref().map(|d| d.serial.as_str()));
+        let device_changed = self.home_ai.sync_scope(
+            self.selected.as_ref().map(|d| d.serial.as_str()),
+            self.amoo_ui.account_scope.as_deref(),
+        );
         let mut events = Vec::new();
         let mut finished = false;
         if let Some(job) = &self.home_ai.job {
@@ -651,6 +687,35 @@ mod tests {
         assert!(state.auto_for.is_none());
         assert!(state.sync_device(None));
         assert!(!state.sync_device(None));
+    }
+
+    #[test]
+    fn account_scope_change_on_same_device_cancels_job_and_clears_brief() {
+        let (sender, receiver) = mpsc::channel();
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut state = HomeAiUi::default();
+        assert!(state.sync_scope(Some("phone-a"), Some("acct-alpha")));
+        state.job = Some(home_ai::Job {
+            receiver,
+            cancel: cancelled.clone(),
+        });
+        state.brief = Some(home_ai::parse_brief(DEMO_BRIEF_REPLY, "demo").unwrap());
+        state.brief_at = Some(Local::now());
+        state.auto_for = Some("phone-a".into());
+        assert!(state.matches_account_scope(Some("acct-alpha")));
+        assert!(!state.sync_scope(Some("phone-a"), Some(" acct-alpha ")));
+
+        assert!(state.sync_scope(Some("phone-a"), Some("acct-beta")));
+        assert!(cancelled.load(std::sync::atomic::Ordering::Acquire));
+        assert!(sender
+            .send(home_ai::Event::Status("stale account brief".into()))
+            .is_err());
+        assert!(!state.running());
+        assert!(state.brief.is_none());
+        assert!(state.brief_at.is_none());
+        assert!(state.auto_for.is_none());
+        assert!(!state.matches_account_scope(Some("acct-alpha")));
+        assert!(state.matches_account_scope(Some("acct-beta")));
     }
 
     #[test]

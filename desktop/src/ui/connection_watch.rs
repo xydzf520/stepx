@@ -6,13 +6,23 @@ struct Snapshot {
     online_transports: Option<Vec<String>>,
     services: Vec<Service>,
     identity: Option<WirelessIdentity>,
+    standby_probed: bool,
     started_at: Instant,
 }
+pub(super) const MAX_WIRELESS_RECONNECT_ATTEMPTS: u8 = 6;
+
+pub(super) fn wireless_reconnect_delay(attempt: u8) -> Duration {
+    let shift = attempt.min(5);
+    Duration::from_secs((2u64 << shift).min(60))
+}
+
 #[derive(Default)]
 pub(super) struct ConnectionWatch {
     job: Option<(Option<String>, mpsc::Receiver<Result<Snapshot>>)>,
     pending: Option<(Option<String>, Snapshot)>,
     pub(super) misses: u8,
+    pub(super) standby_misses: u8,
+    standby_serial: Option<String>,
     pub(super) user_paused: bool,
     last_backups: Vec<String>,
     pub detached_serial: Option<String>,
@@ -21,6 +31,36 @@ pub(super) struct ConnectionWatch {
     online_transports: Option<Vec<String>>,
     observed_serial: Option<String>,
     reported_failure: Option<(String, Instant)>,
+    pub(super) reconnect_attempts: u8,
+    pub(super) next_reconnect_at: Option<Instant>,
+}
+
+impl ConnectionWatch {
+    pub(super) fn reset_wireless_backoff(&mut self) {
+        self.reconnect_attempts = 0;
+        self.next_reconnect_at = None;
+    }
+
+    pub(super) fn take_wireless_reconnect_budget(&mut self, now: Instant) -> bool {
+        if self.reconnect_attempts >= MAX_WIRELESS_RECONNECT_ATTEMPTS {
+            return false;
+        }
+        if self.next_reconnect_at.is_some_and(|due| now < due) {
+            return false;
+        }
+        let delay = wireless_reconnect_delay(self.reconnect_attempts);
+        self.reconnect_attempts = self.reconnect_attempts.saturating_add(1);
+        self.next_reconnect_at = Some(now + delay);
+        true
+    }
+}
+
+fn wireless_standby_poll_interval(needs_wireless_standby: bool, standby_misses: u8) -> Duration {
+    if !needs_wireless_standby {
+        return Duration::from_secs(120);
+    }
+    let shift = standby_misses.min(4);
+    Duration::from_secs((8u64 << shift).min(120))
 }
 
 fn online_transport_ids(raw: &str) -> Vec<String> {
@@ -148,6 +188,25 @@ impl Companion {
             return;
         }
         let current = self.selected.clone();
+        let has_remembered_wireless = self
+            .preferences
+            .wireless
+            .values()
+            .any(|w| !w.endpoint.trim().is_empty())
+            || !self.pairing_hosts.is_empty();
+        let allow_wireless_reconnect = if current.is_some() {
+            true
+        } else if has_remembered_wireless {
+            self.connection_watch
+                .take_wireless_reconnect_budget(Instant::now())
+        } else {
+            false
+        };
+        let current_serial = current.as_ref().map(|d| d.serial.clone());
+        if self.connection_watch.standby_serial != current_serial {
+            self.connection_watch.standby_serial = current_serial;
+            self.connection_watch.standby_misses = 0;
+        }
         let origin = current.as_ref().map(|d| d.transport.clone());
         let prefs = self.preferences.clone();
         let hosts = self.pairing_hosts.clone();
@@ -155,9 +214,17 @@ impl Companion {
             .selected
             .as_ref()
             .is_some_and(|d| !is_wireless(&d.transport) && d.backup_transports().is_empty());
-        let identity_due = self.connection_watch.identity_at.is_none_or(|t| {
-            t.elapsed() > Duration::from_secs(if needs_wireless_standby { 8 } else { 120 })
-        });
+        if !needs_wireless_standby {
+            self.connection_watch.standby_misses = 0;
+        }
+        let poll_interval = wireless_standby_poll_interval(
+            needs_wireless_standby,
+            self.connection_watch.standby_misses,
+        );
+        let identity_due = self
+            .connection_watch
+            .identity_at
+            .is_none_or(|t| t.elapsed() > poll_interval);
         if identity_due {
             self.connection_watch.identity_at = Some(Instant::now());
         }
@@ -179,32 +246,51 @@ impl Companion {
                 });
                 if online {
                     if let Some(d) = current.as_ref() {
-                        if is_wireless(&d.transport) {
+                        if stepx_companion::adb::is_wireless_transport(&d.transport) {
                             let probe_ok = adb.probe_device_identity(
                                 &d.transport,
                                 &d.serial,
                                 Duration::from_millis(1800),
                             );
                             if !probe_ok {
+                                let _ = adb.run_timeout(
+                                    &["disconnect", &d.transport],
+                                    Duration::from_millis(800),
+                                );
+                                stepx_companion::device::invalidate_verified_transport(
+                                    &d.transport,
+                                );
                                 let recovered = stepx_companion::device::recover_transport(
                                     &adb,
                                     &d.transport,
                                     Duration::from_secs(4),
                                 );
+                                online = recovered.as_deref() == Some(d.transport.as_str());
+                                if !online {
+                                    let _ = adb.run_timeout(
+                                        &["disconnect", &d.transport],
+                                        Duration::from_millis(800),
+                                    );
+                                    stepx_companion::device::invalidate_verified_transport(
+                                        &d.transport,
+                                    );
+                                    if let Some(ref next) = recovered {
+                                        stepx_companion::device::promote_active_transport(
+                                            &d.serial,
+                                            next,
+                                        );
+                                    }
+                                }
                                 if let Ok(raw) =
                                     adb.run_timeout(&["devices", "-l"], Duration::from_secs(2))
                                 {
                                     online_transports = Some(online_transport_ids(&raw));
                                     devices = parse_devices(&raw);
                                 }
-                                online = recovered.as_deref() == Some(d.transport.as_str());
                                 if !online {
                                     if let Some(ids) = online_transports.as_mut() {
                                         ids.retain(|id| id != &d.transport);
                                     }
-                                    stepx_companion::device::invalidate_verified_transport(
-                                        &d.transport,
-                                    );
                                     for t in &mut devices {
                                         if t.id == d.transport {
                                             t.state = "offline".into();
@@ -216,27 +302,55 @@ impl Companion {
                     }
                 }
                 if online {
+                    let standby_probed = identity_due
+                        && current.as_ref().is_some_and(|d| !is_wireless(&d.transport));
                     let identity = if identity_due {
-                        current
-                            .as_ref()
-                            .and_then(|d| reconnect::ensure_usb_wireless_standby(&adb, d))
+                        current.as_ref().and_then(|d| {
+                            reconnect::ensure_usb_wireless_standby(&adb, d).or_else(|| {
+                                if !is_wireless(&d.transport) {
+                                    let mut id =
+                                        reconnect::network_identity(&adb, d).unwrap_or_default();
+                                    id.endpoint.clear();
+                                    Some(id)
+                                } else {
+                                    None
+                                }
+                            })
+                        })
                     } else {
                         None
                     };
                     // Warm up wireless standby while on USB so unplugging fails over seamlessly.
                     if let Some(d) = current.as_ref() {
                         if !is_wireless(&d.transport) {
-                            let standby_ep = identity
-                                .as_ref()
-                                .map(|id| id.endpoint.as_str())
-                                .filter(|ep| !ep.is_empty())
-                                .or_else(|| {
-                                    prefs
-                                        .wireless
-                                        .get(&d.serial)
-                                        .map(|id| id.endpoint.as_str())
-                                        .filter(|ep| !ep.is_empty())
-                                });
+                            let standby_ep = if identity_due {
+                                identity
+                                    .as_ref()
+                                    .map(|id| id.endpoint.as_str())
+                                    .filter(|ep| !ep.is_empty())
+                            } else {
+                                prefs
+                                    .wireless
+                                    .get(&d.serial)
+                                    .map(|id| id.endpoint.as_str())
+                                    .filter(|ep| !ep.is_empty())
+                            };
+                            if identity_due && standby_ep.is_none() {
+                                if let Some(stale_ep) = prefs
+                                    .wireless
+                                    .get(&d.serial)
+                                    .map(|id| id.endpoint.as_str())
+                                    .filter(|ep| !ep.is_empty())
+                                {
+                                    if devices.iter().any(|t| t.id == stale_ep && t.state != "device") {
+                                        let _ = adb.run_timeout(
+                                            &["disconnect", stale_ep],
+                                            Duration::from_millis(1200),
+                                        );
+                                        devices.retain(|t| t.id != stale_ep);
+                                    }
+                                }
+                            }
                             if let Some(ep) = standby_ep {
                                 let is_offline =
                                     devices.iter().any(|t| t.id == ep && t.state != "device");
@@ -295,6 +409,7 @@ impl Companion {
                         online_transports,
                         services: vec![],
                         identity,
+                        standby_probed,
                     })
                 } else {
                     if let Some(d) = current.as_ref() {
@@ -342,8 +457,9 @@ impl Companion {
                             online_transports,
                             services: vec![],
                             identity: None,
+                            standby_probed: false,
                         })
-                    } else {
+                    } else if allow_wireless_reconnect {
                         let (devices, services) = reconnect::scan(&adb, &prefs, &hosts)?;
                         let online_transports = adb
                             .run_timeout(&["devices", "-l"], Duration::from_secs(2))
@@ -355,6 +471,18 @@ impl Companion {
                             online_transports,
                             services,
                             identity: None,
+                            standby_probed: false,
+                        })
+                    } else {
+                        let services = stepx_companion::discovery::discover_services(&adb)
+                            .unwrap_or_default();
+                        Ok(Snapshot {
+                            started_at,
+                            devices,
+                            online_transports,
+                            services,
+                            identity: None,
+                            standby_probed: false,
                         })
                     }
                 }
@@ -376,6 +504,23 @@ impl Companion {
             }
         }
         let Some((origin, rx)) = &self.connection_watch.job else {
+            if self.selected.is_none()
+                && !self.demo_mode
+                && !self.connection_watch.user_paused
+                && self.connection_watch.reconnect_attempts < MAX_WIRELESS_RECONNECT_ATTEMPTS
+                && self
+                    .preferences
+                    .wireless
+                    .values()
+                    .any(|w| !w.endpoint.trim().is_empty())
+                && self
+                    .connection_watch
+                    .next_reconnect_at
+                    .is_none_or(|due| Instant::now() >= due)
+            {
+                self.last_scan = Instant::now();
+                self.begin_connection_watch();
+            }
             return;
         };
         let result = match rx.try_recv() {
@@ -402,41 +547,49 @@ impl Companion {
         if online_changed {
             ctx.notify();
         }
-        if let (Some(d), Some(mut identity)) = (&self.selected, snapshot.identity.clone()) {
-            // Never overwrite remembered endpoint, guid, wlan_mac, or wifi_ip with empty values.
-            if let Some(prior) = self.preferences.wireless.get(&d.serial) {
-                if identity.endpoint.is_empty() && !prior.endpoint.is_empty() {
-                    identity.endpoint = prior.endpoint.clone();
-                }
-                if identity.guid.is_empty() && !prior.guid.is_empty() {
-                    identity.guid = prior.guid.clone();
-                }
-                if identity.wlan_mac.is_empty() && !prior.wlan_mac.is_empty() {
-                    identity.wlan_mac = prior.wlan_mac.clone();
-                }
-                if identity.wifi_ip.is_empty() && !prior.wifi_ip.is_empty() {
-                    identity.wifi_ip = prior.wifi_ip.clone();
-                }
+        if snapshot.standby_probed {
+            let has_standby_ep = snapshot
+                .identity
+                .as_ref()
+                .is_some_and(|id| !id.endpoint.is_empty());
+            if has_standby_ep {
+                self.connection_watch.standby_misses = 0;
+            } else {
+                self.connection_watch.standby_misses =
+                    self.connection_watch.standby_misses.saturating_add(1);
             }
-            if self.preferences.wireless.get(&d.serial) != Some(&identity) {
-                self.preferences.wireless.insert(d.serial.clone(), identity);
+        }
+        if let (Some(d), Some(identity)) = (&self.selected, snapshot.identity.clone()) {
+            if self.apply_wireless_identity_update(&d.serial.clone(), identity) {
                 if let Err(e) = self.preferences.save() {
-                    eprintln!("Unable to remember wireless connection: {e}");
+                    use std::io::Write as _;
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "Unable to remember wireless connection: {e}"
+                    );
                 }
             }
         }
-        let online = origin.as_ref().is_some_and(|id| {
-            snapshot.devices.iter().any(|d| {
-                d.state == "device"
-                    && (&d.id == id || d.backup_transports().iter().any(|b| b == id))
-            })
-        });
+        let promoted_away = origin.as_ref().zip(self.selected.as_ref()).is_some_and(
+            |(id, selected)| {
+                stepx_companion::adb::is_wireless_transport(id)
+                    && super::active_transport_for(&selected.serial, id) != *id
+            },
+        );
+        let online = !promoted_away
+            && origin.as_ref().is_some_and(|id| {
+                snapshot.devices.iter().any(|d| {
+                    d.state == "device"
+                        && (&d.id == id || d.backup_transports().iter().any(|b| b == id))
+                })
+            });
         if online {
             if self.acknowledge_connection_recovery(snapshot.started_at) {
                 ctx.notify();
             }
             self.connection_watch.misses = 0;
             self.connection_watch.disconnected_at = None;
+            self.connection_watch.reset_wireless_backoff();
         }
         let has_online_failover = self.selected.as_ref().is_some_and(|selected| {
             let known_backups = selected.backup_transports();
@@ -491,6 +644,38 @@ impl Companion {
             if devices_changed || services_changed || backup_changed || self.selected.is_none() {
                 ctx.notify();
             }
+        }
+    }
+
+    pub(super) fn apply_wireless_identity_update(
+        &mut self,
+        serial: &str,
+        mut identity: WirelessIdentity,
+    ) -> bool {
+        // Preserve remembered guid, wlan_mac, and wifi_ip, while allowing an empty
+        // live endpoint from USB inspection to clear a stale ephemeral port.
+        if let Some(prior) = self.preferences.wireless.get(serial) {
+            if identity.guid.is_empty() && !prior.guid.is_empty() {
+                identity.guid = prior.guid.clone();
+            }
+            if identity.wlan_mac.is_empty() && !prior.wlan_mac.is_empty() {
+                identity.wlan_mac = prior.wlan_mac.clone();
+            }
+            if identity.wifi_ip.is_empty() && !prior.wifi_ip.is_empty() {
+                identity.wifi_ip = prior.wifi_ip.clone();
+            }
+        } else if identity.endpoint.is_empty()
+            && identity.guid.is_empty()
+            && identity.wlan_mac.is_empty()
+            && identity.wifi_ip.is_empty()
+        {
+            return false;
+        }
+        if self.preferences.wireless.get(serial) != Some(&identity) {
+            self.preferences.wireless.insert(serial.to_string(), identity);
+            true
+        } else {
+            false
         }
     }
 }
@@ -629,5 +814,87 @@ mod tests {
         assert!(app.online_device_backups(&device).is_empty());
         assert!(!app.device_has_online_usb_and_wireless(&device));
         assert_eq!(app.device_connection_label(&device), "无线直连");
+    }
+
+    #[test]
+    fn promoted_usb_flips_half_open_wireless_immediately_and_clears_stale_endpoint() {
+        let mut app = Companion::new_for_test();
+        app.demo_mode = true;
+        let serial = "STEPX-HALF-OPEN-USB";
+        let stale_wireless = "192.168.43.22:42959";
+        let dev = Device {
+            serial: serial.into(),
+            transport: stale_wireless.into(),
+            model: "StepX PZ261A".into(),
+            android: "16".into(),
+            product: "pandora".into(),
+        };
+        dev.set_backup_transports(vec![serial.into()]);
+        app.selected = Some(dev);
+        app.preferences.wireless.insert(
+            serial.into(),
+            WirelessIdentity {
+                endpoint: stale_wireless.into(),
+                guid: "adb-STEPX-HALF-OPEN-USB-abcd".into(),
+                wlan_mac: "aa:bb:cc:dd:ee:ff".into(),
+                wifi_ip: "192.168.43.22".into(),
+            },
+        );
+
+        // Simulate recover_transport having promoted USB while adb devices still listed wireless.
+        stepx_companion::device::promote_active_transport(serial, serial);
+        let raw_devices = parse_devices(
+            "List of devices attached\n192.168.43.22:42959 device model:PZ261A\nSTEPX-HALF-OPEN-USB device model:PZ261A\n",
+        );
+        app.apply(Outcome::Transports(raw_devices, vec![]));
+        assert_eq!(
+            app.selected.as_ref().map(|d| d.transport.as_str()),
+            Some(serial)
+        );
+
+        // Live USB inspection with Wireless Debugging off clears stale ephemeral port.
+        assert!(app.apply_wireless_identity_update(
+            serial,
+            WirelessIdentity {
+                endpoint: String::new(),
+                guid: String::new(),
+                wlan_mac: String::new(),
+                wifi_ip: "192.168.43.22".into(),
+            }
+        ));
+        let updated = app.preferences.wireless.get(serial).unwrap();
+        assert_eq!(updated.endpoint, "");
+        assert_eq!(updated.guid, "adb-STEPX-HALF-OPEN-USB-abcd");
+        assert_eq!(updated.wlan_mac, "aa:bb:cc:dd:ee:ff");
+        assert_eq!(updated.wifi_ip, "192.168.43.22");
+
+        // Standby polling interval backs off exponentially on consecutive misses up to 120s.
+        assert_eq!(wireless_standby_poll_interval(true, 0), Duration::from_secs(8));
+        assert_eq!(wireless_standby_poll_interval(true, 1), Duration::from_secs(16));
+        assert_eq!(wireless_standby_poll_interval(true, 2), Duration::from_secs(32));
+        assert_eq!(wireless_standby_poll_interval(true, 4), Duration::from_secs(120));
+        assert_eq!(wireless_standby_poll_interval(false, 0), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn wireless_reconnect_backoff_is_exponential_and_bounded_at_max_attempts() {
+        assert_eq!(wireless_reconnect_delay(0), Duration::from_secs(2));
+        assert_eq!(wireless_reconnect_delay(1), Duration::from_secs(4));
+        assert_eq!(wireless_reconnect_delay(2), Duration::from_secs(8));
+        assert_eq!(wireless_reconnect_delay(3), Duration::from_secs(16));
+        assert_eq!(wireless_reconnect_delay(4), Duration::from_secs(32));
+        assert_eq!(wireless_reconnect_delay(5), Duration::from_secs(60));
+
+        let mut watch = ConnectionWatch::default();
+        let mut t = Instant::now();
+        for i in 0..MAX_WIRELESS_RECONNECT_ATTEMPTS {
+            assert!(watch.take_wireless_reconnect_budget(t));
+            // Immediate retry before backoff window is rejected
+            assert!(!watch.take_wireless_reconnect_budget(t));
+            t += wireless_reconnect_delay(i) + Duration::from_millis(10);
+        }
+        assert!(!watch.take_wireless_reconnect_budget(t));
+        watch.reset_wireless_backoff();
+        assert!(watch.take_wireless_reconnect_budget(t));
     }
 }

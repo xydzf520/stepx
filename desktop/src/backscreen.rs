@@ -926,8 +926,48 @@ struct Saved {
     kind: String,
     manual: String,
     automatic: String,
+    basic_text: Option<String>,
 }
 impl Saved {
+    fn normalize_basic_type_num(code: u64) -> String {
+        match code {
+            0 => "time".into(),
+            1 => "agent".into(),
+            2 => "text".into(),
+            other => other.to_string(),
+        }
+    }
+
+    fn to_mcp_json(&self) -> String {
+        let mode_int = match self.mode.as_str() {
+            "always" => 1,
+            "custom" => 2,
+            _ => 0,
+        };
+        let auto_int = if self.automatic == "true" { 1 } else { 0 };
+        let manual_int = self
+            .manual
+            .trim()
+            .parse::<i64>()
+            .map(|v| v.clamp(0, 255))
+            .unwrap_or(160);
+        let basic_type_val = if let Ok(code) = self.kind.trim().parse::<u64>() {
+            serde_json::json!(code)
+        } else {
+            serde_json::json!(self.kind)
+        };
+        let mut obj = serde_json::json!({
+            "displayMode": mode_int,
+            "autoBrightness": auto_int,
+            "manualBrightness": manual_int,
+            "basicType": basic_type_val,
+        });
+        if let Some(ref txt) = self.basic_text {
+            obj["basicText"] = serde_json::Value::String(txt.clone());
+        }
+        obj.to_string()
+    }
+
     fn from_mcp_json(raw: &str) -> Result<Self> {
         let value: serde_json::Value = serde_json::from_str(raw)
             .context("背屏恢复快照损坏，已保留快照供重试")?;
@@ -945,60 +985,171 @@ impl Saved {
             Some(1) => "true",
             _ => bail!("背屏恢复快照缺少有效亮度模式，已保留快照"),
         };
-        let manual = field("manualBrightness", "brightness").and_then(serde_json::Value::as_u64)
-            .filter(|level| (1..=255).contains(level))
+        let manual = field("manualBrightness", "brightness")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|level| (0..=255).contains(level))
             .context("背屏恢复快照缺少有效亮度，已保留快照")?;
-        let kind = field("basicType", "type").and_then(serde_json::Value::as_str)
-            .filter(|kind| matches!(*kind, "agent" | "time" | "text"))
+        let raw_kind = field("basicType", "type")
             .context("背屏恢复快照缺少有效内容类型，已保留快照")?;
+        let kind = if let Some(code) = raw_kind.as_u64() {
+            Self::normalize_basic_type_num(code)
+        } else if let Some(s) = raw_kind.as_str() {
+            let trimmed = s.trim();
+            if matches!(trimmed, "agent" | "time" | "text") {
+                trimmed.to_string()
+            } else if let Ok(code) = trimmed.parse::<u64>() {
+                Self::normalize_basic_type_num(code)
+            } else {
+                bail!("背屏恢复快照缺少有效内容类型，已保留快照");
+            }
+        } else {
+            bail!("背屏恢复快照缺少有效内容类型，已保留快照");
+        };
+        let basic_text = match field("basicText", "basic_text") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => Some(
+                v.as_str()
+                    .context("背屏恢复快照文字内容无效，已保留快照")?
+                    .to_string(),
+            ),
+        };
         Ok(Self {
             mode: mode.into(),
-            kind: kind.into(),
+            kind,
             manual: manual.to_string(),
             automatic: automatic.into(),
+            basic_text,
         })
     }
 
     fn read(adb: &Adb, device: &Device) -> Result<Self> {
         let combined = bs_batch(adb, device, &[&["basic"], &["brightness"]])?;
         let mode = token(&combined, "settingsDisplayMode=").context("固件未返回背屏模式")?;
-        let kind = token(&combined, "settingsType=").context("固件未返回背屏内容类型")?;
+        let raw_kind = token(&combined, "settingsType=").context("固件未返回背屏内容类型")?;
+        let kind = if let Ok(code) = raw_kind.parse::<u64>() {
+            Self::normalize_basic_type_num(code)
+        } else {
+            raw_kind.into()
+        };
         let automatic = token(&combined, "auto=").context("固件未返回自动亮度")?;
-        let manual = combined
+        let raw_manual = combined
             .lines()
             .find_map(|l| l.split("manual=").nth(1))
             .and_then(|s| s.split_whitespace().next())
             .context("固件未返回手动亮度")?;
+        let manual = raw_manual
+            .parse::<i64>()
+            .map(|v| v.clamp(0, 255).to_string())
+            .unwrap_or_else(|_| raw_manual.into());
+        let basic_text = device
+            .resolve_active_transport(adb)
+            .ok()
+            .and_then(|transport| {
+                adb.shell(
+                    &transport,
+                    &["settings", "get", "system", "stepos_back_screen_basic_text"],
+                )
+                .ok()
+            })
+            .map(|out| {
+                let cleaned = out.trim_end_matches(['\r', '\n']);
+                if cleaned == "null" {
+                    String::new()
+                } else {
+                    cleaned.to_string()
+                }
+            });
         Ok(Self {
             mode: mode.into(),
-            kind: kind.into(),
-            manual: manual.into(),
+            kind,
+            manual,
             automatic: automatic.into(),
+            basic_text,
         })
     }
     fn restore(&self, adb: &Adb, device: &Device) -> Result<()> {
         device.verify(adb)?;
         clear_frame(adb, device)?;
+        let transport = device.resolve_active_transport(adb)?;
+        if let Some(ref text) = self.basic_text {
+            let _ = adb.shell(
+                &transport,
+                &[
+                    "settings",
+                    "put",
+                    "system",
+                    "stepos_back_screen_basic_text",
+                    text,
+                ],
+            );
+        }
         let auto_arg = if self.automatic == "true" {
             "on"
         } else {
             "off"
         };
-        bs_batch(
-            adb,
-            device,
-            &[
-                &["brightness", "manual", &self.manual],
-                &["brightness", "auto", auto_arg],
-                &["basic", "type", &self.kind],
-                &["basic", "display_mode", &self.mode],
-            ],
-        )?;
+        let manual_for_bs = match self.manual.trim().parse::<u64>() {
+            Ok(0) => "1".to_string(),
+            Ok(v) => v.min(255).to_string(),
+            Err(_) => self.manual.clone(),
+        };
+        if matches!(self.kind.as_str(), "agent" | "time" | "text") {
+            bs_batch(
+                adb,
+                device,
+                &[
+                    &["brightness", "manual", &manual_for_bs],
+                    &["brightness", "auto", auto_arg],
+                    &["basic", "type", &self.kind],
+                    &["basic", "display_mode", &self.mode],
+                ],
+            )?;
+        } else {
+            bs_batch(
+                adb,
+                device,
+                &[
+                    &["brightness", "manual", &manual_for_bs],
+                    &["brightness", "auto", auto_arg],
+                    &["basic", "display_mode", &self.mode],
+                ],
+            )?;
+            let _ = adb.shell(
+                &transport,
+                &[
+                    "settings",
+                    "put",
+                    "system",
+                    "stepos_back_screen_basic_type",
+                    &self.kind,
+                ],
+            );
+        }
+        if self.manual == "0" {
+            let _ = adb.shell(
+                &transport,
+                &[
+                    "settings",
+                    "put",
+                    "system",
+                    "stepos_back_screen_manual_brightness",
+                    "0",
+                ],
+            );
+        }
         let now = Self::read(adb, device)?;
+        let manual_matches = now.manual == self.manual
+            || (self.manual == "0" && (now.manual == "0" || now.manual == "1"));
+        let kind_matches = now.kind == self.kind;
+        let text_matches = match (&self.basic_text, &now.basic_text) {
+            (Some(exp), Some(act)) => exp == act,
+            _ => true,
+        };
         if now.mode != self.mode
-            || now.kind != self.kind
-            || now.manual != self.manual
+            || !kind_matches
+            || !manual_matches
             || now.automatic != self.automatic
+            || !text_matches
         {
             bail!("背屏播放已结束，但手机设置恢复校验未通过")
         };
@@ -1919,37 +2070,53 @@ fn write_mcp_status_file(
     );
 }
 
-fn read_mcp_restore_state(adb: &Adb, transport: &str) -> Result<Option<Saved>> {
-    let raw = adb.script(transport, &format!(
-        "if [ -f {restore} ]; then cat {restore}; else printf '%s' MISSING; fi",
-        restore = shell_quote(MCP_RESTORE_FILE),
-    )).context("无法读取手机背屏恢复快照")?;
-    if raw.trim() == "MISSING" {
+fn read_mcp_restore_raw(adb: &Adb, transport: &str) -> Result<Option<String>> {
+    let raw = adb
+        .script(
+            transport,
+            &format!(
+                "if [ -f {restore} ]; then cat {restore}; else printf '%s' MISSING; fi",
+                restore = shell_quote(MCP_RESTORE_FILE),
+            ),
+        )
+        .context("无法读取手机背屏恢复快照")?;
+    let trimmed = raw.trim();
+    if trimmed == "MISSING" {
         Ok(None)
     } else {
-        Saved::from_mcp_json(raw.trim()).map(Some)
+        Ok(Some(trimmed.to_string()))
     }
 }
 
-fn save_mcp_restore_state_if_needed(adb: &Adb, device: &Device, transport: &str) -> Result<()> {
-    if read_mcp_restore_state(adb, transport)?.is_some() {
-        return Ok(());
+fn read_mcp_restore_state(adb: &Adb, transport: &str) -> Result<Option<Saved>> {
+    match read_mcp_restore_raw(adb, transport)? {
+        None => Ok(None),
+        Some(raw) => Saved::from_mcp_json(&raw).map(Some),
+    }
+}
+
+pub(crate) fn save_mcp_restore_state_if_needed(
+    adb: &Adb,
+    device: &Device,
+    transport: &str,
+) -> Result<()> {
+    if let Some(existing_raw) = read_mcp_restore_raw(adb, transport)? {
+        match Saved::from_mcp_json(&existing_raw) {
+            Ok(_) => return Ok(()),
+            Err(err) => {
+                eprintln!(
+                    "[backscreen] warning: existing {MCP_RESTORE_FILE} is unreadable/corrupt ({err:#}); re-snapshotting current backscreen settings"
+                );
+                let _ = adb.script(
+                    transport,
+                    &format!("rm -f {}", shell_quote(MCP_RESTORE_FILE)),
+                );
+            }
+        }
     }
     let saved = Saved::read(adb, device)?;
-    let mode_int = match saved.mode.as_str() {
-        "always" => 1,
-        "custom" => 2,
-        _ => 0,
-    };
-    let auto_int = if saved.automatic == "true" { 1 } else { 0 };
-    let manual_int = saved.manual.parse::<i32>().unwrap_or(160);
-    let payload = serde_json::json!({
-        "displayMode": mode_int,
-        "autoBrightness": auto_int,
-        "manualBrightness": manual_int,
-        "basicType": saved.kind,
-    })
-    .to_string();
+    let payload = saved.to_mcp_json();
+    Saved::from_mcp_json(&payload).context("生成的背屏恢复快照校验未通过，尚未修改显示")?;
     adb.script(
         transport,
         &format!(
@@ -1958,10 +2125,77 @@ fn save_mcp_restore_state_if_needed(adb: &Adb, device: &Device, transport: &str)
             restore = shell_quote(MCP_RESTORE_FILE),
             payload = shell_quote(&payload),
         ),
-    ).context("无法保存手机背屏恢复快照，尚未修改显示")?;
-    anyhow::ensure!(read_mcp_restore_state(adb, transport)?.is_some(),
-        "手机未保存背屏恢复快照，尚未修改显示");
+    )
+    .context("无法保存手机背屏恢复快照，尚未修改显示")?;
+    anyhow::ensure!(
+        read_mcp_restore_state(adb, transport)?.is_some(),
+        "手机未保存背屏恢复快照，尚未修改显示"
+    );
     Ok(())
+}
+
+fn synthesize_mcp_animation_frames(
+    source: &Source,
+    config: &PlaybackConfig,
+    clamped_brightness: u8,
+) -> (Vec<Vec<u8>>, u8, u32, u64) {
+    let is_smart_carousel = matches!(source, Source::SmartCarousel(slides) if !slides.is_empty());
+    let fps = if matches!(source, Source::Preset(Preset::Countdown)) || is_smart_carousel {
+        1
+    } else {
+        config.fps.clamp(1, 12)
+    };
+    let duration_secs = if matches!(source, Source::Preset(Preset::Countdown)) {
+        config.duration_secs.clamp(1, 3600)
+    } else if config.duration_secs > 0 {
+        config.duration_secs.clamp(5, 3600)
+    } else {
+        30
+    };
+    let effective_cfg = PlaybackConfig {
+        brightness: clamped_brightness,
+        fps,
+        duration_secs,
+        invert: config.invert,
+    };
+    match source {
+        Source::SmartCarousel(slides) if !slides.is_empty() => (
+            synthesize_smart_carousel_frames(slides, clamped_brightness, config.invert),
+            fps,
+            duration_secs,
+            1000,
+        ),
+        Source::Preset(Preset::Countdown) => {
+            let frame_count: usize = (duration_secs as usize)
+                .saturating_add(1)
+                .clamp(2, 180);
+            let denom = frame_count.saturating_sub(1).max(1) as u64;
+            let frame_delay_ms = ((u64::from(duration_secs) * 1000) / denom).max(1000);
+            let live = LiveData::default();
+            let mut out: Vec<Vec<u8>> = Vec::with_capacity(frame_count);
+            for i in 0..frame_count {
+                let elapsed_secs = (i as u64 * u64::from(duration_secs)) / denom;
+                out.push(frame(
+                    source,
+                    &effective_cfg,
+                    Duration::from_secs(elapsed_secs),
+                    &live,
+                ));
+            }
+            (out, fps, duration_secs, frame_delay_ms)
+        }
+        _ => {
+            let frame_count = 24usize;
+            let frame_delay_ms = (1000 / u64::from(fps.max(1))).max(80);
+            let live = LiveData::default();
+            let mut out: Vec<Vec<u8>> = Vec::with_capacity(frame_count);
+            for i in 0..frame_count {
+                let elapsed = Duration::from_millis((i as u64 * 1000) / u64::from(fps.max(1)));
+                out.push(frame(source, &effective_cfg, elapsed, &live));
+            }
+            (out, fps, duration_secs, frame_delay_ms)
+        }
+    }
 }
 
 /// Historical entry-point name retained for callers. Atomic settings/frames use
@@ -2074,45 +2308,34 @@ pub fn apply_via_firmware_mcp(
             ))
         }
         _ => {
-            crate::bridge::ensure_bridge_jar(adb, device)?;
-            let is_smart_carousel = matches!(source, Source::SmartCarousel(slides) if !slides.is_empty());
-            let fps = if matches!(source, Source::Preset(Preset::Countdown)) || is_smart_carousel {
-                1
-            } else {
-                config.fps.clamp(1, 12)
-            };
-            let duration_secs = if matches!(source, Source::Preset(Preset::Countdown)) {
-                config.duration_secs.clamp(1, 3600)
-            } else if config.duration_secs > 0 {
-                config.duration_secs.clamp(5, 60)
-            } else {
-                30
-            };
-            let frames: Vec<Vec<u8>> = match source {
-                Source::SmartCarousel(slides) if !slides.is_empty() => {
-                    synthesize_smart_carousel_frames(slides, clamped_brightness, config.invert)
-                }
-                _ => {
-                    let frame_count: usize = if matches!(source, Source::Preset(Preset::Countdown)) {
-                        (duration_secs as usize).clamp(2, 120)
-                    } else {
-                        24
-                    };
-                    let live = LiveData::default();
-                    let mut out: Vec<Vec<u8>> = Vec::with_capacity(frame_count);
-                    for i in 0..frame_count {
-                        let elapsed = if matches!(source, Source::Preset(Preset::Countdown)) {
-                            let step_secs = (i as u64 * u64::from(duration_secs))
-                                / (frame_count.max(1) as u64);
-                            Duration::from_secs(step_secs)
-                        } else {
-                            Duration::from_millis((i as u64 * 1000) / u64::from(fps.max(1)))
-                        };
-                        out.push(frame(source, config, elapsed, &live));
+            if matches!(source, Source::Preset(Preset::Countdown)) && config.duration_secs > 99 {
+                let target_dur = config.duration_secs.clamp(1, 3600);
+                if let Ok(comp_status) = crate::companion_app::inspect(adb, device) {
+                    if comp_status.installed && comp_status.permission_granted {
+                        if let Ok(msg) = crate::companion_app::apply_preset(
+                            adb,
+                            device,
+                            "countdown",
+                            clamped_brightness,
+                            target_dur,
+                        ) {
+                            write_mcp_status_file(
+                                adb,
+                                &transport,
+                                true,
+                                "animation",
+                                clean_title,
+                                clamped_brightness,
+                                1,
+                            );
+                            return Ok(msg);
+                        }
                     }
-                    out
                 }
-            };
+            }
+            crate::bridge::ensure_bridge_jar(adb, device)?;
+            let (frames, fps, duration_secs, frame_delay_ms) =
+                synthesize_mcp_animation_frames(source, config, clamped_brightness);
 
             // Push frame 0 immediately so the backscreen lights up right away
             bs_batch(
@@ -2139,6 +2362,7 @@ pub fn apply_via_firmware_mcp(
                 "jobId": job_id,
                 "title": clean_title,
                 "fps": fps,
+                "frameDelayMs": frame_delay_ms,
                 "brightness": clamped_brightness,
                 "durationSecs": duration_secs,
                 "frames": frames,
@@ -4593,8 +4817,21 @@ mod tests {
         assert_eq!(saved, Saved {
             mode: "custom".into(), kind: "text".into(),
             manual: "77".into(), automatic: "false".into(),
+            basic_text: None,
         });
         assert_eq!(saved, Saved::from_mcp_json(r#"{"mode":2,"automatic":0,"brightness":77,"type":"text","rotate":0}"#).unwrap());
+
+        let zero_and_ext = Saved::from_mcp_json(
+            r#"{"displayMode":1,"autoBrightness":1,"manualBrightness":0,"basicType":3,"basicText":"专注中"}"#,
+        )
+        .unwrap();
+        assert_eq!(zero_and_ext.manual, "0");
+        assert_eq!(zero_and_ext.kind, "3");
+        assert_eq!(zero_and_ext.basic_text.as_deref(), Some("专注中"));
+        assert_eq!(
+            Saved::from_mcp_json(&zero_and_ext.to_mcp_json()).unwrap(),
+            zero_and_ext
+        );
     }
 
     #[test]
@@ -4603,12 +4840,46 @@ mod tests {
             "", "{}", "null", "not json",
             r#"{"displayMode":9,"autoBrightness":1,"manualBrightness":160,"basicType":"agent"}"#,
             r#"{"displayMode":0,"autoBrightness":2,"manualBrightness":160,"basicType":"agent"}"#,
-            r#"{"displayMode":0,"autoBrightness":1,"manualBrightness":0,"basicType":"agent"}"#,
+            r#"{"displayMode":0,"autoBrightness":1,"manualBrightness":-1,"basicType":"agent"}"#,
             r#"{"displayMode":0,"autoBrightness":1,"manualBrightness":256,"basicType":"agent"}"#,
             r#"{"displayMode":0,"autoBrightness":1,"manualBrightness":160,"basicType":"unknown"}"#,
+            r#"{"displayMode":0,"autoBrightness":1,"manualBrightness":160,"basicType":-1}"#,
         ] {
             assert!(Saved::from_mcp_json(raw).is_err(), "invalid snapshot accepted: {raw}");
         }
+    }
+
+    #[test]
+    fn animation_synthesis_preserves_5m_25m_durations_and_countdown_pacing() {
+        let cfg_5m = PlaybackConfig {
+            brightness: 5,
+            fps: 6,
+            duration_secs: 300,
+            invert: false,
+        };
+        let (_, _, dur_5m, _) =
+            synthesize_mcp_animation_frames(&Source::Preset(Preset::Astronaut), &cfg_5m, 5);
+        assert_eq!(dur_5m, 300);
+
+        let cfg_25m = PlaybackConfig {
+            brightness: 6,
+            fps: 1,
+            duration_secs: 1500,
+            invert: false,
+        };
+        let (cd_frames, cd_fps, dur_25m, delay_ms) =
+            synthesize_mcp_animation_frames(&Source::Preset(Preset::Countdown), &cfg_25m, 6);
+        assert_eq!(dur_25m, 1500);
+        assert_eq!(cd_fps, 1);
+        assert_eq!(cd_frames.len(), 180);
+        assert!(delay_ms > 8000);
+        let expected_zero = frame(
+            &Source::Preset(Preset::Countdown),
+            &cfg_25m,
+            Duration::from_secs(1500),
+            &LiveData::default(),
+        );
+        assert_eq!(cd_frames.last().unwrap(), &expected_zero);
     }
 
     #[test]

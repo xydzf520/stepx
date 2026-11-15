@@ -59,6 +59,7 @@ impl Companion {
                 | St::ContinueOutputInAmoo(..)
                 | St::ContinueLabInAmoo(_)
                 | St::OpenPath(_)
+                | St::PreviewOutput { .. }
                 | St::RevealPath(_)
                 | St::AmooWorks
                 | St::NewInAmoo
@@ -73,7 +74,7 @@ impl Companion {
                 St::SaveQr | St::ImportLocalFile => Some(UiIcon::Download),
                 St::PasteLink => Some(UiIcon::Clipboard),
                 St::ContinueOutputInAmoo(..) | St::ContinueLabInAmoo(_) => Some(UiIcon::Chat),
-                St::OpenPath(_) => Some(UiIcon::Play),
+                St::OpenPath(_) | St::PreviewOutput { .. } => Some(UiIcon::Play),
                 St::RevealPath(_) | St::OpenWorksFolder => Some(UiIcon::Folder),
                 St::SetDeliverableFilter(1) => Some(UiIcon::Presentation),
                 St::SetDeliverableFilter(2) => Some(UiIcon::File),
@@ -394,6 +395,7 @@ impl Companion {
                             .is_some_and(|(_, h)| h.lock().unwrap().is_mouse_over_element())
                     })
                 };
+                let open_lab_id = output.lab_id.clone();
                 let mut action_btns = vec![
                     self.st_button(
                         &cont_id,
@@ -408,7 +410,10 @@ impl Companion {
                         } else {
                             "打开预览"
                         },
-                        St::OpenPath(path.clone()),
+                        St::PreviewOutput {
+                            path: path.clone(),
+                            lab_id: open_lab_id.clone(),
+                        },
                         Btn::Secondary,
                     ),
                 ];
@@ -457,7 +462,10 @@ impl Companion {
                         ],
                     ),
                     None,
-                    Some(Action::Studio(St::OpenPath(open_double))),
+                    Some(Action::Studio(St::PreviewOutput {
+                        path: open_double,
+                        lab_id: open_lab_id,
+                    })),
                     Some(crate::ui::context_menu::Target::StudioWork(
                         crate::ui::context_menu::StudioWorkTarget::WorkspaceOutput {
                             task_id: menu_tid,

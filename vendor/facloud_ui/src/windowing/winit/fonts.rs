@@ -30,9 +30,7 @@ use resvg::usvg::fontdb;
 use resvg::usvg::fontdb::Query;
 use vec1::Vec1;
 
-use cosmic_text::{
-    Align, Attrs, AttrsList, BidiParagraphs, LayoutGlyph, LayoutLine, ShapeLine, Shaping, Wrap,
-};
+use cosmic_text::{Align, Attrs, AttrsList, LayoutGlyph, LayoutLine, ShapeLine, Shaping, Wrap};
 use dashmap::{mapref::entry::Entry, DashMap};
 use fontdb::Source;
 use itertools::Itertools;
@@ -329,29 +327,58 @@ impl TextLayoutSystem {
         }
     }
 
-    /// Helper function to read a Font Face ([`owned_ttf_parser::Face`]) identified by a [`FontId`].
-    ///
-    /// ## Panics
-    /// This function can panic under a few conditions:
-    /// 1) If there is no font identified by [`FontId`] stored in the [`TextLayoutSystem`].
-    /// 2) The underlying [`fontdb::Database`] does not hold a font identified by [`ID`]. We only
-    ///    store an [`ID`] in the `font_id_map` upon inserting it in the [`fontdb::Database`].
-    /// 3) The font can't be parsed by [`ttf_parser`]. We validate fonts can be parsed by
-    ///    `owned_ttf_parser` when we initially load a font.
-    fn read_font_face<T, F: FnOnce(owned_ttf_parser::Face) -> T>(
+    /// Helper function to read a Font Face ([`owned_ttf_parser::Face`]) identified by a [`FontId`],
+    /// falling back cleanly to default/embedded font data if a system font file disappears or
+    /// fails `Face::parse`.
+    fn read_font_face_or_fallback<T, F: FnOnce(owned_ttf_parser::Face) -> T>(
         &self,
         font_id: FontId,
         ttf_font_callback: F,
-    ) -> T {
-        self.read_font_face_data(font_id, |data, index| {
-            // SAFETY: We've already validated that we can parse the font when loading it.
-            let font_face =
-                owned_ttf_parser::Face::parse(data, index).expect("Must be able to parse font");
-            ttf_font_callback(font_face)
-        })
+    ) -> Option<T> {
+        let mut callback = Some(ttf_font_callback);
+        if let Some(Some(res)) = self.try_read_font_face_data(font_id, |data, index| {
+            let font_face = owned_ttf_parser::Face::parse(data, index).ok()?;
+            let cb = callback.take()?;
+            Some(cb(font_face))
+        }) {
+            return Some(res);
+        }
+
+        self.log_missing_font_face(font_id);
+
+        let default_internal_id = self
+            .families
+            .get(&FamilyId(0))
+            .and_then(|family| self.font_id_map.read().get_by_left(family.font_ids.first()).copied());
+
+        let font_store = self.font_store.read();
+        let db = font_store.db();
+        let fallback_ids = default_internal_id
+            .into_iter()
+            .chain(
+                db.faces()
+                    .filter(|info| matches!(info.source, Source::Binary(_)))
+                    .map(|info| info.id),
+            )
+            .chain(db.faces().map(|info| info.id));
+
+        for fallback_id in fallback_ids {
+            if let Some(Some(res)) = db.with_face_data(fallback_id, |data, index| {
+                let font_face = owned_ttf_parser::Face::parse(data, index).ok()?;
+                let cb = callback.take()?;
+                Some(cb(font_face))
+            }) {
+                return Some(res);
+            }
+            if callback.is_none() {
+                break;
+            }
+        }
+
+        None
     }
 
-    /// Safe version of [`Self::read_font_face`]. Instead of panicking, will return None
+    /// Safe version of reading a font face without fallback. Returns `None` if unavailable.
     fn try_read_font_face<T, F: FnOnce(owned_ttf_parser::Face) -> T>(
         &self,
         font_id: FontId,
@@ -372,50 +399,34 @@ impl TextLayoutSystem {
         }
     }
 
-    /// Helper function to read the font data of a font identified by a [`FontId`].
-    ///
-    /// ## Panics
-    /// This function can panic under a few conditions:
-    /// 1) If there is no font identified by [`FontId`] stored in the [`TextLayoutSystem`].
-    /// 2) The underlying [`fontdb::Database`] does not hold a font identified by [`ID`]. We only
-    ///    store an [`ID`] in the `font_id_map` upon inserting it in the [`fontdb::Database`].
-    fn read_font_face_data<T, F: FnOnce(&[u8], u32) -> T>(
-        &self,
-        font_id: FontId,
-        font_data_callback: F,
-    ) -> T {
-        match self.try_read_font_face_data(font_id, font_data_callback) {
-            Some(x) => x,
-            None => {
-                match self.font_id_map.read().get_by_left(&font_id) {
-                    Some(internal_font_id) => {
-                        let internal_font_id = *internal_font_id;
-                        let panic_font_data =
-                            self.read_font_face_panic_data(font_id, Some(internal_font_id));
-                        let panic_message = match self.font_store.read().db().face_source(internal_font_id)
-                    {
-                        None => {
-                            format!("does not have an internal font source for id {internal_font_id}")
-                        }
-                        Some((source, idx)) => format!(
-                            "was unable to load font source ({source:?}, {idx}) for id {internal_font_id}"
-                        )
-                    };
-                        log::warn!(
-                            "Tried to load font data {panic_font_data}, but {panic_message}"
-                        );
-                    }
+    fn log_missing_font_face(&self, font_id: FontId) {
+        let internal_font_id = self.font_id_map.read().get_by_left(&font_id).copied();
+        match internal_font_id {
+            Some(internal_font_id) => {
+                let panic_font_data =
+                    self.read_font_face_panic_data(font_id, Some(internal_font_id));
+                let reason = match self.font_store.read().db().face_source(internal_font_id) {
                     None => {
-                        let panic_font_data = self.read_font_face_panic_data(font_id, None);
-                        log::warn!("Tried to load font data {panic_font_data}, but no corresponding internal id exists");
+                        format!("does not have an internal font source for id {internal_font_id}")
                     }
+                    Some((source, idx)) => format!(
+                        "was unable to load or parse font source ({source:?}, {idx}) for id {internal_font_id}"
+                    ),
                 };
-                panic!("Tried to load font data. No font source");
+                log::warn!(
+                    "Tried to load font data {panic_font_data}, but {reason}; falling back to default/embedded font"
+                );
+            }
+            None => {
+                let panic_font_data = self.read_font_face_panic_data(font_id, None);
+                log::warn!(
+                    "Tried to load font data {panic_font_data}, but no corresponding internal id exists; falling back to default/embedded font"
+                );
             }
         }
     }
 
-    /// Safe version of [`Self::read_font_face_data`]. Instead of panicking, will return None
+    /// Reads the raw font data of a font identified by [`FontId`], returning `None` on failure.
     fn try_read_font_face_data<T, F: FnOnce(&[u8], u32) -> T>(
         &self,
         font_id: FontId,
@@ -568,7 +579,7 @@ impl TextLayoutSystem {
     #[allow(clippy::too_many_arguments)]
     fn create_text_frame(
         &self,
-        layout_lines: impl Iterator<Item = (LayoutLine, bool)>,
+        layout_lines: impl Iterator<Item = (LayoutLine, bool, usize)>,
         line_style: LineStyle,
         text_styles_map: &TextStylesMap,
         max_height: f32,
@@ -584,12 +595,14 @@ impl TextLayoutSystem {
 
         let mut max_line_width: f32 = 0.;
         let mut total_height = 0.;
-        let mut line_glyph_start_index: usize = 0;
 
         let mut layout_lines = layout_lines.peekable();
-        while let Some((line, has_trailing_newline)) = layout_lines.next() {
+        while let Some((line, has_trailing_newline, line_byte_start_index)) = layout_lines.next() {
             max_line_width = max_line_width.max(line.w);
             let is_last_line = layout_lines.peek().is_none();
+            let line_glyph_start_index = str_index_map
+                .char_index(line_byte_start_index)
+                .unwrap_or_else(|| str_index_map.num_chars());
             let line = self.create_line(
                 line,
                 line_style,
@@ -598,22 +611,10 @@ impl TextLayoutSystem {
                 str_index_map,
                 text,
                 line_glyph_start_index,
+                line_byte_start_index,
                 has_trailing_newline,
             );
             total_height += line.height();
-
-            // We add 1 to the last caret position here to skip the newline character
-            // when advancing to the next paragraph. Wrapped lines within the same
-            // paragraph (`has_trailing_newline == false`) already have `glyph.start`
-            // byte offsets relative to the start of the paragraph.
-            if has_trailing_newline {
-                line_glyph_start_index = line
-                    .caret_positions
-                    .last()
-                    .map(|position| position.last_offset)
-                    .unwrap_or(line_glyph_start_index)
-                    + 1;
-            }
 
             // TODO(alokedesai): Properly clip multi-line text using the same strategy we use on mac.
             // See https://github.com/warpdotdev/warp-internal/blob/91dfe429074c6129a6b5c1c57c55c1daf6d274a9/ui/src/platform/mac/text_layout.rs#L318-L359.
@@ -639,6 +640,7 @@ impl TextLayoutSystem {
         str_index_map: &StrIndexMap,
         text: &str,
         line_glyph_start_index: usize,
+        line_byte_start_index: usize,
         has_trailing_newline: bool,
     ) -> Line {
         let Some(first_glyph) = layout_line.glyphs.first() else {
@@ -659,10 +661,7 @@ impl TextLayoutSystem {
         let mut run_builder = RunBuilder::new(text_styles_map, initial_font_id, str_index_map);
         let mut caret_positions = vec![];
         let mut chars_with_missing_glyphs = vec![];
-        let mut last_glyph_offset: usize = 0;
-        let line_byte_start_index = str_index_map
-            .byte_index(line_glyph_start_index)
-            .unwrap_or(0);
+        let mut max_glyph_offset: Option<usize> = None;
 
         run_builder.reserve_capacity(layout_line.glyphs.len());
         for glyph in layout_line.glyphs {
@@ -671,10 +670,10 @@ impl TextLayoutSystem {
             // not work for certain ligatures
             if glyph.w > 0.0 {
                 let start_offset = str_index_map
-                    .char_index(line_byte_start_index + glyph.start)
+                    .char_index(line_byte_start_index.saturating_add(glyph.start))
                     .unwrap_or(0);
                 let last_offset = str_index_map
-                    .char_index(line_byte_start_index + glyph.end)
+                    .char_index(line_byte_start_index.saturating_add(glyph.end))
                     .unwrap_or_else(|| str_index_map.num_chars())
                     .saturating_sub(1);
                 caret_positions.push(CaretPosition {
@@ -682,17 +681,18 @@ impl TextLayoutSystem {
                     start_offset,
                     last_offset,
                 });
-                last_glyph_offset = last_offset;
+                max_glyph_offset =
+                    Some(max_glyph_offset.map_or(last_offset, |prev| prev.max(last_offset)));
             }
 
             // A glyph_id of 0 implies that no glyph was found for this character.
             if glyph.glyph_id == 0 {
-                if let Some(ch) = Self::char_for_glyph(&glyph, text) {
+                if let Some(ch) = Self::char_for_glyph(&glyph, line_byte_start_index, text) {
                     chars_with_missing_glyphs.push(ch);
                 }
             }
 
-            run_builder.push_glyph(glyph, |id| {
+            run_builder.push_glyph(glyph, line_byte_start_index, |id| {
                 *self
                     .font_id_map
                     .read()
@@ -702,10 +702,12 @@ impl TextLayoutSystem {
         }
 
         if has_trailing_newline {
+            let newline_offset =
+                max_glyph_offset.map_or(line_glyph_start_index, |offset| offset + 1);
             caret_positions.push(CaretPosition {
                 position_in_line: layout_line.w,
-                start_offset: last_glyph_offset + 1,
-                last_offset: last_glyph_offset + 1,
+                start_offset: newline_offset,
+                last_offset: newline_offset,
             });
         }
 
@@ -725,13 +727,18 @@ impl TextLayoutSystem {
         }
     }
 
-    fn char_for_glyph(glyph: &LayoutGlyph, text: &str) -> Option<char> {
-        if !text.is_char_boundary(glyph.start) {
-            log::warn!("Expected glyph start to be a char boundary");
+    fn char_for_glyph(
+        glyph: &LayoutGlyph,
+        line_byte_start_index: usize,
+        text: &str,
+    ) -> Option<char> {
+        let abs_byte = line_byte_start_index.saturating_add(glyph.start);
+        let Some(tail) = text.get(abs_byte..) else {
+            log::warn!("Expected glyph start ({abs_byte}) to be a char boundary");
             return None;
-        }
+        };
 
-        text[glyph.start..].chars().next()
+        tail.chars().next()
     }
 
     /// Produces an [`AttrsList`] to layout text given a list of `style_runs` and the `text` the
@@ -967,6 +974,84 @@ impl platform::FontDB for FontDB {
     }
 }
 
+fn is_bidi_or_line_separator(ch: char) -> bool {
+    matches!(
+        ch,
+        '\r' | '\n'
+            | '\u{000B}'
+            | '\u{000C}'
+            | '\u{001C}'..='\u{001E}'
+            | '\u{0085}'
+            | '\u{2028}'
+            | '\u{2029}'
+    )
+}
+
+/// Replaces all `BidiClass::B` paragraph separators and line-break control characters with
+/// `U+200B` (zero-width space, `BidiClass::BN`) 1-for-1 so `ShapeLine::new` never sees multiple
+/// bidi paragraphs (`assert_eq!(line_rtl, rtl)`) while preserving `style_runs` character indices.
+fn sanitize_single_line_text(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.chars().any(is_bidi_or_line_separator) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+
+    let mut sanitized = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if is_bidi_or_line_separator(ch) {
+            sanitized.push('\u{200B}');
+        } else {
+            sanitized.push(ch);
+        }
+    }
+    std::borrow::Cow::Owned(sanitized)
+}
+
+struct ParagraphSpan<'a> {
+    paragraph: &'a str,
+    byte_start: usize,
+    total_span_bytes: usize,
+    has_trailing_separator: bool,
+}
+
+/// Splits `text` on every `BidiClass::B` / line-separator character while coalescing `\r\n` as a
+/// single paragraph break. Ensures `ShapeLine::new` never sees residual separator characters and
+/// multi-paragraph byte offsets remain exact across LF, CRLF, CR, NEL, LS, and PS line endings.
+fn split_paragraphs_for_layout(text: &str) -> impl Iterator<Item = ParagraphSpan<'_>> {
+    let mut cursor = 0;
+    std::iter::from_fn(move || {
+        if cursor >= text.len() {
+            return None;
+        }
+        let byte_start = cursor;
+        let remainder = &text[byte_start..];
+        let mut chars = remainder.char_indices().peekable();
+        while let Some((rel_idx, ch)) = chars.next() {
+            if is_bidi_or_line_separator(ch) {
+                let mut sep_len = ch.len_utf8();
+                if ch == '\r' && matches!(chars.peek(), Some(&(_, '\n'))) {
+                    sep_len += '\n'.len_utf8();
+                }
+                let total_span_bytes = rel_idx + sep_len;
+                cursor = byte_start + total_span_bytes;
+                return Some(ParagraphSpan {
+                    paragraph: &remainder[..rel_idx],
+                    byte_start,
+                    total_span_bytes,
+                    has_trailing_separator: true,
+                });
+            }
+        }
+        let total_span_bytes = remainder.len();
+        cursor = text.len();
+        Some(ParagraphSpan {
+            paragraph: remainder,
+            byte_start,
+            total_span_bytes,
+            has_trailing_separator: false,
+        })
+    })
+}
+
 impl platform::TextLayoutSystem for TextLayoutSystem {
     fn layout_line(
         &self,
@@ -976,17 +1061,15 @@ impl platform::TextLayoutSystem for TextLayoutSystem {
         max_width: f32,
         clip_config: ClipConfig,
     ) -> Line {
-        // cosmic_text panics if we pass text that is multiple paragraphs. Since we are laying out
-        // a line (which is by definition _not_ wrapped), combine all of the paragraphs together
-        // with a zero-width space (U+200B). We do this to ensure that all of the text renders on a
-        // single line, while also ensuring the style runs (which previously included the separator)
-        // are still respected properly.
-        let text = BidiParagraphs::new(text).join("\u{200B}");
+        // cosmic_text panics (`assert_eq!(line_rtl, rtl)`) if `ShapeLine::new` sees multiple bidi
+        // paragraphs (e.g. mixed LTR + RTL separated by `\r\n`, `\r`, or any `BidiClass::B` char).
+        // Replace every separator character 1-for-1 with U+200B so `style_runs` char ranges stay exact.
+        let text = sanitize_single_line_text(text);
 
         let mut text_styles_map = TextStylesMap::new();
         let str_index_map = StrIndexMap::new(&text);
         let attrs_list = self.build_attrs_list(
-            text.as_str(),
+            text.as_ref(),
             style_runs,
             &mut text_styles_map,
             &str_index_map,
@@ -995,7 +1078,7 @@ impl platform::TextLayoutSystem for TextLayoutSystem {
         let tab_width = line_style.fixed_width_tab_size.unwrap_or(4).into();
         let shape_line = ShapeLine::new(
             self.font_store.write().deref_mut(),
-            text.as_str(),
+            text.as_ref(),
             &attrs_list,
             Shaping::Advanced,
             tab_width,
@@ -1030,7 +1113,8 @@ impl platform::TextLayoutSystem for TextLayoutSystem {
             &text_styles_map,
             Some(clip_config),
             &str_index_map,
-            &text,
+            text.as_ref(),
+            0,
             0,
             false,
         )
@@ -1052,35 +1136,17 @@ impl platform::TextLayoutSystem for TextLayoutSystem {
         let mut font_store = self.font_store.write();
 
         let tab_width = line_style.fixed_width_tab_size.unwrap_or(4).into();
-        let mut num_bytes_seen = 0;
-        let layouts = BidiParagraphs::new(text).flat_map(|paragraph| {
-            let following_paragraph_text = &text[num_bytes_seen + paragraph.len()..];
-            let mut char_indices = following_paragraph_text.char_indices();
-
-            // Determine the byte length of the separator. The `BidiParagraphs` iterator does not
-            // coalesce multiple paragraph separators so we know there is at most one separator.
-            let (separator_byte_length, has_trailing_separator) = match char_indices.next() {
-                Some((start_byte_index, _char)) => {
-                    // Determine the end byte index of the character by checking the start character
-                    // index of the following character. If the current character is the last
-                    // character, the end byte index is the total length of the string.
-                    let end_byte_index = char_indices
-                        .next()
-                        .map(|(index, _)| index)
-                        .unwrap_or(following_paragraph_text.len());
-
-                    (end_byte_index - start_byte_index, true)
-                }
-                None => (0, false),
-            };
-            num_bytes_seen += paragraph.len() + separator_byte_length;
+        let layouts = split_paragraphs_for_layout(text).flat_map(|span| {
+            let paragraph_byte_start = span.byte_start;
+            let total_span_bytes = span.total_span_bytes;
+            let has_trailing_separator = span.has_trailing_separator;
+            let paragraph = span.paragraph;
 
             // Remove the attributes from the attrs list that correspond to this specific paragraph.
             // We also remove the paragraph's separator--this won't impact styling (since the length
             // of the text is smaller than that of the attribute list) but ensures all of the styles
             // related to this line of text are correctly removed.
-            let mut current_attrs_list =
-                attrs_list.split_off(paragraph.len() + separator_byte_length);
+            let mut current_attrs_list = attrs_list.split_off(total_span_bytes);
             std::mem::swap(&mut current_attrs_list, &mut attrs_list);
 
             let shape_line = ShapeLine::new(
@@ -1104,12 +1170,12 @@ impl platform::TextLayoutSystem for TextLayoutSystem {
             layout_lines
                 .into_iter()
                 .enumerate()
-                .map(|(line_idx, line)| {
+                .map(move |(line_idx, line)| {
                     // Each ShapeLine may get wrapped to multiple LayoutLines.
                     // We should only add the trailing separator to the last LayoutLine.
                     let is_last = line_idx == layout_line_count.saturating_sub(1);
                     let include_trailing_separator = is_last && has_trailing_separator;
-                    (line, include_trailing_separator)
+                    (line, include_trailing_separator, paragraph_byte_start)
                 })
                 .collect_vec()
         });
@@ -1145,10 +1211,15 @@ impl TextLayoutSystem {
         match self.font_selections.entry((family_id, properties)) {
             Entry::Occupied(entry) => *entry.get(),
             Entry::Vacant(entry) => {
-                let family = self
+                let Some(family) = self
                     .families
                     .get(&family_id)
-                    .expect("Font family must exist");
+                    .or_else(|| self.families.get(&FamilyId(0)))
+                    .or_else(|| self.families.values().next())
+                else {
+                    log::warn!("No font families loaded when selecting {family_id:?}");
+                    return FontId(0);
+                };
 
                 let weight =
                     fontdb::Weight(font_weight_to_cosmic_text(properties.weight).0);
@@ -1200,16 +1271,22 @@ impl TextLayoutSystem {
     }
 
     fn font_metrics(&self, font_id: FontId) -> crate::fonts::Metrics {
-        self.read_font_face(font_id, |font_face| crate::fonts::Metrics {
+        self.read_font_face_or_fallback(font_id, |font_face| crate::fonts::Metrics {
             units_per_em: font_face.units_per_em().into(),
             ascent: font_face.ascender(),
             descent: font_face.descender(),
             line_gap: font_face.line_gap(),
         })
+        .unwrap_or(crate::fonts::Metrics {
+            units_per_em: 1000,
+            ascent: 800,
+            descent: -200,
+            line_gap: 0,
+        })
     }
 
     fn glyph_advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Vector2I> {
-        self.read_font_face(font_id, |font_face| {
+        self.read_font_face_or_fallback(font_id, |font_face| {
             let glyph_id = owned_ttf_parser::GlyphId(glyph_id as u16);
 
             let horizontal_advance = font_face.glyph_hor_advance(glyph_id).unwrap_or(0);
@@ -1217,10 +1294,11 @@ impl TextLayoutSystem {
 
             Ok(vec2i(horizontal_advance.into(), vertical_advance.into()))
         })
+        .unwrap_or_else(|| Err(anyhow!("Unable to read font face for {font_id:?}")))
     }
 
     fn glyph_typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<RectI> {
-        self.read_font_face(font_id, |font_face| {
+        self.read_font_face_or_fallback(font_id, |font_face| {
             let ttf_parser_glyph_id = owned_ttf_parser::GlyphId::from_glyph_id(glyph_id);
 
             let raster_image = font_face.glyph_raster_image(ttf_parser_glyph_id, u16::MAX);
@@ -1246,6 +1324,7 @@ impl TextLayoutSystem {
 
             Ok(bounding_box.to_recti())
         })
+        .unwrap_or_else(|| Err(anyhow!("Unable to read font face for {font_id:?}")))
     }
 
     fn glyph_for_char(&self, font_id: FontId, char: char) -> Option<GlyphId> {
@@ -1699,5 +1778,84 @@ mod micro_craft_tests {
         assert_eq!(schedule.progress_for_char(5), 1.0);
         assert!((schedule.progress_for_char(10) - 0.5).abs() < 1e-5);
         assert_eq!(schedule.progress_for_char(20), 0.0);
+    }
+
+    #[test]
+    fn missing_font_id_does_not_panic_in_metrics_or_rasterizer() {
+        let font_db = FontDB::new();
+        let bogus_font = FontId(999_999);
+        let metrics = font_db.font_metrics(bogus_font);
+        assert!(metrics.units_per_em > 0);
+        assert!(font_db.glyph_advance(bogus_font, 1).is_err());
+        assert!(font_db.glyph_typographic_bounds(bogus_font, 1).is_err());
+        assert_eq!(
+            font_db.select_font(FamilyId(999_999), Properties::default()),
+            FontId(0)
+        );
+    }
+
+    #[test]
+    fn layout_line_mixed_ltr_rtl_with_crlf_and_bidi_separators_does_not_panic() {
+        let (font_db, roboto) = init_fonts();
+        let line_style = LineStyle {
+            font_size: 16.0,
+            line_height_ratio: DEFAULT_UI_LINE_HEIGHT_RATIO,
+            baseline_ratio: DEFAULT_TOP_BOTTOM_RATIO,
+            fixed_width_tab_size: None,
+        };
+
+        for sample in [
+            "Hello\r\nمرحبا",
+            "Hello\rשלום",
+            "Hello\u{0085}مرحبا\u{2028}שלום\u{2029}World\u{001C}אבג",
+        ] {
+            let style_runs = [(
+                0..sample.chars().count(),
+                StyleAndFont::new(roboto, Properties::default(), TextStyle::new()),
+            )];
+            let line = font_db.text_layout_system().layout_line(
+                sample,
+                line_style,
+                &style_runs,
+                f32::MAX,
+                ClipConfig::default(),
+            );
+            assert!(line.width > 0.0, "expected laid out glyphs for {sample:?}");
+        }
+    }
+
+    #[test]
+    fn layout_text_multi_paragraph_and_codeblock_glyph_indices_use_global_char_offsets() {
+        let (font_db, roboto) = init_fonts();
+        let line_style = LineStyle {
+            font_size: 14.0,
+            line_height_ratio: DEFAULT_UI_LINE_HEIGHT_RATIO,
+            baseline_ratio: DEFAULT_TOP_BOTTOM_RATIO,
+            fixed_width_tab_size: Some(4),
+        };
+        let code_block = "fn main() {\r\n    let x = 42;\n    println!(\"{}\", x);\n}";
+        let style_runs = [(
+            0..code_block.chars().count(),
+            StyleAndFont::new(roboto, Properties::default(), TextStyle::new()),
+        )];
+        let frame = font_db.text_layout_system().layout_text(
+            code_block,
+            line_style,
+            &style_runs,
+            f32::MAX,
+            f32::MAX,
+            TextAlignment::Left,
+            None,
+        );
+        let indices = collect_glyph_indices(&frame);
+        assert_eq!(indices.len(), 4);
+        // Line 0 ("fn main() {"): chars 0..11, followed by \r\n (chars 11, 12)
+        assert_eq!(indices[0].first().copied(), Some(0));
+        // Line 1 ("    let x = 42;"): starts at char 13 (NOT 0!)
+        assert_eq!(indices[1].first().copied(), Some(13));
+        // Line 2 ("    println!(\"{}\", x);"): starts at char 13 + 15 + 1 = 29 (NOT 0!)
+        assert_eq!(indices[2].first().copied(), Some(29));
+        // Line 3 ("}"): starts at char 29 + 22 + 1 = 52 (NOT 0!)
+        assert_eq!(indices[3], vec![52]);
     }
 }

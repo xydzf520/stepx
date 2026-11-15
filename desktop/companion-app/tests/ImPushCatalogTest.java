@@ -198,8 +198,33 @@ public final class ImPushCatalogTest {
         testParseWindowSnapshot();
         testConvertAbilityViewNode();
         testMcpToolsSchemaAndExpansionFilter();
+        testBinderSnapshotBudgetAndNonMutation();
 
         System.out.println("ImPushCatalogTest passed");
+    }
+
+    private static void testBinderSnapshotBudgetAndNonMutation() throws Exception {
+        check(PushStore.MAX_BINDER_SNAPSHOT_CHARS == 180_000, "Binder snapshot char budget must be 180k");
+        check(PushStore.MAX_SOCKET_SNAPSHOT_CHARS == 350_000, "Socket snapshot char budget must be 350k");
+        check(ChatUiBridge.MAX_CAPTURE_MEDIA_B64_CHARS == 128 * 1024, "Apex capture media budget must be 128 KiB chars");
+        check(PushNotificationService.RESCAN_COOLDOWN_MS == 30_000L, "Rescan cooldown must be 30s");
+
+        PushStore store = new PushStore(null);
+        // Verify bounded LRU eviction on handlesByKey / resolvedGenericThreadAliases and removeRecord pruning
+        for (int i = 0; i < 600; i++) {
+            String tid = "com.tencent.mm::会话" + i;
+            PushStore.RemoteReplyHandle h = new PushStore.RemoteReplyHandle(
+                null, null, null, "sbn_lru_" + i, "com.tencent.mm", "会话" + i, tid, 1000L + i
+            );
+            store.ingestRecord(
+                "sbn_lru_" + i, "com.tencent.mm", "微信", "msg",
+                "会话" + i, "", "你好 " + i, "",
+                1000L + i, false, false, false, null, h, null
+            );
+        }
+        check(store.getThreadCount() <= PushStore.MAX_THREADS, "Thread count must remain bounded at MAX_THREADS");
+        check(!store.hasReplyHandle("com.tencent.mm::会话0"), "Evicted oldest thread handle must be pruned");
+        check(store.hasReplyHandle("com.tencent.mm::会话599"), "Most recent thread handle must be retained");
     }
 
     private static void testGenericGroupAndSenderUpgrade() throws Exception {

@@ -59,10 +59,14 @@ final class CallAudioTools {
         }
     }
 
+    static final long UPLINK_READ_TIMEOUT_MS = 15_000L;
+
     static void run(String id) throws Exception {
         if (!id.matches("[a-f0-9-]{36}")) throw new IllegalArgumentException("通话标识无效");
         AudioTrack track = null;
         AudioRecord record = null;
+        Thread upload = null;
+        Thread download = null;
         AtomicBoolean running = new AtomicBoolean(true);
         AtomicLong lastInput = new AtomicLong(android.os.SystemClock.elapsedRealtime());
         try (CallLease lease = new CallLease()) {
@@ -95,7 +99,7 @@ final class CallAudioTools {
             if (record.getRecordingState() != AudioRecord.RECORDSTATE_RECORDING || track.getPlayState() != AudioTrack.PLAYSTATE_PLAYING)
                 throw new IllegalStateException("手机通话音频未启动");
             if (!lease.active(id)) throw new IllegalStateException("通话已变化");
-            Thread upload = new Thread(() -> {
+            upload = new Thread(() -> {
                 byte[] bytes = new byte[640];
                 try { int count; while (running.get() && (count = System.in.read(bytes)) > 0) {
                     lastInput.set(android.os.SystemClock.elapsedRealtime());
@@ -107,7 +111,7 @@ final class CallAudioTools {
                     }
                 }} catch (Throwable ignored) { } finally { running.set(false); }
             }, "stepx-call-uplink");
-            Thread download = new Thread(() -> {
+            download = new Thread(() -> {
                 byte[] bytes = new byte[640];
                 try { while (running.get()) {
                     int count = downlink.read(bytes, 0, bytes.length);
@@ -119,13 +123,25 @@ final class CallAudioTools {
             System.err.println("STEPX_CALL_AUDIO_READY"); System.err.flush();
             upload.start(); download.start();
             // Closing the host ADB process cannot deliver EOF during a Wi-Fi partition.
-            // Release the phone's audio redirection even if the TCP peer silently vanishes.
-            while (running.get() && android.os.SystemClock.elapsedRealtime() - lastInput.get() < 5000
+            // Release the phone's audio redirection even if the TCP peer silently vanishes,
+            // allowing up to 15s of uplink jitter before terminating.
+            while (running.get() && android.os.SystemClock.elapsedRealtime() - lastInput.get() < UPLINK_READ_TIMEOUT_MS
                 && lease.active(id)) Thread.sleep(300);
         } finally {
             running.set(false);
-            if (record != null) { try { record.stop(); } catch (Exception ignored) { } record.release(); }
-            if (track != null) { try { track.stop(); } catch (Exception ignored) { } track.release(); }
+            try { System.in.close(); } catch (Exception ignored) { }
+            if (record != null) { try { record.stop(); } catch (Exception ignored) { } }
+            if (track != null) { try { track.stop(); } catch (Exception ignored) { } }
+            if (upload != null) {
+                upload.interrupt();
+                try { upload.join(300L); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+            }
+            if (download != null) {
+                download.interrupt();
+                try { download.join(300L); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+            }
+            if (record != null) { try { record.release(); } catch (Exception ignored) { } }
+            if (track != null) { try { track.release(); } catch (Exception ignored) { } }
         }
     }
 }

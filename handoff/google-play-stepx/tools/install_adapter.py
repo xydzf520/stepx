@@ -1,10 +1,8 @@
-from common import baseline_matches, DEVICE_KEY
-import sys
 #!/usr/bin/env python3
 """Install only the reviewed, fixed-device GMS boot adapter, preserving stock."""
-import pathlib, subprocess, json, base64, uuid, hashlib, shutil
+import pathlib, subprocess, json, base64, uuid, hashlib, shutil, sys
 
-from common import ROOT, STATE as BACKUP, ADB, CONFIG, guard, verified_fingerprint, hold_operation_lock, private_write
+from common import ROOT, STATE as BACKUP, ADB, CONFIG, DEVICE_KEY, baseline_matches, guard, heal_stale_zygote_prop, subprocess_options, verified_fingerprint, hold_operation_lock, private_write
 from source_integrity import read_python_source
 import argparse
 parser = argparse.ArgumentParser(description=__doc__)
@@ -13,13 +11,13 @@ args = parser.parse_args()
 guard(native=True)
 operation_lease = hold_operation_lock()
 STOCK_SHA = '5cfe5a88a97eca424bd4922fe813e0cc553adad0e8623105311ec1514022152f'
-baseline = json.loads((BACKUP / ('recovery-baseline.json' if args.recovery else 'baseline.json')).read_text())
+baseline = json.loads((BACKUP / ('recovery-baseline.json' if args.recovery else 'baseline.json')).read_text(encoding='utf-8'))
 if args.recovery:
     from install_recovery import check_recovery_receipt
     check_recovery_receipt(baseline, verified_fingerprint(), DEVICE_KEY)
 assert baseline_matches(baseline), 'Wrong device baseline'
 assert verified_fingerprint() == baseline['fingerprint'], '安装基线固件与当前手机不同；备份已保留'
-assert subprocess.check_output(ADB + ['shell', 'getprop', 'persist.openclaw.zygote.path'], text=True).strip() == ''
+assert heal_stale_zygote_prop() == '', 'Another startup operation is active'
 files = {p.name: read_python_source(p) for p in (ROOT / 'module').glob('*.py')}
 assert set(files) == {'launcher.py', 'boot.py', 'inject.py'}
 for name, data in files.items():
@@ -27,8 +25,8 @@ for name, data in files.items():
 manifest = {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}
 stage = '/tmp/stepx-gms-stage-' + uuid.uuid4().hex[:10]
 remote = 'import os,base64,json;d=' + repr({n: base64.b64encode(b).decode() for n, b in files.items()}) + ';os.mkdir(' + repr(stage) + ',0o700)\nfor n,b in d.items():\n with open(' + repr(stage) + '+"/"+n,"wb") as f: f.write(base64.b64decode(b))\nprint("staged")'
-result = subprocess.run([sys.executable, str(ROOT / 'tools/gateway.py')], input=json.dumps({'command': ['python3', '-c', remote], 'timeoutMs': 15000}), capture_output=True, text=True, timeout=45)
-response = json.loads(result.stdout)
+result = subprocess.run([sys.executable, str(ROOT / 'tools/gateway.py')], input=json.dumps({'command': ['python3', '-c', remote], 'timeoutMs': 15000}), capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=45, **subprocess_options())
+response = json.loads(result.stdout or '{}')
 assert response.get('exitCode') == 0, 'Staging failed'
 code = '''import os,stat,hashlib,json,shutil
 stage=STAGE;manifest=MANIFEST
@@ -97,8 +95,21 @@ for directory in [base,state,os.path.dirname(launcher)]:
 shutil.rmtree(stage)
 print(json.dumps({'installed':True,'original_sha256':regular_digest(stock),'launcher_sha256':regular_digest(launcher),'manifest':manifest}))
 '''.replace('STAGE', repr(stage)).replace('MANIFEST', repr(manifest)).replace('STOCK_SHA', repr(STOCK_SHA))
-result = subprocess.run([sys.executable, str(ROOT / 'tools/root_bridge.py')], input=code, capture_output=True, text=True, timeout=150)
-proof = json.JSONDecoder().raw_decode(result.stdout.lstrip())[0]
+try:
+    result = subprocess.run([sys.executable, str(ROOT / 'tools/root_bridge.py')], input=code, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=150, **subprocess_options())
+    raw_stdout = (result.stdout or '').lstrip()
+    if not raw_stdout:
+        raise RuntimeError('Root bridge returned empty output during adapter installation')
+    proof = json.JSONDecoder().raw_decode(raw_stdout)[0]
+finally:
+    try:
+        subprocess.run(
+            [sys.executable, str(ROOT / 'tools/gateway.py')],
+            input=json.dumps({'command': ['python3', '-c', 'import shutil;shutil.rmtree(' + repr(stage) + ',ignore_errors=True)'], 'timeoutMs': 15000}),
+            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=20, **subprocess_options(),
+        )
+    except Exception:
+        pass
 assert proof.get('installed') and proof['original_sha256'] == STOCK_SHA
 proof['install_kind'] = 'recovery' if args.recovery else 'fresh'
 # Retain the original receipt after a recovery; never turn today's package

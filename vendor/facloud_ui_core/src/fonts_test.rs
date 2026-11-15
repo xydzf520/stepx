@@ -39,6 +39,11 @@ fn test_subpixel_alignment_computation() {
         let alignment = SubpixelAlignment::new(pos);
         assert_eq!(alignment.0, 0);
     }
+    {
+        // Negative coordinates use Euclidean remainder (-0.34 -> 0.66 -> 2, -0.8 -> 0.2 -> 1)
+        assert_eq!(SubpixelAlignment::new(vec2f(-0.34, 0.)).0, 2);
+        assert_eq!(SubpixelAlignment::new(vec2f(-0.8, 0.)).0, 1);
+    }
 }
 
 #[test]

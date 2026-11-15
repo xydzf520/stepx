@@ -4,23 +4,42 @@ use crate::search::{Document, Hit, Kind};
 use anyhow::Result;
 use rusqlite::{params, Connection};
 use std::{
-    collections::{BTreeSet, HashMap},
-    path::Path,
+    cell::RefCell,
+    collections::{BTreeSet, HashMap, HashSet},
+    path::{Path, PathBuf},
 };
 
 pub struct Index {
     conn: Connection,
 }
-fn grams(text: &str, query: bool) -> BTreeSet<String> {
-    let chars: Vec<_> = text.to_lowercase().chars().collect();
+pub(crate) fn ngrams(text: &str, query: bool) -> BTreeSet<String> {
+    let lower = text.to_lowercase();
+    let normalized = crate::search::normalize_han_mid_punct(&lower);
     let mut tokens = BTreeSet::new();
-    if !query || chars.len() == 1 {
-        for c in &chars {
-            tokens.insert(format!("u{:x}", *c as u32));
+    if query {
+        let chars: Vec<_> = normalized.chars().collect();
+        if chars.len() == 1 {
+            for c in &chars {
+                tokens.insert(format!("u{:x}", *c as u32));
+            }
         }
+        for pair in chars.windows(2) {
+            tokens.insert(format!("b{:x}x{:x}", pair[0] as u32, pair[1] as u32));
+        }
+        return tokens;
+    }
+    let chars: Vec<_> = lower.chars().collect();
+    for c in &chars {
+        tokens.insert(format!("u{:x}", *c as u32));
     }
     for pair in chars.windows(2) {
         tokens.insert(format!("b{:x}x{:x}", pair[0] as u32, pair[1] as u32));
+    }
+    if normalized != lower {
+        let norm_chars: Vec<_> = normalized.chars().collect();
+        for pair in norm_chars.windows(2) {
+            tokens.insert(format!("b{:x}x{:x}", pair[0] as u32, pair[1] as u32));
+        }
     }
     tokens
 }
@@ -36,11 +55,12 @@ impl Index {
         conn.execute_batch("CREATE TABLE IF NOT EXISTS search_docs (id TEXT PRIMARY KEY, position INTEGER NOT NULL, digest TEXT NOT NULL, kind TEXT NOT NULL, phone INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS search_filter ON search_docs(phone,kind);
             CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(id UNINDEXED, grams, tokenize='ascii');")?;
-        let version: i64 = conn.query_row("PRAGMA application_id", [], |r| r.get(0))?;
-        if version != 2 {
-            conn.execute_batch(
-                "DELETE FROM search_fts; DELETE FROM search_docs; PRAGMA application_id=2;",
-            )?;
+        let app_id: i64 = conn.query_row("PRAGMA application_id", [], |r| r.get(0))?;
+        if app_id != crate::data_store::CACHE_APPLICATION_ID {
+            conn.execute_batch(&format!(
+                "DELETE FROM search_fts; DELETE FROM search_docs; PRAGMA application_id={};",
+                crate::data_store::CACHE_APPLICATION_ID
+            ))?;
         }
         Ok(Self { conn })
     }
@@ -74,7 +94,7 @@ impl Index {
                     d.kind.label(),
                     if d.phone { "手机" } else { "电脑 desktop" }
                 );
-                let terms = grams(&text, false)
+                let terms = ngrams(&text, false)
                     .into_iter()
                     .collect::<Vec<_>>()
                     .join(" ");
@@ -111,7 +131,7 @@ impl Index {
             {
                 continue;
             }
-            terms.extend(grams(term, true));
+            terms.extend(ngrams(term, true));
         }
         let matching = terms.into_iter().collect::<Vec<_>>().join(" AND ");
         let filter = kind.map(Kind::label);
@@ -139,9 +159,20 @@ impl Index {
     }
 }
 
+thread_local! {
+    static FILE_TEXT_SCHEMA_READY: RefCell<HashSet<PathBuf>> = RefCell::new(HashSet::new());
+}
+
+const FILE_TEXT_SEEN_REFRESH_MS: i64 = 86_400_000;
+
 /// Cache only small text previews. Original files are always re-statted and never
 /// modified by indexing. ctime also catches same-size writes restoring mtime.
 pub fn file_text(path: &Path, meta: &std::fs::Metadata) -> Result<String> {
+    let db = crate::resources::user_state().join("cache/file-text.sqlite3");
+    file_text_in(&db, path, meta)
+}
+
+pub(crate) fn file_text_in(db: &Path, path: &Path, meta: &std::fs::Metadata) -> Result<String> {
     let stamp = format!("{:?}:{}:{}", meta.modified()?, meta.len(), {
         #[cfg(unix)]
         {
@@ -153,25 +184,53 @@ pub fn file_text(path: &Path, meta: &std::fs::Metadata) -> Result<String> {
             format!("{:?}", meta.created())
         }
     });
-    let db = crate::resources::user_state().join("cache/file-text.sqlite3");
-    crate::data_store::with_connection(&db, |conn| {
+    if std::fs::symlink_metadata(db).is_err() {
+        FILE_TEXT_SCHEMA_READY.with(|ready| {
+            ready.borrow_mut().remove(db);
+        });
+    }
+    crate::data_store::with_connection(db, |conn| {
         use rusqlite::OptionalExtension;
-        conn.execute_batch("CREATE TABLE IF NOT EXISTS file_text(path TEXT PRIMARY KEY,stamp TEXT NOT NULL,body TEXT NOT NULL,seen INTEGER NOT NULL);
-            CREATE INDEX IF NOT EXISTS file_text_seen ON file_text(seen);")?;
+        let needs_ddl = FILE_TEXT_SCHEMA_READY.with(|ready| !ready.borrow().contains(db));
+        if needs_ddl {
+            conn.execute_batch(&format!(
+                "CREATE TABLE IF NOT EXISTS file_text(path TEXT PRIMARY KEY,stamp TEXT NOT NULL,body TEXT NOT NULL,seen INTEGER NOT NULL);
+                 CREATE INDEX IF NOT EXISTS file_text_seen ON file_text(seen);
+                 PRAGMA application_id={};",
+                crate::data_store::CACHE_APPLICATION_ID
+            ))?;
+            FILE_TEXT_SCHEMA_READY.with(|ready| {
+                let mut set = ready.borrow_mut();
+                if set.len() >= 64 {
+                    set.clear();
+                }
+                set.insert(db.to_path_buf());
+            });
+        }
         let now = chrono::Utc::now().timestamp_millis();
-        let key = path.to_string_lossy();
-        if let Some(body) = conn
-            .query_row(
-                "SELECT body FROM file_text WHERE path=? AND stamp=? AND seen>?",
-                params![key, stamp, now - 600_000],
-                |r| r.get::<_, String>(0),
-            )
+        let key_cow = path.to_string_lossy();
+        let key: &str = &key_cow;
+        let cached = {
+            let mut stmt = conn
+                .prepare_cached("SELECT body, seen FROM file_text WHERE path=?1 AND stamp=?2")?;
+            stmt.query_row(params![key, &stamp], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
             .optional()?
-        {
+        };
+        if let Some((body, seen)) = cached {
+            if now.saturating_sub(seen) > FILE_TEXT_SEEN_REFRESH_MS {
+                let mut touch =
+                    conn.prepare_cached("UPDATE file_text SET seen=?1 WHERE path=?2")?;
+                touch.execute(params![now, key])?;
+            }
             return Ok(body);
         }
         let body = String::from_utf8(crate::local_store::read_bounded(path, 256 * 1024)?)?;
-        conn.execute("INSERT INTO file_text VALUES(?1,?2,?3,?4) ON CONFLICT(path) DO UPDATE SET stamp=excluded.stamp,body=excluded.body,seen=excluded.seen",params![key,stamp,body,now])?;
+        let mut upsert = conn.prepare_cached(
+            "INSERT INTO file_text VALUES(?1,?2,?3,?4) ON CONFLICT(path) DO UPDATE SET stamp=excluded.stamp,body=excluded.body,seen=excluded.seen",
+        )?;
+        upsert.execute(params![key, stamp, &body, now])?;
         Ok(body)
     })
 }
@@ -239,5 +298,84 @@ mod tests {
         assert_eq!(index.find(&docs, "新账号", None, None).unwrap()[0].index, 0);
         let again = Index::open(&dir.path().join("index.db")).unwrap();
         assert_eq!(again.find(&docs, "新账号", None, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn han_middle_punctuation_bridges_bigrams_and_matches_reference_search() {
+        let mut index = Index::memory().unwrap();
+        let docs = vec![
+            Document {
+                id: "dot".into(),
+                kind: Kind::Contact,
+                phone: true,
+                title: "买买提·艾力".into(),
+                body: "年度预算-评审_纪要".into(),
+                source: "通讯录".into(),
+                at: 100,
+            },
+            Document {
+                id: "plain".into(),
+                kind: Kind::File,
+                phone: false,
+                title: "普通笔记".into(),
+                body: "无关内容".into(),
+                source: "桌面".into(),
+                at: 90,
+            },
+        ];
+        index.sync(&docs).unwrap();
+        for q in [
+            "买买提艾力",
+            "买买提·艾力",
+            "预算评审纪要",
+            "预算-评审_纪要",
+        ] {
+            let ref_hits = crate::search::find(&docs, q, None, None);
+            let idx_hits = index.find(&docs, q, None, None).unwrap();
+            assert_eq!(ref_hits.len(), 1, "query {q}");
+            assert_eq!(idx_hits.len(), 1, "query {q}");
+            assert_eq!(ref_hits[0].score, idx_hits[0].score);
+        }
+    }
+
+    #[test]
+    fn file_text_cache_hits_beyond_ten_minutes_without_reindexing_storm() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("cache/file-text.sqlite3");
+        let file = dir.path().join("note.md");
+        std::fs::write(&file, "稳态缓存内容").unwrap();
+        let meta = std::fs::metadata(&file).unwrap();
+
+        assert_eq!(file_text_in(&db, &file, &meta).unwrap(), "稳态缓存内容");
+
+        // Backdate `seen` to 2 hours ago (> 10 minutes, < 24 hours).
+        let two_hours_ago = chrono::Utc::now().timestamp_millis() - 2 * 3_600_000;
+        let changes_before = crate::data_store::with_connection(&db, |c| {
+            c.execute("UPDATE file_text SET seen=?1", [two_hours_ago])?;
+            Ok(c.total_changes())
+        })
+        .unwrap();
+
+        assert_eq!(file_text_in(&db, &file, &meta).unwrap(), "稳态缓存内容");
+        let changes_after =
+            crate::data_store::with_connection(&db, |c| Ok(c.total_changes())).unwrap();
+        assert_eq!(
+            changes_before, changes_after,
+            "unchanged stamp within 24h must not rewrite SQLite"
+        );
+
+        // Backdate `seen` to 2 days ago (> 24 hours): `seen` refreshes once without re-reading.
+        let two_days_ago = chrono::Utc::now().timestamp_millis() - 2 * 86_400_000;
+        crate::data_store::with_connection(&db, |c| {
+            c.execute("UPDATE file_text SET seen=?1", [two_days_ago])?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(file_text_in(&db, &file, &meta).unwrap(), "稳态缓存内容");
+        let refreshed_seen: i64 = crate::data_store::with_connection(&db, |c| {
+            Ok(c.query_row("SELECT seen FROM file_text", [], |r| r.get(0))?)
+        })
+        .unwrap();
+        assert!(refreshed_seen > two_hours_ago);
     }
 }

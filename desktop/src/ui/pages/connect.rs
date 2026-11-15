@@ -134,8 +134,22 @@ impl Companion {
         match step {
             0 => {
                 body.push(self.connection_reference(1));
-                body.push(self.button("guide-find-developer", "找不到开发者选项？看前一步", Action::AdbGuide(Some(0)), Btn::Secondary));
-                body.push(self.text("第一次使用建议先连数据线；电脑已包含连接工具。", CAPTION, p.text2));
+                body.push(self.wrap(vec![
+                    self.button(
+                        "guide-find-developer",
+                        "找不到开发者选项？看前一步",
+                        Action::AdbGuide(Some(0)),
+                        Btn::Secondary,
+                    ),
+                    self.button_icon(
+                        "guide-wireless-shortcut",
+                        "免数据线 · 直接无线配对",
+                        UiIcon::Wifi,
+                        Action::ConnectGuide(Some(4)),
+                        Btn::Secondary,
+                    ),
+                ]));
+                body.push(self.text("第一次使用建议先连数据线；若不便插线，也可直接切换到无线配对。", CAPTION, p.text2));
             }
             1 => {
                 body.push(self.connection_reference(2));
@@ -610,6 +624,52 @@ impl Companion {
             ]));
         }
         let mut channels = vec![self.heading(format!("检测到的设备 · {}", self.devices.len()))];
+        if self.devices.iter().any(|d| d.state == "unauthorized") {
+            channels.push(
+                Container::new(self.vstack(
+                    S2,
+                    vec![
+                        self.hstack(
+                            S2,
+                            vec![
+                                self.content_icon(UiIcon::Shield, 16., p.warning),
+                                self.text_w(
+                                    "手机尚未允许 USB 调试授权",
+                                    SUBHEAD,
+                                    p.warning,
+                                    facloud_ui::fonts::Weight::Semibold,
+                                ),
+                            ],
+                        ),
+                        self.text(
+                            "1. 请解锁手机并保持亮屏，在系统弹出的「允许 USB 调试吗？」窗口勾选「一律允许使用这台计算机进行调试」后点击「允许／确定」。\n2. 若手机未弹出授权框，请重插数据线，或在手机「设置 → 开发者选项 → 撤销 USB 调试授权」后重新开关「USB 调试」。",
+                            CAPTION,
+                            p.text,
+                        ),
+                        self.wrap(vec![
+                            self.button_icon(
+                                "conn-unauth-refresh",
+                                "我已点允许，重新检测",
+                                UiIcon::Refresh,
+                                Action::Refresh,
+                                Btn::Primary,
+                            ),
+                            self.button(
+                                "conn-unauth-guide",
+                                "查看图文指引",
+                                Action::AdbGuide(Some(2)),
+                                Btn::Secondary,
+                            ),
+                        ]),
+                    ],
+                ))
+                .with_uniform_padding(S3)
+                .with_background_color(p.warning_soft)
+                .with_border(Border::all(1.).with_border_color(p.warning))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(R_CONTROL)))
+                .finish(),
+            );
+        }
         if self.devices.is_empty() {
             channels.push(self.text(
                 "尚未发现设备。连接 USB 并授权，或使用右侧无线配对。",
@@ -770,6 +830,14 @@ impl Companion {
                 ));
             }
             let mut right_actions = vec![];
+            if !is_online && !self.busy {
+                right_actions.push(self.button(
+                    format!("conn-reconnect-{idx}"),
+                    "重连",
+                    Action::ReconnectRememberedDevice(device.serial.clone()),
+                    Btn::Secondary,
+                ));
+            }
             if multi_remembered && !is_preferred {
                 right_actions.push(self.button(
                     format!("conn-pref-{idx}"),

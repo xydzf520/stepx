@@ -130,7 +130,7 @@ pub fn convert_keyboard_input_event(
             right_alt: window_state.right_alt_pressed,
             key_without_modifiers,
         },
-        is_composing: false,
+        is_composing: window_state.ime_composing,
     })
 }
 

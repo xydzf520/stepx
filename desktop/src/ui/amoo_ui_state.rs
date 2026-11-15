@@ -101,6 +101,7 @@ pub(super) struct AmooUiState {
     gui_last_second: u64,
     gui_rx: Option<mpsc::Receiver<GuiEvent>>,
     gui_cancel: Option<GuiCancellation>,
+    pub album_open: bool,
     pub album_path: Option<String>,
     album_entries: Vec<storage::Entry>,
     album_cache: Vec<tempfile::TempDir>,
@@ -329,10 +330,12 @@ impl Companion {
                 std::thread::spawn(move || {
                     let result = Adb::discover()
                         .and_then(|adb| {
-                            device.verify(&adb)?;
-                            let _ = adb.shell(&device.transport, &["input", "keyevent", "224"]);
+                            let mut device = device;
+                            let transport = device.resolve_active_transport(&adb)?;
+                            device.transport = transport.clone();
+                            let _ = adb.shell(&transport, &["input", "keyevent", "224"]);
                             let _ = adb.shell(
-                                &device.transport,
+                                &transport,
                                 &["input", "swipe", "540", "1850", "540", "650", "300"],
                             );
                             std::thread::sleep(Duration::from_millis(450));
@@ -578,6 +581,7 @@ impl Companion {
                 }
             }
             AmooUiAction::AlbumClose => {
+                self.amoo_ui.album_open = false;
                 self.amoo_ui.album_path = None;
                 self.trigger_subtab_switch();
             }
@@ -668,7 +672,7 @@ impl Companion {
                         anyhow::ensure!(!app.busy, "当前操作尚未完成，请重新保存附件");
                         app.with_device("正在下载手机附件…", move |adb, device| {
                             adb.shell(&device.transport, &["test", "-f", &path])?;
-                            storage::pull(adb, &device, &path, &output)?;
+                            storage::pull_overwrite(adb, &device, &path, &output)?;
                             Ok(Outcome::Notice(format!("附件已保存：{}", output.display())))
                         });
                         Ok(())
@@ -1014,6 +1018,7 @@ impl Companion {
                         task.attachments.clear();
                     }
                 }
+                self.prune_album_cache();
                 self.workspace_persist();
                 if let Some(session) = self.amoo_sessions.iter_mut().find(|s| s.session_key == key)
                 {
@@ -1035,6 +1040,7 @@ impl Companion {
                 }
             }
             AmooUiOutcome::Album(path, rows) => {
+                self.amoo_ui.album_open = true;
                 self.amoo_ui.album_path = Some(path);
                 self.amoo_ui.album_entries = rows;
                 self.scroll = Default::default();
@@ -1042,7 +1048,13 @@ impl Companion {
             }
             AmooUiOutcome::AlbumFile(cache, path) => match self.add_amoo_paths(&[path]) {
                 Ok(()) => {
+                    self.prune_album_cache();
+                    if self.amoo_ui.album_cache.len() >= 8 {
+                        let excess = self.amoo_ui.album_cache.len() + 1 - 8;
+                        self.amoo_ui.album_cache.drain(..excess);
+                    }
                     self.amoo_ui.album_cache.push(cache);
+                    self.amoo_ui.album_open = false;
                     self.amoo_ui.album_path = None;
                 }
                 Err(error) => {
@@ -1078,7 +1090,27 @@ impl Companion {
         }
     }
 
+    fn prune_album_cache(&mut self) {
+        self.amoo_ui.album_cache.retain(|dir| {
+            let root = dir.path();
+            self.amoo_attachments
+                .iter()
+                .filter_map(|a| a.local_path.as_deref())
+                .any(|p| p.starts_with(root))
+                || self
+                    .workspace
+                    .journal
+                    .tasks
+                    .iter()
+                    .flat_map(|t| t.attachments.iter())
+                    .any(|p| p.starts_with(root))
+        });
+    }
+
     pub(super) fn amoo_album_picker(&self) -> Option<El> {
+        if !self.amoo_ui.album_open && self.amoo_ui.album_path.is_none() {
+            return None;
+        }
         let path = self.amoo_ui.album_path.as_ref()?;
         let p = self.p();
         let mut rows = vec![
@@ -1180,6 +1212,12 @@ impl Companion {
                 self.amoo_ui.clear_gui_account();
             }
             self.work.clear_account_previews();
+            self.amoo_attachments.clear();
+            self.amoo_ui.album_cache.clear();
+            self.amoo_ui.album_entries.clear();
+            self.amoo_ui.album_path = None;
+            self.amoo_ui.album_open = false;
+            self.amoo_plus_open = false;
             if self.amoo_ui.account_scope.is_some()
                 || !self.amoo_sessions.is_empty()
                 || !self.amoo_pending_reply.is_empty()
@@ -1356,7 +1394,8 @@ impl Companion {
             match event {
                 Ok(UsageSyncEvent::Scope(scope)) => {
                     if self.amoo_ui.account_scope != scope {
-                        self.amoo_ui.account_scope = scope;
+                        self.clear_changed_account_views(scope.as_deref());
+                        self.amoo_ui.set_account_scope(scope);
                         self.auto_sync.context_triggered_for_cycle = false;
                         self.handle_context_action(&super::context_state::ContextAction::Refresh);
                         changed = true;
@@ -2087,19 +2126,81 @@ mod tests {
         );
         assert_eq!(recovered.run_id, "run-accepted-on-phone");
     }
+
+    #[test]
+    fn send_confirmed_tolerates_phone_clock_drift_and_scope_event_clears_previous_account() {
+        let now_ms = 1_700_000_100_000i64;
+        let snap = stepx_companion::openclaw::RealAmooData {
+            sessions: vec![stepx_companion::openclaw::RealSessionInfo {
+                key: "agent:main:skew".into(),
+                history_loaded: true,
+                messages: vec![stepx_companion::openclaw::RealChatMessage {
+                    role: "user".into(),
+                    text: "核对报销发票".into(),
+                    timestamp_ms: now_ms - 45_000,
+                    run_id: "run-clock-skew".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let recovered = recover_accepted_pending_reply(snap, "agent:main:skew", "核对报销发票", now_ms)
+            .expect("phone clock up to 60s behind PC should still confirm message match");
+        assert_eq!(recovered.run_id, "run-clock-skew");
+
+        let mut app = Companion::new_for_test();
+        app.amoo_ui.set_account_scope(Some("account-a".into()));
+        app.amoo_sessions.push(AmooSessionItem {
+            session_key: "agent:main:a".into(),
+            title: "Account A Session".into(),
+            agent: "Amoo".into(),
+            status: "就绪".into(),
+            status_kind: 0,
+            meta: String::new(),
+            items: Vec::new(),
+        });
+        app.amoo_attachments.push(AmooAttachment {
+            name: "secret.png".into(),
+            size_label: "12 KB".into(),
+            is_image: true,
+            local_path: None,
+        });
+        app.amoo_ui.album_open = true;
+        app.amoo_ui.album_path = Some("/sdcard/DCIM".into());
+        app.amoo_ui.album_entries.push(storage::Entry {
+            name: "photo.jpg".into(),
+            path: "/sdcard/DCIM/photo.jpg".into(),
+            bytes: 1024,
+            directory: false,
+            symlink: false,
+        });
+        let (tx, rx) = mpsc::channel();
+        app.amoo_ui.usage_rx = Some(rx);
+        tx.send(UsageSyncEvent::Scope(Some("account-b".into()))).unwrap();
+        assert!(app.poll_account_usage_sync());
+        assert_eq!(app.amoo_ui.account_scope.as_deref(), Some("account-b"));
+        assert!(app.amoo_sessions.is_empty());
+        assert!(app.amoo_attachments.is_empty());
+        assert!(!app.amoo_ui.album_open);
+        assert!(app.amoo_ui.album_entries.is_empty());
+        assert!(app.amoo_ui.album_cache.is_empty());
+    }
 }
 
-pub(super) fn recover_accepted_pending_reply(
-    snap: stepx_companion::openclaw::RealAmooData,
+pub(super) fn send_confirmed_in_sessions(
+    sessions: &[stepx_companion::openclaw::RealSessionInfo],
     key: &str,
     prompt: &str,
-    send_started_ms: i64,
+    sent_after_ms: i64,
 ) -> Option<amoo::PendingReply> {
-    let sess = snap.sessions.into_iter().find(|s| s.key == key)?;
+    let sess = sessions.iter().find(|s| s.key == key)?;
     let last_user_idx = sess.messages.iter().rposition(|m| m.role == "user")?;
     let user_msg = &sess.messages[last_user_idx];
     let trimmed = prompt.trim();
-    if user_msg.timestamp_ms < send_started_ms
+    let min_timestamp_ms = sent_after_ms.saturating_sub(60_000);
+    if trimmed.is_empty()
+        || user_msg.timestamp_ms < min_timestamp_ms
         || user_msg.run_id.trim().is_empty()
         || (user_msg.text.trim() != trimmed && !user_msg.text.contains(trimmed))
     {
@@ -2121,6 +2222,15 @@ pub(super) fn recover_accepted_pending_reply(
         text: prompt.to_string(),
         run_id: user_msg.run_id.clone(),
     })
+}
+
+pub(super) fn recover_accepted_pending_reply(
+    snap: stepx_companion::openclaw::RealAmooData,
+    key: &str,
+    prompt: &str,
+    send_started_ms: i64,
+) -> Option<amoo::PendingReply> {
+    send_confirmed_in_sessions(&snap.sessions, key, prompt, send_started_ms)
 }
 
 pub(super) fn send_amoo_with_transient_retry<B, ConnectFn, SendFn, SnapshotFn>(

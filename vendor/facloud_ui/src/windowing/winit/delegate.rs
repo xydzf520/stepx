@@ -8,7 +8,10 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, OnceLock,
+    },
     thread::{self, panicking},
 };
 
@@ -169,6 +172,12 @@ impl platform::DispatchDelegate for DispatchDelegate {
     }
 }
 
+#[derive(Default)]
+pub(super) struct ImeSharedState {
+    pub(super) active_open: AtomicBool,
+    pub(super) any_composing: AtomicBool,
+}
+
 pub struct AppDelegate {
     /// A handle for enqueueing [`CustomEvent`]s into the main event loop.
     pub(super) event_loop_proxy: EventLoopProxy<super::CustomEvent>,
@@ -178,6 +187,8 @@ pub struct AppDelegate {
     /// Responsible for registering the global hotkeys in the platform's desktop environment. Will
     /// be `None` for platforms that can't support global hotkeys.
     global_hotkey_handler: Option<GlobalHotKeyHandler>,
+
+    ime_state: Arc<ImeSharedState>,
 
     #[cfg(feature = "test-util")]
     last_known_cursor: RefCell<Cursor>,
@@ -202,9 +213,14 @@ impl AppDelegate {
             event_loop_proxy,
             clipboard: Box::<InMemoryClipboard>::default(),
             global_hotkey_handler,
+            ime_state: Arc::new(ImeSharedState::default()),
             #[cfg(feature = "test-util")]
             last_known_cursor: RefCell::new(Cursor::Arrow),
         })
+    }
+
+    pub(super) fn ime_state(&self) -> Arc<ImeSharedState> {
+        self.ime_state.clone()
     }
 
     /// The way copy-paste is handled depends on the specific windowing system. As winit is
@@ -485,7 +501,7 @@ impl platform::Delegate for AppDelegate {
     }
 
     fn set_cursor_shape(&self, cursor: Cursor) {
-        #[cfg(test)]
+        #[cfg(feature = "test-util")]
         {
             *self.last_known_cursor.borrow_mut() = cursor;
         }
@@ -494,14 +510,17 @@ impl platform::Delegate for AppDelegate {
     }
 
     fn close_ime_async(&self, _window_id: WindowId) {
-        // Winit does not expose a portable async IME close operation. This is
-        // queried on every focus transition, so it must remain a quiet no-op.
+        if self.ime_state.any_composing.load(Ordering::Acquire) {
+            let _ = self.event_loop_proxy.send_event(CustomEvent::CloseIme {
+                window_id: _window_id,
+            });
+        }
     }
 
     fn is_ime_open(&self) -> bool {
         // Called once for every view in the responder chain on each key event.
-        // Logging here turns normal typing into synchronous log I/O.
-        false
+        // Read the atomic composition state without logging.
+        self.ime_state.active_open.load(Ordering::Acquire)
     }
 
     fn open_character_palette(&self) {
@@ -574,6 +593,10 @@ impl IntegrationTestDelegate {
             app_delegate: AppDelegate::new(event_loop_proxy)?,
             clipboard: InMemoryClipboard::default(),
         })
+    }
+
+    pub(super) fn ime_state(&self) -> Arc<ImeSharedState> {
+        self.app_delegate.ime_state()
     }
 }
 
@@ -652,11 +675,11 @@ impl platform::Delegate for IntegrationTestDelegate {
     }
 
     fn close_ime_async(&self, _window_id: WindowId) {
-        // no-op
+        self.app_delegate.close_ime_async(_window_id);
     }
 
     fn is_ime_open(&self) -> bool {
-        false
+        self.app_delegate.is_ime_open()
     }
 
     fn open_character_palette(&self) {

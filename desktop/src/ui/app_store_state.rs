@@ -110,6 +110,7 @@ pub enum AppStoreAction {
     DownloadApkOnly {
         package: String,
     },
+    CancelTask(String),
     UpdateAll,
     RequestUninstall(String),
     CancelUninstall,
@@ -181,6 +182,13 @@ pub enum StoreWorkerEvent {
         result: Result<String, String>,
         refreshed_apps: Option<Vec<AppInfo>>,
     },
+    DowngradeRecheckFinished {
+        package: String,
+        version_idx: usize,
+        still_higher_installed: bool,
+        refreshed_apps: Option<Vec<AppInfo>>,
+        error: Option<String>,
+    },
 }
 
 pub struct AppStoreUiState {
@@ -205,6 +213,7 @@ pub struct AppStoreUiState {
     pub page_size: usize,
     pub selected_package: Option<String>,
     pub tasks: HashMap<String, StoreTaskState>,
+    pub cancel_flags: HashMap<String, std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub batch_queue: Vec<String>,
     pub batch_total: usize,
     pub batch_done: usize,
@@ -313,6 +322,7 @@ impl AppStoreUiState {
             page_size: STORE_DEFAULT_PAGE_SIZE,
             selected_package,
             tasks: HashMap::new(),
+            cancel_flags: HashMap::new(),
             batch_queue: Vec::new(),
             batch_total: 0,
             batch_done: 0,
@@ -1340,18 +1350,19 @@ impl Companion {
         size_bytes: u64,
         is_downgrade: bool,
         version_idx: Option<usize>,
-        force_reinstall: bool,
+        _force_reinstall: bool,
     ) {
         if self.app_store.tasks.get(&package).is_some_and(|t| {
             matches!(
                 t.stage,
-                StoreTaskStage::Downloading { .. }
+                StoreTaskStage::Queued
+                    | StoreTaskStage::Downloading { .. }
                     | StoreTaskStage::Verifying
                     | StoreTaskStage::Installing
                     | StoreTaskStage::Uninstalling
             )
         }) {
-            self.status = format!("「{app_name}」正在下载或安装中，请稍候…");
+            self.status = format!("「{app_name}」已在下载或等待队列中，请稍候…");
             return;
         }
 
@@ -1371,11 +1382,19 @@ impl Companion {
         if initial_device.is_none() {
             self.app_store.status_banner = Some((
                 format!(
-                    "正在下载「{app_name}」v{version_name}（如检测到已连接手机将自动安装，否则保存至 Downloads 目录）…"
+                    "正在下载「{app_name}」v{version_name}（如检测到唯一在线手机将自动安装，否则保存至 Downloads 目录）…"
                 ),
                 false,
             ));
         }
+
+        if let Some(prev_flag) = self.app_store.cancel_flags.remove(&package) {
+            prev_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.app_store
+            .cancel_flags
+            .insert(package.clone(), cancel_flag.clone());
 
         self.app_store.tasks.insert(
             package.clone(),
@@ -1403,6 +1422,9 @@ impl Companion {
                 &package,
                 &valid_candidates,
                 |offer| {
+                    if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Err("已取消下载".to_string());
+                    }
                     let cur_attempt = attempt_idx;
                     attempt_idx += 1;
                     let offer_ver = if offer.version_name.trim().is_empty() {
@@ -1415,7 +1437,7 @@ impl Companion {
                     } else {
                         size_bytes
                     };
-                    if cur_attempt > 0 {
+                    if cur_attempt > 0 && !cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
                         let _ = tx_progress.send(StoreWorkerEvent::TaskProgress {
                             package: pkg_progress.clone(),
                             stage: StoreTaskStage::Downloading {
@@ -1432,6 +1454,9 @@ impl Companion {
                         &package,
                         offer_ver,
                         |downloaded, total| {
+                            if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                return;
+                            }
                             let effective_total = if total > 0 { total } else { offer_size };
                             if effective_total > 0 && downloaded >= effective_total {
                                 if last_pct != Some(100) {
@@ -1471,9 +1496,16 @@ impl Companion {
                 },
             );
 
+            if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+
             let (apk_path, used_offer) = match dl_res {
                 Ok(res) => res,
                 Err(err) => {
+                    if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
                     let _ = tx.send(StoreWorkerEvent::TaskFinished {
                         package,
                         app_name,
@@ -1493,22 +1525,36 @@ impl Companion {
                 used_offer.version_name
             };
 
-            let resolved_device = initial_device.or_else(|| {
-                let adb = Adb::discover().ok()?;
-                let raw = adb
-                    .run_timeout(&["devices", "-l"], Duration::from_secs(3))
-                    .ok()?;
-                for t in stepx_companion::device::parse_devices(&raw) {
-                    if t.state == "device" {
-                        if let Ok(dev) = stepx_companion::device::Device::inspect(&adb, &t.id) {
-                            return Some(dev);
+            let mut multi_device_ambiguous = false;
+            let resolved_device = match initial_device {
+                Some(dev) => Some(dev),
+                None => (|| -> Option<stepx_companion::device::Device> {
+                    let adb = Adb::discover().ok()?;
+                    let raw = adb
+                        .run_timeout(&["devices", "-l"], Duration::from_secs(3))
+                        .ok()?;
+                    let mut inspected = Vec::new();
+                    for t in stepx_companion::device::parse_devices(&raw) {
+                        if t.state == "device" {
+                            if let Ok(dev) = stepx_companion::device::Device::inspect(&adb, &t.id) {
+                                inspected.push(dev);
+                            }
                         }
                     }
-                }
-                None
-            });
+                    match select_unambiguous_online_device(inspected) {
+                        Ok(dev_opt) => dev_opt,
+                        Err(_count) => {
+                            multi_device_ambiguous = true;
+                            None
+                        }
+                    }
+                })(),
+            };
 
             let Some(device) = resolved_device else {
+                if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
                 let dest_dir = user_downloads_dir();
                 let filename = format!(
                     "{}_v{}.apk",
@@ -1520,14 +1566,33 @@ impl Companion {
                     let _ = std::fs::copy(&apk_path, &dest);
                 }
                 let final_path = if dest.is_file() { dest } else { apk_path };
-                let _ = tx.send(StoreWorkerEvent::ApkDownloadedOnly {
-                    package,
-                    app_name,
-                    target_version: effective_ver,
-                    result: Ok(final_path),
-                });
+                if multi_device_ambiguous {
+                    let _ = tx.send(StoreWorkerEvent::TaskFinished {
+                        package,
+                        app_name,
+                        target_version: effective_ver,
+                        is_downgrade,
+                        version_idx,
+                        result: Err(format!(
+                            "检测到多台已连接手机且未选定目标设备，为安全起见未自动安装（APK 已保存至 {}，请先选择目标手机后再安装）",
+                            final_path.display()
+                        )),
+                        refreshed_apps: None,
+                    });
+                } else {
+                    let _ = tx.send(StoreWorkerEvent::ApkDownloadedOnly {
+                        package,
+                        app_name,
+                        target_version: effective_ver,
+                        result: Ok(final_path),
+                    });
+                }
                 return;
             };
+
+            if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
 
             let _ = tx.send(StoreWorkerEvent::TaskProgress {
                 package: package.clone(),
@@ -1539,12 +1604,13 @@ impl Companion {
             });
 
             let install_res = Adb::discover().and_then(|adb| {
+                // Never pass clean_reinstall_pkg = Some(...): device.rs refuses silent data wipe.
                 let msg = device.install_apk_with_options(
                     &adb,
                     &apk_path,
                     is_downgrade,
                     &package,
-                    force_reinstall.then_some(package.as_str()),
+                    None,
                 )?;
                 let refreshed = apps::catalog(&adb, &device).ok();
                 Ok((msg, refreshed))
@@ -1609,13 +1675,14 @@ impl Companion {
         if self.app_store.tasks.get(&package).is_some_and(|t| {
             matches!(
                 t.stage,
-                StoreTaskStage::Downloading { .. }
+                StoreTaskStage::Queued
+                    | StoreTaskStage::Downloading { .. }
                     | StoreTaskStage::Verifying
                     | StoreTaskStage::Installing
                     | StoreTaskStage::Uninstalling
             )
         }) {
-            self.status = format!("「{app_name}」正在下载中，请稍候…");
+            self.status = format!("「{app_name}」已在下载或等待队列中，请稍候…");
             return;
         }
 
@@ -1630,6 +1697,13 @@ impl Companion {
             ));
             return;
         }
+        if let Some(prev_flag) = self.app_store.cancel_flags.remove(&package) {
+            prev_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.app_store
+            .cancel_flags
+            .insert(package.clone(), cancel_flag.clone());
         self.app_store.tasks.insert(
             package.clone(),
             StoreTaskState {
@@ -1656,6 +1730,9 @@ impl Companion {
                 &package,
                 &valid_candidates,
                 |offer| {
+                    if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Err("已取消下载".to_string());
+                    }
                     let cur_attempt = attempt_idx;
                     attempt_idx += 1;
                     let offer_ver = if offer.version_name.trim().is_empty() {
@@ -1668,7 +1745,7 @@ impl Companion {
                     } else {
                         size_bytes
                     };
-                    if cur_attempt > 0 {
+                    if cur_attempt > 0 && !cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
                         let _ = tx_progress.send(StoreWorkerEvent::TaskProgress {
                             package: pkg_progress.clone(),
                             stage: StoreTaskStage::Downloading {
@@ -1685,6 +1762,9 @@ impl Companion {
                         &package,
                         offer_ver,
                         |downloaded, total| {
+                            if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                return;
+                            }
                             let effective_total = if total > 0 { total } else { offer_size };
                             if effective_total > 0 && downloaded >= effective_total {
                                 if last_pct != Some(100) {
@@ -1724,6 +1804,10 @@ impl Companion {
                 },
             );
 
+            if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+
             let mut final_ver = version_name.clone();
             let res = dl_res.and_then(|(cached_path, used_offer)| {
                 if !used_offer.version_name.trim().is_empty() {
@@ -1746,6 +1830,10 @@ impl Companion {
                 }
             });
 
+            if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+
             let _ = tx.send(StoreWorkerEvent::ApkDownloadedOnly {
                 package,
                 app_name,
@@ -1756,8 +1844,16 @@ impl Companion {
     }
 
     fn advance_batch_queue(&mut self) {
-        if let Some(next_pkg) = self.app_store.batch_queue.first().cloned() {
+        while let Some(next_pkg) = self.app_store.batch_queue.first().cloned() {
             self.app_store.batch_queue.remove(0);
+            if self
+                .app_store
+                .tasks
+                .get(&next_pkg)
+                .is_some_and(|t| matches!(t.stage, StoreTaskStage::Queued))
+            {
+                self.app_store.tasks.remove(&next_pkg);
+            }
             if let Some(app) = self.app_store.find_app_for_install(&next_pkg) {
                 let candidates = collect_download_candidates(&app, None);
                 if let Some(primary) = candidates.first().cloned() {
@@ -1771,7 +1867,12 @@ impl Companion {
                         None,
                         false,
                     );
+                    break;
                 }
+            }
+            if self.app_store.batch_total > 0 {
+                self.app_store.batch_done =
+                    (self.app_store.batch_done + 1).min(self.app_store.batch_total);
             }
         }
     }
@@ -2074,13 +2175,77 @@ impl Companion {
                 version_idx,
                 force_reinstall,
             } => {
-                self.app_store.pending_downgrade_reinstall = None;
                 let Some(app) = self.app_store.find_app_for_install(&package) else {
+                    self.app_store.pending_downgrade_reinstall = None;
                     return;
                 };
                 let Some(hist) = app.historical_versions.get(version_idx).cloned() else {
+                    self.app_store.pending_downgrade_reinstall = None;
                     return;
                 };
+                if force_reinstall {
+                    if self.demo_mode || self.selected.is_none() {
+                        if higher_version_installed_in_catalog(
+                            &self.apps,
+                            &package,
+                            hist.version_code,
+                            &hist.version_name,
+                        ) {
+                            let warn = "检测到手机上仍安装有高版本，请先在手机或『应用』页卸载后再点击重试"
+                                .to_string();
+                            self.app_store.pending_downgrade_reinstall =
+                                Some((package, version_idx));
+                            self.app_store.status_banner = Some((warn.clone(), true));
+                            self.status = warn;
+                            return;
+                        }
+                        self.app_store.pending_downgrade_reinstall = None;
+                    } else if let Some(device) = self.selected.clone() {
+                        self.app_store.pending_downgrade_reinstall =
+                            Some((package.clone(), version_idx));
+                        self.status = format!("正在核对手机上「{}」的当前版本状态…", app.name);
+                        let tx = self.app_store.tx.clone();
+                        let pkg_check = package.clone();
+                        let target_code = hist.version_code;
+                        let target_ver = hist.version_name.clone();
+                        std::thread::spawn(move || {
+                            let outcome = Adb::discover().and_then(|adb| {
+                                let still = phone_has_higher_installed_version(
+                                    &adb,
+                                    &device,
+                                    &pkg_check,
+                                    target_code,
+                                    &target_ver,
+                                )?;
+                                let refreshed = apps::catalog(&adb, &device).ok();
+                                Ok((still, refreshed))
+                            });
+                            match outcome {
+                                Ok((still_higher_installed, refreshed_apps)) => {
+                                    let _ = tx.send(StoreWorkerEvent::DowngradeRecheckFinished {
+                                        package: pkg_check,
+                                        version_idx,
+                                        still_higher_installed,
+                                        refreshed_apps,
+                                        error: None,
+                                    });
+                                }
+                                Err(err) => {
+                                    let _ = tx.send(StoreWorkerEvent::DowngradeRecheckFinished {
+                                        package: pkg_check,
+                                        version_idx,
+                                        still_higher_installed: true,
+                                        refreshed_apps: None,
+                                        error: Some(format!("{err:#}")),
+                                    });
+                                }
+                            }
+                        });
+                        return;
+                    }
+                } else {
+                    self.app_store.pending_downgrade_reinstall = None;
+                }
                 let hist_offer = StoreSourceOffer {
                     source: hist.source,
                     version_name: hist.version_name.clone(),
@@ -2099,7 +2264,7 @@ impl Companion {
                     hist.size_bytes,
                     true,
                     Some(version_idx),
-                    force_reinstall,
+                    false,
                 );
             }
             AppStoreAction::DownloadApkOnly { package } => {
@@ -2122,13 +2287,47 @@ impl Companion {
                     primary.size_bytes,
                 );
             }
+            AppStoreAction::CancelTask(pkg) => {
+                if let Some(flag) = self.app_store.cancel_flags.remove(&pkg) {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                self.app_store.batch_queue.retain(|q| q != &pkg);
+                let removed_name = self
+                    .app_store
+                    .tasks
+                    .remove(&pkg)
+                    .map(|t| t.app_name)
+                    .or_else(|| self.app_store.find_app(&pkg).map(|a| a.name.clone()))
+                    .unwrap_or_else(|| pkg.clone());
+                if self.app_store.batch_total > 0 {
+                    self.app_store.batch_total = self.app_store.batch_total.saturating_sub(1);
+                    let any_running = self.app_store.tasks.values().any(|t| {
+                        matches!(
+                            t.stage,
+                            StoreTaskStage::Downloading { .. }
+                                | StoreTaskStage::Verifying
+                                | StoreTaskStage::Installing
+                                | StoreTaskStage::Uninstalling
+                        )
+                    });
+                    if !any_running && !self.app_store.batch_queue.is_empty() {
+                        self.advance_batch_queue();
+                    } else if !any_running && self.app_store.batch_queue.is_empty() {
+                        self.app_store.batch_total = 0;
+                        self.app_store.batch_done = 0;
+                    }
+                }
+                let msg = format!("已取消「{removed_name}」下载任务");
+                self.app_store.status_banner = Some((msg.clone(), false));
+                self.status = msg;
+            }
             AppStoreAction::UpdateAll => {
                 if self.selected.is_none() {
                     self.app_store.status_banner =
                         Some(("请先连接手机后再执行一键全部更新".into(), true));
                     return;
                 }
-                let updatable: Vec<StoreApp> = self
+                let all_updatable: Vec<StoreApp> = self
                     .app_store
                     .catalog
                     .iter()
@@ -2140,15 +2339,48 @@ impl Companion {
                     })
                     .cloned()
                     .collect();
-                if updatable.is_empty() {
+                if all_updatable.is_empty() {
                     self.app_store.status_banner =
                         Some(("手机上的所有已安装应用均为最新版本".into(), false));
                     return;
                 }
-                self.app_store.batch_total = updatable.len();
-                self.app_store.batch_done = 0;
-                self.app_store.batch_queue.clear();
-                for app in &updatable {
+                let newly_queued: Vec<StoreApp> = all_updatable
+                    .into_iter()
+                    .filter(|app| {
+                        !self
+                            .app_store
+                            .tasks
+                            .get(&app.package)
+                            .is_some_and(|t| t.stage.is_active())
+                            && !self.app_store.batch_queue.contains(&app.package)
+                    })
+                    .collect();
+                if newly_queued.is_empty() {
+                    self.app_store.status_banner =
+                        Some(("所有可更新应用均已在下载或更新队列中".into(), false));
+                    return;
+                }
+                let running_count = self
+                    .app_store
+                    .tasks
+                    .values()
+                    .filter(|t| {
+                        matches!(
+                            t.stage,
+                            StoreTaskStage::Downloading { .. }
+                                | StoreTaskStage::Verifying
+                                | StoreTaskStage::Installing
+                                | StoreTaskStage::Uninstalling
+                        )
+                    })
+                    .count();
+                if self.app_store.batch_total == 0 {
+                    self.app_store.batch_done = 0;
+                    self.app_store.batch_total = running_count + newly_queued.len();
+                } else {
+                    self.app_store.batch_total += newly_queued.len();
+                }
+                for app in &newly_queued {
                     self.app_store.tasks.insert(
                         app.package.clone(),
                         StoreTaskState {
@@ -2161,7 +2393,9 @@ impl Companion {
                     );
                     self.app_store.batch_queue.push(app.package.clone());
                 }
-                self.advance_batch_queue();
+                if running_count == 0 {
+                    self.advance_batch_queue();
+                }
             }
             AppStoreAction::RequestUninstall(pkg) => {
                 self.app_store.pending_uninstall = Some(pkg);
@@ -2544,6 +2778,7 @@ impl Companion {
                     result,
                     refreshed_apps,
                 } => {
+                    self.app_store.cancel_flags.remove(&package);
                     if let Some(apps) = refreshed_apps {
                         self.apps_loaded = true;
                         self.apps_error = None;
@@ -2601,28 +2836,31 @@ impl Companion {
                     app_name,
                     target_version,
                     result,
-                } => match result {
-                    Ok(path) => {
-                        if let Some(task) = self.app_store.tasks.get_mut(&package) {
-                            task.stage =
-                                StoreTaskStage::Completed(format!("已下载 v{target_version}"));
+                } => {
+                    self.app_store.cancel_flags.remove(&package);
+                    match result {
+                        Ok(path) => {
+                            if let Some(task) = self.app_store.tasks.get_mut(&package) {
+                                task.stage =
+                                    StoreTaskStage::Completed(format!("已下载 v{target_version}"));
+                            }
+                            let msg = format!(
+                                "已将「{app_name}」v{target_version} 下载至：{}",
+                                path.display()
+                            );
+                            self.app_store.status_banner = Some((msg.clone(), false));
+                            self.status = msg;
                         }
-                        let msg = format!(
-                            "已将「{app_name}」v{target_version} 下载至：{}",
-                            path.display()
-                        );
-                        self.app_store.status_banner = Some((msg.clone(), false));
-                        self.status = msg;
-                    }
-                    Err(err) => {
-                        if let Some(task) = self.app_store.tasks.get_mut(&package) {
-                            task.stage = StoreTaskStage::Failed(err.clone());
+                        Err(err) => {
+                            if let Some(task) = self.app_store.tasks.get_mut(&package) {
+                                task.stage = StoreTaskStage::Failed(err.clone());
+                            }
+                            let msg = format!("「{app_name}」APK 下载失败：{err}");
+                            self.app_store.status_banner = Some((msg.clone(), true));
+                            self.status = msg;
                         }
-                        let msg = format!("「{app_name}」APK 下载失败：{err}");
-                        self.app_store.status_banner = Some((msg.clone(), true));
-                        self.status = msg;
                     }
-                },
+                }
                 StoreWorkerEvent::UninstallFinished {
                     package,
                     app_name,
@@ -2644,6 +2882,59 @@ impl Companion {
                             let msg = format!("卸载「{app_name}」失败：{err}");
                             self.app_store.status_banner = Some((msg.clone(), true));
                             self.status = msg;
+                        }
+                    }
+                }
+                StoreWorkerEvent::DowngradeRecheckFinished {
+                    package,
+                    version_idx,
+                    still_higher_installed,
+                    refreshed_apps,
+                    error,
+                } => {
+                    if let Some(apps) = refreshed_apps {
+                        self.apps_loaded = true;
+                        self.apps_error = None;
+                        self.apps = apps;
+                    }
+                    if still_higher_installed || error.is_some() {
+                        let warn = match error {
+                            Some(err) => format!(
+                                "检测到手机上仍安装有高版本，请先在手机或『应用』页卸载后再点击重试（{err}）"
+                            ),
+                            None => {
+                                "检测到手机上仍安装有高版本，请先在手机或『应用』页卸载后再点击重试"
+                                    .to_string()
+                            }
+                        };
+                        self.app_store.pending_downgrade_reinstall = Some((package, version_idx));
+                        self.app_store.status_banner = Some((warn.clone(), true));
+                        self.status = warn;
+                    } else {
+                        self.app_store.pending_downgrade_reinstall = None;
+                        if let Some(app) = self.app_store.find_app_for_install(&package) {
+                            if let Some(hist) = app.historical_versions.get(version_idx).cloned() {
+                                let hist_offer = StoreSourceOffer {
+                                    source: hist.source,
+                                    version_name: hist.version_name.clone(),
+                                    version_code: hist.version_code,
+                                    size_bytes: hist.size_bytes,
+                                    download_url: hist.download_url.clone(),
+                                    updated_at: hist.release_date.clone(),
+                                    md5: String::new(),
+                                    changelog: String::new(),
+                                };
+                                self.start_download_and_install(
+                                    app.package,
+                                    app.name,
+                                    hist.version_name,
+                                    vec![hist_offer],
+                                    hist.size_bytes,
+                                    true,
+                                    Some(version_idx),
+                                    false,
+                                );
+                            }
                         }
                     }
                 }
@@ -2992,4 +3283,166 @@ mod tests {
             "must return first_err rather than secondary fallback error, got: {err}"
         );
     }
+
+    #[test]
+    fn test_select_unambiguous_online_device_and_downgrade_higher_version_check() {
+        let mut dev_a_usb = stepx_companion::device::Device::default();
+        dev_a_usb.serial = "SERIAL_A".into();
+        dev_a_usb.transport = "SERIAL_A".into();
+        let mut dev_a_wifi = stepx_companion::device::Device::default();
+        dev_a_wifi.serial = "SERIAL_A".into();
+        dev_a_wifi.transport = "192.168.1.20:5555".into();
+        let mut dev_b = stepx_companion::device::Device::default();
+        dev_b.serial = "SERIAL_B".into();
+        dev_b.transport = "SERIAL_B".into();
+
+        assert!(select_unambiguous_online_device(vec![]).unwrap().is_none());
+        let single = select_unambiguous_online_device(vec![dev_a_wifi.clone(), dev_a_usb.clone()])
+            .expect("same physical device over USB + Wi-Fi is unambiguous")
+            .expect("must resolve device");
+        assert_eq!(single.serial, "SERIAL_A");
+        assert_eq!(single.transport, "SERIAL_A");
+
+        assert_eq!(
+            select_unambiguous_online_device(vec![dev_a_usb, dev_b]),
+            Err(2),
+            "multiple distinct connected phones must not pick first device arbitrarily"
+        );
+
+        let dump = "Packages:\n  Package [com.example.demo] (123456):\n    versionCode=240 minSdk=26 targetSdk=34\n    versionName=2.4.0\n";
+        assert_eq!(
+            parse_dumpsys_installed_version(dump),
+            (240, "2.4.0".to_string())
+        );
+
+        let installed = vec![AppInfo {
+            package: "com.example.demo".into(),
+            label: "Demo".into(),
+            version_name: "2.4.0".into(),
+            version_code: 240,
+            system: false,
+            user_id: 0,
+            ..Default::default()
+        }];
+        assert!(higher_version_installed_in_catalog(
+            &installed,
+            "com.example.demo",
+            200,
+            "2.0.0"
+        ));
+        assert!(!higher_version_installed_in_catalog(
+            &[],
+            "com.example.demo",
+            200,
+            "2.0.0"
+        ));
+    }
+}
+
+fn select_unambiguous_online_device(
+    candidates: Vec<stepx_companion::device::Device>,
+) -> std::result::Result<Option<stepx_companion::device::Device>, usize> {
+    let mut by_serial: Vec<stepx_companion::device::Device> = Vec::new();
+    for dev in candidates {
+        let key = if dev.serial.trim().is_empty() {
+            dev.transport.trim()
+        } else {
+            dev.serial.trim()
+        };
+        if key.is_empty() {
+            continue;
+        }
+        if let Some(existing) = by_serial.iter_mut().find(|d| {
+            let ek = if d.serial.trim().is_empty() {
+                d.transport.trim()
+            } else {
+                d.serial.trim()
+            };
+            ek == key
+        }) {
+            let existing_is_wireless =
+                existing.transport.contains(':') || existing.transport.starts_with("adb-");
+            let candidate_is_wireless =
+                dev.transport.contains(':') || dev.transport.starts_with("adb-");
+            if existing_is_wireless && !candidate_is_wireless {
+                *existing = dev;
+            }
+        } else {
+            by_serial.push(dev);
+        }
+    }
+    match by_serial.len() {
+        0 => Ok(None),
+        1 => Ok(by_serial.into_iter().next()),
+        n => Err(n),
+    }
+}
+
+fn higher_version_installed_in_catalog(
+    apps: &[AppInfo],
+    package: &str,
+    target_version_code: u64,
+    target_version_name: &str,
+) -> bool {
+    let Some(inst) = apps.iter().find(|a| a.package == package) else {
+        return false;
+    };
+    if target_version_code > 0 && inst.version_code > 0 {
+        return inst.version_code > target_version_code;
+    }
+    stepx_companion::app_store::compare_android_versions(&inst.version_name, target_version_name)
+        == std::cmp::Ordering::Greater
+}
+
+fn parse_dumpsys_installed_version(dump: &str) -> (u64, String) {
+    let mut version_code = 0u64;
+    let mut version_name = String::new();
+    for line in dump.lines() {
+        let trimmed = line.trim();
+        if version_code == 0 {
+            if let Some(rest) = trimmed.strip_prefix("versionCode=") {
+                let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(code) = digits.parse::<u64>() {
+                    version_code = code;
+                }
+            }
+        }
+        if version_name.is_empty() {
+            if let Some(rest) = trimmed.strip_prefix("versionName=") {
+                version_name = rest.trim().to_string();
+            }
+        }
+        if version_code > 0 && !version_name.is_empty() {
+            break;
+        }
+    }
+    (version_code, version_name)
+}
+
+fn phone_has_higher_installed_version(
+    adb: &Adb,
+    device: &stepx_companion::device::Device,
+    package: &str,
+    target_version_code: u64,
+    target_version_name: &str,
+) -> anyhow::Result<bool> {
+    let transport = device.resolve_active_transport(adb)?;
+    let pm_out = adb
+        .shell(&transport, &["pm", "path", "--user", "0", package])
+        .unwrap_or_default();
+    if !pm_out.lines().any(|l| l.trim().starts_with("package:")) {
+        return Ok(false);
+    }
+    let dump = adb.shell(&transport, &["dumpsys", "package", package])?;
+    let (inst_code, inst_name) = parse_dumpsys_installed_version(&dump);
+    if target_version_code > 0 && inst_code > 0 {
+        return Ok(inst_code > target_version_code);
+    }
+    if !inst_name.is_empty() && !target_version_name.trim().is_empty() {
+        return Ok(stepx_companion::app_store::compare_android_versions(
+            &inst_name,
+            target_version_name,
+        ) != std::cmp::Ordering::Less);
+    }
+    Ok(true)
 }

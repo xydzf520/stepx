@@ -17,8 +17,12 @@ import json
 import os
 from pathlib import Path
 import re
+import sys
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / 'scripts') not in sys.path:
+    sys.path.insert(0, str(ROOT / 'scripts'))
+from source_integrity import python_source_sha256, read_python_source
 spec = importlib.util.spec_from_file_location('owned_display_snapshot', ROOT / 'scripts/gui-native-display-snapshot.py')
 snapshot = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(snapshot)
@@ -94,7 +98,7 @@ def validate_result(value, pid):
 def build_worker(dex, identity):
     require(dex.startswith(b'dex\n') and len(dex) <= 64 * 1024 and hashlib.sha256(dex).hexdigest() == DEX_SHA256,
             'Unreviewed one-off recovery DEX')
-    source = (permissions.WORKFLOW / 'module/inject.py').read_text()
+    source = read_python_source(permissions.WORKFLOW / 'module/inject.py').decode('utf-8')
     require(hashlib.sha256(source.encode()).hexdigest() == permissions.LOADER_SHA256, 'Audited loader changed')
     source, count = re.subn(r'dex=base64\.b64decode\([^\n]+?\);dexp=', 'dex=base64.b64decode(RECOVERY_DEX);dexp=', source)
     require(count == 1 and source.count("cstr('stepx.GmsProbe')") == 1, 'Unsupported loader template')
@@ -115,7 +119,7 @@ def recover(owner, redirect):
     require(EXECUTION_ENABLED, 'Archived research recovery: the stale mapping already recovered normally')
     expected_identity = validate_owner(owner, redirect)
     permissions.guard(native=True)
-    require(hashlib.sha256((permissions.WORKFLOW / 'tools/root_worker.py').read_bytes()).hexdigest() == permissions.WORKER_SHA256,
+    require(python_source_sha256(permissions.WORKFLOW / 'tools/root_worker.py') == permissions.WORKER_SHA256,
             'Audited bounded worker changed')
     for path, expected in snapshot.IMAGE_HASHES.items():
         require(permissions.shell('sha256sum', path).split()[0] == expected, 'Original system service image changed')
@@ -151,20 +155,22 @@ def main():
     redirect_bytes = args.redirect_proof.read_bytes()
     owner, redirect = json.loads(owner_bytes), json.loads(redirect_bytes)
     validate_owner(owner, redirect)
-    fd = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, 'w') as output:
+    open_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_BINARY', 0)
+    fd = os.open(args.output, open_flags, 0o600)
+    with os.fdopen(fd, 'wb') as output:
         try:
             proof = recover(owner, redirect)
             proof['owner_proof_sha256'] = hashlib.sha256(owner_bytes).hexdigest()
             proof['redirect_proof_sha256'] = hashlib.sha256(redirect_bytes).hexdigest()
-            json.dump(proof, output, ensure_ascii=False, indent=2)
-            output.write('\n'); output.flush(); os.fsync(output.fileno())
+            output.write((json.dumps(proof, ensure_ascii=False, indent=2) + '\n').encode('utf-8'))
+            output.flush(); os.fsync(output.fileno())
             print(json.dumps(proof, ensure_ascii=False))
         except BaseException as error:
             proof = {'ok': False, 'error_type': type(error).__name__, 'owner_id': OWNER_ID,
                      'global_rollback_verified': False, 'requires_independent_readback': True,
                      'do_not_retry_without_review': True}
-            json.dump(proof, output); output.write('\n'); output.flush(); os.fsync(output.fileno())
+            output.write((json.dumps(proof, ensure_ascii=False) + '\n').encode('utf-8'))
+            output.flush(); os.fsync(output.fileno())
             raise
 
 

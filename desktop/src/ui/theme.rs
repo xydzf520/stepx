@@ -367,10 +367,12 @@ fn linux_installed_font_families() -> Option<std::collections::HashSet<String>> 
     }
     // Probing via fc-list avoids a NULL-pointer panic inside fontconfig bindings when a
     // requested family is missing (seen with Rust 1.92 debug builds).
-    let output = std::process::Command::new("fc-list")
-        .args([":", "family"])
-        .output()
-        .ok()?;
+    let mut cmd = std::process::Command::new("fc-list");
+    cmd.args([":", "family"]);
+    stepx_companion::resources::quiet_command(&mut cmd);
+    let output =
+        stepx_companion::adb::run_process(cmd, None, std::time::Duration::from_millis(1500))
+            .ok()?;
     if !output.status.success() {
         return None;
     }

@@ -60,6 +60,7 @@ impl<'a> RunBuilder<'a> {
     pub(super) fn push_glyph<F: FnOnce(&fontdb::ID) -> FontId>(
         &mut self,
         glyph: LayoutGlyph,
+        line_byte_start_index: usize,
         font_id_fn: F,
     ) {
         let font_id = font_id_fn(&glyph.font_id);
@@ -76,9 +77,10 @@ impl<'a> RunBuilder<'a> {
             self.font_in_current_run = font_id;
         }
 
+        let abs_byte = line_byte_start_index.saturating_add(glyph.start);
         let glyph_char_index = self
             .str_index_map
-            .char_index(glyph.start)
+            .char_index(abs_byte)
             .unwrap_or_else(|| self.str_index_map.num_chars());
 
         self.glyphs_in_current_run.push(Glyph {

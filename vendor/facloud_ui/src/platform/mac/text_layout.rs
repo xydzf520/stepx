@@ -471,9 +471,14 @@ fn create_attributed_string(
         CFAttributedStringBeginEditing(attributed_string.as_concrete_TypeRef());
     }
 
-    let mut utf16_lens = text.chars().map(|c| c.len_utf16());
-    let mut prev_char_ix: usize = 0;
-    let mut prev_utf16_ix: usize = 0;
+    let mut char_to_utf16 = Vec::with_capacity(text.len() + 1);
+    char_to_utf16.push(0usize);
+    let mut utf16_acc = 0usize;
+    for ch in text.chars() {
+        utf16_acc += ch.len_utf16();
+        char_to_utf16.push(utf16_acc);
+    }
+    let total_chars = char_to_utf16.len() - 1;
 
     let tab_interval = line_style.fixed_width_tab_size.and_then(|tab_size| {
         // In fully fixed-width paragraphs, style runs should all resolve to the same monospace font.
@@ -503,20 +508,15 @@ fn create_attributed_string(
     }
 
     for (range, style_and_font) in style_runs {
-        let utf16_start: usize = prev_utf16_ix
-            + utf16_lens
-                .by_ref()
-                .take(range.start - prev_char_ix)
-                .sum::<usize>();
-        let utf16_end: usize = utf16_start
-            + utf16_lens
-                .by_ref()
-                .take(range.end - range.start)
-                .sum::<usize>();
-        prev_char_ix = range.end;
-        prev_utf16_ix = utf16_end;
+        let start_char = range.start.min(total_chars);
+        let end_char = range.end.min(total_chars).max(start_char);
+        let utf16_start = char_to_utf16[start_char];
+        let utf16_end = char_to_utf16[end_char];
 
-        let cf_range = CFRange::init(utf16_start as isize, (utf16_end - utf16_start) as isize);
+        let cf_range = CFRange::init(
+            utf16_start as isize,
+            utf16_end.saturating_sub(utf16_start) as isize,
+        );
         let font_id = font_db.select_font(style_and_font.font_family, style_and_font.properties);
         let native_font = font_db.native_font(font_id, line_style.font_size);
 
@@ -533,7 +533,11 @@ fn create_attributed_string(
                 native_font.ascent() + native_font.descent() + native_font.leading();
             let app_font_line_height =
                 line_style.font_size as CGFloat * line_style.line_height_ratio as CGFloat;
-            let line_height_multiple = app_font_line_height / system_font_line_height;
+            let line_height_multiple = if system_font_line_height > 0.0 {
+                app_font_line_height / system_font_line_height
+            } else {
+                1.0
+            };
             let line_height_multiple_setting = ParagraphStyleSetting::new_float_setting(
                 CTParagraphStyleSpecifier::LineHeightMultiple,
                 line_height_multiple,
@@ -562,22 +566,32 @@ fn create_attributed_string(
             // For example if we want to highlight `bc` in abcd
             // We would apply kerning on `a` and `c`. The text spacing would look like [a  ][b][c  ][d].
             if style_and_font.style.border.is_some() {
-                if utf16_start > 0 {
-                    let kerning_range = CFRange::init((utf16_start - 1) as isize, 1_isize);
-                    attributed_string.set_attribute(
-                        kerning_range,
-                        kCTKernAttributeName,
-                        &CFNumber::from(6.),
-                    );
+                if start_char > 0 && utf16_start > 0 {
+                    let prev_utf16_start = char_to_utf16[start_char - 1];
+                    let prev_utf16_len = utf16_start.saturating_sub(prev_utf16_start);
+                    if prev_utf16_len > 0 {
+                        let kerning_range =
+                            CFRange::init(prev_utf16_start as isize, prev_utf16_len as isize);
+                        attributed_string.set_attribute(
+                            kerning_range,
+                            kCTKernAttributeName,
+                            &CFNumber::from(6.),
+                        );
+                    }
                 }
 
-                if utf16_end > 0 {
-                    let kerning_range = CFRange::init((utf16_end - 1) as isize, 1_isize);
-                    attributed_string.set_attribute(
-                        kerning_range,
-                        kCTKernAttributeName,
-                        &CFNumber::from(6.),
-                    );
+                if end_char > 0 && utf16_end > 0 {
+                    let last_utf16_start = char_to_utf16[end_char - 1];
+                    let last_utf16_len = utf16_end.saturating_sub(last_utf16_start);
+                    if last_utf16_len > 0 {
+                        let kerning_range =
+                            CFRange::init(last_utf16_start as isize, last_utf16_len as isize);
+                        attributed_string.set_attribute(
+                            kerning_range,
+                            kCTKernAttributeName,
+                            &CFNumber::from(6.),
+                        );
+                    }
                 }
             }
 
@@ -608,9 +622,19 @@ pub fn layout_text(
     if text.is_empty() {
         TextFrame::empty(line_style.font_size, line_style.line_height_ratio)
     } else {
-        // Ensure the max height is finite--under certain conditions `CTFrameSetter` won't terminate
-        // if the height is unbounded.
-        let max_height = max_height.min(f32::MAX);
+        // Clamp infinite or extreme dimensions before passing to CoreGraphics/CoreText:
+        // passing f32::INFINITY to CGPathCreateWithRect returns a NULL CGPathRef and crashes,
+        // and unbounded height can cause CTFramesetter to fail to terminate.
+        let max_width = if max_width.is_nan() {
+            0.0
+        } else {
+            max_width.clamp(0.0, 10_000_000.0)
+        };
+        let max_height = if max_height.is_nan() {
+            0.0
+        } else {
+            max_height.clamp(0.0, 10_000_000.0)
+        };
 
         let mut insert_extra_initial_line = false;
         // Core Text always tries to put at least 1 character on the first line, which does not work well
@@ -762,15 +786,22 @@ fn line_from_ct_line(
 
     let mut previous_run_font_and_attribute = None;
 
-    for run in line.glyph_runs().into_iter() {
-        let attributes = run.attributes().expect("attributes should exist");
+    let fallback_char_end = utf16_offset_to_char_idx.last().map(|idx| idx + 1).unwrap_or(0);
 
-        let font_id = font_db.font_id_for_native_font(unsafe {
-            attributes
-                .get(kCTFontAttributeName)
-                .downcast::<CTFont>()
-                .unwrap()
-        });
+    for run in line.glyph_runs().into_iter() {
+        let Some(attributes) = run.attributes() else {
+            continue;
+        };
+
+        let font_id = unsafe { attributes.find(kCTFontAttributeName) }
+            .and_then(|value| value.downcast::<CTFont>())
+            .map(|native_font| font_db.font_id_for_native_font(native_font))
+            .unwrap_or_else(|| {
+                font_db.select_font(
+                    facloud_ui_core::fonts::FamilyId(0),
+                    facloud_ui_core::fonts::Properties::default(),
+                )
+            });
 
         let glyphs = itertools::multizip((
             run.glyphs().iter(),
@@ -779,10 +810,11 @@ fn line_from_ct_line(
             advances(&run).iter(),
         ))
         .map(|(glyph_id, position, utf16_offset, advance)| {
-            let utf16_offset = usize::try_from(*utf16_offset).expect("Negative character offset");
+            let utf16_offset = usize::try_from(*utf16_offset).unwrap_or(0);
             let char_index = utf16_offset_to_char_idx
                 .get(utf16_offset)
-                .expect("mapping covers whole string");
+                .copied()
+                .unwrap_or(fallback_char_end);
 
             Glyph {
                 id: *glyph_id as GlyphId,
@@ -842,17 +874,17 @@ fn line_from_ct_line(
 /// Returns the char index within `text` given the number of UTF-16 bytes from the start of the
 /// string.
 fn char_index_from_utf_16_byte_index(text: &str, utf_16_index: usize) -> usize {
-    let mut start_index_utf_16 = 0;
-    let mut start_index = 0;
-    for (index, char) in text.chars().enumerate() {
-        if utf_16_index <= start_index_utf_16 {
-            start_index = index;
-            break;
+    let mut utf_16_counter = 0;
+    let mut char_count = 0;
+    for (index, ch) in text.chars().enumerate() {
+        if utf_16_index <= utf_16_counter {
+            return index;
         }
 
-        start_index_utf_16 += char.len_utf16();
+        utf_16_counter += ch.len_utf16();
+        char_count = index + 1;
     }
-    start_index
+    char_count
 }
 
 /// Builds a lookup table for finding a character's index within the input
@@ -909,7 +941,7 @@ fn caret_positions_for_line(
         let positions = positions.clone();
         ConcreteBlock::new(move |offset, char_index: isize, leading_edge, _stop| {
             positions.borrow_mut().push(CaretEdge {
-                utf16_index: char_index.try_into().expect("Negative UTF-16 offset"),
+                utf16_index: usize::try_from(char_index).unwrap_or(0),
                 leading_edge,
                 pixel_offset: offset,
             });
@@ -961,13 +993,16 @@ fn caret_positions_for_line(
                 second.pixel_offset
             };
 
+            let fallback_last_idx = utf16_offset_to_char_idx.last().copied().unwrap_or(0);
             let first_index = utf16_offset_to_char_idx
                 .get(first.utf16_index)
-                .expect("Mapping covers whole string")
+                .copied()
+                .unwrap_or(fallback_last_idx)
                 + char_offset;
             let second_index = utf16_offset_to_char_idx
                 .get(second.utf16_index)
-                .expect("Mapping covers whole string")
+                .copied()
+                .unwrap_or(fallback_last_idx)
                 + char_offset;
 
             let (start, end) = if first_index < second_index {

@@ -15,18 +15,29 @@ static KNOWN_THEMES: &[&str] = &["Yaru", "Adwaita"];
 pub fn ensure_cursor_theme() {
     // If the XCURSOR_THEME value is explicitly set,
     // then we do not want to modify the user's environment
-    if env::var(ENV_CURSOR_THEME).is_ok() {
+    if env::var_os(ENV_CURSOR_THEME).is_some() {
         return;
     }
 
     let crawler = CursorThemeCrawler::new();
 
     if let Some(theme) = crawler.determine_cursor_theme() {
-        // winit and it's dependencies will automatically check for
+        // winit and its dependencies will automatically check for
         // the default theme, so we do not need to mess with the
         // env var here.
         if theme != *DEFAULT_THEME {
-            env::set_var(ENV_CURSOR_THEME, theme);
+            // POSIX `setenv` is unsound when other threads are concurrently reading `environ`.
+            // Only mutate `XCURSOR_THEME` when called during early single-threaded startup.
+            let is_single_threaded = std::fs::read_dir("/proc/self/task")
+                .map(|entries| entries.take(2).count() <= 1)
+                .unwrap_or(false);
+            if is_single_threaded {
+                env::set_var(ENV_CURSOR_THEME, theme);
+            } else {
+                log::debug!(
+                    "Skipping set_var({ENV_CURSOR_THEME}={theme}) because multiple threads are running"
+                );
+            }
         }
     }
 }

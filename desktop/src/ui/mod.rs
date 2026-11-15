@@ -128,7 +128,7 @@ use facloud_ui::{
     event::{DispatchedEvent, Event},
     fonts::{Cache as FontCache, FamilyId},
     platform::{self, WindowBounds},
-    AppContext, Element, Entity, SingletonEntity, View, ViewContext, ViewHandle,
+    AppContext, Element, Entity, SingletonEntity, View, ViewContext, ViewHandle, WindowId,
 };
 use pathfinder_geometry::vector::{vec2f, Vector2F};
 use std::{
@@ -250,10 +250,12 @@ pub fn run() -> Result<()> {
         .position(|arg| arg == "--capture-ui")
         .and_then(|i| std::env::args().nth(i + 1))
         .map(PathBuf::from);
-    let instance_dir = if capture.is_some() || std::env::args().any(|a| a == "--verify-home-live") {
+    let isolated_capture = cfg!(feature = "ui-capture")
+        && (capture.is_some() || std::env::args().any(|a| a == "--verify-home-live"));
+    let instance_dir = if isolated_capture {
         std::env::temp_dir().join(format!("stepx-companion-capture-{}", std::process::id()))
     } else {
-        stepx_companion::resources::user_config().join("stepx-companion/runtime")
+        stepx_companion::resources::default_user_config().join("stepx-companion/runtime")
     };
     let stepx_companion::single_instance::Claim::Primary(instance) =
         stepx_companion::single_instance::Instance::claim(&instance_dir)?
@@ -261,8 +263,42 @@ pub fn run() -> Result<()> {
         return Ok(());
     };
     let activation = instance.activation_requests();
+    let main_window: Arc<std::sync::Mutex<Option<(WindowId, ViewHandle<Companion>)>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let close_slot = main_window.clone();
+    let terminate_slot = main_window.clone();
+    #[allow(unused_mut)]
     let mut builder = platform::AppBuilder::new(
         platform::AppCallbacks {
+            on_should_close_window: Some(Box::new(move |win_id, app_ctx| {
+                let target = close_slot
+                    .lock()
+                    .ok()
+                    .and_then(|guard| guard.as_ref().cloned());
+                if let Some((main_id, view)) = target {
+                    if win_id == main_id {
+                        return view.update(app_ctx, |me, vctx| {
+                            me.handle_window_close_request(vctx)
+                        });
+                    }
+                }
+                platform::app::ApproveTerminateResult::Terminate
+            })),
+            on_will_terminate: Some(Box::new(move |app_ctx| {
+                let target = terminate_slot
+                    .lock()
+                    .ok()
+                    .and_then(|mut guard| guard.take())
+                    // Closing the main window already ran shutdown and removed the view.
+                    .filter(|(id, _)| app_ctx.root_view_id(*id).is_some());
+                if let Some((_, view)) = target {
+                    view.update(app_ctx, |me, vctx| {
+                        me.force_quitting = true;
+                        me.shutdown_all(Some(vctx));
+                        me.settings.tray = None;
+                    });
+                }
+            })),
             // The framework only tears down closed windows when this callback is set.
             on_window_will_close: Some(Box::new(|_, _| {})),
             ..Default::default()
@@ -282,12 +318,60 @@ pub fn run() -> Result<()> {
             "../../assets/stepx_companion_icon.png"
         )));
     }
-    let size = mini_modes::WindowMemory::new().preferences.full;
-    let (default_w, default_h) = (size.width, size.height);
+    #[cfg(target_os = "macos")]
+    {
+        use facloud_ui::{
+            actions::StandardAction,
+            platform::mac::AppExt,
+            platform::menu::{Menu, MenuBar, MenuItem},
+        };
+        builder.set_dev_icon(std::borrow::Cow::Borrowed(include_bytes!(
+            "../../assets/stepx_companion_icon.png"
+        )));
+        builder.set_menu_bar_builder(|_| {
+            MenuBar::new(vec![
+                Menu::new(
+                    "StepX Companion",
+                    vec![
+                        MenuItem::Standard(StandardAction::Hide),
+                        MenuItem::Standard(StandardAction::HideOtherApps),
+                        MenuItem::Standard(StandardAction::ShowAllApps),
+                        MenuItem::Separator,
+                        MenuItem::Standard(StandardAction::Quit),
+                    ],
+                ),
+                Menu::new(
+                    "Window",
+                    vec![
+                        MenuItem::Standard(StandardAction::Minimize),
+                        MenuItem::Standard(StandardAction::Zoom),
+                        MenuItem::Separator,
+                        MenuItem::Standard(StandardAction::Close),
+                        MenuItem::Separator,
+                        MenuItem::Standard(StandardAction::ToggleFullScreen),
+                        MenuItem::Separator,
+                        MenuItem::Standard(StandardAction::BringAllToFront),
+                    ],
+                ),
+            ])
+        });
+    }
+    let wm = mini_modes::WindowMemory::new();
+    let startup_mode = wm.startup_mode();
+    let min_size = mini_modes::min_inner_size_for_mode(startup_mode);
+    let size = wm.preferences.full;
+    let (default_w, default_h) = (
+        size.width.max(mini_modes::FULL_MIN_INNER_SIZE.0),
+        size.height.max(mini_modes::FULL_MIN_INNER_SIZE.1),
+    );
+    let run_slot = main_window.clone();
     builder.run(move |ctx| {
-        ctx.add_window(
+        let mut child_slot: Option<ViewHandle<Companion>> = None;
+        let slot_ref = &mut child_slot;
+        let (win_id, _) = ctx.add_window(
             facloud_ui::AddWindowOptions {
                 title: Some("StepX Companion".into()),
+                min_inner_size: Some(min_size),
                 // Capture runs may ask for a taller window so a long panel is
                 // not cut off at the fold.
                 window_bounds: WindowBounds::ExactSize(vec2f(
@@ -302,10 +386,18 @@ pub fn run() -> Result<()> {
                 )),
                 ..Default::default()
             },
-            move |ctx| Root {
-                child: ctx.add_typed_action_view(|ctx| Companion::new(ctx, capture, activation)),
+            move |ctx| {
+                let child =
+                    ctx.add_typed_action_view(|ctx| Companion::new(ctx, capture, activation));
+                *slot_ref = Some(child.clone());
+                Root { child }
             },
         );
+        if let Some(child) = child_slot {
+            if let Ok(mut guard) = run_slot.lock() {
+                *guard = Some((win_id, child));
+            }
+        }
     })?;
     drop(instance);
     Ok(())
@@ -329,7 +421,7 @@ impl View for Root {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub(crate) enum Page {
     Search,
@@ -676,6 +768,7 @@ pub(crate) enum Action {
     Forget,
     SetPreferredDevice(String),
     RemoveRememberedDevice(String),
+    ReconnectRememberedDevice(String),
     ConnectEndpoint(String),
     PairTab(PairTab),
     ToggleShowSecret,
@@ -702,6 +795,7 @@ pub(crate) enum Action {
     Insert(String),
     Preedit(String),
     Backspace,
+    BackspaceWord,
     BackspaceLine,
     Delete,
     Left,
@@ -1533,6 +1627,15 @@ struct Companion {
     last_scan: Instant,
     connection_watch: connection_watch::ConnectionWatch,
     battery: battery_state::BatteryUi,
+    pub(super) device_epoch: u64,
+    pub(super) sms_sending_in_flight: bool,
+    pub(super) next_temp_sms_id: i64,
+    pub(super) pending_outcome_in_flight: Option<outcome_apply::OutcomeApplyInFlight>,
+    pub(super) amoo_in_flight_by_session: HashMap<String, outcome_apply::AmooSendContext>,
+    pub(super) page_scroll_offsets: HashMap<Page, f32>,
+    pub(super) last_tray_poll: Instant,
+    pub(super) force_quitting: bool,
+    pub(super) shutdown_completed: bool,
     text_selection: SelectionHandle,
     selected_text: Option<String>,
     context_menu: Option<context_menu::Menu>,
@@ -1596,6 +1699,12 @@ fn is_stepx_model(model: &str) -> bool {
 
 fn is_wireless(transport: &str) -> bool {
     transport.contains(':') || transport.contains("_tcp")
+}
+
+pub(super) fn active_transport_for(serial: &str, transport: &str) -> String {
+    stepx_companion::device::current_active_transport_for_serial(serial)
+        .or_else(|| stepx_companion::device::current_active_transport_for_serial(transport))
+        .unwrap_or_else(|| transport.to_string())
 }
 
 /// Reaps any zombie `ps` child process left behind by Winit's startup
@@ -2008,6 +2117,15 @@ impl Companion {
             last_scan: Instant::now(),
             connection_watch: Default::default(),
             battery: Default::default(),
+            device_epoch: 0,
+            sms_sending_in_flight: false,
+            next_temp_sms_id: -1,
+            pending_outcome_in_flight: None,
+            amoo_in_flight_by_session: HashMap::new(),
+            page_scroll_offsets: HashMap::new(),
+            last_tray_poll: Instant::now() - Duration::from_secs(1),
+            force_quitting: false,
+            shutdown_completed: false,
             text_selection: Default::default(),
             selected_text: None,
             context_menu: None,
@@ -2312,6 +2430,8 @@ impl Companion {
             || self.doctor_running
         {
             100
+        } else if self.settings.hidden {
+            750
         } else {
             500
         };
@@ -2423,17 +2543,179 @@ impl Companion {
         });
     }
 
+    pub(super) fn active_transport(&self) -> String {
+        self.selected
+            .as_ref()
+            .map(|d| self.online_device_active_transport(d))
+            .unwrap_or_default()
+    }
+
+    pub(super) fn should_hide_to_tray(&self) -> bool {
+        !self.force_quitting && self.settings.value.close_to_tray && self.settings.tray.is_some()
+    }
+
+    pub(super) fn handle_window_close_request(
+        &mut self,
+        ctx: &mut ViewContext<Self>,
+    ) -> platform::app::ApproveTerminateResult {
+        if self.should_hide_to_tray() {
+            let id = ctx.window_id();
+            self.remember_window(ctx, true);
+            self.settings.hidden = true;
+            ctx.windows().hide_window(id);
+            ctx.notify();
+            return platform::app::ApproveTerminateResult::Cancel;
+        }
+        if !self.force_quitting && self.back_screen.companion_busy {
+            self.status = "正在安装或修复背屏伴侣，完成后再关闭窗口".into();
+            ctx.notify();
+            return platform::app::ApproveTerminateResult::Cancel;
+        }
+        self.force_quitting = true;
+        self.shutdown_all(Some(ctx));
+        self.settings.tray = None;
+        platform::app::ApproveTerminateResult::Terminate
+    }
+
+    pub(super) fn shutdown_all(&mut self, ctx: Option<&mut ViewContext<Self>>) {
+        self.stop_mirror();
+        if let Some(mut srv) = self.lan_cast.server.take() {
+            srv.stop();
+        }
+        if self.amoo_ui.gui_running || self.amoo_ui.gui_paused {
+            self.handle_amoo_ui_action(&AmooUiAction::GuiStopWaiting);
+        }
+        self.amoo_ui.snapshot_job = None;
+        if let Some(handle) = self.work.handle.take() {
+            handle.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.work.running = false;
+        if self.workspace.running.is_some() {
+            self.workspace_stop();
+        }
+        if let Some(handle) = self.studio_lab.handle.take() {
+            handle.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        stepx_companion::studio_lab::shutdown_all_previews();
+        if let Some(job) = &self.updates.transfer {
+            job.cancel();
+        }
+        self.cancel_backscreen();
+        self.phone_link = None;
+        if let Some(ctx) = ctx {
+            self.close_mirror_controls(ctx);
+            self.close_desktop_popup_window(ctx);
+            self.remember_window(ctx, true);
+        } else {
+            self.window_memory.flush();
+        }
+        self.workspace_flush();
+        stepx_companion::diagnostics::flush();
+        self.shutdown_completed = true;
+    }
+
+    fn take_or_infer_in_flight(
+        &mut self,
+        label: &str,
+    ) -> Option<outcome_apply::OutcomeApplyInFlight> {
+        if let Some(explicit) = self.pending_outcome_in_flight.take() {
+            return Some(explicit);
+        }
+        let is_amoo_send_label = label.contains("发送给 Amoo")
+            || label.contains("重新发送这条请求")
+            || label.contains("后台重新发送请求");
+        if is_amoo_send_label {
+            let draft = self.fields[F_AMOO].text.trim().to_string();
+            if !draft.is_empty() {
+                let task_id = self
+                    .workspace
+                    .running
+                    .as_ref()
+                    .map(|r| r.task.clone())
+                    .or_else(|| self.workspace.active.clone());
+                let session_key = task_id
+                    .as_deref()
+                    .and_then(|id| {
+                        self.workspace
+                            .journal
+                            .tasks
+                            .iter()
+                            .find(|t| t.id == id)
+                            .and_then(|t| t.session.clone())
+                    })
+                    .or_else(|| {
+                        self.amoo_sessions
+                            .get(self.amoo_session_idx)
+                            .map(|s| s.session_key.clone())
+                    })
+                    .or_else(|| self.workspace_task().and_then(|t| t.session.clone()));
+                return Some(outcome_apply::OutcomeApplyInFlight::AmooSend(
+                    outcome_apply::AmooSendContext {
+                        task_id,
+                        session_key,
+                        draft,
+                    },
+                ));
+            }
+        }
+        None
+    }
+
     pub(super) fn with_device(
         &mut self,
         label: &str,
         job: impl FnOnce(&Adb, Device) -> Result<Outcome> + Send + 'static,
     ) {
         match self.selected.clone() {
-            Some(mut device) => self.submit(label, move |adb| {
-                device.transport = device.resolve_active_transport(adb)?;
-                job(adb, device)
-            }),
+            Some(mut device) => {
+                let captured_epoch = self.device_epoch;
+                let captured_serial = device.serial.clone();
+                let page = self.page;
+                let tool = self.tool_page;
+                let in_flight = self.take_or_infer_in_flight(label);
+                let mut operation = self
+                    .interaction
+                    .active_operation
+                    .clone()
+                    .unwrap_or_else(|| {
+                        interaction::OperationFailure::for_action(
+                            &Action::ReviewHistory,
+                            self.page,
+                            Some(captured_serial.clone()),
+                        )
+                    });
+                operation.label = label
+                    .trim_start_matches("正在")
+                    .trim_end_matches(['…', '.', ' '])
+                    .to_string();
+                self.submit(label, move |adb| {
+                    let result = device
+                        .resolve_active_transport(adb)
+                        .and_then(|transport| {
+                            device.transport = transport;
+                            job(adb, device)
+                        })
+                        .with_context(|| operation);
+                    match result {
+                        Ok(inner) => Ok(Outcome::DeviceScoped {
+                            epoch: captured_epoch,
+                            serial: captured_serial,
+                            in_flight,
+                            outcome: Box::new(inner),
+                        }),
+                        Err(error) => Ok(Outcome::DeviceScopedError {
+                            epoch: captured_epoch,
+                            serial: captured_serial,
+                            page,
+                            tool,
+                            in_flight,
+                            error,
+                        }),
+                    }
+                });
+            }
             None => {
+                self.pending_outcome_in_flight = None;
                 self.page = Page::Connect;
                 self.status = "请先连接设备".into();
                 self.error = true;
@@ -2469,13 +2751,17 @@ impl Companion {
         job: impl FnOnce(&Adb, Device) -> Result<Outcome> + Send + 'static,
     ) {
         let Some(mut device) = self.selected.clone() else {
+            self.pending_outcome_in_flight = None;
             self.page = Page::Connect;
             self.status = "请先连接设备".into();
             self.error = true;
             return;
         };
+        let captured_epoch = self.device_epoch;
+        let captured_serial = device.serial.clone();
         let page = self.page;
         let tool = self.tool_page;
+        let in_flight = self.take_or_infer_in_flight(label);
         let label_str = label.to_string();
         let mut operation = self
             .interaction
@@ -2485,7 +2771,7 @@ impl Companion {
                 interaction::OperationFailure::for_action(
                     &Action::ReviewHistory,
                     self.page,
-                    self.selected.as_ref().map(|d| d.serial.clone()),
+                    Some(captured_serial.clone()),
                 )
             });
         operation.label = label
@@ -2500,8 +2786,20 @@ impl Companion {
                 })
                 .with_context(|| operation);
             match result {
-                Ok(outcome) => outcome,
-                Err(error) => Outcome::JobFailed(page, tool, error),
+                Ok(inner) => Outcome::DeviceScoped {
+                    epoch: captured_epoch,
+                    serial: captured_serial,
+                    in_flight,
+                    outcome: Box::new(inner),
+                },
+                Err(error) => Outcome::DeviceScopedError {
+                    epoch: captured_epoch,
+                    serial: captured_serial,
+                    page,
+                    tool,
+                    in_flight,
+                    error,
+                },
             }
         });
     }
@@ -2559,7 +2857,10 @@ impl Companion {
         self.tick_google_recovery(ctx);
         self.tick_weather_fetch(ctx);
         self.ensure_calendar_state_scope();
-        self.tick_settings(ctx);
+        if self.last_tray_poll.elapsed() >= Duration::from_millis(500) {
+            self.last_tray_poll = Instant::now();
+            self.tick_settings(ctx);
+        }
         self.tick_home(ctx);
         self.tick_context(ctx);
         self.tick_productivity(ctx);
@@ -2580,9 +2881,7 @@ impl Companion {
             .selected
             .as_ref()
             .zip(self.phone_link.as_ref())
-            .is_some_and(|(device, link)| {
-                device.serial == link.serial && device.transport == link.transport
-            });
+            .is_some_and(|(device, link)| device.serial == link.serial);
         if !self.is_demo_device() && !link_matches {
             self.phone_link = None;
             if let Some(device) = self.selected.clone() {
@@ -2690,6 +2989,14 @@ impl Companion {
             && self.summary.is_empty()
         {
             self.handle_device_action(&Action::Summary);
+            ctx.notify();
+        } else if !self.is_demo_device()
+            && self.page == Page::Overview
+            && self.selected.is_some()
+            && !self.busy
+            && !self.companion_status.checked
+        {
+            self.handle_device_action(&Action::CompanionInspect);
             ctx.notify();
         }
         if !self.is_demo_device()
@@ -2871,10 +3178,20 @@ impl Companion {
                     let (completed_page, completed_tool, _) = self.bg_receivers.swap_remove(bg_idx);
                     match result {
                         Ok(outcome) => {
+                            let explicit_user_send = matches!(
+                                &outcome,
+                                Outcome::DeviceScoped {
+                                    in_flight: Some(_),
+                                    ..
+                                } | Outcome::DeviceScopedError {
+                                    in_flight: Some(_),
+                                    ..
+                                }
+                            );
                             let prev_status = self.status.clone();
                             let prev_error = self.error;
                             self.apply(outcome);
-                            if self.busy || self.page == Page::Amoo {
+                            if !explicit_user_send && (self.busy || self.page == Page::Amoo) {
                                 self.status = prev_status;
                                 self.error = prev_error;
                             }
@@ -3174,8 +3491,29 @@ impl Companion {
                         ctx.notify();
                     } else {
                         self.last_scan = Instant::now();
-                        self.submit("等待扫码…", move |adb| {
-                            Ok(Outcome::Qr(qr.try_pair(adb)?))
+                        self.submit("等待扫码…", move |adb| match qr.try_pair(adb)? {
+                            Some(endpoint) => {
+                                let connected = adb
+                                    .run(&["devices", "-l"])
+                                    .ok()
+                                    .map(|raw| stepx_companion::device::parse_devices(&raw))
+                                    .is_some_and(|list| {
+                                        list.iter().any(|t| {
+                                            t.state == "device"
+                                                && (t.id == endpoint
+                                                    || pairing::validate_endpoint(&endpoint)
+                                                        .ok()
+                                                        .zip(pairing::validate_endpoint(&t.id).ok())
+                                                        .is_some_and(|(a, b)| a.ip() == b.ip()))
+                                        })
+                                    });
+                                if connected {
+                                    Ok(Outcome::Qr(Some(endpoint)))
+                                } else {
+                                    Ok(Outcome::QrPairedNeedsConnectPort(endpoint))
+                                }
+                            }
+                            None => Ok(Outcome::Qr(None)),
                         });
                     }
                 } else if !self.error {
@@ -3195,7 +3533,11 @@ impl Companion {
                 // when --capture-ui fires.
                 self.page = Page::Tools;
                 self.tool_page = Some(ToolPage::Google);
-                eprintln!("GOOGLE_CERT_UI_VERIFICATION: landing on Tools → Google");
+                use std::io::Write as _;
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "GOOGLE_CERT_UI_VERIFICATION: landing on Tools → Google"
+                );
             }
         }
         #[cfg(feature = "ui-capture")]
@@ -3212,7 +3554,11 @@ impl Companion {
             if !SENT.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 self.amoo_ui.screen_mode = false;
                 self.fields[F_AMOO].set("打开京东，我的订单");
-                eprintln!("GUI_UI_VERIFICATION: normal Amoo composer sends user request");
+                use std::io::Write as _;
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "GUI_UI_VERIFICATION: normal Amoo composer sends user request"
+                );
                 self.send_amoo_draft();
             }
         }
@@ -3300,7 +3646,7 @@ impl Companion {
                             == stepx_companion::desktop_notify::PopupMode::Silent
                             || self.notification_active_popup().is_some())
                     {
-                        let mut guard = POPUP_READY_AT.lock().unwrap();
+                        let mut guard = POPUP_READY_AT.lock().unwrap_or_else(|p| p.into_inner());
                         let t = *guard.get_or_insert_with(Instant::now);
                         ctx.notify();
                         t.elapsed() > Duration::from_millis(450)
@@ -3319,11 +3665,11 @@ impl Companion {
         let bezel_screen_ready = {
             static SHOT_READY_AT: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
             if self.screenshot.is_some() {
-                let mut guard = SHOT_READY_AT.lock().unwrap();
+                let mut guard = SHOT_READY_AT.lock().unwrap_or_else(|p| p.into_inner());
                 let t = *guard.get_or_insert_with(Instant::now);
                 t.elapsed() > Duration::from_millis(650)
             } else {
-                *SHOT_READY_AT.lock().unwrap() = None;
+                *SHOT_READY_AT.lock().unwrap_or_else(|p| p.into_inner()) = None;
                 false
             }
         };
@@ -3434,7 +3780,8 @@ impl Companion {
                             image::ColorType::Rgba8,
                         );
                         if let Err(e) = result {
-                            eprintln!("UI capture failed: {e}");
+                            use std::io::Write as _;
+                            let _ = writeln!(std::io::stderr(), "UI capture failed: {e}");
                             std::process::exit(1);
                         }
                         std::process::exit(0);
@@ -3778,8 +4125,7 @@ impl View for Companion {
 
 impl Drop for Companion {
     fn drop(&mut self) {
-        self.workspace_flush();
-        self.stop_mirror();
+        self.shutdown_all(None);
     }
 }
 
@@ -3798,9 +4144,13 @@ impl Companion {
         }
         let elapsed_ms = self.capture_at.elapsed().as_millis() as u64;
         if elapsed_ms > 90_000 {
-            eprintln!(
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
                 "HOME_LIVE_E2E timeout at step={} status={} suite_loading={}",
-                step, self.status, self.back_screen.stepos_suite_loading
+                step,
+                self.status,
+                self.back_screen.stepos_suite_loading
             );
             std::process::exit(2);
         }
@@ -3951,20 +4301,31 @@ impl Companion {
                 }
                 let avg_ms = (total_us as f64) / 10_000.0;
                 let max_ms = (max_us as f64) / 1_000.0;
-                eprintln!(
-                    "HOME_LIVE_FRAME_TIMING: avg={:.2}ms max={:.2}ms",
-                    avg_ms, max_ms
-                );
+                {
+                    use std::io::Write as _;
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "HOME_LIVE_FRAME_TIMING: avg={:.2}ms max={:.2}ms",
+                        avg_ms,
+                        max_ms
+                    );
+                }
                 assert!(
                     avg_ms < 8.0 && max_ms < 16.0,
                     "Home render exceeded frame budget"
                 );
 
                 let (key, _tid, pkg, label) = self.resolve_home_reply_target(&self.push.snapshot);
-                eprintln!(
-                    "HOME_LIVE_REPLY_TARGET: key={} pkg={} label={}",
-                    key, pkg, label
-                );
+                {
+                    use std::io::Write as _;
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "HOME_LIVE_REPLY_TARGET: key={} pkg={} label={}",
+                        key,
+                        pkg,
+                        label
+                    );
+                }
                 assert!(
                     !label.contains("微信支付")
                         && !label.contains("顺丰速运")
@@ -4098,7 +4459,13 @@ impl Companion {
                 self.fields[F_OV_TEXT].clear();
                 self.fields[F_HOME_COMMAND].clear();
                 self.scroll.scroll_to(facloud_ui::units::Pixels::new(0.0));
-                eprintln!("HOME_LIVE_E2E_VERIFIED: all 4 screenshots captured and DefaultAll restored cleanly");
+                {
+                    use std::io::Write as _;
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "HOME_LIVE_E2E_VERIFIED: all 4 screenshots captured and DefaultAll restored cleanly"
+                    );
+                }
                 STEP.store(99, std::sync::atomic::Ordering::SeqCst);
                 std::process::exit(0);
             }

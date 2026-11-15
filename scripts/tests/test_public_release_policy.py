@@ -5,10 +5,14 @@ import importlib.util
 import io
 import json
 import os
+import stat
+import struct
 import subprocess
 from pathlib import Path
 import sys
+import tarfile
 import tempfile
+import types
 import unittest
 import urllib.error
 from unittest import mock
@@ -29,6 +33,7 @@ def load(name, filename):
 stage = load('release_stage', 'stage-release-resources.py').stage
 export = load('release_export', 'sync-public-repo.py')
 package = load('release_package', 'package-release.py')
+runtime_pkg = load('release_runtime', 'package-runtime.py')
 
 
 class PackagedGoogleImportsTests(unittest.TestCase):
@@ -59,6 +64,12 @@ print('Isolated packaged Google imports: PASS')
             result = subprocess.run([sys.executable, '-I', '-B', '-c', code, str(root)],
                                     cwd=td, env=env, capture_output=True, text=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_verify_packaged_runtime_asserts_offline_google_play_apks_and_digests(self):
+        verifier_src = (SCRIPTS / 'verify-packaged-runtime.py').read_text(encoding='utf-8')
+        self.assertIn("google_dir=root/'runtime/google-play'", verifier_src)
+        self.assertIn("manage._bundled_google_apks_ready(", verifier_src)
+        self.assertIn("hashlib.sha256(bundled_apk.read_bytes()).hexdigest()==entry['sha256']", verifier_src)
 
 
 class ToolDownloadTests(unittest.TestCase):
@@ -116,6 +127,105 @@ class ToolDownloadTests(unittest.TestCase):
                 package.download_verified_tool(self.url, self.target, self.digest)
         self.assertEqual(opener.call_count, 1)
         self.assertFalse(self.target.exists())
+
+    def test_github_network_failure_falls_back_to_mirrors_and_verifies_digest(self):
+        api = 'https://api.github.com/repos/example/tool/releases/assets/123'
+        effects = [
+            urllib.error.URLError('github timeout'),
+            TimeoutError('api timeout'),
+            urllib.error.URLError('first mirror reset'),
+            io.BytesIO(self.payload),
+        ]
+        with mock.patch.object(downloads.urllib.request, 'urlopen', side_effect=effects) as opener:
+            package.download_verified_tool(self.url, self.target, self.digest, asset_api_url=api)
+        urls = [call.args[0].full_url for call in opener.call_args_list]
+        self.assertEqual(urls[0], self.url)
+        self.assertTrue(urls[1].startswith(api + '?stepx_retry='))
+        self.assertEqual(urls[2], 'https://ghfast.top/' + self.url)
+        self.assertEqual(urls[3], 'https://gh-proxy.com/' + self.url)
+        self.assertEqual(self.target.read_bytes(), self.payload)
+
+        self.target.write_bytes(b'previous-verified-archive')
+        bad_effects = [
+            TimeoutError('github timeout'),
+            io.BytesIO(b'corrupt-mirror-payload'),
+            io.BytesIO(b'second-corrupt-mirror-payload'),
+        ]
+        with mock.patch.object(downloads.urllib.request, 'urlopen', side_effect=bad_effects) as opener:
+            with self.assertRaisesRegex(RuntimeError, 'SHA256 mismatch'):
+                package.download_verified_tool(self.url, self.target, self.digest)
+        self.assertEqual(opener.call_count, 3)
+        self.assertEqual(self.target.read_bytes(), b'previous-verified-archive')
+        self.assertEqual(list(self.target.parent.glob('*.part')), [])
+
+    def test_large_slow_download_exceeding_120s_succeeds_with_steady_liveness(self):
+        chunks = [b'x' * (64 * 1024) for _ in range(10)] + [b'']
+        expected = hashlib.sha256(b''.join(chunks)).hexdigest()
+        clock = [0.0]
+
+        class SlowSteadyStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read1(self, _size):
+                chunk = chunks.pop(0)
+                # 64 KB every 6s => 128 KB per 12s (>= 128 KB / 15s), spanning > 120s total
+                clock[0] += 30.0 if not chunk else 6.0
+                return chunk
+
+        # Override total elapsed to > 240s via 42 chunks of 64 KB at 6s each (= 252s total)
+        chunks[:] = [b'x' * (64 * 1024) for _ in range(42)] + [b'']
+        expected = hashlib.sha256(b''.join(chunks)).hexdigest()
+        with mock.patch.object(downloads.time, 'monotonic', side_effect=lambda: clock[0]), \
+             mock.patch.object(downloads.urllib.request, 'urlopen', return_value=SlowSteadyStream()):
+            package.download_verified_tool(self.url, self.target, expected)
+        self.assertGreater(clock[0], 240.0)
+        self.assertEqual(hashlib.sha256(self.target.read_bytes()).hexdigest(), expected)
+
+    def test_stalled_reader_without_window_progress_times_out_and_cleans_partial(self):
+        clock = [0.0]
+
+        class StalledStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read1(self, _size):
+                clock[0] += 65.0
+                return b'tiny'
+
+        with mock.patch.object(downloads.time, 'monotonic', side_effect=lambda: clock[0]), \
+             mock.patch.object(downloads.urllib.request, 'urlopen', side_effect=lambda *a, **kw: StalledStream()) as opener:
+            with self.assertRaises(TimeoutError):
+                package.download_verified_tool(self.url, self.target, self.digest)
+        self.assertEqual(opener.call_count, 3)
+        self.assertFalse(self.target.exists())
+        self.assertEqual(list(self.target.parent.glob('*.part')), [])
+
+    def test_github_token_attached_as_unredirected_header_only_for_api_github_com(self):
+        api = 'https://api.github.com/repos/example/tool/releases/assets/123'
+        effects = [
+            urllib.error.URLError('github timeout'),
+            urllib.error.URLError('api timeout'),
+            io.BytesIO(self.payload),
+        ]
+        with mock.patch.dict(os.environ, {'GH_TOKEN': 'test-token-value'}, clear=False), \
+             mock.patch.object(downloads.urllib.request, 'urlopen', side_effect=effects) as opener:
+            package.download_verified_tool(self.url, self.target, self.digest, asset_api_url=api)
+        req_github = opener.call_args_list[0].args[0]
+        req_api = opener.call_args_list[1].args[0]
+        req_mirror = opener.call_args_list[2].args[0]
+        self.assertNotIn('Authorization', req_github.headers)
+        self.assertNotIn('Authorization', req_github.unredirected_hdrs)
+        self.assertNotIn('Authorization', req_api.headers)
+        self.assertEqual(req_api.unredirected_hdrs.get('Authorization'), 'Bearer test-token-value')
+        self.assertNotIn('Authorization', req_mirror.headers)
+        self.assertNotIn('Authorization', req_mirror.unredirected_hdrs)
 
 
 class PublicationBoundaryTests(unittest.TestCase):
@@ -422,6 +532,277 @@ class PublicationBoundaryTests(unittest.TestCase):
         names = package.stage_release_media(self.root, dist, '0.2.181')
         self.assertEqual(len(names), 3)
         self.assertEqual(len((dist/'media-sha256.txt').read_text().splitlines()), 3)
+
+    def test_macos_packaging_strips_extended_attributes_before_deep_codesign(self):
+        source = (SCRIPTS / 'package-release.py').read_text(encoding='utf-8')
+        xattr_idx = source.find("['xattr','-cr',str(base/'StepX Companion.app')]")
+        sign_idx = source.find("['codesign','--force','--deep','--sign','-',str(base/'StepX Companion.app')]")
+        verify_idx = source.find("['codesign','--verify','--deep','--strict',str(base/'StepX Companion.app')]")
+        self.assertNotEqual(xattr_idx, -1, 'macOS packaging must strip extended attributes with xattr -cr')
+        self.assertNotEqual(sign_idx, -1, 'macOS packaging must deep ad-hoc codesign the app bundle')
+        self.assertNotEqual(verify_idx, -1, 'macOS packaging must strictly verify the deep signature')
+        self.assertLess(xattr_idx, sign_idx, 'xattr -cr must run before codesign --force --deep')
+        self.assertLess(sign_idx, verify_idx, 'codesign --force --deep must run before codesign --verify')
+
+
+def _macho64_with_build_version(major, minor, patch=0, *, use_version_min=False):
+    raw_ver = (major << 16) | (minor << 8) | patch
+    if use_version_min:
+        cmd = struct.pack('<IIII', 0x24, 16, raw_ver, raw_ver)
+    else:
+        cmd = struct.pack('<IIIIII', 0x32, 24, 1, raw_ver, raw_ver, 0)
+    header = struct.pack('<IIIIIIII', 0xfeedfacf, 0x0100000c, 0, 2, 1, len(cmd), 0, 0)
+    return header + cmd
+
+
+class ReleasePackagingHardeningTests(unittest.TestCase):
+    def test_root_facloud_licenses_and_manifest_entries_exist_in_main_repo(self):
+        repo_root = SCRIPTS.parent
+        mf = policy.manifest(repo_root)
+        expected_licenses = [
+            'licenses/FaCloud-LICENSE-AGPL',
+            'licenses/FaCloud-LICENSE-MIT',
+            'licenses/FaCloud-LICENSES.md',
+            'licenses/FaCloud-NOTICE',
+        ]
+        for rel in expected_licenses:
+            self.assertIn(rel, mf['package_documents'])
+            self.assertIn(rel, mf['public_files'])
+            self.assertTrue((repo_root / rel).is_file(), f'Missing root {rel}')
+        self.assertIn('scripts/test-metal-glyph-fade.py', mf['public_scripts'])
+        for rel in mf['package_documents']:
+            data = policy.safe_read(repo_root, rel)
+            self.assertGreater(len(data), 0, rel)
+
+    def test_macho_binaries_distinguishes_fat_macho_from_java_class_and_sorts_deepest_first(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            shallow = root / 'tools/bin/adb'
+            deep = root / 'runtime/python/lib/python3.13/lib-dynload/_ssl.so'
+            fat = root / 'runtime/java/lib/server/libjvm.dylib'
+            java_cls = root / 'runtime/classes/ApkIdentity.class'
+            java_preview_cls = root / 'runtime/classes/Preview.class'
+            bad_fat = root / 'runtime/classes/FakeFat.bin'
+            for path in (shallow, deep, fat, java_cls, java_preview_cls, bad_fat):
+                path.parent.mkdir(parents=True, exist_ok=True)
+            shallow.write_bytes(b'\xcf\xfa\xed\xfe\x07\x00\x00\x01' + b'\x00' * 24)
+            deep.write_bytes(b'\xfe\xed\xfa\xcf\x01\x00\x00\x0c' + b'\x00' * 24)
+            fat.write_bytes(b'\xca\xfe\xba\xbe\x00\x00\x00\x02' + b'\x00' * 40)
+            # Java 11 class file: magic 0xCAFEBABE, minor=0, major=55 (0x0037 > 20)
+            java_cls.write_bytes(b'\xca\xfe\xba\xbe\x00\x00\x00\x37' + b'\x00' * 16)
+            # Java preview class file: magic 0xCAFEBABE, minor=65535, major=65
+            java_preview_cls.write_bytes(b'\xca\xfe\xba\xbe\xff\xff\x00\x41' + b'\x00' * 16)
+            # Zero-arch header is not a valid Fat Mach-O
+            bad_fat.write_bytes(b'\xca\xfe\xba\xbe\x00\x00\x00\x00' + b'\x00' * 16)
+            link = root / 'tools/bin/adb-link'
+            link.symlink_to(shallow)
+
+            found = package.macho_binaries(root)
+            self.assertEqual(found, [deep, fat, shallow])
+
+    def test_verify_macos_minos_accepts_11_0_and_rejects_higher_deployment_targets(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ok_bin = root / 'stepx-11'
+            ok_bin.write_bytes(_macho64_with_build_version(11, 0))
+            self.assertEqual(package.verify_macos_minos(ok_bin), [(11, 0, 0)])
+
+            legacy_bin = root / 'stepx-10-15'
+            legacy_bin.write_bytes(_macho64_with_build_version(10, 15, 7, use_version_min=True))
+            self.assertEqual(package.verify_macos_minos(legacy_bin), [(10, 15, 7)])
+
+            bad_bin = root / 'stepx-15'
+            bad_bin.write_bytes(_macho64_with_build_version(15, 0))
+            with self.assertRaisesRegex(RuntimeError, 'macos minos 15.0 exceeds 11.0|macOS minos 15.0 exceeds 11.0'):
+                package.verify_macos_minos(bad_bin)
+
+            # Universal binary with one 11.0 slice and one 14.0 slice must fail closed.
+            s1 = _macho64_with_build_version(11, 0)
+            s2 = _macho64_with_build_version(14, 0)
+            off1 = 8 + 2 * 20
+            off2 = off1 + len(s1)
+            fat_hdr = struct.pack('>II', 0xcafebabe, 2)
+            arch1 = struct.pack('>iiIII', 0x01000007, 3, off1, len(s1), 0)
+            arch2 = struct.pack('>iiIII', 0x0100000c, 0, off2, len(s2), 0)
+            fat_bin = root / 'stepx-universal'
+            fat_bin.write_bytes(fat_hdr + arch1 + arch2 + s1 + s2)
+            with self.assertRaisesRegex(RuntimeError, '14.0 exceeds 11.0'):
+                package.verify_macos_minos(fat_bin)
+
+    def test_macos_info_plist_declares_gpu_switching_and_all_bonjour_services(self):
+        info = package.macos_info_plist('0.2.183')
+        self.assertEqual(info['CFBundleInfoDictionaryVersion'], '6.0')
+        self.assertTrue(info['NSSupportsAutomaticGraphicsSwitching'])
+        self.assertEqual(info['LSMinimumSystemVersion'], '11.0')
+        self.assertEqual(info['CFBundleIdentifier'], 'io.github.xydzf520.stepx')
+        self.assertEqual(
+            set(info['NSBonjourServices']),
+            {'_adb-tls-pairing._tcp', '_adb-tls-connect._tcp', '_adb._tcp',
+             '_airplay._tcp', '_googlecast._tcp', '_raop._tcp'},
+        )
+
+    def test_sign_macos_bundle_signs_readonly_nested_machos_before_deep_sign(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            app = base / 'StepX Companion.app'
+            binary = app / 'Contents/MacOS/stepx-companion'
+            resources = app / 'Contents/Resources'
+            tools = resources / 'tools/bin'
+            py_so = resources / 'runtime/python/lib/python3.13/lib-dynload/_ctypes.so'
+            java_bin = resources / 'runtime/java/bin/java'
+            scrcpy_bin = tools / 'scrcpy'
+            java_cls = resources / 'runtime/android-build-tools/ApkIdentity.class'
+            for path in (binary, py_so, java_bin, scrcpy_bin, java_cls):
+                path.parent.mkdir(parents=True, exist_ok=True)
+            macho_bytes = _macho64_with_build_version(11, 0)
+            for path in (binary, py_so, java_bin, scrcpy_bin):
+                path.write_bytes(macho_bytes)
+                path.chmod(0o555)
+            java_cls.write_bytes(b'\xca\xfe\xba\xbe\x00\x00\x00\x37' + b'\x00' * 16)
+
+            calls = []
+            with mock.patch.object(package.subprocess, 'run', side_effect=lambda cmd, **kw: calls.append(cmd)):
+                signed = package.sign_macos_bundle(base, binary, resources, tools, {'PYTHONDONTWRITEBYTECODE': '1'})
+
+            self.addCleanup(lambda: [p.chmod(0o755) for p in (binary, py_so, java_bin, scrcpy_bin) if p.exists()])
+            self.assertEqual(signed, [py_so, java_bin, scrcpy_bin])
+            for p in (binary, py_so, java_bin, scrcpy_bin):
+                self.assertTrue(p.stat().st_mode & stat.S_IWUSR)
+            self.assertEqual(calls[0], ['xattr', '-cr', str(app)])
+            self.assertEqual(calls[1:4], [['codesign', '--force', '--sign', '-', str(p)] for p in [py_so, java_bin, scrcpy_bin]])
+            self.assertEqual(calls[4], ['codesign', '--force', '--deep', '--sign', '-', str(app)])
+            self.assertEqual(calls[5], [str(binary), '--check-runtime'])
+            self.assertEqual(calls[6], [str(scrcpy_bin), '--version'])
+            self.assertEqual(calls[7:10], [['codesign', '--verify', '--strict', str(p)] for p in [py_so, java_bin, scrcpy_bin]])
+            self.assertEqual(calls[10], ['codesign', '--verify', '--deep', '--strict', str(app)])
+
+    def test_clean_tar_info_strips_host_uid_gid_and_usernames(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            src = root / 'pkg'
+            src.mkdir()
+            (src / 'stepx-companion').write_bytes(b'binary')
+            archive = root / 'out.tar.gz'
+            with tarfile.open(archive, 'w:gz') as tf:
+                tf.add(src, arcname='StepX-Companion', filter=package.clean_tar_info)
+            with tarfile.open(archive, 'r:gz') as tf:
+                members = tf.getmembers()
+            self.assertTrue(members)
+            for member in members:
+                self.assertEqual(member.uid, 0)
+                self.assertEqual(member.gid, 0)
+                self.assertEqual(member.uname, '')
+                self.assertEqual(member.gname, '')
+
+    def test_windows_quiet_popen_skips_create_no_window_for_detached_and_new_console(self):
+        recorded = []
+
+        class FakePopen:
+            def __init__(self, *args, **kwargs):
+                recorded.append(kwargs)
+
+        fake_subproc = types.SimpleNamespace(
+            Popen=FakePopen,
+            CREATE_NO_WINDOW=0x08000000,
+            DETACHED_PROCESS=0x00000008,
+            CREATE_NEW_CONSOLE=0x00000010,
+            CREATE_NEW_PROCESS_GROUP=0x00000200,
+        )
+        fake_sys = types.SimpleNamespace(dont_write_bytecode=False)
+        ns = {}
+        with mock.patch.dict(sys.modules, {'subprocess': fake_subproc, 'sys': fake_sys}):
+            exec(runtime_pkg.SITE_CUSTOMIZE, ns)
+        self.assertTrue(fake_sys.dont_write_bytecode)
+        fake_subproc.Popen(['cmd'])
+        fake_subproc.Popen(['cmd'], creationflags=fake_subproc.CREATE_NEW_PROCESS_GROUP)
+        fake_subproc.Popen(['cmd'], creationflags=fake_subproc.DETACHED_PROCESS)
+        fake_subproc.Popen(['cmd'], creationflags=fake_subproc.CREATE_NEW_CONSOLE)
+        self.assertEqual(recorded[0]['creationflags'], fake_subproc.CREATE_NO_WINDOW)
+        self.assertEqual(recorded[1]['creationflags'], fake_subproc.CREATE_NEW_PROCESS_GROUP | fake_subproc.CREATE_NO_WINDOW)
+        self.assertEqual(recorded[2]['creationflags'], fake_subproc.DETACHED_PROCESS)
+        self.assertEqual(recorded[3]['creationflags'], fake_subproc.CREATE_NEW_CONSOLE)
+
+    def test_windows_mt_numeric_sorting_and_npmmirror_fallback(self):
+        paths = [
+            Path('/kits/10.0.19041.0/x64/mt.exe'),
+            Path('/kits/10.0.9999.0/x64/mt.exe'),
+            Path('/kits/10.0.26100.0/x64/mt.exe'),
+        ]
+        self.assertEqual(runtime_pkg.sort_mt_candidates(paths)[0], Path('/kits/10.0.26100.0/x64/mt.exe'))
+
+        with tempfile.TemporaryDirectory() as td:
+            archive = Path(td) / 'python.zip'
+            seen = []
+
+            def fake_download(url, dest, sha):
+                seen.append((url, sha))
+                if 'python.org' in url:
+                    raise TimeoutError('python.org timeout')
+                Path(dest).write_bytes(b'verified-embed-zip')
+
+            with mock.patch.object(runtime_pkg, 'download_verified_tool', side_effect=fake_download):
+                runtime_pkg.download_windows_python(archive)
+            self.assertEqual(seen, [
+                (runtime_pkg.PYTHON_URL, runtime_pkg.WIN_PY_SHA256),
+                (runtime_pkg.PYTHON_FALLBACK_URL, runtime_pkg.WIN_PY_SHA256),
+            ])
+            self.assertEqual(archive.read_bytes(), b'verified-embed-zip')
+
+    def test_strip_pe_authenticode_removes_certificates_in_reverse_order(self):
+        removed = []
+        closed = []
+
+        class FakeKernel32:
+            class CreateFileW:
+                argtypes = None
+                restype = None
+                def __call__(self, *args):
+                    return 42
+
+            class CloseHandle:
+                argtypes = None
+                restype = None
+                def __call__(self, handle):
+                    closed.append(handle)
+                    return 1
+
+        FakeKernel32.CreateFileW = FakeKernel32.CreateFileW()
+        FakeKernel32.CloseHandle = FakeKernel32.CloseHandle()
+
+        class FakeImagehlp:
+            class ImageEnumerateCertificates:
+                argtypes = None
+                restype = None
+                def __call__(self, handle, type_filter, count_ptr, indices, index_count):
+                    count_ptr._obj.value = 2
+                    return 1
+
+            class ImageRemoveCertificate:
+                argtypes = None
+                restype = None
+                def __call__(self, handle, index):
+                    removed.append((handle, index))
+                    return 1
+
+        FakeImagehlp.ImageEnumerateCertificates = FakeImagehlp.ImageEnumerateCertificates()
+        FakeImagehlp.ImageRemoveCertificate = FakeImagehlp.ImageRemoveCertificate()
+
+        import ctypes
+        import ctypes.wintypes
+        fake_wintypes = types.SimpleNamespace(
+            LPCWSTR=ctypes.c_wchar_p,
+            DWORD=ctypes.c_uint32,
+            WORD=ctypes.c_uint16,
+            HANDLE=ctypes.c_void_p,
+            BOOL=ctypes.c_int,
+        )
+        with mock.patch.object(ctypes, 'WinDLL', side_effect=lambda name, **kw: FakeKernel32 if name == 'kernel32' else FakeImagehlp, create=True), \
+             mock.patch.object(ctypes, 'get_last_error', return_value=0, create=True), \
+             mock.patch.dict(sys.modules, {'ctypes.wintypes': fake_wintypes}):
+            count = runtime_pkg.strip_pe_authenticode(Path('java.exe'))
+        self.assertEqual(count, 2)
+        self.assertEqual(removed, [(42, 1), (42, 0)])
+        self.assertEqual(closed, [42])
 
 
 if __name__ == '__main__':

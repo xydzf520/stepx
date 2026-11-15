@@ -9,15 +9,22 @@ impl TypedActionView for Companion {
     type Action = Action;
 
     fn handle_action(&mut self, action: &Action, ctx: &mut ViewContext<Self>) {
+        if matches!(action, Action::Escape)
+            && self.focus.is_some_and(|i| !self.fields[i].preedit.is_empty())
+        {
+            if let Some(i) = self.focus {
+                self.fields[i].preedit.clear();
+            }
+            self.sync_ime(ctx);
+            ctx.notify();
+            return;
+        }
         if matches!(action, Action::PhoneHangup) && self.push.snapshot.live_call.ongoing(chrono::Utc::now().timestamp_millis()) {
             self.handle_live_call(&live_calls::LiveCallAction::Control { id: self.push.snapshot.live_call.id.clone(), action: stepx_companion::phone::CallControl::Hangup }, ctx);
             return;
         }
         if let Action::LiveCall(action) = action {
             self.handle_live_call(action, ctx);
-            return;
-        }
-        if self.interaction_gate(action, ctx) {
             return;
         }
         if let Action::DesktopUpdate(action) = action {
@@ -46,6 +53,27 @@ impl TypedActionView for Companion {
                 return;
             }
         }
+        if self.handle_context(action, ctx) {
+            self.sync_ime(ctx);
+            return;
+        }
+        if matches!(action, Action::Escape) && self.interaction.review.is_some() {
+            if let Some(r) = &self.interaction.review {
+                match r.action {
+                    Action::ConfirmUninstallApp(_) => self.pending_app_uninstall = None,
+                    Action::ConfirmTrash => self.trash_confirm = false,
+                    Action::ConfirmDirectSms => self.pending_sms_plan = None,
+                    Action::PhoneConfirmCall => self.pending_call = None,
+                    _ => {}
+                }
+            }
+            self.interaction.review = None;
+            ctx.notify();
+            return;
+        }
+        if self.interaction_gate(action, ctx) {
+            return;
+        }
 
         if self.header_actions_open && !matches!(action, Action::HeaderActions(_)) {
             self.header_actions_open = false;
@@ -53,10 +81,6 @@ impl TypedActionView for Companion {
                 ctx.notify();
                 return;
             }
-        }
-        if self.handle_context(action, ctx) {
-            self.sync_ime(ctx);
-            return;
         }
         if self.shortcuts.recording
             && matches!(
@@ -97,8 +121,22 @@ impl TypedActionView for Companion {
             }
         }
         // The guide is modal: no background shortcuts or device operations leak through.
-        if self.adb_guide_step.is_some()
-            && !matches!(
+        if self.adb_guide_step.is_some() {
+            if let Action::PairTab(tab) = action {
+                self.adb_guide_step = None;
+                self.preferences.adb_guide_seen = true;
+                let _ = self.preferences.save();
+                self.prefs = self.preferences.clone();
+                self.page = Page::Connect;
+                self.connection_pairing_open = true;
+                self.pair_tab = *tab;
+                if *tab == PairTab::Qr && self.qr.is_none() {
+                    self.qr = QrSession::new().ok().map(Arc::new);
+                }
+                ctx.notify();
+                return;
+            }
+            if !matches!(
                 action,
                 Action::AdbGuide(_)
                     | Action::AdbGuideContinue
@@ -109,9 +147,9 @@ impl TypedActionView for Companion {
                     | Action::CloseWindow
                     | Action::QuitApplication
                     | Action::StudioOpenUrl(_)
-            )
-        {
-            return;
+            ) {
+                return;
+            }
         }
         if matches!(action, Action::CompactChat) {
             self.summon_compact_chat(ctx);
@@ -241,13 +279,6 @@ impl TypedActionView for Companion {
             self.handle_amoo_ui_action(action);
             self.sync_ime(ctx);
             ctx.notify();
-            return;
-        }
-        if self.page == Page::Amoo
-            && matches!(action, Action::Escape)
-            && (self.workspace.panel != 0 || self.workspace.history)
-        {
-            self.handle_action(&Action::Workspace(WorkspaceAction::ClosePanel), ctx);
             return;
         }
         if let Action::Workspace(action) = action {
@@ -544,7 +575,32 @@ impl Companion {
                 self.search.closing = None;
                 self.back_screen.live_capsule_popover_open = false;
                 self.clear_text_interaction();
+                let was_compact = self.push.shell_mode != ShellMode::Full;
+                self.set_compact_mode(ShellMode::Full, ctx);
+                if self.page == *page && !was_compact {
+                    if *page == Page::AppStore
+                        && (self.app_store.selected_package.is_some()
+                            || self.app_store.lightbox.is_some())
+                    {
+                        self.app_store.selected_package = None;
+                        self.app_store.lightbox = None;
+                        self.trigger_subtab_switch();
+                        return true;
+                    }
+                    if *page == Page::Tools && self.tool_page.is_some() {
+                        self.tool_page = None;
+                        self.tool_confirmation = None;
+                        self.tools_pending = None;
+                        self.scroll = Default::default();
+                        self.scroll_aux = Default::default();
+                        self.trigger_subtab_switch();
+                        return true;
+                    }
+                    return true;
+                }
                 if self.page != *page {
+                    self.page_scroll_offsets
+                        .insert(self.page, self.scroll.scroll_start().as_f32());
                     // Status messages belong to the page that produced them;
                     // drop stale non-error text when navigating away.
                     if !self.error && !self.busy && !self.bulk_busy {
@@ -568,7 +624,6 @@ impl Companion {
                     self.app_store.selected_package = None;
                     self.app_store.lightbox = None;
                 }
-                self.set_compact_mode(ShellMode::Full, ctx);
                 if let Some(i) = self.focus {
                     self.fields[i].preedit.clear();
                 }
@@ -601,6 +656,9 @@ impl Companion {
                 self.tool_confirmation = None;
                 self.focus = None;
                 self.scroll = Default::default();
+                if let Some(&saved) = self.page_scroll_offsets.get(page).filter(|&&y| y > 0.0) {
+                    self.scroll.scroll_to(facloud_ui::units::Pixels::new(saved));
+                }
                 self.scroll_aux = Default::default();
                 self.trash_confirm = false;
                 self.tools_pending = None;
@@ -900,12 +958,10 @@ impl Companion {
                 self.save_preferences("已设为默认设备");
             }
             Action::RemoveRememberedDevice(serial) => {
-                self.preferences.devices.retain(|p| &p.serial != serial);
-                if self.preferences.selected_serial.as_ref() == Some(serial) {
-                    self.preferences.selected_serial =
-                        self.preferences.devices.first().map(|d| d.serial.clone());
-                }
-                self.save_preferences("已移除");
+                self.remove_remembered_device(serial);
+            }
+            Action::ReconnectRememberedDevice(serial) => {
+                self.reconnect_remembered_device(serial);
             }
             Action::FileSort(sort) => {
                 self.motion_started = Instant::now();
@@ -1215,17 +1271,20 @@ impl Companion {
             }
             Action::Escape if self.search.open => self.handle_search(&SearchAction::Close, ctx),
             Action::Escape => {
-                if self
-                    .push
-                    .selected_key
-                    .as_deref()
-                    .is_some_and(|key| key.starts_with("msg_detail::"))
-                {
-                    self.push.selected_key = None;
+                if self.back_screen.live_capsule_popover_open {
+                    self.back_screen.live_capsule_popover_open = false;
                     return true;
                 }
                 if self.notification_center.drawer_open {
                     self.apply_notification_center_action(NotificationCenterAction::CloseDrawer);
+                    return true;
+                }
+                if self.home_reminder_drawer_open {
+                    self.home_reminder_drawer_open = false;
+                    return true;
+                }
+                if self.auto_sync.details_open {
+                    self.auto_sync.details_open = false;
                     return true;
                 }
                 if self.adb_guide_step.is_some() {
@@ -1240,6 +1299,82 @@ impl Companion {
                     self.amoo_lightbox_open = false;
                     return true;
                 }
+                if self.page == Page::AppStore && self.app_store.lightbox.is_some() {
+                    self.app_store.lightbox = None;
+                    return true;
+                }
+                if self.amoo_ui.album_path.is_some() {
+                    self.amoo_ui.album_path = None;
+                    return true;
+                }
+                if self.workspace.delivery.is_some() {
+                    self.workspace.delivery = None;
+                    return true;
+                }
+                if self.file_modal.is_some() {
+                    self.file_modal = None;
+                    if self.focus == Some(F_FILE_NAME) {
+                        self.focus = None;
+                    }
+                    return true;
+                }
+                if self.trash_confirm {
+                    self.trash_confirm = false;
+                    return true;
+                }
+                if self.pending_app_uninstall.is_some() {
+                    self.pending_app_uninstall = None;
+                    return true;
+                }
+                if self.page == Page::AppStore && self.app_store.pending_uninstall.is_some() {
+                    self.app_store.pending_uninstall = None;
+                    return true;
+                }
+                if self.page == Page::AppStore
+                    && self.app_store.pending_downgrade_reinstall.is_some()
+                {
+                    self.app_store.pending_downgrade_reinstall = None;
+                    return true;
+                }
+                if self.pending_sms_plan.is_some() {
+                    self.pending_sms_plan = None;
+                    return true;
+                }
+                if self.pending_call.is_some() {
+                    self.pending_call = None;
+                    return true;
+                }
+                if self.work.pending_install.is_some() {
+                    self.work.pending_install = None;
+                    return true;
+                }
+                if self.tool_confirmation.take().is_some() {
+                    return true;
+                }
+                if self.tools_pending.take().is_some() {
+                    return true;
+                }
+                if self.amoo_plus_open {
+                    self.amoo_plus_open = false;
+                    return true;
+                }
+                if self.amoo_recording {
+                    self.amoo_recording = false;
+                    return true;
+                }
+                if self.work.attach_menu_open {
+                    self.work.attach_menu_open = false;
+                    return true;
+                }
+                if self
+                    .push
+                    .selected_key
+                    .as_deref()
+                    .is_some_and(|key| key.starts_with("msg_detail::"))
+                {
+                    self.push.selected_key = None;
+                    return true;
+                }
                 if self.back_screen.editing_calendar_event_id.is_some() {
                     self.handle_backscreen_action(&BackScreenAction::CalendarCancelEdit, ctx);
                     return true;
@@ -1251,51 +1386,52 @@ impl Companion {
                 if self.page == Page::Home && self.home_module_edit_mode {
                     let action = if self.home_drag_active() || self.home_pending_move.is_some() {
                         pages::home::HomeModuleAction::CancelDrag
-                    } else { pages::home::HomeModuleAction::CancelEdit };
+                    } else {
+                        pages::home::HomeModuleAction::CancelEdit
+                    };
                     self.apply_home_action(&Action::HomeModule(action), Some(ctx));
                     return true;
                 }
-                self.tool_confirmation = None;
-                self.tools_pending = None;
-                if self.page == Page::AppStore {
-                    if self.app_store.lightbox.is_some() {
-                        self.app_store.lightbox = None;
-                        return true;
-                    }
-                    if self.app_store.pending_uninstall.is_some() {
-                        self.app_store.pending_uninstall = None;
-                        return true;
-                    }
-                    if self.app_store.pending_downgrade_reinstall.is_some() {
-                        self.app_store.pending_downgrade_reinstall = None;
-                        return true;
-                    }
-                    if self.focus.is_none() && self.app_store.selected_package.is_some() {
-                        self.app_store.selected_package = None;
-                        self.trigger_subtab_switch();
-                        return true;
-                    }
+                if self.push.shell_mode != ShellMode::Full && self.compact.history {
+                    self.compact.history = false;
+                    return true;
                 }
-                if self.amoo_plus_open {
-                    self.amoo_plus_open = false;
-                } else if self.amoo_recording {
-                    self.amoo_recording = false;
-                } else if self.file_modal.is_some() {
-                    self.file_modal = None;
-                    if self.focus == Some(F_FILE_NAME) {
-                        self.focus = None;
-                    }
-                } else if self.pending_sms_plan.is_some() {
-                    self.pending_sms_plan = None;
-                } else if self.trash_confirm {
-                    self.trash_confirm = false;
-                } else if self.focus.is_some() {
+                if matches!(self.page, Page::Amoo | Page::Work) && self.workspace.history {
+                    self.workspace.history = false;
+                    return true;
+                }
+                if self.page == Page::Amoo && self.workspace.panel != 0 {
+                    self.handle_workspace(&WorkspaceAction::ClosePanel, ctx);
+                    return true;
+                }
+                if self.page == Page::Work && self.work.panel != 0 {
+                    self.work.panel = 0;
+                    return true;
+                }
+                if self.focus.is_some() {
                     self.focus = None;
-                } else if self.page == Page::Apps && self.selected_app.is_some() {
+                    return true;
+                }
+                if self.push.shell_mode != ShellMode::Full {
+                    if self.compact.notification_detail {
+                        self.compact.notification_detail = false;
+                    } else {
+                        self.set_compact_mode(ShellMode::Full, ctx);
+                    }
+                    return true;
+                }
+                if self.page == Page::AppStore && self.app_store.selected_package.is_some() {
+                    self.app_store.selected_package = None;
+                    self.trigger_subtab_switch();
+                    return true;
+                }
+                if self.page == Page::Apps && self.selected_app.is_some() {
                     self.selected_app = None;
                     self.selected_app_details = None;
                     self.selected_app_loading = false;
-                } else if self.page == Page::Files && !self.recent_files_view {
+                    return true;
+                }
+                if self.page == Page::Files && !self.recent_files_view {
                     self.selected_file = None;
                 }
             }
@@ -1307,8 +1443,7 @@ impl Companion {
             }
             Action::CloseWindow | Action::QuitApplication => {
                 let force_quit = matches!(action, Action::QuitApplication);
-                if !force_quit && self.settings.value.close_to_tray && self.settings.tray.is_some()
-                {
+                if !force_quit && self.should_hide_to_tray() {
                     self.remember_window(ctx, true);
                     self.settings.hidden = true;
                     let id = ctx.window_id();
@@ -1320,17 +1455,11 @@ impl Companion {
                     ctx.notify();
                     return true;
                 }
-                if let Some(job) = &self.updates.transfer {
-                    job.cancel();
+                self.force_quitting = true;
+                self.shutdown_all(if force_quit { None } else { Some(ctx) });
+                if force_quit {
+                    self.remember_window(ctx, true);
                 }
-                self.cancel_backscreen();
-                self.stop_mirror();
-                if !force_quit {
-                    self.close_mirror_controls(ctx);
-                    self.close_desktop_popup_window(ctx);
-                }
-                self.workspace_flush();
-                self.remember_window(ctx, true);
                 self.settings.tray = None;
                 if force_quit {
                     // The workspace is flushed above. Explicit app exit must not
@@ -1698,7 +1827,7 @@ impl Companion {
                         .set_location(&stepx_companion::settings::downloads()),
                     DialogKind::SaveFile,
                     move |app, dest, _| {
-                        std::fs::write(&dest, md)?;
+                        stepx_companion::local_store::write_if_changed(&dest, md.as_bytes())?;
                         app.status = format!("已导出 {total_count} 条记忆到 {}", dest.display());
                         Ok(())
                     },
@@ -1791,17 +1920,36 @@ impl Companion {
                 }
             }
             Action::PhoneDialAppend(ch) => {
-                self.pending_call = None;
-                self.fields[F_PHONE_DIAL].insert(ch);
-                self.focus_field(F_PHONE_DIAL, ctx);
+                let was_focused = self.focus == Some(F_PHONE_DIAL);
+                if !was_focused {
+                    self.focus = Some(F_PHONE_DIAL);
+                    self.fields[F_PHONE_DIAL].cursor = keyboard_input::clamp_char_boundary(
+                        &self.fields[F_PHONE_DIAL].text,
+                        if self.fields[F_PHONE_DIAL].cursor == 0 {
+                            self.fields[F_PHONE_DIAL].text.len()
+                        } else {
+                            self.fields[F_PHONE_DIAL].cursor
+                        },
+                    );
+                    ctx.focus_self();
+                }
+                self.dial_append(ch);
             }
             Action::PhoneDialBackspace => {
-                self.pending_call = None;
-                let input = &mut self.fields[F_PHONE_DIAL];
-                let p = input.previous();
-                input.text.replace_range(p..input.cursor, "");
-                input.cursor = p;
-                self.focus_field(F_PHONE_DIAL, ctx);
+                let was_focused = self.focus == Some(F_PHONE_DIAL);
+                if !was_focused {
+                    self.focus = Some(F_PHONE_DIAL);
+                    self.fields[F_PHONE_DIAL].cursor = keyboard_input::clamp_char_boundary(
+                        &self.fields[F_PHONE_DIAL].text,
+                        if self.fields[F_PHONE_DIAL].cursor == 0 {
+                            self.fields[F_PHONE_DIAL].text.len()
+                        } else {
+                            self.fields[F_PHONE_DIAL].cursor
+                        },
+                    );
+                    ctx.focus_self();
+                }
+                self.dial_backspace();
             }
             Action::PhoneDialClear => {
                 self.pending_call = None;
@@ -1957,6 +2105,7 @@ impl Companion {
             Action::Insert(_)
             | Action::Preedit(_)
             | Action::Backspace
+            | Action::BackspaceWord
             | Action::BackspaceLine
             | Action::Delete
             | Action::Left
@@ -2683,5 +2832,102 @@ impl Companion {
         }
         self.notification_center.save();
         self.sync_notification_center();
+    }
+
+    pub(super) fn dial_append(&mut self, ch: &str) {
+        self.pending_call = None;
+        let input = &mut self.fields[F_PHONE_DIAL];
+        input.checkpoint(true);
+        input.insert(ch);
+    }
+
+    pub(super) fn dial_backspace(&mut self) {
+        self.pending_call = None;
+        let input = &mut self.fields[F_PHONE_DIAL];
+        input.checkpoint(false);
+        if input.selection_range().is_some() {
+            input.delete_selection();
+        } else {
+            let cur = keyboard_input::clamp_char_boundary(&input.text, input.cursor);
+            let p = input.previous();
+            input.text.replace_range(p..cur, "");
+            input.cursor = p;
+        }
+    }
+}
+
+#[cfg(test)]
+mod fixer11_actions_tests {
+    use super::*;
+
+    #[test]
+    fn dial_append_and_backspace_are_utf8_safe_on_multibyte_chars_and_mid_char_cursors() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = crate::ui::TestUiConfigDirGuard::set(dir.path());
+        let mut app = Companion::new_for_test();
+
+        app.dial_append("（010）—　8888");
+        assert_eq!(app.fields[F_PHONE_DIAL].text, "（010）—　8888");
+        assert!(app.fields[F_PHONE_DIAL]
+            .text
+            .is_char_boundary(app.fields[F_PHONE_DIAL].cursor));
+
+        // Force cursor inside multi-byte full-width paren `（` (bytes 0..3) and test backspace + append
+        app.fields[F_PHONE_DIAL].cursor = 1;
+        app.dial_append("+");
+        assert!(app.fields[F_PHONE_DIAL]
+            .text
+            .is_char_boundary(app.fields[F_PHONE_DIAL].cursor));
+
+        // Force cursor inside em-dash `—` and delete backwards repeatedly through all multi-byte chars
+        app.fields[F_PHONE_DIAL].cursor = app.fields[F_PHONE_DIAL].text.len();
+        for _ in 0..20 {
+            if app.fields[F_PHONE_DIAL].cursor > 1 {
+                app.fields[F_PHONE_DIAL].cursor -= 1;
+            }
+            app.dial_backspace();
+            assert!(app.fields[F_PHONE_DIAL]
+                .text
+                .is_char_boundary(app.fields[F_PHONE_DIAL].cursor));
+        }
+    }
+
+    #[test]
+    fn ime_composing_consumes_escape_before_closing_overlays() {
+        let mut kb = keyboard_input::Keyboard {
+            search: false,
+            accept_attachments: false,
+            context_menu: true,
+            interaction: true,
+            shortcut: Default::default(),
+            recording_shortcut: false,
+            child: Empty::new().finish(),
+            active: true,
+            multiline: true,
+            composing: true,
+        };
+        let esc = Event::KeyDown {
+            keystroke: facloud_ui::keymap::Keystroke {
+                key: "escape".into(),
+                ..Default::default()
+            },
+            chars: String::new(),
+            details: Default::default(),
+            is_composing: false,
+        };
+        assert!(kb.action_for_event(&esc).is_none());
+
+        kb.composing = false;
+        let composing_esc = Event::KeyDown {
+            keystroke: facloud_ui::keymap::Keystroke {
+                key: "escape".into(),
+                ..Default::default()
+            },
+            chars: String::new(),
+            details: Default::default(),
+            is_composing: true,
+        };
+        assert!(kb.action_for_event(&composing_esc).is_none());
+        assert!(matches!(kb.action_for_event(&esc), Some(Action::Escape)));
     }
 }

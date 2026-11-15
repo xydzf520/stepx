@@ -224,9 +224,71 @@ pub struct Draft {
     pub quotes: Vec<String>,
 }
 
+/// Strip optional case-insensitive ```JSON fences and short conversational preambles
+/// around a JSON object while leaving already-unfenced JSON objects untouched.
+pub fn strip_fence(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        return trimmed;
+    }
+    if let Some(fence_pos) = trimmed.find("```") {
+        let preamble = trimmed[..fence_pos].trim();
+        if !preamble.starts_with('{') && preamble.chars().count() <= 240 {
+            let after_ticks = &trimmed[fence_pos + 3..];
+            if let Some(nl) = after_ticks.find('\n') {
+                let lang = after_ticks[..nl].trim();
+                if lang.is_empty()
+                    || lang.eq_ignore_ascii_case("json")
+                    || lang.eq_ignore_ascii_case("jsonc")
+                    || lang
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                {
+                    let rest = &after_ticks[nl + 1..];
+                    if let Some(close_pos) = rest.rfind("```") {
+                        if rest[close_pos + 3..].trim().chars().count() <= 240 {
+                            let inner = rest[..close_pos].trim();
+                            if inner.starts_with('{') && inner.ends_with('}') {
+                                return inner;
+                            }
+                        }
+                    }
+                }
+            } else if let Some(close_pos) = after_ticks.rfind("```") {
+                let mut inner = after_ticks[..close_pos].trim();
+                if inner.len() >= 4 && inner[..4].eq_ignore_ascii_case("json") {
+                    let tail = &inner[4..];
+                    if tail.starts_with(char::is_whitespace) || tail.starts_with('{') {
+                        inner = tail.trim();
+                    }
+                }
+                if inner.starts_with('{') && inner.ends_with('}') {
+                    return inner;
+                }
+            }
+        }
+    }
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
+        if start < end
+            && trimmed[..start].chars().count() <= 240
+            && trimmed[end + 1..].chars().count() <= 240
+        {
+            let candidate = &trimmed[start..=end];
+            if serde_json::from_str::<serde_json::Value>(candidate)
+                .is_ok_and(|val| val.is_object())
+            {
+                return candidate;
+            }
+        }
+    }
+    trimmed
+}
+
 pub fn validate_output(scenario: Scenario, request: &str, raw: &str) -> Result<Draft> {
     ensure!(raw.len() <= 16_384, "Agent 返回过长");
-    let mut result: Draft = serde_json::from_str(raw).context("Agent 返回格式不符合场景要求")?;
+    let cleaned = strip_fence(raw);
+    let mut result: Draft =
+        serde_json::from_str(cleaned).context("Agent 返回格式不符合场景要求")?;
     result.title = result.title.trim().into();
     result.draft = result.draft.trim().into();
     ensure!(
@@ -396,5 +458,14 @@ mod persistence_tests {
         std::fs::write(&blocked, "existing").unwrap();
         assert!(save_draft(&blocked, &draft).is_err());
         assert_eq!(std::fs::read_to_string(blocked).unwrap(), "existing");
+    }
+
+    #[test]
+    fn validate_output_accepts_case_insensitive_json_fences_and_short_preambles() {
+        let req = "请帮我拟一段回复：明天下午三点开会确认预算。";
+        let payload = "好的，已按要求整理：\n```JSON\r\n{\"title\":\"会议回复\",\"draft\":\"收到，明天下午三点准时参加预算确认会。\",\"needs_input\":false,\"search_query\":null,\"quotes\":[\"明天下午三点开会确认预算\"]}\r\n```";
+        let draft = validate_output(Scenario::Reply, req, payload).unwrap();
+        assert_eq!(draft.title, "会议回复");
+        assert_eq!(draft.quotes, vec!["明天下午三点开会确认预算"]);
     }
 }

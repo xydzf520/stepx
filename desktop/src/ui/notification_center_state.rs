@@ -302,6 +302,8 @@ pub(crate) struct UnifiedNotificationItem {
     pub full_body: String,
     #[serde(default)]
     pub banner_body: String,
+    #[serde(default)]
+    pub can_inline_reply: bool,
     pub category: NotificationCategory,
     pub visual: NotificationVisualKind,
     pub priority: NotificationPriority,
@@ -317,6 +319,15 @@ pub(crate) struct UnifiedNotificationItem {
 }
 
 impl UnifiedNotificationItem {
+    pub(crate) fn supports_inline_reply(&self) -> bool {
+        if self.id.starts_with("otp:")
+            || matches!(self.popup_widget, NotificationPopupWidget::OtpCode { .. })
+        {
+            return false;
+        }
+        self.can_inline_reply
+    }
+
     /// Only structured payment/chat payloads imply a red packet. A nickname,
     /// marketing copy or a receipt about an old packet is not a new packet.
     pub(crate) fn is_red_packet(&self) -> bool {
@@ -406,6 +417,21 @@ pub(crate) fn persistence_path() -> PathBuf {
 pub(crate) const MAX_POPUP_QUEUE_LEN: usize = 8;
 const MAX_CACHED_HISTORY_LEN: usize = 80;
 
+#[derive(Clone, Debug)]
+pub(crate) struct PendingPopupReply {
+    pub item_id: String,
+    pub text: String,
+    pub started_ms: i64,
+    pub im_client_msg_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PopupSmsReplyOutcome {
+    pub item_id: String,
+    pub text: String,
+    pub result: Result<(), String>,
+}
+
 #[derive(Clone)]
 pub(crate) struct NotificationCenterState {
     pub drawer_open: bool,
@@ -422,6 +448,9 @@ pub(crate) struct NotificationCenterState {
     pub popup_menu_item_id: Option<String>,
     pub popup_reply_drafts: HashMap<String, String>,
     pub popup_hovered: bool,
+    pub(crate) last_dispatched_hover: std::rc::Rc<std::cell::Cell<Option<bool>>>,
+    pub(crate) pending_popup_replies: HashMap<String, PendingPopupReply>,
+    pub(crate) sms_reply_outcomes: std::sync::Arc<std::sync::Mutex<Vec<PopupSmsReplyOutcome>>>,
     pub popup_remaining_ms: u32,
     pub popup_total_ms: u32,
     pub snooze_until_ms: Option<i64>,
@@ -477,6 +506,9 @@ impl NotificationCenterState {
             popup_menu_item_id: None,
             popup_reply_drafts: HashMap::new(),
             popup_hovered: false,
+            last_dispatched_hover: std::rc::Rc::new(std::cell::Cell::new(None)),
+            pending_popup_replies: HashMap::new(),
+            sms_reply_outcomes: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             popup_remaining_ms: 0,
             popup_total_ms: 0,
             snooze_until_ms: None,
@@ -534,6 +566,14 @@ impl NotificationCenterState {
                 && timestamp_ms <= now_ms.saturating_add(120_000))
     }
 
+    pub(crate) fn reset_hover_dispatch_cache(&self) {
+        self.last_dispatched_hover.set(None);
+    }
+
+    pub(crate) fn is_reply_sending(&self, item_id: &str) -> bool {
+        self.pending_popup_replies.contains_key(item_id)
+    }
+
     pub fn load_from_path(path: &Path) -> Self {
         let mut state = Self::new_empty();
         let Ok(raw) = stepx_companion::local_store::read_bounded(path, 2 * 1024 * 1024) else {
@@ -557,8 +597,18 @@ impl NotificationCenterState {
             .take(MAX_PERSISTED_IDS)
             .collect();
         state.popup_shown_ids = parsed.popup_shown_ids.into_iter().take(MAX_PERSISTED_IDS).collect();
-        state.delivered_events = parsed.delivered_events.into_iter()
-            .filter(|key| key.len() <= 1024).take(MAX_PERSISTED_IDS).collect();
+        let mut normalized_events = VecDeque::new();
+        let mut seen_events = HashSet::new();
+        for key in parsed.delivered_events.into_iter().filter(|key| key.len() <= 1024) {
+            let norm = normalize_persisted_delivery_event_key(&key);
+            if seen_events.insert(norm.clone()) {
+                normalized_events.push_back(norm);
+                if normalized_events.len() >= MAX_PERSISTED_IDS {
+                    break;
+                }
+            }
+        }
+        state.delivered_events = normalized_events;
         state.cached_history = parsed
             .cached_history
             .into_iter()
@@ -567,6 +617,11 @@ impl NotificationCenterState {
             .map(|mut i| {
                 if state.read_ids.contains(&i.id) {
                     i.unread = false;
+                }
+                if i.id.starts_with("otp:")
+                    || matches!(i.popup_widget, NotificationPopupWidget::OtpCode { .. })
+                {
+                    i.can_inline_reply = false;
                 }
                 // A persisted event receipt supersedes the legacy conversation
                 // marker. Otherwise a later message in the same conversation
@@ -946,6 +1001,56 @@ fn classify_ai_value_thread(
     None
 }
 
+fn is_ip_like_scope(s: &str) -> bool {
+    let trimmed = s.trim();
+    !trimmed.is_empty()
+        && trimmed.split('.').count() == 4
+        && trimmed
+            .split('.')
+            .all(|part| !part.is_empty() && part.len() <= 3 && part.chars().all(|c| c.is_ascii_digit()))
+}
+
+fn normalize_delivery_device_key(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("desktop") {
+        return None;
+    }
+    if let Some(rest) = trimmed.strip_prefix("adb-") {
+        let head = rest.split('.').next().unwrap_or(rest).trim();
+        if let Some((hw, tail)) = head.rsplit_once('-') {
+            if !hw.trim().is_empty()
+                && (4..=12).contains(&tail.len())
+                && tail.chars().all(|c| c.is_ascii_alphanumeric())
+            {
+                return Some(hw.trim().to_string());
+            }
+        }
+        if !head.is_empty() {
+            return Some(head.to_string());
+        }
+    }
+    if let Some((host, port)) = trimmed.rsplit_once(':') {
+        if !host.is_empty()
+            && !host.contains(':')
+            && !port.is_empty()
+            && port.chars().all(|c| c.is_ascii_digit())
+        {
+            return Some(host.trim().to_string());
+        }
+    }
+    Some(trimmed.to_string())
+}
+
+fn normalize_persisted_delivery_event_key(key: &str) -> String {
+    if let Some((scope, rest)) = key.split_once('|') {
+        let norm_scope =
+            normalize_delivery_device_key(scope).unwrap_or_else(|| "desktop".to_string());
+        format!("{norm_scope}|{rest}")
+    } else {
+        key.to_string()
+    }
+}
+
 fn popup_delivery_event_suffix(item: &UnifiedNotificationItem) -> String {
     // Clipboard reads have no source event timestamp. Re-reading the same
     // value must not turn it into a new alert after restarting the desktop.
@@ -954,9 +1059,47 @@ fn popup_delivery_event_suffix(item: &UnifiedNotificationItem) -> String {
 }
 
 impl Companion {
+    fn normalized_popup_device_scope(&self) -> String {
+        let candidates = [
+            self.selected.as_ref().map(|d| d.serial.as_str()),
+            self.selected.as_ref().map(|d| d.transport.as_str()),
+            self.auto_sync.device_serial.as_deref(),
+            self.last_connected_serial.as_deref(),
+        ];
+        let mut ip_fallback: Option<String> = None;
+        for candidate in candidates.into_iter().flatten() {
+            if let Some(norm) = normalize_delivery_device_key(candidate) {
+                if !is_ip_like_scope(&norm) {
+                    return norm;
+                }
+                if ip_fallback.is_none() {
+                    ip_fallback = Some(norm);
+                }
+            }
+        }
+        ip_fallback.unwrap_or_else(|| "desktop".to_string())
+    }
+
     fn popup_delivery_key(&self, item: &UnifiedNotificationItem) -> String {
-        let serial = self.selected.as_ref().map(|device| device.serial.as_str()).unwrap_or("desktop");
+        let serial = self.normalized_popup_device_scope();
         format!("{serial}{}", popup_delivery_event_suffix(item))
+    }
+
+    fn has_delivered_popup_event(&self, item: &UnifiedNotificationItem) -> bool {
+        let suffix = popup_delivery_event_suffix(item);
+        let current_scope = self.normalized_popup_device_scope();
+        self.notification_center.delivered_events.iter().any(|key| {
+            let Some(stored_scope) = key.strip_suffix(&suffix) else {
+                return false;
+            };
+            let norm_stored = normalize_delivery_device_key(stored_scope)
+                .unwrap_or_else(|| "desktop".to_string());
+            norm_stored == current_scope
+                || norm_stored == "desktop"
+                || current_scope == "desktop"
+                || is_ip_like_scope(&norm_stored)
+                || is_ip_like_scope(&current_scope)
+        })
     }
 
     pub(crate) fn popup_batch_receipts(&self) -> Vec<(String, String)> {
@@ -971,18 +1114,27 @@ impl Companion {
     }
 
     fn clear_popup_batch(&mut self, receipts: Vec<(String, String)>) {
-        let events: HashSet<_> = receipts.iter().map(|(_, key)| key.as_str()).collect();
+        let events: HashSet<_> = receipts
+            .iter()
+            .map(|(_, key)| normalize_persisted_delivery_event_key(key))
+            .collect();
+        let event_suffixes: HashSet<String> = events
+            .iter()
+            .filter_map(|key| key.find('|').map(|idx| key[idx..].to_string()))
+            .collect();
         let clear_ids: HashSet<_> = self.notification_center.items.iter()
             .filter(|item| !item.id.starts_with("live-call:")
                 && !matches!(item.popup_widget, NotificationPopupWidget::LiveCall { .. })
-                && events.contains(self.popup_delivery_key(item).as_str()))
+                && (events.contains(self.popup_delivery_key(item).as_str())
+                    || event_suffixes.contains(&popup_delivery_event_suffix(item))))
             .map(|item| item.id.clone()).collect();
         // Persist the exact batch even if an item has since received a new
         // event. Only the captured event is acknowledged; the new one stays.
         for (id, key) in receipts {
             if id.starts_with("live-call:") { continue; }
-            if !self.notification_center.delivered_events.contains(&key) {
-                self.notification_center.delivered_events.push_front(key);
+            let norm_key = normalize_persisted_delivery_event_key(&key);
+            if !self.notification_center.delivered_events.contains(&norm_key) {
+                self.notification_center.delivered_events.push_front(norm_key);
             }
         }
         self.notification_center.delivered_events.truncate(MAX_PERSISTED_IDS);
@@ -1010,6 +1162,7 @@ impl Companion {
             }
         }
         self.notification_center.popup_hovered = false;
+        self.notification_center.reset_hover_dispatch_cache();
         self.sync_active_popup_from_queue(false);
         // History, unread state, reply drafts and reminder preferences remain.
         self.notification_center.save();
@@ -1075,6 +1228,7 @@ impl Companion {
 
     pub(crate) fn notification_active_popup(&self) -> Option<&UnifiedNotificationItem> {
         let now_ms = Local::now().timestamp_millis();
+        let snoozed = self.notification_center.is_snoozed(now_ms);
         let all_silent = self.push.prefs.popup_mode
             == stepx_companion::desktop_notify::PopupMode::Silent
             && self
@@ -1085,7 +1239,6 @@ impl Companion {
                 .all(|m| *m == stepx_companion::desktop_notify::PopupMode::Silent);
         if self.notification_center.alert_mode != NotificationAlertMode::PopupAndBadge
             || all_silent
-            || self.notification_center.is_snoozed(now_ms)
         {
             return None;
         }
@@ -1100,10 +1253,14 @@ impl Companion {
                     .map(String::as_str)
             })?;
         self.notification_center.items.iter().find(|item| {
+            let is_live_call = item.id.starts_with("live-call:")
+                || matches!(item.popup_widget, NotificationPopupWidget::LiveCall { .. });
             item.id == popup_id
                 && item.unread
-                && self.push.prefs.effective_popup_mode(&item.package_name)
-                    != stepx_companion::desktop_notify::PopupMode::Silent
+                && (!snoozed || is_live_call)
+                && (is_live_call
+                    || self.push.prefs.effective_popup_mode(&item.package_name)
+                        != stepx_companion::desktop_notify::PopupMode::Silent)
         })
     }
 
@@ -1172,7 +1329,10 @@ impl Companion {
         }
         self.desktop_popup.reply_focused = false;
         if let Some(previous) = self.notification_center.popup_reply_item_id.take() {
-            let draft = self.fields[super::F_TOAST_REPLY].text.clone();
+            let mut draft = self.fields[super::F_TOAST_REPLY].text.clone();
+            if draft.is_empty() && !self.fields[super::F_TOAST_REPLY].preedit.is_empty() {
+                draft = self.fields[super::F_TOAST_REPLY].preedit.clone();
+            }
             if draft.is_empty() {
                 self.notification_center
                     .popup_reply_drafts
@@ -1183,6 +1343,7 @@ impl Companion {
                     .insert(previous, draft);
             }
         }
+        self.fields[super::F_TOAST_REPLY].preedit.clear();
         let draft = next_id
             .as_ref()
             .and_then(|id| self.notification_center.popup_reply_drafts.get(id))
@@ -1194,6 +1355,7 @@ impl Companion {
 
     fn sync_active_popup_from_queue(&mut self, _reset_timer_if_changed: bool) {
         let now_ms = Local::now().timestamp_millis();
+        let snoozed = self.notification_center.is_snoozed(now_ms);
         let all_silent = self.push.prefs.popup_mode
             == stepx_companion::desktop_notify::PopupMode::Silent
             && self
@@ -1204,11 +1366,23 @@ impl Companion {
                 .all(|m| *m == stepx_companion::desktop_notify::PopupMode::Silent);
         let next_id = if self.notification_center.alert_mode != NotificationAlertMode::PopupAndBadge
             || all_silent
-            || self.notification_center.is_snoozed(now_ms)
             || self.notification_center.popup_queue.is_empty()
         {
             self.notification_center.popup_cursor = 0;
             None
+        } else if snoozed {
+            if let Some(idx) = self
+                .notification_center
+                .popup_queue
+                .iter()
+                .position(|id| id.starts_with("live-call:"))
+            {
+                self.notification_center.popup_cursor = idx;
+                self.notification_center.popup_queue.get(idx).cloned()
+            } else {
+                self.notification_center.popup_cursor = 0;
+                None
+            }
         } else {
             if self.notification_center.popup_cursor >= self.notification_center.popup_queue.len() {
                 self.notification_center.popup_cursor = 0;
@@ -1218,11 +1392,16 @@ impl Companion {
                 .get(self.notification_center.popup_cursor)
                 .cloned()
         };
+        if self.notification_center.active_popup_id != next_id {
+            self.notification_center.popup_hovered = false;
+            self.notification_center.popup_menu_item_id = None;
+            self.notification_center.reset_hover_dispatch_cache();
+        }
         self.sync_popup_reply_draft(next_id.clone());
         self.notification_center.active_popup_id = next_id;
         if let Some(item) = self.notification_center.items.iter().find(|item| Some(&item.id) == self.notification_center.active_popup_id.as_ref()) {
             let key = self.popup_delivery_key(item);
-            if !self.notification_center.delivered_events.contains(&key) {
+            if !self.has_delivered_popup_event(item) {
                 self.notification_center.delivered_events.push_front(key);
                 self.notification_center.delivered_events.truncate(MAX_PERSISTED_IDS);
                 self.notification_center.save();
@@ -1234,22 +1413,44 @@ impl Companion {
     }
 
     fn select_pending_popup(&mut self) -> bool {
+        let Some(id) = self.notification_center.popup_pending_front.clone() else {
+            return false;
+        };
+        let is_urgent_live_call = id.starts_with("live-call:");
+        let active_sending = self
+            .notification_center
+            .active_popup_id
+            .as_deref()
+            .is_some_and(|active_id| self.notification_center.is_reply_sending(active_id));
         let field = &self.fields[super::F_TOAST_REPLY];
-        if self.desktop_popup.reply_focused || !field.text.is_empty() || !field.preedit.is_empty()
-            || self.notification_center.popup_hovered || self.notification_center.popup_menu_item_id.is_some()
+        if !is_urgent_live_call
+            && (active_sending
+                || self.desktop_popup.reply_focused
+                || !field.text.is_empty()
+                || !field.preedit.is_empty()
+                || self.notification_center.popup_hovered
+                || self.notification_center.popup_menu_item_id.is_some())
         {
             return false;
         }
-        let Some(id) = self.notification_center.popup_pending_front.as_ref() else { return false; };
         // A live carrier call retains its controls until it ends.
         if self.notification_active_popup().is_some_and(|item| matches!(item.popup_widget, NotificationPopupWidget::LiveCall { .. }))
-            && !id.starts_with("live-call:")
+            && !is_urgent_live_call
         {
             return false;
         }
-        let index = self.notification_center.popup_queue.iter().position(|queued| queued == id);
+        let index = self.notification_center.popup_queue.iter().position(|queued| queued == &id);
         self.notification_center.popup_pending_front = None;
         if let Some(index) = index {
+            if is_urgent_live_call {
+                self.notification_center.popup_hovered = false;
+                self.notification_center.popup_menu_item_id = None;
+                self.notification_center.reset_hover_dispatch_cache();
+                self.desktop_popup.reply_focused = false;
+                if self.focus == Some(super::F_TOAST_REPLY) {
+                    self.focus = None;
+                }
+            }
             self.notification_center.popup_cursor = index;
             true
         } else { false }
@@ -1257,7 +1458,7 @@ impl Companion {
 
     pub(crate) fn tick_notification_popup_timer(&mut self, _elapsed_ms: u32) -> bool {
         let now_ms = Local::now().timestamp_millis();
-        let mut changed = false;
+        let mut changed = self.drain_popup_sms_reply_outcomes();
         if self.select_pending_popup() {
             self.sync_active_popup_from_queue(false);
             changed = true;
@@ -1277,6 +1478,7 @@ impl Companion {
             .is_some_and(|until| until <= now_ms)
         {
             self.notification_center.snooze_until_ms = None;
+            self.sync_notification_center();
             changed = true;
         }
         changed
@@ -1677,6 +1879,7 @@ impl Companion {
     }
 
     pub(crate) fn sync_notification_center(&mut self) {
+        let _ = self.drain_popup_sms_reply_outcomes_inner();
         self.notification_center.last_materialized_at = Some(std::time::Instant::now());
         let now_ms = Local::now().timestamp_millis();
         let mut raw_items: Vec<UnifiedNotificationItem> = Vec::with_capacity(24);
@@ -1902,6 +2105,13 @@ impl Companion {
             };
 
             if seen_ids.insert(item_id.clone()) {
+                let can_inline_reply = matches!(
+                    thread_popup_widget,
+                    NotificationPopupWidget::InlineImReply {
+                        can_reply: true,
+                        ..
+                    }
+                );
                 raw_items.push(UnifiedNotificationItem {
                     id: item_id,
                     category: thread_category,
@@ -1913,6 +2123,7 @@ impl Companion {
                     sender: sender_label,
                     full_body,
                     banner_body,
+                    can_inline_reply,
                     source_badge: badge,
                     title: display_title,
                     summary: truncate_concise(summary_text, 64),
@@ -2157,6 +2368,13 @@ impl Companion {
                 NotificationCategory::PhoneApps
             };
             if seen_ids.insert(item_id.clone()) {
+                let can_inline_reply = matches!(
+                    popup_widget,
+                    NotificationPopupWidget::InlineImReply {
+                        can_reply: true,
+                        ..
+                    }
+                );
                 raw_items.push(UnifiedNotificationItem {
                     id: item_id,
                     category: notif_category,
@@ -2168,6 +2386,7 @@ impl Companion {
                     sender: sender_label,
                     full_body,
                     banner_body,
+                    can_inline_reply,
                     source_badge: badge,
                     title,
                     summary,
@@ -2239,6 +2458,7 @@ impl Companion {
                     sender: app_label,
                     full_body,
                     banner_body,
+                    can_inline_reply: false,
                     source_badge: "验证码".into(),
                     title: truncate_concise(&format!("验证码 {code}"), 24),
                     summary,
@@ -2333,6 +2553,7 @@ impl Companion {
                     sender: source_app,
                     full_body,
                     banner_body,
+                    can_inline_reply: false,
                     source_badge: "验证码".into(),
                     title: truncate_concise(&format!("验证码 {code}"), 24),
                     summary: truncate_concise(&notif.text, 64),
@@ -2400,6 +2621,7 @@ impl Companion {
                                 sender: sender.to_string(),
                                 full_body: msg.body.trim().to_string(),
                                 banner_body: format!("短信 · 收到来自「{src_app}」的验证码提醒"),
+                                can_inline_reply: false,
                                 source_badge: "验证码".into(),
                                 title: truncate_concise(&format!("验证码 {code}"), 24),
                                 summary: truncate_concise(&msg.body, 64),
@@ -2553,6 +2775,13 @@ impl Companion {
                         )
                     };
                 let banner_body = format!("{} · 收到来自「{}」的新消息", source_badge, sender);
+                let sms_can_inline_reply = matches!(
+                    sms_widget,
+                    NotificationPopupWidget::InlineImReply {
+                        can_reply: true,
+                        ..
+                    }
+                );
                 raw_items.push(UnifiedNotificationItem {
                     id: sms_id,
                     category: NotificationCategory::PhoneComm,
@@ -2564,6 +2793,7 @@ impl Companion {
                     sender: sender.to_string(),
                     full_body: msg.body.trim().to_string(),
                     banner_body,
+                    can_inline_reply: sms_can_inline_reply,
                     source_badge,
                     title: display_title,
                     summary: truncate_concise(&msg.body, 64),
@@ -2590,7 +2820,9 @@ impl Companion {
                 sender: caller.clone(), title: caller,
                 full_body: format!("{}\n{}", if live_call.number.is_empty() { "手机未提供号码" } else { &live_call.number }, self.live_call_audio_label()),
                 summary: live_call.number.clone(), source_badge: if live_call.state == "ringing" { "手机来电" } else { "当前通话" }.into(),
-                banner_body: "手机来电".into(), time_label: "现在".into(),
+                banner_body: "手机来电".into(),
+                can_inline_reply: false,
+                time_label: "现在".into(),
                 sort_ts_ms: live_call.started_ms, unread: true,
                 status_tag: Some(if live_call.state == "ringing" { "响铃中" } else { "通话进行中" }.into()),
                 primary_action: Some(("查看通话".into(), NotificationPrimaryAction::OpenPage(Page::Phone))),
@@ -2634,6 +2866,7 @@ impl Companion {
                         call.number.trim()
                     ),
                     banner_body: format!("未接来电 · 收到来自「{}」的来电提醒", caller),
+                    can_inline_reply: !call.number.trim().is_empty(),
                     source_badge: "未接来电".into(),
                     title: truncate_concise(caller, 24),
                     summary: truncate_concise(
@@ -2745,6 +2978,7 @@ impl Companion {
                     sender: carrier_label.clone(),
                     full_body,
                     banner_body: format!("快递取件 · 收到来自「{carrier_label}」的包裹提醒"),
+                    can_inline_reply: false,
                     source_badge: "快递取件".into(),
                     title,
                     summary,
@@ -2819,6 +3053,7 @@ impl Companion {
                         sender: ev.title.trim().to_string(),
                         full_body: format!("{} · {} · {loc}", ev.hm_label(), ev.title.trim()),
                         banner_body: "日程提醒 · 收到一条即将开始的日程提醒".into(),
+                        can_inline_reply: false,
                         source_badge: "日程提醒".into(),
                         title: truncate_concise(ev.title.trim(), 24),
                         summary: truncate_concise(&format!("{} · {loc}", ev.hm_label()), 34),
@@ -2909,6 +3144,7 @@ impl Companion {
                             alarm.repeat_label()
                         ),
                         banner_body: "闹钟提醒 · 收到一条即将响铃提醒".into(),
+                        can_inline_reply: false,
                         source_badge: "闹钟提醒".into(),
                         title: truncate_concise(
                             &format!("{} {}", alarm.time_label(), alarm.display_title()),
@@ -3033,6 +3269,7 @@ impl Companion {
                     sender: app_short.clone(),
                     full_body: format!("{title} · {summary}"),
                     banner_body: format!("应用更新 · 「{app_short}」有新的状态提醒"),
+                    can_inline_reply: false,
                     source_badge: "应用更新".into(),
                     title: truncate_concise(&title, 24),
                     summary: truncate_concise(&summary, 34),
@@ -3152,6 +3389,7 @@ impl Companion {
                     sender: "应用商店".into(),
                     full_body: summary_text.clone(),
                     banner_body: format!("应用更新 · 有 {count} 款手机应用可更新"),
+                    can_inline_reply: false,
                     source_badge: "应用更新".into(),
                     title: format!("{count} 款手机应用可更新"),
                     summary: truncate_concise(&summary_text, 34),
@@ -3193,6 +3431,7 @@ impl Companion {
                             "{short_name} 可从 v{installed_ver} 升级至 v{latest_ver}"
                         ),
                         banner_body: format!("应用更新 · 「{short_name}」有新版本可升级"),
+                        can_inline_reply: false,
                         source_badge: "应用更新".into(),
                         title: truncate_concise(&format!("{short_name} 可更新"), 24),
                         summary: truncate_concise(&format!("v{installed_ver} → v{latest_ver}"), 34),
@@ -3229,6 +3468,7 @@ impl Companion {
                     sender: short_name.clone(),
                     full_body: format!("{short_name} 已更新完成，当前版本 v{target_ver}"),
                     banner_body: format!("应用更新 · 「{short_name}」已完成更新"),
+                    can_inline_reply: false,
                     source_badge: "应用更新".into(),
                     title: truncate_concise(&format!("{short_name} 已更新完成"), 24),
                     summary: truncate_concise(&format!("已升级至 v{target_ver}"), 34),
@@ -3269,6 +3509,7 @@ impl Companion {
                     sender: "Amoo 安全助手".into(),
                     full_body: detail.to_string(),
                     banner_body: "安全确认 · 有一项手机操作等待您的批准".into(),
+                    can_inline_reply: false,
                     source_badge: "安全确认".into(),
                     title: "手机操作待您批准".into(),
                     summary: truncate_concise(detail, 34),
@@ -3350,6 +3591,7 @@ impl Companion {
                     sender: "协同任务".into(),
                     full_body,
                     banner_body: "跨端协同 · 收到一条协同任务状态提醒".into(),
+                    can_inline_reply: false,
                     source_badge: "跨端协同".into(),
                     title,
                     summary,
@@ -3419,6 +3661,7 @@ impl Companion {
                     sender: "手机剪贴板".into(),
                     full_body: clip_text.clone(),
                     banner_body: "跨端剪贴 · 手机剪贴板已同步一条新内容".into(),
+                    can_inline_reply: false,
                     source_badge: "跨端剪贴".into(),
                     title: "手机剪贴板已同步".into(),
                     summary: truncate_concise(&clip_text, 34),
@@ -3461,6 +3704,7 @@ impl Companion {
                     sender: "存储扩容".into(),
                     full_body: fb.to_string(),
                     banner_body: "存储扩容 · 收到一条存储同步状态提醒".into(),
+                    can_inline_reply: false,
                     source_badge: "存储扩容".into(),
                     title: "电脑存储扩容同步".into(),
                     summary: truncate_concise(fb, 34),
@@ -3504,6 +3748,7 @@ impl Companion {
                         sender: "手机伴侣".into(),
                         full_body: link_msg.trim().to_string(),
                         banner_body: "跨端协同 · 收到一条手机协同通道提醒".into(),
+                        can_inline_reply: false,
                         source_badge: "跨端协同".into(),
                         title: if is_err {
                             "手机协同通道提醒".into()
@@ -3548,6 +3793,7 @@ impl Companion {
                     sender: title.clone(),
                     full_body: detail.clone(),
                     banner_body: format!("操作提醒 · {}", truncate_concise(title, 20)),
+                    can_inline_reply: false,
                     source_badge: "操作提醒".into(),
                     title: truncate_concise(title, 24),
                     summary: truncate_concise(detail, 34),
@@ -3591,6 +3837,7 @@ impl Companion {
                 sender: "StepX Companion".into(),
                 full_body: companion_summary.clone(),
                 banner_body: "本机软件 · StepX Companion 已就绪".into(),
+                can_inline_reply: false,
                 source_badge: "本机软件".into(),
                 title: format!(
                     "StepX Companion v{} 已就绪",
@@ -3635,6 +3882,7 @@ impl Companion {
                                 "手机当前电量 {lvl}%（低于 20%），建议及时连接电源充电"
                             ),
                             banner_body: "电量告警 · 手机电量偏低提醒".into(),
+                            can_inline_reply: false,
                             source_badge: "电量告警".into(),
                             title: format!("手机电量低 ({lvl}%)"),
                             summary: "电量低于 20%，建议及时连接电源充电".into(),
@@ -3683,6 +3931,7 @@ impl Companion {
                                 "手机存储空间已使用 {pct}%，建议开启电脑存储扩容释放手机空间"
                             ),
                             banner_body: "存储空间 · 手机存储空间紧张提醒".into(),
+                            can_inline_reply: false,
                             source_badge: "存储空间".into(),
                             title: format!("手机存储空间紧张 ({pct}%)"),
                             summary: "建议开启电脑存储扩容释放手机空间".into(),
@@ -3725,6 +3974,7 @@ impl Companion {
                         sender: "手机系统".into(),
                         full_body: "检测到可用固件升级包，点击查看详情".into(),
                         banner_body: "系统更新 · 发现手机系统 OTA 更新提醒".into(),
+                        can_inline_reply: false,
                         source_badge: "系统更新".into(),
                         title: "发现手机系统 OTA 更新".into(),
                         summary: "检测到可用固件升级包，点击查看详情".into(),
@@ -3773,6 +4023,7 @@ impl Companion {
                     sender: model_name.to_string(),
                     full_body: format!("{transport_label}{bat_suffix}"),
                     banner_body: format!("手机系统 · 已连接 {model_name}"),
+                    can_inline_reply: false,
                     source_badge: "手机系统".into(),
                     title: truncate_concise(&format!("已连接 {model_name}"), 24),
                     summary: truncate_concise(&format!("{transport_label}{bat_suffix}"), 34),
@@ -3802,6 +4053,7 @@ impl Companion {
                     sender: "手机系统".into(),
                     full_body: "支持 USB 或同 Wi-Fi 扫码无线连接".into(),
                     banner_body: "手机系统 · 尚未连接 StepX 手机".into(),
+                    can_inline_reply: false,
                     source_badge: "手机系统".into(),
                     title: "尚未连接 StepX 手机".into(),
                     summary: "支持 USB 或同 Wi-Fi 扫码无线连接".into(),
@@ -3833,6 +4085,7 @@ impl Companion {
                         sender: "系统状态".into(),
                         full_body: push_err.trim().to_string(),
                         banner_body: "系统状态 · 手机推送同步异常提醒".into(),
+                        can_inline_reply: false,
                         source_badge: "系统状态".into(),
                         title: "手机推送同步异常".into(),
                         summary: truncate_concise(push_err.trim(), 34),
@@ -3869,6 +4122,7 @@ impl Companion {
                     sender: "系统状态".into(),
                     full_body: self.status.trim().to_string(),
                     banner_body: "系统状态 · 收到一条操作状态提醒".into(),
+                    can_inline_reply: false,
                     source_badge: "系统状态".into(),
                     title: "操作未能完成".into(),
                     summary: truncate_concise(self.status.trim(), 34),
@@ -3904,6 +4158,21 @@ impl Companion {
             }
             if seen_ids.insert(hist_item.id.clone()) {
                 hist_item.unread = !self.notification_center.read_ids.contains(&hist_item.id);
+                if hist_item.id.starts_with("otp:")
+                    || matches!(hist_item.popup_widget, NotificationPopupWidget::OtpCode { .. })
+                {
+                    hist_item.can_inline_reply = false;
+                } else if !hist_item.can_inline_reply
+                    && matches!(
+                        hist_item.popup_widget,
+                        NotificationPopupWidget::InlineImReply {
+                            can_reply: true,
+                            ..
+                        }
+                    )
+                {
+                    hist_item.can_inline_reply = true;
+                }
                 if hist_item.full_body.trim().is_empty() {
                     hist_item.full_body = hist_item.summary.clone();
                 }
@@ -3938,7 +4207,8 @@ impl Companion {
             .cloned()
             .collect();
         for item in &mut raw_items {
-            if prev_queue_set.contains(&item.id)
+            if (prev_queue_set.contains(&item.id)
+                || self.notification_center.is_reply_sending(&item.id))
                 && !self.notification_center.read_ids.contains(&item.id)
                 && !self.notification_center.dismissed_ids.contains(&item.id)
             {
@@ -3969,7 +4239,7 @@ impl Companion {
 
         let previous_events: HashMap<_, _> = self.notification_center.items.iter()
             .filter(|item| prev_queue_set.contains(&item.id))
-            .map(|item| (item.id.clone(), self.popup_delivery_key(item))).collect();
+            .map(|item| (item.id.clone(), popup_delivery_event_suffix(item))).collect();
         self.notification_center.items = raw_items;
 
         if self
@@ -4001,6 +4271,8 @@ impl Companion {
             self.notification_center.popup_queue.clear();
             self.sync_popup_reply_draft(None);
             self.notification_center.active_popup_id = None;
+            self.notification_center.popup_hovered = false;
+            self.notification_center.reset_hover_dispatch_cache();
             self.sync_smart_backscreen_display();
             return;
         }
@@ -4021,25 +4293,41 @@ impl Companion {
             .iter()
             .cloned()
             .collect();
+        let snoozed_now = self.notification_center.is_snoozed(now_ms);
 
         let mut eligible_items: Vec<&UnifiedNotificationItem> = self
             .notification_center
             .items
             .iter()
             .filter(|item| {
-                if !Self::is_item_popup_eligible(item, &self.push.prefs, &self.reminder_governance)
+                let is_live_call = item.id.starts_with("live-call:")
+                    || matches!(item.popup_widget, NotificationPopupWidget::LiveCall { .. });
+                if snoozed_now && !is_live_call {
+                    return false;
+                }
+                if !is_live_call
+                    && !Self::is_item_popup_eligible(
+                        item,
+                        &self.push.prefs,
+                        &self.reminder_governance,
+                    )
                 {
                     return false;
                 }
-                if self.notification_center.popup_shown_ids.contains(&item.id) {
+                if !is_live_call && self.notification_center.popup_shown_ids.contains(&item.id) {
                     return false;
                 }
-                if !prev_queue_set.contains(&item.id) && self.notification_center.delivered_events.contains(&self.popup_delivery_key(item)) {
+                if !is_live_call
+                    && !prev_queue_set.contains(&item.id)
+                    && !self.notification_center.is_reply_sending(&item.id)
+                    && self.has_delivered_popup_event(item)
+                {
                     return false;
                 }
                 let is_current = self.demo_mode
-                    || matches!(item.popup_widget, NotificationPopupWidget::LiveCall { .. })
+                    || is_live_call
                     || prev_queue_set.contains(&item.id)
+                    || self.notification_center.is_reply_sending(&item.id)
                     || self
                         .notification_center
                         .is_current_popup_event(item, now_ms);
@@ -4056,7 +4344,7 @@ impl Companion {
         });
         let newest_arrival = eligible_items.iter().find(|item| {
             !prev_queue_set.contains(&item.id)
-                || previous_events.get(&item.id).is_some_and(|key| key != &self.popup_delivery_key(item))
+                || previous_events.get(&item.id).is_some_and(|sfx| sfx != &popup_delivery_event_suffix(item))
         }).map(|item| item.id.clone());
         let live_call = eligible_items.iter().find(|item| item.id.starts_with("live-call:")).map(|item| item.id.clone());
         self.notification_center.popup_queue = eligible_items.into_iter().map(|item| item.id.clone()).collect();
@@ -4182,6 +4470,93 @@ impl Companion {
         }
     }
 
+    pub(crate) fn on_popup_im_reply_finished(
+        &mut self,
+        client_msg_id: &str,
+        result: Result<(), String>,
+    ) {
+        let matched_key = self
+            .notification_center
+            .pending_popup_replies
+            .iter()
+            .find(|(_, p)| p.im_client_msg_id.as_deref() == Some(client_msg_id))
+            .map(|(k, _)| k.clone());
+        if let Some(item_id) = matched_key {
+            if let Some(pending) = self.notification_center.pending_popup_replies.remove(&item_id) {
+                self.finish_pending_popup_reply_inner(&pending.item_id, &pending.text, result);
+                self.sync_notification_center();
+            }
+        }
+    }
+
+    pub(crate) fn drain_popup_sms_reply_outcomes(&mut self) -> bool {
+        let changed = self.drain_popup_sms_reply_outcomes_inner();
+        if changed {
+            self.sync_notification_center();
+        }
+        changed
+    }
+
+    fn drain_popup_sms_reply_outcomes_inner(&mut self) -> bool {
+        let outcomes: Vec<PopupSmsReplyOutcome> = {
+            let Ok(mut guard) = self.notification_center.sms_reply_outcomes.lock() else {
+                return false;
+            };
+            std::mem::take(&mut *guard)
+        };
+        if outcomes.is_empty() {
+            return false;
+        }
+        for outcome in outcomes {
+            self.notification_center
+                .pending_popup_replies
+                .remove(&outcome.item_id);
+            self.finish_pending_popup_reply_inner(&outcome.item_id, &outcome.text, outcome.result);
+        }
+        true
+    }
+
+    fn finish_pending_popup_reply_inner(
+        &mut self,
+        item_id: &str,
+        text: &str,
+        result: Result<(), String>,
+    ) {
+        let now_ms = Local::now().timestamp_millis();
+        match result {
+            Ok(()) => {
+                self.notification_center.popup_reply_drafts.remove(item_id);
+                if self.notification_center.popup_reply_item_id.as_deref() == Some(item_id) {
+                    self.fields[super::F_TOAST_REPLY].clear();
+                }
+                self.mark_underlying_source_read(item_id);
+                self.notification_center
+                    .popup_shown_ids
+                    .insert(item_id.to_string());
+                self.notification_center
+                    .popup_queue
+                    .retain(|id| id != item_id);
+                if self.notification_center.active_popup_id.as_deref() == Some(item_id) {
+                    self.notification_center.active_popup_id = None;
+                    self.notification_center.popup_hovered = false;
+                    self.notification_center.reset_hover_dispatch_cache();
+                }
+                self.notification_center.popup_feedback_text =
+                    Some(("✓ 回复已发送".into(), now_ms + 1_500));
+                self.error = false;
+                self.notification_center.save();
+            }
+            Err(err) => {
+                self.restore_popup_reply_draft(item_id, text);
+                let msg = format!("回复发送失败：{err}");
+                self.notification_center.popup_feedback_text =
+                    Some((msg.clone(), now_ms + 5_000));
+                self.status = msg;
+                self.error = true;
+            }
+        }
+    }
+
     pub(crate) fn submit_popup_quick_reply(&mut self, item_id: &str, text: &str) {
         let trimmed = text.trim();
         if trimmed.is_empty() {
@@ -4204,6 +4579,23 @@ impl Companion {
             self.error = true;
             return;
         };
+        if self.notification_center.is_reply_sending(item_id) {
+            self.status = "正在发送回复，等待手机确认…".into();
+            self.notification_center.popup_feedback_text =
+                Some((self.status.clone(), now_ms + 5_000));
+            return;
+        }
+
+        if item_id.starts_with("otp:")
+            || matches!(matched_item.popup_widget, NotificationPopupWidget::OtpCode { .. })
+            || (!self.demo_mode && !matched_item.supports_inline_reply())
+        {
+            self.status = "当前通知未提供后台回复入口，消息未发送；请打开会话查看".into();
+            self.error = true;
+            self.notification_center.popup_feedback_text =
+                Some((self.status.clone(), now_ms + 5_000));
+            return;
+        }
 
         let is_sms_or_call = matched_item.package_name == "com.android.mms"
             || item_id.starts_with("sms:")
@@ -4278,9 +4670,46 @@ impl Companion {
                     let sim = self.selected_sim;
                     let to = target_addr.clone();
                     let body = trimmed.to_string();
+                    let outcome_sink = self.notification_center.sms_reply_outcomes.clone();
+                    let reply_item_id = item_id.to_string();
+                    let reply_text = trimmed.to_string();
+                    self.notification_center.pending_popup_replies.insert(
+                        reply_item_id.clone(),
+                        PendingPopupReply {
+                            item_id: reply_item_id.clone(),
+                            text: reply_text.clone(),
+                            started_ms: now_ms,
+                            im_client_msg_id: None,
+                        },
+                    );
                     let (tx, rx) = std::sync::mpsc::channel();
                     self.bg_receivers.push((Page::Sms, None, rx));
                     std::thread::spawn(move || {
+                        struct SmsOutcomeGuard {
+                            sink: std::sync::Arc<std::sync::Mutex<Vec<PopupSmsReplyOutcome>>>,
+                            item_id: String,
+                            text: String,
+                            disarmed: bool,
+                        }
+                        impl Drop for SmsOutcomeGuard {
+                            fn drop(&mut self) {
+                                if !self.disarmed {
+                                    if let Ok(mut g) = self.sink.lock() {
+                                        g.push(PopupSmsReplyOutcome {
+                                            item_id: self.item_id.clone(),
+                                            text: self.text.clone(),
+                                            result: Err("短信回复后台线程意外中断".into()),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        let mut guard = SmsOutcomeGuard {
+                            sink: outcome_sink.clone(),
+                            item_id: reply_item_id.clone(),
+                            text: reply_text.clone(),
+                            disarmed: false,
+                        };
                         let outcome = stepx_companion::adb::Adb::discover().and_then(|adb| {
                             device.transport = device.resolve_active_transport(&adb)?;
                             let plan = stepx_companion::bridge::sms_prepare(
@@ -4295,15 +4724,28 @@ impl Companion {
                             );
                             Ok(super::Outcome::SmsSent(status, messages))
                         });
+                        let popup_res = outcome
+                            .as_ref()
+                            .map(|_| ())
+                            .map_err(|e| format!("{e:#}"));
+                        if let Ok(mut g) = outcome_sink.lock() {
+                            g.push(PopupSmsReplyOutcome {
+                                item_id: reply_item_id,
+                                text: reply_text,
+                                result: popup_res,
+                            });
+                        }
+                        guard.disarmed = true;
                         let _ = tx.send(outcome);
                     });
                 }
+                self.status = format!("正在通过手机向 {target_addr} 发送短信，等待确认…");
+                self.error = false;
+                self.notification_center.popup_feedback_text =
+                    Some(("正在发送回复，等待手机确认…".into(), now_ms + 15_000));
+                return;
             }
-            self.status = if self.demo_mode {
-                format!("演示：已向 {target_addr} 模拟发送短信回复")
-            } else {
-                format!("正在通过手机向 {target_addr} 发送短信，等待确认…")
-            };
+            self.status = format!("演示：已向 {target_addr} 模拟发送短信回复");
             self.error = false;
         } else if item_id.starts_with("im-thread:")
             || item_id.starts_with("push-notif:")
@@ -4408,13 +4850,27 @@ impl Companion {
                 return;
             };
             if !self.demo_mode && self.selected.is_some() {
-                self.dispatch_im_reply(
+                let Some(client_msg_id) = self.dispatch_im_reply_for_popup(
                     &thread_id,
                     &package_name,
                     &title,
                     trimmed,
                     notif_key.as_deref(),
+                ) else {
+                    return;
+                };
+                self.notification_center.pending_popup_replies.insert(
+                    item_id.to_string(),
+                    PendingPopupReply {
+                        item_id: item_id.to_string(),
+                        text: trimmed.to_string(),
+                        started_ms: now_ms,
+                        im_client_msg_id: Some(client_msg_id),
+                    },
                 );
+                self.notification_center.popup_feedback_text =
+                    Some(("正在发送回复，等待手机确认…".into(), now_ms + 15_000));
+                return;
             } else {
                 let client_msg_id = format!("stepx-{now_ms}-{}", self.push.snapshot.revision);
                 let (effective_tid, effective_title) =
@@ -4454,12 +4910,7 @@ impl Companion {
             .popup_queue
             .retain(|id| id != item_id);
         self.notification_center.popup_feedback_text = Some((
-            if self.demo_mode {
-                "演示：已模拟回复"
-            } else {
-                "正在发送，等待手机确认…"
-            }
-            .into(),
+            "演示：已模拟回复".into(),
             now_ms + 1_200,
         ));
         self.notification_center.save();
@@ -4587,17 +5038,28 @@ impl Companion {
                             Page::Notifications
                         };
                         self.notification_center.drawer_open = false;
-                        self.notification_center
-                            .popup_queue
-                            .retain(|queued| queued != &id);
-                        self.notification_center.popup_shown_ids.insert(id.clone());
-                        self.notification_center.active_popup_id = None;
+                        if !id.starts_with("live-call:")
+                            && !matches!(item.popup_widget, NotificationPopupWidget::LiveCall { .. })
+                        {
+                            self.notification_center
+                                .popup_queue
+                                .retain(|queued| queued != &id);
+                            self.notification_center.popup_shown_ids.insert(id.clone());
+                            if self.notification_center.active_popup_id.as_deref()
+                                == Some(id.as_str())
+                            {
+                                self.notification_center.active_popup_id = None;
+                                self.notification_center.popup_hovered = false;
+                                self.notification_center.reset_hover_dispatch_cache();
+                            }
+                        }
                         if let Some(key) = id
                             .strip_prefix("push-notif:")
                             .or_else(|| id.strip_prefix("push:"))
                         {
                             self.push.selected_key = Some(key.into());
                         }
+                        self.sync_notification_center();
                         self.status = "已打开提醒详情".into();
                         self.error = false;
                     }
@@ -4605,18 +5067,18 @@ impl Companion {
             }
             NotificationCenterAction::ToggleDrawer => {
                 self.notification_center.drawer_open = !self.notification_center.drawer_open;
+                self.notification_center.popup_hovered = false;
+                self.notification_center.popup_menu_item_id = None;
+                self.notification_center.reset_hover_dispatch_cache();
                 if self.notification_center.drawer_open {
                     self.notification_center.drawer_list_started = Some(Instant::now());
                     self.dismiss_search_for_header();
                     self.back_screen.live_capsule_popover_open = false;
                     self.header_actions_open = false;
-                    for id in self.notification_center.popup_queue.drain(..) {
-                        self.notification_center.popup_shown_ids.insert(id);
-                    }
-                    self.notification_center.popup_cursor = 0;
-                    self.notification_center.active_popup_id = None;
                     self.notification_center.popup_remaining_ms = 0;
                     self.notification_center.popup_total_ms = 0;
+                    self.sync_notification_center();
+                } else {
                     self.sync_notification_center();
                 }
             }
@@ -4627,6 +5089,8 @@ impl Companion {
                 self.notification_center.alert_mode = mode;
                 if mode != NotificationAlertMode::PopupAndBadge {
                     self.notification_center.active_popup_id = None;
+                    self.notification_center.popup_hovered = false;
+                    self.notification_center.reset_hover_dispatch_cache();
                     self.push.active_toasts.clear();
                     self.push.prefs.popup_mode = stepx_companion::desktop_notify::PopupMode::Silent;
                     self.settings.notify_draft.popup_mode =
@@ -4679,6 +5143,10 @@ impl Companion {
                     .as_ref()
                     .and_then(|i| i.primary_action.as_ref().map(|(_, act)| act.clone()));
 
+                let is_live_call = id.starts_with("live-call:")
+                    || matched_item.as_ref().is_some_and(|i| {
+                        matches!(i.popup_widget, NotificationPopupWidget::LiveCall { .. })
+                    });
                 let now_ms = Local::now().timestamp_millis();
                 if let Some(ref item) = matched_item {
                     if let NotificationPopupWidget::ExpressPickup {
@@ -4691,18 +5159,28 @@ impl Companion {
                             self.back_screen.record_clipboard_history(&code);
                             self.back_screen.last_synced_desktop_clip = code.clone();
                             self.push.clipboard_preview = code.chars().take(240).collect();
+                            let fb = if self.push.prefs.privacy_mask {
+                                "✓ 已复制取件码 ••••••".to_string()
+                            } else {
+                                format!("✓ 已复制取件码 {code}")
+                            };
                             self.notification_center.popup_feedback_text =
-                                Some((format!("✓ 已复制取件码 {code}"), now_ms + 1_200));
+                                Some((fb, now_ms + 1_200));
                         }
                     }
                 }
-                self.mark_underlying_source_read(&id);
-                for qid in self.notification_center.popup_queue.drain(..) {
-                    self.notification_center.popup_shown_ids.insert(qid);
+                if !is_live_call {
+                    self.mark_underlying_source_read(&id);
+                    self.notification_center
+                        .popup_queue
+                        .retain(|qid| qid != &id);
+                    self.notification_center.popup_shown_ids.insert(id.clone());
+                    if self.notification_center.active_popup_id.as_deref() == Some(id.as_str()) {
+                        self.notification_center.active_popup_id = None;
+                        self.notification_center.popup_hovered = false;
+                        self.notification_center.reset_hover_dispatch_cache();
+                    }
                 }
-                self.notification_center.popup_shown_ids.insert(id.clone());
-                self.notification_center.popup_cursor = 0;
-                self.notification_center.active_popup_id = None;
                 if let Some(key) = id
                     .strip_prefix("push-notif:")
                     .or_else(|| id.strip_prefix("push:"))
@@ -4720,14 +5198,34 @@ impl Companion {
                             self.push
                                 .active_toasts
                                 .retain(|t| t.otp_code.as_deref() != Some(text.as_str()));
-                            let fb = if label.contains("验证码") {
-                                "✓ 已复制验证码".to_string()
+                            let (fb, status_msg) = if self.push.prefs.privacy_mask {
+                                if label.contains("验证码") {
+                                    (
+                                        "✓ 已复制验证码 ••••••".to_string(),
+                                        "已复制验证码 ••••••".to_string(),
+                                    )
+                                } else if label.contains("取件码") {
+                                    (
+                                        "✓ 已复制取件码 ••••••".to_string(),
+                                        "已复制取件码 ••••••".to_string(),
+                                    )
+                                } else {
+                                    (
+                                        "✓ 已复制内容 ••••••".to_string(),
+                                        "已复制内容 ••••••".to_string(),
+                                    )
+                                }
                             } else {
-                                format!("✓ 已复制{label}")
+                                let fb = if label.contains("验证码") {
+                                    "✓ 已复制验证码".to_string()
+                                } else {
+                                    format!("✓ 已复制{label}")
+                                };
+                                (fb, format!("已复制{label}：{text}"))
                             };
                             self.notification_center.popup_feedback_text =
                                 Some((fb, now_ms + 1_200));
-                            self.status = format!("已复制{label}：{text}");
+                            self.status = status_msg;
                             self.error = false;
                         }
                         NotificationPrimaryAction::OpenImThread { thread_id } => {
@@ -4877,6 +5375,8 @@ impl Companion {
                 self.notification_center.popup_queue.retain(|q| q != &id);
                 if self.notification_center.active_popup_id.as_deref() == Some(id.as_str()) {
                     self.notification_center.active_popup_id = None;
+                    self.notification_center.popup_hovered = false;
+                    self.notification_center.reset_hover_dispatch_cache();
                 }
                 self.sync_notification_center();
                 self.notification_center.save();
@@ -4886,6 +5386,7 @@ impl Companion {
                     .notification_center
                     .items
                     .iter()
+                    .filter(|i| !i.id.starts_with("live-call:"))
                     .map(|i| i.id.clone())
                     .collect();
                 for id in all_ids {
@@ -4896,9 +5397,20 @@ impl Companion {
                         .smart_display_cleared_ids
                         .insert(format!("raw-notif:{}", notif.key));
                 }
-                self.notification_center.popup_queue.clear();
+                self.notification_center
+                    .popup_queue
+                    .retain(|id| id.starts_with("live-call:"));
                 self.notification_center.popup_cursor = 0;
-                self.notification_center.active_popup_id = None;
+                if self
+                    .notification_center
+                    .active_popup_id
+                    .as_deref()
+                    .is_none_or(|id| !id.starts_with("live-call:"))
+                {
+                    self.notification_center.active_popup_id = None;
+                }
+                self.notification_center.popup_hovered = false;
+                self.notification_center.reset_hover_dispatch_cache();
                 self.sync_notification_center();
                 self.notification_center.save();
             }
@@ -4908,6 +5420,8 @@ impl Companion {
                 self.notification_center.popup_queue.retain(|q| q != &id);
                 if self.notification_center.active_popup_id.as_deref() == Some(id.as_str()) {
                     self.notification_center.active_popup_id = None;
+                    self.notification_center.popup_hovered = false;
+                    self.notification_center.reset_hover_dispatch_cache();
                 }
                 self.sync_notification_center();
                 self.notification_center.save();
@@ -4933,6 +5447,8 @@ impl Companion {
                 self.notification_center.save();
             }
             NotificationCenterAction::DismissPopup => {
+                self.notification_center.popup_hovered = false;
+                self.notification_center.reset_hover_dispatch_cache();
                 if !self.notification_center.popup_queue.is_empty() {
                     let idx = self
                         .notification_center
@@ -4952,6 +5468,8 @@ impl Companion {
             NotificationCenterAction::SwitchToBadgeOnlyFromPopup => {
                 self.notification_center.alert_mode = NotificationAlertMode::BadgeOnly;
                 self.notification_center.active_popup_id = None;
+                self.notification_center.popup_hovered = false;
+                self.notification_center.reset_hover_dispatch_cache();
                 self.push.active_toasts.clear();
                 self.notification_center.save();
                 self.sync_notification_center();
@@ -4978,8 +5496,15 @@ impl Companion {
                 }
             }
             NotificationCenterAction::PopupHoverChanged(hovered) => {
-                self.notification_center.popup_hovered = hovered;
-                if hovered
+                let effective_hovered = hovered && self.notification_active_popup().is_some();
+                self.notification_center
+                    .last_dispatched_hover
+                    .set(Some(effective_hovered));
+                if self.notification_center.popup_hovered == effective_hovered {
+                    return;
+                }
+                self.notification_center.popup_hovered = effective_hovered;
+                if effective_hovered
                     && self.notification_center.popup_total_ms > 0
                     && self.notification_center.popup_remaining_ms == 0
                 {
@@ -4990,12 +5515,15 @@ impl Companion {
             NotificationCenterAction::SnoozePopups { duration_ms } => {
                 let now_ms = Local::now().timestamp_millis();
                 self.notification_center.snooze_until_ms = Some(now_ms + duration_ms.max(0));
-                self.notification_center.popup_queue.clear();
+                self.notification_center
+                    .popup_queue
+                    .retain(|id| id.starts_with("live-call:"));
                 self.notification_center.popup_cursor = 0;
-                self.notification_center.active_popup_id = None;
                 self.notification_center.popup_remaining_ms = 0;
                 self.notification_center.popup_total_ms = 0;
                 self.notification_center.popup_hovered = false;
+                self.notification_center.reset_hover_dispatch_cache();
+                self.sync_active_popup_from_queue(false);
                 self.push.active_toasts.clear();
                 self.status = format!(
                     "弹窗已暂停至 {}",
@@ -5031,7 +5559,7 @@ impl Companion {
                 let text = self.fields[super::F_TOAST_REPLY].text.trim().to_string();
                 if !text.is_empty() {
                     self.submit_popup_quick_reply(&item_id, &text);
-                    if !self.error {
+                    if !self.error && !self.notification_center.is_reply_sending(&item_id) {
                         self.notification_center.popup_reply_drafts.remove(&item_id);
                         if self.notification_center.popup_reply_item_id.as_deref()
                             == Some(item_id.as_str())
@@ -7269,5 +7797,266 @@ mod tests {
         app.sync_notification_center();
         assert!(app.notification_center.popup_queue.is_empty(),
             "reloading cached history must not replay delivered events");
+    }
+
+    #[test]
+    fn incoming_live_call_preempts_hovered_or_reply_focused_popup_and_preserves_draft() {
+        let (_dir, _guard, mut app) = setup_test_companion();
+        let now = Local::now().timestamp_millis();
+        app.selected = Some(Device {
+            serial: "STEPXTEST8DB89E4B8927".into(),
+            ..Default::default()
+        });
+        app.push.snapshot.threads = vec![ImThread {
+            thread_id: "wx:alice".into(),
+            package_name: "com.tencent.mm".into(),
+            title: "Alice".into(),
+            last_message: "今晚有空吗？".into(),
+            unread_count: 1,
+            last_timestamp_ms: now,
+            can_remote_reply: true,
+            ..Default::default()
+        }];
+        app.sync_notification_center();
+        assert_eq!(
+            app.notification_active_popup().unwrap().id,
+            "im-thread:wx:alice"
+        );
+
+        app.notification_center.popup_hovered = true;
+        app.desktop_popup.reply_focused = true;
+        app.focus = Some(super::super::F_TOAST_REPLY);
+        app.fields[super::super::F_TOAST_REPLY].set("等我接个电话马上回你");
+
+        app.push.snapshot.live_call = stepx_companion::phone::LiveCall {
+            available: true,
+            id: "incoming-99".into(),
+            state: "ringing".into(),
+            number: "13800009996".into(),
+            started_ms: now + 50,
+            observed_ms: now + 50,
+            ..Default::default()
+        };
+        app.sync_notification_center();
+
+        assert_eq!(
+            app.notification_active_popup().unwrap().id,
+            "live-call:incoming-99"
+        );
+        assert!(!app.notification_center.popup_hovered);
+        assert!(!app.desktop_popup.reply_focused);
+        assert_eq!(
+            app.notification_center
+                .popup_reply_drafts
+                .get("im-thread:wx:alice")
+                .map(String::as_str),
+            Some("等我接个电话马上回你")
+        );
+
+        // When call ends, returning to Alice's card restores her draft
+        app.push.snapshot.live_call.state = "idle".into();
+        app.sync_notification_center();
+        assert_eq!(
+            app.notification_active_popup().unwrap().id,
+            "im-thread:wx:alice"
+        );
+        assert_eq!(
+            app.fields[super::super::F_TOAST_REPLY].text,
+            "等我接个电话马上回你"
+        );
+    }
+
+    #[test]
+    fn startup_and_reconnect_transport_transitions_do_not_repop_delivered_notifications() {
+        let (_dir, _guard, mut app) = setup_test_companion();
+        app.demo_mode = false;
+        let now = Local::now().timestamp_millis();
+        app.selected = Some(Device {
+            serial: "STEPXTEST8DB89E4B8927".into(),
+            transport: "STEPXTEST8DB89E4B8927".into(),
+            ..Default::default()
+        });
+        app.push.snapshot.threads = vec![ImThread {
+            thread_id: "wx:dedup".into(),
+            package_name: "com.tencent.mm".into(),
+            title: "项目群".into(),
+            last_message: "构建通过".into(),
+            unread_count: 1,
+            last_timestamp_ms: now,
+            ..Default::default()
+        }];
+        app.sync_notification_center();
+        assert_eq!(app.notification_center.popup_queue.len(), 1);
+        app.apply_notification_center_action(NotificationCenterAction::ClearPopupBatch {
+            receipts: app.popup_batch_receipts(),
+        });
+        assert!(app.notification_center.popup_queue.is_empty());
+
+        // Reload from disk while selected is None ("desktop"), then wireless IP, then mDNS
+        app.selected = None;
+        app.last_connected_serial = None;
+        app.auto_sync.device_serial = None;
+        app.notification_center = NotificationCenterState::load_from_path(&persistence_path());
+        app.sync_notification_center();
+        assert!(app.notification_center.popup_queue.is_empty());
+
+        app.selected = Some(Device {
+            serial: "192.168.1.28:41235".into(),
+            transport: "192.168.1.28:41235".into(),
+            ..Default::default()
+        });
+        app.sync_notification_center();
+        assert!(app.notification_center.popup_queue.is_empty());
+
+        app.selected = Some(Device {
+            serial: "adb-STEPXTEST8DB89E4B8927-a1b2c3._adb-tls-connect._tcp".into(),
+            transport: "192.168.1.28:39001".into(),
+            ..Default::default()
+        });
+        app.sync_notification_center();
+        assert!(app.notification_center.popup_queue.is_empty());
+    }
+
+    #[test]
+    fn drawer_toggle_trigger_item_and_snooze_preserve_live_call_and_unseen_queued_popups() {
+        let (_dir, _guard, mut app) = setup_test_companion();
+        let now = Local::now().timestamp_millis();
+        app.selected = Some(Device {
+            serial: "STEPXTEST8DB89E4B8927".into(),
+            ..Default::default()
+        });
+        app.push.snapshot.threads = popup_test_threads();
+        app.push.snapshot.live_call = stepx_companion::phone::LiveCall {
+            available: true,
+            id: "call-77".into(),
+            state: "ringing".into(),
+            number: "13800009367".into(),
+            started_ms: now,
+            observed_ms: now,
+            ..Default::default()
+        };
+        app.sync_notification_center();
+        assert_eq!(app.notification_center.popup_queue.len(), 4);
+
+        // ToggleDrawer open & closed must not drain or mark-shown live-call or 2/N..N/N
+        app.apply_notification_center_action(NotificationCenterAction::ToggleDrawer);
+        app.apply_notification_center_action(NotificationCenterAction::ToggleDrawer);
+        assert_eq!(app.notification_center.popup_queue.len(), 4);
+        assert!(app.notification_center.popup_shown_ids.is_empty());
+
+        // TriggerItem on one IM thread only handles that item, preserving live-call & remaining 2 items
+        app.apply_notification_center_action(NotificationCenterAction::TriggerItem(
+            "im-thread:wx:one".into(),
+        ));
+        assert!(app
+            .notification_center
+            .popup_queue
+            .contains(&"live-call:call-77".to_string()));
+        assert!(app
+            .notification_center
+            .popup_queue
+            .contains(&"im-thread:wx:two".to_string()));
+        assert!(app
+            .notification_center
+            .popup_queue
+            .contains(&"im-thread:wa:one".to_string()));
+
+        // SnoozePopups keeps live-call visible and preserves unseen queued items for ClearSnooze
+        app.apply_notification_center_action(NotificationCenterAction::SnoozePopups {
+            duration_ms: 600_000,
+        });
+        assert_eq!(
+            app.notification_active_popup().unwrap().id,
+            "live-call:call-77"
+        );
+        app.push.snapshot.live_call.state = "idle".into();
+        app.apply_notification_center_action(NotificationCenterAction::ClearSnooze);
+        assert_eq!(app.notification_center.popup_queue.len(), 2);
+    }
+
+    #[test]
+    fn otp_blocks_inline_reply_and_im_reply_waits_for_confirmation_before_dismiss() {
+        let (_dir, _guard, mut app) = setup_test_companion();
+        app.demo_mode = false;
+        let now = Local::now().timestamp_millis();
+        app.selected = Some(Device {
+            serial: "STEPXTEST8DB89E4B8927".into(),
+            ..Default::default()
+        });
+        app.push.snapshot.otp_banners.push(OtpBanner {
+            code: "482910".into(),
+            source_app: "短信".into(),
+            title: "验证码".into(),
+            raw_text: "您的验证码是 482910".into(),
+            timestamp_ms: now - 100,
+            ..Default::default()
+        });
+        app.push.snapshot.threads = vec![ImThread {
+            thread_id: "wx:confirm".into(),
+            package_name: "com.tencent.mm".into(),
+            title: "王五".into(),
+            last_message: "在吗".into(),
+            unread_count: 1,
+            last_timestamp_ms: now,
+            can_remote_reply: true,
+            ..Default::default()
+        }];
+        app.sync_notification_center();
+
+        let otp_item = app
+            .notification_center
+            .items
+            .iter()
+            .find(|i| i.id == "otp:482910")
+            .unwrap();
+        assert!(!otp_item.can_inline_reply);
+        assert!(!otp_item.supports_inline_reply());
+        app.submit_popup_quick_reply("otp:482910", "谢谢");
+        assert!(app.error && app.status.contains("未发送"));
+
+        // Privacy mask hides OTP digits in TriggerItem status
+        app.push.prefs.privacy_mask = true;
+        app.apply_notification_center_action(NotificationCenterAction::TriggerItem(
+            "otp:482910".into(),
+        ));
+        assert!(!app.status.contains("482910"));
+
+        // Simulate pending IM reply in flight: failure keeps popup & restores draft; success dismisses
+        let item_id = "im-thread:wx:confirm".to_string();
+        app.notification_center.pending_popup_replies.insert(
+            item_id.clone(),
+            PendingPopupReply {
+                item_id: item_id.clone(),
+                text: "稍等五分钟".into(),
+                started_ms: now,
+                im_client_msg_id: Some("cid-fail".into()),
+            },
+        );
+        app.on_popup_im_reply_finished("cid-fail", Err("网络中断".into()));
+        assert!(!app.notification_center.read_ids.contains(&item_id));
+        assert_eq!(
+            app.notification_center
+                .popup_reply_drafts
+                .get(&item_id)
+                .map(String::as_str),
+            Some("稍等五分钟")
+        );
+
+        app.notification_center.pending_popup_replies.insert(
+            item_id.clone(),
+            PendingPopupReply {
+                item_id: item_id.clone(),
+                text: "稍等五分钟".into(),
+                started_ms: now,
+                im_client_msg_id: Some("cid-ok".into()),
+            },
+        );
+        app.on_popup_im_reply_finished("cid-ok", Ok(()));
+        assert!(app.notification_center.read_ids.contains(&item_id));
+        assert!(!app.notification_center.popup_queue.contains(&item_id));
+        assert!(!app
+            .notification_center
+            .popup_reply_drafts
+            .contains_key(&item_id));
     }
 }

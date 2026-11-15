@@ -343,6 +343,11 @@ pub(super) struct BackScreenUiState {
     pub gallery_selected: usize,
     pub gallery_zoom_pct: u16,
     pub gallery_lightbox: bool,
+    pub gallery_rotating_path: Option<String>,
+    gallery_cache_dir: Option<std::sync::Arc<tempfile::TempDir>>,
+    mcp_status_rx: Option<mpsc::Receiver<(String, Option<(bool, String)>)>>,
+    last_mcp_status_poll: Option<Instant>,
+    pomodoro_restore_rx: Option<mpsc::Receiver<(String, std::result::Result<String, String>)>>,
     pub gallery_grid_cols: u8,
     pub gallery_rotations: std::collections::HashMap<String, u16>,
     pub completed_calendar_events: std::collections::HashSet<i64>,
@@ -368,6 +373,49 @@ impl BackScreenUiState {
         self.pomodoro_lane.advance();
         self.pomodoro_request = None;
         self.pomodoro_device = None;
+    }
+
+    pub(super) fn disarm_pomodoro_timer(&mut self) {
+        self.cancel_pomodoro_commands();
+        self.pomodoro_active = false;
+        self.pomodoro_started_at = None;
+        self.pomodoro_last_remaining_secs = None;
+        if self
+            .active_phone_capsule
+            .as_ref()
+            .is_some_and(|(tag, _, _, _)| tag == "stepx_pomodoro")
+        {
+            self.active_phone_capsule = None;
+        }
+    }
+
+    pub(super) fn ensure_gallery_cache_dir(&mut self) -> Result<PathBuf> {
+        if let Some(dir) = &self.gallery_cache_dir {
+            if dir.path().is_dir() {
+                return Ok(dir.path().to_path_buf());
+            }
+        }
+        let parent = stepx_companion::resources::user_state()
+            .join("cache")
+            .join("gallery");
+        std::fs::create_dir_all(&parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700));
+        }
+        let temp_dir = tempfile::Builder::new()
+            .prefix("thumbs-")
+            .tempdir_in(&parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ =
+                std::fs::set_permissions(temp_dir.path(), std::fs::Permissions::from_mode(0o700));
+        }
+        let path = temp_dir.path().to_path_buf();
+        self.gallery_cache_dir = Some(std::sync::Arc::new(temp_dir));
+        Ok(path)
     }
 
     fn accept_pomodoro_reply(
@@ -510,6 +558,11 @@ impl Default for BackScreenUiState {
             gallery_selected: 0,
             gallery_zoom_pct: 100,
             gallery_lightbox: false,
+            gallery_rotating_path: None,
+            gallery_cache_dir: None,
+            mcp_status_rx: None,
+            last_mcp_status_poll: None,
+            pomodoro_restore_rx: None,
             gallery_grid_cols: 3,
             gallery_rotations: std::collections::HashMap::new(),
             completed_calendar_events: std::collections::HashSet::new(),
@@ -676,6 +729,9 @@ impl BackScreenUiState {
         self.preview_visible
             || self.pomodoro_active
             || self.pomodoro_request.is_some()
+            || self.pomodoro_restore_rx.is_some()
+            || (self.applied_to_phone && self.companion_mode != "native" && !self.playing)
+            || self.mcp_status_rx.is_some()
             || self.playback.is_some()
             || self.generation.is_some()
             || self.companion_rx.is_some()
@@ -1303,6 +1359,7 @@ impl Companion {
                 })?;
             }
             BackScreenAction::SaveMarquee => {
+                self.back_screen.disarm_pomodoro_timer();
                 let text = self.fields[F_BACK_MARQUEE].text.clone();
                 let scroll = self.matrix_marquee_on;
                 let invert = self.back_screen.config.invert;
@@ -1339,6 +1396,7 @@ impl Companion {
                     "请先确认清除旧背屏图案"
                 );
                 self.back_screen.clear_confirmation = false;
+                self.back_screen.disarm_pomodoro_timer();
                 self.start_backscreen_setting(|adb, device| {
                     let transport = device.resolve_active_transport(adb)?;
                     let _ = bs::release_custom_frame_owner(adb, device);
@@ -1377,9 +1435,11 @@ impl Companion {
                 }
             }
             BackScreenAction::Play => {
+                self.back_screen.disarm_pomodoro_timer();
                 self.begin_backscreen_apply()?;
             }
             BackScreenAction::Stop => {
+                self.back_screen.disarm_pomodoro_timer();
                 self.back_screen.pending_play = false;
                 if let Some(playback) = &self.back_screen.playback {
                     playback.cancel();
@@ -3595,14 +3655,13 @@ impl Companion {
                         .as_deref()
                         .is_none_or(|p| !std::path::Path::new(p).is_file());
                     if needs_pull {
+                        let remote = item.remote_path.clone();
+                        let name = item.name.clone();
                         if let Some(device) = self.selected.clone() {
-                            let remote = item.remote_path.clone();
-                            let name = item.name.clone();
                             let sel_idx = *idx;
+                            let cache_dir = self.back_screen.ensure_gallery_cache_dir()?;
                             let (tx, rx) = async_channel::bounded(1);
                             std::thread::spawn(move || {
-                                let cache_dir = std::env::temp_dir().join("stepx-gallery-cache");
-                                let _ = std::fs::create_dir_all(&cache_dir);
                                 let safe_name: String = name
                                     .chars()
                                     .map(|c| {
@@ -3620,7 +3679,7 @@ impl Companion {
                                 let local_file =
                                     cache_dir.join(format!("sel_{sel_idx}_{safe_name}"));
                                 let res = Adb::discover().and_then(|adb| {
-                                    storage::pull(&adb, &device, &remote, &local_file)?;
+                                    storage::pull_overwrite(&adb, &device, &remote, &local_file)?;
                                     Ok(local_file)
                                 });
                                 let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
@@ -3718,6 +3777,10 @@ impl Companion {
                 }
             }
             BackScreenAction::GalleryRotateRight(remote_path) => {
+                if self.back_screen.gallery_rotating_path.as_deref() == Some(remote_path.as_str()) {
+                    self.status = "正在旋转该照片，请稍候…".into();
+                    return Ok(());
+                }
                 let prev_deg = self
                     .back_screen
                     .gallery_rotations
@@ -3737,74 +3800,112 @@ impl Companion {
                         .local_thumb_path
                         .clone()
                         .filter(|p| std::path::Path::new(p).is_file());
+                    let name = self.back_screen.gallery_items[item_idx].name.clone();
                     if let Some(thumb_str) = current_thumb {
+                        let cache_dir = self.back_screen.ensure_gallery_cache_dir()?;
                         let thumb_path = PathBuf::from(&thumb_str);
-                        let img = image::open(&thumb_path)
-                            .map_err(|e| anyhow::anyhow!("读取本地预览图进行旋转失败：{e}"))?;
-                        let rotated = img.rotate90();
-                        let cache_dir = std::env::temp_dir().join("stepx-gallery-cache");
-                        let _ = std::fs::create_dir_all(&cache_dir);
-                        let rot_path = cache_dir.join(format!("rot_{}_{}.png", item_idx, next_deg));
-                        rotated
-                            .save(&rot_path)
-                            .map_err(|e| anyhow::anyhow!("保存旋转后的预览图失败：{e}"))?;
-                        let rot_str = rot_path.to_string_lossy().into_owned();
-                        let remote_path_ref = std::path::Path::new(remote_path);
-                        if remote_path_ref.is_file() {
-                            save_image_matching_path_format(&rotated, remote_path_ref)
-                                .map_err(|e| anyhow::anyhow!("写回旋转图片到原文件失败：{e}"))?;
-                        } else if !self.demo_mode && remote_path.starts_with('/') {
-                            if let Some(device) = self.selected.clone() {
-                                let remote_for_push = remote_path.clone();
-                                let ext = remote_path_ref
-                                    .extension()
-                                    .and_then(|s| s.to_str())
-                                    .unwrap_or("jpg");
-                                let local_for_push = cache_dir
-                                    .join(format!("rot_push_{}_{}.{}", item_idx, next_deg, ext));
-                                let _ = save_image_matching_path_format(&rotated, &local_for_push);
-                                std::thread::spawn(move || {
-                                    if let Ok(adb) = Adb::discover() {
-                                        if let Ok(transport) = device.resolve_active_transport(&adb)
-                                        {
-                                            let _ = adb.transfer(
-                                                &transport,
-                                                "push",
-                                                &local_for_push,
-                                                std::path::Path::new(&remote_for_push),
-                                            );
-                                            let _ = adb.shell(
-                                                &transport,
-                                                &[
-                                                    "am",
-                                                    "broadcast",
-                                                    "-a",
-                                                    "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
-                                                    "-d",
-                                                    &format!("file://{remote_for_push}"),
-                                                ],
-                                            );
+                        let remote_owned = remote_path.clone();
+                        let demo_mode = self.demo_mode;
+                        let selected_device = self.selected.clone();
+                        self.back_screen.gallery_rotating_path = Some(remote_owned.clone());
+                        self.status = format!("正在旋转照片 {name} ({next_deg}°)…");
+                        self.error = false;
+                        let (tx, rx) = async_channel::bounded(1);
+                        std::thread::spawn(move || {
+                            let res = (|| -> Result<PathBuf> {
+                                let img = image::open(&thumb_path)
+                                    .map_err(|e| anyhow::anyhow!("读取本地预览图进行旋转失败：{e}"))?;
+                                let rotated = img.rotate90();
+                                let rot_path =
+                                    cache_dir.join(format!("rot_{}_{}.png", item_idx, next_deg));
+                                rotated
+                                    .save(&rot_path)
+                                    .map_err(|e| anyhow::anyhow!("保存旋转后的预览图失败：{e}"))?;
+                                let remote_path_ref = std::path::Path::new(&remote_owned);
+                                if remote_path_ref.is_file() {
+                                    save_image_matching_path_format(&rotated, remote_path_ref)
+                                        .map_err(|e| anyhow::anyhow!("写回旋转图片到原文件失败：{e}"))?;
+                                } else if !demo_mode && remote_owned.starts_with('/') {
+                                    if let Some(device) = selected_device {
+                                        let ext = remote_path_ref
+                                            .extension()
+                                            .and_then(|s| s.to_str())
+                                            .unwrap_or("jpg");
+                                        let local_for_push = cache_dir.join(format!(
+                                            "rot_push_{}_{}.{}",
+                                            item_idx, next_deg, ext
+                                        ));
+                                        let _ = save_image_matching_path_format(
+                                            &rotated,
+                                            &local_for_push,
+                                        );
+                                        if let Ok(adb) = Adb::discover() {
+                                            if let Ok(transport) =
+                                                device.resolve_active_transport(&adb)
+                                            {
+                                                let _ = adb.transfer(
+                                                    &transport,
+                                                    "push",
+                                                    &local_for_push,
+                                                    std::path::Path::new(&remote_owned),
+                                                );
+                                                let _ = adb.shell(
+                                                    &transport,
+                                                    &[
+                                                        "am",
+                                                        "broadcast",
+                                                        "-a",
+                                                        "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
+                                                        "-d",
+                                                        &format!("file://{remote_owned}"),
+                                                    ],
+                                                );
+                                            }
                                         }
                                     }
-                                });
+                                }
+                                Ok(rot_path)
+                            })();
+                            let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
+                        });
+                        let remote_done = remote_path.clone();
+                        ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                            if me.back_screen.gallery_rotating_path.as_deref()
+                                == Some(remote_done.as_str())
+                            {
+                                me.back_screen.gallery_rotating_path = None;
                             }
-                        }
-                        self.back_screen.gallery_items[item_idx].local_thumb_path =
-                            Some(rot_str.clone());
-                        self.work.insert_image_preview(rot_str, rot_path);
-                        self.status = format!(
-                            "已顺时针旋转 90°（当前 {}°）：{}",
-                            next_deg, self.back_screen.gallery_items[item_idx].name
-                        );
-                        self.error = false;
+                            match result {
+                                Ok(Ok(rot_path)) => {
+                                    let rot_str = rot_path.to_string_lossy().into_owned();
+                                    if let Some(slot) = me
+                                        .back_screen
+                                        .gallery_items
+                                        .iter_mut()
+                                        .find(|i| i.remote_path == remote_done)
+                                    {
+                                        slot.local_thumb_path = Some(rot_str.clone());
+                                    }
+                                    me.work.insert_image_preview(rot_str, rot_path);
+                                    me.status =
+                                        format!("已顺时针旋转 90°（当前 {next_deg}°）：{name}");
+                                    me.error = false;
+                                }
+                                Ok(Err(err)) => {
+                                    me.error = true;
+                                    me.status = format!("旋转照片失败：{err}");
+                                }
+                                Err(_) => {}
+                            }
+                            ctx.notify();
+                        });
                     } else if let Some(device) = self.selected.clone() {
                         let remote = remote_path.clone();
-                        let name = self.back_screen.gallery_items[item_idx].name.clone();
+                        let cache_dir = self.back_screen.ensure_gallery_cache_dir()?;
+                        self.back_screen.gallery_rotating_path = Some(remote.clone());
                         self.status = format!("正在从手机拉取并旋转 {name} ({next_deg}°)…");
                         let (tx, rx) = async_channel::bounded(1);
                         std::thread::spawn(move || {
-                            let cache_dir = std::env::temp_dir().join("stepx-gallery-cache");
-                            let _ = std::fs::create_dir_all(&cache_dir);
                             let safe_name: String = name
                                 .chars()
                                 .map(|c| {
@@ -3818,7 +3919,7 @@ impl Companion {
                                 .collect();
                             let raw_file = cache_dir.join(format!("sel_{item_idx}_{safe_name}"));
                             let res = Adb::discover().and_then(|adb| {
-                                storage::pull(&adb, &device, &remote, &raw_file)?;
+                                storage::pull_overwrite(&adb, &device, &remote, &raw_file)?;
                                 let img = image::open(&raw_file)?;
                                 let rotated = rotate_dynamic_image_by_deg(img, next_deg);
                                 let rot_file = cache_dir
@@ -3848,12 +3949,21 @@ impl Companion {
                             });
                             let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
                         });
+                        let remote_done = remote_path.clone();
                         ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                            if me.back_screen.gallery_rotating_path.as_deref()
+                                == Some(remote_done.as_str())
+                            {
+                                me.back_screen.gallery_rotating_path = None;
+                            }
                             match result {
                                 Ok(Ok(rot_file)) => {
                                     let rot_str = rot_file.to_string_lossy().into_owned();
-                                    if let Some(slot) =
-                                        me.back_screen.gallery_items.get_mut(item_idx)
+                                    if let Some(slot) = me
+                                        .back_screen
+                                        .gallery_items
+                                        .iter_mut()
+                                        .find(|i| i.remote_path == remote_done)
                                     {
                                         slot.local_thumb_path = Some(rot_str.clone());
                                     }
@@ -3954,6 +4064,7 @@ impl Companion {
                 };
                 self.back_screen.gallery_loading = true;
                 self.status = "正在从手机相册删除图片…".into();
+                let remote_path_done = remote_path.clone();
                 let (tx, rx) = async_channel::bounded(1);
                 std::thread::spawn(move || {
                     let res = Adb::discover().and_then(|adb| {
@@ -3965,10 +4076,11 @@ impl Companion {
                     });
                     let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
                 });
-                ctx.spawn(async move { rx.recv().await }, |me, result, ctx| {
+                ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
                     me.back_screen.gallery_loading = false;
                     match result {
                         Ok(Ok(items)) => {
+                            me.invalidate_search_path(&remote_path_done);
                             me.apply(Outcome::PhoneGallery(
                                 items,
                                 "已从手机相册删除该图片".into(),
@@ -4122,15 +4234,14 @@ impl Companion {
                     .and_then(|n| n.to_str())
                     .unwrap_or("preview.jpg")
                     .to_string();
+                let cache_dir = self.back_screen.ensure_gallery_cache_dir()?;
                 self.status = format!("正在拉取 {file_name} 并在电脑打开…");
                 let (tx, rx) = async_channel::bounded(1);
                 let remote_for_cache = remote_path.clone();
                 std::thread::spawn(move || {
-                    let cache_dir = std::env::temp_dir().join("stepx-gallery-cache");
-                    let _ = std::fs::create_dir_all(&cache_dir);
                     let local_path = cache_dir.join(&file_name);
                     let res = Adb::discover().and_then(|adb| {
-                        storage::pull(&adb, &device, &remote_path, &local_path)?;
+                        storage::pull_overwrite(&adb, &device, &remote_path, &local_path)?;
                         work_state::open_work_path(&local_path)?;
                         Ok(local_path)
                     });
@@ -4189,15 +4300,15 @@ impl Companion {
                         .is_some_and(|n| n == real_name)
                     {
                         local_path
-                    } else {
-                        let cache_dir = std::env::temp_dir().join("stepx-gallery-cache");
-                        let _ = std::fs::create_dir_all(&cache_dir);
+                    } else if let Ok(cache_dir) = self.back_screen.ensure_gallery_cache_dir() {
                         let staged = cache_dir.join(&real_name);
                         if std::fs::copy(&local_path, &staged).is_ok() {
                             staged
                         } else {
                             local_path
                         }
+                    } else {
+                        local_path
                     };
                     let _ = self.add_amoo_paths(&[attach_path]);
                     self.page = Page::Amoo;
@@ -4218,14 +4329,13 @@ impl Companion {
                     .and_then(|n| n.to_str())
                     .unwrap_or("gallery_photo.jpg")
                     .to_string();
+                let cache_dir = self.back_screen.ensure_gallery_cache_dir()?;
                 self.status = format!("正在拉取 {file_name} 并带入 Amoo 对话…");
                 let (tx, rx) = async_channel::bounded(1);
                 std::thread::spawn(move || {
-                    let cache_dir = std::env::temp_dir().join("stepx-gallery-cache");
-                    let _ = std::fs::create_dir_all(&cache_dir);
                     let local_path = cache_dir.join(&file_name);
                     let res = Adb::discover().and_then(|adb| {
-                        storage::pull(&adb, &device, &remote_path, &local_path)?;
+                        storage::pull_overwrite(&adb, &device, &remote_path, &local_path)?;
                         Ok(local_path)
                     });
                     let _ = tx.send_blocking(res.map_err(|e| format!("{e:#}")));
@@ -5445,6 +5555,14 @@ impl Companion {
             !self.back_screen.playing,
             "请先停止临时联动，再切换手机游戏"
         );
+        if matches!(
+            action,
+            BackScreenAction::CompanionStop
+                | BackScreenAction::GameArm
+                | BackScreenAction::GameStart
+        ) {
+            self.back_screen.disarm_pomodoro_timer();
+        }
         let adb = Adb::discover()?;
         let (sender, receiver) = mpsc::channel();
         self.back_screen.companion_checked_device = Some(device.serial.clone());
@@ -5476,6 +5594,20 @@ impl Companion {
                         mode: "game".into(),
                     },
                     BackScreenAction::CompanionStop => {
+                        let transport = device
+                            .resolve_active_transport(&adb)
+                            .unwrap_or_else(|_| device.serial.clone());
+                        let _ = stepx_companion::push::dismiss_phone_live_capsule(
+                            &adb,
+                            &transport,
+                            "stepx_pomodoro",
+                        );
+                        let _ = stepx_companion::backscreen_amoo::sync_sprite_state_to_backscreen(
+                            &adb,
+                            &device,
+                            stepx_companion::backscreen_amoo::AgentSpriteState::Idle,
+                            0,
+                        );
                         CompanionEvent::Stopped(bs::stop_via_firmware_mcp(&adb, &device)?)
                     }
                     _ => CompanionEvent::Inspected(ca::inspect(&adb, &device)?),
@@ -5519,6 +5651,9 @@ impl Companion {
         self.back_screen.native_rx = None;
         self.back_screen.applying_native = false;
         self.back_screen.companion_rx = None;
+        self.back_screen.mcp_status_rx = None;
+        self.back_screen.last_mcp_status_poll = None;
+        self.back_screen.pomodoro_restore_rx = None;
         self.back_screen.companion_busy = false;
         self.back_screen.companion_checked_device = None;
         self.back_screen.companion_installed = None;
@@ -5946,6 +6081,100 @@ impl Companion {
                 }
             }
         }
+        if let Some(rx) = &self.back_screen.pomodoro_restore_rx {
+            match rx.try_recv() {
+                Ok((serial, res)) => {
+                    self.back_screen.pomodoro_restore_rx = None;
+                    if self.selected.as_ref().map(|d| d.serial.as_str()) == Some(serial.as_str()) {
+                        match res {
+                            Ok(msg) => {
+                                self.back_screen.applied_to_phone = false;
+                                self.back_screen.applied_revision = None;
+                                self.back_screen.applied_title.clear();
+                                self.back_screen.companion_mode.clear();
+                                self.back_screen.applied_status = msg;
+                                changed = true;
+                            }
+                            Err(err) => {
+                                self.back_screen.applied_status =
+                                    format!("番茄钟结束，背屏恢复待确认：{err}");
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.back_screen.pomodoro_restore_rx = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(rx) = &self.back_screen.mcp_status_rx {
+            match rx.try_recv() {
+                Ok((serial, status_opt)) => {
+                    self.back_screen.mcp_status_rx = None;
+                    if self.selected.as_ref().map(|d| d.serial.as_str()) == Some(serial.as_str())
+                        && self.back_screen.applied_to_phone
+                        && self.back_screen.companion_mode != "native"
+                        && !self.back_screen.playing
+                    {
+                        if let Some((running, mode)) = status_opt {
+                            if !running
+                                || matches!(mode.as_str(), "restored" | "stopped" | "idle")
+                            {
+                                self.back_screen.applied_to_phone = false;
+                                self.back_screen.applied_revision = None;
+                                self.back_screen.applied_title.clear();
+                                self.back_screen.companion_mode.clear();
+                                self.back_screen.applied_status =
+                                    "定时播放已结束，已恢复手机原显示".into();
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.back_screen.mcp_status_rx = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if !self.demo_mode
+            && self.back_screen.applied_to_phone
+            && self.back_screen.companion_mode != "native"
+            && !self.back_screen.playing
+            && !self.back_screen.companion_busy
+            && !self.back_screen.pomodoro_active
+            && self.back_screen.mcp_status_rx.is_none()
+            && self
+                .back_screen
+                .last_mcp_status_poll
+                .is_none_or(|t| t.elapsed() >= Duration::from_millis(2500))
+        {
+            if let Some(device) = self.selected.clone() {
+                self.back_screen.last_mcp_status_poll = Some(Instant::now());
+                let serial = device.serial.clone();
+                let (tx, rx) = mpsc::channel();
+                self.back_screen.mcp_status_rx = Some(rx);
+                std::thread::spawn(move || {
+                    let parsed = Adb::discover()
+                        .and_then(|adb| {
+                            let transport = device.resolve_active_transport(&adb)?;
+                            adb.script(
+                                &transport,
+                                "if [ -f /data/local/tmp/stepx-companion/backscreen-mcp-status.json ]; then \
+                                   cat /data/local/tmp/stepx-companion/backscreen-mcp-status.json; \
+                                 else \
+                                   echo '__STEPX_MCP_MISSING__'; \
+                                 fi",
+                            )
+                        })
+                        .ok()
+                        .and_then(|raw| parse_mcp_status_poll_output(&raw));
+                    let _ = tx.send((serial, parsed));
+                });
+            }
+        }
         if self.back_screen.pomodoro_active {
             let remaining = self.back_screen.pomodoro_remaining_secs();
             if remaining == 0 {
@@ -5959,12 +6188,42 @@ impl Companion {
                     self.back_screen.refresh_frame();
                     self.back_screen.applied_frame = self.back_screen.frame.clone();
                 }
-                self.back_screen.pomodoro_active = false;
-                self.back_screen.cancel_pomodoro_commands();
-                self.back_screen.pomodoro_started_at = None;
-                self.back_screen.pomodoro_last_remaining_secs = None;
+                self.back_screen.disarm_pomodoro_timer();
+                let dispatch_generation = self.back_screen.pomodoro_lane.current();
+                if !self.demo_mode {
+                    if let Some(device) = self.selected.clone() {
+                        let serial = device.serial.clone();
+                        let lane = self.back_screen.pomodoro_lane.clone();
+                        let (tx, rx) = mpsc::channel();
+                        self.back_screen.pomodoro_restore_rx = Some(rx);
+                        std::thread::spawn(move || {
+                            let Some(res) = lane.run_if_current(dispatch_generation, || {
+                                Adb::discover().and_then(|adb| {
+                                    let transport = device
+                                        .resolve_active_transport(&adb)
+                                        .unwrap_or_else(|_| device.serial.clone());
+                                    let _ = stepx_companion::push::dismiss_phone_live_capsule(
+                                        &adb,
+                                        &transport,
+                                        "stepx_pomodoro",
+                                    );
+                                    let _ = stepx_companion::backscreen_amoo::sync_sprite_state_to_backscreen(
+                                        &adb,
+                                        &device,
+                                        stepx_companion::backscreen_amoo::AgentSpriteState::Idle,
+                                        0,
+                                    );
+                                    bs::stop_pomodoro_countdown(&adb, &device)
+                                })
+                            }) else {
+                                return;
+                            };
+                            let _ = tx.send((serial, res.map_err(|e| format!("{e:#}"))));
+                        });
+                    }
+                }
                 self.back_screen.status = format!(
-                    "{} 分钟桌面专注番茄钟已完成",
+                    "{} 分钟桌面专注番茄钟已完成，已恢复手机原显示",
                     self.back_screen.pomodoro_duration_secs / 60
                 );
                 changed = true;
@@ -7125,6 +7384,24 @@ fn recent_images() -> Vec<PathBuf> {
     images.into_iter().take(24).map(|(_, path)| path).collect()
 }
 
+fn parse_mcp_status_poll_output(raw: &str) -> Option<(bool, String)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.contains("__STEPX_MCP_MISSING__") {
+        return Some((false, "stopped".into()));
+    }
+    let val: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    let running = val.get("running").and_then(|v| v.as_bool())?;
+    let mode = val
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or(if running { "animation" } else { "stopped" })
+        .to_string();
+    Some((running, mode))
+}
+
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
@@ -7947,5 +8224,58 @@ mod lifecycle_tests {
         app.sync_smart_backscreen_display();
         assert_eq!(app.back_screen.smart_display_live_count, 0);
         assert!(app.back_screen.smart_display_live_slides.is_empty());
+    }
+
+    #[test]
+    fn backscreen_pomodoro_disarm_mcp_status_and_private_gallery_cache_work() {
+        let mut state = BackScreenUiState::default();
+        state.pomodoro_active = true;
+        state.pomodoro_started_at = Some(Instant::now());
+        state.pomodoro_last_remaining_secs = Some(600);
+        state.active_phone_capsule = Some((
+            "stepx_pomodoro".into(),
+            "专注".into(),
+            "25m".into(),
+            Instant::now(),
+        ));
+        state.disarm_pomodoro_timer();
+        assert!(!state.pomodoro_active);
+        assert!(state.pomodoro_started_at.is_none());
+        assert!(state.pomodoro_last_remaining_secs.is_none());
+        assert!(state.active_phone_capsule.is_none());
+
+        state.applied_to_phone = true;
+        state.companion_mode = "animation".into();
+        state.playing = false;
+        assert!(
+            state.needs_poll(),
+            "applied firmware/companion animation must keep polling MCP_STATUS_FILE until restored/stopped"
+        );
+
+        assert_eq!(
+            parse_mcp_status_poll_output("__STEPX_MCP_MISSING__\n"),
+            Some((false, "stopped".into()))
+        );
+        assert_eq!(
+            parse_mcp_status_poll_output(r#"{"running":false,"mode":"restored"}"#),
+            Some((false, "restored".into()))
+        );
+        assert_eq!(
+            parse_mcp_status_poll_output(r#"{"running":true,"mode":"animation"}"#),
+            Some((true, "animation".into()))
+        );
+
+        let dir = state
+            .ensure_gallery_cache_dir()
+            .expect("create private gallery cache TempDir");
+        assert!(dir.is_dir());
+        assert!(!dir.to_string_lossy().contains("/tmp/stepx-bs-gallery"));
+        assert!(!dir.to_string_lossy().contains("stepx-gallery-cache"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
     }
 }

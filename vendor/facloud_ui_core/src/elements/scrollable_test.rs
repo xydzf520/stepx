@@ -29,19 +29,19 @@ use crate::{
 /// (one for each scrollable direction).
 macro_rules! define_axis_agnostic_tests {
     ($test_function:ident) => {
-        concat_idents::concat_idents!(test_name = $test_function, _, vertical {
-            #[test]
-            fn test_name() {
-                $test_function(Axis::Vertical);
-            }
-        });
+        mod $test_function {
+            use super::*;
 
-        concat_idents::concat_idents!(test_name = $test_function, _, horizontal {
             #[test]
-            fn test_name() {
-                $test_function(Axis::Horizontal);
+            fn vertical() {
+                super::$test_function(Axis::Vertical);
             }
-        });
+
+            #[test]
+            fn horizontal() {
+                super::$test_function(Axis::Horizontal);
+            }
+        }
     };
 }
 

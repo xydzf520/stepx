@@ -234,7 +234,9 @@ impl SubpixelAlignment {
     /// rounded up-and-around to 0.0.
     pub fn new(glyph_position: Vector2F) -> Self {
         // Scale the floating point range [0, 1) to [0, Self::STEPS).
-        let scaled_pos = glyph_position.x().fract() * Self::STEPS as f32;
+        // Use Euclidean remainder so negative fractional coordinates wrap into [0, 1)
+        // instead of clamping to 0 on `as u8`.
+        let scaled_pos = glyph_position.x().rem_euclid(1.0) * Self::STEPS as f32;
         // Round the scaled value to the nearest integer in range 0..Self::STEPS
         // and convert to an integer.  We use modulus to make sure we don't
         // exceed the range.

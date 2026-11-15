@@ -3,6 +3,16 @@
 use super::*;
 use facloud_ui::clipboard::ClipboardContent;
 
+pub(super) const MAX_INPUT_BYTES: usize = 16_384;
+
+pub(crate) fn clamp_char_boundary(s: &str, index: usize) -> usize {
+    let mut idx = index.min(s.len());
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
 #[derive(Default)]
 pub(super) struct TextField {
     pub(super) text: String,
@@ -37,26 +47,64 @@ impl TextField {
     }
 
     pub(super) fn insert(&mut self, text: &str) {
-        self.delete_selection();
         let clean: String = text.chars().filter(|c| *c != '\0' && *c != '\r').collect();
-        if self.text.len() + clean.len() > 16_384 {
+        let sel_bytes = self.selection_range().map_or(0, |r| r.len());
+        let used_after_replace = self.text.len().saturating_sub(sel_bytes);
+        let avail = MAX_INPUT_BYTES.saturating_sub(used_after_replace);
+        let slice = &clean[..clamp_char_boundary(&clean, avail)];
+        if slice.is_empty() && !clean.is_empty() {
             return;
         }
-        self.text.insert_str(self.cursor, &clean);
-        self.cursor = (self.cursor + clean.len()).min(self.text.len());
+        self.delete_selection();
+        let cur = clamp_char_boundary(&self.text, self.cursor);
+        self.text.insert_str(cur, slice);
+        self.cursor = (cur + slice.len()).min(self.text.len());
         self.preedit.clear();
     }
 
     pub(super) fn previous(&self) -> usize {
-        self.text[..self.cursor.min(self.text.len())]
+        let cur = clamp_char_boundary(&self.text, self.cursor);
+        self.text[..cur]
             .char_indices()
             .last()
             .map(|(i, _)| i)
             .unwrap_or(0)
     }
 
+    pub(super) fn previous_word(&self) -> usize {
+        let cur = clamp_char_boundary(&self.text, self.cursor);
+        if cur == 0 {
+            return 0;
+        }
+        let before = &self.text[..cur];
+        let mut chars = before.char_indices().rev().peekable();
+        while let Some(&(_, ch)) = chars.peek() {
+            if ch.is_whitespace() && ch != '\n' {
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        let Some(&(idx, first)) = chars.peek() else {
+            return 0;
+        };
+        if first == '\n' {
+            return idx;
+        }
+        let first_is_word = first.is_alphanumeric() || first == '_';
+        let mut start = idx;
+        while let Some(&(i, ch)) = chars.peek() {
+            if ch.is_whitespace() || ((ch.is_alphanumeric() || ch == '_') != first_is_word) {
+                break;
+            }
+            start = i;
+            chars.next();
+        }
+        start
+    }
+
     pub(super) fn next(&self) -> usize {
-        let cur = self.cursor.min(self.text.len());
+        let cur = clamp_char_boundary(&self.text, self.cursor);
         self.text[cur..]
             .chars()
             .next()
@@ -86,8 +134,11 @@ impl Companion {
         self.focus = Some(index);
         self.fields[index].cursor = self.fields[index].text.len();
         self.fields[index].all = false;
-        if index == F_AMOO {
-            Self::scroll_to_end(&self.amoo_ui.composer_scroll);
+        match index {
+            F_AMOO => Self::scroll_to_end(&self.amoo_ui.composer_scroll),
+            F_WORK_PROMPT => Self::scroll_to_end(&self.work.prompt_scroll),
+            F_LAB_PROMPT => Self::scroll_to_end(&self.studio_lab.prompt_scroll),
+            _ => {}
         }
         if index == F_TOAST_REPLY && self.push.active_toasts.is_empty() {
             if let Some(popup) = self.notification_active_popup().cloned() {
@@ -121,6 +172,7 @@ impl Companion {
                 | Action::Paste
                 | Action::CutInput
                 | Action::Backspace
+                | Action::BackspaceWord
                 | Action::BackspaceLine
                 | Action::Delete
         ) {
@@ -138,7 +190,7 @@ impl Companion {
                 input.cursor = input.text.len();
             }
             Action::CopyInput | Action::CutInput => {
-                if i != F_LAB_KEY {
+                if (i != F_LAB_KEY && i != F_PAIR_CODE) || self.show_secret {
                     if let Some(range) = input.selection_range().filter(|r| !r.is_empty()) {
                         ctx.clipboard()
                             .write(ClipboardContent::plain_text(input.text[range].to_owned()));
@@ -152,8 +204,19 @@ impl Companion {
                 if input.selection_range().is_some() {
                     input.delete_selection();
                 } else {
+                    let cur = clamp_char_boundary(&input.text, input.cursor);
                     let p = input.previous();
-                    input.text.replace_range(p..input.cursor, "");
+                    input.text.replace_range(p..cur, "");
+                    input.cursor = p;
+                }
+            }
+            Action::BackspaceWord => {
+                if input.selection_range().is_some() {
+                    input.delete_selection();
+                } else {
+                    let cur = clamp_char_boundary(&input.text, input.cursor);
+                    let p = input.previous_word();
+                    input.text.replace_range(p..cur, "");
                     input.cursor = p;
                 }
             }
@@ -161,7 +224,8 @@ impl Companion {
                 if input.selection_range().is_some() {
                     input.delete_selection();
                 } else {
-                    input.text.replace_range(0..input.cursor, "");
+                    let cur = clamp_char_boundary(&input.text, input.cursor);
+                    input.text.replace_range(0..cur, "");
                     input.cursor = 0;
                 }
             }
@@ -169,8 +233,10 @@ impl Companion {
                 if input.selection_range().is_some() {
                     input.delete_selection();
                 } else {
+                    let cur = clamp_char_boundary(&input.text, input.cursor);
                     let p = input.next();
-                    input.text.replace_range(input.cursor..p, "");
+                    input.cursor = cur;
+                    input.text.replace_range(cur..p, "");
                 }
             }
             Action::Left => {
@@ -205,21 +271,22 @@ impl Companion {
             self.pending_sms_plan = None;
         }
         // Copy and Select All must not move the text or its scroll viewport.
-        if [F_AMOO, F_WORK_PROMPT].contains(&i)
-            && !matches!(action, Action::CopyInput | Action::SelectAll)
+        let multiline_scroll = match i {
+            F_AMOO => Some(&self.amoo_ui.composer_scroll),
+            F_WORK_PROMPT => Some(&self.work.prompt_scroll),
+            F_LAB_PROMPT => Some(&self.studio_lab.prompt_scroll),
+            _ => None,
+        };
+        if let Some(scroll) =
+            multiline_scroll.filter(|_| !matches!(action, Action::CopyInput | Action::SelectAll))
         {
-            let scroll = if i == F_AMOO {
-                &self.amoo_ui.composer_scroll
-            } else {
-                &self.work.prompt_scroll
-            };
             if self.fields[i].cursor == self.fields[i].text.len() {
                 Self::scroll_to_end(scroll);
             } else if self.fields[i].cursor == 0 {
                 scroll.scroll_to(facloud_ui::units::Pixels::new(0.));
             } else {
                 scroll.scroll_to_position(ScrollTarget {
-                    position_id: format!("input-caret:{i}"),
+                    position_id: format!("input-glyph:{i}"),
                     mode: ScrollToPositionMode::FullyIntoView,
                 });
             }
@@ -299,32 +366,66 @@ impl Element for Keyboard {
     ) -> bool {
         #[cfg(feature = "ui-capture")]
         if std::env::var_os("STEPX_ENTER_TEST").is_some() {
+            use std::io::Write as _;
             if let Event::KeyDown {
                 keystroke,
                 is_composing,
                 ..
             } = event.raw_event()
             {
-                eprintln!(
+                let _ = writeln!(
+                    std::io::stderr(),
                     "ENTER_KEY key={} shift={} active={} composing={}/{}",
-                    keystroke.key, keystroke.shift, self.active, self.composing, is_composing
+                    keystroke.key,
+                    keystroke.shift,
+                    self.active,
+                    self.composing,
+                    is_composing
                 );
             }
             match event.raw_event() {
-                Event::TypedCharacters { chars } => eprintln!(
-                    "ENTER_TEXT bytes={} control={:?}",
-                    chars.len(),
-                    chars.chars().filter(|c| c.is_control()).collect::<Vec<_>>()
-                ),
-                Event::SetMarkedText { marked_text, .. } => {
-                    eprintln!("ENTER_PREEDIT bytes={}", marked_text.len())
+                Event::TypedCharacters { chars } => {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "ENTER_TEXT bytes={} control={:?}",
+                        chars.len(),
+                        chars.chars().filter(|c| c.is_control()).collect::<Vec<_>>()
+                    );
                 }
-                Event::ClearMarkedText => eprintln!("ENTER_PREEDIT clear"),
+                Event::SetMarkedText { marked_text, .. } => {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "ENTER_PREEDIT bytes={}",
+                        marked_text.len()
+                    );
+                }
+                Event::ClearMarkedText => {
+                    let _ = writeln!(std::io::stderr(), "ENTER_PREEDIT clear");
+                }
                 _ => {}
             }
         }
-        if self.context_menu {
-            if let Event::KeyDown { keystroke, .. } = event.raw_event() {
+        if let Event::KeyDown {
+            keystroke,
+            is_composing,
+            ..
+        } = event.raw_event()
+        {
+            if keystroke.key == "escape" && (*is_composing || self.composing) {
+                if self.composing && !*is_composing && self.active {
+                    ctx.dispatch_typed_action(Action::Preedit(String::new()));
+                    return true;
+                }
+                return false;
+            }
+        }
+        if self.context_menu && !self.composing {
+            if let Event::KeyDown {
+                keystroke,
+                is_composing: false,
+                ..
+            } = event.raw_event()
+            {
                 let a = match keystroke.key.as_str() {
                     "up" => Some(Action::ContextNavigate(-1)),
                     "down" => Some(Action::ContextNavigate(1)),
@@ -338,8 +439,13 @@ impl Element for Keyboard {
                 }
             }
         }
-        if self.interaction {
-            if let Event::KeyDown { keystroke, .. } = event.raw_event() {
+        if self.interaction && !self.composing {
+            if let Event::KeyDown {
+                keystroke,
+                is_composing: false,
+                ..
+            } = event.raw_event()
+            {
                 let a = match keystroke.key.as_str() {
                     "escape" => Some(Action::ReviewCancel),
                     "enter" | "return" => Some(Action::ReviewConfirm),
@@ -412,75 +518,91 @@ impl Keyboard {
                 is_composing: false,
                 ..
             } if !self.composing => {
-                let cmd = k.ctrl || k.cmd;
+                let primary_mod = shortcuts::primary_mod(k);
+                let no_mod = !k.ctrl && !k.cmd && !k.alt && !k.meta;
                 let typing = self.active;
                 match k.key.as_str() {
-                    "1" if cmd => Some(Action::Page(Page::Overview)),
+                    "1" if primary_mod && !k.shift && !typing => Some(Action::Page(Page::Overview)),
                     // Ctrl+2 始终打开唯一的 AI 入口「Amoo 对话」；文件处理（Page::Work）
                     // 与「我的作品」（Page::Studio）是次要入口，不分配数字快捷键。
-                    "2" if cmd => Some(Action::Page(Page::Amoo)),
-                    "3" if cmd => Some(Action::Page(Page::Sms)),
-                    "4" if cmd => Some(Action::Page(Page::Files)),
-                    "5" if cmd => Some(Action::Page(Page::Apps)),
-                    "6" if cmd => Some(Action::Page(Page::Connect)),
-                    "7" if cmd => Some(Action::Page(Page::Tools)),
-                    "8" if cmd => Some(Action::Page(Page::BackScreen)),
-                    "," if cmd => Some(Action::Page(Page::Settings)),
-                    "k" if cmd => Some(Action::GlobalSearch(SearchAction::Open)),
-                    "r" if cmd => Some(Action::ContextRefresh),
-                    "f5" => Some(Action::ContextRefresh),
-                    "m" if cmd => Some(Action::Mirror),
-                    "t" if cmd => Some(Action::CycleTheme),
-                    "f" if cmd => Some(Action::FocusSearch),
-                    "n" if cmd => Some(Action::OpenNewFolder),
-                    "escape" => Some(Action::Escape),
-                    "tab" => Some(Action::NextField(k.shift)),
-                    "enter" | "return" if self.search && cmd => {
+                    "2" if primary_mod && !k.shift && !typing => Some(Action::Page(Page::Amoo)),
+                    "3" if primary_mod && !k.shift && !typing => Some(Action::Page(Page::Sms)),
+                    "4" if primary_mod && !k.shift && !typing => Some(Action::Page(Page::Files)),
+                    "5" if primary_mod && !k.shift && !typing => Some(Action::Page(Page::Apps)),
+                    "6" if primary_mod && !k.shift && !typing => Some(Action::Page(Page::Connect)),
+                    "7" if primary_mod && !k.shift && !typing => Some(Action::Page(Page::Tools)),
+                    "8" if primary_mod && !k.shift && !typing => {
+                        Some(Action::Page(Page::BackScreen))
+                    }
+                    "," if primary_mod && !k.shift && !typing => Some(Action::Page(Page::Settings)),
+                    "k" if primary_mod && !k.shift => Some(Action::GlobalSearch(SearchAction::Open)),
+                    "r" if primary_mod && !k.shift && !typing => Some(Action::ContextRefresh),
+                    "f5" if no_mod && !k.shift && !typing => Some(Action::ContextRefresh),
+                    "m" if primary_mod && !k.shift && !typing => Some(Action::Mirror),
+                    "t" if primary_mod && !k.shift && !typing => Some(Action::CycleTheme),
+                    "f" if primary_mod && !k.shift && !typing => Some(Action::FocusSearch),
+                    "n" if primary_mod && !k.shift && !typing => Some(Action::OpenNewFolder),
+                    "escape" if no_mod && !k.shift => Some(Action::Escape),
+                    "tab" if no_mod => Some(Action::NextField(k.shift)),
+                    "enter" | "return" if self.search && primary_mod && !k.shift => {
                         Some(Action::GlobalSearch(SearchAction::AllResults))
                     }
-                    "enter" | "return" if typing && k.shift && self.multiline => {
+                    "enter" | "return" if typing && no_mod && k.shift && self.multiline => {
                         Some(Action::Insert("\n".into()))
                     }
-                    "enter" | "return" if typing => Some(Action::SubmitFocused),
-                    "enter" | "return" => Some(Action::ActivateSelectedFile),
-                    "up" if self.search && !self.composing => {
+                    "enter" | "return" if typing && no_mod && !k.shift => {
+                        Some(Action::SubmitFocused)
+                    }
+                    "enter" | "return" if !typing && no_mod && !k.shift => {
+                        Some(Action::ActivateSelectedFile)
+                    }
+                    "up" if self.search && !self.composing && no_mod && !k.shift => {
                         Some(Action::GlobalSearch(SearchAction::Move(-1)))
                     }
-                    "down" if self.search && !self.composing => {
+                    "down" if self.search && !self.composing && no_mod && !k.shift => {
                         Some(Action::GlobalSearch(SearchAction::Move(1)))
                     }
-                    "up" if !typing => Some(Action::MoveFileSelection(-1)),
-                    "down" if !typing => Some(Action::MoveFileSelection(1)),
-                    "left" if !typing => Some(Action::MoveHorizontalSelection(-1)),
-                    "right" if !typing => Some(Action::MoveHorizontalSelection(1)),
-                    "backspace" if !typing => Some(Action::ParentDirectory),
-                    "delete" if !typing => Some(Action::Trash),
-                    "f2" if !typing => Some(Action::OpenRename),
-                    "z" if cmd && k.shift && typing => Some(Action::RedoInput),
-                    "z" if cmd && typing => Some(Action::UndoInput),
-                    "y" if cmd && typing => Some(Action::RedoInput),
-                    "v" if cmd && typing => Some(Action::Paste),
-                    "c" if cmd && typing => Some(Action::CopyInput),
-                    "c" if cmd => Some(Action::Copy),
-                    "x" if cmd && typing => Some(Action::CutInput),
-                    "a" if cmd && typing => Some(Action::SelectAll),
-                    "backspace" if cmd => Some(Action::BackspaceLine),
-                    "backspace" => Some(Action::Backspace),
-                    "delete" => Some(Action::Delete),
+                    "up" if !typing && no_mod && !k.shift => Some(Action::MoveFileSelection(-1)),
+                    "down" if !typing && no_mod && !k.shift => Some(Action::MoveFileSelection(1)),
+                    "left" if !typing && no_mod && !k.shift => {
+                        Some(Action::MoveHorizontalSelection(-1))
+                    }
+                    "right" if !typing && no_mod && !k.shift => {
+                        Some(Action::MoveHorizontalSelection(1))
+                    }
+                    "backspace" if !typing && no_mod && !k.shift => Some(Action::ParentDirectory),
+                    "delete" if !typing && no_mod && !k.shift => Some(Action::Trash),
+                    "f2" if !typing && no_mod && !k.shift => Some(Action::OpenRename),
+                    "z" if primary_mod && k.shift && typing => Some(Action::RedoInput),
+                    "z" if primary_mod && !k.shift && typing => Some(Action::UndoInput),
+                    "y" if primary_mod && !k.shift && typing => Some(Action::RedoInput),
+                    "v" if primary_mod && !k.shift && typing => Some(Action::Paste),
+                    "c" if primary_mod && !k.shift && typing => Some(Action::CopyInput),
+                    "c" if primary_mod && !k.shift && !typing => Some(Action::Copy),
+                    "x" if primary_mod && !k.shift && typing => Some(Action::CutInput),
+                    "a" if primary_mod && !k.shift && typing => Some(Action::SelectAll),
+                    "backspace" if typing && shortcuts::word_backward_mod(k) => {
+                        Some(Action::BackspaceWord)
+                    }
+                    "backspace" if typing && shortcuts::line_backward_mod(k) => {
+                        Some(Action::BackspaceLine)
+                    }
+                    "backspace" if typing && no_mod && !k.shift => Some(Action::Backspace),
+                    "delete" if typing && no_mod && !k.shift => Some(Action::Delete),
                     "left" if k.shift && typing => {
-                        Some(Action::ExtendSelection(if cmd { -2 } else { -1 }))
+                        Some(Action::ExtendSelection(if primary_mod { -2 } else { -1 }))
                     }
                     "right" if k.shift && typing => {
-                        Some(Action::ExtendSelection(if cmd { 2 } else { 1 }))
+                        Some(Action::ExtendSelection(if primary_mod { 2 } else { 1 }))
                     }
-                    "home" if k.shift && typing => Some(Action::ExtendSelection(-2)),
-                    "end" if k.shift && typing => Some(Action::ExtendSelection(2)),
-                    "left" if k.cmd && typing => Some(Action::Home),
-                    "right" if k.cmd && typing => Some(Action::End),
-                    "left" if typing => Some(Action::Left),
-                    "right" if typing => Some(Action::Right),
-                    "home" if typing => Some(Action::Home),
-                    "end" if typing => Some(Action::End),
+                    "home" if k.shift && no_mod && typing => Some(Action::ExtendSelection(-2)),
+                    "end" if k.shift && no_mod && typing => Some(Action::ExtendSelection(2)),
+                    "left" if k.cmd && !k.shift && typing => Some(Action::Home),
+                    "right" if k.cmd && !k.shift && typing => Some(Action::End),
+                    "left" if no_mod && !k.shift && typing => Some(Action::Left),
+                    "right" if no_mod && !k.shift && typing => Some(Action::Right),
+                    "home" if no_mod && !k.shift && typing => Some(Action::Home),
+                    "end" if no_mod && !k.shift && typing => Some(Action::End),
                     _ => None,
                 }
             }
@@ -505,6 +627,17 @@ mod input_tests {
             active: true,
             multiline: true,
             composing,
+        }
+    }
+
+    fn set_primary_mod(k: &mut facloud_ui::keymap::Keystroke) {
+        #[cfg(target_os = "macos")]
+        {
+            k.cmd = true;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            k.ctrl = true;
         }
     }
 
@@ -568,7 +701,7 @@ mod input_tests {
         ));
         let mut shortcut = key("k", false);
         if let Event::KeyDown { keystroke, .. } = &mut shortcut {
-            keystroke.ctrl = true;
+            set_primary_mod(keystroke);
         }
         assert!(matches!(
             input.action_for_event(&shortcut),
@@ -576,6 +709,90 @@ mod input_tests {
         ));
         input.composing = true;
         assert!(input.action_for_event(&key("down", false)).is_none());
+    }
+
+    #[test]
+    fn paste_truncates_utf8_cleanly_and_preserves_selection_budget() {
+        let mut input = Input::default();
+        let filler = "a".repeat(MAX_INPUT_BYTES - 10);
+        input.set(&filler);
+        input.insert("1234567890");
+        assert_eq!(input.text.len(), MAX_INPUT_BYTES);
+
+        // Select the last 10 bytes and paste multi-byte Chinese text exceeding remaining budget:
+        // 10 bytes fit 3 Chinese chars (9 bytes), must NOT delete selection and abort!
+        input.anchor = Some(MAX_INPUT_BYTES - 10);
+        input.cursor = MAX_INPUT_BYTES;
+        input.insert("你好世界测试");
+        assert_eq!(&input.text[MAX_INPUT_BYTES - 10..], "你好世");
+        assert!(input.text.len() <= MAX_INPUT_BYTES);
+        assert!(input.text.is_char_boundary(input.cursor));
+
+        // When buffer is full and only 2 bytes are selected, pasting a 3-byte char preserves selection.
+        let mut full = Input::default();
+        full.set(&"b".repeat(MAX_INPUT_BYTES));
+        full.anchor = Some(MAX_INPUT_BYTES - 2);
+        full.cursor = MAX_INPUT_BYTES;
+        full.insert("你");
+        assert_eq!(full.text.len(), MAX_INPUT_BYTES);
+        assert_eq!(&full.text[MAX_INPUT_BYTES - 2..], "bb");
+    }
+
+    #[test]
+    fn shortcuts_guard_typing_shift_altgr_and_word_backspace() {
+        let mut active_kb = keyboard(false);
+        active_kb.active = true;
+
+        // Global navigation shortcuts must NOT fire when typing in an input field
+        let mut nav = key("1", false);
+        if let Event::KeyDown { keystroke, .. } = &mut nav {
+            set_primary_mod(keystroke);
+        }
+        assert!(active_kb.action_for_event(&nav).is_none());
+
+        let mut idle_kb = keyboard(false);
+        idle_kb.active = false;
+        assert!(matches!(
+            idle_kb.action_for_event(&nav),
+            Some(Action::Page(Page::Overview))
+        ));
+
+        // Ctrl+Shift+1 and AltGr (Ctrl+Alt+1) must NOT misfire as Page(Overview)
+        let mut shifted = nav.clone();
+        if let Event::KeyDown { keystroke, .. } = &mut shifted {
+            keystroke.shift = true;
+        }
+        assert!(idle_kb.action_for_event(&shifted).is_none());
+
+        let mut altgr = nav.clone();
+        if let Event::KeyDown { keystroke, .. } = &mut altgr {
+            keystroke.alt = true;
+        }
+        assert!(idle_kb.action_for_event(&altgr).is_none());
+
+        // Word-backward delete
+        let mut word_bs = key("backspace", false);
+        if let Event::KeyDown { keystroke, .. } = &mut word_bs {
+            #[cfg(target_os = "macos")]
+            {
+                keystroke.alt = true;
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                keystroke.ctrl = true;
+            }
+        }
+        assert!(matches!(
+            active_kb.action_for_event(&word_bs),
+            Some(Action::BackspaceWord)
+        ));
+
+        let mut field = Input::default();
+        field.set("hello 你好世界");
+        let p = field.previous_word();
+        field.text.replace_range(p..field.cursor, "");
+        field.cursor = p;
+        assert_eq!(field.text, "hello ");
     }
 
     #[test]

@@ -9,15 +9,34 @@ p = importlib.util.module_from_spec(spec); spec.loader.exec_module(p)
 
 def digest(path): return hashlib.sha256(path.read_bytes()).hexdigest()
 
+def _is_wireless(serial):
+    return ':' in serial or '._adb-' in serial or serial.startswith('adb-')
+
+def _ensure_connected(expected):
+    try:
+        if p.run(p.ADB + ['get-state'], timeout=15).strip() == 'device':
+            p.AUTHORIZED_SERIAL = p.ADB[-1]
+            return True
+    except Exception:
+        pass
+    if expected and p.common.recover_active_transport(expected):
+        try:
+            if p.run(p.ADB + ['get-state'], timeout=15).strip() == 'device':
+                p.AUTHORIZED_SERIAL = p.ADB[-1]
+                return True
+        except Exception:
+            pass
+    return False
+
 def installation_device():
     """Ordinary APK installation needs identity, not a privileged firmware adapter."""
     transport = p.ADB[-1]
     expected = os.environ.get('STEPX_DEVICE_SERIAL', '').strip()
-    if not expected and ':' not in transport and not transport.startswith('adb-'):
+    if not expected and not _is_wireless(transport):
         expected = transport
     if not expected or not transport or transport.startswith('-') or any(c.isspace() for c in transport):
         raise RuntimeError('安装缺少已选手机身份，请重新选择设备')
-    if p.run(p.ADB + ['get-state']).strip() != 'device':
+    if not _ensure_connected(expected):
         raise RuntimeError('手机未授权或已离线，尚未安装')
     if p.shell('getprop', 'ro.serialno') != expected:
         raise RuntimeError('连接的手机与已选设备不一致，尚未安装')
@@ -39,6 +58,10 @@ def package_paths():
     # Treat only that exact absence as a first install, never a transport error.
     probe = subprocess.run(p.ADB + ['shell', 'pm', 'path', '--user', '0', p.PACKAGE],
                            capture_output=True, text=True, timeout=30, **subprocess_options())
+    if probe.returncode and p.common.recover_active_transport():
+        p.AUTHORIZED_SERIAL = p.ADB[-1]
+        probe = subprocess.run(p.ADB + ['shell', 'pm', 'path', '--user', '0', p.PACKAGE],
+                               capture_output=True, text=True, timeout=30, **subprocess_options())
     if probe.returncode in (0, 1) and not probe.stdout.strip() and not probe.stderr.strip():
         return []
     if probe.returncode:

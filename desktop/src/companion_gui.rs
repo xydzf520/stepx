@@ -5,11 +5,11 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::Value;
 
 pub fn call(adb: &Adb, device: &Device, request: Value) -> Result<Value> {
-    device.verify(adb)?;
+    let transport = device.resolve_active_transport(adb)?;
     let encoded = STANDARD.encode(serde_json::to_vec(&request)?);
     ensure!(encoded.len() <= 32768, "GUI 请求过长");
     let result = adb.shell(
-        &device.transport,
+        &transport,
         &[
             "content",
             "call",
@@ -40,10 +40,10 @@ pub fn call(adb: &Adb, device: &Device, request: Value) -> Result<Value> {
 }
 
 pub fn enable(adb: &Adb, device: &Device) -> Result<()> {
-    device.verify(adb)?;
+    let transport = device.resolve_active_transport(adb)?;
     let component = "com.stepx.companion.app/com.stepx.companion.app.GuiAccessibilityService";
     let old = adb.shell(
-        &device.transport,
+        &transport,
         &[
             "settings",
             "--user",
@@ -61,7 +61,7 @@ pub fn enable(adb: &Adb, device: &Device) -> Result<()> {
     if !services.contains(&component) {
         services.push(component);
         adb.shell(
-            &device.transport,
+            &transport,
             &[
                 "settings",
                 "--user",
@@ -74,7 +74,7 @@ pub fn enable(adb: &Adb, device: &Device) -> Result<()> {
         )?;
     }
     adb.shell(
-        &device.transport,
+        &transport,
         &[
             "settings",
             "--user",
@@ -102,11 +102,12 @@ pub fn observe(adb: &Adb, device: &Device, task: &str) -> Result<(Value, Vec<u8>
             || remote == "/sdcard/Android/data/com.stepx.companion.app/files/gui-screen.png",
         "截图路径异常"
     );
+    let transport = device.resolve_active_transport(adb)?;
     let folder = tempfile::tempdir()?;
     let path = folder.path().join("screen.png");
     adb.run(&[
         "-s",
-        &device.transport,
+        &transport,
         "pull",
         remote,
         path.to_str().context("本地路径无效")?,

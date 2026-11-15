@@ -498,8 +498,14 @@ impl Companion {
                                 Btn::Secondary,
                             ),
                             self.button(
+                                "store-downgrade-open-apps",
+                                "去『应用』页卸载",
+                                Action::AppStore(AppStoreAction::OpenInstalledManager(pkg.clone())),
+                                Btn::Secondary,
+                            ),
+                            self.button(
                                 "store-downgrade-confirm",
-                                "已了解",
+                                "已卸载，重试安装",
                                 Action::AppStore(AppStoreAction::InstallHistorical {
                                     package: pkg.clone(),
                                     version_idx: *ver_idx,
@@ -1050,6 +1056,12 @@ impl Companion {
                     vec![
                         self.pill_badge("排队中", p.text2, p.tag_bg),
                         self.line(format!("等待下载{ver_hint}…"), MICRO, p.text3),
+                        self.button(
+                            format!("store-task-cancel-q:{}", task.package),
+                            "取消",
+                            Action::AppStore(AppStoreAction::CancelTask(task.package.clone())),
+                            Btn::Ghost,
+                        ),
                     ],
                 )
             }
@@ -1072,7 +1084,15 @@ impl Companion {
                     S1,
                     vec![
                         self.progress(Some((*percent).max(5)), p.blue),
-                        self.line(detail, MICRO, p.blue),
+                        self.between(
+                            self.line(detail, MICRO, p.blue),
+                            self.button(
+                                format!("store-task-cancel-dl:{}", task.package),
+                                "取消",
+                                Action::AppStore(AppStoreAction::CancelTask(task.package.clone())),
+                                Btn::Ghost,
+                            ),
+                        ),
                     ],
                 )
             }
@@ -1251,7 +1271,11 @@ impl Companion {
                 StoreTaskStage::Uninstalling => ("卸载中…".to_string(), 85, p.warning),
                 _ => ("处理中…".to_string(), 50, p.blue),
             };
-            self.fixed_w(
+            let cancellable = matches!(
+                task.stage,
+                StoreTaskStage::Queued | StoreTaskStage::Downloading { .. }
+            );
+            let progress_col = self.fixed_w(
                 116.,
                 self.vstack(
                     4.,
@@ -1260,7 +1284,23 @@ impl Companion {
                         self.progress(Some(pct), color),
                     ],
                 ),
-            )
+            );
+            if cancellable {
+                self.hstack(
+                    S2,
+                    vec![
+                        progress_col,
+                        self.button(
+                            format!("store-card-cancel:{pkg}"),
+                            "取消",
+                            Action::AppStore(AppStoreAction::CancelTask(pkg.clone())),
+                            Btn::Ghost,
+                        ),
+                    ],
+                )
+            } else {
+                progress_col
+            }
         } else {
             let detail_btn = self.button(
                 format!("store-card-detail:{pkg}"),
@@ -1967,11 +2007,25 @@ impl Companion {
             app.developer
         );
 
+        let cancellable_task = active_task.is_some_and(|t| {
+            matches!(
+                t.stage,
+                StoreTaskStage::Queued | StoreTaskStage::Downloading { .. }
+            )
+        });
         let mut hero_actions = Vec::new();
         match &install_state {
             StoreInstallState::Updatable { can_uninstall, .. } => {
                 if let Some(ref lbl) = active_task_label {
                     hero_actions.push(self.disabled_button(lbl.clone()));
+                    if cancellable_task {
+                        hero_actions.push(self.button(
+                            format!("store-det-cancel:{pkg}"),
+                            "取消下载",
+                            Action::AppStore(AppStoreAction::CancelTask(pkg.clone())),
+                            Btn::Ghost,
+                        ));
+                    }
                 } else {
                     hero_actions.push(self.button_icon(
                         format!("store-det-upd:{pkg}"),
@@ -2033,6 +2087,14 @@ impl Companion {
             StoreInstallState::NotInstalled => {
                 if let Some(ref lbl) = active_task_label {
                     hero_actions.push(self.disabled_button(lbl.clone()));
+                    if cancellable_task {
+                        hero_actions.push(self.button(
+                            format!("store-det-cancel:{pkg}"),
+                            "取消下载",
+                            Action::AppStore(AppStoreAction::CancelTask(pkg.clone())),
+                            Btn::Ghost,
+                        ));
+                    }
                 } else {
                     hero_actions.push(self.button_icon(
                         format!("store-det-inst:{pkg}"),

@@ -41,12 +41,12 @@ def main():
     args = parser.parse_args()
     dex = compile_java(ROOT / 'java/GmsProbe.java', ROOT / 'build/grant')
     injector = ROOT / 'module/inject.py'
-    source = injector.read_text()
+    source = injector.read_text(encoding='utf-8')
     old = base64.b64decode(ast.literal_eval(re.search(r'dex=base64\.b64decode\(([^\n]+?)\);dexp=', source).group(1)))
     print('Compiled DEX SHA-256:', hashlib.sha256(dex).hexdigest())
     print('Embedded DEX matches compilation:', dex == old)
     if args.write:
-        injector.write_text(replace_dex(source, dex))
+        injector.write_text(replace_dex(source, dex), encoding='utf-8')
         print('Bundle injector updated. Installed device module was not changed.')
 
 

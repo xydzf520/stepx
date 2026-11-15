@@ -20,8 +20,8 @@ mod tests;
 /// * `Some(CapturedFrame)` containing the RGBA pixel data if successful
 /// * `None` if the texture dimensions are invalid
 pub fn capture_frame(texture: &metal::TextureRef, size: Vector2F) -> Option<CapturedFrame> {
-    let width = size.x() as usize;
-    let height = size.y() as usize;
+    let width = (size.x().max(0.0) as usize).min(texture.width() as usize);
+    let height = (size.y().max(0.0) as usize).min(texture.height() as usize);
 
     if width == 0 || height == 0 {
         log::warn!("Invalid texture dimensions: {}x{}", width, height);

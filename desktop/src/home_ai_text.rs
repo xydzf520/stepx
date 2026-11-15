@@ -407,7 +407,7 @@ def run():
     if protocol == 'anthropic':
         endpoint += '/messages'
         headers.update({'x-api-key': key, 'anthropic-version': '2023-06-01'})
-        body = {'model': model, 'system': request['system'], 'messages': [{'role':'user','content':request['prompt']}], 'max_tokens':8192}
+        body = {'model': model, 'system': request['system'], 'messages': [{'role':'user','content':request['prompt']}], 'max_tokens': 8192}
     else:
         endpoint += '/chat/completions'
         headers['Authorization'] = 'Bearer ' + key
@@ -478,11 +478,55 @@ def run():
     if step_json_stream:
         record_metadata('last-text-model-response.json')
     print(json.dumps({'text':text, 'model':str(data.get('model') or model)}, ensure_ascii=False))
+def friendly_http_error(e):
+    code = getattr(e, 'code', 0)
+    hints = {
+        400: '请求参数或模型名称无效',
+        401: 'API 密钥无效或已过期',
+        402: '账户余额或配额不足',
+        403: '当前密钥无权访问该模型或接口',
+        404: 'API 地址或模型名称不存在',
+        429: '请求频率受限或额度已满',
+    }
+    hint = hints.get(code)
+    detail = ''
+    if code in hints:
+        try:
+            raw_err = e.read(8192)
+            parsed = json.loads(raw_err.decode('utf-8', errors='replace')) if raw_err else None
+            if isinstance(parsed, dict):
+                err_obj = parsed.get('error')
+                if isinstance(err_obj, dict) and isinstance(err_obj.get('message'), str):
+                    detail = err_obj['message']
+                elif isinstance(err_obj, str):
+                    detail = err_obj
+                elif isinstance(parsed.get('message'), str):
+                    detail = parsed['message']
+        except Exception:
+            detail = ''
+    if detail:
+        import re as _re
+        try:
+            with open(sys.argv[1], 'r', encoding='utf-8') as _cf:
+                _k = (json.load(_cf).get('key') or '').strip()
+                if _k:
+                    detail = detail.replace(_k, '[redacted]')
+        except Exception:
+            pass
+        detail = _re.sub(r'(?i)bearer\s+\S+', 'Bearer [redacted]', detail)
+        detail = _re.sub(r'sk-[A-Za-z0-9_\-]{6,}', '[redacted]', detail)
+        detail = ' '.join(ch if ch >= ' ' else ' ' for ch in detail).split()
+        detail = ' '.join(detail)[:140]
+    if hint and detail:
+        return f'模型服务返回 HTTP {code}（{hint}）：{detail}'
+    if hint:
+        return f'模型服务返回 HTTP {code}（{hint}）'
+    return '模型服务返回 HTTP ' + str(code)
 try:
     run()
 except urllib.error.HTTPError as e:
     record_failure(e)
-    sys.stderr.write('模型服务返回 HTTP ' + str(e.code))
+    sys.stderr.write(friendly_http_error(e))
     sys.exit(1)
 except TimeoutError as e:
     record_failure(e)
@@ -519,6 +563,82 @@ fn connector_failure(code: Option<i32>, message: &[u8]) -> anyhow::Error {
     else { anyhow::anyhow!("{}", String::from_utf8_lossy(message)) }
 }
 
+/// Extract a JSON object from model output, tolerating case-insensitive ```JSON fences
+/// and short conversational preambles/postambles while leaving clean JSON untouched.
+pub(crate) fn extract_json_object(raw: &str) -> &str {
+    crate::agent_workflows::strip_fence(raw)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn friendly_http_error(status: u16, body: &str, redact_key: Option<&str>) -> String {
+    let hint = match status {
+        400 => Some("请求参数或模型名称无效"),
+        401 => Some("API 密钥无效或已过期"),
+        402 => Some("账户余额或配额不足"),
+        403 => Some("当前密钥无权访问该模型或接口"),
+        404 => Some("API 地址或模型名称不存在"),
+        429 => Some("请求频率受限或额度已满"),
+        _ => None,
+    };
+    let mut detail = String::new();
+    if hint.is_some() {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) {
+            if let Some(msg) = parsed
+                .get("error")
+                .and_then(|e| {
+                    e.get("message")
+                        .and_then(|m| m.as_str())
+                        .or_else(|| e.as_str())
+                })
+                .or_else(|| parsed.get("message").and_then(|m| m.as_str()))
+            {
+                detail = msg.to_string();
+            }
+        }
+    }
+    if !detail.is_empty() {
+        if let Some(key) = redact_key.filter(|k| !k.trim().is_empty()) {
+            detail = detail.replace(key.trim(), "[redacted]");
+        }
+        let cleaned: String = detail
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        let mut sanitized_words = Vec::new();
+        let mut redact_next = false;
+        for word in cleaned.split_whitespace() {
+            if redact_next {
+                sanitized_words.push("[redacted]");
+                redact_next = false;
+                continue;
+            }
+            if word.eq_ignore_ascii_case("bearer") {
+                sanitized_words.push("Bearer");
+                redact_next = true;
+            } else if word.starts_with("sk-") && word.len() >= 9 {
+                sanitized_words.push("[redacted]");
+            } else {
+                sanitized_words.push(word);
+            }
+        }
+        detail = sanitized_words.join(" ").chars().take(140).collect();
+    }
+    match (hint, detail.is_empty()) {
+        (Some(h), false) => format!("模型服务返回 HTTP {status}（{h}）：{detail}"),
+        (Some(h), true) => format!("模型服务返回 HTTP {status}（{h}）"),
+        (None, _) => format!("模型服务返回 HTTP {status}"),
+    }
+}
+
+fn kill_connector_child(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    unsafe {
+        let _ = libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 fn validate_document(text: &str) -> Result<String> {
     ensure!(!text.trim().is_empty(), "模型没有返回文稿");
     ensure!(text.len() <= MAX_DOCUMENT_BYTES, "模型文稿过长，请缩小资料范围");
@@ -549,6 +669,10 @@ fn run_local_with_system(path: &Path, prompt: &str, cancel: &AtomicBool, system:
     let mut command = crate::resources::python_command();
     command.arg("-I").arg("-c").arg(API_SCRIPT).arg(path)
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)] {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     #[cfg(target_os = "linux")] {
         use std::os::unix::process::CommandExt;
         let parent = std::process::id() as libc::pid_t;
@@ -568,6 +692,12 @@ fn run_local_with_system(path: &Path, prompt: &str, cancel: &AtomicBool, system:
     let mut child = command.spawn().context("无法启动文稿模型连接器")?;
     let stdout = child.stdout.take().context("无法读取模型输出")?;
     let stderr = child.stderr.take().context("无法读取模型错误")?;
+    let input = child.stdin.take().context("无法写入模型材料")?;
+    let writer = thread::spawn(move || -> std::io::Result<()> {
+        let mut input = input;
+        input.write_all(&payload)?;
+        input.flush()
+    });
     let output = thread::spawn(move || {
         let mut bytes = Vec::new();
         stdout.take((MAX_DOCUMENT_BYTES * 6 + 4096) as u64).read_to_end(&mut bytes).map(|_| bytes)
@@ -576,30 +706,36 @@ fn run_local_with_system(path: &Path, prompt: &str, cancel: &AtomicBool, system:
         let mut bytes = Vec::new();
         stderr.take(2048).read_to_end(&mut bytes).map(|_| bytes)
     });
-    let input = child.stdin.take();
-    let input_result = input.context("无法写入模型材料").and_then(|mut input| input.write_all(&payload).map_err(Into::into));
     let deadline = Instant::now() + Duration::from_secs(timeout_seconds + 5);
     let status = loop {
-        if input_result.is_err() || cancel.load(Ordering::Acquire) || Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+        if cancel.load(Ordering::Acquire) || Instant::now() >= deadline {
+            kill_connector_child(&mut child);
             break None;
         }
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) => thread::sleep(Duration::from_millis(25)),
-            Err(_) => { let _ = child.kill(); let _ = child.wait(); break None; }
+            Err(_) => {
+                kill_connector_child(&mut child);
+                break None;
+            }
         }
     };
     let bytes = output.join().map_err(|_| anyhow::anyhow!("模型输出读取失败"))??;
     let error_bytes = error.join().map_err(|_| anyhow::anyhow!("模型错误读取失败"))??;
+    let input_result = writer.join().map_err(|_| anyhow::anyhow!("模型输入写入失败"))?;
     check_cancel(cancel)?;
-    input_result?;
     let status = status.context("文稿模型请求超时，原始材料已保留")?;
     if !status.success() { return Err(connector_failure(status.code(), &error_bytes)); }
+    input_result.context("无法写入模型材料")?;
     #[derive(Deserialize)] struct Reply { text: String, model: String }
     let reply: Reply = serde_json::from_slice(&bytes).context("模型没有返回有效文稿")?;
-    Ok(TextBrief { markdown: validate_document(&reply.text)?, model: reply.model.chars().take(100).collect(), session_cleaned: true })
+    let body_text = if system == JSON_SYSTEM {
+        extract_json_object(&reply.text)
+    } else {
+        reply.text.as_str()
+    };
+    Ok(TextBrief { markdown: validate_document(body_text)?, model: reply.model.chars().take(100).collect(), session_cleaned: true })
 }
 
 fn run_phone(adb: &Adb, device: &Device, prompt: &str, cancel: &AtomicBool, sender: &Sender<TextEvent>) -> Result<TextBrief> {
@@ -628,7 +764,12 @@ fn run_phone_with_system(adb:&Adb, device:&Device, prompt:&str, cancel:&AtomicBo
         validate_phone_completion(&messages)?;
         let reply = messages.iter().rev().find(|m| m.role == "assistant" && !m.text.trim().is_empty()).context("手机 Amoo 没有返回文稿")?;
         ensure!(amoo_usage::account_scope_fresh(adb,device)?.as_deref()==Some(account.as_str()),"手机账号已变化，未采用此次生成结果");
-        let markdown=validate_document(&reply.text)?;
+        let phone_text = if system == JSON_SYSTEM {
+            extract_json_object(&reply.text)
+        } else {
+            reply.text.as_str()
+        };
+        let markdown=validate_document(phone_text)?;
         let inference=InferenceMeta {source:Source::PhoneAccount,model:reply.model.chars().take(100).collect(),
             provider:reply.provider.chars().take(100).collect(),usage:reply.usage.has_tokens().then(||reply.usage.clone()),
             account_scope:Some(account.clone()),observed_ms:chrono::Utc::now().timestamp_millis(),session_cleaned:false,temporary_session_key:Some(key.clone()),channel:Some("agentbus_manual".into()),isolation:None,session_cleanup:None};
@@ -963,5 +1104,56 @@ for host, json_mode, model in [
         assert!(validate_phone_completion(&[&message,&terminal]).is_ok());
         message.stop_reason="max_tokens".into();
         assert!(validate_phone_completion(&[&message,&terminal]).is_err());
+    }
+
+    #[test]
+    fn large_stdin_payload_http_error_detail_and_json_extraction_work() {
+        // 1. >100 KiB payload (>64 KiB pipe buffer) completes without stdin deadlock
+        //    and extracts uppercase ```JSON fenced objects with short preambles.
+        let (_root, path, server) = fake_api(json!({
+            "model": "test-text",
+            "choices": [{
+                "finish_reason": "stop",
+                "message": { "content": "好的，整理结果如下：\n```JSON\n{\"schema\":1,\"ok\":true}\n```" }
+            }]
+        }));
+        let large_prompt = format!("[E1] {}", "会议纪要内容".repeat(6000));
+        assert!(large_prompt.len() > 96 * 1024);
+        let brief =
+            run_local_with_system(&path, &large_prompt, &AtomicBool::new(false), JSON_SYSTEM)
+                .unwrap();
+        assert_eq!(brief.markdown, "{\"schema\":1,\"ok\":true}");
+        let req = server.join().unwrap();
+        assert_eq!(req["messages"][1]["content"].as_str().unwrap().len(), large_prompt.len());
+
+        // 2. Preserves inner markdown fences inside already-unfenced JSON objects.
+        let nested = "{\"draft\":\"示例：```json\\n{\\\"a\\\":1}\\n```\"}";
+        assert_eq!(extract_json_object(nested), nested);
+        assert_eq!(
+            extract_json_object("Here is the JSON:\n```JSON\n{\"a\": 1}\n```"),
+            "{\"a\": 1}"
+        );
+        assert_eq!(
+            extract_json_object("以下是输出：\n{\"a\": 2}"),
+            "{\"a\": 2}"
+        );
+
+        // 3. Friendly HTTP error parses OpenAI/Anthropic error.message and redacts keys.
+        let msg_401 = friendly_http_error(
+            401,
+            "{\"error\":{\"message\":\"Incorrect API key provided: sk-secret123456789\"}}",
+            Some("my-private-key"),
+        );
+        assert!(msg_401.contains("HTTP 401"));
+        assert!(msg_401.contains("Incorrect API key provided:"));
+        assert!(!msg_401.contains("sk-secret123456789"));
+
+        let msg_429 = friendly_http_error(
+            429,
+            "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Rate limit reached for model\"}}",
+            None,
+        );
+        assert!(msg_429.contains("HTTP 429"));
+        assert!(msg_429.contains("Rate limit reached for model"));
     }
 }

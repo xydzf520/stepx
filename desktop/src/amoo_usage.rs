@@ -233,10 +233,22 @@ mod tests {
     }
 }
 
-const ACCOUNT_SCOPE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+const ACCOUNT_SCOPE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
-static SCOPE_CACHE: std::sync::Mutex<Option<(String, String, std::time::Instant, Option<String>)>> =
-    std::sync::Mutex::new(None);
+static SCOPE_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
+> = std::sync::OnceLock::new();
+
+fn scope_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>> {
+    SCOPE_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+pub fn invalidate_account_scope(serial: &str) {
+    if let Ok(mut guard) = scope_cache().lock() {
+        guard.remove(serial);
+    }
+}
 
 /// Non-secret, account-scoped cache key for the Android foreground user.
 /// Reads the account registry only; no credential or auth-token API is used.
@@ -264,6 +276,7 @@ fn account_scope_inner(
     use anyhow::{anyhow, Context};
     use std::time::Instant;
     let can_cache = device.serial != "phone"
+        && !device.serial.trim().is_empty()
         && adb
             .path
             .file_stem()
@@ -282,13 +295,10 @@ fn account_scope_inner(
         device
     };
     if can_cache && use_cache {
-        if let Ok(guard) = SCOPE_CACHE.lock() {
-            if let Some((transport, serial, at, cached)) = guard.as_ref() {
-                if transport == &device.transport
-                    && serial == &device.serial
-                    && at.elapsed() < ACCOUNT_SCOPE_CACHE_TTL
-                {
-                    return Ok(cached.clone());
+        if let Ok(guard) = scope_cache().lock() {
+            if let Some((cached, at)) = guard.get(&device.serial) {
+                if at.elapsed() < ACCOUNT_SCOPE_CACHE_TTL {
+                    return Ok(Some(cached.clone()));
                 }
             }
         }
@@ -304,14 +314,7 @@ fn account_scope_inner(
         .map_err(|_| anyhow!("无法读取手机账号状态"))?;
     let Some(account) = account_name(&dump, user) else {
         if can_cache {
-            if let Ok(mut guard) = SCOPE_CACHE.lock() {
-                *guard = Some((
-                    device.transport.clone(),
-                    device.serial.clone(),
-                    Instant::now(),
-                    None,
-                ));
-            }
+            invalidate_account_scope(&device.serial);
         }
         return Ok(None);
     };
@@ -322,13 +325,11 @@ fn account_scope_inner(
     let digest = crate::device::sha256(domain.as_bytes());
     let scope: String = digest.iter().map(|b| format!("{b:02x}")).collect();
     if can_cache {
-        if let Ok(mut guard) = SCOPE_CACHE.lock() {
-            *guard = Some((
-                device.transport.clone(),
-                device.serial.clone(),
-                Instant::now(),
-                Some(scope.clone()),
-            ));
+        if let Ok(mut guard) = scope_cache().lock() {
+            if guard.len() >= 64 {
+                guard.retain(|_, (_, at)| at.elapsed() < ACCOUNT_SCOPE_CACHE_TTL);
+            }
+            guard.insert(device.serial.clone(), (scope.clone(), Instant::now()));
         }
     }
     Ok(Some(scope))
@@ -382,6 +383,21 @@ mod account_tests {
             None
         );
     }
+    #[test]
+    fn scope_cache_is_keyed_by_serial_and_supports_invalidation() {
+        let now = std::time::Instant::now();
+        {
+            let mut guard = scope_cache().lock().unwrap();
+            guard.insert("serial-a".into(), ("scope-a".into(), now));
+            guard.insert("serial-b".into(), ("scope-b".into(), now));
+        }
+        invalidate_account_scope("serial-a");
+        let guard = scope_cache().lock().unwrap();
+        assert!(!guard.contains_key("serial-a"));
+        assert_eq!(guard.get("serial-b").map(|(s, _)| s.as_str()), Some("scope-b"));
+        drop(guard);
+        invalidate_account_scope("serial-b");
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -408,7 +424,7 @@ pub fn fetch_account_usage(
     use anyhow::{bail, Context};
     use serde_json::json;
     use std::time::{Duration, Instant};
-    let scope = account_scope(adb, device)?.context("未读取到唯一的手机 Amoo 账号")?;
+    let scope = account_scope_fresh(adb, device)?.context("未读取到唯一的手机 Amoo 账号")?;
     let mut bus = crate::amoo::AgentBus::connect(adb, device)?;
     let list = bus.call("sessions.list", json!({"limit":100}))?;
     let sessions = list["sessions"].as_array().context("手机未返回会话目录")?;
@@ -484,7 +500,7 @@ pub fn fetch_account_usage(
             });
         }
     }
-    if account_scope(adb, device)?.as_deref() != Some(&scope) {
+    if account_scope_fresh(adb, device)?.as_deref() != Some(&scope) {
         bail!("同步期间手机账号已改变，未混合保存用量")
     }
     snapshot.entries.sort_by_key(|entry| entry.timestamp_ms);

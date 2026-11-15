@@ -429,4 +429,88 @@ class GoogleAdoptionTests(unittest.TestCase):
                 with self.assertRaises(AssertionError):exec(code,dict(env))
             self.assertEqual(launcher.read_bytes(),b'# foreign\n')
 
+    def test_google_rollback_preserves_chained_companion_and_restores_stock_when_alone(self):
+        import importlib.util
+        import sys
+        from unittest.mock import patch
+        tools_dir = str(Path(__file__).parents[1] / 'handoff/google-play-stepx/tools')
+        scripts_dir = str(Path(__file__).parents[1] / 'scripts')
+        for extra in (scripts_dir, tools_dir):
+            if extra not in sys.path:
+                sys.path.insert(0, extra)
+        spec = importlib.util.spec_from_file_location(
+            'google_rollback_test',
+            Path(__file__).parents[1] / 'handoff/google-play-stepx/tools/rollback.py',
+        )
+        rb = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(rb)
+        original = b'# factory\n'
+        google_launcher = b'# google launcher\n'
+        comp_launcher = b'# companion launcher\n'
+        # Case 1: Companion boot is chained -> restore companion launcher + standalone config, keep stock.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            base = root / 'usr/local/lib/stepx-companion'
+            gms_base = root / 'usr/local/lib/stepx-gms'
+            gms_state = root / 'var/lib/stepx-gms'
+            comp_state = root / 'var/lib/stepx-companion'
+            for d in (base, gms_base, gms_state, comp_state, root / 'usr/local/bin'):
+                d.mkdir(parents=True, exist_ok=True)
+            launcher = root / 'usr/local/bin/ubuntu_zygote'
+            stock = Path(str(launcher) + '.stepx-stock-20261021')
+            launcher.write_bytes(google_launcher); launcher.chmod(0o755)
+            stock.write_bytes(original); stock.chmod(0o755)
+            (base / 'launcher.py').write_bytes(comp_launcher)
+            (base / 'previous-boot.py').write_bytes(b'# google worker\n')
+            (base / 'standalone-config-before-google.json').write_text('{}')
+            cfg = {
+                'boot_mode': 'chained',
+                'hook_path': str(gms_base / 'boot.py'),
+                'launcher_sha256': hashof(comp_launcher),
+            }
+            (base / 'config.json').write_text(json.dumps(cfg))
+            code = rb.build_rollback_code(hashof(original), hashof(google_launcher), hashof(comp_launcher))
+            code = (
+                code.replace("'/usr/local/", repr(str(root / 'usr/local') + '/')[:-1])
+                .replace("'/var/lib/", repr(str(root / 'var/lib') + '/')[:-1])
+            )
+            out = io.StringIO()
+            with patch('os.chown'), contextlib.redirect_stdout(out):
+                exec(code, {})
+            proof = json.loads(out.getvalue())
+            self.assertTrue(proof['restored'])
+            self.assertTrue(proof['companion_preserved'])
+            self.assertEqual(launcher.read_bytes(), comp_launcher)
+            self.assertTrue(stock.is_file(), 'stock backup must remain for standalone companion boot')
+            updated_cfg = json.loads((base / 'config.json').read_text())
+            self.assertEqual(updated_cfg['boot_mode'], 'standalone')
+            self.assertFalse((base / 'previous-boot.py').exists())
+            self.assertFalse((base / 'standalone-config-before-google.json').exists())
+            self.assertFalse(gms_base.exists())
+            self.assertFalse(gms_state.exists())
+        # Case 2: No companion boot -> restore stock and unlink stock backup cleanly.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            gms_base = root / 'usr/local/lib/stepx-gms'
+            gms_state = root / 'var/lib/stepx-gms'
+            for d in (gms_base, gms_state, root / 'usr/local/bin'):
+                d.mkdir(parents=True, exist_ok=True)
+            launcher = root / 'usr/local/bin/ubuntu_zygote'
+            stock = Path(str(launcher) + '.stepx-stock-20261021')
+            launcher.write_bytes(google_launcher); launcher.chmod(0o755)
+            stock.write_bytes(original); stock.chmod(0o755)
+            code = rb.build_rollback_code(hashof(original), hashof(google_launcher), hashof(comp_launcher))
+            code = (
+                code.replace("'/usr/local/", repr(str(root / 'usr/local') + '/')[:-1])
+                .replace("'/var/lib/", repr(str(root / 'var/lib') + '/')[:-1])
+            )
+            out = io.StringIO()
+            with patch('os.chown'), contextlib.redirect_stdout(out):
+                exec(code, {})
+            proof = json.loads(out.getvalue())
+            self.assertTrue(proof['restored'])
+            self.assertFalse(proof['companion_preserved'])
+            self.assertEqual(launcher.read_bytes(), original)
+            self.assertFalse(stock.exists(), 'stock backup must be unlinked so future install_adapter succeeds')
+
 if __name__=='__main__':unittest.main()

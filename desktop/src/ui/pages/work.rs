@@ -556,7 +556,8 @@ impl Companion {
         let mut value = field.text.clone();
         let mut caret = 0;
         if focused {
-            let cursor = field.cursor.min(value.len());
+            let cursor =
+                crate::ui::keyboard_input::clamp_char_boundary(&value, field.cursor.min(value.len()));
             caret = value[..cursor].chars().count() + field.preedit.chars().count();
             value.insert_str(cursor, &field.preedit);
         }

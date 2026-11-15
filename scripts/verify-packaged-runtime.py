@@ -28,9 +28,9 @@ with tempfile.TemporaryDirectory(prefix='StepX 中文 runtime ') as td:
     env['PYTHONUTF8']='1';env['PYTHONIOENCODING']='utf-8'
     env['STEPX_STATE_DIR']=str(Path(td)/'user data');env['PYTHONDONTWRITEBYTECODE']='1'
     python=copy/'runtime/python/python.exe' if os.name=='nt' else copy/'runtime/python/bin/python3'
-    code="""import importlib.util,sys,hashlib
+    code="""import importlib.util,os,sys,hashlib
 from pathlib import Path
-root=Path(sys.argv[1]);sys.path.insert(0,str(root/'scripts'))
+root=Path(sys.argv[1]);sys.path[:0]=[str(root/'scripts'),str(root/'handoff/google-play-stepx/tools')]
 for name in ['companion-permissions','companion-power','companion-system']:
  spec=importlib.util.spec_from_file_location(name,root/'scripts'/(name+'.py'));m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
  if name=='companion-permissions':
@@ -40,6 +40,18 @@ for name in ['companion-permissions','companion-power','companion-system']:
    assert b'\\r' not in data, 'Packaged Python source must use LF: '+relative
    assert hashlib.sha256(data).hexdigest()==expected, 'Packaged audited source hash differs: '+relative
   print('Packaged loader and worker exact-byte integrity: PASS')
+import manage
+google_dir=root/'runtime/google-play'
+assert google_dir.is_dir(), 'Missing bundled runtime/google-play directory'
+assert {e['package'] for e in manage.CONFIG['apks']}==set(manage.PACKAGES), 'Bundled Google Play APK config incomplete'
+assert {p.name for p in google_dir.iterdir()}=={e['filename'] for e in manage.CONFIG['apks']}, 'Unexpected files in runtime/google-play'
+for entry in manage.CONFIG['apks']:
+ bundled_apk=google_dir/entry['filename']
+ assert bundled_apk.is_file(), 'Missing bundled Google Play APK: '+entry['filename']
+ assert hashlib.sha256(bundled_apk.read_bytes()).hexdigest()==entry['sha256'], 'Bundled Google Play APK SHA256 mismatch: '+entry['package']
+offline_stage=Path(os.environ['STEPX_STATE_DIR'])/'offline-google-play';offline_stage.mkdir(parents=True,exist_ok=True)
+assert manage._bundled_google_apks_ready(offline_stage), 'Offline Google Play APK staging failed'
+print('Packaged Google Play offline 3-piece APKs and SHA-256 integrity: PASS')
 # Verify that signature checking rejects modified APK bytes, not just a known filename.
 import zipfile
 apk=root/'desktop/assets/stepx-companion.apk';bad=root/'tampered.apk';data=bytearray(apk.read_bytes())
@@ -98,3 +110,8 @@ if os.name=='nt':
     binary=(root/'stepx-companion.exe').read_bytes();pe=struct.unpack_from('<I',binary,0x3c)[0]
     assert struct.unpack_from('<H',binary,pe+24+68)[0]==2,'EXE must use Windows GUI subsystem'
     print('Windows GUI subsystem: PASS')
+    java_exe=(root/'runtime/java/bin/java.exe').read_bytes();jpe=struct.unpack_from('<I',java_exe,0x3c)[0]
+    assert struct.unpack_from('<II',java_exe,jpe+24+112+4*8)==(0,0),'java.exe must not retain invalidated PE Authenticode certificate data'
+    win_py=root/'runtime/python/python.exe'
+    run_checked([str(win_py),'-B','-X','utf8','-c','import subprocess,sys; assert subprocess.Popen([sys.executable,"-B","-c","pass"],creationflags=subprocess.DETACHED_PROCESS).wait(timeout=15)==0'],env,20)
+    print('Windows java.exe clean PE header and QuietPopen DETACHED_PROCESS: PASS')

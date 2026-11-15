@@ -45,7 +45,16 @@ impl Companion {
             if self.error { content.push(self.text(&self.status, CAPTION, p.danger)); }
             content.push(self.button_icon("adb-guide-detect", "重新检查", UiIcon::Refresh, Action::Refresh, Btn::Secondary));
         }
-        if step == 0 { content.push(self.text("已经开启过？直接点上面的“开 USB 调试”。若手机要求密码，请在手机上自行验证。", CAPTION, p.text3)); }
+        if step == 0 {
+            content.push(self.text("已经开启过？直接点上面的“开 USB 调试”。若手机要求密码，请在手机上自行验证。", CAPTION, p.text3));
+            content.push(self.button_icon(
+                "adb-guide-wireless",
+                "免数据线 · 直接使用无线配对",
+                UiIcon::Wifi,
+                Action::PairTab(PairTab::Qr),
+                Btn::Secondary,
+            ));
+        }
         let mut actions = Vec::new();
         if step > 0 { actions.push(self.button("adb-guide-back", "上一步", Action::AdbGuide(Some(step - 1)), Btn::Secondary)); }
         if step < 2 { actions.push(self.button("adb-guide-next", "下一步", Action::AdbGuide(Some(step + 1)), Btn::Primary)); }

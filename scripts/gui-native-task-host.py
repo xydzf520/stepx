@@ -7,7 +7,6 @@ neither file cleanup nor host exit is represented as complete GUI rollback.
 """
 import argparse
 import base64
-import fcntl
 import gzip
 import hashlib
 import importlib.util
@@ -20,6 +19,9 @@ import time
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / 'scripts') not in sys.path:
+    sys.path.insert(0, str(ROOT / 'scripts'))
+from host_runtime import file_lock
 DEX = ROOT / 'desktop/.runtime/native-gui-research/stepx-native-gui-task-host.dex'
 # Fixed-test gate and artifact reviewed by the coordinating task; never a general executor.
 # Disabled after the original MMKV native reader crashed the disposable host.
@@ -66,8 +68,8 @@ def read_payload():
 def validate_record(record):
     require(record.get('schema') == SCHEMA
             and record.get('serial') == recovery.SERIAL
-            and record.get('fingerprint') == recovery.FINGERPRINT
-            and record.get('ability_sha256') == recovery.APK_SHA256
+            and record.get('fingerprint') in recovery.ALLOWED_FINGERPRINTS
+            and record.get('ability_sha256') in recovery.ALLOWED_APK_SHA256S
             and record.get('main') == MAIN and record.get('socket') == SOCKET,
             'Unknown task host identity or firmware')
     require(re.fullmatch(r'[0-9a-f]{32}', record.get('id', '')) is not None,
@@ -339,7 +341,8 @@ def process_valid(value):
  return value is not None and value['argv'] in (full,[MAIN]) and value['uids']==[1000]*4 and value['gids']==[1000]*4 and value['context']=='u:r:system_app:s0' and value['boot_id']==RECORD['boot_id']
 checked(boot()==RECORD['boot_id'],'boot_changed')
 checked(callable(globals().get('publish')),'agentbus_supervisor_required')
-checked(hashlib.sha256(open('/system/priv-app/ability/ability.apk','rb').read()).hexdigest()==ABILITY_SHA256,'ability_changed')
+ability_sha=hashlib.sha256(open('/system/priv-app/ability/ability.apk','rb').read()).hexdigest()
+checked(ability_sha in ALLOWED_ABILITY_SHA256S and ability_sha==ABILITY_SHA256,'ability_changed')
 checked(hashlib.sha256(open(APP_PROCESS,'rb').read()).hexdigest()==APP_PROCESS_SHA256,'app_process_changed')
 directory=os.open(REMOTE_DIR,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
 directory_stat=os.fstat(directory)
@@ -356,7 +359,9 @@ def worker_prefix(record):
     validate_record(record)
     values = dict(RECORD=record, APP_PROCESS=APP_PROCESS, MAIN=MAIN, REMOTE_DIR=REMOTE_DIR,
                   REMOTE_ALIASES=REMOTE_ALIASES,
-                  APP_PROCESS_SHA256=APP_PROCESS_SHA256, ABILITY_SHA256=recovery.APK_SHA256,
+                  APP_PROCESS_SHA256=APP_PROCESS_SHA256,
+                  ABILITY_SHA256=record['ability_sha256'],
+                  ALLOWED_ABILITY_SHA256S=recovery.ALLOWED_APK_SHA256S,
                   MAX_OUTPUT_BYTES=MAX_OUTPUT_BYTES)
     return ''.join(key + '=' + repr(value) + '\n' for key, value in values.items()) + WORKER_COMMON
 
@@ -536,7 +541,8 @@ def provider_status(adb, record):
             and value.get('pid') == record['process']['pid']
             and value.get('uid') == record['companion_uid']
             and value.get('socket') == SOCKET and value.get('target') == recovery.PACKAGE
-            and value.get('apk_sha256') == recovery.APK_SHA256
+            and value.get('apk_sha256') in recovery.ALLOWED_APK_SHA256S
+            and value.get('apk_sha256') == record['ability_sha256']
             and value.get('mode') == 'fixed_settings_about_test'
             and value.get('arbitrary_tasks_enabled') is False and value.get('running') is True,
             'Research socket is not the recorded fixed-test host')
@@ -564,7 +570,7 @@ def preserve_worker(permissions, record_path, record, code, operation):
         # fails. Preserve only this invocation's matching proof, never an older one.
         last = permissions.STATE / 'last-worker-result.json'
         try:
-            proof = json.loads(last.read_text())
+            proof = json.loads(last.read_text(encoding='utf-8'))
             if proof.get('worker_code_sha256') == hashlib.sha256(code.encode()).hexdigest():
                 save(proof)
         except (OSError, ValueError):
@@ -577,6 +583,7 @@ def start(backup, apk):
     permissions, adb = permissions_and_adb()
     backup = backup.resolve(strict=True)
     before = strict_baseline(adb, backup)
+    manifest = recovery.load_backup(backup)
     baseline = readiness.display_baseline(adb)
     companion = permissions.inspect(apk)
     require(companion.get('signature_verified') is True, 'Signed companion identity is not verified')
@@ -586,8 +593,9 @@ def start(backup, apk):
             'A fixed-test socket already exists; do not replace another host')
     identity = uuid.uuid4().hex
     record = dict(schema=SCHEMA, id=identity, status='preparing', backup=str(backup),
-                  serial=recovery.SERIAL, fingerprint=recovery.FINGERPRINT,
-                  ability_sha256=recovery.APK_SHA256, main=MAIN, socket=SOCKET,
+                  serial=recovery.SERIAL,
+                  fingerprint=manifest['snapshot']['identity']['ro.build.fingerprint'],
+                  ability_sha256=manifest['original_sha256'], main=MAIN, socket=SOCKET,
                   signer=permissions.signer(apk), companion_uid=companion['uid'],
                   dex_sha256=DEX_SHA256, boot_id=before['current_process']['boot_id'],
                   ability_pid=before['current_process']['pid'],
@@ -633,7 +641,7 @@ def start(backup, apk):
 
 def load_record(record_path):
     record_path = record_path.resolve(strict=True)
-    record = validate_record(json.loads(record_path.read_text()))
+    record = validate_record(json.loads(record_path.read_text(encoding='utf-8')))
     require(record_path.parent == Path(record['backup']).resolve(strict=True),
             'Record is outside its recovery directory')
     require(record_path.name == 'task-host-' + record['id'] + '.json', 'Unexpected record filename')
@@ -720,11 +728,7 @@ def main():
     args = parser.parse_args()
     backup = args.backup if args.command == 'start' else args.record.parent
     # Local lock only, preventing two invocations of this runner racing its record.
-    fd = os.open(backup / '.native-gui-task-host.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, 'w', encoding='utf-8') as lock:
-        found = os.fstat(lock.fileno())
-        require(found.st_uid == os.getuid() and found.st_nlink == 1, 'Unexpected local lock owner')
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with file_lock(backup / '.native-gui-task-host.lock'):
         print(json.dumps(start(args.backup, args.apk) if args.command == 'start'
                          else collect(args.record, args.finalize_only), ensure_ascii=False))
 

@@ -8,8 +8,33 @@ class Cancelled(Exception): pass
 def emit(event, **fields):
     print(json.dumps(dict(event=event, **fields), ensure_ascii=False), flush=True)
 
+def _parent_exited(parent_pid):
+    try:
+        pid = int(parent_pid)
+    except (TypeError, ValueError):
+        return True
+    if pid <= 0:
+        return True
+    if os.name == "nt":
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        k32.OpenProcess.restype = ctypes.c_void_p
+        k32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        k32.WaitForSingleObject.restype = ctypes.c_uint32
+        k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        k32.CloseHandle.restype = ctypes.c_int
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        handle = k32.OpenProcess(0x00100000, False, pid)
+        if not handle:
+            return True
+        try:
+            return k32.WaitForSingleObject(handle, 0) == 0
+        finally:
+            k32.CloseHandle(handle)
+    return os.getppid() != pid
+
 def check_cancel(req):
-    if req.get("parent_pid") is not None and os.getppid() != req["parent_pid"]: raise Cancelled()
+    if req.get("parent_pid") is not None and _parent_exited(req["parent_pid"]): raise Cancelled()
     if req.get('cancel') and os.path.exists(req['cancel']): raise Cancelled()
 
 def validate_url(url, test_origin=None):
@@ -202,7 +227,12 @@ def stage(req):
     if not re.fullmatch(r'/sdcard/Download/StepX-OTA/[0-9a-f]{32}/update\.zip', remote): raise ValueError('手机固件目标路径无效')
     def run(args, timeout=30, cancellable=True):
         with tempfile.TemporaryFile() as output:
-            child = subprocess.Popen(adb + ['shell', ' '.join(shlex.quote(str(v)) for v in args)], stdout=output, stderr=subprocess.DEVNULL)
+            child = subprocess.Popen(
+                adb + ['shell', ' '.join(shlex.quote(str(v)) for v in args)],
+                stdout=output,
+                stderr=subprocess.DEVNULL,
+                **({'creationflags': 0x08000000} if os.name == 'nt' else {}),
+            )
             began = time.monotonic()
             try:
                 while child.poll() is None:
@@ -223,15 +253,42 @@ def stage(req):
     run(['mkdir', '-p', folder])
     temp = remote + '.part'
     proc = None
+    STALL_TIMEOUT_SECS = 60.0
     try:
         check_cancel(req)
-        proc = subprocess.Popen(adb + ['push', req['path'], temp], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc = subprocess.Popen(
+            adb + ['push', req['path'], temp],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            **({'creationflags': 0x08000000} if os.name == 'nt' else {}),
+        )
         last = 0
+        last_bytes = -1
+        last_progress_at = time.monotonic()
         while proc.poll() is None:
             check_cancel(req)
             if time.monotonic() - last > 1:
                 amount = run(['sh', '-c', 'stat -c %s ' + temp + ' 2>/dev/null || echo 0'], timeout=10)
-                emit('progress', phase='transfer', done=min(int(amount), req['size']) if amount.isdigit() else 0, total=req['size']); last=time.monotonic()
+                cur_bytes = int(amount) if amount.isdigit() else 0
+                now = time.monotonic()
+                if cur_bytes > last_bytes:
+                    last_bytes = cur_bytes
+                    last_progress_at = now
+                elif now - last_progress_at > STALL_TIMEOUT_SECS:
+                    if os.name == 'nt':
+                        try:
+                            subprocess.Popen(
+                                ['taskkill', '/PID', str(proc.pid), '/T', '/F'],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                **({'creationflags': 0x08000000} if os.name == 'nt' else {}),
+                            ).wait(timeout=5)
+                        except Exception:
+                            pass
+                    proc.kill()
+                    proc.wait()
+                    raise ValueError('固件传输停滞超过 60 秒，请检查连接后重试')
+                emit('progress', phase='transfer', done=min(cur_bytes, req['size']), total=req['size']); last = now
             time.sleep(.15)
         if proc.returncode: raise ValueError('固件传输失败，请检查 USB 连接及手机剩余空间')
         check_cancel(req)
@@ -244,6 +301,16 @@ def stage(req):
         return dict(verified, remote=remote)
     finally:
         if proc is not None and proc.poll() is None:
+            if os.name == 'nt':
+                try:
+                    subprocess.Popen(
+                        ['taskkill', '/PID', str(proc.pid), '/T', '/F'],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        **({'creationflags': 0x08000000} if os.name == 'nt' else {}),
+                    ).wait(timeout=5)
+                except Exception:
+                    pass
             proc.kill(); proc.wait()
         try:
             run(['rm', '-f', temp], timeout=5, cancellable=False)

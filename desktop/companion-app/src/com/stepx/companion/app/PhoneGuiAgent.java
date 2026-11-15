@@ -97,9 +97,24 @@ public final class PhoneGuiAgent extends Service {
             if(!s.optString("task").equals(id)||s.optString("phase").equals("stopped"))throw new IOException("手机已停止任务");
         }
     }
+    private boolean enterForeground(String message){
+        try{
+            NotificationManager n=getSystemService(NotificationManager.class);
+            if(n!=null)n.createNotificationChannel(new NotificationChannel("gui_agent","手机 GUI Agent",NotificationManager.IMPORTANCE_LOW));
+            startForeground(29,notification(message));
+            return true;
+        }catch(Throwable t){
+            android.util.Log.w("StepXGuiAgent","startForeground failed",t);
+            synchronized(PhoneGuiAgent.class){
+                reserved=false;
+                try{snapshot.put("phase","failed").put("progress","前台服务启动受限："+safe(t));}catch(Exception ignored){}
+            }
+            stopSelf();
+            return false;
+        }
+    }
     @Override public void onCreate(){super.onCreate();instance=this;
-        NotificationManager n=getSystemService(NotificationManager.class);n.createNotificationChannel(new NotificationChannel("gui_agent","手机 GUI Agent",NotificationManager.IMPORTANCE_LOW));
-        startForeground(29,notification("手机独立执行 · 可随时暂停或停止"));
+        if(!enterForeground("手机独立执行 · 可随时暂停或停止"))return;
         wake=getSystemService(PowerManager.class).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,"StepX:PhoneGuiAgent");wake.acquire(20*60*1000L);
     }
     private Notification notification(String message){
@@ -109,10 +124,11 @@ public final class PhoneGuiAgent extends Service {
         return b.build();
     }
     @Override public int onStartCommand(Intent intent,int flags,int startId){
-        if(intent==null){stopSelf();return START_NOT_STICKY;}
+        if(!enterForeground("手机独立执行 · 可随时暂停或停止"))return START_NOT_STICKY;
+        if(intent==null){try{stopForeground(STOP_FOREGROUND_REMOVE);}catch(Throwable ignored){}stopSelf();return START_NOT_STICKY;}
         String human=intent.getStringExtra("human");
-        if(human!=null){GuiAccessibilityService s=GuiAccessibilityService.instance;if(human.equals("stop")){cancelled=true;stopRequested=true;if(connection!=null)connection.disconnect();}if(s!=null){try{s.request(new JSONObject().put("op","user_"+human).put("task",s.task.id),new CompletableFuture<>());}catch(Exception ignored){}}return START_NOT_STICKY;}
-        if(!id.equals(intent.getStringExtra("task"))||!reserved){stopSelf();return START_NOT_STICKY;}
+        if(human!=null){GuiAccessibilityService s=GuiAccessibilityService.instance;if(human.equals("stop")){cancelled=true;stopRequested=true;if(connection!=null)connection.disconnect();}if(s!=null){try{s.request(new JSONObject().put("op","user_"+human).put("task",s.task.id),new CompletableFuture<>());}catch(Exception ignored){}}if(!reserved){try{stopForeground(STOP_FOREGROUND_REMOVE);}catch(Throwable ignored){}stopSelf();}return START_NOT_STICKY;}
+        if(!id.equals(intent.getStringExtra("task"))||!reserved){try{stopForeground(STOP_FOREGROUND_REMOVE);}catch(Throwable ignored){}stopSelf();return START_NOT_STICKY;}
         runner.execute(this::run);return START_NOT_STICKY;
     }
     static void controlChanged(String operation){
@@ -250,7 +266,8 @@ public final class PhoneGuiAgent extends Service {
                     .put("usage",new JSONObject().put("inputTokens",inputTokens).put("outputTokens",outputTokens).put("requests",requests).put("modelMs",modelMs))).put("executionLocation","phone");
                     getSharedPreferences("gui_agent",0).edit().putString("last",snapshot.toString()).commit();}
             }catch(Exception ignored){}
-            new File(getExternalFilesDir(null),"gui-screen.png").delete();if(wake!=null&&wake.isHeld())wake.release();stopForeground(STOP_FOREGROUND_REMOVE);stopSelf();
+            new File(getExternalFilesDir(null),"gui-screen.png").delete();if(wake!=null&&wake.isHeld())wake.release();
+            new Handler(Looper.getMainLooper()).post(()->{try{stopForeground(STOP_FOREGROUND_REMOVE);}catch(Throwable ignored){}try{stopSelf();}catch(Throwable ignored){}});
         }
     }
     private static String safe(Throwable e){while(e.getCause()!=null)e=e.getCause();String s=e.getMessage();return s==null?"执行失败":s.length()>400?s.substring(0,400):s;}

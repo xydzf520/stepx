@@ -23,6 +23,18 @@ final class BridgePolicy {
         return "completed".equals(state) || "reported".equals(state) || "failed".equals(state)
             || "stopped".equals(state) || "interrupted".equals(state) || "needs_input".equals(state);
     }
+    static boolean activeMonitorState(String state) {
+        return state != null && !state.isEmpty() && !terminal(state);
+    }
+    static boolean mdiAlreadyReleasedError(String message) {
+        return message != null && (message.contains("不是当前 MDI 任务")
+            || message.contains("already released")
+            || message.contains("MDI 任务已回收")
+            || message.contains("不存在该 MDI 任务"));
+    }
+    static boolean allowUnmatchedMdiStop(boolean active, boolean restartCleanup, String taskName, boolean released) {
+        return !active && (restartCleanup || (taskName != null && !taskName.isEmpty() && !released));
+    }
     static String diagnosticText(String value, String credential, int limit) {
         if (value == null) return "";
         // Redact before truncation so even an arbitrary-format key cannot leak

@@ -1,7 +1,8 @@
 //! The capsule consumes local fulfillment evidence and optional scoped Agent reviews.
 use super::*;
 use std::{
-    collections::VecDeque,
+    collections::{hash_map::DefaultHasher, VecDeque},
+    hash::{Hash, Hasher},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -12,6 +13,73 @@ use stepx_companion::{
     home_reminder_governance::{ReminderCategory, ReminderTargetSpec},
     model_source::Source,
 };
+
+pub(crate) const LIVE_CAPSULE_PROXIMITY_MS: i64 = 60 * 60_000;
+const MAX_FULFILLMENT_REVIEWS: usize = 128;
+
+pub(crate) fn stable_phone_timer_capsule_id(
+    timer: &stepx_companion::push::LiveCountdownTimer,
+) -> String {
+    if timer.is_pomodoro || timer.key == "desktop-pomodoro" {
+        return "desktop-pomodoro".into();
+    }
+    let raw = timer.key.trim();
+    if !raw.is_empty() {
+        let sanitized: String = raw
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        format!("phone-timer-{sanitized}")
+    } else {
+        format!(
+            "phone-timer-{}",
+            rules::digest(&[&timer.package_name, &timer.app_name, &timer.title])
+        )
+    }
+}
+
+fn signals_share_fulfillment_identity(a: &rules::Signal, b: &rules::Signal) -> bool {
+    if a.id == b.id {
+        return true;
+    }
+    if let (Some(ta), Some(tb)) = (
+        a.tracking.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+        b.tracking.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+    ) {
+        if ta.eq_ignore_ascii_case(tb) {
+            return true;
+        }
+    }
+    if a.kind == b.kind && a.provider == b.provider {
+        if let (Some(sa), Some(sb)) = (
+            a.order_suffix
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty()),
+            b.order_suffix
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty()),
+        ) {
+            return sa.eq_ignore_ascii_case(sb);
+        }
+        if a.tracking.is_none()
+            && b.tracking.is_none()
+            && a.order_suffix.is_none()
+            && b.order_suffix.is_none()
+            && (a.at - b.at).abs() <= 45 * 60_000
+        {
+            return true;
+        }
+    }
+    false
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Scope {
@@ -39,11 +107,69 @@ pub(super) struct FulfillmentUi {
     reviews: VecDeque<(String, bool)>,
     next_poll: Option<Instant>,
     next_expiry: Cell<Option<i64>>,
+    cached_signals: RefCell<Option<(u64, Vec<rules::Signal>)>>,
     pub status: String,
 }
 
 impl Companion {
+    fn fulfillment_signals_cache_key(&self, now: i64) -> u64 {
+        let mut h = DefaultHasher::new();
+        self.selected
+            .as_ref()
+            .map(|d| d.serial.as_str())
+            .hash(&mut h);
+        self.last_connected_serial.as_deref().hash(&mut h);
+        (now / 15_000).hash(&mut h);
+        self.sms.len().hash(&mut h);
+        for msg in self.sms.iter().take(96) {
+            msg.outgoing.hash(&mut h);
+            msg.date_ms.hash(&mut h);
+            msg.address.hash(&mut h);
+            msg.body.hash(&mut h);
+        }
+        self.push.snapshot.notifications.len().hash(&mut h);
+        for notif in self.push.snapshot.notifications.iter().take(96) {
+            notif.key.hash(&mut h);
+            notif.is_group.hash(&mut h);
+            notif.post_time_ms.hash(&mut h);
+            notif.read.hash(&mut h);
+            notif.dismissed.hash(&mut h);
+            notif.package_name.hash(&mut h);
+            notif.app_name.hash(&mut h);
+            notif.title.hash(&mut h);
+            notif.text.hash(&mut h);
+            notif.sub_text.hash(&mut h);
+            self.notification_center
+                .read_ids
+                .contains(&format!("push-notif:{}", notif.key))
+                .hash(&mut h);
+        }
+        self.push.snapshot.threads.len().hash(&mut h);
+        for thread in self.push.snapshot.threads.iter().take(48) {
+            thread.thread_id.hash(&mut h);
+            thread.is_group.hash(&mut h);
+            thread.last_timestamp_ms.hash(&mut h);
+            thread.unread_count.hash(&mut h);
+            thread.package_name.hash(&mut h);
+            thread.app_name.hash(&mut h);
+            thread.title.hash(&mut h);
+            thread.last_message.hash(&mut h);
+            thread.messages.last().map(|m| m.outgoing).hash(&mut h);
+            self.notification_center
+                .read_ids
+                .contains(&format!("im-thread:{}", thread.thread_id))
+                .hash(&mut h);
+        }
+        h.finish()
+    }
+
     pub(super) fn fulfillment_signals(&self, now: i64) -> Vec<rules::Signal> {
+        let cache_key = self.fulfillment_signals_cache_key(now);
+        if let Some((cached_key, cached)) = self.fulfillment.cached_signals.borrow().as_ref() {
+            if *cached_key == cache_key {
+                return cached.clone();
+            }
+        }
         let mut signals = Vec::new();
         for msg in self.sms.iter().take(96).filter(|m| !m.outgoing) {
             signals.extend(rules::classify(
@@ -106,7 +232,9 @@ impl Companion {
                 now,
             ));
         }
-        rules::reconcile(signals)
+        let reconciled = rules::reconcile(signals);
+        *self.fulfillment.cached_signals.borrow_mut() = Some((cache_key, reconciled.clone()));
+        reconciled
     }
 
     fn fulfillment_key(&self, signal: &rules::Signal) -> String {
@@ -131,6 +259,136 @@ impl Companion {
         self.reminder_governance.effective_ttl_ms(category)
     }
 
+    pub(super) fn fulfillment_correlated_keys(&self, signal: &rules::Signal) -> Vec<String> {
+        let mut keys = vec![
+            self.fulfillment_key(signal),
+            format!("fulfillment:{}", signal.id),
+        ];
+        let push_unique = |list: &mut Vec<String>, k: String| {
+            if !k.is_empty() && !list.contains(&k) {
+                list.push(k);
+            }
+        };
+        let (sms_addr, notif_key, thread_id) = match &signal.origin {
+            rules::Origin::Sms(address) => (Some(address.as_str()), None, None),
+            rules::Origin::Notification(key) => {
+                let linked_tid = self
+                    .push
+                    .snapshot
+                    .notifications
+                    .iter()
+                    .find(|n| n.key == *key)
+                    .map(|n| n.thread_id.as_str())
+                    .filter(|s| !s.trim().is_empty());
+                (None, Some(key.as_str()), linked_tid)
+            }
+            rules::Origin::Thread(id) => (None, None, Some(id.as_str())),
+        };
+        let pickup_code = stepx_companion::home_hub::extract_pickup_code(&signal.detail);
+        for alias in stepx_companion::home_reminder_governance::canonical_keys_for_delivery(
+            &signal.provider,
+            notif_key,
+            thread_id,
+            sms_addr,
+        ) {
+            push_unique(&mut keys, alias);
+        }
+        for alias in stepx_companion::home_reminder_governance::canonical_keys_for_code_or_parcel(
+            pickup_code.as_deref(),
+            signal.tracking.as_deref(),
+            notif_key,
+            sms_addr,
+        ) {
+            push_unique(&mut keys, alias);
+        }
+        if let Some(tracking) = signal
+            .tracking
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            push_unique(&mut keys, format!("parcel:{}", tracking.to_uppercase()));
+        }
+        if let Some(suffix) = signal
+            .order_suffix
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            push_unique(
+                &mut keys,
+                format!("order:{}:{}", signal.provider.trim(), suffix.to_uppercase()),
+            );
+        }
+        keys
+    }
+
+    pub(crate) fn is_capsule_within_proximity(
+        &self,
+        cap: &super::shell::TopBarLiveCapsuleItem,
+        now_ms: i64,
+    ) -> bool {
+        if let Some(rest) = cap.id.strip_prefix("cal-") {
+            if !cap.id.starts_with("cal-notif-") {
+                let (id_part, start_part) = match rest.split_once(':') {
+                    Some((i, s)) => (i, s.parse::<i64>().ok()),
+                    None => (rest, None),
+                };
+                if let Ok(ev_id) = id_part.parse::<i64>() {
+                    if let Some(ev) = self
+                        .back_screen
+                        .stepos_suite
+                        .calendar_events
+                        .iter()
+                        .find(|e| e.id == ev_id && start_part.is_none_or(|ts| e.dtstart == ts))
+                    {
+                        if crate::ui::pages::home::calendar_event_is_ended_at(ev, now_ms) {
+                            return false;
+                        }
+                        if ev.all_day {
+                            return ev.dtstart > 0
+                                && (ev.dtstart - now_ms).abs() <= LIVE_CAPSULE_PROXIMITY_MS;
+                        }
+                        if ev.dtstart > now_ms {
+                            return ev.dtstart - now_ms <= LIVE_CAPSULE_PROXIMITY_MS;
+                        }
+                        return true;
+                    }
+                }
+            }
+        }
+        if let Some(rest) = cap.id.strip_prefix("alarm-") {
+            if let Ok(alarm_id) = rest.parse::<i64>() {
+                if let Some(alarm) = self
+                    .back_screen
+                    .stepos_suite
+                    .alarms
+                    .iter()
+                    .find(|a| a.id == alarm_id)
+                {
+                    let now_local = chrono::TimeZone::timestamp_millis_opt(&chrono::Local, now_ms)
+                        .single()
+                        .unwrap_or_else(chrono::Local::now);
+                    let now_min = chrono::Timelike::hour(&now_local) * 60
+                        + chrono::Timelike::minute(&now_local);
+                    let weekday_idx =
+                        chrono::Datelike::weekday(&now_local).num_days_from_monday();
+                    let status = crate::ui::pages::home::resolve_alarm_status(
+                        alarm,
+                        now_ms,
+                        now_min,
+                        weekday_idx,
+                        &self.reminder_governance,
+                    );
+                    return status.next_offset_mins().is_some_and(|mins| {
+                        (mins as i64).saturating_mul(60_000) <= LIVE_CAPSULE_PROXIMITY_MS
+                    });
+                }
+            }
+        }
+        true
+    }
+
     pub(super) fn fulfillment_visible(&self, signal: &rules::Signal, now: i64) -> bool {
         if !signal.current(now, self.fulfillment_ttl(signal))
             || self.push.parcel_receipts.retires_capsule(signal, now)
@@ -145,36 +403,27 @@ impl Companion {
         {
             return false;
         }
-        let key = self.fulfillment_key(signal);
-        let provider_key = format!("delivery:{}", signal.provider);
-        let mut keys = vec![key, provider_key.clone()];
-        match &signal.origin {
-            rules::Origin::Sms(address) => keys.push(format!(
-                "sms:{}",
-                stepx_companion::sms::normalize_address(address)
-            )),
-            rules::Origin::Notification(key) => {
-                keys.push(format!("notif:{key}"));
-                if let Some(notif) = self
-                    .push
-                    .snapshot
-                    .notifications
-                    .iter()
-                    .find(|n| n.key == *key)
+        if let rules::Origin::Notification(key) = &signal.origin {
+            if let Some(notif) = self
+                .push
+                .snapshot
+                .notifications
+                .iter()
+                .find(|n| n.key == *key)
+            {
+                if self.push.prefs.effective_popup_mode(&notif.package_name)
+                    == stepx_companion::desktop_notify::PopupMode::Silent
+                    || self
+                        .reminder_governance
+                        .muted_sources
+                        .contains_key(&format!("pkg:{}", notif.package_name))
                 {
-                    if self.push.prefs.effective_popup_mode(&notif.package_name)
-                        == stepx_companion::desktop_notify::PopupMode::Silent
-                        || self
-                            .reminder_governance
-                            .muted_sources
-                            .contains_key(&format!("pkg:{}", notif.package_name))
-                    {
-                        return false;
-                    }
+                    return false;
                 }
             }
-            rules::Origin::Thread(id) => keys.push(format!("im:{id}")),
         }
+        let provider_key = format!("delivery:{}", signal.provider);
+        let keys = self.fulfillment_correlated_keys(signal);
         !self.reminder_governance.is_any_key_suppressed(
             &keys,
             Some(signal.at),
@@ -347,10 +596,30 @@ impl Companion {
         } else {
             ReminderCategory::TakeoutAndMobility
         };
+        let mut aliases = self.fulfillment_correlated_keys(signal);
+        let mut max_source_ts = signal.at;
+        for other in self.fulfillment_signals(now) {
+            if signals_share_fulfillment_identity(signal, &other) {
+                max_source_ts = max_source_ts.max(other.at);
+                for alias in self.fulfillment_correlated_keys(&other) {
+                    if !aliases.contains(&alias) {
+                        aliases.push(alias);
+                    }
+                }
+            }
+        }
+        for alias in &aliases {
+            if let Some(cap_id) = alias.strip_prefix("capsule:") {
+                self.back_screen
+                    .dismissed_capsule_ids
+                    .insert(cap_id.to_string());
+            }
+        }
         self.reminder_governance.manual_expire(
             ReminderTargetSpec::new(self.fulfillment_key(signal), category, signal.title.clone())
+                .with_aliases(aliases)
                 .with_source(&signal.provider, None)
-                .with_source_ts(signal.at),
+                .with_source_ts(now.max(max_source_ts)),
             now,
         );
         self.status = "已收起这条胶囊".into();
@@ -464,7 +733,7 @@ impl Companion {
                     self.fulfillment.status = match result {
                         Ok((reviews, verified)) => {
                             self.fulfillment.reviews.extend(reviews);
-                            while self.fulfillment.reviews.len() > 192 {
+                            while self.fulfillment.reviews.len() > MAX_FULFILLMENT_REVIEWS {
                                 self.fulfillment.reviews.pop_front();
                             }
                             if verified {
@@ -546,5 +815,191 @@ impl Companion {
             };
             let _ = tx.send(reviews);
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stable_phone_timer_capsule_id_ignores_ticking_countdown_seconds() {
+        let mut timer_a = stepx_companion::push::LiveCountdownTimer {
+            key: "0|com.android.deskclock|77|timer|101".into(),
+            package_name: "com.android.deskclock".into(),
+            app_name: "时钟".into(),
+            title: "手冲咖啡焖蒸".into(),
+            total_secs: 180,
+            remaining_secs: 142,
+            remaining_label: "还剩 2 分 22 秒".into(),
+            mm_ss_label: "02:22".into(),
+            progress_pct: 21,
+            is_pomodoro: false,
+        };
+        let id_initial = stable_phone_timer_capsule_id(&timer_a);
+        assert!(id_initial.starts_with("phone-timer-"));
+        assert!(!id_initial.contains("02:22") && !id_initial.contains("142"));
+
+        timer_a.remaining_secs = 59;
+        timer_a.remaining_label = "还剩 59 秒".into();
+        timer_a.mm_ss_label = "00:59".into();
+        timer_a.progress_pct = 67;
+        assert_eq!(
+            stable_phone_timer_capsule_id(&timer_a),
+            id_initial,
+            "ticking countdown text/seconds must never mutate timer capsule ID"
+        );
+    }
+
+    #[test]
+    fn acknowledge_fulfillment_propagates_aliases_across_secondary_keys() {
+        let mut app = Companion::new_for_test();
+        let now = 1_762_000_000_000i64;
+        app.push.snapshot.notifications = vec![stepx_companion::push::PushNotification {
+            key: "notif-meituan-8821".into(),
+            package_name: "com.sankuai.meituan.takeoutnew".into(),
+            app_name: "美团外卖".into(),
+            title: "美团外卖".into(),
+            text: "您的美团外卖订单尾号 8821 骑手正在配送中，预计 12:30~12:45 送达".into(),
+            post_time_ms: now - 120_000,
+            active: true,
+            ..Default::default()
+        }];
+        app.sms = vec![stepx_companion::sms::Message {
+            provider_id: Some(1),
+            address: "10690123".into(),
+            body: "【美团外卖】您的订单尾号8821骑手已接单正在配送中".into(),
+            date_ms: now - 100_000,
+            outgoing: false,
+            kind: 1,
+            read: false,
+            subscription: None,
+        }];
+        let caps_before = app.fulfillment_capsules(now);
+        assert_eq!(caps_before.len(), 1);
+        let cap_id = caps_before[0].id.clone();
+
+        let signal = app.find_fulfillment(&cap_id, now).expect("active fulfillment");
+        app.acknowledge_fulfillment(&signal, now);
+
+        // Even if primary notification disappears and only the secondary SMS remains,
+        // correlated order/provider/SMS aliases keep it suppressed.
+        app.push.snapshot.notifications.clear();
+        let caps_after = app.fulfillment_capsules(now);
+        assert!(
+            caps_after.is_empty(),
+            "acknowledged fulfillment must not re-surface under secondary SMS/order key: {caps_after:?}"
+        );
+        assert!(app.reminder_governance.is_any_key_suppressed(
+            &["order:美团外卖:8821".to_string()],
+            Some(now - 90_000),
+            None,
+            None,
+            now,
+        ));
+        assert!(app.reminder_governance.is_any_key_suppressed(
+            &[format!("fulfillment:{}", signal.id)],
+            Some(now - 90_000),
+            None,
+            None,
+            now,
+        ));
+        assert!(
+            !app.reminder_governance.is_any_key_suppressed(
+                &["delivery:美团外卖".to_string()],
+                Some(now - 90_000),
+                None,
+                None,
+                now,
+            ),
+            "item-level acknowledgment must not poison channel-wide delivery:美团外卖 alias"
+        );
+        // Unrelated concurrent order on the same channel must remain visible.
+        app.sms.push(stepx_companion::sms::Message {
+            provider_id: Some(2),
+            address: "10690123".into(),
+            body: "【美团外卖】您的订单尾号8822骑手已接单正在配送中".into(),
+            date_ms: now - 95_000,
+            outgoing: false,
+            kind: 1,
+            read: false,
+            subscription: None,
+        });
+        let caps_other_order = app.fulfillment_capsules(now);
+        assert_eq!(caps_other_order.len(), 1);
+    }
+
+    #[test]
+    fn capsule_proximity_window_enforces_60_minutes_for_calendar_and_alarms() {
+        let mut app = Companion::new_for_test();
+        let now_local = chrono::Local::now();
+        let now_ms = now_local.timestamp_millis();
+
+        app.back_screen.stepos_suite.calendar_events = vec![
+            stepx_companion::toolbox::PhoneCalendarEvent {
+                id: 901,
+                title: "6小时后的远期评审".into(),
+                dtstart: now_ms + 6 * 3_600_000,
+                dtend: now_ms + 7 * 3_600_000,
+                all_day: false,
+                ..Default::default()
+            },
+            stepx_companion::toolbox::PhoneCalendarEvent {
+                id: 902,
+                title: "35分钟后的临近会议".into(),
+                dtstart: now_ms + 35 * 60_000,
+                dtend: now_ms + 95 * 60_000,
+                all_day: false,
+                ..Default::default()
+            },
+            stepx_companion::toolbox::PhoneCalendarEvent {
+                id: 903,
+                title: "正在进行中的会议".into(),
+                dtstart: now_ms - 15 * 60_000,
+                dtend: now_ms + 45 * 60_000,
+                all_day: false,
+                ..Default::default()
+            },
+        ];
+
+        let mk_cap = |id: &str| super::super::shell::TopBarLiveCapsuleItem {
+            id: id.into(),
+            tag: "stepx_schedule".into(),
+            icon: icons::UiIcon::Calendar,
+            kind: super::super::shell::TopBarCapsuleKind::ScheduleOrAlarm,
+            track: super::super::shell::CapsuleTrack::ImportantMessage,
+            domain_badge: "今日日程".into(),
+            strategy_tag: String::new(),
+            score: 90,
+            pill_text: "10:00".into(),
+            title: id.into(),
+            subtitle: String::new(),
+            metric: "10:00".into(),
+            source_tag: "重要消息",
+            progress_pct: 0,
+            countdown_secs: None,
+            short_sig: "日程".into(),
+            primary_label: "查看",
+            primary_action: Action::Page(Page::Calendar),
+            copy_value: None,
+            complete_label: "已知晓",
+            pickup_code: None,
+            sms_address: None,
+            im_thread_id: None,
+            notif_key: None,
+        };
+
+        assert!(
+            !app.is_capsule_within_proximity(&mk_cap("cal-901"), now_ms),
+            "meeting 6 hours away must not hog the live capsule"
+        );
+        assert!(
+            app.is_capsule_within_proximity(&mk_cap("cal-902"), now_ms),
+            "meeting within 60 minutes must be promoted to live capsule"
+        );
+        assert!(
+            app.is_capsule_within_proximity(&mk_cap("cal-903"), now_ms),
+            "ongoing meeting must stay in live capsule"
+        );
     }
 }

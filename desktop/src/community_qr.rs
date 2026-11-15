@@ -4,13 +4,14 @@ use serde::{Deserialize, Serialize};
 use std::{
     io::Write,
     path::{Path, PathBuf},
-    process::Command,
+    time::Duration,
 };
 
 pub const MANIFEST_PATH: &str = "community/group-qr.json";
-pub const SOURCES: [&str; 2] = [
-    "https://raw.githubusercontent.com/xydzf520/stepx/main/",
+pub const SOURCES: [&str; 3] = [
+    "https://ghfast.top/https://raw.githubusercontent.com/xydzf520/stepx/main/",
     "https://cdn.jsdelivr.net/gh/xydzf520/stepx@main/",
+    "https://raw.githubusercontent.com/xydzf520/stepx/main/",
 ];
 const MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: usize = 4096;
@@ -164,31 +165,42 @@ fn sync_from(
 
 fn download(url: &str, max_bytes: usize) -> Result<Vec<u8>> {
     let file = tempfile::NamedTempFile::new()?;
-    let mut command = Command::new("curl");
-    crate::resources::quiet_command(&mut command);
-    let output = command
-        .args([
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--location",
-            "--proto",
-            "=https",
-            "--proto-redir",
-            "=https",
-            "--connect-timeout",
-            "4",
-            "--max-time",
-            "8",
-            "--max-filesize",
-            &max_bytes.to_string(),
-            "--header",
-            "Cache-Control: no-cache",
-            "--output",
-        ])
-        .arg(file.path())
+    let script = r#"import pathlib, sys, urllib.parse, urllib.request
+url = sys.argv[1]
+max_bytes = int(sys.argv[2])
+dest = pathlib.Path(sys.argv[3])
+
+def check_https(u):
+    p = urllib.parse.urlsplit(u)
+    if p.scheme != 'https' or not p.hostname or p.username or p.password:
+        raise ValueError('HTTPS required')
+
+class HttpsOnlyRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        check_https(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+check_https(url)
+opener = urllib.request.build_opener(HttpsOnlyRedirect())
+req = urllib.request.Request(
+    url,
+    headers={
+        'User-Agent': 'StepX-Companion',
+        'Cache-Control': 'no-cache',
+    },
+)
+with opener.open(req, timeout=12) as resp:
+    data = resp.read(max_bytes + 1)
+if len(data) > max_bytes:
+    raise ValueError('response too large')
+dest.write_bytes(data)
+"#;
+    let mut cmd = crate::resources::python_command();
+    cmd.args(["-c", script])
         .arg(url)
-        .output()
+        .arg(max_bytes.to_string())
+        .arg(file.path());
+    let output = crate::adb::run_process(cmd, None, Duration::from_secs(20))
         .context("无法启动群码下载")?;
     ensure!(
         output.status.success(),

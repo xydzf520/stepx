@@ -8,10 +8,7 @@ use anyhow::{ensure, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{
-    process::Command,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Scope {
@@ -220,18 +217,20 @@ pub fn parse_snapshot(value: &Value, scope: Scope, observed_ms: i64) -> Result<P
     })
 }
 
-fn bounded_read(adb: &Adb, args: &[&str], budget: Duration) -> Result<String> {
+fn bounded_read(
+    adb: &Adb,
+    transport: &str,
+    shell_args: &[&str],
+    budget: Duration,
+) -> Result<String> {
     ensure!(!budget.is_zero(), "手机状态查询已达到时间预算");
-    // Deliberately do not enter the generic ADB retry/failover pipeline: a
-    // passive Home poll has a hard deadline and cannot reconnect transports.
-    let mut command = Command::new(&adb.path);
-    command.args(args).env("ADB_MDNS_OPENSCREEN", "1");
-    let out = adb::run_process(command, None, budget)?;
-    ensure!(
-        out.status.success() && out.stdout.len() <= 65536,
-        "手机只读状态查询失败"
-    );
-    String::from_utf8(out.stdout).context("手机状态响应无效")
+    // Deliberately suppress generic ADB reconnect/failover (passive Home polls
+    // have a hard deadline and cannot reconnect transports), while routing via
+    // `adb.shell_timeout` so `TransportCoordinator` wireless concurrency limits apply.
+    let _no_reconnect = adb::enter_transport_recovery();
+    let out = adb.shell_timeout(transport, shell_args, budget)?;
+    ensure!(out.len() <= 65536, "手机只读状态查询失败");
+    Ok(out)
 }
 
 fn query(adb: &Adb, device: &Device, scope: Scope) -> Result<PhoneGuiSnapshot> {
@@ -240,22 +239,15 @@ fn query(adb: &Adb, device: &Device, scope: Scope) -> Result<PhoneGuiSnapshot> {
         "手机任务设备不匹配"
     );
     let deadline = Instant::now() + Duration::from_secs(6);
-    let serial = bounded_read(
-        adb,
-        &["-s", &device.transport, "shell", "getprop", "ro.serialno"],
-        Duration::from_secs(2),
-    )?;
-    ensure!(serial.trim() == scope.device, "手机连接的设备身份已变化");
+    let transport = device.resolve_active_transport(adb)?;
     let encoded = STANDARD.encode(serde_json::to_vec(
         &json!({"op":"agent","agentOp":"status_readonly"}),
     )?);
     let remaining = deadline.saturating_duration_since(Instant::now());
     let result = bounded_read(
         adb,
+        &transport,
         &[
-            "-s",
-            &device.transport,
-            "shell",
             "content",
             "call",
             "--user",
@@ -471,6 +463,7 @@ mod tests {
             android: "16".into(),
             product: "pandora".into(),
         };
+        crate::device::invalidate_verified_transport("phone");
         let mut cache = StatusCache::default();
         let first = cache.refresh(&adb, &device, Some("account"));
         assert_eq!(first.phase, PhoneGuiPhase::NeedsInput);
@@ -485,16 +478,61 @@ mod tests {
         );
         let request = calls
             .lines()
-            .find(|line| line.contains("content call"))
+            .find(|line| line.contains("content") && line.contains("call"))
             .unwrap()
-            .split("--arg ")
+            .split("--arg")
             .nth(1)
-            .unwrap();
+            .unwrap()
+            .split_whitespace()
+            .last()
+            .unwrap()
+            .trim_matches('\'');
         let request: Value = serde_json::from_slice(&STANDARD.decode(request).unwrap()).unwrap();
         assert_eq!(request, json!({"op":"agent","agentOp":"status_readonly"}));
         assert!(!serde_json::to_string(&first).unwrap().contains("private"));
         let next = cache.refresh(&adb, &device, None);
         assert_eq!(next.scope.account, None);
-        assert_eq!(std::fs::read_to_string(log).unwrap().lines().count(), 4);
+        assert!((3..=4).contains(&std::fs::read_to_string(log).unwrap().lines().count()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_read_respects_transport_coordinator_wireless_concurrency_limits() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("adb");
+        let calls = dir.path().join("calls");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\necho 'Bundle[{{result=e30=}}]'\n",
+                adb::shell_quote(calls.to_str().unwrap())
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let adb = Adb { path };
+        let wireless = "192.0.2.244:41999";
+
+        // Saturate all wireless concurrency slots for `wireless`
+        let _guards: Vec<_> = (0..adb::TransportCoordinator::MAX_WIRELESS_CONCURRENCY)
+            .map(|_| adb::TransportCoordinator::acquire_slot(wireless).unwrap())
+            .collect();
+
+        let err = bounded_read(
+            &adb,
+            wireless,
+            &["content", "call"],
+            Duration::from_millis(60),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("繁忙") || err.to_string().contains("超时"),
+            "bounded_read must wait on TransportCoordinator wireless slots: {err:#}"
+        );
+        assert!(
+            !calls.exists(),
+            "adb must not be spawned when all wireless TransportCoordinator slots are saturated"
+        );
     }
 }

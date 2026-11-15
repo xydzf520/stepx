@@ -73,10 +73,10 @@ rect_vertex_shader(
     uint vertex_id [[vertex_id]],
     uint instance_id [[instance_id]],
     constant float2 *vertices [[buffer(0)]],
-    constant PerRectUniforms *glyph_uniforms [[buffer(1)]],
+    const device PerRectUniforms *glyph_uniforms [[buffer(1)]],
     constant Uniforms *uniforms [[buffer(2)]])
 {
-    const constant PerRectUniforms *rect = &glyph_uniforms[instance_id];
+    const device PerRectUniforms *rect = &glyph_uniforms[instance_id];
 
     float2 pixel_pos = vertices[vertex_id] * rect->size + rect->origin;
     float2 device_pos = pixel_pos / uniforms->viewport_size * float2(2.0, -2.0) + float2(-1.0, 1.0);

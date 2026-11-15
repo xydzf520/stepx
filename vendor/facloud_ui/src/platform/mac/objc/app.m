@@ -56,10 +56,14 @@ NSArray *getFilePathsFromPasteboard() {
 }
 
 void *registerGlobalHotkey(NSUInteger key, NSUInteger modifiers) {
+    if (_hotKeys == nil) {
+        return nil;
+    }
     EventHotKeyRef hotKeyRef = NULL;
     EventHotKeyID hotKeyID = {0, _nextHotKeyID};
     if (RegisterEventHotKey((UInt32)key, (UInt32)modifiers, hotKeyID, GetEventDispatcherTarget(), 0,
-                            &hotKeyRef)) {
+                            &hotKeyRef) ||
+        hotKeyRef == NULL) {
         return nil;
     };
     [_hotKeys setObject:[[[WarpHotKey alloc] initWithEventHotKey:hotKeyRef
@@ -71,7 +75,10 @@ void *registerGlobalHotkey(NSUInteger key, NSUInteger modifiers) {
 }
 
 void *unregisterGlobalHotkey(NSUInteger key, NSUInteger modifiers) {
-    NSNumber *keyIdx;
+    if (_hotKeys == nil) {
+        return nil;
+    }
+    NSNumber *keyIdx = nil;
     BOOL found = NO;
 
     for (NSNumber *hotKeyID in _hotKeys) {
@@ -83,8 +90,11 @@ void *unregisterGlobalHotkey(NSUInteger key, NSUInteger modifiers) {
         }
     }
 
-    if (found) {
-        UnregisterEventHotKey([_hotKeys objectForKey:keyIdx]->_eventHotKey);
+    if (found && keyIdx != nil) {
+        WarpHotKey *hotkey = [_hotKeys objectForKey:keyIdx];
+        if (hotkey != nil && hotkey->_eventHotKey != NULL) {
+            UnregisterEventHotKey(hotkey->_eventHotKey);
+        }
         [_hotKeys removeObjectForKey:keyIdx];
     }
     return nil;
@@ -446,12 +456,16 @@ NSUInteger activeScreenId() {
     // other than the default action currently.
     if ([response.actionIdentifier isEqualToString:UNNotificationDefaultActionIdentifier]) {
         NSDictionary *userInfo = response.notification.request.content.userInfo;
-        NSString *data = userInfo[@"DATA"];
+        id rawData = userInfo[@"DATA"];
+        NSString *data = [rawData isKindOfClass:[NSString class]] ? (NSString *)rawData : @"";
 
         if (rustWrapper) {
             warp_app_notification_clicked(self, response.notification.date.timeIntervalSince1970,
                                           data);
         }
+    }
+    if (completionHandler) {
+        completionHandler();
     }
 }
 
@@ -537,18 +551,29 @@ NSMenuItem *make_warp_custom_menu_item(void *context) {
 }
 
 NSString *executableInApplicationBundleWithIdentifier(NSString *bundle_path) {
+    if (bundle_path == nil) {
+        return nil;
+    }
     NSBundle *bundle = [NSBundle bundleWithPath:bundle_path];
-    NSString *executable = [bundle.bundlePath stringByAppendingPathComponent:@"Contents/MacOS"];
-    executable = [executable
-        stringByAppendingPathComponent:[bundle
-                                           objectForInfoDictionaryKey:(id)kCFBundleExecutableKey]];
-    return executable;
+    NSString *bundlePath = bundle.bundlePath;
+    id file = [bundle objectForInfoDictionaryKey:(id)kCFBundleExecutableKey];
+    if (bundlePath && [file isKindOfClass:[NSString class]]) {
+        NSString *executable = [bundlePath stringByAppendingPathComponent:@"Contents/MacOS"];
+        return [executable stringByAppendingPathComponent:(NSString *)file];
+    }
+    return nil;
 }
 
 NSString *absolutePathForApplicationBundleWithIdentifier(NSString *bundle_identifier) {
+    if (bundle_identifier == nil) {
+        return nil;
+    }
     NSURL *url =
         [[NSWorkspace sharedWorkspace] URLForApplicationWithBundleIdentifier:bundle_identifier];
-    return url.path;
+    if (url.path) {
+        return url.path;
+    }
+    return nil;
 }
 
 BOOL isVoiceOverEnabled() { return [[NSWorkspace sharedWorkspace] isVoiceOverEnabled]; }

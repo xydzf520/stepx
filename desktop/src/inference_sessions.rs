@@ -3,10 +3,79 @@
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::BTreeSet, fs, io::Write, path::{Path, PathBuf}};
+use std::{
+    collections::{BTreeSet, HashMap},
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
+};
 
 #[derive(Serialize, Deserialize)]
 struct OwnedSession { schema:u32, scope_id:String, device:String, account:String, session_key:String }
+
+const TEMPORARY_SESSION_PREFIXES: &[&str] = &[
+    "stepx-home-ai-",
+    "stepx-brief-",
+    "stepx-text-",
+    "stepx-weather-",
+    "stepx-doctor-",
+    "stepx-model-check-",
+    "stepx-matrix-",
+    "stepx-screen-",
+    "stepx-work-",
+];
+
+static ACTIVE_SESSIONS: OnceLock<Mutex<HashMap<String, BTreeSet<String>>>> = OnceLock::new();
+
+fn active_sessions() -> &'static Mutex<HashMap<String, BTreeSet<String>>> {
+    ACTIVE_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn is_temporary_session_key(key: &str) -> bool {
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let tail = trimmed.rsplit(':').next().unwrap_or(trimmed);
+    TEMPORARY_SESSION_PREFIXES
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix) || tail.starts_with(prefix))
+}
+
+pub fn begin(device: &str, account: Option<&str>, key: &str) {
+    if device.trim().is_empty() || key.trim().is_empty() || key.len() > 512 {
+        return;
+    }
+    if let Ok(mut guard) = active_sessions().lock() {
+        guard
+            .entry(device.to_owned())
+            .or_default()
+            .insert(key.to_owned());
+    }
+    if let Some(account) = account.filter(|a| !a.trim().is_empty()) {
+        let _ = register(&default_context_root(), device, account, key);
+    }
+}
+
+pub fn finish(device: &str, _account: Option<&str>, key: &str) {
+    if let Ok(mut guard) = active_sessions().lock() {
+        if let Some(keys) = guard.get_mut(device) {
+            keys.remove(key);
+            if keys.is_empty() {
+                guard.remove(device);
+            }
+        }
+    }
+}
+
+pub fn is_active(device: &str, key: &str) -> bool {
+    active_sessions()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(device).map(|keys| keys.contains(key)))
+        .unwrap_or(false)
+}
 
 pub fn default_context_root()->PathBuf { crate::resources::user_state().join("stepx-companion/context") }
 
@@ -66,6 +135,11 @@ fn metadata_key(meta:&Value,account:&str)->Option<String> {
 /// every attempt, including rejected/retired drafts. No prompt/title heuristic.
 pub fn known(root:&Path,device:&str,account:Option<&str>)->Result<BTreeSet<String>> {
     let mut result=BTreeSet::new();
+    if let Ok(guard) = active_sessions().lock() {
+        if let Some(active) = guard.get(device) {
+            result.extend(active.iter().cloned());
+        }
+    }
     let Some(account)=account.filter(|account|!account.is_empty()) else{return Ok(result);};
     if !root.exists() {return Ok(result);}
     check_dir(root)?;
@@ -193,5 +267,30 @@ mod tests {
         assert!(known(root.path(),"device",Some("account")).is_err());
         assert!(register(root.path(),"device","account","owned").is_err());
         assert_eq!(fs::read_dir(elsewhere.path()).unwrap().count(),0);
+    }
+    #[test]
+    fn temporary_machine_session_prefixes_match_without_hiding_user_chats() {
+        for key in [
+            "stepx-model-check-abc123",
+            "agent:main:stepx-model-check-abc123",
+            "stepx-matrix-001",
+            "agent:main:stepx-matrix-001",
+            "stepx-screen-001",
+            "agent:main:stepx-screen-001",
+            "stepx-work-001",
+            "agent:main:stepx-work-001",
+            "stepx-home-ai-001",
+        ] {
+            assert!(is_temporary_session_key(key), "expected temporary: {key}");
+        }
+        for user_key in [
+            "",
+            "agent:main:desktop-real-user",
+            "agent:main:stepx-1",
+            "main",
+            "user-discussion-123",
+        ] {
+            assert!(!is_temporary_session_key(user_key), "unexpected match: {user_key}");
+        }
     }
 }

@@ -7,7 +7,9 @@ use core_foundation::dictionary::CFDictionary;
 use core_foundation::string::{CFString, CFStringRef, UniChar};
 use core_graphics::display::CGSize;
 use core_graphics::font::CGGlyph;
-use core_text::font::{cascade_list_for_languages as ct_cascade_list_for_languages, CTFont};
+use core_text::font::{
+    cascade_list_for_languages as ct_cascade_list_for_languages, CTFont, CTFontNameSpecifier,
+};
 use core_text::font_descriptor::{
     kCTFontFamilyNameAttribute, kCTFontLanguagesAttribute, kCTFontNameAttribute,
     kCTFontOrientationHorizontal, CTFontDescriptor, CTFontDescriptorCopyAttribute,
@@ -73,6 +75,10 @@ mod loader {
 
             fonts.push(font);
         }
+        anyhow::ensure!(
+            !fonts.is_empty(),
+            "Font family resolved to zero usable font faces"
+        );
         Ok(FontFamily {
             fonts,
             name: font_family.into(),
@@ -162,6 +168,11 @@ mod loader {
             fonts.push(font);
         }
 
+        anyhow::ensure!(
+            !fonts.is_empty(),
+            "Font family resolved to zero usable font faces"
+        );
+
         Ok(FontFamily {
             fonts,
             name: name.to_owned(),
@@ -203,6 +214,16 @@ impl Default for FontDB {
 }
 
 const DEFAULT_FONT_SIZE: f64 = 16.0;
+
+// Returns the PostScript (or fallback unique/full) name of a Core Text font without panicking.
+// `CTFont::postscript_name()` in `core-text` (and by extension `font_kit::Font::postscript_name()`
+// on macOS) calls `.expect("Fonts should always have a PostScript name.")`, which panics if
+// `CTFontCopyName(..., kCTFontPostScriptNameKey)` returns NULL for a system or fallback font.
+fn ct_font_postscript_name(font: &CTFont) -> Option<String> {
+    font.get_string_by_name_key(CTFontNameSpecifier::PostScript)
+        .or_else(|| font.get_string_by_name_key(CTFontNameSpecifier::Unique))
+        .or_else(|| font.get_string_by_name_key(CTFontNameSpecifier::Full))
+}
 
 // Returns the horizontal advance (in points) of a single space in the given font.
 fn space_advance_width(font: &CTFont) -> Option<f64> {
@@ -278,10 +299,15 @@ impl FontDB {
     }
 
     pub fn fallback_fonts(&self, font_id: FontId) -> Vec<FontId> {
-        self.fallback_fonts
-            .get(&font_id)
-            .expect("Font fallback should not be empty")
-            .to_vec()
+        if let Some(fallbacks) = self.fallback_fonts.get(&font_id) {
+            return fallbacks.to_vec();
+        }
+        let fallbacks = Arc::new(self.cascade_list_for_languages(
+            &self.font(font_id).native_font(),
+            &["zh-Hans", "zh-Hant", "ja", "ko", "en"],
+        ));
+        self.fallback_fonts.insert(font_id, Arc::clone(&fallbacks));
+        fallbacks.to_vec()
     }
 
     // Check if the font family supports english.
@@ -419,28 +445,50 @@ impl FontDB {
         match self.font_selections.entry((family_id, properties)) {
             Entry::Occupied(entry) => *entry.get(),
             Entry::Vacant(entry) => {
-                let family = &self
-                    .families
-                    .get(&family_id)
-                    .expect("FamilyId must correspond to a valid family");
+                let fallback_font_id = || {
+                    self.families
+                        .get(&FamilyId(0))
+                        .and_then(|f| f.font_ids.first().copied())
+                        .or_else(|| {
+                            self.families
+                                .values()
+                                .find_map(|f| f.font_ids.first().copied())
+                        })
+                        .unwrap_or(FontId(0))
+                };
+
+                let Some(family) = self.families.get(&family_id) else {
+                    log::warn!("FamilyId {family_id:?} does not correspond to a valid family");
+                    return fallback_font_id();
+                };
                 let candidates = family
                     .font_ids
                     .iter()
                     .map(|font_id| self.font(*font_id).properties())
                     .collect::<Vec<_>>();
 
-                let font_id = {
-                    if let Ok(idx) = font_kit::matching::find_best_match(
-                        &candidates,
-                        &properties_to_font_kit(properties),
-                    ) {
-                        self.font(family.font_ids[idx]).properties();
-                        family.font_ids[idx]
+                let font_id = if candidates.is_empty() {
+                    fallback_font_id()
+                } else if let Ok(idx) = font_kit::matching::find_best_match(
+                    &candidates,
+                    &properties_to_font_kit(properties),
+                ) {
+                    if let Some(&matched_id) = family.font_ids.get(idx) {
+                        self.font(matched_id).properties();
+                        matched_id
                     } else {
-                        font_kit::matching::find_best_match(&candidates, &Default::default())
-                            .map(|idx| family.font_ids[idx])
-                            .unwrap_or(family.font_ids[0])
+                        family
+                            .font_ids
+                            .first()
+                            .copied()
+                            .unwrap_or_else(fallback_font_id)
                     }
+                } else {
+                    font_kit::matching::find_best_match(&candidates, &Default::default())
+                        .ok()
+                        .and_then(|idx| family.font_ids.get(idx).copied())
+                        .or_else(|| family.font_ids.first().copied())
+                        .unwrap_or_else(fallback_font_id)
                 };
 
                 // Make sure we've loaded fallback fonts for the selected font.
@@ -451,7 +499,8 @@ impl FontDB {
                 // fallback list already contains a CJK-capable family. Using only `en`
                 // made Chinese terminal output render as blanks while punctuation and
                 // ASCII still appeared.
-                if !self.fallback_fonts.contains_key(&font_id) {
+                if !self.fallback_fonts.contains_key(&font_id) && self.rasterizer.has_font(font_id)
+                {
                     self.fallback_fonts.insert(
                         font_id,
                         Arc::new(self.cascade_list_for_languages(
@@ -492,19 +541,24 @@ impl FontDB {
     }
 
     pub fn font_id_for_native_font(&self, native_font: NativeFont) -> FontId {
-        let postscript_name = native_font.postscript_name();
-        if let Some(font_id) = self.fonts_by_name.get(&postscript_name).as_ref() {
-            return *font_id.value();
+        if let Some(postscript_name) = ct_font_postscript_name(&native_font) {
+            if let Some(font_id) = self.fonts_by_name.get(&postscript_name).as_ref() {
+                return *font_id.value();
+            }
         }
 
         self.push_font(Font::from_ct_font(native_font))
     }
 
     fn push_font(&self, font: Font) -> FontId {
-        let name = Arc::new(font.postscript_name().unwrap());
         let font_id = FontId(self.next_font_id.fetch_add(1, Ordering::SeqCst));
+        let native_font = font.native_font();
+        let name = Arc::new(
+            ct_font_postscript_name(&native_font)
+                .unwrap_or_else(|| format!("__unnamed_font_{}", font_id.0)),
+        );
 
-        let ct_font = font.native_font().clone_with_font_size(DEFAULT_FONT_SIZE);
+        let ct_font = native_font.clone_with_font_size(DEFAULT_FONT_SIZE);
         let advance = space_advance_width(&ct_font);
 
         self.rasterizer.insert(font_id, Arc::new(font));
@@ -518,6 +572,11 @@ impl FontDB {
         if let Some(family_id) = self.family_id_for_name(&font_family.name) {
             return Ok(family_id);
         }
+
+        anyhow::ensure!(
+            !font_family.fonts.is_empty(),
+            "Font family resolved to zero usable font faces"
+        );
 
         let font_ids = font_family
             .fonts

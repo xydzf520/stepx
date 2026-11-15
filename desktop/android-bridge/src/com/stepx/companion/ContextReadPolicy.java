@@ -1,5 +1,9 @@
 package com.stepx.companion;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Locale;
@@ -56,8 +60,37 @@ final class ContextReadPolicy {
         if (name == null) return false;
         String trimmed = name.trim();
         if (trimmed.isEmpty() || trimmed.startsWith(".")) return false;
-        int dot = trimmed.lastIndexOf('.');
-        if (dot <= 0 || dot >= trimmed.length() - 1) return false;
-        return AUDIO_EXT.contains(trimmed.substring(dot + 1).toLowerCase(Locale.ROOT));
+        String ext = fileExtension(trimmed);
+        return !ext.isEmpty() && AUDIO_EXT.contains(ext);
+    }
+
+    static String fileExtension(String name) {
+        if (name == null) return "";
+        String trimmed = name.trim();
+        int slash = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'));
+        String base = slash >= 0 ? trimmed.substring(slash + 1) : trimmed;
+        int dot = base.lastIndexOf('.');
+        if (dot <= 0 || dot >= base.length() - 1) return "";
+        return base.substring(dot + 1).toLowerCase(Locale.ROOT);
+    }
+
+    static String readBoundedLine(InputStream in, int maxBytes) throws IOException {
+        if (in == null || maxBytes <= 0) return null;
+        ByteArrayOutputStream out = new ByteArrayOutputStream(Math.min(maxBytes, 1024));
+        int b;
+        boolean any = false;
+        while ((b = in.read()) != -1) {
+            any = true;
+            if (b == '\n') break;
+            if (out.size() >= maxBytes) {
+                throw new IllegalArgumentException("请求为空或过长");
+            }
+            out.write(b);
+        }
+        if (!any && out.size() == 0) return null;
+        byte[] bytes = out.toByteArray();
+        int len = bytes.length;
+        if (len > 0 && bytes[len - 1] == '\r') len--;
+        return new String(bytes, 0, len, StandardCharsets.UTF_8);
     }
 }

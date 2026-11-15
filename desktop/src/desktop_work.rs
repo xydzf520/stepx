@@ -19,7 +19,66 @@ pub use crate::amoo_background::{
 const FIRMWARE: &str = FP_172;
 static CLOSED: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
     std::sync::Mutex::new(None);
+static REQUEST_RETRIES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, (u32, Instant)>>,
+> = std::sync::OnceLock::new();
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+
+fn request_retries() -> &'static std::sync::Mutex<std::collections::HashMap<String, (u32, Instant)>>
+{
+    REQUEST_RETRIES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+pub fn clear_device_closed_cache(serial: &str) {
+    let prefix = format!("{serial}:");
+    if let Ok(mut guard) = CLOSED.lock() {
+        if let Some(set) = guard.as_mut() {
+            set.retain(|key| !key.starts_with(&prefix));
+        }
+    }
+    if let Ok(mut guard) = request_retries().lock() {
+        guard.retain(|key, _| !key.starts_with(&prefix));
+    }
+}
+
+fn should_skip_transient_retry(cache_key: &str, now: Instant) -> bool {
+    request_retries()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(cache_key).map(|(_, not_before)| now < *not_before))
+        .unwrap_or(false)
+}
+
+fn note_transient_read_error(cache_key: &str, now: Instant) {
+    if let Ok(mut guard) = request_retries().lock() {
+        if guard.len() >= 2048 {
+            guard.retain(|_, (_, not_before)| now < *not_before);
+        }
+        let next_attempts = guard.get(cache_key).map(|(n, _)| n + 1).unwrap_or(1);
+        if next_attempts >= 5 {
+            guard.insert(cache_key.to_owned(), (0, now + Duration::from_secs(60)));
+        } else {
+            let backoff = Duration::from_secs(1u64 << (next_attempts - 1).min(3));
+            guard.insert(cache_key.to_owned(), (next_attempts, now + backoff));
+        }
+    }
+}
+
+fn clear_transient_retry(cache_key: &str) {
+    if let Ok(mut guard) = request_retries().lock() {
+        guard.remove(cache_key);
+    }
+}
+
+fn remote_receipt_exists(adb: &Adb, transport: &str, remote: &str) -> bool {
+    let receipt = crate::adb::shell_quote(&format!("{remote}/receipt.json"));
+    adb.script(
+        transport,
+        &format!("test -f {receipt} && test ! -L {receipt} && echo yes"),
+    )
+    .is_ok_and(|out| out.trim() == "yes")
+}
+
 /// Used by the existing updater so a phone-delegated job cannot be interrupted
 /// merely because its conversation is not the selected desktop view.
 pub fn is_running() -> bool {
@@ -41,6 +100,8 @@ struct Request {
     goal: String,
     files: Vec<String>,
     firmware: String,
+    #[serde(default, alias = "accountScope", skip_serializing_if = "Option::is_none")]
+    account: Option<String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Output {
@@ -60,6 +121,8 @@ struct State {
     task: String,
     #[serde(default)]
     device: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    account: Option<String>,
     #[serde(default)]
     workspace: Option<PathBuf>,
     #[serde(rename = "desktopId")]
@@ -123,9 +186,41 @@ pub fn poll(adb: &Adb, device: &Device) -> Result<()> {
     let transport = device.resolve_active_transport(adb)?;
     let listing = adb.script(
         &transport,
-        &format!("if test -d {BASE} && test ! -L {BASE}; then ls -1 {BASE}; fi"),
+        &format!(
+            "if test -d {BASE} && test ! -L {BASE}; then \
+               now=$(date +%s 2>/dev/null || echo 0); pruned=0; \
+               if [ \"$now\" -gt 604800 ]; then \
+                 cutoff=$((now - 604800)); \
+                 for r in {BASE}/*/receipt.json; do \
+                   [ -f \"$r\" ] && [ ! -L \"$r\" ] || continue; \
+                   d=${{r%/receipt.json}}; id=${{d##*/}}; \
+                   [ -d \"$d\" ] && [ ! -L \"$d\" ] && [ \"${{#id}}\" -eq 36 ] || continue; \
+                   ts=$(stat -c %Y \"$r\" 2>/dev/null || echo \"$now\"); \
+                   if [ \"$ts\" -gt 0 ] && [ \"$ts\" -le \"$cutoff\" ]; then \
+                     rm -rf -- \"$d\" && echo \"PRUNED:$id\"; \
+                     pruned=$((pruned + 1)); \
+                     [ \"$pruned\" -ge 5 ] && break; \
+                   fi; \
+                 done; \
+               fi; \
+               ls -1 {BASE}; \
+             fi"
+        ),
     )?;
-    for id in listing.lines().filter(|s| link::valid_id(s)).take(100) {
+    for pruned in listing.lines().filter_map(|line| line.strip_prefix("PRUNED:")) {
+        let key = format!("{}:{pruned}", device.serial);
+        if let Ok(mut guard) = CLOSED.lock() {
+            if let Some(set) = guard.as_mut() {
+                set.remove(&key);
+            }
+        }
+        clear_transient_retry(&key);
+    }
+    for id in listing
+        .lines()
+        .filter(|s| !s.starts_with("PRUNED:") && link::valid_id(s))
+        .take(100)
+    {
         let cache_key = format!("{}:{id}", device.serial);
         if CLOSED
             .lock()
@@ -135,35 +230,55 @@ pub fn poll(adb: &Adb, device: &Device) -> Result<()> {
         {
             continue;
         }
+        let now = Instant::now();
+        if should_skip_transient_retry(&cache_key, now) {
+            continue;
+        }
         let remote = format!("{BASE}/{id}");
         let raw = match link::read_json(adb, device, &format!("{remote}/request.json")) {
-            Ok(v) => v,
+            Ok(v) => {
+                clear_transient_retry(&cache_key);
+                v
+            }
             Err(_) => {
-                CLOSED
-                    .lock()
-                    .unwrap()
-                    .get_or_insert_with(Default::default)
-                    .insert(cache_key);
+                if remote_receipt_exists(adb, &transport, &remote) {
+                    clear_transient_retry(&cache_key);
+                    CLOSED
+                        .lock()
+                        .unwrap()
+                        .get_or_insert_with(Default::default)
+                        .insert(cache_key);
+                } else {
+                    note_transient_read_error(&cache_key, now);
+                }
                 continue;
             }
         };
         let request: Request = match serde_json::from_value(raw) {
             Ok(v) => v,
             Err(_) => {
+                if remote_receipt_exists(adb, &transport, &remote) {
+                    CLOSED
+                        .lock()
+                        .unwrap()
+                        .get_or_insert_with(Default::default)
+                        .insert(cache_key);
+                } else {
+                    note_transient_read_error(&cache_key, now);
+                }
+                continue;
+            }
+        };
+        if request.id != id || !valid(&request, &desktop) {
+            if remote_receipt_exists(adb, &transport, &remote) {
                 CLOSED
                     .lock()
                     .unwrap()
                     .get_or_insert_with(Default::default)
                     .insert(cache_key);
-                continue;
+            } else {
+                note_transient_read_error(&cache_key, now);
             }
-        };
-        if request.id != id || !valid(&request, &desktop) {
-            CLOSED
-                .lock()
-                .unwrap()
-                .get_or_insert_with(Default::default)
-                .insert(cache_key);
             continue;
         }
         let dir = folder(id)?;
@@ -174,8 +289,19 @@ pub fn poll(adb: &Adb, device: &Device) -> Result<()> {
             fs::write(dir.join("cancel"), b"cancel")?;
         }
         let state_path = dir.join("state.json");
+        let resolved_account = || {
+            request
+                .account
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| crate::amoo_usage::account_scope(adb, device).ok().flatten())
+        };
         let mut state: State = if state_path.exists() {
-            serde_json::from_slice(&fs::read(&state_path)?)?
+            let mut loaded: State = serde_json::from_slice(&fs::read(&state_path)?)?;
+            if loaded.account.is_none() {
+                loaded.account = resolved_account();
+            }
+            loaded
         } else {
             let file = tempfile::NamedTempFile::new_in(&dir)?;
             serde_json::to_writer(file.as_file(), &request)?;
@@ -186,6 +312,7 @@ pub fn poll(adb: &Adb, device: &Device) -> Result<()> {
                 updated_ms: None,
                 task: id.into(),
                 device: device.serial.clone(),
+                account: resolved_account(),
                 workspace: None,
                 desktop: desktop.clone(),
                 phase: "queued".into(),
@@ -227,9 +354,6 @@ pub fn poll(adb: &Adb, device: &Device) -> Result<()> {
                         state.detail = detail;
                         save(&dir, &mut state)?;
                     }
-                    // A disconnected phone may not receive this receipt yet;
-                    // the desktop task still shows the durable retry state.
-                    let _ = link::json_write(adb, device, &format!("{remote}/receipt.json"), &public_receipt(&state));
                     break;
                 }
                 state.outputs[i].delivered = true;
@@ -241,18 +365,21 @@ pub fn poll(adb: &Adb, device: &Device) -> Result<()> {
                 save(&dir, &mut state)?;
             }
         }
-        link::json_write(
+        let receipt_written = link::json_write(
             adb,
             device,
             &format!("{remote}/receipt.json"),
             &public_receipt(&state),
-        )?;
+        )
+        .is_ok();
         if ["completed", "cancelled", "interrupted", "failed"].contains(&state.phase.as_str()) {
-            CLOSED
-                .lock()
-                .unwrap()
-                .get_or_insert_with(Default::default)
-                .insert(cache_key);
+            if receipt_written || remote_receipt_exists(adb, &transport, &remote) {
+                CLOSED
+                    .lock()
+                    .unwrap()
+                    .get_or_insert_with(Default::default)
+                    .insert(cache_key);
+            }
             continue;
         }
         if state.phase != "queued"
@@ -497,7 +624,7 @@ fn build_task_from_state(
     updated: i64,
 ) -> crate::amoo_workspace::Task {
     use crate::amoo_workspace::{Executor, Intent, Output, Phase, Step, Task, Turn};
-    let mut task = Task::new(Some(serial.into()), None);
+    let mut task = Task::new(Some(serial.into()), state.account.clone());
     task.id = format!("phone-work-{}", state.task);
     task.title = crate::amoo_workspace::clean_task_title(&request.goal);
     task.intent = Intent::Files;
@@ -582,30 +709,56 @@ fn build_task_from_state(
 
 /// Read by the background link thread, merged into the existing Amoo task UI.
 pub fn snapshot(serial: &str) -> Vec<crate::amoo_workspace::Task> {
-    use crate::amoo_workspace::Task;
-    let mut tasks = Vec::new();
+    snapshot_for_account(serial, None)
+}
+
+pub fn snapshot_for_account(
+    serial: &str,
+    account: Option<&str>,
+) -> Vec<crate::amoo_workspace::Task> {
     let root = crate::resources::user_state().join("stepx-companion/phone-work");
+    snapshot_from_root(&root, serial, account)
+}
+
+fn snapshot_from_root(
+    root: &Path,
+    serial: &str,
+    account: Option<&str>,
+) -> Vec<crate::amoo_workspace::Task> {
+    use crate::amoo_workspace::Task;
     let Ok(entries) = fs::read_dir(root) else {
-        return tasks;
+        return Vec::new();
     };
-    for entry in entries.flatten().take(100) {
-        let load = || -> Result<Task> {
-            let state: State = serde_json::from_slice(&fs::read(entry.path().join("state.json"))?)?;
+    let mut ranked: Vec<(i64, Task)> = Vec::new();
+    for entry in entries.flatten().take(4096) {
+        let load = || -> Result<(i64, Task)> {
+            let state_path = entry.path().join("state.json");
+            let state: State = serde_json::from_slice(&fs::read(&state_path)?)?;
             ensure!(state.device == serial, "different phone");
+            if let Some(expected) = account {
+                ensure!(
+                    state.account.as_deref().is_none_or(|a| a == expected),
+                    "different account"
+                );
+            }
             let request: Request =
                 serde_json::from_slice(&fs::read(entry.path().join("request.json"))?)?;
-            let updated = fs::metadata(entry.path().join("state.json"))?
+            let mtime_ms = fs::metadata(&state_path)?
                 .modified()?
                 .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs() as i64;
-            Ok(build_task_from_state(serial, state, request, updated))
+                .as_millis()
+                .min(i64::MAX as u128) as i64;
+            let sort_ms = state.updated_ms.or(state.created_ms).unwrap_or(mtime_ms);
+            let updated = sort_ms.div_euclid(1000);
+            Ok((sort_ms, build_task_from_state(serial, state, request, updated)))
         };
-        if let Ok(task) = load() {
-            tasks.push(task);
+        if let Ok(item) = load() {
+            ranked.push(item);
         }
     }
-    tasks.sort_by(|a, b| a.id.cmp(&b.id));
-    tasks
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.id.cmp(&a.1.id)));
+    ranked.truncate(100);
+    ranked.into_iter().map(|(_, task)| task).collect()
 }
 #[cfg(test)]
 mod tests {
@@ -618,6 +771,7 @@ mod tests {
             goal: "分析所选表格".into(),
             files: vec![link::uuid()],
             firmware: FIRMWARE.into(),
+            account: None,
         }
     }
     #[test]
@@ -652,6 +806,7 @@ mod tests {
             updated_ms: None,
             task: link::uuid(),
             device: "phone".into(),
+            account: None,
             workspace: None,
             desktop: "computer".into(),
             phase: "completed".into(),
@@ -688,6 +843,7 @@ mod tests {
             updated_ms: Some(2000),
             task: "t1".into(),
             device: "phone".into(),
+            account: Some("acct-a".into()),
             workspace: None,
             desktop: "computer".into(),
             phase: "awaiting_delivery".into(),
@@ -719,5 +875,73 @@ mod tests {
         assert!(task.note.contains("待回传手机 · 已回传 1/2 项成果"));
         assert_eq!(task.outputs[0].kind, "手机任务成果 · 已回传");
         assert_eq!(task.outputs[1].kind, "手机任务成果 · 待回传");
+        assert!(task.visible(Some("phone"), Some("acct-a")));
+        assert!(!task.visible(Some("phone"), Some("acct-b")));
+    }
+    #[test]
+    fn snapshot_filters_device_and_account_and_sorts_descending_before_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        for idx in 0..115u32 {
+            let id = format!("00000000-0000-0000-0000-{idx:012}");
+            let sub = dir.path().join(&id);
+            fs::create_dir_all(&sub).unwrap();
+            let mut r = request();
+            r.id = id.clone();
+            fs::write(sub.join("request.json"), serde_json::to_vec(&r).unwrap()).unwrap();
+            let s = State {
+                created_ms: Some(i64::from(idx) * 1000),
+                updated_ms: Some(i64::from(idx) * 1000),
+                task: id,
+                device: if idx < 5 { "other-phone".into() } else { "phone".into() },
+                account: Some(if idx == 114 { "acct-b".into() } else { "acct-a".into() }),
+                workspace: None,
+                desktop: "computer".into(),
+                phase: "completed".into(),
+                detail: "done".into(),
+                sequence: 1,
+                session: None,
+                outputs: vec![],
+            };
+            fs::write(sub.join("state.json"), serde_json::to_vec(&s).unwrap()).unwrap();
+        }
+        let all_for_phone = snapshot_from_root(dir.path(), "phone", None);
+        assert_eq!(all_for_phone.len(), 100);
+        assert_eq!(
+            all_for_phone[0].id,
+            "phone-work-00000000-0000-0000-0000-000000000114"
+        );
+        assert_eq!(
+            all_for_phone[99].id,
+            "phone-work-00000000-0000-0000-0000-000000000015"
+        );
+        let acct_a = snapshot_from_root(dir.path(), "phone", Some("acct-a"));
+        assert_eq!(acct_a.len(), 100);
+        assert_eq!(
+            acct_a[0].id,
+            "phone-work-00000000-0000-0000-0000-000000000113"
+        );
+    }
+    #[test]
+    fn transient_read_errors_backoff_and_clear_device_closed_cache_resets() {
+        let key = "serial-test:00000000-0000-0000-0000-000000000001";
+        let now = Instant::now();
+        clear_device_closed_cache("serial-test");
+        for _ in 0..5 {
+            note_transient_read_error(key, now);
+        }
+        assert!(should_skip_transient_retry(key, now + Duration::from_secs(30)));
+        assert!(!should_skip_transient_retry(key, now + Duration::from_secs(61)));
+        CLOSED
+            .lock()
+            .unwrap()
+            .get_or_insert_with(Default::default)
+            .insert(key.into());
+        clear_device_closed_cache("serial-test");
+        assert!(!should_skip_transient_retry(key, now));
+        assert!(!CLOSED
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|set| set.contains(key)));
     }
 }

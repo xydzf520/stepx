@@ -903,9 +903,26 @@ fn completed_cleanup_confirmed(payload:&serde_json::Value,before_matches:bool,af
 /// and only after matching this exact run's completed reply before deletion and
 /// observing an empty exact-key history afterwards. This confirms content
 /// cleanup; it does not claim absence from a truncated global session index.
+fn before_cleanup_reply_verified(
+    live_read: Option<&RealSessionInfo>,
+    recent_history: Option<&RealSessionInfo>,
+    receipt: &PendingReply,
+    expected: &str,
+) -> bool {
+    live_read.is_some_and(|session| completed_reply_matches(session, receipt, expected))
+        || recent_history.is_some_and(|session| completed_reply_matches(session, receipt, expected))
+}
 fn clear_completed_brief_session(bus:&mut AgentBus,receipt:&PendingReply,expected:&str)->bool {
-    let before_matches=read_brief_session(bus,&receipt.key,Duration::from_secs(4))
-        .is_ok_and(|session|completed_reply_matches(&session,receipt,expected));
+    clear_completed_brief_session_with_history(bus,receipt,expected,None)
+}
+fn clear_completed_brief_session_with_history(
+    bus:&mut AgentBus,
+    receipt:&PendingReply,
+    expected:&str,
+    recent_history:Option<&RealSessionInfo>,
+)->bool {
+    let live_read=read_brief_session(bus,&receipt.key,Duration::from_secs(4)).ok();
+    let before_matches=before_cleanup_reply_verified(live_read.as_ref(),recent_history,receipt,expected);
     let deleted=bus.call_with_timeout("sessions.delete",json!({"key":receipt.key}),Duration::from_secs(4));
     if deleted.as_ref().is_ok_and(native_deletion_confirmed) {return true;}
     if let Ok(payload)=deleted {
@@ -1005,6 +1022,7 @@ fn run(
     check_cancel(cancel)?;
     let account=crate::amoo_usage::account_scope_fresh(adb,device)?.context("请先确认手机 Amoo 账号，再生成首页建议")?;
     let key = bus.create_session()?;
+    let mut completed_state: Option<(PendingReply, String, RealSessionInfo)> = None;
     let result = (|| -> Result<HomeAiBrief> {
         check_cancel(cancel)?;
         crate::inference_sessions::register(&crate::inference_sessions::default_context_root(),&device.serial,&account,&key)
@@ -1016,18 +1034,26 @@ fn run(
         let receipt = bus.send_verbatim(&key, &build_prompt(context))?;
         let session =
             wait_reply(adb, device, &mut bus, &receipt, cancel, Duration::from_secs(90))?;
+        ensure!(
+            crate::amoo_usage::account_scope_fresh(adb, device)?.as_deref()
+                == Some(account.as_str()),
+            "手机账号已变化，未采用此次生成结果"
+        );
         let messages = run_messages(&session, &receipt);
         let reply = messages
             .iter()
             .rev()
             .find(|m| m.role == "assistant" && !m.text.trim().is_empty())
             .context("手机 Amoo 没有返回建议")?;
+        let reply_text = reply.text.clone();
         let model = if reply.model.is_empty() {
             session.model.clone()
         } else {
             reply.model.clone()
         };
-        parse_brief_with_context(&reply.text, &model, context)
+        let brief = parse_brief_with_context(&reply_text, &model, context)?;
+        completed_state = Some((receipt, reply_text, session));
+        Ok(brief)
     })();
     // Always attempt cleanup, including cancelled, timed-out and invalid replies.
     if result.is_err() {
@@ -1037,9 +1063,25 @@ fn run(
             Duration::from_secs(3),
         );
     }
-    let deleted = delete_brief_session(&mut bus, &key)
-        || AgentBus::connect(adb, device)
-            .is_ok_and(|mut fresh| delete_brief_session(&mut fresh, &key));
+    let same_account = crate::amoo_usage::account_scope_fresh(adb, device)
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some(account.as_str());
+    let cleanup = |bus: &mut AgentBus| match (result.as_ref(), completed_state.as_ref()) {
+        (Ok(_), Some((receipt, expected_reply, recent_history))) => {
+            clear_completed_brief_session_with_history(
+                bus,
+                receipt,
+                expected_reply,
+                Some(recent_history),
+            )
+        }
+        _ => delete_brief_session(bus, &key),
+    };
+    let deleted = same_account
+        && (cleanup(&mut bus)
+            || AgentBus::connect(adb, device).is_ok_and(|mut fresh| cleanup(&mut fresh)));
     match result {
         Ok(mut brief) => {
             brief.session_cleaned = deleted;
@@ -1493,6 +1535,9 @@ mod tests {
         assert!(!completed_reply_matches(&session,&receipt,"completed reply"));
         session.messages[0].run_id=receipt.run_id.clone();session.messages[0].stop_reason="length".into();
         assert!(!completed_reply_matches(&session,&receipt,"completed reply"));
+        session.messages[0].stop_reason="stop".into();
+        assert!(before_cleanup_reply_verified(None,Some(&session),&receipt,"completed reply"));
+        assert!(!before_cleanup_reply_verified(None,Some(&session),&receipt,"wrong reply"));
     }
 
     #[test]

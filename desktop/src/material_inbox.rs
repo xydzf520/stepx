@@ -133,6 +133,42 @@ const MAX_STORE_BYTES: u64 = 2 * 1024 * 1024;
 const OUTBOX: &str = "/sdcard/Android/data/com.stepx.companion.app/files/transfers/outbox";
 static STORE_LOCK: Mutex<()> = Mutex::new(());
 static ACTIVE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static SCOPE_APPEND_LOCKS: OnceLock<Mutex<BTreeMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+
+struct FileUnlockGuard(fs::File);
+impl Drop for FileUnlockGuard {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+fn scope_append_mutex(scope_key: &str) -> Arc<Mutex<()>> {
+    let mut map = SCOPE_APPEND_LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if map.len() >= 256 {
+        map.retain(|_, v| Arc::strong_count(v) > 1);
+    }
+    map.entry(scope_key.to_owned())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+fn scope_file_lock(inbox_dir: &Path) -> Result<FileUnlockGuard> {
+    let file = open_lock(&inbox_dir.join("scope.lock"))?;
+    let until = Instant::now() + Duration::from_secs(15);
+    loop {
+        if file.try_lock().is_ok() {
+            return Ok(FileUnlockGuard(file));
+        }
+        ensure!(
+            Instant::now() < until,
+            "当前账号资料正在同步，请稍后重试"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Scope {
@@ -520,20 +556,20 @@ pub fn link(scope: &Scope, id: &str, item: Option<&str>) -> Result<Snapshot> {
     );
     // Validate and apply the ledger's actual source relationship before claiming
     // success in the inbox. Unknown targets and metadata-only items are refused.
-    append_ready(scope, id, item.map(str::to_owned), false)?;
+    append_ready(scope, id, Some(item.map(str::to_owned)), false)?;
     snapshot(scope)
 }
 
-fn verify_scope(adb: &Adb, device: &Device, scope: &Scope) -> Result<()> {
+fn verify_scope(adb: &Adb, device: &Device, scope: &Scope) -> Result<String> {
     scope.key()?;
     ensure!(device.serial == scope.device, "当前手机已变化");
-    device.verify(adb)?;
+    let transport = device.resolve_active_transport(adb)?;
     let current = crate::amoo_usage::account_scope_fresh(adb, device)?;
     ensure!(
         current.as_deref() == Some(scope.account.as_str()),
         "手机账号已变化或无法核验，未处理资料"
     );
-    Ok(())
+    Ok(transport)
 }
 fn add(s: &mut Store, item: MaterialItem, source: Source) {
     if s.entries.contains_key(&item.id) {
@@ -650,11 +686,11 @@ pub fn remember_media(scope: &Scope, media: &[BridgeMediaItem]) -> Result<()> {
 /// Lists only Companion's explicit outbox, not arbitrary app directories. The
 /// user's transfer selection is not treated as implicit permission to run AI.
 pub fn collect(adb: &Adb, device: &Device, scope: &Scope) -> Result<Snapshot> {
-    verify_scope(adb, device, scope)?;
+    let transport = verify_scope(adb, device, scope)?;
     let desktop = crate::companion_link::desktop_id()?;
     let script=format!("n=0; if test -d {base} && test ! -L {base}; then for material_id in $(ls -1t {base} 2>/dev/null | head -n {limit}); do case \"$material_id\" in *[!0-9a-fA-F-]*) continue;; esac; test ${{#material_id}} -eq 36 || continue; material_dir={base}/\"$material_id\"; test -d \"$material_dir\" && test ! -L \"$material_dir\" && test ! -L \"$material_dir/manifest.json\" || continue; head -c 16385 \"$material_dir/manifest.json\" 2>/dev/null; printf '\\036'; done; fi",base=shell_quote(OUTBOX),limit=MAX_MANIFESTS);
     let raw = adb.run_timeout(
-        &["-s", &device.transport, "shell", &script],
+        &["-s", &transport, "shell", &script],
         Duration::from_secs(12),
     )?;
     ensure!(raw.len() <= MAX_MANIFESTS * 16386, "手机资料清单超过上限");
@@ -812,7 +848,8 @@ fn retrieve(
         }
     };
     ensure!(size <= MAX_SOURCE_BYTES, "单份资料最大32MB");
-    let canonical = adb.shell(&device.transport, &["readlink", "-f", &remote])?;
+    let transport = device.resolve_active_transport(adb)?;
+    let canonical = adb.shell(&transport, &["readlink", "-f", &remote])?;
     ensure!(
         canonical.trim()
             == format!(
@@ -825,7 +862,7 @@ fn retrieve(
     let stat = adb.run_timeout(
         &[
             "-s",
-            &device.transport,
+            &transport,
             "shell",
             &format!("test -f {q} && test ! -L {q} && stat -c '%s %Y' {q}"),
         ],
@@ -848,9 +885,9 @@ fn retrieve(
         // ADB already passes this remote command through its shell. An extra
         // sh -c plus a quoted script changes argument interpretation; some
         // devices return shell text with exit 0 instead of the file bytes.
-        .args(["-s", &device.transport, "exec-out", &script])
+        .args(["-s", &transport, "exec-out", &script])
         .env("ADB_MDNS_OPENSCREEN", "1");
-    let _slot = adb::TransportCoordinator::acquire_slot(&device.transport)?;
+    let _slot = adb::TransportCoordinator::acquire_slot(&transport)?;
     let output = run_cancellable(
         command,
         cancel,
@@ -870,7 +907,7 @@ fn retrieve(
     let stat_after = adb.run_timeout(
         &[
             "-s",
-            &device.transport,
+            &transport,
             "shell",
             &format!("stat -c '%s %Y' {q}"),
         ],
@@ -926,7 +963,7 @@ pub fn process(
             drop(s);
             drop(_file_lock);
             drop(_lock);
-            append_ready(scope, id, entry_link(scope, id)?, true)?;
+            append_ready(scope, id, None, true)?;
             return snapshot(scope);
         }
         ensure!(
@@ -998,6 +1035,12 @@ pub fn process(
     })();
     match result {
         Ok((content, sha, method, truncated, artifacts)) => {
+            let scope_key = scope.key()?;
+            let inbox_dir = scoped_dir(scope)?;
+            let context_root = crate::resources::user_state().join("stepx-companion/context");
+            let scope_mutex = scope_append_mutex(&scope_key);
+            let _mem_guard = scope_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            let _scope_file_guard = scope_file_lock(&inbox_dir)?;
             mutate(scope, |s| {
                 let e = s.entries.get_mut(id).context("资料不存在")?;
                 e.item.state = MaterialState::Ready;
@@ -1015,7 +1058,15 @@ pub fn process(
                 e.item.error = None;
                 Ok(())
             })?;
-            if let Err(error) = append_ready(scope, id, entry.item.linked_item.clone(), false) {
+            if let Err(error) = append_ready_locked(
+                &inbox_dir,
+                &context_root,
+                scope,
+                id,
+                Some(entry.item.linked_item.clone()),
+                false,
+                true,
+            ) {
                 let _ = mutate(scope, |s| {
                     let e = s.entries.get_mut(id).context("资料不存在")?;
                     e.item.error = Some(format!("正文已提取，但事项资料收录未完成：{error:#}"));
@@ -1024,6 +1075,8 @@ pub fn process(
                 });
                 return Err(error);
             }
+            drop(_scope_file_guard);
+            drop(_mem_guard);
             snapshot(scope)
         }
         Err(error) => {
@@ -1083,14 +1136,6 @@ fn read_plain_source(path: &Path) -> Result<String> {
     Ok(text)
 }
 
-fn entry_link(scope: &Scope, id: &str) -> Result<Option<String>> {
-    Ok(snapshot(scope)?
-        .items
-        .into_iter()
-        .find(|e| e.id == id)
-        .context("资料不存在")?
-        .linked_item)
-}
 const INVALIDATED_LINK_NOTE: &str = "原关联事项已不存在；资料已独立收录，请重新选择关联。";
 
 /// Only the explicit Ready re-import may recover a removed matter. An explicit
@@ -1207,33 +1252,96 @@ fn update_ready_entry(
     entry.item.error = None;
 }
 
-fn append_ready(
+fn append_ready_locked(
+    inbox_dir: &Path,
+    context_root: &Path,
     scope: &Scope,
     id: &str,
-    linked_matter_id: Option<String>,
+    linked_matter_id: Option<Option<String>>,
     recover_missing_link: bool,
+    use_global_store_lock: bool,
 ) -> Result<()> {
-    let text = read_content(scope, id)?;
-    let item = snapshot(scope)?
-        .items
-        .into_iter()
-        .find(|e| e.id == id)
-        .context("资料不存在")?;
+    let (text, item, target_link) = {
+        let _lock = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _file_lock = if use_global_store_lock {
+            Some(store_file_lock()?)
+        } else {
+            None
+        };
+        let text = read_content_at(inbox_dir, scope, id)?;
+        let s = load_at(inbox_dir, scope)?;
+        let item = s.entries.get(id).context("资料不存在")?.item.clone();
+        let target_link = match linked_matter_id {
+            Some(explicit) => explicit,
+            None => item.linked_item.clone(),
+        };
+        (text, item, target_link)
+    };
     let summary = content_summary(&text, &item.content_method, item.content_truncated);
     let (resolved, history, source_label) = append_ready_content(
-        &crate::resources::user_state().join("stepx-companion/context"),
+        context_root,
         scope,
         &item,
         &text,
-        linked_matter_id,
+        target_link,
         recover_missing_link,
     )?;
-    mutate(scope, |s| {
-        let e = s.entries.get_mut(id).context("资料不存在")?;
-        update_ready_entry(e, resolved, history, summary, source_label);
-        Ok(())
-    })?;
+    let _lock = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _file_lock = if use_global_store_lock {
+        Some(store_file_lock()?)
+    } else {
+        None
+    };
+    let mut s = load_at(inbox_dir, scope)?;
+    let e = s.entries.get_mut(id).context("资料不存在")?;
+    update_ready_entry(e, resolved, history, summary, source_label);
+    s.updated_ms = now();
+    atomic_json(&inbox_dir.join("inbox.json"), &s)?;
     Ok(())
+}
+
+fn append_ready_in(
+    inbox_dir: &Path,
+    context_root: &Path,
+    scope: &Scope,
+    id: &str,
+    linked_matter_id: Option<Option<String>>,
+    recover_missing_link: bool,
+    use_global_store_lock: bool,
+) -> Result<()> {
+    ensure!(valid_hash(id), "资料标识无效");
+    let scope_key = scope.key()?;
+    let scope_mutex = scope_append_mutex(&scope_key);
+    let _mem_guard = scope_mutex.lock().unwrap_or_else(|e| e.into_inner());
+    let _scope_file_guard = scope_file_lock(inbox_dir)?;
+    append_ready_locked(
+        inbox_dir,
+        context_root,
+        scope,
+        id,
+        linked_matter_id,
+        recover_missing_link,
+        use_global_store_lock,
+    )
+}
+
+fn append_ready(
+    scope: &Scope,
+    id: &str,
+    linked_matter_id: Option<Option<String>>,
+    recover_missing_link: bool,
+) -> Result<()> {
+    let inbox_dir = scoped_dir(scope)?;
+    let context_root = crate::resources::user_state().join("stepx-companion/context");
+    append_ready_in(
+        &inbox_dir,
+        &context_root,
+        scope,
+        id,
+        linked_matter_id,
+        recover_missing_link,
+        true,
+    )
 }
 
 /// Resolves only a receipt-backed content file inside the current scope. This
@@ -1693,5 +1801,213 @@ mod tests {
         assert!(out.status.success());
         assert_eq!(out.stdout, bytes);
         assert!(!dir.path().join("escaped-marker.png").exists());
+    }
+
+    #[test]
+    fn append_ready_holds_scope_lock_and_keeps_ledger_and_inbox_consistent() {
+        let temp = tempfile::tempdir().unwrap();
+        let inbox = temp.path().join("inbox");
+        let root = temp.path().join("context");
+        private_dir(&inbox).unwrap();
+        let scope = Scope {
+            device: "lock-sync-phone".into(),
+            account: "lock-sync-account".into(),
+        };
+
+        let make_matter = |tag: &str, body: &str| {
+            crate::context_ledger::append_material(
+                &root,
+                &scope.device,
+                Some(&scope.account),
+                &crate::context_ledger::MaterialInput {
+                    id: hash(tag.as_bytes()),
+                    title: format!("{tag}.txt"),
+                    source_label: "手机选择的文件".into(),
+                    text: body.into(),
+                    content_sha256: hash(body.as_bytes()),
+                    source_time_ms: None,
+                    method: crate::context_ledger::MaterialMethod::RawText,
+                    truncated: false,
+                    linked_matter_id: None,
+                    now_ms: now(),
+                    utc_offset_seconds: 8 * 3600,
+                },
+            )
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|m| {
+                m.source_objects
+                    .iter()
+                    .any(|s| s.id == format!("material:{}", hash(tag.as_bytes())))
+            })
+            .unwrap()
+            .id
+        };
+        let matter_a = make_matter("matter-a", "第一项排期安排讨论内容。");
+        let matter_b = make_matter("matter-b", "第二项采购合同审核内容。");
+
+        let id = hash(b"shared-ready-material");
+        let run = inbox.join(&id).join("run-1");
+        private_dir(&run).unwrap();
+        let content = run.join("extracted-content.txt");
+        let text = "并发关联验证资料正文，确认账本与收件箱最终一致。";
+        fs::write(&content, text).unwrap();
+        let input_hash = hash(b"raw-bytes");
+        atomic_json(
+            &run.join("content-receipt.json"),
+            &json!({
+                "schema": 1,
+                "scope_id": scope.key().unwrap(),
+                "material_id": id,
+                "input_sha256": input_hash,
+                "content_sha256": hash(text.as_bytes()),
+            }),
+        )
+        .unwrap();
+
+        let mut store = Store {
+            scope: Some(scope.clone()),
+            ..Default::default()
+        };
+        add(
+            &mut store,
+            MaterialItem {
+                id: id.clone(),
+                title: "资料.txt".into(),
+                kind: MaterialKind::Text,
+                source_label: "手机已选资料".into(),
+                state: MaterialState::Ready,
+                content_path: Some(content),
+                input_sha256: Some(input_hash),
+                content_method: "文字原文提取".into(),
+                ..Default::default()
+            },
+            Source::Local {
+                path: run.join("资料.txt"),
+            },
+        );
+        atomic_json(&inbox.join("inbox.json"), &store).unwrap();
+
+        std::thread::scope(|s| {
+            for idx in 0..6 {
+                let inbox = &inbox;
+                let root = &root;
+                let scope = &scope;
+                let id = &id;
+                let target = if idx % 2 == 0 {
+                    matter_a.clone()
+                } else {
+                    matter_b.clone()
+                };
+                s.spawn(move || {
+                    append_ready_in(inbox, root, scope, id, Some(Some(target)), false, false)
+                        .unwrap();
+                });
+            }
+        });
+
+        let final_store = load_at(&inbox, &scope).unwrap();
+        let inbox_linked = final_store.entries[&id].item.linked_item.clone().unwrap();
+        let ledger_view =
+            crate::context_ledger::load(&root, &scope.device, Some(&scope.account)).unwrap();
+        let ledger_owner = ledger_view
+            .items
+            .iter()
+            .find(|item| {
+                item.source_objects
+                    .iter()
+                    .any(|src| src.id == format!("material:{id}"))
+            })
+            .unwrap()
+            .id
+            .clone();
+        assert_eq!(
+            inbox_linked, ledger_owner,
+            "scope lock must keep inbox linked_item and context_ledger owner identical"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn material_audio_script_allows_unknown_header_duration_and_enforces_segment_end_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub_pkgs = dir.path().join("py_stubs");
+        fs::create_dir_all(&stub_pkgs).unwrap();
+        fs::write(
+            stub_pkgs.join("av.py"),
+            r#"time_base = 1000000
+class _Stream:
+    duration = None
+    time_base = None
+class _Streams:
+    audio = [_Stream()]
+class _Container:
+    streams = _Streams()
+    duration = None
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+def open(path):
+    return _Container()
+"#,
+        )
+        .unwrap();
+        fs::write(
+            stub_pkgs.join("faster_whisper.py"),
+            r#"import os
+class _Seg:
+    def __init__(self, start, end, text):
+        self.start = start
+        self.end = end
+        self.text = text
+class _Info:
+    language = "zh"
+class WhisperModel:
+    def __init__(self, *a, **kw): pass
+    def transcribe(self, *a, **kw):
+        end = float(os.environ.get("TEST_SEG_END", "12.5"))
+        return [_Seg(0.0, end, "测试语音片段")], _Info()
+"#,
+        )
+        .unwrap();
+
+        let audio = dir.path().join("streamed.aac");
+        fs::write(&audio, b"small-audio-without-header-duration").unwrap();
+        let model_dir = dir.path().join("model");
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join("model.bin"), b"weights").unwrap();
+
+        // Notice `-I` isolates PYTHONPATH, so run via python3 without `-I` to load our offline stubs.
+        let python = crate::resources::python();
+        let ok_out = std::process::Command::new(&python)
+            .arg("-c")
+            .arg(include_str!("material_audio.py"))
+            .arg(&audio)
+            .arg(&model_dir)
+            .env("PYTHONPATH", &stub_pkgs)
+            .env("TEST_SEG_END", "42.5")
+            .output()
+            .unwrap();
+        assert!(
+            ok_out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&ok_out.stderr)
+        );
+        let parsed: Value = serde_json::from_slice(&ok_out.stdout).unwrap();
+        assert_eq!(parsed["engine"], "faster-whisper");
+        assert!(parsed["duration"].is_null());
+        assert_eq!(parsed["segments"][0]["end"], 42.5);
+
+        let too_long = std::process::Command::new(&python)
+            .arg("-c")
+            .arg(include_str!("material_audio.py"))
+            .arg(&audio)
+            .arg(&model_dir)
+            .env("PYTHONPATH", &stub_pkgs)
+            .env("TEST_SEG_END", "900.1")
+            .output()
+            .unwrap();
+        assert!(!too_long.status.success());
+        assert!(String::from_utf8_lossy(&too_long.stderr).contains("15分钟"));
     }
 }

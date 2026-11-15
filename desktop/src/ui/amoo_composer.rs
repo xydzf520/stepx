@@ -184,7 +184,8 @@ impl Companion {
         let mut value = field.text.clone();
         let mut caret = 0;
         if focused {
-            let cursor = field.cursor.min(value.len());
+            let cursor =
+                crate::ui::keyboard_input::clamp_char_boundary(&value, field.cursor.min(value.len()));
             // Text's saved positions use Unicode character indices; Input uses
             // UTF-8 byte offsets for editing. Convert before positioning IME/scroll.
             caret = value[..cursor].chars().count() + field.preedit.chars().count();

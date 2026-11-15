@@ -283,3 +283,38 @@ fn test_strip_leading_unicode_bom_with_single_style_run() {
     )];
     assert_eq!(adjusted_style_runs, Some(expected_style_runs));
 }
+
+#[test]
+fn test_single_char_wrapped_line_returns_first_index() {
+    let line = Line {
+        width: 10.0,
+        trailing_whitespace_width: 0.0,
+        font_size: 12.0,
+        line_height_ratio: 1.0,
+        baseline_ratio: DEFAULT_TOP_BOTTOM_RATIO,
+        clip_config: None,
+        ascent: 10.0,
+        descent: -2.0,
+        runs: vec![Run {
+            font_id: FontId(0),
+            glyphs: vec![Glyph {
+                id: 1,
+                index: 5,
+                position_along_baseline: vec2f(2.0, 0.0),
+                width: 8.0,
+            }],
+            styles: TextStyle::default(),
+            width: 8.0,
+        }],
+        caret_positions: vec![CaretPosition {
+            position_in_line: 2.0,
+            start_offset: 5,
+            last_offset: 5,
+        }],
+        chars_with_missing_glyphs: vec![],
+    };
+
+    assert_eq!(line.first_index(), 5);
+    assert_eq!(line.index_for_x(1.0), Some(5));
+    assert_eq!(line.caret_index_for_x(1.0), Some(5));
+}

@@ -172,11 +172,22 @@ struct WindowState {
     scroll_velocity: Option<ScrollVelocity>,
     /// Abort handle for momentum scrolling timer. Present only during the momentum phase.
     momentum_scroll_abort: Option<AbortHandle>,
+    /// Whether IME input is currently enabled for this specific window.
+    pub(super) ime_enabled: bool,
+    /// Whether an active IME preedit composition is currently open in this window.
+    pub(super) ime_composing: bool,
     /// For touch events, stores whether soft keyboard was requested during LeftMouseDown.
     /// This is needed because touch keyboard updates are deferred to LeftMouseUp, but the
     /// UI element only requests the keyboard during LeftMouseDown.
     #[cfg(target_family = "wasm")]
     pending_soft_keyboard_request: bool,
+}
+
+#[derive(Debug)]
+enum ImeTransition {
+    Ignored,
+    Enabled,
+    Dispatch(Vec<crate::Event>),
 }
 
 impl WindowState {
@@ -194,8 +205,55 @@ impl WindowState {
             last_touch_purpose: None,
             scroll_velocity: None,
             momentum_scroll_abort: None,
+            ime_enabled: false,
+            ime_composing: false,
             #[cfg(target_family = "wasm")]
             pending_soft_keyboard_request: false,
+        }
+    }
+
+    fn apply_ime_event(&mut self, event: ImeEvent) -> ImeTransition {
+        match event {
+            winit::event::Ime::Enabled => {
+                self.ime_enabled = true;
+                ImeTransition::Enabled
+            }
+            winit::event::Ime::Preedit(preedit_text, cursor_position) => {
+                if !self.ime_enabled {
+                    return ImeTransition::Ignored;
+                }
+                if preedit_text.is_empty() {
+                    let was_composing = std::mem::replace(&mut self.ime_composing, false);
+                    if was_composing {
+                        ImeTransition::Dispatch(vec![ClearMarkedText])
+                    } else {
+                        ImeTransition::Ignored
+                    }
+                } else {
+                    self.ime_composing = true;
+                    ImeTransition::Dispatch(vec![SetMarkedText {
+                        marked_text: preedit_text,
+                        selected_range: cursor_position
+                            .map(|cursor_position| cursor_position.0..cursor_position.1)
+                            .unwrap_or(0..0),
+                    }])
+                }
+            }
+            winit::event::Ime::Commit(chars) => {
+                self.ime_composing = false;
+                // Clear the marked text state before inserting typed characters so that the Vim
+                // FSA knows it can interpret the committed text as a user insertion.
+                ImeTransition::Dispatch(vec![ClearMarkedText, TypedCharacters { chars }])
+            }
+            winit::event::Ime::Disabled => {
+                self.ime_enabled = false;
+                let was_composing = std::mem::replace(&mut self.ime_composing, false);
+                if was_composing {
+                    ImeTransition::Dispatch(vec![ClearMarkedText])
+                } else {
+                    ImeTransition::Ignored
+                }
+            }
         }
     }
 
@@ -511,7 +569,7 @@ pub(super) struct EventLoop {
     window_icon: Option<winit::window::Icon>,
     state: State,
     proxy: EventLoopProxy<CustomEvent>,
-    ime_enabled: bool,
+    ime_state: std::sync::Arc<super::delegate::ImeSharedState>,
     /// Whether to downrank non-NVIDIA vulkan adapters. This is set to true when we detect a DRI3
     /// error that occurs when trying to present against a non-NVIDIA Vulkan adapter when the
     /// PRIME Profile is set to "Performance" mode.  It's not fully clear why this error occurs. Our
@@ -533,6 +591,7 @@ impl EventLoop {
         window_class: Option<String>,
         #[cfg(target_os = "linux")] window_icon: Option<winit::window::Icon>,
         proxy: EventLoopProxy<CustomEvent>,
+        ime_state: std::sync::Arc<super::delegate::ImeSharedState>,
     ) -> Self {
         Self {
             ui_app: ui_app.clone(),
@@ -543,10 +602,56 @@ impl EventLoop {
             window_icon,
             state: Default::default(),
             proxy,
-            ime_enabled: false,
+            ime_state,
             downrank_non_nvidia_vulkan_adapters: false,
             #[cfg(target_family = "wasm")]
             soft_keyboard_manager: None,
+        }
+    }
+
+    fn sync_ime_open_flag(&self) {
+        use std::sync::atomic::Ordering;
+
+        let any_composing = self.state.windows.values().any(|ws| ws.ime_composing);
+        let active_open = match self.state.pending_active_window_change {
+            Some(ActiveWindowChange::FocusOut) => false,
+            Some(ActiveWindowChange::FocusIn(winit_id)) => self
+                .state
+                .windows
+                .get(&winit_id)
+                .is_some_and(|ws| ws.ime_composing),
+            None => self
+                .ui_app
+                .read(|ctx| ctx.windows().active_window())
+                .map(|active_id| {
+                    self.state
+                        .windows
+                        .values()
+                        .any(|ws| ws.window_id == active_id && ws.ime_composing)
+                })
+                .unwrap_or(any_composing),
+        };
+        self.ime_state
+            .any_composing
+            .store(any_composing, Ordering::Release);
+        self.ime_state
+            .active_open
+            .store(active_open, Ordering::Release);
+    }
+
+    fn schedule_recovery_redraw_if_needed(&self, window: &super::Window) {
+        if let Some((winit_window_id, delay)) = window.take_pending_recovery_timer() {
+            let proxy = self.proxy.clone();
+            self.ui_app.read(|ctx| {
+                ctx.foreground_executor()
+                    .spawn(async move {
+                        Timer::after(delay).await;
+                        let _ = proxy.send_event(CustomEvent::RetryRecreateRenderer {
+                            window_id: winit_window_id,
+                        });
+                    })
+                    .detach();
+            });
         }
     }
 
@@ -716,6 +821,7 @@ impl EventLoop {
                     .and_then(|window_id| self.state.windows.get(&window_id))
                     .map(|state| state.window_id);
                 self.callbacks.active_window_changed(active_window_id);
+                self.sync_ime_open_flag();
 
                 // If the application became active or inactive, invoke the appropriate callback.
                 let app_is_active = active_window_id.is_some();
@@ -781,7 +887,16 @@ impl EventLoop {
                 });
             }
             Event::UserEvent(CustomEvent::ActiveCursorPositionUpdated) => {
-                if self.ime_enabled {
+                let active_ime_enabled = self
+                    .ui_app
+                    .read(|ctx| ctx.windows().active_window())
+                    .is_some_and(|active_id| {
+                        self.state
+                            .windows
+                            .values()
+                            .any(|ws| ws.window_id == active_id && ws.ime_enabled)
+                    });
+                if active_ime_enabled {
                     self.update_ime_position();
                 }
             }
@@ -862,6 +977,36 @@ impl EventLoop {
                         modifiers: ModifiersState::default(),
                     },
                 );
+            }
+            Event::UserEvent(CustomEvent::CloseIme { window_id }) => {
+                let was_composing = self
+                    .state
+                    .windows
+                    .values_mut()
+                    .find(|ws| ws.window_id == window_id)
+                    .is_some_and(|ws| std::mem::replace(&mut ws.ime_composing, false));
+                self.sync_ime_open_flag();
+                if was_composing {
+                    if let Some(window) = self
+                        .ui_app
+                        .read(|ctx| ctx.windows().platform_window(window_id))
+                    {
+                        let mut window_callbacks = self.callbacks.for_window(window.as_ref());
+                        window_callbacks.dispatch_event(ClearMarkedText);
+                    }
+                }
+            }
+            Event::UserEvent(CustomEvent::RetryRecreateRenderer { window_id }) => {
+                let Some(ui_window_id) = self.state.windows.get(&window_id).map(|ws| ws.window_id)
+                else {
+                    return;
+                };
+                if let Some(window) = self
+                    .ui_app
+                    .read(|ctx| ctx.windows().platform_window(ui_window_id))
+                {
+                    downcast_window(window.as_ref()).on_recovery_timer_fired();
+                }
             }
             Event::WindowEvent {
                 window_id,
@@ -1081,6 +1226,8 @@ impl EventLoop {
                 }
             }
         }
+
+        self.schedule_recovery_redraw_if_needed(window);
     }
 
     /// Handles a [`winit::event::WindowEvent`].
@@ -1516,19 +1663,20 @@ impl EventLoop {
         &mut self,
         window_id: crate::WindowId,
         winit_window_id: winit::window::WindowId,
-        window_target: &ActiveEventLoop,
+        _window_target: &ActiveEventLoop,
     ) {
         let window_state = self.state.windows.remove(&winit_window_id);
+        self.sync_ime_open_flag();
 
-        // Drop the renderer before we actually clean up the window, to ensure
-        // that the window outlives the `wgpu` surface that references it.
+        // Drop the window's renderer and retained scene before cleaning up the window so the
+        // native window outlives its `wgpu` surface, without resetting the shared `wgpu::Instance`
+        // used by other open windows.
         if let Some(WindowState { window_id, .. }) = window_state {
             if let Some(window) = self
                 .ui_app
                 .read(|ctx| ctx.windows().platform_window(window_id))
             {
-                downcast_window(window.as_ref())
-                    .drop_renderer(Box::new(window_target.owned_display_handle()));
+                downcast_window(window.as_ref()).drop_renderer_for_close();
             }
         }
 
@@ -1554,72 +1702,68 @@ impl EventLoop {
     fn handle_ime_event(&mut self, winit_window_id: WinitWindowId, event: ImeEvent) {
         #[cfg(target_os = "linux")]
         if super::linux::linux_webview_owns_keyboard() {
-            match event {
-                winit::event::Ime::Enabled => {
-                    self.ime_enabled = true;
-                    self.update_ime_position();
+            let mut should_update_ime_pos = false;
+            let mut committed_chars = None;
+            if let Some(window_state) = self.state.windows.get_mut(&winit_window_id) {
+                match event {
+                    winit::event::Ime::Enabled => {
+                        window_state.ime_enabled = true;
+                        should_update_ime_pos = true;
+                    }
+                    winit::event::Ime::Disabled => {
+                        window_state.ime_enabled = false;
+                        window_state.ime_composing = false;
+                    }
+                    winit::event::Ime::Preedit(preedit_text, _) => {
+                        if window_state.ime_enabled {
+                            window_state.ime_composing = !preedit_text.is_empty();
+                        }
+                    }
+                    winit::event::Ime::Commit(chars) => {
+                        window_state.ime_composing = false;
+                        committed_chars = Some(chars);
+                    }
                 }
-                winit::event::Ime::Disabled => {
-                    self.ime_enabled = false;
-                }
-                winit::event::Ime::Preedit(_, _) => {}
-                winit::event::Ime::Commit(chars) => {
-                    super::linux::linux_webview_insert_text(&chars);
-                }
+            }
+            self.sync_ime_open_flag();
+            if should_update_ime_pos {
+                self.update_ime_position();
+            }
+            if let Some(chars) = committed_chars {
+                super::linux::linux_webview_insert_text(&chars);
             }
             return;
         }
 
-        match event {
-            winit::event::Ime::Enabled => {
-                self.ime_enabled = true;
+        let Some((ui_window_id, transition)) = self
+            .state
+            .windows
+            .get_mut(&winit_window_id)
+            .map(|ws| (ws.window_id, ws.apply_ime_event(event)))
+        else {
+            return;
+        };
+        self.sync_ime_open_flag();
+
+        match transition {
+            ImeTransition::Ignored => {}
+            ImeTransition::Enabled => {
                 self.ui_app
                     .update(|ctx| ctx.report_active_cursor_position_update());
             }
-            winit::event::Ime::Preedit(preedit_text, cursor_position) => {
-                if !self.ime_enabled {
+            ImeTransition::Dispatch(events) => {
+                let Some(window) = self
+                    .ui_app
+                    .read(|ctx| ctx.windows().platform_window(ui_window_id))
+                else {
                     return;
+                };
+                let mut window_callbacks = self.callbacks.for_window(window.as_ref());
+                for evt in events {
+                    window_callbacks.dispatch_event(evt);
                 }
-
-                let Some(window_state) = self.state.windows.get_mut(&winit_window_id) else {
-                    return;
-                };
-                let Some(window) = self
-                    .ui_app
-                    .read(|ctx| ctx.windows().platform_window(window_state.window_id))
-                else {
-                    return;
-                };
-
-                let mut window_callbacks = self.callbacks.for_window(window.as_ref());
-                window_callbacks.dispatch_event(SetMarkedText {
-                    marked_text: preedit_text,
-                    selected_range: cursor_position
-                        .map(|cursor_position| cursor_position.0..cursor_position.1)
-                        .unwrap_or(0..0),
-                });
             }
-            winit::event::Ime::Commit(chars) => {
-                let Some(window_state) = self.state.windows.get_mut(&winit_window_id) else {
-                    return;
-                };
-                let Some(window) = self
-                    .ui_app
-                    .read(|ctx| ctx.windows().platform_window(window_state.window_id))
-                else {
-                    return;
-                };
-
-                let mut window_callbacks = self.callbacks.for_window(window.as_ref());
-                // We clear the marked text state before inserting typed characters so that the Vim
-                // FSA knows it can interpret the committed text as a user insertion.
-                window_callbacks.dispatch_event(ClearMarkedText);
-                window_callbacks.dispatch_event(TypedCharacters { chars });
-            }
-            winit::event::Ime::Disabled => {
-                self.ime_enabled = false;
-            }
-        };
+        }
     }
 
     /// Keep fcitx on the parent XIC and inject typing into the Harness page.
@@ -1974,14 +2118,26 @@ impl EventLoop {
     /// details.
     #[cfg(target_os = "linux")]
     fn resume_from_sleep_on_linux(&mut self) {
+        let proxy = self.proxy.clone();
         self.ui_app.update(|ctx| {
             for window_id in ctx.window_ids() {
                 let Some(window) = ctx.windows().platform_window(window_id) else {
-                    return;
+                    continue;
                 };
 
                 let winit_window = downcast_window(window.as_ref());
                 winit_window.recreate_renderer(self.downrank_non_nvidia_vulkan_adapters);
+                if let Some((winit_window_id, delay)) = winit_window.take_pending_recovery_timer() {
+                    let proxy = proxy.clone();
+                    ctx.foreground_executor()
+                        .spawn(async move {
+                            Timer::after(delay).await;
+                            let _ = proxy.send_event(CustomEvent::RetryRecreateRenderer {
+                                window_id: winit_window_id,
+                            });
+                        })
+                        .detach();
+                }
             }
         });
     }
@@ -2194,6 +2350,71 @@ mod render_error_tests {
         assert!(!is_transient_surface_error(&renderer::Error::SurfaceError(
             renderer::GetSurfaceTextureError::Lost,
         )));
+    }
+
+    #[test]
+    fn per_window_ime_state_isolates_secondary_popup_and_clears_marked_text() {
+        let mut main_win = WindowState::new(crate::WindowId::new());
+        let mut popup_win = WindowState::new(crate::WindowId::new());
+
+        assert!(matches!(
+            main_win.apply_ime_event(winit::event::Ime::Enabled),
+            ImeTransition::Enabled
+        ));
+        assert!(main_win.ime_enabled);
+        assert!(!main_win.ime_composing);
+
+        // Start CJK composition in main window.
+        match main_win.apply_ime_event(winit::event::Ime::Preedit("ni".into(), Some((2, 2)))) {
+            ImeTransition::Dispatch(events) => match events.as_slice() {
+                [SetMarkedText {
+                    marked_text,
+                    selected_range,
+                }] => {
+                    assert_eq!(marked_text, "ni");
+                    assert_eq!(selected_range, &(2..2));
+                }
+                other => panic!("expected SetMarkedText, got {other:?}"),
+            },
+            other => panic!("expected Dispatch, got {other:?}"),
+        }
+        assert!(main_win.ime_composing);
+
+        // Secondary popup toast receives Ime::Disabled; main window IME must stay enabled & composing.
+        assert!(matches!(
+            popup_win.apply_ime_event(winit::event::Ime::Disabled),
+            ImeTransition::Ignored
+        ));
+        assert!(!popup_win.ime_enabled);
+        assert!(main_win.ime_enabled);
+        assert!(main_win.ime_composing);
+
+        // Cancelling composition via empty Preedit("", None) dispatches ClearMarkedText.
+        match main_win.apply_ime_event(winit::event::Ime::Preedit(String::new(), None)) {
+            ImeTransition::Dispatch(events) => {
+                assert!(matches!(events.as_slice(), [ClearMarkedText]));
+            }
+            other => panic!("expected Dispatch([ClearMarkedText]), got {other:?}"),
+        }
+        assert!(!main_win.ime_composing);
+
+        // Redundant empty Preedit when not composing is ignored.
+        assert!(matches!(
+            main_win.apply_ime_event(winit::event::Ime::Preedit(String::new(), None)),
+            ImeTransition::Ignored
+        ));
+
+        // Ime::Disabled while composing also dispatches ClearMarkedText.
+        let _ = main_win.apply_ime_event(winit::event::Ime::Preedit("hao".into(), Some((3, 3))));
+        assert!(main_win.ime_composing);
+        match main_win.apply_ime_event(winit::event::Ime::Disabled) {
+            ImeTransition::Dispatch(events) => {
+                assert!(matches!(events.as_slice(), [ClearMarkedText]));
+            }
+            other => panic!("expected Dispatch([ClearMarkedText]), got {other:?}"),
+        }
+        assert!(!main_win.ime_enabled);
+        assert!(!main_win.ime_composing);
     }
 }
 

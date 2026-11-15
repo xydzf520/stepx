@@ -803,31 +803,45 @@ fn grouped_message_reads<A: Send, B: Send, C: Send, D: Send>(
     messages: impl FnOnce() -> B + Send,
     calls: impl FnOnce() -> C + Send,
     contacts: impl FnOnce() -> D + Send,
-) -> (A, B, C, D) {
+) -> anyhow::Result<(A, B, C, D)> {
     if wireless {
-        let (a, b) = std::thread::scope(|scope| {
+        let (a, b) = std::thread::scope(|scope| -> anyhow::Result<_> {
             let a = scope.spawn(capabilities);
             let b = scope.spawn(messages);
-            (a.join().unwrap(), b.join().unwrap())
-        });
-        let (c, d) = std::thread::scope(|scope| {
+            Ok((
+                a.join()
+                    .map_err(|_| anyhow::anyhow!("后台同步子线程异常退出"))?,
+                b.join()
+                    .map_err(|_| anyhow::anyhow!("后台同步子线程异常退出"))?,
+            ))
+        })?;
+        let (c, d) = std::thread::scope(|scope| -> anyhow::Result<_> {
             let c = scope.spawn(calls);
             let d = scope.spawn(contacts);
-            (c.join().unwrap(), d.join().unwrap())
-        });
-        (a, b, c, d)
+            Ok((
+                c.join()
+                    .map_err(|_| anyhow::anyhow!("后台同步子线程异常退出"))?,
+                d.join()
+                    .map_err(|_| anyhow::anyhow!("后台同步子线程异常退出"))?,
+            ))
+        })?;
+        Ok((a, b, c, d))
     } else {
-        std::thread::scope(|scope| {
+        std::thread::scope(|scope| -> anyhow::Result<_> {
             let a = scope.spawn(capabilities);
             let b = scope.spawn(messages);
             let c = scope.spawn(calls);
             let d = scope.spawn(contacts);
-            (
-                a.join().unwrap(),
-                b.join().unwrap(),
-                c.join().unwrap(),
-                d.join().unwrap(),
-            )
+            Ok((
+                a.join()
+                    .map_err(|_| anyhow::anyhow!("后台同步子线程异常退出"))?,
+                b.join()
+                    .map_err(|_| anyhow::anyhow!("后台同步子线程异常退出"))?,
+                c.join()
+                    .map_err(|_| anyhow::anyhow!("后台同步子线程异常退出"))?,
+                d.join()
+                    .map_err(|_| anyhow::anyhow!("后台同步子线程异常退出"))?,
+            ))
         })
     }
 }
@@ -870,15 +884,21 @@ fn cached_contacts(adb: &Adb, device: &Device) -> std::result::Result<Vec<Contac
     Ok(fresh)
 }
 
-fn read_message_domain(adb: &Adb, device: &Device) -> Outcome {
+fn read_message_domain(adb: &Adb, device: &Device) -> anyhow::Result<Outcome> {
     let (caps, sms, calls, contacts) = grouped_message_reads(
         is_wireless(&device.transport),
         || cached_capabilities(adb, device),
         || read_result(device.messages(adb)),
         || read_result(device.call_logs(adb)),
         || cached_contacts(adb, device),
-    );
-    Outcome::HomeRefreshed(String::new(), caps, sms, calls, contacts)
+    )?;
+    Ok(Outcome::HomeRefreshed(
+        String::new(),
+        caps,
+        sms,
+        calls,
+        contacts,
+    ))
 }
 
 impl Companion {
@@ -901,7 +921,7 @@ impl Companion {
                 Adb::discover()
                     .and_then(|adb| {
                         device.transport = device.resolve_active_transport(&adb)?;
-                        Ok(Box::new(read_message_domain(&adb, &device)))
+                        Ok(Box::new(read_message_domain(&adb, &device)?))
                     })
                     .map_err(|error| format!("{error:#}"))
             }))
@@ -971,16 +991,34 @@ impl Companion {
         let Some(mut device) = self.selected.clone() else {
             return false;
         };
+        let captured_epoch = self.device_epoch;
+        let captured_serial = device.serial.clone();
         let (tx, rx) = mpsc::channel();
         self.bg_receivers.push((page, None, rx));
         std::thread::spawn(move || {
-            let outcome = Adb::discover().and_then(|adb| {
+            let result = Adb::discover().and_then(|adb| {
                 if let Ok(active) = device.resolve_active_transport(&adb) {
                     device.transport = active;
                 }
                 job(&adb, device)
             });
-            let _ = tx.send(outcome);
+            let wrapped = match result {
+                Ok(inner) => Ok(Outcome::DeviceScoped {
+                    epoch: captured_epoch,
+                    serial: captured_serial,
+                    in_flight: None,
+                    outcome: Box::new(inner),
+                }),
+                Err(error) => Ok(Outcome::DeviceScopedError {
+                    epoch: captured_epoch,
+                    serial: captured_serial,
+                    page,
+                    tool: None,
+                    in_flight: None,
+                    error,
+                }),
+            };
+            let _ = tx.send(wrapped);
         });
         true
     }
@@ -1167,6 +1205,21 @@ impl Companion {
         use AutoSyncDomain::*;
         let mut results = vec![];
         match outcome {
+            Outcome::DeviceScoped { outcome, .. } => {
+                return self.auto_sync_outcome_results(outcome);
+            }
+            Outcome::DeviceScopedError { page, error, .. } => {
+                if let Some(domain) = match page {
+                    Page::Overview => Some(DeviceAndSummary),
+                    Page::Apps | Page::AppStore => Some(AppsAndUpdates),
+                    Page::Sms | Page::Phone => Some(MessagesAndCalls),
+                    Page::Gallery => Some(GalleryAndStorage),
+                    Page::Calendar | Page::Schedule | Page::Alarms => Some(CalendarAndSuite),
+                    _ => None,
+                } {
+                    results.push((domain, Some(format!("{error:#}"))));
+                }
+            }
             Outcome::Summary(text, _) if !text.trim().is_empty() => {
                 results.push((DeviceAndSummary, None))
             }
@@ -2163,7 +2216,7 @@ mod tests {
             2
         };
         assert_eq!(
-            grouped_message_reads(true, || first(), || first(), || second(), || second()),
+            grouped_message_reads(true, || first(), || first(), || second(), || second()).unwrap(),
             (1, 1, 2, 2)
         );
     }

@@ -1131,8 +1131,8 @@ pub fn save(root: &Path,device: &str,account: Option<&str>,request: &GenerationR
 }
 fn save_current_locked(root:&Path,device:&str,account:Option<&str>,current:&GenerationRequest,
     raw_json:&str,_guard:&OutcomeWriteGuard,scope:PathBuf)->Result<OutcomeBundle> {
-    if raw_json.len() > 200_000 { return Err(ModelContentError("模型返回过长，请聚焦主要判断和行动".into()).into()); } let raw = raw_json.trim();
-    let raw = if raw.starts_with("```json\n") && raw.ends_with("```") {raw.strip_prefix("```json\n").unwrap().strip_suffix("```").unwrap().trim()} else {raw};
+    if raw_json.len() > 200_000 { return Err(ModelContentError("模型返回过长，请聚焦主要判断和行动".into()).into()); }
+    let raw = crate::agent_workflows::strip_fence(raw_json);
     let d = parse_and_validate(&current,raw).map_err(model_content)?;
     let dir = scope.join("outcomes"); fs::create_dir_all(&dir)?;
     ensure!(!fs::symlink_metadata(&dir)?.file_type().is_symlink() && fs::canonicalize(&dir)?.starts_with(fs::canonicalize(&scope)?),"成果目录越界");
@@ -1187,8 +1187,7 @@ pub(crate) fn sync_saved_actions(root:&Path,device:&str,account:Option<&str>,bun
     ensure!(bundle.scope_id == scope_id(device,account),"成果范围已变化");
     let request=prepare(root,device,account,&bundle.target)?;
     if request.input_revision != bundle.input_revision {return Ok(false);}
-    let raw=raw_json.trim();
-    let raw=if raw.starts_with("```json\n") && raw.ends_with("```") {raw.strip_prefix("```json\n").unwrap().strip_suffix("```").unwrap().trim()} else {raw};
+    let raw = crate::agent_workflows::strip_fence(raw_json);
     let key=digest(&format!("{}:{}:{}",request.target.key(),request.input_revision,raw));
     let file=bundle.manifest_path.file_name().and_then(|name|name.to_str()).unwrap_or("");
     if file != format!("bundle-{key}.json") && !file.starts_with(&format!("bundle-{key}-generated-")) {return Ok(false);}

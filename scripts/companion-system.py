@@ -20,6 +20,8 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('companion_permissions', ROOT / 'scripts/companion-permissions.py')
 permissions = importlib.util.module_from_spec(spec); spec.loader.exec_module(permissions)
+from host_runtime import subprocess_options, user_state_root
+
 DEX = ROOT / 'desktop/assets/stepx-amoo-background.dex'
 APK = ROOT / 'desktop/assets/stepx-companion.apk'
 MAIN = 'stepx.PairingDaemon'
@@ -30,11 +32,36 @@ APP_PROCESS = '/system/bin/app_process64'
 APP_PROCESS_SHA256 = '5acb9827648f9adba44ae2bb16f81ef006ba5564dd81c2a2efd854dccb140bae'
 TOYBOX_SHA256 = '051ef75fe661eb65b0b1b204959717c6834a872a415a7a99991f8d08ccc250aa'
 PAIRING_STATUS = '/sdcard/Android/data/com.stepx.companion.app/files/pairing.json'
-STATE = Path(os.environ.get('XDG_STATE_HOME', Path.home() / '.local/state')) / 'stepx-companion/system-service'
+STATE = (Path(os.environ['XDG_STATE_HOME']) / 'stepx-companion/system-service'
+         if os.environ.get('XDG_STATE_HOME')
+         else user_state_root() / 'system-service' if os.name == 'nt'
+         else Path.home() / '.local/state/stepx-companion/system-service')
+
+
+def _ensure_usb_fallback():
+    if getattr(permissions.inspect, '__module__', '') != permissions.__name__:
+        return
+    device_serial = os.environ.get('STEPX_DEVICE_SERIAL', '').strip()
+    if not device_serial:
+        return
+    transport = permissions.ADB[-1]
+    if ':' in transport or '._adb-' in transport or transport.startswith('adb-'):
+        try:
+            if permissions.run(permissions.ADB + ['get-state'], timeout=15).strip() == 'device':
+                permissions.AUTHORIZED_SERIAL = permissions.ADB[-1]
+                return
+        except Exception:
+            pass
+        if permissions.common.recover_active_transport(device_serial):
+            permissions.AUTHORIZED_SERIAL = permissions.ADB[-1]
+    elif permissions.ADB[-1] == device_serial:
+        permissions.AUTHORIZED_SERIAL = device_serial
 
 
 def save(path, value):
-    STATE.mkdir(parents=True, exist_ok=True, mode=0o700); STATE.chmod(0o700)
+    STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name != 'nt':
+        STATE.chmod(0o700)
     temp = path.with_suffix('.new')
     fd = os.open(temp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
     with os.fdopen(fd, 'w') as stream:
@@ -58,6 +85,7 @@ def system_session():
 
 
 def preflight(apk):
+    _ensure_usb_fallback()
     companion = permissions.inspect(apk)
     if not companion.get('signature_verified'):
         raise RuntimeError('Install the signed StepX companion before preparing pairing')
@@ -317,7 +345,9 @@ def main():
     parser.add_argument('command', choices=['preflight', 'status', 'start', 'stop'])
     parser.add_argument('--apk', type=Path, default=APK)
     args = parser.parse_args()
-    STATE.mkdir(parents=True, exist_ok=True, mode=0o700); STATE.chmod(0o700)
+    STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name != 'nt':
+        STATE.chmod(0o700)
     with permissions.file_lock(STATE / 'operation.lock'):
         result = {'preflight': preflight, 'status': status, 'start': start, 'stop': stop}[args.command](args.apk)
         print(json.dumps(result, ensure_ascii=False))

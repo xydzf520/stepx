@@ -121,7 +121,7 @@ impl Companion {
             action,
             UpdateAction::PrepareCleanup | UpdateAction::ConfirmCleanup
         ) {
-            let device = self
+            let mut device = self
                 .selected
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("请先连接手机"))?;
@@ -142,6 +142,7 @@ impl Companion {
             std::thread::spawn(move || {
                 let result = Adb::discover()
                     .and_then(|adb| {
+                        device.transport = device.resolve_active_transport(&adb)?;
                         if clean {
                             transfer::cleanup_staged(&adb, &device)
                         } else {
@@ -194,7 +195,7 @@ impl Companion {
         }
         if matches!(action, UpdateAction::ConfirmInstall) {
             anyhow::ensure!(self.updates.confirm_install, "请先核对升级信息");
-            let device = self
+            let mut device = self
                 .selected
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("请先连接手机"))?;
@@ -217,6 +218,7 @@ impl Companion {
             std::thread::spawn(move || {
                 let result = Adb::discover()
                     .and_then(|adb| {
+                        device.transport = device.resolve_active_transport(&adb)?;
                         transfer::submit_install(
                             &adb,
                             &device,
@@ -234,7 +236,7 @@ impl Companion {
             });
             return Ok(());
         }
-        let device = self
+        let mut device = self
             .selected
             .clone()
             .ok_or_else(|| anyhow::anyhow!("请先连接手机"))?;
@@ -253,14 +255,17 @@ impl Companion {
         std::thread::spawn(move || {
             let serial = device.serial.clone();
             if open {
-                let result =
-                    Adb::discover().and_then(|adb| updates::open_phone_update(&adb, &device));
+                let result = Adb::discover().and_then(|adb| {
+                    device.transport = device.resolve_active_transport(&adb)?;
+                    updates::open_phone_update(&adb, &device)
+                });
                 let _ = tx.send(UpdateEvent::Opened(
                     serial,
                     result.map_err(|e| format!("{e:#}")),
                 ));
             } else {
                 let result = Adb::discover().and_then(|adb| {
+                    device.transport = device.resolve_active_transport(&adb)?;
                     let phone = updates::phone_version(&adb, &device);
                     let _ = tx.send(UpdateEvent::Phone(
                         serial.clone(),
@@ -424,10 +429,25 @@ impl Companion {
                             Some("已取消；电脑上已完成校验的缓存可用于下次下载。".into());
                         break;
                     }
-                    let device = self.selected.clone().unwrap();
-                    match Adb::discover()
-                        .and_then(|adb| transfer::start_stage(adb, device, package))
-                    {
+                    let Some(mut device) = self.selected.clone() else {
+                        self.updates.transfer_progress = None;
+                        self.updates.error =
+                            Some("手机已断开连接；已下载的固件缓存在电脑上，重连后可继续。".into());
+                        break;
+                    };
+                    let active_transport = self.active_transport();
+                    if !active_transport.is_empty() {
+                        device.transport = active_transport;
+                    } else {
+                        device.transport =
+                            super::active_transport_for(&device.serial, &device.transport);
+                    }
+                    match Adb::discover().and_then(|adb| {
+                        if let Ok(active) = device.resolve_active_transport(&adb) {
+                            device.transport = active;
+                        }
+                        transfer::start_stage(adb, device, package)
+                    }) {
                         Ok(job) => self.updates.transfer = Some(job),
                         Err(error) => {
                             self.updates.error = Some(format!("{error:#}"));

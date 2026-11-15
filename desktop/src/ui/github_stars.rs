@@ -20,10 +20,33 @@ fn parse(bytes: &[u8]) -> Result<u64> {
         .ok_or_else(|| anyhow::anyhow!("缺少 Star 数量"))
 }
 fn fetch() -> Result<u64> {
-    // Reuse the packaged Python runtime, not a developer-specific executable or curl.
     #[cfg(feature = "ui-capture")]
     if std::env::args().any(|a| a == "--verify-shell-details") {
-        eprintln!("GITHUB_STARS_FETCH_ONCE");
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "GITHUB_STARS_FETCH_ONCE");
+    }
+    // Prefer lightweight system curl before spawning Python at startup (and avoid
+    // triggering macOS Xcode CLT prompts when launched from Finder).
+    let mut curl = std::process::Command::new("curl");
+    curl.args([
+        "-fsSL",
+        "--max-time",
+        "5",
+        "-H",
+        "Accept: application/vnd.github+json",
+        "-H",
+        "User-Agent: StepX-Companion",
+        "-H",
+        "X-GitHub-Api-Version: 2022-11-28",
+        "https://api.github.com/repos/xydzf520/stepx",
+    ]);
+    stepx_companion::resources::quiet_command(&mut curl);
+    if let Ok(out) = stepx_companion::adb::run_process(curl, None, Duration::from_secs(6)) {
+        if out.status.success() && out.stdout.len() <= 65536 {
+            if let Ok(count) = parse(&out.stdout) {
+                return Ok(count);
+            }
+        }
     }
     let mut command = stepx_companion::resources::python_command();
     command.args(["-c", r#"

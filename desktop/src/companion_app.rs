@@ -211,7 +211,7 @@ fn oem_exempt(text: &str) -> Result<bool> {
 /// These three runtime permissions are explicitly authorized as part of install.
 /// Keep the list fixed to the app's actual camera, notification and call-state features.
 pub fn grant_runtime_permissions(adb: &Adb, device: &Device) -> Result<()> {
-    device.verify(adb)?;
+    let transport = device.resolve_active_transport(adb)?;
     let mut script = String::new();
     for permission in RUNTIME_PERMISSIONS {
         script.push_str(&format!(
@@ -220,7 +220,7 @@ pub fn grant_runtime_permissions(adb: &Adb, device: &Device) -> Result<()> {
     }
     script.push_str(&format!("dumpsys package {PACKAGE}"));
     let dump = adb
-        .script(&device.transport, &script)
+        .script(&transport, &script)
         .context("StepX伴侣已安装，但授予运行权限失败")?;
     for permission in RUNTIME_PERMISSIONS {
         if dump.contains(&format!("STEPX_GRANT_FAILED:{permission}")) {
@@ -235,6 +235,7 @@ pub fn grant_runtime_permissions(adb: &Adb, device: &Device) -> Result<()> {
 }
 
 fn apply_power_exemption(adb: &Adb, device: &Device, apk: &Path) -> Result<()> {
+    let transport = device.resolve_active_transport(adb)?;
     let script = crate::resources::root().join("scripts/companion-power.py");
     ensure!(script.is_file(), "缺少 StepX伴侣电池优化适配组件");
     let mut command = crate::resources::python_command();
@@ -243,7 +244,7 @@ fn apply_power_exemption(adb: &Adb, device: &Device, apk: &Path) -> Result<()> {
         .arg("apply")
         .arg("--apk")
         .arg(apk)
-        .env("STEPX_SERIAL", &device.transport)
+        .env("STEPX_SERIAL", &transport)
         .env("STEPX_DEVICE_SERIAL", &device.serial)
         .env("STEPX_ADB", &adb.path)
         .env_remove("PYTHONOPTIMIZE");
@@ -405,6 +406,9 @@ fn pairing_status(
 }
 
 fn read_pairing_readiness(adb: &Adb, device: &Device) -> (bool, String) {
+    let Ok(transport) = device.resolve_active_transport(adb) else {
+        return pairing_status(true, &Value::Null, false, None);
+    };
     let cmd = format!(
         "cat {FILES}/pairing.json 2>/dev/null || true; \
          printf '\\n<<<STEPX_PAIRING_META>>>\\n'; \
@@ -412,7 +416,7 @@ fn read_pairing_readiness(adb: &Adb, device: &Device) -> (bool, String) {
          printf '\\n<<<STEPX_PAIRING_TIME>>>\\n'; \
          date +%s 2>/dev/null || true"
     );
-    let Ok(raw) = adb.script(&device.transport, &cmd) else {
+    let Ok(raw) = adb.script(&transport, &cmd) else {
         return pairing_status(true, &Value::Null, false, None);
     };
     let raw = raw.replace("\r\n", "\n").replace('\r', "\n");
@@ -467,13 +471,16 @@ fn background_capability(
 }
 
 fn read_status(adb: &Adb, device: &Device) -> Result<Value> {
-    let text = adb.shell(&device.transport, &["cat", STATUS])?;
+    let transport = device.resolve_active_transport(adb)?;
+    let text = adb.shell(&transport, &["cat", STATUS])?;
     ensure!(text.len() <= 64 * 1024, "StepX伴侣状态数据过大");
     serde_json::from_str(&text).context("尚未收到 StepX伴侣的有效状态")
 }
 
 pub fn inspect(adb: &Adb, device: &Device) -> Result<CompanionStatus> {
-    device.verify(adb)?;
+    let transport = device.resolve_active_transport(adb)?;
+    let mut active_device = device.clone();
+    active_device.transport = transport.clone();
     let script = format!(
         "pkg=$(pm path {PACKAGE}); \
          printf '%s\\n' \"$pkg\"; \
@@ -503,11 +510,11 @@ pub fn inspect(adb: &Adb, device: &Device) -> Result<CompanionStatus> {
          printf '\\n<<<STEPX_OEM>>>\\n'; \
          dumpsys activity freeze whitelist 2>/dev/null || printf 'STEPX_OEM_ERR\\n'"
     );
-    let raw = adb.script(&device.transport, &script)?;
-    let mut status = parse_inspect_output(&raw, device);
+    let raw = adb.script(&transport, &script)?;
+    let mut status = parse_inspect_output(&raw, &active_device);
     if !status.running {
         if let Ok(mcp_raw) = adb.shell(
-            &device.transport,
+            &transport,
             &[
                 "cat",
                 "/data/local/tmp/stepx-companion/backscreen-mcp-status.json",
@@ -783,7 +790,8 @@ pub fn install(
     device: &Device,
     mut progress: impl FnMut(&str),
 ) -> Result<CompanionStatus> {
-    device.verify(adb)?;
+    let mut active_device = device.clone();
+    active_device.transport = device.resolve_active_transport(adb)?;
     let script = permission_script()?;
     progress("正在核对安装版本、保留内置能力并备份原安装包…");
     let candidate = installation_apk(&crate::resources::root())?;
@@ -793,7 +801,7 @@ pub fn install(
     command.arg(crate::resources::root().join("scripts/companion-install-plan.py"))
         .arg("--apk").arg(candidate.path()).arg("--trusted-apk").arg(trusted.path())
         .arg("--selected-apk").arg(apk.path())
-        .env("STEPX_SERIAL", &device.transport).env("STEPX_DEVICE_SERIAL", &device.serial)
+        .env("STEPX_SERIAL", &active_device.transport).env("STEPX_DEVICE_SERIAL", &active_device.serial)
         .env("STEPX_ADB", &adb.path).env_remove("PYTHONOPTIMIZE");
     let output = run_process(command, None, Duration::from_secs(120))?;
     let plan: Value = serde_json::from_slice(&output.stdout).context("安装检查未返回有效结果，未修改手机")?;
@@ -807,16 +815,16 @@ pub fn install(
         // running old root, native-loader, freezer or boot-hook adapters.
         if needs_install {
             progress("正在安装基础伴侣，请在手机确认系统安装提示…");
-            device.verify(adb)?;
+            active_device.transport = device.resolve_active_transport(adb)?;
             let result = adb.run_timeout(
-                &["-s", &device.transport, "install", "-r", "--user", "0",
+                &["-s", &active_device.transport, "install", "-r", "--user", "0",
                   apk.path().to_str().context("安装包路径无效")?],
                 Duration::from_secs(120),
             ).context("基础安装未完成，请在手机允许 USB 安装并确认系统提示；现有应用数据保留")?;
             ensure!(result.lines().any(|line| line.trim() == "Success"),
                 "手机未确认基础安装成功：{}。请检查手机 USB 安装许可与系统提示", result.trim());
         }
-        let mut result = inspect(adb, device)?;
+        let mut result = inspect(adb, &active_device)?;
         ensure!(result.installed, "手机未确认 StepX伴侣已安装");
         if !result.pairing_ready {
             result.pairing_message = "当前固件的伴侣扫码服务尚未适配，可使用手机系统的无线调试配对码。".into();
@@ -826,22 +834,26 @@ pub fn install(
         );
         return Ok(result);
     }
-    run_adapter(adb, device, &script, apk.path(), "preflight")?;
+    run_adapter(adb, &active_device, &script, apk.path(), "preflight")?;
     if needs_install {
         let installation = (|| -> Result<()> {
-            run_adapter(adb, device, &script, apk.path(), "prepare-install")?;
+            run_adapter(adb, &active_device, &script, apk.path(), "prepare-install")?;
             progress("正在安装 StepX伴侣，保留手机现有数据…");
-            let result = adb.run_timeout(&["-s", &device.transport, "install", "-r", "--user", "0",
+            let install_transport = device.resolve_active_transport(adb)?;
+            let result = adb.run_timeout(&["-s", &install_transport, "install", "-r", "--user", "0",
                 apk.path().to_str().context("安装包路径无效")?], Duration::from_secs(120))?;
             ensure!(result.lines().any(|l|l.trim()=="Success"), "手机未确认安装成功：{}", result.trim());
             Ok(())
         })();
-        let restored = run_adapter(adb, device, &script, apk.path(), "finish-install");
+        let restored = run_adapter(adb, &active_device, &script, apk.path(), "finish-install");
         if let Err(error) = restored {
             bail!("恢复 USB 安装许可失败：{error}；安装结果：{}", installation.as_ref().err().map(ToString::to_string).unwrap_or_else(||"APK 已安装".into()));
         }
         installation?;
     }
+
+    active_device.transport = device.resolve_active_transport(adb)?;
+    let device = &active_device;
 
     let mut warnings = Vec::new();
     progress("正在授予相机、服务通知与通话状态权限，并逐项回读…");
@@ -937,6 +949,7 @@ fn run_pairing_adapter(adb: &Adb, device: &Device, apk: &Path, operation: &str) 
         ["status", "start", "stop"].contains(&operation),
         "不支持的扫码服务操作"
     );
+    let transport = device.resolve_active_transport(adb)?;
     let script = crate::resources::root().join("scripts/companion-system.py");
     ensure!(script.is_file(), "缺少 StepX伴侣扫码系统服务组件");
     let mut command = crate::resources::python_command();
@@ -945,7 +958,7 @@ fn run_pairing_adapter(adb: &Adb, device: &Device, apk: &Path, operation: &str) 
         .arg(operation)
         .arg("--apk")
         .arg(apk)
-        .env("STEPX_SERIAL", &device.transport)
+        .env("STEPX_SERIAL", &transport)
         .env("STEPX_DEVICE_SERIAL", &device.serial)
         .env("STEPX_ADB", &adb.path)
         .env_remove("PYTHONOPTIMIZE");
@@ -1007,11 +1020,12 @@ fn configure_pairing_service(
 }
 
 fn activate_system_service(adb: &Adb, device: &Device, apk: &Path) -> Result<()> {
+    let transport = device.resolve_active_transport(adb)?;
     let script = crate::resources::root().join("scripts/companion-boot.py");
     ensure!(script.is_file(), "缺少伴侣系统服务组件");
     let mut command = crate::resources::python_command();
     command.arg(script).arg("activate").arg("--apk").arg(apk)
-        .env("STEPX_SERIAL", &device.transport).env("STEPX_DEVICE_SERIAL", &device.serial)
+        .env("STEPX_SERIAL", &transport).env("STEPX_DEVICE_SERIAL", &device.serial)
         .env("STEPX_ADB", &adb.path).env_remove("PYTHONOPTIMIZE");
     let output = run_process(command, None, Duration::from_secs(180))?;
     let result: Value = serde_json::from_slice(&output.stdout).context("系统服务未返回有效回执")?;
@@ -1025,6 +1039,9 @@ fn activate_system_service(adb: &Adb, device: &Device, apk: &Path) -> Result<()>
 
 /// Verify companion boot restoration after any installation changes the shared factory entry.
 pub fn complete_boot_setup(adb: &Adb, device: &Device) -> Result<CompanionStatus> {
+    let mut active_device = device.clone();
+    active_device.transport = device.resolve_active_transport(adb)?;
+    let device = &active_device;
     let apk = installed_apk_snapshot(adb, device)?;
     activate_system_service(adb, device, apk.path())?;
     crate::amoo_background::refresh_status(adb, device)?;
@@ -1035,15 +1052,16 @@ pub fn complete_boot_setup(adb: &Adb, device: &Device) -> Result<CompanionStatus
 }
 
 fn installed_apk_snapshot(adb: &Adb, device: &Device) -> Result<tempfile::NamedTempFile> {
-    let raw = adb.shell(&device.transport, &["pm", "path", "--user", "0", PACKAGE])?;
+    let transport = device.resolve_active_transport(adb)?;
+    let raw = adb.shell(&transport, &["pm", "path", "--user", "0", PACKAGE])?;
     let paths: Vec<_> = raw.lines().filter_map(|l| l.strip_prefix("package:")).collect();
     ensure!(paths.len()==1 && paths[0].starts_with("/data/app/"), "无法核对已安装伴侣的位置");
     let apk = tempfile::Builder::new().suffix(".apk").tempfile()?;
-    adb.run_timeout(&["-s", &device.transport,"pull",paths[0],apk.path().to_str().context("路径无效")?],Duration::from_secs(60))?;
+    adb.run_timeout(&["-s", &transport,"pull",paths[0],apk.path().to_str().context("路径无效")?],Duration::from_secs(60))?;
     let trusted=compiled_apk_snapshot()?;
     let mut command=crate::resources::python_command();
     command.arg(permission_script()?).arg("preflight").arg("--apk").arg(apk.path()).arg("--trusted-apk").arg(trusted.path())
-        .env("STEPX_SERIAL",&device.transport).env("STEPX_DEVICE_SERIAL",&device.serial).env("STEPX_ADB",&adb.path).env_remove("PYTHONOPTIMIZE");
+        .env("STEPX_SERIAL",&transport).env("STEPX_DEVICE_SERIAL",&device.serial).env("STEPX_ADB",&adb.path).env_remove("PYTHONOPTIMIZE");
     let output=run_process(command,None,Duration::from_secs(90))?;
     ensure!(output.status.success(),"已安装伴侣的签名与状态核对未通过");
     Ok(apk)
@@ -1052,13 +1070,14 @@ fn installed_apk_snapshot(adb: &Adb, device: &Device) -> Result<tempfile::NamedT
 fn start_pairing_service(adb: &Adb, device: &Device, apk: &Path) -> Result<()> {
     // The boot adapter runs a scoped Binder in system_server, not a disposable shell process.
     // A fresh successful roundtrip to the signed app is sufficient; don't spawn a duplicate.
+    let transport = device.resolve_active_transport(adb)?;
     if let Ok(raw) = adb.shell(
-        &device.transport,
+        &transport,
         &["cat", &format!("{FILES}/pairing.json")],
     ) {
         if let Ok(state) = serde_json::from_str::<Value>(&raw) {
             let system_pid = adb
-                .shell(&device.transport, &["pidof", "system_server"])
+                .shell(&transport, &["pidof", "system_server"])
                 .ok()
                 .and_then(|pid| pid.trim().parse::<u64>().ok());
             if state["pairingProcessUid"] == 1000
@@ -1135,6 +1154,7 @@ fn run_adapter(
     apk: &Path,
     operation: &str,
 ) -> Result<()> {
+    let transport = device.resolve_active_transport(adb)?;
     let trusted = if matches!(operation, "preflight" | "prepare-install") {
         Some(compiled_apk_snapshot()?)
     } else {
@@ -1146,7 +1166,7 @@ fn run_adapter(
         .arg(operation)
         .arg("--apk")
         .arg(apk)
-        .env("STEPX_SERIAL", &device.transport)
+        .env("STEPX_SERIAL", &transport)
         .env("STEPX_DEVICE_SERIAL", &device.serial)
         .env("STEPX_ADB", &adb.path)
         .env_remove("PYTHONOPTIMIZE");
@@ -1171,7 +1191,7 @@ fn run_adapter(
 }
 
 fn command_ack(adb: &Adb, device: &Device, op: &str, extras: &[&str]) -> Result<Value> {
-    device.verify(adb)?;
+    let transport = device.resolve_active_transport(adb)?;
     let id = format!(
         "desktop-{}-{}",
         chrono::Utc::now().timestamp_millis(),
@@ -1192,7 +1212,7 @@ fn command_ack(adb: &Adb, device: &Device, op: &str, extras: &[&str]) -> Result<
         &id,
     ];
     args.extend_from_slice(extras);
-    adb.shell(&device.transport, &args)?;
+    adb.shell(&transport, &args)?;
     let deadline = Instant::now() + Duration::from_secs(12);
     while Instant::now() < deadline {
         if let Ok(state) = read_status(adb, device) {
@@ -1211,6 +1231,7 @@ fn command_ack(adb: &Adb, device: &Device, op: &str, extras: &[&str]) -> Result<
 }
 
 pub fn ensure_background_execution(adb: &Adb, device: &Device) -> Result<String> {
+    let transport = device.resolve_active_transport(adb)?;
     let fast_probe = format!(
         "dumpsys package {PACKAGE} 2>/dev/null || true; \
          printf '\\n<<<STEPX_FREEZE>>>\\n'; \
@@ -1218,7 +1239,7 @@ pub fn ensure_background_execution(adb: &Adb, device: &Device) -> Result<String>
          printf '\\n<<<STEPX_IDLE>>>\\n'; \
          dumpsys deviceidle whitelist 2>/dev/null || cmd deviceidle whitelist 2>/dev/null || true"
     );
-    if let Ok(raw) = adb.script(&device.transport, &fast_probe) {
+    if let Ok(raw) = adb.script(&transport, &fast_probe) {
         let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
         let (dump, rest) = split_section(&normalized, "<<<STEPX_FREEZE>>>");
         let (freeze_raw, idle_raw) = split_section(rest, "<<<STEPX_IDLE>>>");
@@ -1236,7 +1257,7 @@ pub fn ensure_background_execution(adb: &Adb, device: &Device) -> Result<String>
                  cmd deviceidle whitelist 2>/dev/null || dumpsys deviceidle whitelist 2>/dev/null || true; \
                  dumpsys activity freeze whitelist 2>/dev/null || true"
             );
-            if let Ok(fixed) = adb.script(&device.transport, &fast_whitelist) {
+            if let Ok(fixed) = adb.script(&transport, &fast_whitelist) {
                 if fixed.contains(PACKAGE) {
                     return Ok("手机后台运行保障已就绪".to_string());
                 }
@@ -1336,8 +1357,9 @@ fn apply_config(adb: &Adb, device: &Device, config: Value) -> Result<String> {
     file.as_file().sync_all()?;
     let part = format!("{FILES}/incoming.json.part");
     let remote = format!("{FILES}/incoming.json");
-    adb.transfer(&device.transport, "push", file.path(), Path::new(&part))?;
-    adb.shell(&device.transport, &["mv", &part, &remote])?;
+    let transport = device.resolve_active_transport(adb)?;
+    adb.transfer(&transport, "push", file.path(), Path::new(&part))?;
+    adb.shell(&transport, &["mv", &part, &remote])?;
     let reply = command_ack(
         adb,
         device,
@@ -1382,7 +1404,8 @@ fn confirm_output(adb: &Adb, device: &Device, acknowledged: &Value) -> Result<St
             return Ok(format!("当前暂停：{reason}"));
         }
         if state["outputAccepted"].as_bool() == Some(true) {
-            let dump = adb.shell(&device.transport, &["dumpsys", "display_ext"])?;
+            let transport = device.resolve_active_transport(adb)?;
+            let dump = adb.shell(&transport, &["dumpsys", "display_ext"])?;
             let owner = state["uid"]
                 .as_u64()
                 .map(|uid| format!("appFrameOwner=uid={uid}"));

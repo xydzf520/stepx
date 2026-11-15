@@ -48,6 +48,11 @@ pub(super) enum StudioAction {
     ContinueLabInAmoo(usize),
     /// 打开本机作品/成果文件或目录。
     OpenPath(PathBuf),
+    /// 在隔离离线沙箱或本机应用中预览指定作品成果。
+    PreviewOutput {
+        path: PathBuf,
+        lab_id: Option<String>,
+    },
     /// 在系统文件管理器中定位该成果所在文件夹。
     RevealPath(PathBuf),
     /// 「新建作品」：回到 Amoo 开一段新对话，直接说要做什么。
@@ -208,6 +213,7 @@ impl Companion {
                     | StudioAction::ContinueOutputInAmoo(..)
                     | StudioAction::ContinueLabInAmoo(_)
                     | StudioAction::OpenPath(_)
+                    | StudioAction::PreviewOutput { .. }
                     | StudioAction::RevealPath(_)
                     | StudioAction::AmooWorks
                     | StudioAction::NewInAmoo
@@ -277,12 +283,17 @@ impl Companion {
                             .to_ascii_lowercase();
                         let dest_dir = stepx_companion::resources::user_state().join("studio-imported");
                         let _ = std::fs::create_dir_all(&dest_dir);
-                        let dest_path = dest_dir.join(&name);
+                        let dest_path = disambiguate_studio_import_path(&dest_dir, &name, &src);
                         let final_path = if src != dest_path && std::fs::copy(&src, &dest_path).is_ok() {
                             dest_path
                         } else {
                             src.clone()
                         };
+                        let display_name = final_path
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or(&name)
+                            .to_string();
                         let kind = if matches!(ext.as_str(), "ppt" | "pptx") {
                             "PPT 演示"
                         } else if matches!(ext.as_str(), "xls" | "xlsx" | "csv") {
@@ -301,10 +312,10 @@ impl Companion {
                             app.selected.as_ref().map(|d| d.serial.clone()),
                             app.amoo_ui.account_scope.clone(),
                         );
-                        task.title = format!("本地导入 · {name}");
+                        task.title = format!("本地导入 · {display_name}");
                         task.add_output(stepx_companion::amoo_workspace::Output {
                             path: final_path.clone(),
-                            name: name.clone(),
+                            name: display_name.clone(),
                             kind: kind.into(),
                             lab_id: None,
                         });
@@ -312,7 +323,7 @@ impl Companion {
                         app.workspace_persist();
                         app.studio.tab = 0;
                         app.studio.source = 3;
-                        app.status = format!("已导入作品「{name}」到我的作品库");
+                        app.status = format!("已导入作品「{display_name}」到我的作品库");
                         app.record_notice("我的作品", app.status.clone());
                         app.motion_started = Instant::now();
 
@@ -574,6 +585,21 @@ impl Companion {
                 }
                 self.focus_field(F_AMOO, ctx);
             }
+            StudioAction::PreviewOutput { path, lab_id } => {
+                if lab_id.is_some() || super::work_state::is_html_deliverable_path(path) {
+                    if let Err(e) =
+                        self.open_html_in_studio_sandbox(path.clone(), lab_id.as_deref())
+                    {
+                        self.status = format!("{e:#}");
+                        self.error = true;
+                    }
+                    return;
+                }
+                if let Err(e) = super::work_state::open_work_path(path) {
+                    self.status = e.to_string();
+                    self.error = true;
+                }
+            }
             StudioAction::OpenPath(path) => {
                 if let Some(idx) = self
                     .studio_lab
@@ -582,6 +608,23 @@ impl Companion {
                     .position(|a| &a.html_path == path)
                 {
                     self.handle_studio_lab_action(&StudioLabAction::PreviewAt(idx), ctx);
+                    return;
+                }
+                if super::work_state::is_html_deliverable_path(path) {
+                    let matched_lab_id = self
+                        .workspace
+                        .journal
+                        .tasks
+                        .iter()
+                        .flat_map(|t| t.outputs.iter())
+                        .find(|o| &o.path == path && o.lab_id.is_some())
+                        .and_then(|o| o.lab_id.clone());
+                    if let Err(e) =
+                        self.open_html_in_studio_sandbox(path.clone(), matched_lab_id.as_deref())
+                    {
+                        self.status = format!("{e:#}");
+                        self.error = true;
+                    }
                     return;
                 }
                 if let Err(e) = super::work_state::open_work_path(path) {
@@ -966,5 +1009,58 @@ impl Companion {
                 }
             }
         }
+    }
+}
+
+fn disambiguate_studio_import_path(
+    dest_dir: &std::path::Path,
+    name: &str,
+    src: &std::path::Path,
+) -> PathBuf {
+    let initial = dest_dir.join(name);
+    if !initial.exists() || src == initial {
+        return initial;
+    }
+    let path_obj = std::path::Path::new(name);
+    let stem = path_obj
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("未命名作品");
+    let ext = path_obj.extension().and_then(|s| s.to_str());
+    for idx in 1..=9999usize {
+        let candidate_name = match ext {
+            Some(ext) if !ext.is_empty() => format!("{stem}-{idx}.{ext}"),
+            _ => format!("{stem}-{idx}"),
+        };
+        let candidate = dest_dir.join(candidate_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    dest_dir.join(format!("{stem}-{}", chrono::Utc::now().timestamp_millis()))
+}
+
+#[cfg(test)]
+mod import_tests {
+    use super::*;
+
+    #[test]
+    fn disambiguates_duplicate_imported_filenames() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let src_file = src.path().join("report.docx");
+        std::fs::write(&src_file, b"v2").unwrap();
+
+        let p0 = disambiguate_studio_import_path(dir.path(), "report.docx", &src_file);
+        assert_eq!(p0, dir.path().join("report.docx"));
+        std::fs::write(&p0, b"v1").unwrap();
+
+        let p1 = disambiguate_studio_import_path(dir.path(), "report.docx", &src_file);
+        assert_eq!(p1, dir.path().join("report-1.docx"));
+        std::fs::write(&p1, b"v2").unwrap();
+
+        let p2 = disambiguate_studio_import_path(dir.path(), "report.docx", &src_file);
+        assert_eq!(p2, dir.path().join("report-2.docx"));
     }
 }

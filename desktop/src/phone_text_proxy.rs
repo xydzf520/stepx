@@ -148,6 +148,14 @@ except Exception as error:
 "#;
 #[derive(Deserialize)]
 struct Reply {text:String,model:String,usage:Value,tool_calls:u32}
+fn kill_proxy_child(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    unsafe {
+        let _ = libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
 fn request(adb:&Adb,transport:&str,prompt:&str,cancel:&AtomicBool)->Result<Reply> {
     check_cancel(cancel)?;
     ensure!(!prompt.trim().is_empty() && prompt.len()+JSON_SYSTEM.len()+1024<=MAX_PROMPT_BYTES,"后台资料为空或超过原生模型单次容量");
@@ -157,22 +165,30 @@ fn request(adb:&Adb,transport:&str,prompt:&str,cancel:&AtomicBool)->Result<Reply
     ensure!(payload.len()<=MAX_PROMPT_BYTES,"后台证据序列化后超过容量，尚未发送");
     let mut command=crate::resources::python_command();command.arg("-I").arg("-c").arg(format!("{definitions}\n{SCRIPT}")).arg(port.to_string())
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)] {use std::os::unix::process::CommandExt;command.process_group(0);}
     #[cfg(target_os="linux")] {use std::os::unix::process::CommandExt;let parent=std::process::id() as libc::pid_t;
         unsafe {command.pre_exec(move || {if libc::prctl(libc::PR_SET_PDEATHSIG,libc::SIGKILL)!=0 {return Err(std::io::Error::last_os_error());}if libc::getppid()!=parent {libc::_exit(125);}Ok(())});}}
     let mut child=command.spawn().context("无法启动手机原生模型连接器")?;
     let stdout=child.stdout.take().context("模型输出不可读")?;let stderr=child.stderr.take().context("模型状态不可读")?;
+    let input=child.stdin.take().context("模型输入不可写")?;
+    let writer=thread::spawn(move || -> std::io::Result<()> {
+        let mut input=input;
+        input.write_all(&payload)?;
+        input.flush()
+    });
     let output=thread::spawn(move || {let mut bytes=vec![];stdout.take(400000).read_to_end(&mut bytes).map(|_|bytes)});
     let errors=thread::spawn(move || {let mut bytes=vec![];stderr.take(2048).read_to_end(&mut bytes).map(|_|bytes)});
-    let input=child.stdin.take().context("模型输入不可写").and_then(|mut input|input.write_all(&payload).map_err(Into::into));
     let deadline=Instant::now()+Duration::from_secs(185);
     let status=loop {
-        if input.is_err() || cancel.load(Ordering::Acquire) || Instant::now()>=deadline {let _=child.kill();let _=child.wait();break None;}
-        match child.try_wait() {Ok(Some(status))=>break Some(status),Ok(None)=>thread::sleep(Duration::from_millis(25)),Err(_)=>{let _=child.kill();let _=child.wait();break None;}}
+        if cancel.load(Ordering::Acquire) || Instant::now()>=deadline {kill_proxy_child(&mut child);break None;}
+        match child.try_wait() {Ok(Some(status))=>break Some(status),Ok(None)=>thread::sleep(Duration::from_millis(25)),Err(_)=>{kill_proxy_child(&mut child);break None;}}
     };
     let bytes=output.join().map_err(|_|anyhow::anyhow!("原生模型输出读取失败"))??;
     let errors=errors.join().map_err(|_|anyhow::anyhow!("原生模型状态读取失败"))??;
-    check_cancel(cancel)?;input?;let status=status.context("手机原生模型请求超时；未改用其他来源")?;
+    let input_result=writer.join().map_err(|_|anyhow::anyhow!("原生模型输入写入失败"))?;
+    check_cancel(cancel)?;let status=status.context("手机原生模型请求超时；未改用其他来源")?;
     ensure!(status.success(),"{}",String::from_utf8_lossy(&errors));
+    input_result.context("模型输入不可写")?;
     serde_json::from_slice(&bytes).context("手机原生模型没有返回有效结果")
 }
 pub(super) fn generate(adb:&Adb,device:&Device,expected:Option<&str>,prompt:&str,cancel:&AtomicBool,require_proof:bool,

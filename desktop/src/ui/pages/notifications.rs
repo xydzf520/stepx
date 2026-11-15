@@ -94,6 +94,19 @@ fn category_badge_colors(cat: PushCategory, p: &Palette) -> (ColorU, ColorU) {
     }
 }
 
+fn mask_notification_title(notif: &PushNotification, app_label: &str) -> String {
+    if let Some(code) = notif_verification_code(notif) {
+        if is_pickup_code(&code, notif) {
+            return format!("{app_label} · 取件提醒");
+        }
+        return format!("{app_label} · 验证码");
+    }
+    if notif.title.contains("红包") || notif.text.contains("红包") {
+        return format!("{app_label} · 红包通知");
+    }
+    app_label.to_string()
+}
+
 fn mask_notification_text(notif: &PushNotification) -> String {
     let app = if notif.app_name.is_empty() {
         "手机应用"
@@ -102,11 +115,8 @@ fn mask_notification_text(notif: &PushNotification) -> String {
     };
     if notif_verification_code(notif).is_some() {
         format!("[{app}] 收到一条含验证码/取件码的通知（已开启防窥保护）")
-    } else if !notif.title.trim().is_empty() {
-        format!(
-            "[{app}] 收到来自「{}」的新消息（已开启防窥保护）",
-            notif.title.trim()
-        )
+    } else if notif.text.contains("红包") || notif.title.contains("红包") {
+        format!("[{app}] 收到一条红包通知（已开启防窥保护）")
     } else {
         format!("[{app}] 收到 1 条新推送通知（已开启防窥保护）")
     }
@@ -427,9 +437,8 @@ impl Companion {
             ));
         }
 
-        // Inside the main window's Notifications page, always display full content;
-        // `self.push.prefs.privacy_mask` only masks desktop popups/banners ("弹窗防窥").
-        let page_privacy_mask = false;
+        // Honor `self.push.prefs.privacy_mask` consistently across notification cards & details.
+        let page_privacy_mask = self.push.prefs.privacy_mask;
 
         // Top OTP & Pickup Code Summary Bar
         let top_otp_pickup_banner: Option<El> = if page_privacy_mask {
@@ -506,14 +515,22 @@ impl Companion {
                 let mut right_actions = Vec::new();
                 if let Some(code) = &newest_otp {
                     left_items.push(self.pill_badge_icon(
-                        format!("验证码 {code}"),
+                        if page_privacy_mask {
+                            "验证码 ••••••".into()
+                        } else {
+                            format!("验证码 {code}")
+                        },
                         UiIcon::Key,
                         p.accent,
                         p.accent_soft,
                     ));
                     right_actions.push(self.button_icon(
                         "push-top-copy-otp",
-                        format!("复制验证码 {code}"),
+                        if page_privacy_mask {
+                            "复制验证码 ••••••".into()
+                        } else {
+                            format!("复制验证码 {code}")
+                        },
                         UiIcon::Clipboard,
                         Action::Push(PushAction::CopyOtp(code.clone())),
                         Btn::Primary,
@@ -521,16 +538,31 @@ impl Companion {
                 }
                 if let Some(pickup) = &newest_pickup {
                     left_items.push(self.pill_badge_icon(
-                        format!("取件码 {pickup}"),
+                        if page_privacy_mask {
+                            "取件码 ••••••".into()
+                        } else {
+                            format!("取件码 {pickup}")
+                        },
                         UiIcon::Package,
                         p.warning,
                         p.warning_soft,
                     ));
                     right_actions.push(self.button_icon(
                         "push-top-copy-pickup",
-                        format!("复制取件码 {pickup}"),
+                        if page_privacy_mask {
+                            "复制取件码 ••••••".into()
+                        } else {
+                            format!("复制取件码 {pickup}")
+                        },
                         UiIcon::Package,
-                        Action::CopyText(pickup.clone(), format!("已复制取件码 {pickup}")),
+                        Action::CopyText(
+                            pickup.clone(),
+                            if page_privacy_mask {
+                                "已复制取件码 ••••••".into()
+                            } else {
+                                format!("已复制取件码 {pickup}")
+                            },
+                        ),
                         if newest_otp.is_none() {
                             Btn::Primary
                         } else {
@@ -801,15 +833,19 @@ impl Companion {
             .with_height(22.)
             .finish();
 
-            let raw_title_text =
-                if !n.sender.is_empty() && n.sender != n.title && !n.title.is_empty() {
-                    format!("{} · {}", n.title, n.sender)
-                } else if !n.title.is_empty() {
-                    n.title.clone()
-                } else {
-                    app_label.to_string()
-                };
-            let title_text = super::sms::sanitize_ui_display_text(&raw_title_text);
+            let title_text = if page_privacy_mask {
+                mask_notification_title(n, app_label)
+            } else {
+                let raw_title_text =
+                    if !n.sender.is_empty() && n.sender != n.title && !n.title.is_empty() {
+                        format!("{} · {}", n.title, n.sender)
+                    } else if !n.title.is_empty() {
+                        n.title.clone()
+                    } else {
+                        app_label.to_string()
+                    };
+                super::sms::sanitize_ui_display_text(&raw_title_text)
+            };
 
             let display_body = if page_privacy_mask {
                 mask_notification_text(n)
@@ -1239,7 +1275,14 @@ impl Companion {
                     },
                     UiIcon::Copy,
                     if is_detail_pickup {
-                        Action::CopyText(code.clone(), format!("已复制取件码 {code}"))
+                        Action::CopyText(
+                            code.clone(),
+                            if page_privacy_mask {
+                                "已复制取件码 ••••••".into()
+                            } else {
+                                format!("已复制取件码 {code}")
+                            },
+                        )
                     } else {
                         Action::Push(PushAction::CopyOtp(code.clone()))
                     },
@@ -1269,6 +1312,14 @@ impl Companion {
                 Btn::Ghost,
             ));
 
+            let detail_title_text = if page_privacy_mask {
+                mask_notification_title(n, app_label)
+            } else if n.title.is_empty() {
+                app_label.to_string()
+            } else {
+                n.title.clone()
+            };
+
             let detail_header = self.panel(vec![
                 self.between(
                     self.hstack(
@@ -1279,11 +1330,7 @@ impl Companion {
                                 4.,
                                 vec![
                                     self.line_w(
-                                        if n.title.is_empty() {
-                                            app_label
-                                        } else {
-                                            n.title.as_str()
-                                        },
+                                        detail_title_text,
                                         SUBHEAD,
                                         p.text,
                                         Weight::Semibold,
@@ -1299,7 +1346,7 @@ impl Companion {
                 self.vstack(
                     S2,
                     vec![
-                        if !n.sender.is_empty() && n.sender != n.title {
+                        if !page_privacy_mask && !n.sender.is_empty() && n.sender != n.title {
                             self.line_w(
                                 format!("发送人：{}", n.sender),
                                 CAPTION,
@@ -1318,7 +1365,8 @@ impl Companion {
                             BODY,
                             p.text,
                         ),
-                        if !n.sub_text.trim().is_empty()
+                        if !page_privacy_mask
+                            && !n.sub_text.trim().is_empty()
                             && !n.sub_text.contains("有人@我")
                             && !n.sub_text.contains("招聘沟通")
                         {

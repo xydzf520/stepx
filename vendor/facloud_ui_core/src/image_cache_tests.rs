@@ -1,7 +1,5 @@
 use std::{borrow::Cow, rc::Rc};
 
-use rust_embed::RustEmbed;
-
 use crate::{
     r#async::executor::{Background, Foreground},
     AssetProvider,
@@ -9,8 +7,7 @@ use crate::{
 
 use super::*;
 
-#[derive(Clone, Copy, RustEmbed)]
-#[folder = "test_data"]
+#[derive(Clone, Copy)]
 pub struct Assets;
 
 // Implement the AssetProvider trait here (required by App::new).
@@ -18,12 +15,11 @@ impl AssetProvider for Assets {
     fn get(&self, path: &str) -> Result<Cow<'_, [u8]>> {
         match path {
             "animated.webp" => Ok(Cow::Borrowed(include_bytes!("../test_data/animated.webp"))),
+            "local.png" => Ok(Cow::Borrowed(include_bytes!("../test_data/local.png"))),
             "numbers-1000ms.gif" => Ok(Cow::Borrowed(include_bytes!(
                 "../../facloud_ui/examples/assets/numbers-1000ms.gif"
             ))),
-            _ => <Assets as RustEmbed>::get(path)
-                .map(|f| f.data)
-                .ok_or_else(|| anyhow!("no asset exists at path {}", path)),
+            _ => Err(anyhow!("no asset exists at path {}", path)),
         }
     }
 }
@@ -564,4 +560,175 @@ fn test_respects_max_dimensions_for_cacheoption_bysize() {
     };
     // Assert that, when we specify a max dimension of 512, the image is resized accordingly.
     assert_eq!(image.img.dimensions(), (512, 512));
+}
+
+#[test]
+fn test_resize_dimensions_zero_and_header_u32_overflow_safe() {
+    assert_eq!(resize_dimensions(0, 100, 64, 64, FitType::Contain), (64, 64));
+    assert_eq!(resize_dimensions(100, 0, 64, 64, FitType::Cover), (64, 64));
+    assert_eq!(resize_dimensions(100, 100, 0, 0, FitType::Contain), (1, 1));
+    assert_eq!(resize_dimensions(100, 100, 0, 0, FitType::Stretch), (1, 1));
+
+    // 65536 * 65536 * 4 overflows u32 to 0 if done in u32; must report full expected usize bytes.
+    let err = CustomImageHeader::prepend_custom_header(vec![], 65536, 65536, CustomImageFormat::Rgba)
+        .expect_err("empty buffer should mismatch 65536x65536 RGBA size");
+    match err {
+        CustomHeaderCreationError::ExpectedDataSizeMismatch {
+            expected_bytes,
+            actual_bytes,
+        } => {
+            assert_eq!(expected_bytes, 65536usize * 65536usize * 4usize);
+            assert_eq!(actual_bytes, 0);
+        }
+    }
+}
+
+#[test]
+fn test_svg_size_in_bytes_is_nonzero_and_lru_evicts_oldest_resized_image() {
+    let svg_asset = ImageType::try_from_bytes(
+        br##"<svg width="160" height="40" viewBox="0 0 160 40" xmlns="http://www.w3.org/2000/svg"></svg>"##,
+    )
+    .expect("SVG should parse");
+    assert!(svg_asset.size_in_bytes() >= 160 * 40 * 4);
+
+    let asset_cache = new_asset_cache();
+    // Cap enough for two 32x32 RGBA images (2 * 4096 = 8192 bytes), so inserting a third evicts LRU.
+    let image_cache = ImageCache::with_max_bytes(8192);
+    let source = AssetSource::Bundled { path: "local.png" };
+
+    let weak_1 = {
+        let rc = load_bundled_image(
+            &image_cache,
+            &asset_cache,
+            "local.png",
+            Vector2I::new(32, 32),
+            FitType::Stretch,
+            AnimatedImageBehavior::FullAnimation,
+        );
+        let Image::Static(arc) = rc.as_ref() else {
+            panic!("expected static");
+        };
+        Arc::downgrade(arc)
+    };
+    let weak_2 = {
+        let rc = load_bundled_image(
+            &image_cache,
+            &asset_cache,
+            "local.png",
+            Vector2I::new(16, 64),
+            FitType::Stretch,
+            AnimatedImageBehavior::FullAnimation,
+        );
+        let Image::Static(arc) = rc.as_ref() else {
+            panic!("expected static");
+        };
+        Arc::downgrade(arc)
+    };
+    // Touch weak_1 so weak_2 becomes least recently used.
+    let _ = load_bundled_image(
+        &image_cache,
+        &asset_cache,
+        "local.png",
+        Vector2I::new(32, 32),
+        FitType::Stretch,
+        AnimatedImageBehavior::FullAnimation,
+    );
+    assert_eq!(weak_1.strong_count(), 1);
+    assert_eq!(weak_2.strong_count(), 1);
+
+    // Insert a third 32x32 (64x16) entry -> weak_2 should be evicted, weak_1 retained.
+    let _ = image_cache.image(
+        source,
+        Vector2I::new(64, 16),
+        FitType::Stretch,
+        AnimatedImageBehavior::FullAnimation,
+        CacheOption::BySize,
+        None,
+        &asset_cache,
+    );
+    assert_eq!(weak_1.strong_count(), 1);
+    assert_eq!(weak_2.strong_count(), 0);
+    assert!(image_cache.total_cached_bytes() <= 8192);
+}
+
+#[test]
+fn test_local_file_asset_reloads_when_overwritten() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file_path = dir.path().join("dynamic.txt");
+    std::fs::write(&file_path, b"first").expect("write v1");
+
+    let fg = Rc::new(Foreground::test());
+    let bg = Arc::new(Background::default());
+    let asset_cache = AssetCache::new(Box::new(Assets), fg.clone(), bg);
+    let source = AssetSource::LocalFile {
+        path: file_path.to_string_lossy().to_string(),
+    };
+
+    let state: AssetState<String> = asset_cache.load_asset(source.clone());
+    let AssetState::Loading { handle } = state else {
+        panic!("expected initial load to be async Loading");
+    };
+    futures::executor::block_on(fg.run(handle.when_loaded(&asset_cache).unwrap()));
+
+    let AssetState::Loaded { data: v1 } = asset_cache.load_asset::<String>(source.clone()) else {
+        panic!("expected Loaded v1");
+    };
+    assert_eq!(v1.as_str(), "first");
+
+    // Overwrite file with different length so (mtime, len) definitely changes even on coarse filesystems.
+    std::fs::write(&file_path, b"second-updated").expect("write v2");
+
+    let state_v2: AssetState<String> = asset_cache.load_asset(source.clone());
+    let AssetState::Loading { handle: handle_v2 } = state_v2 else {
+        panic!("expected overwritten LocalFile to trigger reload");
+    };
+    futures::executor::block_on(fg.run(handle_v2.when_loaded(&asset_cache).unwrap()));
+
+    let AssetState::Loaded { data: v2 } = asset_cache.load_asset::<String>(source) else {
+        panic!("expected Loaded v2");
+    };
+    assert_eq!(v2.as_str(), "second-updated");
+}
+
+#[test]
+fn test_asset_cache_unified_lru_evicts_local_file_and_retains_bundled() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let p1 = dir.path().join("a.txt");
+    let p2 = dir.path().join("b.txt");
+    std::fs::write(&p1, b"1234567890").expect("write p1");
+    std::fs::write(&p2, b"abcdefghij").expect("write p2");
+
+    let fg = Rc::new(Foreground::test());
+    let bg = Arc::new(Background::default());
+    // Budget 15 bytes: fits one 10-byte LocalFile asset, not two.
+    let asset_cache = AssetCache::with_max_cached_bytes(Box::new(Assets), fg.clone(), bg, 15);
+
+    let s1 = AssetSource::LocalFile {
+        path: p1.to_string_lossy().to_string(),
+    };
+    let s2 = AssetSource::LocalFile {
+        path: p2.to_string_lossy().to_string(),
+    };
+
+    let AssetState::Loading { handle: h1 } = asset_cache.load_asset::<String>(s1.clone()) else {
+        panic!("expected loading s1");
+    };
+    futures::executor::block_on(fg.run(h1.when_loaded(&asset_cache).unwrap()));
+    let weak_1 = match asset_cache.load_asset::<String>(s1.clone()) {
+        AssetState::Loaded { data } => Rc::downgrade(&data),
+        _ => panic!("expected loaded s1"),
+    };
+    assert_eq!(weak_1.strong_count(), 1);
+
+    let AssetState::Loading { handle: h2 } = asset_cache.load_asset::<String>(s2.clone()) else {
+        panic!("expected loading s2");
+    };
+    futures::executor::block_on(fg.run(h2.when_loaded(&asset_cache).unwrap()));
+
+    // s1 should have been LRU-evicted, and requesting s1 again cleanly reloads it!
+    assert_eq!(weak_1.strong_count(), 0);
+    assert!(matches!(
+        asset_cache.load_asset::<String>(s1),
+        AssetState::Loading { .. }
+    ));
 }

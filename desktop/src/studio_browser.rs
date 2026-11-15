@@ -32,6 +32,33 @@ struct Worker {
 }
 static WORKER: OnceLock<Mutex<Option<Worker>>> = OnceLock::new();
 
+#[derive(Default)]
+struct InflightState {
+    generation: u64,
+    active_pid: Option<u32>,
+}
+static INFLIGHT: OnceLock<Mutex<InflightState>> = OnceLock::new();
+
+fn force_kill_worker_pid(pid: u32) {
+    #[cfg(unix)]
+    unsafe {
+        let _ = libc::kill(-(pid as i32), libc::SIGTERM);
+        std::thread::sleep(Duration::from_millis(50));
+        let _ = libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    {
+        let mut command = std::process::Command::new("taskkill.exe");
+        command
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        crate::resources::quiet_command(&mut command);
+        let _ = command.status();
+    }
+}
+
 /// Locate an installed browser executable; never inspect its profile or account.
 pub fn browser_path() -> Result<PathBuf> {
     let mut paths = Vec::new();
@@ -189,6 +216,11 @@ impl Worker {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
         let mut child = command
             .spawn()
             .context("无法启动 Studio 工作窗口，请检查完整安装包中的 Python 运行环境")?;
@@ -271,51 +303,114 @@ impl Drop for Worker {
 /// Success is reported only after the server account, project ownership and route agree.
 pub fn open_editor(url: &str, handoff: &Value) -> Result<BrowserReceipt> {
     let request = validated_request(url, handoff)?;
-    let mut slot = WORKER
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .map_err(|_| anyhow::anyhow!("Studio 工作窗口状态异常"))?;
-    if slot
-        .as_mut()
-        .is_some_and(|w| w.child.try_wait().ok().flatten().is_some())
-    {
-        *slot = None;
+    let mut worker = {
+        let mut slot = WORKER
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Studio 工作窗口状态异常"))?;
+        if slot
+            .as_mut()
+            .is_some_and(|w| w.child.try_wait().ok().flatten().is_some())
+        {
+            *slot = None;
+        }
+        match slot.take() {
+            Some(existing) => existing,
+            None => Worker::spawn()?,
+        }
+    };
+    let my_generation = {
+        let mut inflight = INFLIGHT
+            .get_or_init(|| Mutex::new(InflightState::default()))
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Studio 工作窗口状态异常"))?;
+        inflight.active_pid = Some(worker.child.id());
+        inflight.generation
+    };
+    // Never hold WORKER mutex across the 75s IPC wait so close_session() can
+    // terminate an in-flight worker immediately without blocking logout/account switch.
+    let result = worker.request(&request);
+    let session_survived = {
+        let mut inflight = INFLIGHT
+            .get_or_init(|| Mutex::new(InflightState::default()))
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Studio 工作窗口状态异常"))?;
+        if inflight.generation == my_generation {
+            inflight.active_pid = None;
+            true
+        } else {
+            false
+        }
+    };
+    if !session_survived {
+        worker.shutdown();
+        bail!("Studio 工作窗口已因账号或设备切换关闭");
     }
-    if slot.is_none() {
-        *slot = Some(Worker::spawn()?);
-    }
-    let result = match slot.as_mut().unwrap().request(&request) {
+    let result = match result {
         Ok(result) => result,
         Err(error) => {
-            if let Some(mut worker) = slot.take() {
-                worker.shutdown();
-            }
+            worker.shutdown();
             return Err(error);
         }
     };
-    ensure!(
-        result["ok"] == true,
-        "{}",
-        match result["code"].as_str().unwrap_or("") {
+    if result["ok"] != true {
+        let msg = match result["code"].as_str().unwrap_or("") {
             "login" => "手机 Studio 官网登录已过期，请在伴侣中重新登录",
             "account" => "电脑与手机的 Studio 账号未通过一致性核对，已关闭工作窗口",
             "project" => "当前账号中没有此项目，请刷新官网项目列表",
             "route" => "官网没有进入指定编辑页面，请重试",
             "browser" => "无法打开 Studio 工作窗口，请检查 Chrome 或 Edge 是否可正常启动",
             _ => "Studio 官网连接未完成，请检查网络后重试",
+        };
+        worker.shutdown();
+        bail!("{msg}");
+    }
+    let receipt: BrowserReceipt = match serde_json::from_value::<BrowserReceipt>(result)
+        .context("Studio 工作窗口回执无效")
+    {
+        Ok(r) if r.url == request["url"] && r.scope == request["scope"] => r,
+        Ok(_) => {
+            worker.shutdown();
+            bail!("Studio 工作窗口核对结果不一致");
         }
-    );
-    let receipt: BrowserReceipt =
-        serde_json::from_value(result).context("Studio 工作窗口回执无效")?;
-    ensure!(
-        receipt.url == request["url"] && receipt.scope == request["scope"],
-        "Studio 工作窗口核对结果不一致"
-    );
-    Ok(receipt)
+        Err(err) => {
+            worker.shutdown();
+            return Err(err);
+        }
+    };
+    // Re-check generation before parking the worker back into WORKER so a concurrent
+    // close_session() can never inherit a previous account's browser.
+    let keep = INFLIGHT
+        .get_or_init(|| Mutex::new(InflightState::default()))
+        .lock()
+        .map(|inflight| inflight.generation == my_generation)
+        .unwrap_or(false);
+    if keep {
+        if let Ok(mut slot) = WORKER.get_or_init(|| Mutex::new(None)).lock() {
+            *slot = Some(worker);
+        } else {
+            worker.shutdown();
+        }
+        Ok(receipt)
+    } else {
+        worker.shutdown();
+        bail!("Studio 工作窗口已因账号或设备切换关闭");
+    }
 }
 
-/// Logout/device switch must close this browser so another account cannot inherit it.
+/// Logout/device switch must close this browser immediately without waiting up to 75s.
 pub fn close_session() {
+    let inflight_pid = INFLIGHT
+        .get_or_init(|| Mutex::new(InflightState::default()))
+        .lock()
+        .ok()
+        .and_then(|mut inflight| {
+            inflight.generation = inflight.generation.wrapping_add(1);
+            inflight.active_pid.take()
+        });
+    if let Some(pid) = inflight_pid {
+        force_kill_worker_pid(pid);
+    }
     if let Some(lock) = WORKER.get() {
         if let Ok(mut slot) = lock.lock() {
             if let Some(mut worker) = slot.take() {

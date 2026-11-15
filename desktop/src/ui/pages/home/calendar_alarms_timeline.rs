@@ -109,6 +109,178 @@ pub(in crate::ui::pages) fn home_event_date_bounds(
     Some((first, NaiveDate::from_ymd_opt(y, m, d)?.max(first)))
 }
 
+pub(crate) fn calendar_event_effective_end_ms(
+    event: &stepx_companion::toolbox::PhoneCalendarEvent,
+) -> i64 {
+    if event.all_day {
+        if let Some((_first, last)) = home_event_date_bounds(event) {
+            if let Some(next_day) = last.succ_opt() {
+                if let Some(ndt) = next_day.and_hms_opt(0, 0, 0) {
+                    if let Some(dt) = chrono::TimeZone::from_local_datetime(&Local, &ndt)
+                        .earliest()
+                        .or_else(|| chrono::TimeZone::from_local_datetime(&Local, &ndt).latest())
+                    {
+                        return dt.timestamp_millis();
+                    }
+                }
+            }
+        }
+    }
+    event.effective_end_ms()
+}
+
+pub(crate) fn calendar_event_is_ended_at(
+    event: &stepx_companion::toolbox::PhoneCalendarEvent,
+    now_ms: i64,
+) -> bool {
+    let end_ms = calendar_event_effective_end_ms(event);
+    (end_ms > 0 && end_ms <= now_ms) || (!event.all_day && event.is_ended_at(now_ms))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResolvedAlarmStatus {
+    TodayPending {
+        diff_mins: u32,
+    },
+    Tomorrow {
+        diff_mins: u32,
+    },
+    FutureWeekday {
+        day_offset: u32,
+        target_weekday: u32,
+        diff_mins: u32,
+    },
+    ManuallyExpired,
+    Disabled,
+}
+
+impl ResolvedAlarmStatus {
+    #[inline]
+    pub(crate) fn future_weekday_ring_label(weekday_idx: u32) -> &'static str {
+        match weekday_idx.min(6) {
+            0 => "周一响铃",
+            1 => "周二响铃",
+            2 => "周三响铃",
+            3 => "周四响铃",
+            4 => "周五响铃",
+            5 => "周六响铃",
+            _ => "周日响铃",
+        }
+    }
+
+    #[inline]
+    pub(crate) fn home_badge_label(self) -> &'static str {
+        match self {
+            Self::TodayPending { .. } => "待响",
+            Self::Tomorrow { .. } => "明日响铃",
+            Self::FutureWeekday { target_weekday, .. } => {
+                Self::future_weekday_ring_label(target_weekday)
+            }
+            Self::ManuallyExpired => "已过期",
+            Self::Disabled => "未开启",
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_today_pending(self) -> bool {
+        matches!(self, Self::TodayPending { .. })
+    }
+
+    #[inline]
+    pub(crate) fn is_valid_active(self) -> bool {
+        matches!(
+            self,
+            Self::TodayPending { .. } | Self::Tomorrow { .. } | Self::FutureWeekday { .. }
+        )
+    }
+
+    #[inline]
+    pub(crate) fn next_offset_mins(self) -> Option<u32> {
+        match self {
+            Self::TodayPending { diff_mins }
+            | Self::Tomorrow { diff_mins }
+            | Self::FutureWeekday { diff_mins, .. } => Some(diff_mins),
+            Self::ManuallyExpired | Self::Disabled => None,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn sort_rank(self) -> u8 {
+        match self {
+            Self::TodayPending { .. } => 0,
+            Self::Tomorrow { .. } => 1,
+            Self::FutureWeekday { .. } => 2,
+            Self::ManuallyExpired => 3,
+            Self::Disabled => 4,
+        }
+    }
+}
+
+pub(crate) fn resolve_alarm_status(
+    alarm: &stepx_companion::toolbox::PhoneAlarmItem,
+    now_ms: i64,
+    now_min: u32,
+    weekday_idx: u32,
+    gov: &stepx_companion::home_hub::HomeReminderGovernanceStore,
+) -> ResolvedAlarmStatus {
+    let suppressed = gov.is_any_key_suppressed(
+        &[
+            format!("alarm:{}", alarm.id),
+            format!("alarm:{:02}:{:02}", alarm.hour, alarm.minutes),
+            format!("capsule:alarm-{}", alarm.id),
+        ],
+        None,
+        None,
+        None,
+        now_ms,
+    );
+    if suppressed {
+        return ResolvedAlarmStatus::ManuallyExpired;
+    }
+    if !alarm.enabled {
+        return ResolvedAlarmStatus::Disabled;
+    }
+    let alarm_min = alarm.total_minutes();
+    let mask = alarm.days_of_week & 0x7F;
+    if mask == 0 {
+        if alarm_min > now_min {
+            ResolvedAlarmStatus::TodayPending {
+                diff_mins: alarm_min - now_min,
+            }
+        } else {
+            ResolvedAlarmStatus::Tomorrow {
+                diff_mins: 1440u32.saturating_add(alarm_min).saturating_sub(now_min),
+            }
+        }
+    } else {
+        let base_wd = weekday_idx.min(6);
+        for offset in 0u32..=7 {
+            let wd = (base_wd + offset) % 7;
+            if (mask & (1u32 << wd)) != 0 && (offset > 0 || alarm_min > now_min) {
+                if offset == 0 {
+                    return ResolvedAlarmStatus::TodayPending {
+                        diff_mins: alarm_min - now_min,
+                    };
+                } else if offset == 1 {
+                    return ResolvedAlarmStatus::Tomorrow {
+                        diff_mins: 1440u32.saturating_add(alarm_min).saturating_sub(now_min),
+                    };
+                } else {
+                    return ResolvedAlarmStatus::FutureWeekday {
+                        day_offset: offset,
+                        target_weekday: wd,
+                        diff_mins: offset
+                            .saturating_mul(1440)
+                            .saturating_add(alarm_min)
+                            .saturating_sub(now_min),
+                    };
+                }
+            }
+        }
+        ResolvedAlarmStatus::Disabled
+    }
+}
+
 fn home_work_event_end_ms(event: &stepx_companion::toolbox::PhoneCalendarEvent) -> i64 {
     if event.dtend > event.dtstart {
         event.dtend
@@ -208,11 +380,19 @@ fn home_alarm_on_date(
     today: NaiveDate,
     now_minute: u32,
 ) -> bool {
-    alarm.enabled
-        && !alarm.is_e2e_probe()
-        && date >= today
-        && alarm.matches_weekday(date.weekday().num_days_from_monday())
-        && (alarm.days_of_week != 0 || (date == today && alarm.total_minutes() >= now_minute))
+    if !alarm.enabled || alarm.is_e2e_probe() || date < today {
+        return false;
+    }
+    let mask = alarm.days_of_week & 0x7F;
+    if mask == 0 {
+        if alarm.total_minutes() > now_minute {
+            date == today
+        } else {
+            today.succ_opt() == Some(date)
+        }
+    } else {
+        alarm.matches_weekday(date.weekday().num_days_from_monday())
+    }
 }
 
 fn home_month_preview(text: &str, user: bool) -> Option<String> {
@@ -1568,6 +1748,17 @@ impl Companion {
             "StepOS"
         };
 
+        let filtered_call_logs: Vec<stepx_companion::device::CallRecord> = self
+            .call_logs
+            .iter()
+            .enumerate()
+            .filter(|(idx, c)| {
+                c.call_type != 3
+                    || super::is_unanswered_latest_missed_call(c, *idx, &self.call_logs)
+            })
+            .map(|(_, c)| c.clone())
+            .collect();
+
         let input = HomeHubInput {
             hour: now.hour(),
             minute: now.minute(),
@@ -1579,7 +1770,7 @@ impl Companion {
             notifications: &snapshot.notifications,
             otp_banners: &snapshot.otp_banners,
             sms: &self.sms,
-            call_logs: &self.call_logs,
+            call_logs: &filtered_call_logs,
             express_parcels,
             calendar_events: &suite.calendar_events,
             alarms: &suite.alarms,
@@ -1647,8 +1838,14 @@ impl Companion {
             today_ymd.hash(&mut h);
             (now_ms / 60_000).hash(&mut h);
             self.demo_mode.hash(&mut h);
-            self.selected.is_some().hash(&mut h);
+            self.selected
+                .as_ref()
+                .map(|d| d.serial.as_str())
+                .hash(&mut h);
+            self.amoo_ui.account_scope.hash(&mut h);
             self.reminder_governance.revision.hash(&mut h);
+            self.back_screen.completed_calendar_events.len().hash(&mut h);
+            self.push.prefs.dismissed_pickup_codes.len().hash(&mut h);
             h.finish()
         };
 
@@ -1934,8 +2131,10 @@ impl Companion {
                 missed_calls: self
                     .call_logs
                     .iter()
-                    .filter(|c| {
+                    .enumerate()
+                    .filter(|(idx, c)| {
                         c.call_type == 3
+                            && super::is_unanswered_latest_missed_call(c, *idx, &self.call_logs)
                             && (c.date_ms <= 0
                                 || Local::now().timestamp_millis().saturating_sub(c.date_ms)
                                     <= 86_400_000)
@@ -2985,12 +3184,24 @@ impl Companion {
                 .first()
                 .map(|d| d.date_ymd.as_str())
                 .unwrap_or("");
-            let key = stepx_companion::home_hub::compute_home_hub_input_hash(
-                210 + quadrant as u8,
-                monday,
-                input,
-                &desktop_entries,
-            );
+            let key = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                stepx_companion::home_hub::compute_home_hub_input_hash(
+                    210 + quadrant as u8,
+                    monday,
+                    input,
+                    &desktop_entries,
+                )
+                .hash(&mut h);
+                self.selected
+                    .as_ref()
+                    .map(|d| d.serial.as_str())
+                    .hash(&mut h);
+                self.amoo_ui.account_scope.hash(&mut h);
+                self.reminder_governance.revision.hash(&mut h);
+                h.finish()
+            };
             if let Some(hit) = DETAILS.with(|cache| {
                 cache.borrow()[quadrant]
                     .as_ref()
@@ -3387,7 +3598,12 @@ impl Companion {
                 2.,
                 vec![
                     self.line_w(
-                        format!("{} {} · {}", &date[5..], entry.time_hm, entry.title),
+                        format!(
+                            "{} {} · {}",
+                            date.get(5..).unwrap_or(date.as_str()),
+                            entry.time_hm,
+                            entry.title
+                        ),
                         CAPTION,
                         p.text,
                         Weight::Medium,
@@ -3435,8 +3651,9 @@ impl Companion {
     ) -> El {
         let p = self.p();
         let ai = &self.home_ai;
-        let running = ai.running();
-        let brief = ai.brief.as_ref();
+        let scope_ok = ai.matches_account_scope(self.amoo_ui.account_scope.as_deref());
+        let running = scope_ok && ai.running();
+        let brief = ai.brief.as_ref().filter(|_| scope_ok);
 
         let status_pill =
             running.then(|| self.pill_badge("更新中…", p.blue, soft_tint(p.blue, p.dark)));
@@ -3533,7 +3750,7 @@ impl Companion {
                 Weight::Medium,
             ));
         }
-        if let (Some(err), false) = (ai.error.as_ref(), running) {
+        if let (Some(err), false) = (ai.error.as_ref().filter(|_| scope_ok), running) {
             children.push(self.line(err.clone(), MICRO, p.warning));
         }
         if recs.is_empty() && !running {
@@ -5570,12 +5787,16 @@ impl Companion {
                 .finish(),
             );
         }
+        let now_local = Local::now();
+        let now_min = now_local.hour() * 60 + now_local.minute();
+        let weekday_idx = now_local.weekday().num_days_from_monday();
         let mut prioritized_alarms: Vec<_> =
             suite.alarms.iter().filter(|a| !a.is_e2e_probe()).collect();
         prioritized_alarms.sort_by_key(|a| {
+            let st = resolve_alarm_status(a, now_ms, now_min, weekday_idx, &self.reminder_governance);
             (
-                std::cmp::Reverse(a.is_today_valid_unexpired_at(now_ms, &self.reminder_governance)),
-                std::cmp::Reverse(a.enabled),
+                st.sort_rank(),
+                st.next_offset_mins().unwrap_or(u32::MAX),
                 a.total_minutes(),
                 std::cmp::Reverse(a.id),
             )
@@ -5644,21 +5865,32 @@ impl Companion {
     ) -> El {
         let p = self.p();
         let enabled = alarm.enabled;
-        let now_ms = Local::now().timestamp_millis();
-        let (status_label, is_today_pending) =
-            alarm.validity_status_label_at(now_ms, &self.reminder_governance);
+        let now = Local::now();
+        let now_ms = now.timestamp_millis();
+        let now_min = now.hour() * 60 + now.minute();
+        let weekday_idx = now.weekday().num_days_from_monday();
+        let status = resolve_alarm_status(
+            alarm,
+            now_ms,
+            now_min,
+            weekday_idx,
+            &self.reminder_governance,
+        );
+        let status_label = status.home_badge_label();
+        let is_today_pending = status.is_today_pending();
+        let is_valid_active = status.is_valid_active();
         let status_badge = self.pill_badge(
             status_label,
             if is_today_pending {
                 p.success_text
-            } else if enabled {
+            } else if is_valid_active {
                 p.warning
             } else {
                 p.text3
             },
             if is_today_pending {
                 p.success_soft
-            } else if enabled {
+            } else if is_valid_active {
                 p.warning_soft
             } else {
                 p.surface

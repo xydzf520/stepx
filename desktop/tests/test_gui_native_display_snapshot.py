@@ -45,6 +45,8 @@ class DisplaySnapshotTests(unittest.TestCase):
             snapshot.compare(proof, changed)
 
     def test_only_fixed_readback_payload_is_injected(self):
+        if not snapshot.DEX.is_file():
+            self.skipTest('optional local display snapshot research DEX not built')
         code = snapshot.build_worker(snapshot.DEX.read_bytes(), dict(pid=1234, start_ticks='50', boot_id='a' * 36))
         self.assertIn("cstr('stepx.NativeGuiDisplaySnapshot')", code)
         self.assertNotIn('GmsProbe', code)

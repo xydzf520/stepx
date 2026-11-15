@@ -818,7 +818,7 @@ pub fn record_verified_cloud_model(
     server_version: &str,
     context_limit: Option<u64>,
 ) -> Result<ModelInfo> {
-    let scope = crate::amoo_usage::account_scope(adb, device)?
+    let scope = crate::amoo_usage::account_scope_fresh(adb, device)?
         .context("未读取到唯一的手机 Amoo 账号，无法保存模型权限")?;
     if model.is_empty() || model.len() > 256 || model.chars().any(char::is_control) {
         bail!("手机未返回有效的真实模型标识")
@@ -855,10 +855,12 @@ pub fn record_verified_cloud_model(
 /// session. Invalid credentials, errors and timeouts never produce visible models.
 pub fn verify_models(adb: &Adb, device: &Device) -> Result<Vec<ModelInfo>> {
     use std::time::Instant;
-    let scope = crate::amoo_usage::account_scope(adb, device)?.context("请先登录手机 Amoo 账号")?;
+    let scope =
+        crate::amoo_usage::account_scope_fresh(adb, device)?.context("请先登录手机 Amoo 账号")?;
     invalidate_verified_models(adb, device)?;
     let mut bus = crate::amoo::AgentBus::connect(adb, device)?;
-    let key = bus.create_session()?;
+    let key = bus.create_temporary_session("stepx-model-check-")?;
+    crate::inference_sessions::begin(&device.serial, Some(&scope), &key);
     let result = (|| -> Result<(String, String, Option<u64>)> {
         let receipt = bus.send(&key, "模型权限验证：请只回复 OK，不要调用工具。")?;
         let deadline = Instant::now() + Duration::from_secs(45);
@@ -885,7 +887,7 @@ pub fn verify_models(adb: &Adb, device: &Device) -> Result<Vec<ModelInfo>> {
                 {
                     continue;
                 }
-                if crate::amoo_usage::account_scope(adb, device)?.as_deref() != Some(&scope) {
+                if crate::amoo_usage::account_scope_fresh(adb, device)?.as_deref() != Some(&scope) {
                     bail!("模型验证期间手机账号已改变，请重新验证")
                 }
                 let model = row["responseModel"]
@@ -910,12 +912,13 @@ pub fn verify_models(adb: &Adb, device: &Device) -> Result<Vec<ModelInfo>> {
         }
     })();
     let cleanup = bus.call("sessions.delete", json!({"key":key}));
+    crate::inference_sessions::finish(&device.serial, Some(&scope), &key);
     if cleanup.is_err() {
         invalidate_verified_models(adb, device)?;
         bail!("模型验证会话清理未确认，请刷新会话列表")
     }
     let (model, provider, context_limit) = result?;
-    if crate::amoo_usage::account_scope(adb, device)?.as_deref() != Some(&scope) {
+    if crate::amoo_usage::account_scope_fresh(adb, device)?.as_deref() != Some(&scope) {
         bail!("模型验证期间手机账号已改变，请重新验证")
     }
     record_verified_cloud_model(adb, device, &model, &provider, &bus.version, context_limit)

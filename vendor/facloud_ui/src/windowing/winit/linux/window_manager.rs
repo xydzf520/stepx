@@ -20,25 +20,26 @@ pub(crate) fn look_for_wayland_compositor() -> Option<String> {
     // have false positives, like processes that name-clash with these compositors.
     let uid = nix::unistd::getuid();
     let euid = nix::unistd::geteuid();
-    if let Some(ps_output) = Command::new("ps")
+    if let Ok(mut ps_child) = Command::new("ps")
         .args(["-u", &format!("{euid}"), "-U", &format!("{uid}")])
         .stdout(Stdio::piped())
         .spawn()
-        .ok()
-        .and_then(|output| output.stdout)
     {
-        let wm_match_cmd = Command::new("grep")
-            .args(
-                ["-m", "1", "-o", "-F", "-i"].iter().chain(
-                    WAYLAND_TILING_WM
-                        .iter()
-                        .flat_map(|wm_name| [&"-e", wm_name]),
-                ),
-            )
-            .stdin(Stdio::from(ps_output))
-            .output()
-            .ok()
-            .filter(|out| out.status.success());
+        let wm_match_cmd = ps_child.stdout.take().and_then(|ps_output| {
+            Command::new("grep")
+                .args(
+                    ["-m", "1", "-o", "-F", "-i"].iter().chain(
+                        WAYLAND_TILING_WM
+                            .iter()
+                            .flat_map(|wm_name| [&"-e", wm_name]),
+                    ),
+                )
+                .stdin(Stdio::from(ps_output))
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+        });
+        let _ = ps_child.wait();
 
         if let Some(wm_name_raw) = wm_match_cmd {
             if let Ok(wm_name) = String::from_utf8(wm_name_raw.stdout) {

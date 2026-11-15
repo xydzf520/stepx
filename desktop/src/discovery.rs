@@ -49,7 +49,7 @@ impl Discovery {
             while let Ok(event) = receiver.try_recv() {
                 match event {
                     ServiceEvent::ServiceResolved(info) => {
-                        let entries = info
+                        let raw_entries = info
                             .get_addresses()
                             .iter()
                             .map(|scoped| scoped.to_ip_addr())
@@ -64,7 +64,10 @@ impl Discovery {
                                 )
                             })
                             .collect();
-                        self.services.insert(info.fullname.to_lowercase(), entries);
+                        self.services.insert(
+                            info.fullname.to_lowercase(),
+                            prioritize_and_dedup_services(raw_entries),
+                        );
                     }
                     ServiceEvent::ServiceRemoved(ty, fullname) => {
                         let full_lower = fullname.to_lowercase();
@@ -110,6 +113,61 @@ fn service_from_dns(fullname: &str, domain: &str, endpoint: &str) -> Option<Serv
     })
 }
 
+pub fn prioritize_and_dedup_services(services: Vec<Service>) -> Vec<Service> {
+    let mut parsed: Vec<(Service, std::net::SocketAddr)> = services
+        .into_iter()
+        .filter_map(|s| {
+            let addr = validate_endpoint(&s.endpoint).ok()?;
+            if let std::net::IpAddr::V6(v6) = addr.ip() {
+                if v6.is_unicast_link_local() {
+                    return None;
+                }
+            }
+            Some((s, addr))
+        })
+        .collect();
+    let addr_rank = |addr: &std::net::SocketAddr| -> u8 {
+        match addr.ip() {
+            std::net::IpAddr::V4(_) => 0,
+            std::net::IpAddr::V6(v6) => {
+                // Prefer ULA (`fc00::/7`) slightly ahead of rotating temporary global SLAAC,
+                // while keeping all IPv6 strictly behind IPv4.
+                if (v6.segments()[0] & 0xfe00) == 0xfc00 {
+                    1
+                } else {
+                    2
+                }
+            }
+        }
+    };
+    parsed.sort_by(|(a, addr_a), (b, addr_b)| {
+        (&a.kind, &a.name, addr_a.port(), addr_rank(addr_a), &a.endpoint).cmp(&(
+            &b.kind,
+            &b.name,
+            addr_b.port(),
+            addr_rank(addr_b),
+            &b.endpoint,
+        ))
+    });
+    parsed.dedup_by(|(a, _), (b, _)| a == b);
+
+    // Deduplicate temporary IPv6 addresses so a single `(kind, name, port)` service
+    // never floods candidate lists with multiple rotating SLAAC addresses.
+    let mut seen_v6_service: std::collections::HashSet<(String, String, u16)> =
+        std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(parsed.len());
+    for (service, addr) in parsed {
+        if addr.is_ipv6() {
+            let key = (service.kind.clone(), service.name.clone(), addr.port());
+            if !seen_v6_service.insert(key) {
+                continue;
+            }
+        }
+        out.push(service);
+    }
+    out
+}
+
 /// Called on the ADB worker; the first query waits briefly for multicast replies.
 pub fn discover_services(adb: &Adb) -> Result<Vec<Service>> {
     static NATIVE: OnceLock<Mutex<Option<Discovery>>> = OnceLock::new();
@@ -149,9 +207,7 @@ pub fn discover_services(adb: &Adb) -> Result<Vec<Service>> {
     } else if result.is_empty() {
         start.context("无法启动自动发现；仍可使用 USB 或手工输入连接地址")?;
     }
-    result.sort_by(|a, b| (&a.kind, &a.name, &a.endpoint).cmp(&(&b.kind, &b.name, &b.endpoint)));
-    result.dedup();
-    Ok(result)
+    Ok(prioritize_and_dedup_services(result))
 }
 
 #[cfg(test)]
@@ -179,5 +235,30 @@ mod tests {
                 .is_none()
         );
         assert!(service_from_dns("wrong.local.", TYPES[0], "192.168.1.2:80").is_none());
+    }
+
+    #[test]
+    fn prioritize_and_dedup_orders_ipv4_before_ipv6_and_collapses_temp_ipv6() {
+        let svc = |ep: &str| Service {
+            name: "adb-SERIAL1-guid".into(),
+            kind: "_adb-tls-connect._tcp".into(),
+            endpoint: ep.into(),
+        };
+        let raw = vec![
+            svc("[240e:390:100::abcd]:41555"),
+            svc("[240e:390:100::1111]:41555"),
+            svc("[fe80::1234]:41555"),
+            svc("192.168.1.25:41555"),
+            svc("[fd00::99]:41555"),
+            svc("192.168.1.25:41555"),
+        ];
+        let deduped = prioritize_and_dedup_services(raw);
+        assert_eq!(
+            deduped,
+            vec![
+                svc("192.168.1.25:41555"),
+                svc("[fd00::99]:41555"),
+            ]
+        );
     }
 }

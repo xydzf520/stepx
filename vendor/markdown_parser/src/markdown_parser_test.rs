@@ -2752,3 +2752,85 @@ fn test_parse_table_with_strikethrough() {
         panic!("Expected table");
     }
 }
+
+#[test]
+fn test_300_consecutive_asterisks_no_overflow() {
+    let stars = "*".repeat(300);
+    let standalone = format!("prefix {stars}");
+    assert_eq!(
+        test_parse_markdown(&standalone),
+        vec![FormattedTextLine::Line(vec![
+            FormattedTextFragment::plain_text(format!("prefix {stars}")),
+        ])]
+    );
+
+    let wrapped = format!("{stars}bold{stars}");
+    let parsed = test_parse_markdown(&wrapped);
+    assert_eq!(parsed.len(), 1);
+    if let FormattedTextLine::Line(fragments) = &parsed[0] {
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0].text, "bold");
+        assert_eq!(fragments[0].styles.weight, Some(CustomWeight::Bold));
+    } else {
+        panic!("Expected Line, got {:?}", parsed[0]);
+    }
+}
+
+#[test]
+fn test_unclosed_streaming_rust_code_block() {
+    let body_lines: String = (0..500)
+        .map(|i| format!("    let x_{i} = {i};\n"))
+        .collect();
+    let streaming_source = format!("```rust\nfn main() {{\n{body_lines}");
+    let start = std::time::Instant::now();
+    let parsed = test_parse_markdown(&streaming_source);
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(1),
+        "Unclosed streaming code block took too long: {:?}",
+        start.elapsed()
+    );
+    assert_eq!(
+        parsed,
+        vec![FormattedTextLine::CodeBlock(CodeBlockText {
+            lang: "rust".to_string(),
+            code: format!("fn main() {{\n{body_lines}"),
+        })]
+    );
+}
+
+#[test]
+fn test_200_unclosed_backticks() {
+    let backticks = "`".repeat(200);
+    let start = std::time::Instant::now();
+    assert_eq!(
+        test_parse_markdown(&backticks),
+        vec![FormattedTextLine::Line(vec![
+            FormattedTextFragment::plain_text(backticks.clone()),
+        ])]
+    );
+    let inline_input = format!("hello {backticks} world");
+    assert_eq!(
+        test_parse_markdown(&inline_input),
+        vec![FormattedTextLine::Line(vec![
+            FormattedTextFragment::plain_text(inline_input),
+        ])]
+    );
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(1),
+        "200 unclosed backticks took too long: {:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn test_pathological_emphasis_500() {
+    let source = "*a**b*c**d*".repeat(500);
+    let start = std::time::Instant::now();
+    let parsed = test_parse_markdown(&source);
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(1),
+        "Pathological emphasis took too long: {:?}",
+        start.elapsed()
+    );
+    assert_eq!(parsed.len(), 1);
+}

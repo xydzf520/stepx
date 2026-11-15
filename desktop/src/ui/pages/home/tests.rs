@@ -4273,3 +4273,365 @@ fn home_release_frame_budget_regression() {
         "metric": "home_view_tree_build_and_drop_us", "cases": rows,
     }));
 }
+
+#[test]
+fn home_reply_target_stays_pinned_against_live_push_hijacking() {
+    let mut app = Companion::new_for_test();
+    app.demo_mode = false;
+    app.page = Page::Home;
+    let now = Local::now().timestamp_millis();
+
+    let mut snap = PushSnapshot::default();
+    snap.notifications.push(stepx_companion::push::PushNotification {
+        key: "notif-zhangsan".into(),
+        thread_id: "wechat:zhangsan".into(),
+        package_name: "com.tencent.mm".into(),
+        app_name: "微信".into(),
+        title: "张三".into(),
+        text: "请发一下最新报价单".into(),
+        post_time_ms: now - 30_000,
+        can_reply: true,
+        active: true,
+        ..Default::default()
+    });
+    snap.threads.push(stepx_companion::push::ImThread {
+        thread_id: "wechat:zhangsan".into(),
+        notification_key: "notif-zhangsan".into(),
+        package_name: "com.tencent.mm".into(),
+        app_name: "微信".into(),
+        title: "张三".into(),
+        last_message: "请发一下最新报价单".into(),
+        last_timestamp_ms: now - 30_000,
+        unread_count: 1,
+        can_remote_reply: true,
+        ..Default::default()
+    });
+
+    // Initial render records 张三 as the displayed reply target
+    let pending_initial = app.home_pending_im_threads(&snap, now);
+    let initial_target = app
+        .home_issue_reply_target(&snap, &pending_initial)
+        .expect("initial reply target");
+    assert_eq!(initial_target.3, "张三");
+
+    // User starts typing in F_PUSH_REPLY without even clicking HomeSelectReplyTarget
+    app.focus = Some(F_PUSH_REPLY);
+    app.fields[F_PUSH_REPLY].set("好的，报价单马上发你");
+
+    // Right before user hits Enter/Send, a brand new push from 李四 lands at index 0!
+    snap.notifications.insert(
+        0,
+        stepx_companion::push::PushNotification {
+            key: "notif-lisi".into(),
+            thread_id: "wechat:lisi".into(),
+            package_name: "com.tencent.mm".into(),
+            app_name: "微信".into(),
+            title: "李四".into(),
+            text: "中午一起吃饭吗？".into(),
+            post_time_ms: now,
+            can_reply: true,
+            active: true,
+            ..Default::default()
+        },
+    );
+    snap.threads.insert(
+        0,
+        stepx_companion::push::ImThread {
+            thread_id: "wechat:lisi".into(),
+            notification_key: "notif-lisi".into(),
+            package_name: "com.tencent.mm".into(),
+            app_name: "微信".into(),
+            title: "李四".into(),
+            last_message: "中午一起吃饭吗？".into(),
+            last_timestamp_ms: now,
+            unread_count: 2,
+            can_remote_reply: true,
+            ..Default::default()
+        },
+    );
+
+    // Both Enter submission and Send button MUST stay locked to 张三!
+    let enter_target = app
+        .resolve_home_actionable_reply_target(&snap)
+        .expect("locked enter target");
+    assert_eq!(enter_target.0, "notif-zhangsan");
+    assert_eq!(enter_target.2, "com.tencent.mm");
+    assert_eq!(enter_target.3, "张三");
+
+    let pending_after = app.home_pending_im_threads(&snap, now);
+    let composer_target = app
+        .home_issue_reply_target(&snap, &pending_after)
+        .expect("locked composer target");
+    assert_eq!(composer_target.0, "notif-zhangsan");
+    assert_eq!(composer_target.3, "张三");
+
+    // Explicit user click via HomeSelectReplyTarget switches cleanly to 李四
+    assert!(app.apply_home_action(
+        &Action::HomeSelectReplyTarget {
+            key: "notif-lisi".into(),
+            thread_id: "wechat:lisi".into(),
+            package_name: "com.tencent.mm".into(),
+            title: "李四".into(),
+        },
+        None,
+    ));
+    let switched = app
+        .resolve_home_actionable_reply_target(&snap)
+        .expect("switched target");
+    assert_eq!(switched.0, "notif-lisi");
+    assert_eq!(switched.3, "李四");
+
+    // Clearing draft and unfocusing releases the lock
+    app.fields[F_PUSH_REPLY].clear();
+    app.focus = None;
+    let natural = app
+        .resolve_home_actionable_reply_target(&snap)
+        .expect("natural target");
+    assert_eq!(natural.3, "李四");
+}
+
+#[test]
+fn purge_expired_now_preserves_ongoing_and_multiday_all_day_meetings() {
+    use chrono::TimeZone;
+    let mut app = Companion::new_for_test();
+    app.demo_mode = true;
+    app.reminder_governance = Default::default();
+    app.back_screen.completed_calendar_events.clear();
+
+    let now = Local::now();
+    let now_ms = now.timestamp_millis();
+    let today = now.date_naive();
+    let yesterday_start = Local
+        .from_local_datetime(&today.pred_opt().unwrap().and_hms_opt(0, 0, 0).unwrap())
+        .single()
+        .unwrap()
+        .timestamp_millis();
+    let day_after_tomorrow_start = Local
+        .from_local_datetime(
+            &today
+                .succ_opt()
+                .unwrap()
+                .succ_opt()
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+        )
+        .single()
+        .unwrap()
+        .timestamp_millis();
+
+    app.back_screen.stepos_suite.calendar_events = vec![
+        stepx_companion::toolbox::PhoneCalendarEvent {
+            id: 501,
+            title: "已结束的早会".into(),
+            dtstart: now_ms - 2 * 3_600_000,
+            dtend: now_ms - 3_600_000,
+            all_day: false,
+            recurring: Some(false),
+            ..Default::default()
+        },
+        stepx_companion::toolbox::PhoneCalendarEvent {
+            id: 502,
+            title: "正在进行中的架构评审".into(),
+            dtstart: now_ms - 20 * 60_000,
+            dtend: now_ms + 40 * 60_000,
+            all_day: false,
+            recurring: Some(false),
+            ..Default::default()
+        },
+        stepx_companion::toolbox::PhoneCalendarEvent {
+            id: 503,
+            title: "跨三天全天峰会".into(),
+            dtstart: yesterday_start,
+            dtend: day_after_tomorrow_start,
+            all_day: true,
+            recurring: Some(false),
+            ..Default::default()
+        },
+    ];
+
+    assert!(app.apply_home_action(
+        &Action::HomeReminder(HomeReminderAction::PurgeExpiredNow),
+        None,
+    ));
+    assert!(
+        app.back_screen.completed_calendar_events.contains(&501),
+        "genuinely ended meeting must be purged"
+    );
+    assert!(
+        !app.back_screen.completed_calendar_events.contains(&502),
+        "currently active in-progress meeting MUST NEVER be purged"
+    );
+    assert!(
+        !app.back_screen.completed_calendar_events.contains(&503),
+        "ongoing multi-day all-day event MUST NEVER be purged"
+    );
+}
+
+#[test]
+fn clear_all_governance_entries_restores_parcels_calendar_and_muted_sources() {
+    let mut app = Companion::new_for_test();
+    app.reminder_governance = Default::default();
+    let now_ms = Local::now().timestamp_millis();
+
+    let older_spec = stepx_companion::home_reminder_governance::ReminderTargetSpec::new(
+        "parcel:A-101",
+        stepx_companion::home_reminder_governance::ReminderCategory::ExpressPickup,
+        "旧取件提醒",
+    );
+    let newer_spec = stepx_companion::home_reminder_governance::ReminderTargetSpec::new(
+        "cal:501",
+        stepx_companion::home_reminder_governance::ReminderCategory::ScheduleAndMeeting,
+        "最新归档日程",
+    );
+    app.reminder_governance.manual_expire(older_spec, now_ms - 60_000);
+    app.reminder_governance.manual_expire(newer_spec, now_ms);
+    app.reminder_governance
+        .mute_source("pkg:com.sankuai.meituan", "美团", now_ms);
+    app.push.prefs.dismissed_pickup_codes.insert("A-101".into());
+    app.back_screen.completed_calendar_events.insert(501);
+    app.back_screen
+        .dismissed_capsule_ids
+        .insert("cal-501".into());
+
+    app.home_reminder_drawer_open = true;
+    app.home_reminder_drawer_tab = 0;
+    let _ = std::hint::black_box(app.render_home_reminder_governance_panel());
+
+    assert!(app.apply_home_action(
+        &Action::HomeReminder(HomeReminderAction::ClearAllGovernanceEntries),
+        None,
+    ));
+    assert!(app.reminder_governance.entries.is_empty());
+    assert!(app.reminder_governance.muted_sources.is_empty());
+    assert!(app.push.prefs.dismissed_pickup_codes.is_empty());
+    assert!(app.back_screen.completed_calendar_events.is_empty());
+    assert!(app.back_screen.dismissed_capsule_ids.is_empty());
+}
+
+#[test]
+fn weather_select_day_action_preserves_home_command_draft() {
+    let mut app = Companion::new_for_test();
+    app.fields[F_HOME_COMMAND].set("给客户准备下午演示大纲");
+    assert!(app.apply_home_action(&Action::WeatherSelectDay(1), None));
+    assert_eq!(app.fields[F_HOME_COMMAND].text, "给客户准备下午演示大纲");
+}
+
+#[test]
+fn missed_calls_deduplicate_answered_or_called_back_without_in_place_mutation() {
+    let mut app = Companion::new_for_test();
+    app.demo_mode = false;
+    let now = Local::now().timestamp_millis();
+    app.call_logs = vec![
+        // Missed call followed by outgoing callback (last 11 digits match despite +86 formatting)
+        stepx_companion::device::CallRecord {
+            number: "+86 138-0000-2916".into(),
+            name: "王经理".into(),
+            call_type: 3,
+            date_ms: now - 600_000,
+            duration_sec: 0,
+        },
+        stepx_companion::device::CallRecord {
+            number: "13800002916".into(),
+            name: "王经理".into(),
+            call_type: 2,
+            date_ms: now - 300_000,
+            duration_sec: 12,
+        },
+        // Missed call followed by answered incoming call (last 8 digits match)
+        stepx_companion::device::CallRecord {
+            number: "021-62345678".into(),
+            name: "前台总机".into(),
+            call_type: 3,
+            date_ms: now - 500_000,
+            duration_sec: 0,
+        },
+        stepx_companion::device::CallRecord {
+            number: "62345678".into(),
+            name: "前台总机".into(),
+            call_type: 1,
+            date_ms: now - 200_000,
+            duration_sec: 45,
+        },
+        // Genuine unanswered missed call
+        stepx_companion::device::CallRecord {
+            number: "13800003091".into(),
+            name: "快递员".into(),
+            call_type: 3,
+            date_ms: now - 100_000,
+            duration_sec: 0,
+        },
+    ];
+
+    let ctx = app.home_ai_context();
+    assert_eq!(ctx.missed_calls, 1);
+
+    // Dismissing via ManualExpire must NOT mutate call_type in-place on call_logs
+    let target = HomeReminderContextTarget {
+        spec: stepx_companion::home_reminder_governance::ReminderTargetSpec::new(
+            "call:13800003091",
+            stepx_companion::home_reminder_governance::ReminderCategory::MissedCall,
+            "快递员",
+        ),
+        sms_address: "13800003091".into(),
+        ..Default::default()
+    };
+    assert!(app.apply_home_action(
+        &Action::HomeReminder(HomeReminderAction::ManualExpire(target)),
+        None,
+    ));
+    assert_eq!(
+        app.call_logs[4].call_type, 3,
+        "shared call_logs snapshot must never be mutated in-place"
+    );
+}
+
+#[test]
+fn home_enriched_report_cache_keys_by_selected_device_serial() {
+    let mut app = Companion::new_for_test();
+    app.demo_mode = false;
+    app.push.snapshot = PushSnapshot::default();
+    app.express_parcels.clear();
+    app.selected = Some(stepx_companion::device::Device {
+        transport: "usb:1".into(),
+        serial: "PHONE-SERIAL-A".into(),
+        model: "StepX Pro".into(),
+        android: "15".into(),
+        product: "stepx".into(),
+    });
+
+    let mut item_a = stepx_companion::context_ledger::PreparedItem::default();
+    item_a.id = "ledger-phone-a".into();
+    item_a.title = "手机A降雨天气出行提醒".into();
+    item_a.summary = "下午降雨降温，外出请带雨伞".into();
+    item_a.updated_ms = Local::now().timestamp_millis();
+    app.context.overview.items = vec![item_a];
+    let titles_a: Vec<String> = app.with_home_report(|report, _, _| {
+        report
+            .life_context_cards
+            .iter()
+            .map(|c| c.title.clone())
+            .collect()
+    });
+
+    // Switch to Phone B with identical model name and cleared ledger items
+    app.selected = Some(stepx_companion::device::Device {
+        transport: "usb:2".into(),
+        serial: "PHONE-SERIAL-B".into(),
+        model: "StepX Pro".into(),
+        android: "15".into(),
+        product: "stepx".into(),
+    });
+    app.context.overview.items.clear();
+    let titles_b: Vec<String> = app.with_home_report(|report, _, _| {
+        report
+            .life_context_cards
+            .iter()
+            .map(|c| c.title.clone())
+            .collect()
+    });
+    assert_ne!(
+        titles_a, titles_b,
+        "switching device serial must never serve Phone A's cached report on Phone B"
+    );
+}

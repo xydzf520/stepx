@@ -836,14 +836,25 @@ void set_accessibility_contents(id window, NSString *value, NSString *help, NSSt
 void set_window_bounds(id window, NSRect frame) { [window setFrame:frame display:YES]; }
 
 void open_file_path(NSString *pathString) {
+    if (pathString == nil) {
+        return;
+    }
     NSString *path = [pathString stringByExpandingTildeInPath];
     NSURL *url = [[NSURL fileURLWithPath:path] standardizedURL];
-    [[NSWorkspace sharedWorkspace] openURL:url];
+    if (url != nil) {
+        [[NSWorkspace sharedWorkspace] openURL:url];
+    }
 }
 
 void open_file_path_in_explorer(NSString *pathString) {
+    if (pathString == nil) {
+        return;
+    }
     NSString *path = [pathString stringByExpandingTildeInPath];
     NSURL *url = [[NSURL fileURLWithPath:path] standardizedURL];
+    if (url == nil) {
+        return;
+    }
 
     // Dispatch this asynchronously on the main thread to avoid double-borrow
     // errors; see https://warpdotdev.sentry.io/issues/4264975772.
@@ -868,8 +879,10 @@ void open_file_picker(void *callback, NSArray<NSString *> *fileTypes, BOOL allow
             if ([fileType isEqualToString:@"Image"]) {
                 [contentTypes addObject:UTTypeImage];
             } else if ([fileType isEqualToString:@"Markdown"]) {
-                UTType *markdownType = [UTType typeWithFilenameExtension:@"md"];
-                [contentTypes addObject:markdownType];
+                UTType *t = [UTType typeWithFilenameExtension:@"md"];
+                if (t != nil) {
+                    [contentTypes addObject:t];
+                }
             } else if ([fileType isEqualToString:@"Yaml"]) {
                 [contentTypes addObject:UTTypeYAML];
             }
@@ -938,8 +951,21 @@ void open_save_file_picker(void *callback, NSString *defaultFilename, NSString *
 
 // Open a given url.
 void open_url(NSString *urlString) {
-    NSURL *url = [NSURL URLWithString:urlString];
-    [[NSWorkspace sharedWorkspace] openURL:url];
+    if (urlString == nil) {
+        return;
+    }
+    NSURL *nsurl = [NSURL URLWithString:urlString];
+    if (nsurl == nil) {
+        NSString *encoded = [urlString
+            stringByAddingPercentEncodingWithAllowedCharacters:
+                [NSCharacterSet URLFragmentAllowedCharacterSet]];
+        if (encoded != nil) {
+            nsurl = [NSURL URLWithString:encoded];
+        }
+    }
+    if (nsurl != nil) {
+        [[NSWorkspace sharedWorkspace] openURL:nsurl];
+    }
 }
 
 void hide_app() {

@@ -448,10 +448,13 @@ pub unsafe extern "C-unwind" fn warp_on_request_notification_permissions_complet
     result_msg: id,
     callback: *mut c_void,
 ) {
+    if callback.is_null() {
+        return;
+    }
+    let callback = Box::from_raw(callback as *mut RequestNotificationPermissionsCallback);
     let outcome =
         super::notification::request_permissions_outcome_from_native(result_type, result_msg);
     if let Ok(outcome) = outcome {
-        let callback = Box::from_raw(callback as *mut RequestNotificationPermissionsCallback);
         callback(outcome);
     }
 }
@@ -465,9 +468,12 @@ pub unsafe extern "C-unwind" fn warp_on_notification_send_error(
     error_msg: id,
     callback: *mut c_void,
 ) {
+    if callback.is_null() {
+        return;
+    }
+    let callback = Box::from_raw(callback as *mut NotificationSendErrorCallback);
     let notification_error = super::notification::send_error_from_native(error_type, error_msg);
     if let Ok(notification_error) = notification_error {
-        let callback = Box::from_raw(callback as *mut NotificationSendErrorCallback);
         callback(notification_error);
     }
 }

@@ -23,7 +23,13 @@ impl Clipboard for LinuxClipboard {
     fn write(&mut self, contents: ClipboardContent) {
         if let Err(err) = self.write_to_specific_clipboard(LinuxClipboardKind::Clipboard, &contents)
         {
-            if contents.html.is_some() {
+            if contents
+                .images
+                .as_ref()
+                .is_some_and(|imgs| !imgs.is_empty())
+            {
+                log::warn!("Unable to set clipboard image: {err:?}");
+            } else if contents.html.is_some() {
                 log::warn!("Unable to set clipboard HTML: {err:?}");
             } else {
                 log::warn!("Unable to set clipboard text: {err:?}");
@@ -111,7 +117,10 @@ impl LinuxClipboard {
             };
 
             let candidate_path = std::path::Path::new(&candidate_path_str);
-            if candidate_path.is_absolute() && candidate_path.exists() {
+            // Do not call `candidate_path.exists()` on the UI thread: arbitrary `text/plain` lines
+            // starting with `/` (e.g. `/net/...` or stale NFS/FUSE mounts) can hang `stat()` for
+            // tens of seconds.
+            if candidate_path.is_absolute() {
                 file_paths.push(candidate_path_str);
             } else {
                 // Not an absolute-path indicates the text was not from copying files, so return
@@ -126,12 +135,35 @@ impl LinuxClipboard {
         }
     }
 
+    fn read_images_from_specific_clipboard(
+        &mut self,
+        clipboard_kind: LinuxClipboardKind,
+        html_content: &Option<String>,
+        text_content: &str,
+    ) -> Option<Vec<crate::clipboard::ImageData>> {
+        match self.inner.get().clipboard(clipboard_kind).image() {
+            Ok(arboard_image) => {
+                let filename = crate::clipboard_utils::extract_filename_from_clipboard_content(
+                    html_content,
+                    text_content,
+                );
+                crate::clipboard_utils::process_clipboard_image(&arboard_image, filename)
+                    .map(|img| vec![img])
+            }
+            Err(arboard::Error::ContentNotAvailable) => None,
+            Err(err) => {
+                log::warn!("Unable to read image from Linux {clipboard_kind:?} clipboard: {err:?}");
+                None
+            }
+        }
+    }
+
     /// Reads clipboard content from a specific clipboard buffer.
     fn read_from_specific_clipboard(
         &mut self,
         clipboard_kind: LinuxClipboardKind,
     ) -> Result<ClipboardContent, arboard::Error> {
-        let text_result = self.inner.get().text();
+        let text_result = self.inner.get().clipboard(clipboard_kind).text();
         let mut content = ClipboardContent {
             plain_text: text_result.as_ref().map(|s| s.clone()).unwrap_or_default(),
             ..Default::default()
@@ -146,8 +178,8 @@ impl LinuxClipboard {
                 content.html = html.is_empty().not().then_some(html);
 
                 // Try to get image content from clipboard
-                content.images = crate::clipboard_utils::read_images_from_clipboard(
-                    &mut self.inner,
+                content.images = self.read_images_from_specific_clipboard(
+                    clipboard_kind,
                     &content.html,
                     &content.plain_text,
                 );
@@ -162,11 +194,8 @@ impl LinuxClipboard {
         }
 
         // Fallback to using plaintext
-        content.images = crate::clipboard_utils::read_images_from_clipboard(
-            &mut self.inner,
-            &None, // No HTML in fallback case
-            &content.plain_text,
-        );
+        content.images =
+            self.read_images_from_specific_clipboard(clipboard_kind, &None, &content.plain_text);
 
         // Return success if we have ANY content (text, paths, OR images)
         // Only error if ALL content types failed
@@ -189,6 +218,19 @@ impl LinuxClipboard {
         clipboard_kind: LinuxClipboardKind,
         contents: &ClipboardContent,
     ) -> Result<(), arboard::Error> {
+        if let Some(first_image) = contents.images.as_ref().and_then(|imgs| imgs.first()) {
+            if let Some(arboard_image) =
+                crate::clipboard_utils::decode_image_for_arboard(first_image)
+            {
+                return self
+                    .inner
+                    .set()
+                    .clipboard(clipboard_kind)
+                    .image(arboard_image);
+            }
+            log::warn!("Unable to decode ClipboardContent image for Linux clipboard write");
+        }
+
         if let Some(html) = &contents.html {
             self.inner
                 .set()

@@ -18,7 +18,7 @@ import java.util.concurrent.*;
 
 /** Phone companion: an explicit connection, scoped file sharing, and user-owned background controls. */
 public final class MainActivity extends Activity {
-    private static final int PICK_FILES=30,SAVE_FILE=31;
+    private static final int PICK_FILES=30,SAVE_FILE=31,REQ_PHONE_STATE=32;
     private final Handler ui=new Handler(Looper.getMainLooper());
     private final ExecutorService files=Executors.newSingleThreadExecutor();
     private final ExecutorService statusWorker=Executors.newSingleThreadExecutor();
@@ -163,11 +163,32 @@ public final class MainActivity extends Activity {
         LinearLayout app=group(p,"应用");row(app,UiGlyph.CLOCK,"任务记录","查看历史与管理本机记录",()->showTab(8));row(app,UiGlyph.HOME,"关于伴侣","版本 "+version()+" · 项目说明",()->showTab(9));
     }
     private void permissionRow(LinearLayout p,String id,int icon,String title,Runnable action){LinearLayout r=design.row(p,icon,title,"正在检查…",action);TextView label=(TextView)((LinearLayout)r.getChildAt(1)).getChildAt(1);permissionLabels.put(id,label);}
+    private void requestPhoneStatePermission(){
+        if(checkSelfPermission(Manifest.permission.READ_PHONE_STATE)!=PackageManager.PERMISSION_GRANTED){
+            requestPermissions(new String[]{Manifest.permission.READ_PHONE_STATE},REQ_PHONE_STATE);
+        }else{
+            startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,Uri.parse("package:"+getPackageName())));
+        }
+    }
+    @Override public void onRequestPermissionsResult(int requestCode,String[] permissions,int[] grantResults){
+        super.onRequestPermissionsResult(requestCode,permissions,grantResults);
+        if(checkSelfPermission(Manifest.permission.READ_PHONE_STATE)==PackageManager.PERMISSION_GRANTED){
+            PushNotificationService svc=PushNotificationService.instance;
+            if(svc!=null)svc.restartCallMonitor();
+        }
+        refresh();
+    }
     private void permissionsPage(){
         LinearLayout p=page("权限与服务","只在使用对应功能时生效；可随时在系统设置中管理。");
+        Runnable app=()->startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,Uri.parse("package:"+getPackageName())));
         LinearLayout core=group(p,"手机操作");permissionRow(core,"gui",UiGlyph.SCREEN,"看屏操作",()->startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)));permissionRow(core,"notifications",UiGlyph.TASK,"手机通知同步",()->startActivity(new Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)));
-        LinearLayout device=group(p,"连接与背屏");Runnable app=()->startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,Uri.parse("package:"+getPackageName())));
-        permissionRow(device,"camera",UiGlyph.SCAN,"扫码相机",app);permissionRow(device,"notice",UiGlyph.TASK,"服务通知",app);permissionRow(device,"screen",UiGlyph.SCREEN,"背屏控制",()->repairHelp("背屏控制"));permissionRow(device,"pairing",UiGlyph.LINK,"安全扫码服务",()->startActivity(new Intent(this,PairingActivity.class)));permissionRow(device,"power",UiGlyph.CLOCK,"后台电量管理",()->startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)));
+        if(Build.VERSION.SDK_INT>=33){
+            LinearLayout restricted=card(p,10);
+            TextView tip=text(restricted,"Android 13+ 受限设置提示：若“看屏操作”或“手机通知同步”显示受限无法开启，请点击此处进入“应用信息”，点右上角“⋮ → 允许受限设置”后再返回开启。",12,secondary,0);
+            restricted.setOnClickListener(v->app.run());tip.setOnClickListener(v->app.run());
+        }
+        LinearLayout device=group(p,"连接与背屏");
+        permissionRow(device,"phone_state",UiGlyph.LINK,"通话状态感知",this::requestPhoneStatePermission);permissionRow(device,"camera",UiGlyph.SCAN,"扫码相机",app);permissionRow(device,"notice",UiGlyph.TASK,"服务通知",app);permissionRow(device,"screen",UiGlyph.SCREEN,"背屏控制",()->repairHelp("背屏控制"));permissionRow(device,"pairing",UiGlyph.LINK,"安全扫码服务",()->startActivity(new Intent(this,PairingActivity.class)));permissionRow(device,"power",UiGlyph.CLOCK,"后台电量管理",()->startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)));
     }
     private boolean bootRecovering(){return android.os.SystemClock.elapsedRealtime()<180000||AutoConnectService.state(this).startsWith("正在恢复开机");}
     private void repairHelp(String feature){new AlertDialog.Builder(this).setTitle(feature).setMessage(bootRecovering()?"手机正在恢复开机服务，请完成首次解锁后等待片刻。已配对电脑会自动连接，不需要再次扫码。":"权限检查未通过。请先确认已安装最新版伴侣并完成首次解锁；仍未恢复时，在电脑连接设备页选择“更新 / 修复 StepX伴侣”。修复会同时配置后续的开机恢复。").setPositiveButton("知道了",null).show();}
@@ -275,6 +296,7 @@ public final class MainActivity extends Activity {
         String error=s.optString("lastError");if(amooState!=null)amooState.setText(!permissions?(bootRecovering()?"正在恢复熄屏协作权限…":"后台协作权限未就绪，请在权限与服务中查看详情。"):!error.isEmpty()?error:!supported?"后台协作未就绪，请在电脑检查固件适配。":!enabled?"已停止后台协作":fresh?s.optString("message","协作进行中"):cachedLink.online?"已连接 "+cachedLink.name+" · 后台协作就绪，电脑发起 Amoo 任务时自动保持唤醒":"已允许 · 等待电脑连接");
         PowerManager power=getSystemService(PowerManager.class);NotificationManager notifications=getSystemService(NotificationManager.class);
         boolean pairingReady=PairingBridgeProvider.available()&&pairing.optBoolean("pairingSupported")&&System.currentTimeMillis()-pairing.optLong("updatedAtMs")<30000;
+        labelPermission("phone_state",checkSelfPermission(Manifest.permission.READ_PHONE_STATE)==PackageManager.PERMISSION_GRANTED?"已授权":"未授权 · 点击授权");
         labelPermission("camera",grant(Manifest.permission.CAMERA));labelPermission("notice",notifications.areNotificationsEnabled()?"已开启":"未开启 · 点击管理");
         labelPermission("screen",checkSelfPermission("com.stepos.permission.MANAGE_BACK_SCREEN")==PackageManager.PERMISSION_GRANTED?"已适配":"待修复 · 查看电脑操作步骤");labelPermission("pairing",pairingReady?"已就绪":"待连接确认 · 查看修复步骤");labelPermission("power",power.isIgnoringBatteryOptimizations(getPackageName())?"不受限制":"受系统管理 · 点击调整");
         String accessibility=Settings.Secure.getString(getContentResolver(),Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);labelPermission("gui",screenPermissionEnabled()?"已开启":"未开启 · 点击授权");

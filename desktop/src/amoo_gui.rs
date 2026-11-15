@@ -126,8 +126,9 @@ fn screen_state(policy: &str, power: &str) -> (Option<bool>, Option<bool>) {
 }
 
 pub(crate) fn read_screen(adb: &Adb, device: &Device) -> Result<(Option<bool>, Option<bool>)> {
+    let transport = device.resolve_active_transport(adb)?;
     let combined = adb.script(
-        &device.transport,
+        &transport,
         "dumpsys window policy; printf '\\n===STEPX_POWER===\\n'; dumpsys power --brief",
     )?;
     let (policy, power) = combined
@@ -165,7 +166,7 @@ fn catalog_has_gui(value: &Value, depth: usize) -> bool {
 /// Safe to call while idle: does not wake the screen, acquire a task lease,
 /// launch an Activity, grant a permission, or modify a phone setting.
 pub fn inspect(adb: &Adb, device: &Device) -> Result<GuiStatus> {
-    device.verify(adb)?;
+    let _transport = device.resolve_active_transport(adb)?;
     let (locked, interactive) = read_screen(adb, device)?;
     let probe = AgentBus::observe(adb, device).and_then(|mut bus| bus.local_gui_catalog());
     let supported = probe.as_ref().is_ok_and(|reply| {

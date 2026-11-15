@@ -7,7 +7,6 @@ The separate audit pins all inodes and owner bytes before explicit cleanup.
 This is not global GUI rollback and never signals a process or launches a task.
 """
 import argparse
-import fcntl
 import importlib.util
 import json
 import os
@@ -15,6 +14,9 @@ from pathlib import Path
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / 'scripts') not in sys.path:
+    sys.path.insert(0, str(ROOT / 'scripts'))
+from host_runtime import file_lock
 spec = importlib.util.spec_from_file_location('storage_task_host', ROOT / 'scripts/gui-native-task-host.py')
 runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
@@ -222,11 +224,7 @@ def main():
     parser.add_argument('command', choices=('audit', 'cleanup'))
     parser.add_argument('--record', type=Path, required=True)
     args = parser.parse_args()
-    fd = os.open(args.record.parent / '.native-gui-task-host.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, 'w') as lock:
-        found = os.fstat(lock.fileno())
-        runner.require(found.st_uid == os.getuid() and found.st_nlink == 1, 'Unexpected local lock owner')
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with file_lock(args.record.parent / '.native-gui-task-host.lock'):
         print(json.dumps(run(args.record, args.command == 'cleanup'), ensure_ascii=False))
 
 

@@ -26,9 +26,59 @@ public final class NativeMcpService extends Service {
     private static final class Client { final int uid; final IBinder callback; volatile String task=""; volatile boolean connected=true; boolean initialized;
         Client(int uid,IBinder callback){this.uid=uid;this.callback=callback;}
     }
+    static boolean isAuthorizedMcpCaller(int callingUid,int ownUid,boolean permissionGranted,boolean systemPackage){
+        return McpRoutePolicy.isAuthorizedMcpCaller(callingUid,ownUid,permissionGranted,systemPackage);
+    }
+    static void enforceMcpCaller(android.content.Context context){
+        if(context==null)throw new SecurityException("Context unavailable");
+        int callingUid=Binder.getCallingUid();
+        int ownUid=android.os.Process.myUid();
+        if(callingUid==ownUid||callingUid==android.os.Process.SYSTEM_UID||callingUid==2000)return;
+        boolean permGranted=context.checkCallingPermission(PERMISSION)==PackageManager.PERMISSION_GRANTED;
+        boolean systemPkg=false;
+        if(permGranted){
+            PackageManager pm=context.getPackageManager();
+            String[] pkgs=pm==null?null:pm.getPackagesForUid(callingUid);
+            if(pkgs!=null&&pkgs.length>0){
+                systemPkg=true;
+                for(String pkg:pkgs){
+                    try{
+                        android.content.pm.ApplicationInfo ai=pm.getApplicationInfo(pkg,0);
+                        if((ai.flags&(android.content.pm.ApplicationInfo.FLAG_SYSTEM
+                            |android.content.pm.ApplicationInfo.FLAG_UPDATED_SYSTEM_APP))==0){
+                            systemPkg=false;
+                            break;
+                        }
+                    }catch(PackageManager.NameNotFoundException e){
+                        systemPkg=false;
+                        break;
+                    }
+                }
+            }
+        }
+        if(!isAuthorizedMcpCaller(callingUid,ownUid,permGranted,systemPkg)){
+            throw new SecurityException("Original MCP caller permission and system identity required");
+        }
+    }
+    static File mcpCaptureFile(android.content.Context context,String fileOrTaskSuffix){
+        return new File(context.getCacheDir(),"mcp-screen-"+fileOrTaskSuffix);
+    }
+    static void deleteMcpCapture(android.content.Context context,String task){
+        if(context==null||task==null||task.isEmpty())return;
+        mcpCaptureFile(context,task+".jpg").delete();
+        File ext=context.getExternalFilesDir(null);
+        if(ext!=null)new File(ext,"mcp-screen-"+task+".jpg").delete();
+    }
+    static void clearAllMcpCaptures(android.content.Context context){
+        if(context==null)return;
+        for(File dir:new File[]{context.getCacheDir(),context.getExternalFilesDir(null)}){
+            if(dir==null)continue;
+            File[] captures=dir.listFiles((d,name)->name.matches("mcp-screen-[a-f0-9]{32}\\.jpg"));
+            if(captures!=null)for(File file:captures)file.delete();
+        }
+    }
     private void authorize(){
-        if(Binder.getCallingUid()!=android.os.Process.myUid() && checkCallingPermission(PERMISSION)!=PackageManager.PERMISSION_GRANTED)
-            throw new SecurityException("Original MCP caller permission required");
+        enforceMcpCaller(this);
     }
     private final Binder binder=new Binder(){
         @Override protected boolean onTransact(int code,Parcel data,Parcel reply,int flags)throws RemoteException {
@@ -55,7 +105,7 @@ public final class NativeMcpService extends Service {
     private void stop(Client c){
         String task=c.task;c.task="";
         if(!task.isEmpty()){
-            new File(getExternalFilesDir(null),"mcp-screen-"+task+".jpg").delete();
+            deleteMcpCapture(this,task);
             GuiAccessibilityService service=GuiAccessibilityService.instance;
             if(service!=null)service.main.post(()->{
                 try{
@@ -158,7 +208,7 @@ public final class NativeMcpService extends Service {
         CompletableFuture<JSONObject> answer=new CompletableFuture<>();s.main.post(()->{if(!answer.isDone()){try{if(!c.connected)throw new IllegalStateException("MCP session closed");requireLegacyOperation(op);if(!op.equals("status")&&!op.equals("start")&&!op.equals("stop"))s.task.renew(c.task,SystemClock.elapsedRealtime());s.request(request,answer);}catch(Exception e){answer.completeExceptionally(e);}}});
         JSONObject value;try{value=answer.get(8,TimeUnit.SECONDS);}catch(TimeoutException e){answer.cancel(false);throw e;}
         if(!value.optBoolean("ok"))throw new IllegalStateException(value.optString("error","Operation failed"));
-        if(op.equals("start")){if(!c.task.isEmpty())new File(getExternalFilesDir(null),"mcp-screen-"+c.task+".jpg").delete();c.task=request.getString("task");if(!c.connected){stop(c);throw new IllegalStateException("MCP session closed");}}if(op.equals("stop")){endedUid=c.uid;endedTask=c.task;new File(getExternalFilesDir(null),"mcp-screen-"+c.task+".jpg").delete();c.task="";}
+        if(op.equals("start")){if(!c.task.isEmpty())deleteMcpCapture(this,c.task);c.task=request.getString("task");if(!c.connected){stop(c);throw new IllegalStateException("MCP session closed");}}if(op.equals("stop")){endedUid=c.uid;endedTask=c.task;deleteMcpCapture(this,c.task);c.task="";}
         value.put("executionModel","caller-plans-each-action");
         value.put("nextStepHint","start 只建立任务，不会自动执行目标。请由 Amoo 根据 observe 逐步调用 action；若尚未打开目标应用，可先用原厂 open_app_by_name 打开，再 observe。不要轮询等待任务自动完成。最终读图核验后 stop。");
         JSONArray content=new JSONArray();
@@ -168,8 +218,12 @@ public final class NativeMcpService extends Service {
             int width=Math.min(480,image.getWidth());Bitmap scaled=Bitmap.createScaledBitmap(image,width,Math.max(1,image.getHeight()*width/image.getWidth()),true);
             ByteArrayOutputStream bytes=new ByteArrayOutputStream();scaled.compress(Bitmap.CompressFormat.JPEG,75,bytes);if(scaled!=image)scaled.recycle();image.recycle();
             if(bytes.size()>350000)throw new IllegalStateException("Screenshot exceeds IPC limit");
-            File capture=new File(getExternalFilesDir(null),"mcp-screen-"+c.task+".jpg");
+            File capture=mcpCaptureFile(this,c.task+".jpg");
             try(FileOutputStream out=new FileOutputStream(capture)){out.write(bytes.toByteArray());}
+            File extDir=getExternalFilesDir(null);
+            if(c.uid==2000&&extDir!=null){
+                try(FileOutputStream extOut=new FileOutputStream(new File(extDir,"mcp-screen-"+c.task+".jpg"))){extOut.write(bytes.toByteArray());}
+            }
             value.remove("screenshot");value.put("screenshotUri","content://"+McpScreenshotProvider.AUTHORITY+"/"+c.task+".jpg").put("captureTimeMs",System.currentTimeMillis());content.put(new JSONObject().put("type","image").put("mimeType","image/jpeg").put("data",Base64.encodeToString(bytes.toByteArray(),Base64.NO_WRAP)));
         }
         content.put(new JSONObject().put("type","text").put("text",value.toString()));

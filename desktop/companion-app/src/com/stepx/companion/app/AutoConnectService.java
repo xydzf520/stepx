@@ -51,17 +51,36 @@ public final class AutoConnectService extends Service {
     }
     public static void resume(Context c){if(enabled(c))try{c.startForegroundService(new Intent(c,AutoConnectService.class));}catch(Exception e){prefs(c).edit().putString("state","请打开伴侣一次，恢复后台自动连接").apply();}}
     private void status(String value){if(!value.equals(state(this)))prefs(this).edit().putString("state",value).apply();showStatus(value);}
-    private void showStatus(String value){
+    private boolean enterForeground(String value){
         TransferStore.Link link=new TransferStore(this).link();
         String title="电脑自动连接";
         String text=link.online?"已连接 · "+link.name:value;
-        if(!foregroundStarted){
+        try{
             startForeground(104,statusNotification(title,text));
             foregroundStarted=true;
             lastTitle=title;
             lastText=text;
-        }else if(!Objects.equals(title,lastTitle)||!Objects.equals(text,lastText)){
-            getSystemService(NotificationManager.class).notify(104,statusNotification(title,text));
+        }catch(Throwable t){
+            foregroundStarted=false;
+            android.util.Log.w("StepXAutoConnect","startForeground failed",t);
+            prefs(this).edit().putString("state","请打开伴侣一次，恢复后台自动连接").apply();
+            stopSelf();
+            return false;
+        }
+        main.removeCallbacks(refreshLink);
+        if(link.online)main.postDelayed(refreshLink,31000);
+        return true;
+    }
+    private void showStatus(String value){
+        if(!foregroundStarted){
+            enterForeground(value);
+            return;
+        }
+        TransferStore.Link link=new TransferStore(this).link();
+        String title="电脑自动连接";
+        String text=link.online?"已连接 · "+link.name:value;
+        if(!Objects.equals(title,lastTitle)||!Objects.equals(text,lastText)){
+            try{getSystemService(NotificationManager.class).notify(104,statusNotification(title,text));}catch(Throwable ignored){}
             lastTitle=title;
             lastText=text;
         }
@@ -89,10 +108,10 @@ public final class AutoConnectService extends Service {
         }catch(Exception e){status("无线连接未就绪 · 请查看连接管理");}
     }
     @Override public int onStartCommand(Intent intent,int flags,int id){
-        showStatus(state(this));
-        if(intent!=null&&"pause".equals(intent.getAction())){setEnabled(this,false);return START_NOT_STICKY;}
-        if(!enabled(this)){stopSelf();return START_NOT_STICKY;}
-        if(!registered){permissionDeadline=SystemClock.elapsedRealtime()+180000;manager=getSystemService(ConnectivityManager.class);try{manager.registerNetworkCallback(new NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build(),callback);registered=true;}catch(Exception e){status("网络监听未启动 · 请重新开启自动连接");stopSelf();return START_NOT_STICKY;}}
+        if(!enterForeground(state(this)))return START_NOT_STICKY;
+        if(intent!=null&&"pause".equals(intent.getAction())){setEnabled(this,false);try{stopForeground(STOP_FOREGROUND_REMOVE);}catch(Throwable ignored){}stopSelf();return START_NOT_STICKY;}
+        if(!enabled(this)){try{stopForeground(STOP_FOREGROUND_REMOVE);}catch(Throwable ignored){}stopSelf();return START_NOT_STICKY;}
+        if(!registered){permissionDeadline=SystemClock.elapsedRealtime()+180000;manager=getSystemService(ConnectivityManager.class);try{manager.registerNetworkCallback(new NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build(),callback);registered=true;}catch(Exception e){status("网络监听未启动 · 请重新开启自动连接");try{stopForeground(STOP_FOREGROUND_REMOVE);}catch(Throwable ignored){}stopSelf();return START_NOT_STICKY;}}
         if(linkObserver==null&&getSystemService(UserManager.class).isUserUnlocked()){java.io.File dir=getExternalFilesDir(null);if(dir!=null){dir.mkdirs();linkObserver=new FileObserver(dir,FileObserver.CLOSE_WRITE|FileObserver.MOVED_TO){@Override public void onEvent(int event,String path){if("desktop-link.json".equals(path))main.post(refreshLink);}};linkObserver.startWatching();}}
         showStatus(state(this));
         return START_STICKY;

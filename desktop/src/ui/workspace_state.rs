@@ -298,7 +298,11 @@ impl Companion {
         for message in messages {
             match message {
                 Ok(()) => {
-                    if self.workspace.error == self.workspace.persistence_error { self.workspace.error = None; }
+                    if self.workspace.persistence_error.is_some()
+                        && self.workspace.error == self.workspace.persistence_error
+                    {
+                        self.workspace.error = None;
+                    }
                     self.workspace.persistence_error = None;
                 }
                 Err(error) => {
@@ -857,8 +861,11 @@ impl Companion {
                             format!("作品已送达 · {}", a.name),
                             Instant::now(),
                         ));
-                        self.with_device("正在保存到手机作品库…", move |adb, d| {
+                        self.with_device("正在保存到手机作品库…", move |adb, mut d| {
+                            let serial = d.serial.clone();
                             let result = (|| {
+                                let transport = d.resolve_active_transport(adb)?;
+                                d.transport = transport.clone();
                                 let html = stepx_companion::studio_lab::verified_html(&a)?;
                                 let r = stepx_companion::studio_delivery::install_local(
                                     adb, &d, &a.name, &html,
@@ -879,7 +886,7 @@ impl Companion {
                                     };
                                 let _ = stepx_companion::push::post_phone_live_capsule(
                                     adb,
-                                    &d.serial,
+                                    &transport,
                                     &capsule_req,
                                 );
                                 let _ =
@@ -896,7 +903,7 @@ impl Companion {
                                 ))
                             })();
                             Ok(Outcome::StudioLab(StudioLabOutcome::Phone(
-                                d.serial,
+                                serial,
                                 Some(a.id),
                                 result.map_err(|e: anyhow::Error| e.to_string()),
                             )))
@@ -913,13 +920,16 @@ impl Companion {
                         format!("成果已送达 · {output_title}"),
                         Instant::now(),
                     ));
-                    self.with_device("正在发送文件到手机…", move |adb, d| {
-                        let result = stepx_companion::companion_link::send_files(
-                            adb,
-                            &d,
-                            &[path.clone()],
-                        )
-                        .map(|count| {
+                    self.with_device("正在发送文件到手机…", move |adb, mut d| {
+                        let serial = d.serial.clone();
+                        let result = (|| -> Result<String> {
+                            let transport = d.resolve_active_transport(adb)?;
+                            d.transport = transport.clone();
+                            let count = stepx_companion::companion_link::send_files(
+                                adb,
+                                &d,
+                                &[path.clone()],
+                            )?;
                             let capsule_req = stepx_companion::push::PhoneLiveCapsuleRequest {
                                 tag: "stepx_amoo".into(),
                                 pill_text: "✨ Amoo已送达".into(),
@@ -934,7 +944,7 @@ impl Companion {
                             };
                             let _ = stepx_companion::push::post_phone_live_capsule(
                                 adb,
-                                &d.serial,
+                                &transport,
                                 &capsule_req,
                             );
                             let _ =
@@ -944,10 +954,12 @@ impl Companion {
                                     stepx_companion::backscreen_amoo::AgentSpriteState::Celebrating,
                                     0,
                                 );
-                            format!("已校验并发送 {count} 个文件到 StepX伴侣 → 文件 → 接收文件")
-                        })
-                        .map_err(|e| e.to_string());
-                        Ok(Outcome::WorkspaceDelivered(task, path, d.serial, result))
+                            Ok(format!(
+                                "已校验并发送 {count} 个文件到 StepX伴侣 → 文件 → 接收文件"
+                            ))
+                        })()
+                        .map_err(|e| format!("{e:#}"));
+                        Ok(Outcome::WorkspaceDelivered(task, path, serial, result))
                     });
                 }
                 self.workspace.delivery = None;
@@ -1172,11 +1184,12 @@ impl Companion {
                     .cloned()
                     .ok_or_else(|| anyhow::anyhow!("此应用成果不可用"))?;
                 if let Some(id) = &output.lab_id {
-                    self.workspace_select_lab(id)?;
-                    self.handle_studio_lab_action(&StudioLabAction::Preview, ctx);
-                } else {
-                    super::work_state::open_work_path(&output.path)?;
+                    if self.workspace_select_lab(id).is_ok() {
+                        self.handle_studio_lab_action(&StudioLabAction::Preview, ctx);
+                        return Ok(());
+                    }
                 }
+                self.open_html_in_studio_sandbox(output.path, output.lab_id.as_deref())?;
             }
             A::PushAppOutputToPhone(idx) => {
                 self.workspace.selected_output = Some(*idx);
@@ -1209,7 +1222,13 @@ impl Companion {
                     .and_then(|t| t.outputs.get(*idx))
                     .cloned()
                     .ok_or_else(|| anyhow::anyhow!("文件不存在"))?;
-                super::work_state::open_work_path(&output.path)?;
+                if output.lab_id.is_some()
+                    || super::work_state::is_html_deliverable_path(&output.path)
+                {
+                    self.open_html_in_studio_sandbox(output.path, output.lab_id.as_deref())?;
+                } else {
+                    super::work_state::open_work_path(&output.path)?;
+                }
             }
             A::SelectOutput(idx) => {
                 return self.do_workspace(&A::Preview(*idx), ctx);
@@ -4462,8 +4481,11 @@ impl Companion {
                         }
                     }
                     let apps = stepx_companion::apps::catalog(&adb, &device).expect("apps");
+                    let active_transport = device
+                        .resolve_active_transport(&adb)
+                        .unwrap_or_else(|_| device.transport.clone());
                     let push_snap =
-                        stepx_companion::push::fetch_snapshot(&adb, &device.transport, 0)
+                        stepx_companion::push::fetch_snapshot(&adb, &active_transport, 0)
                             .expect("push_snap");
                     let caps = stepx_companion::bridge::capabilities(&adb, &device).ok();
                     let call_logs = device.call_logs(&adb).expect("call_logs");
@@ -5908,12 +5930,16 @@ mod tests {
             image::load_from_memory(&png).is_ok(),
             "phone returns a decodable image"
         );
-        eprintln!(
-            "DEVICE_SMOKE: model={} apps={} gallery={} status_read=true screenshot_valid=true",
-            device.model,
-            apps.len(),
-            gallery.len()
-        );
+        {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "DEVICE_SMOKE: model={} apps={} gallery={} status_read=true screenshot_valid=true",
+                device.model,
+                apps.len(),
+                gallery.len()
+            );
+        }
         let _ = summary;
     }
 

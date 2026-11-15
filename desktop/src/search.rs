@@ -76,6 +76,38 @@ pub struct Hit {
     pub score: u32,
 }
 
+pub(crate) fn is_han(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0x20000..=0x2CEAF
+    )
+}
+
+pub(crate) fn normalize_han_mid_punct(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if matches!(chars[i], '·' | '-' | '_') {
+            let run_start = i;
+            while i < chars.len() && matches!(chars[i], '·' | '-' | '_') {
+                i += 1;
+            }
+            let prev_han = run_start > 0 && is_han(chars[run_start - 1]);
+            let next_han = i < chars.len() && is_han(chars[i]);
+            if !(prev_han && next_han) {
+                for &c in &chars[run_start..i] {
+                    out.push(c);
+                }
+            }
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 pub fn find(docs: &[Document], query: &str, kind: Option<Kind>, phone: Option<bool>) -> Vec<Hit> {
     find_indices(docs, query, kind, phone, 0..docs.len())
 }
@@ -123,6 +155,14 @@ pub(crate) fn find_indices(docs: &[Document], query: &str, kind: Option<Kind>, p
             }
         })
         .collect();
+    let norm_terms: Vec<String> = terms.iter().map(|t| normalize_han_mid_punct(t)).collect();
+    let stripped_query = terms.join(" ");
+    let effective_query = if date_range.is_some() {
+        stripped_query.as_str()
+    } else {
+        query.as_str()
+    };
+    let norm_effective_query = normalize_han_mid_punct(effective_query);
     let mut hits = Vec::new();
     for index in indices {
         let Some(d) = docs.get(index) else { continue; };
@@ -147,25 +187,38 @@ pub(crate) fn find_indices(docs: &[Document], query: &str, kind: Option<Kind>, p
             if d.phone { "手机" } else { "电脑 desktop" }
         )
         .to_lowercase();
-        if !terms
-            .iter()
-            .all(|t| title.contains(t) || body.contains(t) || meta.contains(t))
-        {
+        let norm_title = normalize_han_mid_punct(&title);
+        let norm_body = normalize_han_mid_punct(&body);
+        let norm_meta = normalize_han_mid_punct(&meta);
+        if !terms.iter().zip(&norm_terms).all(|(t, nt)| {
+            title.contains(t)
+                || body.contains(t)
+                || meta.contains(t)
+                || (!nt.is_empty()
+                    && (norm_title.contains(nt)
+                        || norm_body.contains(nt)
+                        || norm_meta.contains(nt)))
+        }) {
             continue;
         }
-        let score = if query.is_empty() {
+        let score = if effective_query.is_empty() {
             0
-        } else if title == query {
+        } else if title == effective_query {
             1000
-        } else if title.starts_with(&query) {
+        } else if !norm_effective_query.is_empty() && norm_title == norm_effective_query {
+            950
+        } else if title.starts_with(effective_query) {
             700
+        } else if !norm_effective_query.is_empty() && norm_title.starts_with(&norm_effective_query) {
+            650
         } else {
             terms
                 .iter()
-                .map(|t| {
-                    if title.contains(t) {
+                .zip(&norm_terms)
+                .map(|(t, nt)| {
+                    if title.contains(t) || (!nt.is_empty() && norm_title.contains(nt)) {
                         150
-                    } else if body.contains(t) {
+                    } else if body.contains(t) || (!nt.is_empty() && norm_body.contains(nt)) {
                         50
                     } else {
                         10
@@ -263,14 +316,33 @@ pub fn safe_document(path: &Path) -> bool {
         )
     })
 }
+fn skip_dir(name: &str) -> bool {
+    name.starts_with('.')
+        || matches!(
+            name,
+            "node_modules"
+                | "target"
+                | "vendor"
+                | "build"
+                | "StepX Storage"
+                | "__pycache__"
+                | ".venv"
+                | "venv"
+                | "cache"
+        )
+}
+
 pub fn desktop_files(roots: &[PathBuf]) -> (Vec<FileRecord>, bool) {
-    let mut stack = roots.to_vec();
+    const MAX_DEPTH: usize = 10;
+    let mut queue: std::collections::VecDeque<(PathBuf, usize)> =
+        roots.iter().cloned().map(|p| (p, 0)).collect();
     let mut seen = std::collections::HashSet::new();
     let mut files = Vec::new();
     let start = std::time::Instant::now();
     let mut visited = 0;
     let mut text_bytes = 0;
-    while let Some(dir) = stack.pop() {
+    let mut limited = false;
+    while let Some((dir, depth)) = queue.pop_front() {
         if start.elapsed().as_secs() > 8 || visited >= 20_000 {
             return (files, true);
         }
@@ -289,12 +361,7 @@ pub fn desktop_files(roots: &[PathBuf]) -> (Vec<FileRecord>, bool) {
                 return (files, true);
             }
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with('.')
-                || matches!(
-                    name.as_str(),
-                    "node_modules" | "target" | "vendor" | "build"
-                )
-            {
+            if name.starts_with('.') {
                 continue;
             }
             let Ok(kind) = entry.file_type() else {
@@ -304,7 +371,13 @@ pub fn desktop_files(roots: &[PathBuf]) -> (Vec<FileRecord>, bool) {
                 continue;
             }
             if kind.is_dir() {
-                stack.push(entry.path());
+                if !skip_dir(&name) {
+                    if depth < MAX_DEPTH {
+                        queue.push_back((entry.path(), depth + 1));
+                    } else {
+                        limited = true;
+                    }
+                }
                 continue;
             }
             if !kind.is_file() {
@@ -339,7 +412,7 @@ pub fn desktop_files(roots: &[PathBuf]) -> (Vec<FileRecord>, bool) {
             });
         }
     }
-    (files, false)
+    (files, limited)
 }
 
 fn uncached_text_preview(path: &Path) -> String {
@@ -498,5 +571,57 @@ mod tests {
         std::fs::write(&path, vec![b'x'; 256 * 1024 + 1]).unwrap();
         assert!(uncached_text_preview(&path).is_empty());
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 256 * 1024 + 1);
+    }
+
+    #[test]
+    fn date_stripped_queries_keep_exact_and_prefix_title_boosts() {
+        let now_ms = chrono::Local::now().timestamp_millis();
+        let mut exact = doc("exact", "周报", "其他说明", true);
+        exact.at = now_ms;
+        let mut prefix = doc("prefix", "周报汇总", "其他说明", true);
+        prefix.at = now_ms;
+        let mut body_only = doc("body", "项目沟通", "请查看本周的周报内容", true);
+        body_only.at = now_ms;
+        let docs = vec![body_only, prefix, exact];
+        let hits = find(&docs, "今天 周报", None, None);
+        assert_eq!(hits.len(), 3);
+        assert_eq!((hits[0].index, hits[0].score), (2, 1000));
+        assert_eq!((hits[1].index, hits[1].score), (1, 700));
+        assert_eq!((hits[2].index, hits[2].score), (0, 50));
+    }
+
+    #[test]
+    fn desktop_files_uses_bfs_caps_depth_and_skips_vault_and_python_caches() {
+        let t = tempfile::tempdir().unwrap();
+        let root_a = t.path().join("root_a");
+        let root_b = t.path().join("root_b");
+        std::fs::create_dir_all(root_a.join("sub")).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        std::fs::write(root_a.join("sub/deeper.txt"), "deeper").unwrap();
+        std::fs::write(root_b.join("top_b.txt"), "top_b").unwrap();
+
+        for ignored in ["StepX Storage", "__pycache__", ".venv", "venv", "cache"] {
+            let d = root_a.join(ignored);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("secret.txt"), "skip").unwrap();
+        }
+
+        let mut deep = root_a.clone();
+        for level in 0..12 {
+            deep = deep.join(format!("d{level}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("too_deep.txt"), "beyond depth 10").unwrap();
+
+        let (files, limited) = desktop_files(&[root_a, root_b]);
+        assert!(limited, "depth > 10 should report limited");
+        let names: Vec<_> = files.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names[0], "top_b.txt",
+            "BFS must visit root_b before descending into root_a/sub"
+        );
+        assert!(names.contains(&"deeper.txt"));
+        assert!(!names.contains(&"secret.txt"));
+        assert!(!names.contains(&"too_deep.txt"));
     }
 }

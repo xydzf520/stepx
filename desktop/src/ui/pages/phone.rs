@@ -307,6 +307,43 @@ impl Companion {
             .collect()
     }
 
+    pub(super) fn effective_active_call_number(&self) -> Option<&str> {
+        if self.demo_mode || self.selected.is_none() {
+            return None;
+        }
+        self.active_call_number
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
+    pub(super) fn effective_call_sim(&self) -> Option<i32> {
+        self.capabilities.as_ref().and_then(|c| {
+            self.selected_call_sim
+                .filter(|id| c.subscriptions.iter().any(|s| s.id == *id))
+                .or_else(|| {
+                    c.subscriptions
+                        .iter()
+                        .find(|s| s.id == c.default_subscription)
+                        .map(|s| s.id)
+                })
+                .or_else(|| (c.subscriptions.len() == 1).then(|| c.subscriptions[0].id))
+        })
+    }
+
+    pub(super) fn cancel_pending_call_action(&self) -> Action {
+        if self
+            .interaction
+            .review
+            .as_ref()
+            .is_some_and(|r| matches!(r.action, Action::PhoneConfirmCall))
+        {
+            Action::ReviewCancel
+        } else {
+            Action::PhoneCancelCall
+        }
+    }
+
     pub(in super::super) fn phone_top_bar(&self) -> El {
         let p = self.p();
         let total_calls_count = self.call_logs.len();
@@ -324,7 +361,7 @@ impl Companion {
             self.pill_badge(format!("{total_calls_count} 通话"), p.accent, p.accent_soft),
             self.pill_badge(format!("{contacts_count} 联系人"), p.text2, p.surface),
         ];
-        if let Some(ref num) = self.active_call_number {
+        if let Some(num) = self.effective_active_call_number() {
             left_items.push(self.pill_badge(
                 format!("通话中 {num}"),
                 p.success_text,
@@ -1095,13 +1132,14 @@ impl Companion {
             .flatten()
             .unwrap_or_default();
 
+        let effective_sim = self.effective_call_sim();
         let carrier_status = self
             .capabilities
             .as_ref()
             .map(|c| {
                 c.subscriptions
                     .iter()
-                    .find(|s| Some(s.id) == self.selected_call_sim)
+                    .find(|s| Some(s.id) == effective_sim)
                     .map(|s| {
                         format!(
                             "{} · 卡 {}",
@@ -1134,7 +1172,7 @@ impl Companion {
                                 stepx_companion::bridge::friendly_carrier_name(&sim.label)
                             ),
                             Action::PhoneSelectSim(sim.id),
-                            if self.selected_call_sim == Some(sim.id) {
+                            if effective_sim == Some(sim.id) {
                                 Btn::Primary
                             } else {
                                 Btn::Secondary
@@ -1249,8 +1287,8 @@ impl Companion {
 
         let mut bottom_call_items: Vec<El> = Vec::new();
 
-        if let Some(active_num) = self.active_call_number.as_ref().filter(|_| !self.demo_mode) {
-            let norm_active = norm_phone(active_num);
+        if let Some(active_num) = self.effective_active_call_number().map(str::to_string) {
+            let norm_active = norm_phone(&active_num);
             let peer_label = effective_contacts
                 .iter()
                 .find(|c| norm_phone(&c.number) == norm_active)
@@ -1300,6 +1338,7 @@ impl Companion {
         }
 
         if let Some(plan) = &self.pending_call {
+            let cancel_action = self.cancel_pending_call_action();
             bottom_call_items.push(
                 Container::new(self.vstack(
                     S2,
@@ -1320,7 +1359,7 @@ impl Companion {
                                 "ph-cancel-call",
                                 "取消",
                                 UiIcon::Close,
-                                Action::PhoneCancelCall,
+                                cancel_action,
                                 Btn::Secondary,
                             ),
                             self.button_icon(
@@ -1667,5 +1706,73 @@ mod tests {
         // Viewing Page::Phone marks the new missed call as seen
         app.mark_missed_calls_seen();
         assert_eq!(app.unseen_missed_call_count(), 0);
+    }
+
+    #[test]
+    fn phone_sim_selection_and_cancel_call_review_stay_consistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = crate::ui::TestUiConfigDirGuard::set(dir.path());
+        let mut app = Companion::new_for_test();
+        app.demo_mode = false;
+        app.selected = Some(Device {
+            serial: "phone-sim-test".into(),
+            ..Default::default()
+        });
+        app.capabilities = Some(stepx_companion::bridge::Capabilities {
+            send_sms: true,
+            locked: false,
+            default_subscription: 2,
+            subscriptions: vec![
+                stepx_companion::bridge::SimSubscription {
+                    id: 1,
+                    slot: 0,
+                    label: "中国移动".into(),
+                },
+                stepx_companion::bridge::SimSubscription {
+                    id: 2,
+                    slot: 1,
+                    label: "中国联通".into(),
+                },
+            ],
+            protocol: 2,
+        });
+
+        // Falls back to default_subscription when selected_call_sim is None or stale.
+        app.selected_call_sim = None;
+        assert_eq!(app.effective_call_sim(), Some(2));
+        app.selected_call_sim = Some(99);
+        assert_eq!(app.effective_call_sim(), Some(2));
+        app.selected_call_sim = Some(1);
+        assert_eq!(app.effective_call_sim(), Some(1));
+
+        // Disconnected device hides stale active_call_number.
+        app.active_call_number = Some("13800009367".into());
+        assert_eq!(app.effective_active_call_number(), Some("13800009367"));
+        app.selected = None;
+        assert_eq!(app.effective_active_call_number(), None);
+
+        // Prepared call sets both pending_call and interaction.review(PhoneConfirmCall);
+        // cancel_pending_call_action selects ReviewCancel so both are cleared together.
+        app.selected = Some(Device {
+            serial: "phone-sim-test".into(),
+            ..Default::default()
+        });
+        app.fields[crate::ui::F_PHONE_DIAL].set("13800009367");
+        app.apply(crate::ui::Outcome::PhoneCallPrepared(
+            stepx_companion::phone::DialPlan {
+                request_id: "req-1".into(),
+                device_serial: "phone-sim-test".into(),
+                number: "13800009367".into(),
+                subscription: 1,
+                subscription_label: "中国移动".into(),
+                account_key: "acc-1".into(),
+            },
+        ));
+        assert!(app.pending_call.is_some());
+        assert!(app.interaction.review.is_some());
+        assert!(matches!(
+            app.cancel_pending_call_action(),
+            crate::ui::Action::ReviewCancel
+        ));
     }
 }

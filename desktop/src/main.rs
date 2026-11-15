@@ -6,28 +6,20 @@ pub use stepx_companion::app_store;
 mod ui;
 
 fn main() -> anyhow::Result<()> {
-    if let Some(i)=std::env::args().position(|v|v=="--restore-database") {
-        let source=std::env::args().nth(i+1).ok_or_else(||anyhow::anyhow!("请提供数据库备份路径"))?;
-        let old=stepx_companion::storage_maintenance::restore(&stepx_companion::data_store::default_path(),std::path::Path::new(&source))?;
-        println!("数据库已恢复；恢复前数据保存在 {}",old.display());return Ok(());
-    }
-    if std::env::args().any(|v|v=="--maintain-database") {println!("{}",stepx_companion::storage_maintenance::run(true)?);return Ok(());}
-    // Cap Rayon's global font-indexing thread pool so 32-core workstations do not
-    // keep 32 permanent idle threads and 32 × 64 MiB malloc arenas for a 40ms startup scan.
-    if std::env::var_os("RAYON_NUM_THREADS").is_none() {
-        unsafe {
-            std::env::set_var("RAYON_NUM_THREADS", "4");
-        }
-    }
-    #[cfg(target_os = "linux")]
-    if std::env::args().any(|a| a == "--speech-helper") {
-        return stepx_companion::speech::helper();
-    }
-    #[cfg(all(windows, feature = "desktop-ui"))]
+    use std::io::Write;
+    #[cfg(target_os = "windows")]
     if std::env::args().any(|a| {
         matches!(
             a.as_str(),
-            "--version" | "-V" | "--help" | "-h" | "--doctor" | "--check-runtime" | "--check-apk"
+            "--restore-database"
+                | "--maintain-database"
+                | "--version"
+                | "-V"
+                | "--help"
+                | "-h"
+                | "--doctor"
+                | "--check-runtime"
+                | "--check-apk"
         )
     }) {
         // Attach only to an existing terminal. Double-click never creates one.
@@ -44,8 +36,30 @@ fn main() -> anyhow::Result<()> {
             }
         }
     }
+    if let Some(i)=std::env::args().position(|v|v=="--restore-database") {
+        let source=std::env::args().nth(i+1).ok_or_else(||anyhow::anyhow!("请提供数据库备份路径"))?;
+        let old=stepx_companion::storage_maintenance::restore(&stepx_companion::data_store::default_path(),std::path::Path::new(&source))?;
+        let _ = writeln!(std::io::stdout(), "数据库已恢复；恢复前数据保存在 {}", old.display());
+        return Ok(());
+    }
+    if std::env::args().any(|v|v=="--maintain-database") {
+        let _ = writeln!(std::io::stdout(), "{}", stepx_companion::storage_maintenance::run(true)?);
+        return Ok(());
+    }
+    // Cap Rayon's global font-indexing thread pool so 32-core workstations do not
+    // keep 32 permanent idle threads and 32 × 64 MiB malloc arenas for a 40ms startup scan.
+    if std::env::var_os("RAYON_NUM_THREADS").is_none() {
+        unsafe {
+            std::env::set_var("RAYON_NUM_THREADS", "4");
+        }
+    }
+    #[cfg(target_os = "linux")]
+    if std::env::args().any(|a| a == "--speech-helper") {
+        return stepx_companion::speech::helper();
+    }
     if std::env::args().any(|arg| arg == "--version" || arg == "-V") {
-        println!(
+        let _ = writeln!(
+            std::io::stdout(),
             "StepX Companion v{} · {}",
             stepx_companion::build_info::VERSION,
             stepx_companion::build_info::compiled_id()
@@ -53,7 +67,7 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     if std::env::args().any(|arg| arg == "--help" || arg == "-h") {
-        println!("StepX Companion · 手机与电脑的桌面伴侣 (macOS / Windows / Linux)\n\n运行：stepx-companion\n诊断连接：stepx-companion --doctor\n备份维护：--maintain-database\n离线恢复（先退出客户端）：--restore-database /absolute/backup.sqlite3\n扫码配对：stepx-companion --pair-qr\n简洁模式：--compact（Amoo 对话 / 手机通知统一小窗）；兼容 --mini-ai、--mini-notify\n界面主题：--light | --dark（默认跟随系统主题，或设置 STEPX_THEME=light|dark）\n界面截图（需要 ui-capture feature）：--capture-ui /absolute/path.png\n指定初始页：--page home|terminal|overview|amoo|sms|notifications|files|apps|tools|connect\n工具详情：--page tools --tool updates|storage|google|companion|neo|apk|screen|services|input-method|device|clipboard|mcp-hub|ai-safety|wellbeing");
+        let _ = writeln!(std::io::stdout(), "StepX Companion · 手机与电脑的桌面伴侣 (macOS / Windows / Linux)\n\n运行：stepx-companion\n诊断连接：stepx-companion --doctor\n备份维护：--maintain-database\n离线恢复（先退出客户端）：--restore-database /absolute/backup.sqlite3\n扫码配对：stepx-companion --pair-qr\n简洁模式：--compact（Amoo 对话 / 手机通知统一小窗）；兼容 --mini-ai、--mini-notify\n界面主题：--light | --dark（默认跟随系统主题，或设置 STEPX_THEME=light|dark）\n界面截图（需要 ui-capture feature）：--capture-ui /absolute/path.png\n指定初始页：--page home|terminal|overview|amoo|sms|notifications|files|apps|tools|connect\n工具详情：--page tools --tool updates|storage|google|companion|neo|apk|screen|services|input-method|device|clipboard|mcp-hub|ai-safety|wellbeing");
         return Ok(());
     }
     if !cfg!(feature = "ui-capture") && std::env::args().any(|arg| arg == "--capture-ui") {
@@ -64,7 +78,7 @@ fn main() -> anyhow::Result<()> {
             .nth(index + 1)
             .ok_or_else(|| anyhow::anyhow!("用法：--check-apk <APK 文件>；仅校验，不安装"))?;
         let package = stepx_companion::device::verify_apk_identity(std::path::Path::new(&path))?;
-        println!("APK verified: {package}");
+        let _ = writeln!(std::io::stdout(), "APK verified: {package}");
         return Ok(());
     }
     if std::env::args().any(|arg| arg == "--check-runtime") {
@@ -89,16 +103,25 @@ fn main() -> anyhow::Result<()> {
             package == "com.stepx.companion.app",
             "随包 APK 包名校验失败"
         );
-        println!("ADB OK; Python OK; APK package and signature verification OK");
+        let _ = writeln!(
+            std::io::stdout(),
+            "ADB OK; Python OK; APK package and signature verification OK"
+        );
         return Ok(());
     }
     if std::env::args().any(|arg| arg == "--doctor") {
         let adb = stepx_companion::adb::Adb::discover()?;
-        println!("{}", adb.run(&["version"])?);
-        println!("{}", adb.run(&["devices", "-l"])?);
-        println!("{}", adb.run(&["mdns", "services"])?);
+        let _ = writeln!(std::io::stdout(), "{}", adb.run(&["version"])?);
+        let _ = writeln!(std::io::stdout(), "{}", adb.run(&["devices", "-l"])?);
+        let _ = writeln!(std::io::stdout(), "{}", adb.run(&["mdns", "services"])?);
         for service in stepx_companion::discovery::discover_services(&adb)? {
-            println!("{} {} {}", service.name, service.kind, service.endpoint);
+            let _ = writeln!(
+                std::io::stdout(),
+                "{} {} {}",
+                service.name,
+                service.kind,
+                service.endpoint
+            );
         }
         return Ok(());
     }

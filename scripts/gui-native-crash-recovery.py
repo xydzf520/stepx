@@ -6,7 +6,6 @@ It proves only ownership and deletion of staged files/private host storage. A
 crash, empty output, or missing endpoint does not prove that no task ever ran.
 """
 import argparse
-import fcntl
 import hashlib
 import importlib.util
 import json
@@ -16,6 +15,9 @@ import re
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / 'scripts') not in sys.path:
+    sys.path.insert(0, str(ROOT / 'scripts'))
+from host_runtime import file_lock
 spec = importlib.util.spec_from_file_location('crash_storage', ROOT / 'scripts/gui-native-host-storage.py')
 storage = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(storage)
@@ -203,11 +205,7 @@ def main():
     parser.add_argument('command', choices=('crash-audit', 'crash-cleanup'))
     parser.add_argument('--record', type=Path, required=True)
     args = parser.parse_args()
-    fd = os.open(args.record.parent / '.native-gui-task-host.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, 'w') as lock:
-        found = os.fstat(lock.fileno())
-        runner.require(found.st_uid == os.getuid() and found.st_nlink == 1, 'Unexpected local lock owner')
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with file_lock(args.record.parent / '.native-gui-task-host.lock'):
         print(json.dumps(run(args.record, args.command == 'crash-cleanup'), ensure_ascii=False))
 
 

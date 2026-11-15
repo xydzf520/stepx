@@ -6,6 +6,7 @@ run on Linux and macOS; Windows itself still runs the packaged executable.
 """
 from __future__ import annotations
 
+import argparse
 import ctypes
 import hashlib
 import json
@@ -14,6 +15,7 @@ import re
 import shutil
 import struct
 import subprocess
+import sys
 from pathlib import Path, PurePosixPath
 
 CRT_DLLS = frozenset({
@@ -146,7 +148,7 @@ def verify_closure(executable: Path) -> list[str]:
 
 
 def select_redist(installation: Path, toolset: str) -> Path:
-    """Select release x64 CRT from the same installation/toolset family."""
+    """Select release x64 CRT from the same major and equal-or-newer minor family."""
     if not re.fullmatch(r'\d+\.\d+\.\d+(?:\.\d+)?', toolset):
         raise ValueError('Invalid active MSVC toolset version')
     family = tuple(map(int, toolset.split('.')[:2]))
@@ -156,12 +158,12 @@ def select_redist(installation: Path, toolset: str) -> Path:
         if not re.fullmatch(r'\d+(?:\.\d+){2,3}', version.name):
             continue
         numbers = tuple(map(int, version.name.split('.')))
-        if numbers[:2] != family:
+        if numbers[0] != family[0] or numbers[:2] < family:
             continue
         for path in (version / 'x64').glob('Microsoft.VC*.CRT'):
             path.resolve(strict=True).relative_to(root.resolve(strict=True))
             if path.is_dir() and not path.is_symlink():
-                choices.append((numbers, path))
+                choices.append(((numbers[:2] == family, numbers), path))
     if not choices:
         raise RuntimeError(f'Matching x64 Visual C++ release CRT not installed for toolset {toolset}')
     return max(choices, key=lambda item: item[0])[1]
@@ -189,7 +191,7 @@ def discover_redist() -> tuple[Path, str, str]:
             raise RuntimeError('Active MSVC toolset is outside the selected installation')
         toolset = rel.name
     else:
-        toolset = (installation / 'VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt').read_text().strip()
+        toolset = (installation / 'VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt').read_text(encoding='utf-8').strip()
     redist = select_redist(installation, toolset)
     return redist, toolset, redist.relative_to(installation).as_posix()
 
@@ -242,7 +244,7 @@ def stage_crt(executable: Path, redist: Path, toolset: str, source: str, *, vers
                     raise RuntimeError(f'Matching Visual Studio release CRT missing {name}')
                 pe_imports(origin)  # x64 and structural validation before copy
                 version = version_reader(origin)
-                if version[:len(minimum)] < minimum:
+                if not (version[0] == minimum[0] and version[:2] >= minimum[:2]):
                     raise RuntimeError(f'{name}: CRT version is older than active MSVC toolset')
                 destination = executable.parent / name
                 if name not in records:
@@ -293,3 +295,28 @@ def relocate_crt(executable: Path, destination: Path) -> None:
 def package_windows_crt(executable: Path) -> dict:
     redist, toolset, source = discover_redist()
     return stage_crt(executable, redist, toolset, source)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description='Stage and verify app-local Windows MSVC CRT DLLs beside the executable.'
+    )
+    parser.add_argument('executable', type=Path, help='Path to the packaged x64 Windows executable')
+    parser.add_argument(
+        '--verify-only',
+        action='store_true',
+        help='Verify existing windows-crt.json manifest and DLL closure without discovering Visual Studio',
+    )
+    args = parser.parse_args(argv)
+    executable = args.executable.resolve(strict=True)
+    if args.verify_only:
+        report = verify_manifest(executable)
+    else:
+        package_windows_crt(executable)
+        report = verify_manifest(executable)
+    print(json.dumps(report, ensure_ascii=False))
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

@@ -3,6 +3,7 @@
 Uses ClawHub's current ownerHandle API, since old phone installers only accept
 globally unique bare slugs. Receives a JSON argument; stdout is structured proof.
 """
+import base64
 import hashlib
 import io
 import json
@@ -10,7 +11,9 @@ import os
 import pathlib
 import re
 import shutil
+import socket
 import stat
+import struct
 import sys
 import tempfile
 import time
@@ -37,6 +40,28 @@ def component(value):
     return value
 
 
+def _extract_http_error_detail(error):
+    try:
+        raw = error.read(2048).decode("utf-8", errors="ignore").strip()
+    except Exception:
+        return ""
+    if not raw:
+        return ""
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            err_field = parsed.get("error") or parsed.get("message") or parsed.get("detail")
+            if isinstance(err_field, dict):
+                err_field = err_field.get("message") or err_field.get("code")
+            if isinstance(err_field, str) and err_field.strip():
+                raw = err_field.strip()
+    except Exception:
+        pass
+    clean = " ".join(raw.split())
+    clean = re.sub(r"(?i)(bearer\s+|token=|key=)\S+", r"\1[redacted]", clean)
+    return clean[:180]
+
+
 def request(path, query, limit=MAX_BYTES):
     url = BASE + path + "?" + urllib.parse.urlencode(query)
     req = urllib.request.Request(url, headers={"User-Agent": "StepX-Companion/0.1"})
@@ -50,7 +75,169 @@ def request(path, query, limit=MAX_BYTES):
         if error.code == 429:
             retry = error.headers.get("Retry-After", "稍后")
             raise ValueError("技能市场限流，请等待 " + retry + " 后重试") from None
-        raise ValueError("技能市场请求失败 HTTP " + str(error.code)) from None
+        detail = _extract_http_error_detail(error)
+        suffix = ("：" + detail) if detail else ""
+        raise ValueError("技能市场请求失败 HTTP " + str(error.code) + suffix) from None
+
+
+def build_ws_connect_params(token=None):
+    resolved_token = (token if token is not None else os.environ.get("OPENCLAW_GATEWAY_TOKEN", "")).strip()
+    params = {
+        "minProtocol": 3,
+        "maxProtocol": 3,
+        "client": {
+            "id": "stepx-companion-skills",
+            "version": "0.1",
+            "platform": "linux",
+            "mode": "cli",
+        },
+        "role": "operator",
+        "scopes": ["operator.read", "operator.write"],
+    }
+    if resolved_token:
+        params["auth"] = {"token": resolved_token}
+    return params
+
+
+def _ws_send_text(sock, text):
+    payload = text.encode("utf-8")
+    mask = os.urandom(4)
+    header = bytearray([0x81])
+    length = len(payload)
+    if length < 126:
+        header.append(0x80 | length)
+    elif length < 65536:
+        header.append(0x80 | 126)
+        header.extend(struct.pack("!H", length))
+    else:
+        header.append(0x80 | 127)
+        header.extend(struct.pack("!Q", length))
+    header.extend(mask)
+    masked = bytes(b ^ mask[idx & 3] for idx, b in enumerate(payload))
+    sock.sendall(bytes(header) + masked)
+
+
+def _ws_recv_exact(sock, count):
+    chunks = bytearray()
+    while len(chunks) < count:
+        chunk = sock.recv(count - len(chunks))
+        if not chunk:
+            raise ValueError("OpenClaw 网关连接意外中断")
+        chunks.extend(chunk)
+    return bytes(chunks)
+
+
+def _ws_recv_json(sock):
+    while True:
+        head = _ws_recv_exact(sock, 2)
+        opcode = head[0] & 0x0F
+        masked = bool(head[1] & 0x80)
+        length = head[1] & 0x7F
+        if length == 126:
+            length = struct.unpack("!H", _ws_recv_exact(sock, 2))[0]
+        elif length == 127:
+            length = struct.unpack("!Q", _ws_recv_exact(sock, 8))[0]
+        require(length <= MAX_BYTES, "OpenClaw 网关响应超过大小上限")
+        mask_key = _ws_recv_exact(sock, 4) if masked else None
+        payload = _ws_recv_exact(sock, length)
+        if mask_key:
+            payload = bytes(b ^ mask_key[idx & 3] for idx, b in enumerate(payload))
+        if opcode == 0x8:
+            raise ValueError("OpenClaw 网关已关闭连接")
+        if opcode == 0x9:
+            # Reply pong
+            pong = bytearray([0x8A, 0x80 | min(len(payload), 125)])
+            pmask = os.urandom(4)
+            pong.extend(pmask)
+            pong.extend(bytes(b ^ pmask[idx & 3] for idx, b in enumerate(payload[:125])))
+            sock.sendall(bytes(pong))
+            continue
+        if opcode == 0x1:
+            return json.loads(payload.decode("utf-8"))
+
+
+def direct_ws_rpc(method, params, host="127.0.0.1", port=18789, token=None, timeout=15):
+    ws_key = base64.b64encode(os.urandom(16)).decode("ascii")
+    with socket.create_connection((host, int(port)), timeout=timeout) as sock:
+        sock.settimeout(timeout)
+        handshake = (
+            f"GET / HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {ws_key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n\r\n"
+        )
+        sock.sendall(handshake.encode("ascii"))
+        header_buf = bytearray()
+        while b"\r\n\r\n" not in header_buf:
+            chunk = sock.recv(1024)
+            if not chunk:
+                raise ValueError("OpenClaw 网关握手未响应")
+            header_buf.extend(chunk)
+            require(len(header_buf) <= 16384, "OpenClaw 网关握手响应异常")
+        status_line = header_buf.split(b"\r\n", 1)[0].decode("latin1", errors="ignore")
+        require("101" in status_line, "OpenClaw 网关拒绝 WebSocket 升级: " + status_line[:120])
+
+        connect_req = {
+            "type": "req",
+            "id": "stepx-connect",
+            "method": "connect",
+            "params": build_ws_connect_params(token=token),
+        }
+        _ws_send_text(sock, json.dumps(connect_req, ensure_ascii=False))
+        while True:
+            frame = _ws_recv_json(sock)
+            if frame.get("type") == "res" and frame.get("id") == "stepx-connect":
+                if not frame.get("ok"):
+                    err = frame.get("error") or {}
+                    msg = err.get("message") if isinstance(err, dict) else str(err)
+                    raise ValueError("OpenClaw 网关鉴权失败: " + (msg or "未授权")[:200])
+                break
+
+        rpc_id = "stepx-rpc-1"
+        _ws_send_text(
+            sock,
+            json.dumps({"type": "req", "id": rpc_id, "method": method, "params": params}, ensure_ascii=False),
+        )
+        while True:
+            frame = _ws_recv_json(sock)
+            if frame.get("type") == "res" and frame.get("id") == rpc_id:
+                if not frame.get("ok"):
+                    err = frame.get("error") or {}
+                    msg = err.get("message") if isinstance(err, dict) else str(err)
+                    raise ValueError((msg or f"{method} 调用失败")[:240])
+                return frame.get("payload")
+
+
+def market_search(args):
+    query = str(args.get("query") or "").strip()
+    require(1 <= len(query) <= 160, "请输入 1–160 字的技能关键词")
+    limit = min(max(int(args.get("limit") or 40), 1), 100)
+    errors = []
+    try:
+        payload = direct_ws_rpc(
+            "skills.search",
+            {"query": query, "limit": limit},
+            token=args.get("gatewayToken"),
+        )
+        if isinstance(payload, dict):
+            payload.setdefault("ok", True)
+            return payload
+    except Exception as ws_err:
+        errors.append(str(ws_err)[:200])
+    try:
+        raw = request("/api/v1/skills/search", {"q": query, "limit": limit}, MAX_TEXT)
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            parsed.setdefault("ok", True)
+            return parsed
+        if isinstance(parsed, list):
+            return {"ok": True, "skills": parsed}
+    except Exception as http_err:
+        errors.append(str(http_err)[:200])
+    detail = "；".join(e for e in errors if e) or "技能市场未返回有效数据"
+    raise ValueError("技能市场搜索失败：" + detail[:320])
 
 
 def safe_path(value):
@@ -206,8 +393,16 @@ if __name__ == "__main__":
     try:
         args = json.loads(sys.argv[1])
         action = args.get("action")
-        require(action in ("install", "export", "origins"), "未知技能操作")
-        result = install(args) if action == "install" else origins(args) if action == "origins" else export(args)
+        require(action in ("install", "export", "origins", "search"), "未知技能操作")
+        result = (
+            install(args)
+            if action == "install"
+            else origins(args)
+            if action == "origins"
+            else market_search(args)
+            if action == "search"
+            else export(args)
+        )
         print(json.dumps(result, ensure_ascii=False))
     except Exception as error:
         print(json.dumps({"ok": False, "error": str(error)[:400]}, ensure_ascii=False))

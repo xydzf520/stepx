@@ -10,9 +10,9 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver},
-        Arc,
+        Arc, Mutex, OnceLock,
     },
     thread,
     time::{Duration, Instant},
@@ -20,6 +20,39 @@ use std::{
 
 const RUNTIME: &str = include_str!("../../scripts/studio-lab-runtime.py");
 const MAX_HTML: u64 = 2 * 1024 * 1024;
+const MAX_STUDIO_CACHE_ENTRIES: usize = 256;
+const CSP_META_TAG: &str = "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; media-src data: blob:; font-src data:; connect-src 'none'; form-action 'none'\">";
+
+pub(crate) fn ensure_csp_meta(html: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    if lower.contains("content-security-policy") {
+        return html.to_string();
+    }
+    if let Some(head_idx) = lower.find("<head") {
+        if let Some(rel_close) = lower[head_idx..].find('>') {
+            let insert_at = head_idx + rel_close + 1;
+            let mut out = String::with_capacity(html.len() + CSP_META_TAG.len() + 1);
+            out.push_str(&html[..insert_at]);
+            out.push('\n');
+            out.push_str(CSP_META_TAG);
+            out.push_str(&html[insert_at..]);
+            return out;
+        }
+    }
+    if let Some(html_idx) = lower.find("<html") {
+        if let Some(rel_close) = lower[html_idx..].find('>') {
+            let insert_at = html_idx + rel_close + 1;
+            let mut out = String::with_capacity(html.len() + CSP_META_TAG.len() + 16);
+            out.push_str(&html[..insert_at]);
+            out.push_str("\n<head>");
+            out.push_str(CSP_META_TAG);
+            out.push_str("</head>");
+            out.push_str(&html[insert_at..]);
+            return out;
+        }
+    }
+    format!("{CSP_META_TAG}\n{html}")
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PublicConfig {
@@ -323,6 +356,32 @@ pub fn list_models() -> Result<Vec<String>> {
     Ok(models)
 }
 
+fn next_cache_seq() -> u64 {
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+fn insert_bounded_cache<K: Eq + std::hash::Hash + Clone, V>(
+    map: &mut std::collections::HashMap<K, (u64, V)>,
+    max_entries: usize,
+    key: K,
+    val: V,
+) {
+    if !map.contains_key(&key) {
+        while map.len() >= max_entries {
+            let Some(oldest_key) = map
+                .iter()
+                .min_by_key(|(_, (seq, _))| *seq)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            map.remove(&oldest_key);
+        }
+    }
+    map.insert(key, (next_cache_seq(), val));
+}
+
 type ValidatedArtifactCacheEntry = (
     u64,
     std::time::SystemTime,
@@ -332,20 +391,20 @@ type ValidatedArtifactCacheEntry = (
 );
 
 fn validated_artifact_cache(
-) -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, ValidatedArtifactCacheEntry>> {
-    static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<PathBuf, ValidatedArtifactCacheEntry>>,
-    > = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+) -> &'static Mutex<std::collections::HashMap<PathBuf, (u64, ValidatedArtifactCacheEntry)>> {
+    static CACHE: OnceLock<
+        Mutex<std::collections::HashMap<PathBuf, (u64, ValidatedArtifactCacheEntry)>>,
+    > = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
-fn report_json_cache() -> &'static std::sync::Mutex<
-    std::collections::HashMap<PathBuf, (u64, std::time::SystemTime, Value)>,
+fn report_json_cache() -> &'static Mutex<
+    std::collections::HashMap<PathBuf, (u64, (u64, std::time::SystemTime, Value))>,
 > {
-    static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<PathBuf, (u64, std::time::SystemTime, Value)>>,
-    > = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    static CACHE: OnceLock<
+        Mutex<std::collections::HashMap<PathBuf, (u64, (u64, std::time::SystemTime, Value))>>,
+    > = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
 fn own_html(path: &Path) -> Result<PathBuf> {
@@ -379,7 +438,8 @@ fn validate_artifact(mut artifact: LabArtifact) -> Result<LabArtifact> {
             && report_meta.is_file()
         {
             if let Ok(cache) = validated_artifact_cache().lock() {
-                if let Some((h_len, h_time, r_len, r_time, cached)) = cache.get(&artifact.html_path)
+                if let Some((_, (h_len, h_time, r_len, r_time, cached))) =
+                    cache.get(&artifact.html_path)
                 {
                     if *h_len == html_meta.len()
                         && *h_time == html_mtime
@@ -427,7 +487,9 @@ fn validate_artifact(mut artifact: LabArtifact) -> Result<LabArtifact> {
     let report: Value =
         serde_json::from_slice(&fs::read(&artifact.report_path)?).context("作品验收报告无效")?;
     if let Ok(mut rcache) = report_json_cache().lock() {
-        rcache.insert(
+        insert_bounded_cache(
+            &mut rcache,
+            MAX_STUDIO_CACHE_ENTRIES,
             artifact.report_path.clone(),
             (metadata.len(), report_mtime, report.clone()),
         );
@@ -454,8 +516,18 @@ fn validate_artifact(mut artifact: LabArtifact) -> Result<LabArtifact> {
                 report_mtime,
                 artifact.clone(),
             );
-            cache.insert(orig_html_path, entry.clone());
-            cache.insert(artifact.html_path.clone(), entry);
+            insert_bounded_cache(
+                &mut cache,
+                MAX_STUDIO_CACHE_ENTRIES,
+                orig_html_path,
+                entry.clone(),
+            );
+            insert_bounded_cache(
+                &mut cache,
+                MAX_STUDIO_CACHE_ENTRIES,
+                artifact.html_path.clone(),
+                entry,
+            );
         }
     }
     Ok(artifact)
@@ -588,27 +660,33 @@ pub fn ensure_starter_artifacts() -> Result<()> {
         let report_path = round_dir.join("report.json");
         let preview_path = round_dir.join("preview.png");
         let artifact_path = round_dir.join("artifact.json");
+        let html_with_csp = ensure_csp_meta(html);
         if html_path.is_file()
             && report_path.is_file()
             && preview_path.is_file()
             && artifact_path.is_file()
         {
             // Upgrade old bundled examples that incorrectly advertised fabricated
-            // browser checks; preserve any actual locally verified report.
+            // browser checks or lacked defense-in-depth CSP meta; preserve any actual locally verified report.
             let old = fs::read(&report_path).ok().and_then(|v| serde_json::from_slice::<Value>(&v).ok());
-            if old.as_ref().is_some_and(|v| v["source"] == "bundled-example"
-                || v["limitations"] != "内置可玩样板已通过桌面与 390×844 手机布局及交互验收。") {
+            let has_csp = fs::read_to_string(&html_path)
+                .map(|s| s.to_ascii_lowercase().contains("content-security-policy"))
+                .unwrap_or(false);
+            if has_csp
+                && old.as_ref().is_some_and(|v| v["source"] == "bundled-example"
+                    || v["limitations"] != "内置可玩样板已通过桌面与 390×844 手机布局及交互验收。")
+            {
                 continue;
             }
         }
         private_directory(&runs.join(dir_name))?;
         private_directory(&round_dir)?;
-        fs::write(&html_path, html.as_bytes())?;
+        fs::write(&html_path, html_with_csp.as_bytes())?;
         let _ = write_starter_preview(&preview_path, kind);
         let report = json!({
             "passed": false,
             "source": "bundled-example",
-            "html_sha256": html_hash(html.as_bytes()),
+            "html_sha256": html_hash(html_with_csp.as_bytes()),
             "checks": [],
             "limitations": "内置示例，可直接体验；本机尚未执行功能验收。修改后会运行浏览器检查。"
         });
@@ -714,7 +792,7 @@ pub fn read_report(artifact: &LabArtifact) -> Result<Value> {
     ensure!(meta.len() < 128 * 1024, "作品报告过大");
     let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
     if let Ok(cache) = report_json_cache().lock() {
-        if let Some((len, cached_mtime, val)) = cache.get(&artifact.report_path) {
+        if let Some((_, (len, cached_mtime, val))) = cache.get(&artifact.report_path) {
             if *len == meta.len() && *cached_mtime == mtime {
                 return Ok(val.clone());
             }
@@ -722,7 +800,12 @@ pub fn read_report(artifact: &LabArtifact) -> Result<Value> {
     }
     let val: Value = serde_json::from_slice(&fs::read(&artifact.report_path)?)?;
     if let Ok(mut cache) = report_json_cache().lock() {
-        cache.insert(artifact.report_path, (meta.len(), mtime, val.clone()));
+        insert_bounded_cache(
+            &mut cache,
+            MAX_STUDIO_CACHE_ENTRIES,
+            artifact.report_path,
+            (meta.len(), mtime, val.clone()),
+        );
     }
     Ok(val)
 }
@@ -979,53 +1062,117 @@ pub fn start_with_phone(
     LabHandle { events, cancel }
 }
 
-/// Open generated content in a separate, unauthenticated offline browser process,
-/// falling back to opening the local HTML file directly if the CDP window fails.
-pub fn open_preview(artifact: &LabArtifact) -> Result<()> {
-    let html = own_html(&artifact.html_path)?;
-    if let Ok(browser) = crate::studio_browser::browser_path() {
-        if let Ok((mut child, events)) =
-            spawn_worker(json!({"op":"preview","html":html,"browser":browser}))
-        {
-            match events.recv_timeout(Duration::from_secs(12)) {
-                Ok(value) if value["event"] == "result" && value["ok"] == true => {
-                    thread::spawn(move || {
-                        let _ = child.wait();
-                    });
-                    return Ok(());
-                }
-                _ => {
-                    stop_worker(&mut child);
-                }
+fn preview_processes() -> &'static Mutex<Vec<Arc<Mutex<Option<Child>>>>> {
+    static PROCESSES: OnceLock<Mutex<Vec<Arc<Mutex<Option<Child>>>>>> = OnceLock::new();
+    PROCESSES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn track_preview_process(child: Child) {
+    let slot = Arc::new(Mutex::new(Some(child)));
+    if let Ok(mut list) = preview_processes().lock() {
+        list.retain(|entry| entry.lock().map(|g| g.is_some()).unwrap_or(false));
+        list.push(slot.clone());
+    }
+    thread::spawn(move || loop {
+        let done = {
+            let Ok(mut guard) = slot.lock() else {
+                break;
+            };
+            match guard.as_mut() {
+                Some(child) => child.try_wait().ok().flatten().is_some(),
+                None => true,
+            }
+        };
+        if done {
+            if let Ok(mut guard) = slot.lock() {
+                *guard = None;
+            }
+            if let Ok(mut list) = preview_processes().lock() {
+                list.retain(|entry| !Arc::ptr_eq(entry, &slot));
+            }
+            break;
+        }
+        thread::sleep(Duration::from_millis(250));
+    });
+}
+
+/// Cleanly terminate all active Studio Lab preview browser sandboxes on exit.
+pub fn shutdown_all_previews() {
+    let slots = preview_processes()
+        .lock()
+        .map(|mut list| std::mem::take(&mut *list))
+        .unwrap_or_default();
+    for slot in slots {
+        if let Ok(mut guard) = slot.lock() {
+            if let Some(mut child) = guard.take() {
+                stop_worker(&mut child);
             }
         }
     }
-    open_local_html_fallback(&html)
+}
+
+fn launch_isolated_preview(html: &Path) -> Result<()> {
+    let browser = crate::studio_browser::browser_path().map_err(|_| {
+        anyhow::anyhow!(
+            "离线隔离预览需要 Chrome、Microsoft Edge、Chromium 或 Brave；为防止未受信任的生成脚本在主浏览器无网络/CSP 隔离下运行，已拒绝直接打开本地文件"
+        )
+    })?;
+    let (mut child, events) = spawn_worker(json!({"op":"preview","html":html,"browser":browser}))
+        .context(
+            "无法启动离线隔离预览沙箱；请检查 Python 运行环境与 Chrome / Edge / Chromium 安装，未回退到系统默认浏览器",
+        )?;
+    match events.recv_timeout(Duration::from_secs(35)) {
+        Ok(value) if value["event"] == "result" && value["ok"] == true => {
+            track_preview_process(child);
+            Ok(())
+        }
+        Ok(value) if value["event"] == "failed" => {
+            stop_worker(&mut child);
+            let detail = value["message"].as_str().unwrap_or("隔离浏览器初始化失败");
+            bail!(
+                "离线隔离预览未能启动（{detail}）；为保护已登录的主浏览器与本地文件安全，未回退到系统默认浏览器，请确认 Chrome / Edge / Chromium 可正常启动"
+            );
+        }
+        _ => {
+            stop_worker(&mut child);
+            bail!(
+                "离线隔离预览在 35 秒内未就绪；为保护已登录的主浏览器与本地文件安全，未回退到系统默认浏览器，请确认 Chrome / Edge / Chromium 可正常启动后重试"
+            );
+        }
+    }
+}
+
+/// Open generated content strictly inside a separate, unauthenticated offline browser process.
+/// Never falls back to opening `file://` in the user's primary authenticated browser.
+pub fn open_preview(artifact: &LabArtifact) -> Result<()> {
+    let html = own_html(&artifact.html_path)?;
+    launch_isolated_preview(&html)
 }
 
 pub fn open_preview_window(artifact: &LabArtifact) -> Result<()> {
     open_preview(artifact)
 }
 
-pub fn open_local_html_fallback(html: &Path) -> Result<()> {
-    let cmd = if cfg!(target_os = "macos") {
-        "open"
-    } else if cfg!(windows) {
-        "explorer"
-    } else {
-        "xdg-open"
-    };
-    let mut child = std::process::Command::new(cmd)
-        .arg(html)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("本地预览未打开，请检查浏览器是否可用")?;
-    thread::spawn(move || {
-        let _ = child.wait();
-    });
-    Ok(())
+/// Route a standalone `.html` / `.htm` output file through the isolated offline CSP sandbox.
+pub fn open_html_file_preview(html_path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(html_path).context("无法读取 HTML 预览文件")?;
+    ensure!(
+        !metadata.file_type().is_symlink() && metadata.is_file(),
+        "HTML 预览文件无效或不是普通文件"
+    );
+    ensure!(
+        metadata.len() > 0 && metadata.len() <= MAX_HTML,
+        "HTML 预览文件为空或超过 2 MiB 限制"
+    );
+    let canonical = html_path
+        .canonicalize()
+        .context("HTML 预览文件不存在或已移动")?;
+    let ext = canonical.extension().and_then(|e| e.to_str()).unwrap_or("");
+    ensure!(
+        ext.eq_ignore_ascii_case("html") || ext.eq_ignore_ascii_case("htm"),
+        "离线隔离预览仅支持 .html 或 .htm 文件"
+    );
+    launch_isolated_preview(&canonical)
 }
 
 const STARTER_NEON_SNAKE_HTML: &str = r#"<!DOCTYPE html>
@@ -1995,7 +2142,11 @@ mod tests {
             assert!(!found.passed);
             assert!(found.html_path.is_file());
             assert!(found.screenshot_path.as_ref().is_some_and(|p| p.is_file()));
-            assert!(!verified_html(found).unwrap().is_empty());
+            let bytes = verified_html(found).unwrap();
+            assert!(!bytes.is_empty());
+            assert!(String::from_utf8_lossy(&bytes)
+                .to_ascii_lowercase()
+                .contains("content-security-policy"));
         }
         let directory = tempfile::tempdir_in(runs_directory().unwrap()).unwrap();
         let root = directory.path().to_path_buf();
@@ -2021,5 +2172,33 @@ mod tests {
             created_at: 0,
         };
         assert_eq!(verified_html(&draft).unwrap(), content);
+    }
+
+    #[test]
+    fn csp_meta_injection_and_bounded_cache_eviction_work() {
+        let bare = "<!DOCTYPE html><html><head><title>App</title></head><body>Hi</body></html>";
+        let injected = ensure_csp_meta(bare);
+        assert!(injected.contains("http-equiv=\"Content-Security-Policy\""));
+        assert!(injected.contains("connect-src 'none'"));
+        assert_eq!(ensure_csp_meta(&injected), injected);
+
+        let mut map = std::collections::HashMap::new();
+        for i in 0..300usize {
+            insert_bounded_cache(&mut map, MAX_STUDIO_CACHE_ENTRIES, i, format!("v-{i}"));
+        }
+        assert_eq!(map.len(), MAX_STUDIO_CACHE_ENTRIES);
+        assert!(!map.contains_key(&0));
+        assert!(!map.contains_key(&43));
+        assert!(map.contains_key(&44));
+        assert!(map.contains_key(&299));
+
+        let dir = tempfile::tempdir().unwrap();
+        let non_html = dir.path().join("notes.txt");
+        fs::write(&non_html, b"hello").unwrap();
+        assert!(open_html_file_preview(&non_html).is_err());
+        let empty_html = dir.path().join("empty.html");
+        fs::write(&empty_html, b"").unwrap();
+        assert!(open_html_file_preview(&empty_html).is_err());
+        shutdown_all_previews();
     }
 }

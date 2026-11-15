@@ -32,20 +32,34 @@ final class MdiTransport implements AutoCloseable {
             }catch(Exception e){fail();}return true;
         }
     };
-    private static String verifiedApk="";
+    private static String cachedSourceDir="";
+    private static long cachedLastUpdateTime=-1L;
+    private static long cachedLastModified=-1L;
+    private static String cachedSha256="";
+    static synchronized String verifyPinnedPackage(String path,long lastUpdateTime,long lastModified,String expectedSha)throws Exception {
+        if(path==null||path.isEmpty())throw new IOException("MDI 服务路径无效");
+        String sha;
+        if(path.equals(cachedSourceDir)&&lastUpdateTime==cachedLastUpdateTime&&lastModified==cachedLastModified&&!cachedSha256.isEmpty()){
+            sha=cachedSha256;
+        }else{
+            java.security.MessageDigest hash=java.security.MessageDigest.getInstance("SHA-256");
+            try(java.io.InputStream in=new java.io.FileInputStream(path)){byte[] b=new byte[65536];int n;while((n=in.read(b))!=-1)hash.update(b,0,n);}
+            StringBuilder hex=new StringBuilder();for(byte b:hash.digest())hex.append(String.format(java.util.Locale.ROOT,"%02x",b&255));
+            sha=hex.toString();
+            cachedSourceDir=path;cachedLastUpdateTime=lastUpdateTime;cachedLastModified=lastModified;cachedSha256=sha;
+        }
+        if(!expectedSha.equals(sha))throw new IOException("MDI 接口资源已变化，请重新评估后再启用");
+        return sha;
+    }
     private static synchronized void verifyFirmware(Context context)throws Exception {
         if(!"StepX/pandora/pandora:16/BQ2A.260122.002-BP2A.250705.008/172:user/release-keys".equals(Build.FINGERPRINT)&&!"StepX/pandora/pandora:16/BQ2A.260122.002-BP2A.250705.008/12:user/release-keys".equals(Build.FINGERPRINT))throw new IOException("固件已变化，MDI MCP 需要重新评估；未创建虚拟屏");
         android.content.pm.PackageInfo info=context.getPackageManager().getPackageInfo("com.stepos.ability",0);
         long vc=info.getLongVersionCode();
         if(vc!=101002&&vc!=102003)throw new IOException("MDI 服务已更新，请重新验证兼容性");
         String path=info.applicationInfo.sourceDir;
-        if(path.equals(verifiedApk))return;
-        java.security.MessageDigest hash=java.security.MessageDigest.getInstance("SHA-256");
-        try(java.io.InputStream in=new java.io.FileInputStream(path)){byte[] b=new byte[65536];int n;while((n=in.read(b))!=-1)hash.update(b,0,n);}
-        StringBuilder hex=new StringBuilder();for(byte b:hash.digest())hex.append(String.format(java.util.Locale.ROOT,"%02x",b&255));
+        long lastModified=new java.io.File(path).lastModified();
         String expectedSha=vc==102003?"a7dbeaa721c13836bbb3990026af6c3d66bf164afc4c73f70bd453aa119fbca8":"c9f56f3078df96d8d726422b1c622a1c19fe8c7dec8cadd8537d9a6ecf513ac4";
-        if(!expectedSha.equals(hex.toString()))throw new IOException("MDI 接口资源已变化，请重新评估后再启用");
-        verifiedApk=path;
+        verifyPinnedPackage(path,info.lastUpdateTime,lastModified,expectedSha);
     }
     MdiTransport(Context c)throws Exception {
         this(c,new ComponentName(DEFAULT_PKG,DEFAULT_CLS));
@@ -322,6 +336,35 @@ final class MdiTransport implements AutoCloseable {
         check(Arrays.equals(resolveServiceTarget("assistant_get_voice_list"), new String[]{"com.stepos.ailauncher", "com.stepos.ailauncher.agent.ability.VoiceAbilityService"}), "VoiceAbilityService routing");
         check(!isAllowedTool("rm_rf") && resolveServiceTarget("rm_rf") == null, "unknown tool must be rejected");
         check(!isAllowedTool("gallery_../bad"), "invalid characters in tool name must be rejected");
+        check(ScopedPairing.isAllowedCaller(2000, "com.android.shell", 36), "shell caller allowed");
+        check(ScopedPairing.isAllowedCaller(1000, "android", 36), "android uid 1000 allowed");
+        check(ScopedPairing.isAllowedCaller(1000, "com.stepos.agentbus", 36), "agentbus uid 1000 allowed");
+        check(!ScopedPairing.isAllowedCaller(1000, "com.example.other", 36), "untrusted package on uid 1000 rejected");
+        check(!ScopedPairing.isAllowedCaller(10123, "com.stepos.agentbus", 36), "non-system uid rejected");
+        try {
+            java.io.File tmp = java.io.File.createTempFile("stepx-mdi-pin-", ".apk");
+            try {
+                java.nio.file.Files.write(tmp.toPath(), "v1".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                String sha1 = "3bfc269594ef649228e9a74bab00f042efc91d5acc6fbee31a382e80d42388fe";
+                check(sha1.equals(verifyPinnedPackage(tmp.getPath(), 100L, tmp.lastModified(), sha1)), "initial pin hash verified");
+                // Mutating file without changing cached (path, lastUpdateTime, lastModified) proves cache hit; changing lastUpdateTime invalidates cache!
+                long origMod = tmp.lastModified();
+                java.nio.file.Files.write(tmp.toPath(), "v2".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                tmp.setLastModified(origMod);
+                check(sha1.equals(verifyPinnedPackage(tmp.getPath(), 100L, origMod, sha1)), "cached sha256 reused when metadata unchanged");
+                boolean rejected = false;
+                try {
+                    verifyPinnedPackage(tmp.getPath(), 101L, origMod, sha1);
+                } catch (IOException expected) {
+                    rejected = true;
+                }
+                check(rejected, "updated lastUpdateTime invalidates sha256 cache");
+            } finally {
+                tmp.delete();
+            }
+        } catch (Exception e) {
+            throw new AssertionError(e);
+        }
         System.out.println("MdiTransport multi-service routing test: passed");
     }
 }

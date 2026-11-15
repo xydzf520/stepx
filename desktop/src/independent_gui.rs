@@ -24,10 +24,11 @@ fn preview(adb: &Adb, device: &Device, value: &serde_json::Value) -> Result<Vec<
             .is_some_and(|id| !id.is_empty() && value["task"].as_str() == Some(id)),
         "虚拟屏尚无预览"
     );
+    let transport = device.resolve_active_transport(adb)?;
     let mut command = Command::new(&adb.path);
     command.args([
         "-s",
-        &device.transport,
+        &transport,
         "exec-out",
         "cat",
         "/sdcard/Android/data/com.stepx.companion.app/files/mdi-preview.jpg",
@@ -70,6 +71,56 @@ mod native_readiness_tests {
     }
 }
 
+struct OnDeviceTaskStopGuard<'a> {
+    adb: &'a Adb,
+    device: &'a Device,
+    task_id: String,
+    armed: bool,
+}
+
+impl<'a> OnDeviceTaskStopGuard<'a> {
+    fn new(adb: &'a Adb, device: &'a Device, task_id: String) -> Self {
+        Self {
+            adb,
+            device,
+            task_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn send_stop_best_effort(&self) {
+        if self.task_id.is_empty() {
+            return;
+        }
+        let stop_payload = json!({
+            "op": "agent",
+            "agentOp": "stop",
+            "action": "stop",
+            "task": self.task_id,
+        });
+        if companion_gui::call(self.adb, self.device, stop_payload).is_err() {
+            if let Ok(mut mcp) = crate::native_mcp::Client::connect(self.adb, self.device) {
+                let _ = mcp.call(
+                    "stepx_gui_agent",
+                    json!({"op": "stop", "action": "stop", "task": self.task_id}),
+                );
+            }
+        }
+    }
+}
+
+impl Drop for OnDeviceTaskStopGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.send_stop_best_effort();
+        }
+    }
+}
+
 pub fn run(
     adb: &Adb,
     device: &Device,
@@ -90,17 +141,19 @@ pub fn run(
     let start = native.call_cancellable("stepx_gui_agent", json!({"op":"start","goal":goal}), &control.stop)?;
     let id = start["task"].as_str().unwrap_or("").to_owned();
     ensure!(!id.is_empty(), "手机没有返回任务标识");
+    let mut stop_guard = OnDeviceTaskStopGuard::new(adb, device, id.clone());
     let started = Instant::now();
     let mut paused = false;
     let mut stopping = false;
     let mut progress = String::new();
     let mut step_number = 0usize;
+    let mut status_poll_retries = 0u32;
     loop {
         if control.stop.load(Ordering::Relaxed) && !stopping {
             companion_gui::call(
                 adb,
                 device,
-                json!({"op":"agent","agentOp":"stop","task":id}),
+                json!({"op":"agent","agentOp":"stop","action":"stop","task":id}),
             )?;
             stopping = true;
             emit(ScreenEvent::Status("正在停止手机任务并释放资源…".into()));
@@ -113,17 +166,30 @@ pub fn run(
                 json!({"op":"agent","agentOp":if paused{"pause"}else{"resume"},"task":id}),
             )?;
         }
-        let value = match native.call("stepx_gui_agent", json!({"op":"status","task":id})) {
-            Ok(v) => v,
-            Err(_) => {
-                return Ok(GuiRunResult {
-                    state: GuiRunState::Disconnected,
-                    message: "desktop 连接中断；任务继续由手机执行，可在伴侣查看或停止。".into(),
-                    invocation_id: id,
-                    raw_result: None,
-                    elapsed_ms: started.elapsed().as_millis() as u64,
-                })
+        let value = loop {
+            match native.call("stepx_gui_agent", json!({"op":"status","task":id})) {
+                Ok(v) => {
+                    status_poll_retries = 0;
+                    break Some(v);
+                }
+                Err(_) if status_poll_retries < 3 => {
+                    status_poll_retries += 1;
+                    std::thread::sleep(Duration::from_millis(250));
+                    if let Ok(reconnected) = crate::native_mcp::Client::connect(adb, device) {
+                        native = reconnected;
+                    }
+                }
+                Err(_) => break None,
             }
+        };
+        let Some(value) = value else {
+            return Ok(GuiRunResult {
+                state: GuiRunState::Disconnected,
+                message: "desktop 连接中断；已请求停止手机任务，可在伴侣查看确认。".into(),
+                invocation_id: id,
+                raw_result: None,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+            });
         };
         ensure!(
             value["task"].as_str() == Some(id.as_str()),
@@ -170,6 +236,11 @@ pub fn run(
             } else {
                 GuiRunState::Failed
             };
+            if value["result"]["phoneStopped"] == true
+                || matches!(value["phase"].as_str(), Some("completed" | "cancelled" | "failed" | "stopped"))
+            {
+                stop_guard.disarm();
+            }
             return Ok(GuiRunResult {
                 state,
                 message: progress,
@@ -181,7 +252,7 @@ pub fn run(
         if started.elapsed() > Duration::from_secs(1250) {
             return Ok(GuiRunResult {
                 state: GuiRunState::TimedOut,
-                message: "desktop 等待超时，请在手机查看任务状态。".into(),
+                message: "desktop 等待超时，已请求停止手机任务，请在手机查看任务状态。".into(),
                 invocation_id: id,
                 elapsed_ms: started.elapsed().as_millis() as u64,
                 raw_result: Some(value),

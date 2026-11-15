@@ -8,6 +8,39 @@ use global_hotkey::{
 use std::str::FromStr;
 use stepx_companion::settings::CompactShortcut;
 
+pub(super) fn primary_mod(k: &Keystroke) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        k.cmd && !k.ctrl && !k.alt
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        k.ctrl && !k.cmd && !k.alt
+    }
+}
+
+pub(super) fn word_backward_mod(k: &Keystroke) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        k.alt && !k.cmd && !k.ctrl && !k.shift
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        k.ctrl && !k.cmd && !k.alt && !k.shift
+    }
+}
+
+pub(super) fn line_backward_mod(k: &Keystroke) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        k.cmd && !k.ctrl && !k.alt && !k.shift
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        k.ctrl && k.shift && !k.cmd && !k.alt
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Shortcuts {
     manager: Option<GlobalHotKeyManager>,

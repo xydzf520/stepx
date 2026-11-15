@@ -449,6 +449,10 @@ where
                     subtree = child_trees.last().unwrap();
                 }
                 Node::Leaf { item_summaries, .. } => {
+                    if item_summaries.is_empty() {
+                        self.at_end = true;
+                        break;
+                    }
                     let last_index = item_summaries.len().saturating_sub(1);
                     for item_summary in &item_summaries[0..last_index] {
                         self.seek_dimension.add_summary(item_summary);

@@ -65,7 +65,10 @@ fn collect_aux_phone_context(
     if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
         return CachedAuxPhoneContext::default();
     }
-    let transport = device.transport.trim();
+    let Ok(resolved_transport) = device.resolve_active_transport(adb) else {
+        return CachedAuxPhoneContext::default();
+    };
+    let transport = resolved_transport.trim();
     if transport.is_empty() {
         return CachedAuxPhoneContext::default();
     }
@@ -267,11 +270,12 @@ fn cancelled(cancel: &AtomicBool) -> Result<()> {
 
 fn checked_scope(adb: &Adb, device: &Device, expected: &str) -> Result<()> {
     ensure!(!expected.is_empty(), "尚未确认手机 Amoo 账号，未读取讨论");
-    // Verify this exact transport, not a failover candidate that the following
-    // account/history calls would not use. Wireless endpoints can be reassigned.
+    let transport = device
+        .resolve_active_transport(adb)
+        .context("无法核验手机上下文的设备身份")?;
     let serial = adb
         .run_timeout(
-            &["-s", &device.transport, "shell", "getprop", "ro.serialno"],
+            &["-s", &transport, "shell", "getprop", "ro.serialno"],
             Duration::from_secs(3),
         )
         .context("无法核验手机上下文的设备身份")?;
@@ -1650,8 +1654,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let adb_path = dir.path().join("adb");
         let calls_log = dir.path().join("calls.log");
+        let serial = format!("batch-cache-test-{:x}", rand::random::<u64>());
         let script = format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\ncase \"$*\" in\n\
+             *ro.serialno*) printf '%s\\n' {}; exit 0;;\n\
              *stat\\ -c\\ %s*) printf 'READY'; exit 0;;\n\
              *app_process*)\n\
                read -r req\n\
@@ -1665,13 +1671,13 @@ mod tests {
                exit 0;;\n\
              esac\n",
             crate::adb::shell_quote(&calls_log.to_string_lossy()),
+            crate::adb::shell_quote(&serial),
             crate::adb::shell_quote(&dir.path().join("stdin.log").to_string_lossy()),
         );
         std::fs::write(&adb_path, script).unwrap();
         std::fs::set_permissions(&adb_path, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         let adb = Adb { path: adb_path };
-        let serial = format!("batch-cache-test-{:x}", rand::random::<u64>());
         crate::bridge::mark_bridge_jar_cached(&serial);
         let device = Device {
             serial: serial.clone(),

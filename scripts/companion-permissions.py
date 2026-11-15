@@ -19,12 +19,35 @@ import sys
 import tempfile
 import time
 
-ROOT = Path(__file__).resolve().parents[1]
-WORKFLOW = Path(os.environ.get('STEPX_GOOGLE_HOME', ROOT / 'handoff/google-play-stepx')).resolve()
-sys.path.insert(0, str(WORKFLOW / 'tools'))
+_SELF = Path(__file__).resolve()
+ROOT = (
+    _SELF.parents[3]
+    if _SELF.parts[-3:-1] == ('compat', 'scripts') and len(_SELF.parents) > 3
+    else _SELF.parents[1]
+)
+WORKFLOW = Path(
+    os.environ.get(
+        'STEPX_GOOGLE_HOME',
+        _SELF.parents[2]
+        if _SELF.parts[-3:-1] == ('compat', 'scripts') and len(_SELF.parents) > 2
+        else ROOT / 'handoff/google-play-stepx',
+    )
+).resolve()
+for _extra_dir in (_SELF.parent, ROOT / 'scripts', WORKFLOW / 'tools'):
+    if _extra_dir.is_dir() and str(_extra_dir) not in sys.path:
+        sys.path.insert(0, str(_extra_dir))
 import common
 from common import ADB, ALLOWED_FINGERPRINTS, CONFIG, guard, root_json, shell
-from host_runtime import file_lock, sdk_tool, sdk_command, java_environment, subprocess_options
+from host_runtime import (
+    file_lock,
+    java_environment,
+    migrate_legacy_state,
+    optional_tool_home,
+    sdk_command,
+    sdk_tool,
+    subprocess_options,
+    user_state_root,
+)
 from companion_apk import ensure_update_preserves_runtime, signer_digests
 from companion_loader import adapt as adapt_native_loader
 from source_integrity import read_python_source, python_source_sha256
@@ -38,8 +61,26 @@ WAKE_OWNER = 'com.stepos.pushservice'
 WAKE_SCOPE = 'wake_permission_v1'
 AUTHORIZED_SERIAL = os.environ.get('STEPX_SERIAL') or os.environ.get('STEPX_DEVICE_SERIAL') or CONFIG.get('serial', '')
 LOADER_SHA256 = '279305289749acada3f9951c816d7e9f00367dce4331d4396c04554e4685fbf8'
-WORKER_SHA256 = '30612b56e23f914f7672863adceffc72fd643ce69d1d1b08fccd9057cd09fdb0'
-STATE = Path(os.environ.get('XDG_STATE_HOME', Path.home() / '.local/state')) / 'stepx-companion/permissions'
+WORKER_SHA256 = 'bace6f48ea6aba3623048cab0a155288c846ab6094d4f8d09cd8104ed7fc7863'
+_DEFAULT_STATE = user_state_root() / 'permissions'
+STATE = _DEFAULT_STATE
+
+
+def _ensure_state_dir() -> Path:
+    if STATE == _DEFAULT_STATE and not os.environ.get('STEPX_STATE_DIR') and not STATE.exists():
+        home = optional_tool_home()
+        if home is not None:
+            legacy_base = Path(os.environ.get('XDG_STATE_HOME') or (home / '.local/state'))
+            legacy = legacy_base / 'stepx-companion/permissions'
+            if legacy != STATE and legacy.exists():
+                migrate_legacy_state(legacy, STATE)
+    STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    STATE.chmod(0o700)
+    return STATE
+
+
+def _authorized_serials():
+    return {s for s in (AUTHORIZED_SERIAL, os.environ.get('STEPX_DEVICE_SERIAL', '').strip()) if s}
 
 
 def device_key() -> str:
@@ -81,7 +122,7 @@ def signer(apk):
 
 def inspect(apk=None, preserve_embedded=False):
     # This command deliberately has no RootBridge call and does not start the app.
-    if ADB[-1] != AUTHORIZED_SERIAL:
+    if ADB[-1] not in _authorized_serials():
         raise RuntimeError('Companion adaptation is scoped to the authorized StepX phone')
     guard()
     dump = shell('dumpsys', 'package', PACKAGE)
@@ -148,11 +189,10 @@ def preflight(apk, trusted_apk=None):
 
 
 def private_json(path, value):
-    STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
-    STATE.chmod(0o700)
+    _ensure_state_dir()
     temp = path.with_suffix('.new')
     fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, 'w') as stream:
+    with os.fdopen(fd, 'w', encoding='utf-8') as stream:
         json.dump(value, stream, indent=2)
         stream.flush()
         os.fsync(stream.fileno())
@@ -190,7 +230,7 @@ def prepare_install(apk, trusted_apk=None):
 
 
 def finish_install():
-    if ADB[-1] != AUTHORIZED_SERIAL:
+    if ADB[-1] not in _authorized_serials():
         raise RuntimeError('Companion adaptation is scoped to the authorized StepX phone')
     guard()
     path = install_gate_path()
@@ -279,8 +319,7 @@ def runtime_status(uid):
 
 @contextmanager
 def runtime_lock():
-    STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
-    STATE.chmod(0o700)
+    _ensure_state_dir()
     with file_lock(STATE / 'runtime.lock'):
         yield
 
@@ -374,7 +413,7 @@ def agentbus_worker_source(source):
     """
     if hashlib.sha256(source.encode()).hexdigest() != WORKER_SHA256:
         raise RuntimeError('Bounded root worker changed; review the AgentBus domain adapter')
-    start = source.index("src=\"\"\"") if 'src=\"\"\"' in source else source.index("src=" + "'" * 3)
+    start = source.index('\nsrc="""') + 1 if '\nsrc="""' in source else source.index("\nsrc='''") + 1
     end_marker = "'" * 3 + ".replace('signal.alarm(25)'"
     end = source.index(end_marker, start)
     template = AGENTBUS_WORKER_TEMPLATE
@@ -397,7 +436,7 @@ import os,sys,json,socket,struct,ctypes,mmap,time,signal,base64,hashlib,binascii
 lib=ctypes.CDLL(None,use_errno=True)
 host='/proc/'+str(os.getppid())+'/root'
 def prop(name,value):
- s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.settimeout(3)
+ s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.settimeout(5)
  try:
   s.connect(host+'/dev/socket/property_service');n=name.encode();v=value.encode();s.sendall(struct.pack('<II',0x20001,len(n))+n+struct.pack('<I',len(v))+v)
   r=s.recv(4)
@@ -491,11 +530,31 @@ def run_bounded_android_worker(code, target_pid, preserve_verified_result=None, 
         previous=json.loads(quarantine.read_text())
         if previous.get('target_pid')==target_pid and previous.get('boot_id')==shell('cat','/proc/sys/kernel/random/boot_id'):
             raise RuntimeError('Previous native operation failed in this system process; automatic retry is disabled')
+    heal_fn = getattr(common, 'heal_stale_zygote_prop', None)
+    if callable(heal_fn):
+        heal_fn(shell_fn=shell, root_fn=root_json)
     properties = {key: shell('getprop', key) for key in ('persist.openclaw.zygote.path', 'sys.openclaw.env.start')}
     if any(properties.values()):
         raise RuntimeError('Another StepClaw startup operation is active; companion permission was not changed')
     expected_launcher = python_source_sha256(WORKFLOW / 'module/launcher.py')
-    allowed_launchers = {s for s in (expected_launcher, getattr(common, 'STOCK_SHA', None), CONFIG.get('stock_sha256', '')) if s}
+    companion_launcher_path = (
+        WORKFLOW.parents[1] / 'scripts/companion_boot/launcher.py'
+        if len(WORKFLOW.parents) > 1
+        else None
+    )
+    companion_launcher = (
+        python_source_sha256(companion_launcher_path)
+        if companion_launcher_path is not None and companion_launcher_path.is_file()
+        else ''
+    )
+    allowed_launchers = {
+        s for s in (
+            expected_launcher,
+            companion_launcher,
+            getattr(common, 'STOCK_SHA', None),
+            CONFIG.get('stock_sha256', ''),
+        ) if s
+    }
     before = root_json("import os,json,hashlib; print(json.dumps({'launcher':hashlib.sha256(open('/usr/local/bin/ubuntu_zygote','rb').read()).hexdigest(),'root_available':os.geteuid()==0}))")
     if before.get('launcher') not in allowed_launchers or before.get('root_available') is not True:
         raise RuntimeError('Existing StepClaw/Google launcher differs from the verified installation')
@@ -542,7 +601,15 @@ def run_bounded_android_worker(code, target_pid, preserve_verified_result=None, 
             if native_fault or not stable:
                 private_json(quarantine,{'target_pid':target_pid,'boot_id':shell('cat','/proc/sys/kernel/random/boot_id'),'error':proof.get('error','Delayed system process restart')})
                 raise RuntimeError('Native operation failed or Android restarted during validation; result saved and automatic retry disabled')
-        after = root_json("import os,json,hashlib; print(json.dumps({'launcher':hashlib.sha256(open('/usr/local/bin/ubuntu_zygote','rb').read()).hexdigest(),'root_available':os.geteuid()==0}))")
+        after = None
+        for _retry in range(5):
+            try:
+                after = root_json("import os,json,hashlib; print(json.dumps({'launcher':hashlib.sha256(open('/usr/local/bin/ubuntu_zygote','rb').read()).hexdigest(),'root_available':os.geteuid()==0}))")
+                break
+            except Exception:
+                if _retry == 4:
+                    raise
+                time.sleep(1.5)
         if after != before:
             raise RuntimeError('Companion worker could not verify original StepClaw launcher/runtime')
         proof.update(launcher_unchanged=True, root_bridge_healthy=True, validation_stage='launcher_verified')

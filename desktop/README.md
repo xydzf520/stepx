@@ -1,12 +1,12 @@
 # 阶跃伴侣 · StepX Companion
 
-原生 Rust 跨平台桌面客户端（支持 **macOS / Windows / Linux**），连接已授权调试的 StepX 手机，复用相邻 `facloud` 仓库中的 `facloud_ui`。界面完全采用 GPU 原生渲染，不依赖浏览器或 Web 服务。
+原生 Rust 跨平台桌面客户端（支持 **macOS / Windows / Linux**），连接已授权调试的 StepX 手机，内置 `vendor/facloud_ui` 渲染组件。界面完全采用 GPU 原生渲染，不依赖浏览器或 Web 服务。
 
 底部状态栏显示 Cargo 包版本和编译时间（UTC+8，精确到秒）。时间由 `build.rs` 固化进二进制，不随启动时间变化；`--version` / `-V` 可读取同一信息。可复现构建支持 `SOURCE_DATE_EPOCH`。
 
 ## 跨平台启动与安装
 
-仓库布局：`stepx/` 与 `facloud/` 位于同一父目录。本次使用的 FaCloud 版本为 `d46ee1a1721d519d5718476da9c92fd3c63a04a7`。未修改 FaCloud 源码。
+仓库布局：所有 UI 与 Markdown 依赖组件均内置于仓库根目录 `vendor/` 下，无需外部 `facloud` 仓库即可独立编译。
 
 ### Linux / macOS
 
@@ -89,6 +89,8 @@ Amoo、Amoo Work 和简洁对话支持拖选正文后复制；输入框支持局
 ## 配置与验证
 
 `STEPX_ADB`、`STEPX_SCRCPY` 可覆盖工具路径；`STEPX_CONFIG_DIR` 可指定设备记录目录；`STEPX_RENDER_DRIVER` 可覆盖 scrcpy 渲染器；`STEPX_THEME=light|dark` 可指定默认主题。
+
+同一系统用户只运行一个桌面客户端。再次启动会唤起已有窗口，即使启动时指定了不同的 StepX 配置目录。
 
 ```bash
 cd desktop

@@ -391,10 +391,17 @@ impl PhoneCalendarEvent {
 
     pub fn effective_end_ms(&self) -> i64 {
         if self.all_day {
-            let (y, m, d) = self.date_ymd();
-            if let Some(dt) = Local.with_ymd_and_hms(y, m, d, 23, 59, 59).single() {
-                return dt.timestamp_millis();
+            if self.dtend > self.dtstart {
+                return self.dtend;
             }
+            if self.dtstart > 0 {
+                let (y, m, d) = self.date_ymd();
+                if let Some(dt) = Local.with_ymd_and_hms(y, m, d, 23, 59, 59).single() {
+                    return dt.timestamp_millis() + 1_000;
+                }
+                return self.dtstart + 86_400_000;
+            }
+            return 0;
         }
         if self.dtend > self.dtstart {
             self.dtend
@@ -407,11 +414,19 @@ impl PhoneCalendarEvent {
 
     pub fn is_ended_at(&self, now_ms: i64) -> bool {
         let end_ms = self.effective_end_ms();
-        end_ms > 0 && now_ms > end_ms
+        if self.all_day {
+            end_ms > 0 && now_ms >= end_ms
+        } else {
+            end_ms > 0 && now_ms > end_ms
+        }
     }
 
     pub fn is_ongoing_at(&self, now_ms: i64) -> bool {
         if self.all_day {
+            let end_ms = self.effective_end_ms();
+            if end_ms > self.dtstart && self.dtstart > 0 {
+                return now_ms >= self.dtstart && now_ms < end_ms;
+            }
             let (y, m, d) = self.date_ymd();
             let now_dt = Local
                 .timestamp_millis_opt(now_ms)
@@ -420,6 +435,26 @@ impl PhoneCalendarEvent {
             return (now_dt.year(), now_dt.month(), now_dt.day()) == (y, m, d);
         }
         self.dtstart > 0 && now_ms >= self.dtstart && now_ms <= self.effective_end_ms()
+    }
+
+    pub fn spans_date_ymd(&self, year: i32, month: u32, day: u32) -> bool {
+        if self.date_ymd() == (year, month, day) {
+            return true;
+        }
+        let Some(day_start) = Local
+            .with_ymd_and_hms(year, month, day, 0, 0, 0)
+            .earliest()
+            .map(|dt| dt.timestamp_millis())
+        else {
+            return false;
+        };
+        let day_end = Local
+            .with_ymd_and_hms(year, month, day, 23, 59, 59)
+            .latest()
+            .map(|dt| dt.timestamp_millis() + 1_000)
+            .unwrap_or(day_start + 86_400_000);
+        let end_ms = self.effective_end_ms();
+        self.dtstart > 0 && end_ms > self.dtstart && self.dtstart < day_end && end_ms > day_start
     }
 
     pub fn is_suppressed_at(
@@ -474,8 +509,13 @@ impl PhoneCalendarEvent {
             .timestamp_millis_opt(now_ms)
             .single()
             .unwrap_or_else(Local::now);
-        let today = (now_dt.year(), now_dt.month(), now_dt.day());
-        self.date_ymd() == today && self.is_valid_unexpired_at(now_ms, completed_ids, gov)
+        let (ty, tm, td) = (now_dt.year(), now_dt.month(), now_dt.day());
+        let covers_today = if self.all_day && self.dtend > self.dtstart {
+            self.spans_date_ymd(ty, tm, td)
+        } else {
+            self.date_ymd() == (ty, tm, td) || self.is_ongoing_at(now_ms)
+        };
+        covers_today && self.is_valid_unexpired_at(now_ms, completed_ids, gov)
     }
 }
 
@@ -602,6 +642,35 @@ impl PhoneAlarmItem {
         (self.days_of_week & bit) != 0
     }
 
+    /// Computes the number of days until this alarm next rings (`0` = later today, `1` = tomorrow, etc.).
+    /// `today_iso_weekday`: ISO-8601 weekday where Monday = `1` .. Sunday = `7`
+    /// (`chrono::Weekday::number_from_monday()`; `0` is also accepted as Monday for safety).
+    pub fn next_ring_offset_days(&self, today_iso_weekday: u32, now_minutes: u32) -> Option<u32> {
+        if !self.enabled {
+            return None;
+        }
+        let alarm_minutes = self.total_minutes();
+        if self.days_of_week == 0 {
+            return if alarm_minutes > now_minutes {
+                Some(0)
+            } else {
+                Some(1)
+            };
+        }
+        let mask = self.days_of_week & 0x7f;
+        if mask == 0 {
+            return None;
+        }
+        let today_mon0 = today_iso_weekday.saturating_sub(1) % 7;
+        for offset in 0..=7u32 {
+            let wd_mon0 = (today_mon0 + offset) % 7;
+            if (mask & (1u32 << wd_mon0)) != 0 && (offset > 0 || alarm_minutes > now_minutes) {
+                return Some(offset);
+            }
+        }
+        None
+    }
+
     pub fn is_suppressed_at(
         &self,
         now_ms: i64,
@@ -615,7 +684,7 @@ impl PhoneAlarmItem {
     }
 
     /// True if this alarm is enabled, not an E2E probe, not suppressed in governance,
-    /// scheduled for today's weekday (or one-shot), AND its time today has not yet passed (`alarm_mins >= now_mins`).
+    /// scheduled for today's weekday (or one-shot), AND its time today has not yet passed (`alarm_mins > now_mins`).
     pub fn is_today_valid_unexpired_at(
         &self,
         now_ms: i64,
@@ -628,18 +697,14 @@ impl PhoneAlarmItem {
             .timestamp_millis_opt(now_ms)
             .single()
             .unwrap_or_else(Local::now);
-        let wd = now_dt.weekday().num_days_from_monday();
-        if !self.matches_weekday(wd) {
-            return false;
-        }
+        let iso_wd = now_dt.weekday().number_from_monday();
         let now_mins = now_dt.hour() * 60 + now_dt.minute();
-        self.total_minutes() >= now_mins
+        self.next_ring_offset_days(iso_wd, now_mins) == Some(0)
     }
 
-    /// True if this alarm is enabled, not an E2E probe, not suppressed, and either:
-    /// - valid & unexpired today, OR
-    /// - a repeating alarm (`days_of_week != 0`) that will ring on a future day.
-    /// (One-shot alarms `days_of_week == 0` whose time has already passed today without ringing are treated as expired/stale unless re-enabled.)
+    /// True if this alarm is enabled, not an E2E probe, not suppressed, and will ring
+    /// either later today or on an upcoming day (an enabled one-shot alarm whose time today
+    /// has passed will ring tomorrow and is NEVER expired).
     pub fn is_valid_future_or_today_unexpired_at(
         &self,
         now_ms: i64,
@@ -648,17 +713,19 @@ impl PhoneAlarmItem {
         if !self.enabled || self.is_e2e_probe() || self.is_suppressed_at(now_ms, gov) {
             return false;
         }
-        if self.is_today_valid_unexpired_at(now_ms, gov) {
-            return true;
-        }
-        self.days_of_week != 0
+        let now_dt = Local
+            .timestamp_millis_opt(now_ms)
+            .single()
+            .unwrap_or_else(Local::now);
+        let iso_wd = now_dt.weekday().number_from_monday();
+        let now_mins = now_dt.hour() * 60 + now_dt.minute();
+        self.next_ring_offset_days(iso_wd, now_mins).is_some()
     }
 
     /// Human-readable validity badge for UI display:
-    /// - `("待响", true)` when enabled and ringing later today
-    /// - `("明天再响", false)` when repeating and today's time has passed
-    /// - `("今日不响", false)` when repeating but not scheduled for today's weekday
-    /// - `("已过", false)` when one-shot (`days_of_week == 0`), enabled, and time has already passed today
+    /// - `("待响", true)` when enabled and ringing later today (`offset == 0`)
+    /// - `("明天再响", false)` when enabled and next ringing tomorrow (`offset == 1`, including one-shot)
+    /// - `("今日不响", false)` when enabled and next ringing in >= 2 days
     /// - `("已过期", false)` when suppressed in governance
     /// - `("关闭", false)` when `!self.enabled`
     pub fn validity_status_label_at(
@@ -676,17 +743,13 @@ impl PhoneAlarmItem {
             .timestamp_millis_opt(now_ms)
             .single()
             .unwrap_or_else(Local::now);
-        let wd = now_dt.weekday().num_days_from_monday();
+        let iso_wd = now_dt.weekday().number_from_monday();
         let now_mins = now_dt.hour() * 60 + now_dt.minute();
-        if !self.matches_weekday(wd) {
-            return ("今日不响", false);
-        }
-        if self.total_minutes() >= now_mins {
-            ("待响", true)
-        } else if self.days_of_week != 0 && self.matches_weekday((wd + 1) % 7) {
-            ("明天再响", false)
-        } else {
-            ("已过", false)
+        match self.next_ring_offset_days(iso_wd, now_mins) {
+            Some(0) => ("待响", true),
+            Some(1) => ("明天再响", false),
+            Some(_) => ("今日不响", false),
+            None => ("关闭", false),
         }
     }
 }
@@ -1195,9 +1258,9 @@ fn parse_ics_datetime(prop_part: &str, value: &str) -> Option<(i64, bool)> {
         && !prop_upper.contains("VALUE=DATE-TIME"))
         || (val.len() == 8 && val.bytes().all(|b| b.is_ascii_digit()));
     if is_date_only && val.len() >= 8 {
-        let year = val[0..4].parse::<i32>().ok()?;
-        let month = val[4..6].parse::<u32>().ok()?;
-        let day = val[6..8].parse::<u32>().ok()?;
+        let year = val.get(0..4)?.parse::<i32>().ok()?;
+        let month = val.get(4..6)?.parse::<u32>().ok()?;
+        let day = val.get(6..8)?.parse::<u32>().ok()?;
         let naive = chrono::NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(0, 0, 0)?;
         let ms = Local
             .from_local_datetime(&naive)
@@ -1211,16 +1274,15 @@ fn parse_ics_datetime(prop_part: &str, value: &str) -> Option<(i64, bool)> {
     if date_part.len() < 8 || time_part.len() < 4 {
         return None;
     }
-    let year = date_part[0..4].parse::<i32>().ok()?;
-    let month = date_part[4..6].parse::<u32>().ok()?;
-    let day = date_part[6..8].parse::<u32>().ok()?;
-    let hour = time_part[0..2].parse::<u32>().ok()?;
-    let minute = time_part[2..4].parse::<u32>().ok()?;
-    let second = if time_part.len() >= 6 {
-        time_part[4..6].parse::<u32>().unwrap_or(0)
-    } else {
-        0
-    };
+    let year = date_part.get(0..4)?.parse::<i32>().ok()?;
+    let month = date_part.get(4..6)?.parse::<u32>().ok()?;
+    let day = date_part.get(6..8)?.parse::<u32>().ok()?;
+    let hour = time_part.get(0..2)?.parse::<u32>().ok()?;
+    let minute = time_part.get(2..4)?.parse::<u32>().ok()?;
+    let second = time_part
+        .get(4..6)
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
     let naive =
         chrono::NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(hour, minute, second)?;
     let ms = if is_utc {
@@ -3703,6 +3765,105 @@ fn is_gallery_image_filename(name: &str) -> bool {
         || lower.ends_with(".bmp")
 }
 
+fn validate_expansion_gallery_record(
+    exp_cfg: &crate::storage_expansion::Config,
+    rec: &serde_json::Value,
+    seen_local: &mut std::collections::HashSet<String>,
+    archived_paths: &mut std::collections::HashSet<String>,
+) -> Option<PhoneGalleryItem> {
+    let state = rec.get("state").and_then(|v| v.as_str())?.trim();
+    if !state.eq_ignore_ascii_case("archived") && !state.eq_ignore_ascii_case("verified") {
+        return None;
+    }
+    let restored = rec.get("restoredAt").is_some_and(|v| !v.is_null())
+        || rec
+            .get("restored_at_ms")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            > 0;
+    if restored {
+        return None;
+    }
+    let expected_size = rec
+        .get("size_bytes")
+        .or_else(|| rec.get("size"))
+        .and_then(|v| v.as_u64())?;
+    let local_path = crate::storage_expansion::local_file(exp_cfg, rec).ok()?;
+    let meta = std::fs::symlink_metadata(&local_path).ok()?;
+    if !meta.file_type().is_file() || meta.len() != expected_size {
+        return None;
+    }
+    let raw_rel = rec
+        .get("path")
+        .or_else(|| rec.get("source_path"))
+        .or_else(|| rec.get("remote_path"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let norm_remote = if raw_rel.starts_with("/storage/emulated/0/") {
+        normalize_sdcard_path(raw_rel)
+    } else if raw_rel.starts_with("/sdcard/") {
+        raw_rel.to_string()
+    } else if !raw_rel.is_empty() {
+        format!("/sdcard/{}", raw_rel.trim_start_matches('/'))
+    } else {
+        local_path.to_string_lossy().into_owned()
+    };
+    if !norm_remote.is_empty() {
+        archived_paths.insert(norm_remote.clone());
+    }
+    if let Some(gal) = rec.get("galleryPath").and_then(|v| v.as_str()) {
+        archived_paths.insert(normalize_sdcard_path(gal));
+    }
+    let name = rec
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            std::path::Path::new(&norm_remote)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(ToOwned::to_owned)
+        })
+        .or_else(|| {
+            local_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_default();
+    if !is_gallery_image_filename(&name) && !is_gallery_image_filename(&local_path.to_string_lossy())
+    {
+        return None;
+    }
+    let local_str = local_path.to_string_lossy().into_owned();
+    if !seen_local.insert(local_str.clone()) {
+        return None;
+    }
+    let raw_mod = rec
+        .get("modified")
+        .or_else(|| rec.get("mtimeMs"))
+        .or_else(|| rec.get("modified_ms"))
+        .or_else(|| rec.get("archivedAt"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let modified_ms = if raw_mod > 0 && raw_mod < 10_000_000_000 {
+        raw_mod * 1000
+    } else {
+        raw_mod
+    };
+    Some(PhoneGalleryItem {
+        remote_path: norm_remote,
+        name,
+        category: "expansion".to_string(),
+        size_bytes: expected_size,
+        modified_ms,
+        local_thumb_path: Some(local_str),
+    })
+}
+
 pub fn load_expansion_gallery_items() -> (std::collections::HashSet<String>, Vec<PhoneGalleryItem>)
 {
     let mut archived_paths = std::collections::HashSet::new();
@@ -3713,101 +3874,14 @@ pub fn load_expansion_gallery_items() -> (std::collections::HashSet<String>, Vec
     };
     let mut seen_local = std::collections::HashSet::new();
     for rec in records {
-        let state = rec
-            .get("state")
-            .and_then(|v| v.as_str())
-            .unwrap_or("archived");
-        let restored = state.eq_ignore_ascii_case("restored")
-            || rec.get("restoredAt").is_some_and(|v| !v.is_null())
-            || rec
-                .get("restored_at_ms")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0)
-                > 0;
-        if restored {
-            continue;
+        if let Some(item) = validate_expansion_gallery_record(
+            &exp_cfg,
+            &rec,
+            &mut seen_local,
+            &mut archived_paths,
+        ) {
+            exp_items.push(item);
         }
-        let Ok(local_path) = crate::storage_expansion::local_file(&exp_cfg, &rec) else {
-            continue;
-        };
-        if !local_path.is_file() {
-            continue;
-        }
-        let raw_rel = rec
-            .get("path")
-            .or_else(|| rec.get("source_path"))
-            .or_else(|| rec.get("remote_path"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim();
-        let norm_remote = if raw_rel.starts_with("/storage/emulated/0/") {
-            normalize_sdcard_path(raw_rel)
-        } else if raw_rel.starts_with("/sdcard/") {
-            raw_rel.to_string()
-        } else if !raw_rel.is_empty() {
-            format!("/sdcard/{}", raw_rel.trim_start_matches('/'))
-        } else {
-            local_path.to_string_lossy().into_owned()
-        };
-        if !norm_remote.is_empty() {
-            archived_paths.insert(norm_remote.clone());
-        }
-        if let Some(gal) = rec.get("galleryPath").and_then(|v| v.as_str()) {
-            archived_paths.insert(normalize_sdcard_path(gal));
-        }
-        let name = rec
-            .get("name")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(ToOwned::to_owned)
-            .or_else(|| {
-                std::path::Path::new(&norm_remote)
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .map(ToOwned::to_owned)
-            })
-            .or_else(|| {
-                local_path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .map(ToOwned::to_owned)
-            })
-            .unwrap_or_default();
-        if !is_gallery_image_filename(&name)
-            && !is_gallery_image_filename(&local_path.to_string_lossy())
-        {
-            continue;
-        }
-        let local_str = local_path.to_string_lossy().into_owned();
-        if !seen_local.insert(local_str.clone()) {
-            continue;
-        }
-        let size_bytes = rec
-            .get("size")
-            .or_else(|| rec.get("size_bytes"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or_else(|| local_path.metadata().map(|m| m.len()).unwrap_or(0));
-        let raw_mod = rec
-            .get("modified")
-            .or_else(|| rec.get("mtimeMs"))
-            .or_else(|| rec.get("modified_ms"))
-            .or_else(|| rec.get("archivedAt"))
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        let modified_ms = if raw_mod > 0 && raw_mod < 10_000_000_000 {
-            raw_mod * 1000
-        } else {
-            raw_mod
-        };
-        exp_items.push(PhoneGalleryItem {
-            remote_path: norm_remote,
-            name,
-            category: "expansion".to_string(),
-            size_bytes,
-            modified_ms,
-            local_thumb_path: Some(local_str),
-        });
     }
     (archived_paths, exp_items)
 }
@@ -4017,6 +4091,76 @@ pub fn list_phone_gallery(adb: &Adb, device: &Device) -> Result<Vec<PhoneGallery
     Ok(items)
 }
 
+pub const MAX_SCREENSHOT_BYTES: usize = 32 * 1024 * 1024;
+
+/// Scales 1080x2400 reference tap coordinates (such as `(956, 616)` or `(540, 1900)`)
+/// proportionally to the active phone display dimensions reported by `wm size`.
+pub fn scale_tap_coords_for_wm_size(wm_size_raw: &str, ref_x: u32, ref_y: u32) -> (u32, u32) {
+    let parse_wh = |line: &str| -> Option<(u32, u32)> {
+        let rhs = line.split(':').nth(1).unwrap_or(line).trim();
+        let token = rhs.split_whitespace().next()?;
+        let (w_str, h_str) = token.split_once('x').or_else(|| token.split_once('X'))?;
+        let w = w_str.parse::<u32>().ok()?;
+        let h = h_str.parse::<u32>().ok()?;
+        (w > 0 && h > 0).then_some((w, h))
+    };
+    let mut override_wh = None;
+    let mut physical_wh = None;
+    let mut fallback_wh = None;
+    for line in wm_size_raw.lines() {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("override size") {
+            override_wh = parse_wh(line).or(override_wh);
+        } else if lower.contains("physical size") {
+            physical_wh = parse_wh(line).or(physical_wh);
+        } else if fallback_wh.is_none() {
+            fallback_wh = parse_wh(line);
+        }
+    }
+    let Some((w, h)) = override_wh.or(physical_wh).or(fallback_wh) else {
+        return (ref_x, ref_y);
+    };
+    let sx = ((ref_x as u64 * w as u64 + 540) / 1080).clamp(1, w.saturating_sub(1).max(1) as u64)
+        as u32;
+    let sy = ((ref_y as u64 * h as u64 + 1200) / 2400).clamp(1, h.saturating_sub(1).max(1) as u64)
+        as u32;
+    (sx, sy)
+}
+
+pub fn capture_screenshot_bytes(adb: &Adb, device: &Device) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let transport = device.resolve_active_transport(adb)?;
+    let mut cmd = std::process::Command::new(&adb.path);
+    crate::resources::quiet_command(&mut cmd);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    cmd.args(["-s", &transport, "exec-out", "screencap", "-p"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().context("无法启动手机截屏进程")?;
+    let mut stdout = child.stdout.take().context("无法读取截屏输出流")?;
+    let mut buf = Vec::new();
+    stdout
+        .by_ref()
+        .take((MAX_SCREENSHOT_BYTES + 1) as u64)
+        .read_to_end(&mut buf)
+        .context("读取手机截屏数据失败")?;
+    if buf.len() > MAX_SCREENSHOT_BYTES {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!("手机截屏数据超过 32 MiB 安全上限");
+    }
+    let status = child.wait().context("等待手机截屏进程结束失败")?;
+    if !status.success() || buf.is_empty() {
+        bail!("手机截屏失败，请确认手机已解锁且当前画面允许截屏");
+    }
+    Ok(buf)
+}
+
 pub fn capture_phone_screenshot_to_gallery(
     adb: &Adb,
     device: &Device,
@@ -4042,8 +4186,9 @@ pub fn capture_phone_screenshot_to_gallery(
     let ts = Local::now().format("%Y%m%d_%H%M%S");
     let remote_path = format!("/sdcard/Pictures/Screenshots/StepX_{ts}.png");
     let script = format!(
-        "mkdir -p /sdcard/Pictures/Screenshots && screencap -p {p} && test -s {p}",
-        p = shell_quote(&remote_path)
+        "mkdir -p /sdcard/Pictures/Screenshots && screencap -p {p} && test -s {p} && [ \"$(wc -c < {p})\" -le {max} ]",
+        p = shell_quote(&remote_path),
+        max = MAX_SCREENSHOT_BYTES
     );
     adb.script(&transport, &script)
         .context("手机截屏失败，请确认手机已解锁且当前画面允许截屏")?;
@@ -4057,12 +4202,64 @@ pub fn capture_phone_screenshot_to_gallery(
     Ok((items, format!("已截取手机画面并存入相册：StepX_{ts}.png")))
 }
 
+fn backup_gallery_item_to_trash_in_dir(
+    adb: &Adb,
+    transport: &str,
+    remote_path: &str,
+    trash_dir: &std::path::Path,
+) -> Result<PathBuf> {
+    std::fs::create_dir_all(trash_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(trash_dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let raw_name = std::path::Path::new(remote_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("photo.bin");
+    let safe_name: String = raw_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let now_ms = Local::now().timestamp_millis().max(0);
+    let path_hash = deterministic_event_id(remote_path, now_ms);
+    let trash_file = trash_dir.join(format!("{now_ms}_{path_hash:08x}_{safe_name}"));
+    adb.transfer(
+        transport,
+        "pull",
+        std::path::Path::new(remote_path),
+        &trash_file,
+    )
+    .context("删除前备份照片到本地 gallery-trash 回收站失败，已取消手机端删除")?;
+    let meta = std::fs::metadata(&trash_file)
+        .context("无法确认本地 gallery-trash 备份文件")?;
+    if !meta.is_file() {
+        bail!("本地 gallery-trash 备份文件无效，已取消手机端删除");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&trash_file, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(trash_file)
+}
+
 pub fn delete_phone_gallery_item(
     adb: &Adb,
     device: &Device,
     remote_path: &str,
 ) -> Result<Vec<PhoneGalleryItem>> {
     crate::storage::validate_path(remote_path)?;
+    let transport = device.resolve_active_transport(adb)?;
+    let trash_dir = crate::resources::user_state().join("gallery-trash");
+    backup_gallery_item_to_trash_in_dir(adb, &transport, remote_path, &trash_dir)?;
     storage::delete(adb, device, remote_path)?;
     list_phone_gallery(adb, device)
 }
@@ -4157,7 +4354,9 @@ pub fn extract_express_number_from_text(text: &str) -> Option<(&'static str, Str
             && tok.starts_with('E')
             && tok.as_bytes()[1].is_ascii_uppercase()
             && tok.ends_with("CN")
-            && tok[2..11].bytes().all(|b| b.is_ascii_digit())
+            && tok
+                .get(2..11)
+                .is_some_and(|s| s.bytes().all(|b| b.is_ascii_digit()))
         {
             return Some(("邮政EMS", tok.clone()));
         }
@@ -6782,10 +6981,186 @@ esac"#,
         assert!(
             !suite_report_cache()
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|p| p.into_inner())
                 .contains_key(&device.serial),
             "set_phone_brightness_percent must invalidate SUITE_REPORT_CACHE"
         );
         invalidate_stepos_suite_cache();
+    }
+
+    #[test]
+    fn parse_ics_datetime_rejects_multibyte_chinese_dates_without_panicking() {
+        assert_eq!(parse_ics_datetime("DTSTART;VALUE=DATE", "2026年11月10日"), None);
+        assert_eq!(
+            parse_ics_datetime("DTSTART", "2026年11月10日T09时30分00秒"),
+            None
+        );
+        assert_eq!(parse_ics_datetime("DTSTART", "2026"), None);
+        assert!(parse_ics_datetime("DTSTART;VALUE=DATE", "20261110").is_some());
+        assert!(parse_ics_datetime("DTSTART", "20261110T093000Z").is_some());
+    }
+
+    #[test]
+    fn alarm_next_ring_offset_days_and_multiday_all_day_calendar_helpers_work() {
+        let disabled = PhoneAlarmItem {
+            id: 1,
+            hour: 7,
+            minutes: 30,
+            enabled: false,
+            days_of_week: 0,
+            vibrate: true,
+            message: "".into(),
+        };
+        assert_eq!(disabled.next_ring_offset_days(1, 6 * 60), None);
+
+        let one_shot = PhoneAlarmItem {
+            enabled: true,
+            ..disabled.clone()
+        };
+        assert_eq!(one_shot.next_ring_offset_days(1, 7 * 60), Some(0));
+        assert_eq!(one_shot.next_ring_offset_days(1, 8 * 60), Some(1));
+        let gov = crate::home_hub::HomeReminderGovernanceStore::default();
+        let late_mon_ms = Local
+            .with_ymd_and_hms(2026, 11, 9, 22, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        assert!(one_shot.is_valid_future_or_today_unexpired_at(late_mon_ms, &gov));
+        assert_eq!(
+            one_shot.validity_status_label_at(late_mon_ms, &gov),
+            ("明天再响", false)
+        );
+
+        let weekdays = PhoneAlarmItem {
+            id: 2,
+            hour: 8,
+            minutes: 0,
+            enabled: true,
+            days_of_week: 31, // Mon..Fri
+            vibrate: true,
+            message: "上班".into(),
+        };
+        // Friday (ISO=5) at 09:00 -> next ring is Monday (offset 3)
+        assert_eq!(weekdays.next_ring_offset_days(5, 9 * 60), Some(3));
+        // Saturday (ISO=6) at 07:00 -> next ring is Monday (offset 2)
+        assert_eq!(weekdays.next_ring_offset_days(6, 7 * 60), Some(2));
+        // Monday (ISO=1) at 07:59 -> later today (offset 0)
+        assert_eq!(weekdays.next_ring_offset_days(1, 7 * 60 + 59), Some(0));
+
+        // Multi-day all-day event [2026-11-10 00:00, 2026-11-13 00:00)
+        let start_ms = Local
+            .with_ymd_and_hms(2026, 11, 10, 0, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let end_ms = Local
+            .with_ymd_and_hms(2026, 11, 13, 0, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let trip = PhoneCalendarEvent {
+            id: 500,
+            title: "三天出差".into(),
+            dtstart: start_ms,
+            dtend: end_ms,
+            all_day: true,
+            ..Default::default()
+        };
+        let day2_noon = Local
+            .with_ymd_and_hms(2026, 11, 11, 12, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let day3_late = Local
+            .with_ymd_and_hms(2026, 11, 12, 23, 30, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let completed = std::collections::HashSet::new();
+        assert!(!trip.is_ended_at(day2_noon));
+        assert!(trip.is_ongoing_at(day2_noon));
+        assert!(trip.is_today_valid_unexpired_at(day2_noon, &completed, &gov));
+        assert!(trip.is_ongoing_at(day3_late));
+        assert!(trip.is_ended_at(end_ms));
+        assert!(!trip.is_ongoing_at(end_ms));
+    }
+
+    #[test]
+    fn scale_tap_coords_and_expansion_gallery_validation_work() {
+        assert_eq!(
+            scale_tap_coords_for_wm_size("Physical size: 1080x2400\n", 956, 616),
+            (956, 616)
+        );
+        assert_eq!(
+            scale_tap_coords_for_wm_size(
+                "Physical size: 1080x2400\nOverride size: 1440x3200\n",
+                956,
+                616
+            ),
+            (1275, 821)
+        );
+        assert_eq!(scale_tap_coords_for_wm_size("", 956, 616), (956, 616));
+
+        let dir = tempfile::tempdir().unwrap();
+        let exp_cfg = crate::storage_expansion::Config {
+            folder: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let item_id = "0123456789abcdef0123456789abcdef";
+        let item_dir = dir.path().join("StepX Storage").join(item_id);
+        std::fs::create_dir_all(&item_dir).unwrap();
+        let file_path = item_dir.join("original.jpg");
+        std::fs::write(&file_path, vec![0xffu8; 512]).unwrap();
+
+        let mut seen = std::collections::HashSet::new();
+        let mut archived = std::collections::HashSet::new();
+
+        let token = "fedcba9876543210fedcba9876543210";
+        let sha = "a".repeat(64);
+
+        // Reject non-archived/non-verified state
+        let staging_rec = serde_json::json!({
+            "id": item_id,
+            "token": token,
+            "sha256": sha,
+            "name": "photo.jpg",
+            "path": "DCIM/Camera/photo.jpg",
+            "state": "staging",
+            "size": 512
+        });
+        assert!(
+            validate_expansion_gallery_record(&exp_cfg, &staging_rec, &mut seen, &mut archived)
+                .is_none()
+        );
+
+        // Reject mismatched file size
+        let mismatch_rec = serde_json::json!({
+            "id": item_id,
+            "token": token,
+            "sha256": sha,
+            "name": "photo.jpg",
+            "path": "DCIM/Camera/photo.jpg",
+            "state": "archived",
+            "size": 1024
+        });
+        assert!(
+            validate_expansion_gallery_record(&exp_cfg, &mismatch_rec, &mut seen, &mut archived)
+                .is_none()
+        );
+
+        // Accept verified/archived with exact matching local file size
+        let valid_rec = serde_json::json!({
+            "id": item_id,
+            "token": token,
+            "sha256": sha,
+            "name": "photo.jpg",
+            "path": "DCIM/Camera/photo.jpg",
+            "state": "verified",
+            "size": 512
+        });
+        let ok_item =
+            validate_expansion_gallery_record(&exp_cfg, &valid_rec, &mut seen, &mut archived)
+                .expect("verified record with matching size should be accepted");
+        assert_eq!(ok_item.size_bytes, 512);
     }
 }

@@ -86,16 +86,23 @@ pub fn is_data_transport_failure(error: &anyhow::Error) -> bool {
 // A transport error does not prove that the phone did not execute a command.
 // Only replay simple, known reads; arbitrary scripts, taps, sends and writes
 // must return their uncertain result to the caller instead of executing twice.
-fn can_replay_after_transport_error(args: &[&str]) -> bool {
+fn can_replay_after_transport_error_os(args: &[&OsStr]) -> bool {
     if args.len() < 3 || args[0] != "-s" {
         return false;
     }
-    match args[2] {
-        "pull" => true,
-        "forward" => args.get(3).is_some_and(|arg| *arg != "tcp:0"),
-        "exec-out" => args.get(3).is_some_and(|arg| *arg == "screencap"),
-        "shell" => {
-            let script = args[3..].join(" ");
+    match args[2].to_str() {
+        Some("pull") => true,
+        Some("forward") => args.get(3).is_some_and(|arg| *arg != "tcp:0"),
+        Some("exec-out") => args.get(3).is_some_and(|arg| *arg == "screencap"),
+        Some("shell") => {
+            let mut script_parts = Vec::with_capacity(args.len().saturating_sub(3));
+            for part in &args[3..] {
+                let Some(s) = part.to_str() else {
+                    return false;
+                };
+                script_parts.push(s);
+            }
+            let script = script_parts.join(" ");
             if script.chars().any(|c| {
                 matches!(
                     c,
@@ -111,6 +118,37 @@ fn can_replay_after_transport_error(args: &[&str]) -> bool {
             match words.as_slice() {
                 ["getprop", ..] | ["echo", ..] | ["screencap", "-p"] => true,
                 ["settings", "get" | "list", ..] | ["content", "query", ..] => true,
+                ["content", "call", rest @ ..] => {
+                    let mut uri = None;
+                    let mut method = None;
+                    let mut valid = true;
+                    let mut i = 0;
+                    while i < rest.len() {
+                        match rest[i] {
+                            "--uri" if i + 1 < rest.len() && uri.is_none() => {
+                                uri = Some(rest[i + 1]);
+                                i += 2;
+                            }
+                            "--method" if i + 1 < rest.len() && method.is_none() => {
+                                method = Some(rest[i + 1]);
+                                i += 2;
+                            }
+                            "--user" | "--arg" if i + 1 < rest.len() => {
+                                i += 2;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    valid
+                        && uri == Some("content://com.stepx.companion.app.push")
+                        && matches!(
+                            method,
+                            Some("snapshot" | "status" | "call_state" | "poll_events")
+                        )
+                }
                 ["wm", "size" | "density"] => true,
                 ["pm", "list", ..] | ["pm", "path", ..] => true,
                 _ => false,
@@ -118,6 +156,12 @@ fn can_replay_after_transport_error(args: &[&str]) -> bool {
         }
         _ => false,
     }
+}
+
+#[cfg(test)]
+fn can_replay_after_transport_error(args: &[&str]) -> bool {
+    let os_args: Vec<&OsStr> = args.iter().map(|s| OsStr::new(*s)).collect();
+    can_replay_after_transport_error_os(&os_args)
 }
 
 pub struct TransportCoordinator;
@@ -300,6 +344,8 @@ static ENSURED_ANDROID_HOME: OnceLock<Mutex<Option<OsString>>> = OnceLock::new()
 static FORWARD_POOL: OnceLock<Mutex<HashMap<(PathBuf, String, String), u16>>> = OnceLock::new();
 
 impl Adb {
+    pub const TRANSFER_TIMEOUT: Duration = Duration::from_secs(600);
+
     pub fn discover() -> Result<Self> {
         let stepx_adb = std::env::var_os("STEPX_ADB");
         let cache = DISCOVER_CACHE.get_or_init(|| Mutex::new(None));
@@ -383,8 +429,29 @@ impl Adb {
             .trim()
             .parse()
             .with_context(|| format!("解析 ADB 转发端口失败: {}", port_raw.trim()))?;
-        if let Ok(mut guard) = pool.lock() {
-            guard.insert(key, port);
+        let existing = if let Ok(mut guard) = pool.lock() {
+            if let Some(&existing_port) = guard.get(&key) {
+                Some(existing_port)
+            } else {
+                guard.insert(key, port);
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(existing_port) = existing {
+            if existing_port != port {
+                let _ = run_process(
+                    self.command(&[
+                        "forward".into(),
+                        "--remove".into(),
+                        format!("tcp:{port}").into(),
+                    ]),
+                    None,
+                    Duration::from_secs(3),
+                );
+            }
+            return Ok((existing_port, true));
         }
         Ok((port, false))
     }
@@ -408,9 +475,17 @@ impl Adb {
             None => pool.lock().ok().and_then(|mut guard| guard.remove(&key)),
         };
         if let Some(p) = port_to_remove {
-            let _ = self.run_timeout(
-                &["-s", serial, "forward", "--remove", &format!("tcp:{p}")],
-                Duration::from_secs(2),
+            // Host TCP forward listeners are owned by the local ADB server and
+            // must be removed without `-s <serial>` or wireless transport slots
+            // so cleanup succeeds even when the phone is already offline/unplugged.
+            let _ = run_process(
+                self.command(&[
+                    "forward".into(),
+                    "--remove".into(),
+                    format!("tcp:{p}").into(),
+                ]),
+                None,
+                Duration::from_secs(3),
             );
         }
     }
@@ -433,18 +508,17 @@ impl Adb {
             vec![]
         };
         // ADB forwards are shared with debuggers and other applications. Never
-        // remove their ports while recovering our own connection.
+        // remove their ports while recovering our own connection. Omit `-s` so
+        // host listeners are cleaned up even when the transport is already offline.
         for port in ports {
             let _ = run_process(
                 self.command(&[
-                    "-s".into(),
-                    trimmed.into(),
                     "forward".into(),
                     "--remove".into(),
                     format!("tcp:{port}").into(),
                 ]),
                 None,
-                Duration::from_millis(1500),
+                Duration::from_secs(3),
             );
         }
     }
@@ -491,7 +565,15 @@ impl Adb {
     pub fn probe_device_identity(&self, target: &str, expected: &str, timeout: Duration) -> bool {
         let _guard = enter_transport_recovery();
         self.run_timeout(&["-s", target, "shell", "getprop", "ro.serialno"], timeout)
-            .is_ok_and(|got| !got.trim().is_empty() && got.trim() == expected)
+            .is_ok_and(|got| {
+                let got = got.trim();
+                if !got.is_empty() && got == expected {
+                    crate::device::record_verified_serial_for_transport(got, target);
+                    true
+                } else {
+                    false
+                }
+            })
     }
 
     pub fn run(&self, args: &[&str]) -> Result<String> {
@@ -504,15 +586,29 @@ impl Adb {
         input: Option<Vec<u8>>,
         timeout: Duration,
     ) -> Result<Output> {
-        let target_serial = if args.len() >= 2 && args[0] == "-s" && !args[1].trim().is_empty() {
-            Some(args[1].trim())
+        let os_args: Vec<&OsStr> = args.iter().map(|s| OsStr::new(*s)).collect();
+        self.run_os_output_with_input(&os_args, input, timeout)
+    }
+
+    pub fn run_os_output_with_input(
+        &self,
+        args: &[&OsStr],
+        input: Option<Vec<u8>>,
+        timeout: Duration,
+    ) -> Result<Output> {
+        let target_serial = if args.len() >= 2 && args[0] == "-s" {
+            args[1].to_str().map(str::trim).filter(|s| !s.is_empty())
         } else {
             None
         };
-        let is_retryable_subcmd = can_replay_after_transport_error(args);
+        let is_retryable_subcmd = can_replay_after_transport_error_os(args);
         let _mutation = if !is_retryable_subcmd && !in_transport_recovery() {
-            target_serial.map(crate::device::protect_transport_mutation).transpose()?
-        } else { None };
+            target_serial
+                .map(crate::device::protect_transport_mutation)
+                .transpose()?
+        } else {
+            None
+        };
 
         let (first_input, retry_input) = if is_retryable_subcmd && !in_transport_recovery() {
             (input.clone(), input)
@@ -535,7 +631,7 @@ impl Adb {
                 bail!("手机请求等待超时，请稍后重试");
             }
             run_process(
-                self.command(&args.iter().map(OsString::from).collect::<Vec<_>>()),
+                self.command(&args.iter().map(|a| (*a).to_os_string()).collect::<Vec<_>>()),
                 first_input,
                 remaining,
             )
@@ -562,17 +658,26 @@ impl Adb {
                 if let Some(target) = target_serial {
                     TransportCoordinator::record_command_failure(target);
                 }
-                is_transient_transport_error("", "", &err.to_string())
+                is_data_transport_failure(err)
             }
         };
 
+        if transient_failure {
+            if let Some(target) = target_serial {
+                crate::device::invalidate_verified_transport(target);
+            }
+        }
+
         if transient_failure && is_retryable_subcmd && !in_transport_recovery() {
             if let Some(target) = target_serial {
+                let remaining = timeout.saturating_sub(start.elapsed());
+                if remaining.is_zero() {
+                    return first_res;
+                }
                 let _recovery_guard = enter_transport_recovery();
                 TransportCoordinator::record_retry(target);
                 // A failed stream does not imply the entire transport is dead.
                 // Preserve live MCP/sync/mirroring streams; share one bounded recovery.
-                let remaining = timeout.saturating_sub(start.elapsed());
                 let Some(resolved_target) = crate::device::recover_transport(
                     self,
                     target,
@@ -588,7 +693,7 @@ impl Adb {
                 retry_args.push(OsString::from("-s"));
                 retry_args.push(OsString::from(&resolved_target));
                 for arg in &args[2..] {
-                    retry_args.push(OsString::from(arg));
+                    retry_args.push((*arg).to_os_string());
                 }
 
                 let retry_start = Instant::now();
@@ -616,8 +721,19 @@ impl Adb {
                             record_transport_failover(target);
                         }
                     }
-                    _ => {
+                    Ok(out) => {
                         TransportCoordinator::record_command_failure(&resolved_target);
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        let stdout = String::from_utf8_lossy(&out.stdout);
+                        if is_transient_transport_error(&stderr, &stdout, "") {
+                            crate::device::invalidate_verified_transport(&resolved_target);
+                        }
+                    }
+                    Err(err) => {
+                        TransportCoordinator::record_command_failure(&resolved_target);
+                        if is_data_transport_failure(err) {
+                            crate::device::invalidate_verified_transport(&resolved_target);
+                        }
                     }
                 }
                 return retry_res;
@@ -650,13 +766,22 @@ impl Adb {
         }
     }
 
-    pub fn shell(&self, serial: &str, arguments: &[&str]) -> Result<String> {
+    pub fn shell_timeout(
+        &self,
+        serial: &str,
+        arguments: &[&str],
+        timeout: Duration,
+    ) -> Result<String> {
         let command = arguments
             .iter()
             .map(|s| shell_quote(s))
             .collect::<Vec<_>>()
             .join(" ");
-        self.run(&["-s", serial, "shell", &command])
+        self.run_timeout(&["-s", serial, "shell", &command], timeout)
+    }
+
+    pub fn shell(&self, serial: &str, arguments: &[&str]) -> Result<String> {
+        self.shell_timeout(serial, arguments, Duration::from_secs(20))
     }
 
     pub fn script(&self, serial: &str, script: &str) -> Result<String> {
@@ -676,28 +801,18 @@ impl Adb {
     }
 
     pub fn transfer(&self, serial: &str, verb: &str, source: &Path, target: &Path) -> Result<()> {
-        if let (Some(src_str), Some(dst_str)) = (source.to_str(), target.to_str()) {
-            let output = self.run_output_with_input(
-                &["-s", serial, verb, src_str, dst_str],
-                None,
-                Duration::from_secs(600),
-            )?;
-            checked_text(output)?;
-            return Ok(());
-        }
-        let args = vec![
-            "-s".into(),
-            serial.into(),
-            verb.into(),
-            source.as_os_str().into(),
-            target.as_os_str().into(),
-        ];
-        let _slot = TransportCoordinator::acquire_slot(serial)?;
-        checked_text(run_process(
-            self.command(&args),
+        let output = self.run_os_output_with_input(
+            &[
+                OsStr::new("-s"),
+                OsStr::new(serial),
+                OsStr::new(verb),
+                source.as_os_str(),
+                target.as_os_str(),
+            ],
             None,
-            Duration::from_secs(600),
-        )?)?;
+            Self::TRANSFER_TIMEOUT,
+        )?;
+        checked_text(output)?;
         Ok(())
     }
 }
@@ -760,6 +875,7 @@ pub fn run_process(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
     let mut attempts = 0u8;
     let mut child = loop {
         match command.spawn() {
@@ -784,19 +900,33 @@ pub fn run_process(
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
     let waiting_thread = thread::current();
+    let out_unpark = waiting_thread.clone();
     let out = thread::spawn(move || {
         let res = read_bounded(&mut stdout);
-        waiting_thread.unpark();
+        out_unpark.unpark();
         res
     });
-    let err = thread::spawn(move || read_bounded(&mut stderr));
-    let stdin = child.stdin.take();
-    let writer = thread::spawn(move || -> std::io::Result<()> {
-        if let (Some(mut stdin), Some(input)) = (stdin, input) {
-            stdin.write_all(&input)?;
-        }
-        Ok(())
+    let err_unpark = waiting_thread.clone();
+    let err = thread::spawn(move || {
+        let res = read_bounded(&mut stderr);
+        err_unpark.unpark();
+        res
     });
+    let writer = match (child.stdin.take(), input) {
+        (Some(mut stdin), Some(input)) => {
+            let writer_unpark = waiting_thread.clone();
+            Some(thread::spawn(move || -> std::io::Result<()> {
+                let res = stdin.write_all(&input);
+                drop(stdin);
+                writer_unpark.unpark();
+                res
+            }))
+        }
+        (stdin, _) => {
+            drop(stdin);
+            None
+        }
+    };
     const BACKOFF_MS: [u64; 6] = [1, 2, 4, 8, 15, 25];
     let mut poll_step = 0usize;
     let mut status = None;
@@ -804,7 +934,11 @@ pub fn run_process(
         if status.is_none() {
             status = child.try_wait()?;
         }
-        if status.is_some() && out.is_finished() && err.is_finished() && writer.is_finished() {
+        if status.is_some()
+            && out.is_finished()
+            && err.is_finished()
+            && writer.as_ref().is_none_or(|w| w.is_finished())
+        {
             break;
         }
         // Include stdin writes and inherited output pipes in the same deadline.
@@ -815,8 +949,39 @@ pub fn run_process(
             unsafe {
                 libc::kill(-(child.id() as i32), libc::SIGKILL);
             }
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                let _ = Command::new("taskkill.exe")
+                    .args(["/PID", &child.id().to_string(), "/T", "/F"])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
             let _ = child.kill();
             let _ = child.wait();
+            let cleanup_deadline = Instant::now() + Duration::from_millis(100);
+            while !(out.is_finished()
+                && err.is_finished()
+                && writer.as_ref().is_none_or(|w| w.is_finished()))
+                && Instant::now() < cleanup_deadline
+            {
+                thread::sleep(Duration::from_millis(2));
+            }
+            if let Some(w) = writer {
+                if w.is_finished() {
+                    let _ = w.join();
+                }
+            }
+            if out.is_finished() {
+                let _ = out.join();
+            }
+            if err.is_finished() {
+                let _ = err.join();
+            }
             return Err(ProcessTimeout.into());
         }
         let wait_ms = BACKOFF_MS[poll_step.min(BACKOFF_MS.len() - 1)];
@@ -829,9 +994,10 @@ pub fn run_process(
     let stderr = err
         .join()
         .map_err(|_| anyhow::anyhow!("读取工具错误失败"))??;
-    let input_result = writer
-        .join()
-        .map_err(|_| anyhow::anyhow!("写入工具输入失败"))?;
+    let input_result = match writer {
+        Some(w) => w.join().map_err(|_| anyhow::anyhow!("写入工具输入失败"))?,
+        None => Ok(()),
+    };
     let status = status.context("工具未返回退出状态")?;
     if status.success() {
         input_result.context("工具未完整接收输入")?;
@@ -865,11 +1031,24 @@ fn read_bounded(reader: &mut impl Read) -> Result<Vec<u8>> {
 }
 
 pub fn find_executable(name: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH").and_then(|paths| {
+    let binary = exe(name);
+    if let Some(found) = std::env::var_os("PATH").and_then(|paths| {
         std::env::split_paths(&paths)
-            .map(|p| p.join(exe(name)))
+            .map(|p| p.join(&binary))
             .find(|p| p.is_file())
-    })
+    }) {
+        return Some(found);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        for dir in ["/opt/homebrew/bin", "/usr/local/bin"] {
+            let candidate = Path::new(dir).join(&binary);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 pub fn bundled_tool(name: &str) -> Option<PathBuf> {
@@ -957,6 +1136,7 @@ pub fn exe(name: &str) -> OsString {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::net::TcpListener;
 
     #[cfg(unix)]
@@ -1374,6 +1554,7 @@ esac
         // keys in FORWARD_POOL and SCREEN_RES_CACHE never collide with or evict entries used by
         // concurrently running live-device tests (e.g., home_hub / bridge).
         let dir = tempfile::tempdir().expect("tempdir for isolated adb link");
+        #[cfg(unix)]
         let isolated_adb_path = dir.path().join(exe("adb"));
         #[cfg(unix)]
         let adb = if std::os::unix::fs::symlink(&discovered_adb.path, &isolated_adb_path).is_ok() {
@@ -1606,6 +1787,10 @@ exit 0
         std::fs::set_permissions(&fake_adb, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let adb = Adb { path: fake_adb };
+        crate::device::record_verified_serial_for_transport(
+            "STEPX_FAILOVER_USB_UNIT",
+            "10.0.1.250:39999",
+        );
         crate::device::set_backup_transports_for(
             &["10.0.1.250:39999", "STEPX_FAILOVER_USB_UNIT"],
             vec!["STEPX_FAILOVER_USB_UNIT".to_string()],
@@ -1619,5 +1804,158 @@ exit 0
         let tel = transport_telemetry("10.0.1.250:39999");
         assert!(tel.total_retries >= 1);
         assert!(tel.total_failovers >= 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forward_pool_concurrent_race_removes_duplicate_and_offline_invalidate_omits_serial() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Barrier;
+
+        let serial = "10.0.1.251:45555";
+        let remote = "localabstract:race-unit";
+        let dir = tempfile::tempdir().unwrap();
+        let adb_path = dir.path().join("adb");
+        let calls_path = dir.path().join("calls.log");
+
+        // Use exclusive file creation because concurrent mkdir calls can both
+        // report success with uutils, causing both fake forwards to return 41001.
+        let script = format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> '{calls}'
+case "$*" in
+  *"-s {serial} forward --remove"*)
+    echo "error: device offline" >&2
+    exit 1
+    ;;
+  *"forward tcp:0"*)
+    if (set -C; : > '{dir}/first') 2>/dev/null; then
+      port=41001
+    else
+      port=41002
+      : > '{dir}/second'
+    fi
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+      [ -f '{dir}/second' ] && break
+      sleep 0.02
+    done
+    echo "$port"
+    exit 0
+    ;;
+  "forward --remove tcp:"*)
+    exit 0
+    ;;
+esac
+exit 0
+"#,
+            calls = calls_path.display(),
+            dir = dir.path().display()
+        );
+        std::fs::write(&adb_path, script).unwrap();
+        std::fs::set_permissions(&adb_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let adb = Adb { path: adb_path };
+        let gate = Barrier::new(2);
+        let (r1, r2) = thread::scope(|scope| {
+            let forward = || {
+                gate.wait();
+                adb.forward_tcp_cached(serial, remote).unwrap()
+            };
+            let first = scope.spawn(forward);
+            let second = scope.spawn(forward);
+            (first.join().unwrap(), second.join().unwrap())
+        });
+
+        assert_eq!(
+            r1.0, r2.0,
+            "concurrent forward_tcp_cached calls must converge on one port"
+        );
+        let chosen = r1.0;
+        let duplicate = if chosen == 41001 { 41002 } else { 41001 };
+        let calls = std::fs::read_to_string(&calls_path).unwrap();
+        assert!(
+            calls.lines().any(|line| line == format!("forward --remove tcp:{duplicate}")),
+            "losing thread must clean up duplicate listener without -s: {calls}"
+        );
+
+        // Exhaust all wireless slots for `serial` and verify offline invalidation still
+        // removes the host forward without `-s <serial>` or waiting on wireless slots.
+        let _slots: Vec<_> = (0..TransportCoordinator::MAX_WIRELESS_CONCURRENCY)
+            .map(|_| TransportCoordinator::acquire_slot(serial).unwrap())
+            .collect();
+        adb.invalidate_forwarded_tcp(serial, remote, Some(chosen));
+        let calls_after = std::fs::read_to_string(&calls_path).unwrap();
+        assert!(
+            calls_after
+                .lines()
+                .any(|l| l == format!("forward --remove tcp:{chosen}")),
+            "invalidate_forwarded_tcp must run `forward --remove` without `-s`: {calls_after}"
+        );
+        assert!(
+            !calls_after
+                .lines()
+                .any(|l| l.contains("-s") && l.contains("--remove")),
+            "forward --remove must never pass -s: {calls_after}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_transfer_uses_managed_pipeline_with_failover_and_mutation_guard() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_adb = dir.path().join("adb");
+        let calls_log = dir.path().join("calls.log");
+        let script = format!(
+            r#"#!/bin/sh
+printf '%s\n' "$1 $2 $3" >> '{calls}'
+if [ "$1" = "-s" ] && [ "$2" = "10.0.1.252:39999" ] && [ "$3" = "pull" ]; then
+  echo "adb: error: closed" >&2
+  exit 1
+fi
+if [ "$1" = "-s" ] && [ "$2" = "STEPX_NONUTF8_USB" ] && [ "$3" = "shell" ]; then
+  echo "STEPX_NONUTF8_USB"
+  exit 0
+fi
+if [ "$1" = "-s" ] && [ "$2" = "STEPX_NONUTF8_USB" ] && [ "$3" = "pull" ]; then
+  printf 'PULLED_OK' > "$5"
+  exit 0
+fi
+if [ "$1" = "devices" ]; then
+  echo "List of devices attached"
+  echo "STEPX_NONUTF8_USB device product:pandora model:PZ261A device:pandora"
+  exit 0
+fi
+exit 0
+"#,
+            calls = calls_log.display()
+        );
+        std::fs::write(&fake_adb, script).unwrap();
+        std::fs::set_permissions(&fake_adb, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let adb = Adb { path: fake_adb };
+        crate::device::record_verified_serial_for_transport(
+            "STEPX_NONUTF8_USB",
+            "10.0.1.252:39999",
+        );
+        crate::device::set_backup_transports_for(
+            &["10.0.1.252:39999", "STEPX_NONUTF8_USB"],
+            vec!["STEPX_NONUTF8_USB".to_string()],
+        );
+
+        let non_utf8_name = OsStr::from_bytes(b"report_\xff\xfe.bin");
+        let local_dst = dir.path().join(non_utf8_name);
+        assert!(local_dst.to_str().is_none());
+
+        adb.transfer(
+            "10.0.1.252:39999",
+            "pull",
+            Path::new("/sdcard/Download/report.bin"),
+            &local_dst,
+        )
+        .expect("non-UTF-8 pull should fail over to verified USB backup");
+        assert_eq!(std::fs::read(&local_dst).unwrap(), b"PULLED_OK");
     }
 }

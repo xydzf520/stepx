@@ -49,3 +49,16 @@ fn test_char_counter_nonsequential() {
     // Skip ahead to the emoji.
     assert_eq!(counter.char_offset(9), Some(7.into()));
 }
+
+#[test]
+fn test_char_offset_add_assign_saturates() {
+    let mut offset = crate::CharOffset::from(3);
+    offset += -10;
+    assert_eq!(offset, crate::CharOffset::zero());
+
+    offset += i32::MIN;
+    assert_eq!(offset, crate::CharOffset::zero());
+
+    offset += 5;
+    assert_eq!(offset, crate::CharOffset::from(5));
+}

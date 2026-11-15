@@ -88,7 +88,11 @@ pub fn watch_wm_settingchange(event_proxy: EventLoopProxy<CustomEvent>) -> WmSet
             log::info!("WM_SETTINGCHANGE listener started");
 
             let mut msg = MSG::default();
-            while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            loop {
+                let ret = GetMessageW(&mut msg, None, 0, 0);
+                if ret.0 <= 0 {
+                    break;
+                }
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
@@ -157,13 +161,32 @@ unsafe extern "system" fn wnd_proc(
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
-/// Extracts a pointer from an opaque `LPARAM` value.
-/// Returns `None` when the pointer is null.
-unsafe fn lparam_to_ptr(lparam: LPARAM) -> Option<*const u16> {
-    let raw: isize = std::mem::transmute_copy(&lparam);
-    if raw == 0 {
+/// Extracts a valid wide-string pointer from an opaque `LPARAM` value.
+///
+/// Rejects null/integer broadcast sentinels in the first 64 KiB (`<= 0xFFFF`, such as `lParam = 1`
+/// from taskbar/DPI/shell broadcasts) and unaligned `u16` addresses so they are never dereferenced.
+fn lparam_to_ptr(lparam: LPARAM) -> Option<*const u16> {
+    let raw = lparam.0 as usize;
+    if raw <= 0xFFFF || raw % core::mem::align_of::<u16>() != 0 {
         None
     } else {
         Some(raw as *const u16)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lparam_to_ptr_rejects_null_low_integers_and_unaligned_addresses() {
+        assert!(lparam_to_ptr(LPARAM(0)).is_none());
+        assert!(lparam_to_ptr(LPARAM(1)).is_none());
+        assert!(lparam_to_ptr(LPARAM(0xFFFF)).is_none());
+        assert!(lparam_to_ptr(LPARAM(0x10001)).is_none());
+
+        let sample: [u16; 2] = [65, 0];
+        let addr = sample.as_ptr() as isize;
+        assert_eq!(lparam_to_ptr(LPARAM(addr)), Some(sample.as_ptr()));
     }
 }

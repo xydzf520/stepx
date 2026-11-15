@@ -33,11 +33,25 @@ if updater.exists():
     if not server.exists() or hashlib.sha256(server.read_bytes()).hexdigest() != checksum:
         server.parent.mkdir(parents=True, exist_ok=True)
         pending = server.with_suffix(".download")
-        subprocess.run(["curl", "-fL", "--connect-timeout", "10", "--max-time", "120",
-            f"https://github.com/Genymobile/scrcpy/releases/download/v{version}/scrcpy-server-v{version}", "-o", str(pending)], check=True)
-        if hashlib.sha256(pending.read_bytes()).hexdigest() != checksum:
-            pending.unlink()
-            raise SystemExit("scrcpy server checksum mismatch")
-        pending.replace(server)
+        upstream_url = f"https://github.com/Genymobile/scrcpy/releases/download/v{version}/scrcpy-server-v{version}"
+        candidates = [
+            upstream_url,
+            f"https://ghfast.top/{upstream_url}",
+            f"https://gh-proxy.com/{upstream_url}",
+        ]
+        verified = False
+        for candidate in candidates:
+            pending.unlink(missing_ok=True)
+            res = subprocess.run(
+                ["curl", "-fL", "--connect-timeout", "10", "--max-time", "120", candidate, "-o", str(pending)],
+                check=False,
+            )
+            if res.returncode == 0 and pending.is_file() and hashlib.sha256(pending.read_bytes()).hexdigest() == checksum:
+                pending.replace(server)
+                verified = True
+                break
+        if not verified:
+            pending.unlink(missing_ok=True)
+            raise SystemExit("scrcpy server download or checksum verification failed")
 if not server.is_file():
     raise SystemExit("The distribution did not provide a scrcpy server. Install the matching official server before mirroring.")

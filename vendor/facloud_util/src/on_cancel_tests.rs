@@ -1,5 +1,6 @@
 use crate::on_cancel::OnCancelFutureExt;
 use futures_util::future::{AbortHandle, Abortable, Aborted};
+use futures_util::FutureExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[test]
@@ -7,7 +8,7 @@ fn test_ready_future_doesnt_call_callback() {
     let callback_called = AtomicBool::new(false);
 
     let future = async {}.on_cancel(|| callback_called.store(true, Ordering::SeqCst));
-    facloud_ui::r#async::block_on(future);
+    future.now_or_never().expect("ready future should resolve");
 
     assert!(!callback_called.load(Ordering::Relaxed));
 }
@@ -24,7 +25,7 @@ fn test_aborted_future_calls_callback() {
 
     // Abort the future before it is ever polled.
     handle.abort();
-    let future_result = facloud_ui::r#async::block_on(future);
+    let future_result = future.now_or_never().expect("aborted future should resolve");
 
     // The future should be aborted and the callback should have been called.
     assert_eq!(future_result, Err(Aborted));

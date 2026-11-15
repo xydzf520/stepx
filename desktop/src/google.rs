@@ -10,9 +10,20 @@ use crate::{
     },
 };
 use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub mod recovery;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GoogleCompatibilityState {
+    #[default]
+    Unknown,
+    Unsupported,
+    Inactive,
+    Active,
+}
 
 #[derive(Debug)]
 pub struct WorkflowFailure {
@@ -60,12 +71,15 @@ pub fn workflow_root() -> Result<PathBuf> {
 
 pub fn run_script(device: &Device, adb: &Adb, script: &str, args: &[&str]) -> Result<String> {
     let root = workflow_root()?;
+    let active_transport = device
+        .resolve_active_transport(adb)
+        .unwrap_or_else(|_| device.transport.clone());
     let mut command = crate::resources::python_command();
     command
         .arg(root.join("tools").join(script))
         .args(args)
         .current_dir(&root)
-        .env("STEPX_SERIAL", &device.transport)
+        .env("STEPX_SERIAL", &active_transport)
         .env("STEPX_DEVICE_SERIAL", &device.serial)
         .env("STEPX_ADB", &adb.path)
         .env_remove("PYTHONOPTIMIZE");
@@ -98,19 +112,20 @@ fn run_compatibility_script(device: &Device, adb: &Adb, action: &str) -> Result<
             )
             .is_ok_and(|s| s.trim() == "device")
     {
-        device.serial.trim()
+        device.serial.trim().to_string()
     } else {
-        device.transport.as_str()
+        device.resolve_active_transport(adb)?
     };
-    let output = crate::resources::python_command()
+    let mut command = crate::resources::python_command();
+    command
         .arg(&script)
         .arg(action)
         .current_dir(script.parent().context("兼容组件目录无效")?)
-        .env("STEPX_SERIAL", selected_transport)
+        .env("STEPX_SERIAL", &selected_transport)
         .env("STEPX_DEVICE_SERIAL", &device.serial)
         .env("STEPX_ADB", &adb.path)
-        .env_remove("PYTHONOPTIMIZE")
-        .output()
+        .env_remove("PYTHONOPTIMIZE");
+    let output = crate::adb::run_process(command, None, std::time::Duration::from_secs(35))
         .context("无法启动 Google Play 兼容组件，请检查 Python 3 环境")?;
     // Only the component's bounded JSON summary may reach the UI. Worker
     // stderr and private rollback receipts are never displayed here.
@@ -140,15 +155,30 @@ fn play_protect_script() -> Result<PathBuf> {
     Ok(script)
 }
 
+fn find_attestation_chain_in(candidates: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    candidates.into_iter().find(|directory| {
+        ["leaf.pem", "intermediates.pem", "chain-provided-root.pem"]
+            .iter()
+            .all(|name| directory.join(name).is_file())
+    })
+}
+
 /// Attestation evidence captured earlier. Generating a new attestation key
 /// needs a diagnostic app on the phone, so only an existing capture is read.
 fn captured_attestation_chain() -> Option<PathBuf> {
-    let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../backups/google-play-compat-20261023/key-attestation-validation");
-    let complete = ["leaf.pem", "intermediates.pem", "chain-provided-root.pem"]
-        .iter()
-        .all(|name| directory.join(name).is_file());
-    complete.then_some(directory)
+    #[allow(unused_mut)]
+    let mut candidates = vec![
+        crate::resources::root().join("runtime/google-play/attestation"),
+        crate::resources::user_state().join("google-play/attestation"),
+        crate::resources::user_config().join("stepx-companion/google-play/attestation"),
+        crate::resources::user_config().join("google-play/attestation"),
+    ];
+    #[cfg(debug_assertions)]
+    candidates.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../backups/google-play-compat-20261023/key-attestation-validation"),
+    );
+    find_attestation_chain_in(candidates)
 }
 
 fn play_protect_text(value: &serde_json::Value, key: &str) -> Result<String> {
@@ -342,24 +372,24 @@ pub fn play_protect_from_value(value: &serde_json::Value) -> Result<PlayProtectR
 /// device, requests a certificate from Google, or reports a certification the
 /// phone does not actually hold.
 pub fn inspect_play_protect(device: &Device, adb: &Adb) -> Result<PlayProtectReport> {
-    device.verify(adb)?;
+    let active_transport = device.resolve_active_transport(adb)?;
     let script = play_protect_script()?;
     let mut command = crate::resources::python_command();
     command
         .arg(&script)
         .arg("status")
+        .arg("--offline")
         .arg("--serial")
-        .arg(&device.transport)
+        .arg(&active_transport)
         .current_dir(script.parent().context("认证组件目录无效")?)
-        .env("STEPX_SERIAL", &device.transport)
+        .env("STEPX_SERIAL", &active_transport)
         .env("STEPX_DEVICE_SERIAL", &device.serial)
         .env("STEPX_ADB", &adb.path)
         .env_remove("PYTHONOPTIMIZE");
     if let Some(directory) = captured_attestation_chain() {
         command.arg("--attestation-chain").arg(directory);
     }
-    let output = command
-        .output()
+    let output = crate::adb::run_process(command, None, std::time::Duration::from_secs(35))
         .context("无法启动 Play 保护机制认证组件，请检查 Python 3 环境")?;
     let value: serde_json::Value = serde_json::from_slice(&output.stdout)
         .context("Play 保护机制认证组件未返回有效状态，请重新检测")?;
@@ -385,6 +415,26 @@ fn apply_compatibility_status(status: &mut GoogleSuiteStatus, value: &serde_json
     status.compatibility_active = status.compatibility_supported && value["active"] == true;
     // A valid backup can remain available after a partial application failure.
     status.compatibility_can_rollback = status.installed && value["can_rollback"] == true;
+    let unsupported_error = matches!(
+        value["error"].as_str(),
+        Some(
+            "unsupported_apk"
+                | "unsupported_firmware"
+                | "unsupported_device"
+                | "unsupported_package_identity"
+        )
+    );
+    status.compatibility_state = if !status.installed {
+        GoogleCompatibilityState::Unknown
+    } else if status.compatibility_active {
+        GoogleCompatibilityState::Active
+    } else if status.compatibility_supported {
+        GoogleCompatibilityState::Inactive
+    } else if (value["ok"] == true && value["supported"] == false) || unsupported_error {
+        GoogleCompatibilityState::Unsupported
+    } else {
+        GoogleCompatibilityState::Unknown
+    };
     status.compatibility_note = value["message"]
         .as_str()
         .unwrap_or("兼容补丁状态未确认，请重新检测")
@@ -392,7 +442,7 @@ fn apply_compatibility_status(status: &mut GoogleSuiteStatus, value: &serde_json
 }
 
 fn should_apply_during_install(plan: GoogleInstallPlan, status: &GoogleSuiteStatus) -> bool {
-    plan == GoogleInstallPlan::Existing
+    matches!(plan, GoogleInstallPlan::Existing | GoogleInstallPlan::Recovery)
         && status.installed
         && status.compatibility_checked
         && status.compatibility_supported
@@ -407,7 +457,9 @@ pub fn change_compatibility(
     rollback: bool,
     progress: impl Fn(&str),
 ) -> Result<(GoogleSuiteStatus, String)> {
-    device.verify(adb)?;
+    let mut active_device = device.clone();
+    active_device.transport = device.resolve_active_transport(adb)?;
+    let device = &active_device;
     progress(if rollback {
         "核对备份并撤销 Google Play 兼容补丁…"
     } else {
@@ -493,10 +545,72 @@ fn package_flags_clear(flags: &serde_json::Value) -> Result<bool> {
     Ok(parse("publicFlags")? & 1 == 0 && parse("privateFlags")? & 8 == 0)
 }
 
+fn apply_certification_and_protect_notes(
+    status: &mut GoogleSuiteStatus,
+    cert_res: Result<serde_json::Value>,
+    protect_res: Result<PlayProtectReport>,
+) {
+    match cert_res {
+        Ok(value) => {
+            let mut blockers = Vec::new();
+            if value["certification_block_visible"] == true {
+                blockers.push("已在手机发现“设备未认证”拦截页；Google 服务当前不可按正常可用验收。");
+            }
+            if value["disabled_components"]
+                .as_array()
+                .is_some_and(|a| !a.is_empty())
+            {
+                blockers.push("检测到 Google 组件被停用，请在手机应用设置中启用后重试。");
+            }
+            status.device_blocker_note = blockers.join(" ");
+            status.certification_note = if !status.device_blocker_note.is_empty() {
+                status.device_blocker_note.clone()
+            } else {
+                "未读取到 Google 认证结果；请在手机 Play → 设置 → 关于核对。".into()
+            };
+            status.certification_catalog = value["catalog_note"]
+                .as_str()
+                .unwrap_or("机型列表未确认")
+                .into();
+            status.boot_security_note = format!(
+                "Bootloader：{} · Verified Boot：{}",
+                match value["bootloader_locked"].as_str() {
+                    Some("1") => "已锁定",
+                    Some("0") => "已解锁",
+                    _ => "未知",
+                },
+                value["verified_boot"].as_str().unwrap_or("未知")
+            );
+        }
+        Err(_) => {
+            status.device_blocker_note.clear();
+            status.certification_note =
+                "认证诊断暂不可用；权限校验成功不代表 Google 认证通过。".into();
+        }
+    }
+    match protect_res {
+        Ok(report) => {
+            let summary = report.summary();
+            status.certification_note = if status.device_blocker_note.is_empty() {
+                summary
+            } else {
+                format!("{} {summary}", status.device_blocker_note)
+            };
+            status.play_protect = report;
+        }
+        Err(error) => {
+            status.play_protect.note = format!("Play 保护机制认证检测未完成：{error}");
+        }
+    }
+}
+
 pub fn inspect(device: &Device, adb: &Adb) -> Result<GoogleSuiteStatus> {
-    device.verify(adb)?;
+    let transport = device.resolve_active_transport(adb)?;
+    let mut active_device = device.clone();
+    active_device.transport = transport.clone();
+    let device = &active_device;
     let pkg_versions = adb.script(
-        &device.transport,
+        &transport,
         "pkgs=$(pm list packages --user 0 | tr -d '\\r'); \
          for p in com.google.android.gsf com.google.android.gms com.android.vending; do \
            if printf '%s\\n' \"$pkgs\" | grep -Fxq \"package:$p\"; then \
@@ -557,7 +671,10 @@ pub fn inspect(device: &Device, adb: &Adb) -> Result<GoogleSuiteStatus> {
         .into();
         return Ok(status);
     }
-    let (cert_res, protect_res, compat_res, manage_res, pkg_res, health_res) =
+    // Run compatibility status before inspect_play_protect so two
+    // google-play-compat.py processes never contend on LOCK_NB concurrently.
+    let compat_res = run_compatibility_script(device, adb, "status");
+    let (cert_res, protect_res, manage_res, pkg_res, health_res) =
         std::thread::scope(|s| {
             let t_cert = s.spawn(|| {
                 run_script(device, adb, "certification.py", &[])
@@ -569,73 +686,31 @@ pub fn inspect(device: &Device, adb: &Adb) -> Result<GoogleSuiteStatus> {
                     .and_then(|text| Ok(serde_json::from_str::<serde_json::Value>(&text)?))
             });
             let t_runtime = s.spawn(|| {
-                let compat = run_compatibility_script(device, adb, "status");
                 let manage = run_script(device, adb, "manage.py", &["status"])
                     .and_then(|text| Ok(serde_json::from_str::<serde_json::Value>(&text)?));
                 let health = run_script(device, adb, "health.py", &["status"])
                     .and_then(|raw| Ok(serde_json::from_str::<serde_json::Value>(&raw)?));
-                (compat, manage, health)
+                (manage, health)
             });
-            let (compat_res, manage_res, health_res) = t_runtime
+            let (manage_res, health_res) = t_runtime
                 .join()
-                .unwrap_or_else(|_| (Err(anyhow::anyhow!("线程异常")), Err(anyhow::anyhow!("线程异常")), Err(anyhow::anyhow!("线程异常"))));
+                .unwrap_or_else(|_| (Err(anyhow::anyhow!("线程异常")), Err(anyhow::anyhow!("线程异常"))));
             (
                 t_cert.join().unwrap_or_else(|_| Err(anyhow::anyhow!("线程异常"))),
                 t_protect.join().unwrap_or_else(|_| Err(anyhow::anyhow!("线程异常"))),
-                compat_res,
                 manage_res,
                 t_pkg.join().unwrap_or_else(|_| Err(anyhow::anyhow!("线程异常"))),
                 health_res,
             )
         });
-    match cert_res {
-        Ok(value) => {
-            status.certification_note = if value["certification_block_visible"] == true {
-                "已在手机发现“设备未认证”拦截页；Google 服务当前不可按正常可用验收。"
-            } else {
-                "未读取到 Google 认证结果；请在手机 Play → 设置 → 关于核对。"
-            }
-            .into();
-            status.certification_catalog = value["catalog_note"]
-                .as_str()
-                .unwrap_or("机型列表未确认")
-                .into();
-            status.boot_security_note = format!(
-                "Bootloader：{} · Verified Boot：{}",
-                match value["bootloader_locked"].as_str() {
-                    Some("1") => "已锁定",
-                    Some("0") => "已解锁",
-                    _ => "未知",
-                },
-                value["verified_boot"].as_str().unwrap_or("未知")
-            );
-            if value["disabled_components"]
-                .as_array()
-                .is_some_and(|a| !a.is_empty())
-            {
-                status
-                    .certification_note
-                    .push_str(" 检测到 Google 组件被停用，请在手机应用设置中启用后重试。");
-            }
-        }
-        Err(_) => {
-            status.certification_note =
-                "认证诊断暂不可用；权限校验成功不代表 Google 认证通过。".into()
-        }
-    }
     match compat_res {
         Ok(value) => apply_compatibility_status(&mut status, &value),
-        Err(error) => status.compatibility_note = format!("兼容补丁暂未完成检测：{error}"),
-    }
-    match protect_res {
-        Ok(report) => {
-            status.certification_note = report.summary();
-            status.play_protect = report;
-        }
         Err(error) => {
-            status.play_protect.note = format!("Play 保护机制认证检测未完成：{error}");
+            status.compatibility_state = GoogleCompatibilityState::Unknown;
+            status.compatibility_note = format!("兼容补丁暂未完成检测：{error}");
         }
     }
+    apply_certification_and_protect_notes(&mut status, cert_res, protect_res);
     let verification = (|| -> Result<()> {
         let value = manage_res?;
         if !apply_adapter_status(&mut status, &value) {
@@ -741,7 +816,9 @@ pub struct GoogleInstallResult {
 /// Existing/partial Google APKs are preserved. A verified existing bundle can
 /// receive the compatibility patch as part of this explicit installation.
 pub fn install(device: &Device, adb: &Adb, progress: impl Fn(&str)) -> Result<GoogleInstallResult> {
-    device.verify(adb)?;
+    let mut active_device = device.clone();
+    active_device.transport = device.resolve_active_transport(adb)?;
+    let device = &active_device;
     progress("检查 Google Play 与 StepX伴侣安装条件…");
     let preflight: serde_json::Value =
         serde_json::from_str(&run_script(device, adb, "manage.py", &["install-plan"])?)?;
@@ -783,7 +860,9 @@ pub fn install(device: &Device, adb: &Adb, progress: impl Fn(&str)) -> Result<Go
         google = updated;
         message.push(' ');
         message.push_str(&patch_message);
-    } else if plan == GoogleInstallPlan::Existing && !google.compatibility_active {
+    } else if matches!(plan, GoogleInstallPlan::Existing | GoogleInstallPlan::Recovery)
+        && !google.compatibility_active
+    {
         message.push(' ');
         message.push_str(&google.compatibility_note);
     }
@@ -834,7 +913,9 @@ fn install_recovery(device: &Device, adb: &Adb, missing: bool, progress: &impl F
 }
 
 fn install_fresh(device: &Device, adb: &Adb, progress: impl Fn(&str)) -> Result<String> {
-    device.verify(adb)?;
+    let mut active_device = device.clone();
+    active_device.transport = device.resolve_active_transport(adb)?;
+    let device = &active_device;
     progress("1 / 6 · 检查设备与安装条件");
     // Preflight validates the exact firmware before downloading or changing phone data.
     let preflight: serde_json::Value =
@@ -902,7 +983,26 @@ mod tests {
         apply_compatibility_status(&mut status, &valid);
         assert!(status.compatibility_active);
         assert!(status.compatibility_can_rollback);
+        assert_eq!(status.compatibility_state, GoogleCompatibilityState::Active);
         assert_eq!(status.certification_note, "认证未核验");
+        let inactive = serde_json::json!({
+            "ok": true, "supported": true, "active": false,
+            "can_rollback": false, "message": "未应用兼容补丁"
+        });
+        apply_compatibility_status(&mut status, &inactive);
+        assert_eq!(
+            status.compatibility_state,
+            GoogleCompatibilityState::Inactive
+        );
+        let unsupported = serde_json::json!({
+            "ok": false, "supported": false, "active": false,
+            "error": "unsupported_apk", "message": "当前 Play 版本未适配"
+        });
+        apply_compatibility_status(&mut status, &unsupported);
+        assert_eq!(
+            status.compatibility_state,
+            GoogleCompatibilityState::Unsupported
+        );
         for key in ["ok", "supported", "active"] {
             let mut missing = valid.clone();
             missing.as_object_mut().unwrap().remove(key);
@@ -914,6 +1014,10 @@ mod tests {
         assert!(!status.compatibility_supported);
         assert!(!status.compatibility_active);
         assert!(!status.compatibility_can_rollback);
+        assert_eq!(
+            status.compatibility_state,
+            GoogleCompatibilityState::Unknown
+        );
     }
 
     #[test]
@@ -932,28 +1036,57 @@ mod tests {
         assert!(status.compatibility_checked);
         assert!(!status.compatibility_active);
         assert!(status.compatibility_can_rollback);
+        assert_eq!(
+            status.compatibility_state,
+            GoogleCompatibilityState::Unknown
+        );
         assert!(status.compatibility_note.contains("未完成"));
     }
 
     #[test]
-    fn combined_install_only_patches_a_verified_existing_bundle() {
+    fn foreground_certification_blocker_and_disabled_components_survive_play_protect_summary() {
+        let mut status = GoogleSuiteStatus::default();
+        let cert = serde_json::json!({
+            "certification_block_visible": true,
+            "disabled_components": ["com.android.vending"],
+            "catalog_note": "未收录",
+            "bootloader_locked": "1",
+            "verified_boot": "green"
+        });
+        apply_certification_and_protect_notes(
+            &mut status,
+            Ok(cert),
+            Ok(PlayProtectReport::demo()),
+        );
+        assert!(status.device_blocker_note.contains("设备未认证"));
+        assert!(status.device_blocker_note.contains("组件被停用"));
+        assert!(status.certification_note.starts_with(&status.device_blocker_note));
+        assert!(status.certification_note.contains(&PlayProtectReport::demo().summary()));
+    }
+
+    #[test]
+    fn combined_install_patches_verified_existing_and_recovery_bundles() {
         let valid = GoogleSuiteStatus {
             installed: true,
             compatibility_checked: true,
             compatibility_supported: true,
             ..Default::default()
         };
-        assert!(should_apply_during_install(
-            GoogleInstallPlan::Existing,
+        for plan in [GoogleInstallPlan::Existing, GoogleInstallPlan::Recovery] {
+            assert!(should_apply_during_install(plan, &valid));
+        }
+        assert!(!should_apply_during_install(
+            GoogleInstallPlan::Missing,
             &valid
         ));
-        for plan in [GoogleInstallPlan::Missing, GoogleInstallPlan::Recovery] {
-            assert!(!should_apply_during_install(plan, &valid));
-        }
         let mut status = valid.clone();
         status.compatibility_active = true;
         assert!(!should_apply_during_install(
             GoogleInstallPlan::Existing,
+            &status
+        ));
+        assert!(!should_apply_during_install(
+            GoogleInstallPlan::Recovery,
             &status
         ));
         status = valid.clone();
@@ -1422,5 +1555,22 @@ mod tests {
         payload["layers"].as_array_mut().unwrap().pop();
         let report = play_protect_from_value(&payload).unwrap();
         assert_eq!(report.layers.len(), 3);
+    }
+
+    #[test]
+    fn attestation_chain_resolves_first_complete_runtime_or_state_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let incomplete = tmp.path().join("runtime/google-play/attestation");
+        let complete = tmp.path().join("state/google-play/attestation");
+        std::fs::create_dir_all(&incomplete).unwrap();
+        std::fs::create_dir_all(&complete).unwrap();
+        std::fs::write(incomplete.join("leaf.pem"), b"leaf").unwrap();
+        for name in ["leaf.pem", "intermediates.pem", "chain-provided-root.pem"] {
+            std::fs::write(complete.join(name), b"pem").unwrap();
+        }
+        assert_eq!(
+            find_attestation_chain_in([incomplete, complete.clone()]),
+            Some(complete)
+        );
     }
 }

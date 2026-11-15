@@ -85,6 +85,31 @@ pub struct QrSession {
     pub path: PathBuf,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QrPairResult {
+    Connected(String),
+    HostOnly(std::net::IpAddr),
+}
+
+fn connect_candidates_for_host(services: &[Service], paired_ip: std::net::IpAddr) -> Vec<String> {
+    let mut matching: Vec<(u8, String)> = services
+        .iter()
+        .filter(|s| s.kind == "_adb-tls-connect._tcp")
+        .filter_map(|s| {
+            let addr = validate_endpoint(&s.endpoint).ok()?;
+            if addr.ip() == paired_ip {
+                let rank = if addr.is_ipv4() { 0 } else { 1 };
+                Some((rank, s.endpoint.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    matching.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    matching.dedup_by(|a, b| a.1 == b.1);
+    matching.into_iter().map(|(_, ep)| ep).collect()
+}
+
 impl QrSession {
     pub fn new() -> Result<Self> {
         let mut rng = rand::thread_rng();
@@ -129,52 +154,82 @@ impl QrSession {
             .as_secs()
     }
 
-    pub fn try_pair(&self, adb: &Adb) -> Result<Option<String>> {
+    pub fn try_pair_with_discovery<F>(
+        &self,
+        adb: &Adb,
+        mut discover: F,
+        poll_interval: Duration,
+    ) -> Result<Option<QrPairResult>>
+    where
+        F: FnMut(&Adb) -> Result<Vec<Service>>,
+    {
         if self.expired() {
             bail!("二维码已过期，请刷新二维码");
         }
-        let services = crate::discovery::discover_services(adb)?;
-        if let Some(service) = services
+        let services = discover(adb)?;
+        let mut pairing_candidates: Vec<&Service> = services
             .iter()
-            .find(|s| s.kind == "_adb-tls-pairing._tcp" && s.name == self.service)
-        {
+            .filter(|s| s.kind == "_adb-tls-pairing._tcp" && s.name == self.service)
+            .collect();
+        pairing_candidates.sort_by_key(|s| {
+            validate_endpoint(&s.endpoint)
+                .map(|a| if a.is_ipv4() { 0u8 } else { 1u8 })
+                .unwrap_or(2)
+        });
+        if let Some(service) = pairing_candidates.first().copied() {
             adb.pair(&service.endpoint, &self.secret)?;
-            if let Ok(paired_addr) = validate_endpoint(&service.endpoint) {
-                let paired_ip = paired_addr.ip();
-                if let Some(connect) = services.iter().find(|s| {
-                    s.kind == "_adb-tls-connect._tcp"
-                        && validate_endpoint(&s.endpoint).is_ok_and(|a| a.ip() == paired_ip)
-                }) {
-                    if adb
-                        .run_timeout(&["connect", &connect.endpoint], Duration::from_secs(3))
+            let paired_addr = validate_endpoint(&service.endpoint)?;
+            let paired_ip = paired_addr.ip();
+
+            for connect_ep in connect_candidates_for_host(&services, paired_ip) {
+                if connect_ep != service.endpoint
+                    && adb
+                        .run_timeout(&["connect", &connect_ep], Duration::from_secs(3))
                         .is_ok()
-                    {
-                        return Ok(Some(connect.endpoint.clone()));
-                    }
+                {
+                    return Ok(Some(QrPairResult::Connected(connect_ep)));
                 }
-                for _ in 0..4 {
-                    std::thread::sleep(Duration::from_millis(350));
-                    if let Ok(polled) = crate::discovery::discover_services(adb) {
-                        if let Some(connect) = polled.iter().find(|s| {
-                            s.kind == "_adb-tls-connect._tcp"
-                                && validate_endpoint(&s.endpoint).is_ok_and(|a| a.ip() == paired_ip)
-                        }) {
-                            if adb
-                                .run_timeout(
-                                    &["connect", &connect.endpoint],
-                                    Duration::from_secs(3),
-                                )
+            }
+            for _ in 0..8 {
+                if !poll_interval.is_zero() {
+                    std::thread::sleep(poll_interval);
+                }
+                if let Ok(polled) = discover(adb) {
+                    for connect_ep in connect_candidates_for_host(&polled, paired_ip) {
+                        if connect_ep != service.endpoint
+                            && adb
+                                .run_timeout(&["connect", &connect_ep], Duration::from_secs(3))
                                 .is_ok()
-                            {
-                                return Ok(Some(connect.endpoint.clone()));
-                            }
+                        {
+                            return Ok(Some(QrPairResult::Connected(connect_ep)));
                         }
                     }
                 }
             }
-            return Ok(Some(service.endpoint.clone()));
+            // Never return the ephemeral pairing port (`service.endpoint`) as a connect endpoint.
+            return Ok(Some(QrPairResult::HostOnly(paired_ip)));
         }
         Ok(None)
+    }
+
+    pub fn try_pair_detailed(&self, adb: &Adb) -> Result<Option<QrPairResult>> {
+        self.try_pair_with_discovery(
+            adb,
+            crate::discovery::discover_services,
+            Duration::from_millis(350),
+        )
+    }
+
+    pub fn try_pair(&self, adb: &Adb) -> Result<Option<String>> {
+        match self.try_pair_detailed(adb)? {
+            Some(QrPairResult::Connected(connect_ep)) => Ok(Some(connect_ep)),
+            Some(QrPairResult::HostOnly(ip)) => {
+                // Distinct from the ephemeral pairing port; preserves host IP for
+                // `remember_pairing_host` -> `reconnect::scan` without touching the dead pair port.
+                Ok(Some(SocketAddr::new(ip, 5555).to_string()))
+            }
+            None => Ok(None),
+        }
     }
 }
 
@@ -341,5 +396,81 @@ mod tests {
         let decoded: WirelessIdentity = serde_json::from_str(&encoded).expect("deserialize");
         assert_eq!(decoded.wlan_mac, "aa:bb:cc:dd:ee:ff");
         assert_eq!(decoded.wifi_ip, "10.0.1.8");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn qr_try_pair_polls_connect_port_up_to_8_times_and_never_returns_pairing_port() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let adb_path = dir.path().join("adb");
+        let calls_path = dir.path().join("calls.log");
+        let script = format!(
+            "#!/usr/bin/env sh\necho \"$*\" >> '{}'\ncase \"$*\" in\n  pair\\ *)\n    cat >/dev/null\n    echo 'Successfully paired to 192.168.1.66:37123 [guid=adb-TEST]'\n    exit 0\n    ;;\n  connect\\ 192.168.1.66:42888)\n    echo 'connected to 192.168.1.66:42888'\n    exit 0\n    ;;\n  connect\\ *)\n    echo 'failed to connect'\n    exit 1\n    ;;\nesac\nexit 0\n",
+            calls_path.display()
+        );
+        std::fs::write(&adb_path, script).unwrap();
+        std::fs::set_permissions(&adb_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let adb = Adb { path: adb_path };
+
+        // Case 1: connect-port mDNS arrives on the 7th poll (>4 polls, <=8 polls).
+        let qr = QrSession::new().unwrap();
+        let qr_name = qr.service.clone();
+        let mut poll_count = 0usize;
+        let res = qr
+            .try_pair_with_discovery(
+                &adb,
+                |_| {
+                    poll_count += 1;
+                    let mut list = vec![Service {
+                        name: qr_name.clone(),
+                        kind: "_adb-tls-pairing._tcp".into(),
+                        endpoint: "192.168.1.66:37123".into(),
+                    }];
+                    // Initial discover is call 1; 7th retry poll is call 8.
+                    if poll_count >= 8 {
+                        list.push(Service {
+                            name: "adb-SERIAL66-xyz".into(),
+                            kind: "_adb-tls-connect._tcp".into(),
+                            endpoint: "192.168.1.66:42888".into(),
+                        });
+                    }
+                    Ok(list)
+                },
+                Duration::ZERO,
+            )
+            .unwrap();
+        assert_eq!(
+            res,
+            Some(QrPairResult::Connected("192.168.1.66:42888".into()))
+        );
+        let calls = std::fs::read_to_string(&calls_path).unwrap();
+        assert!(calls.contains("connect 192.168.1.66:42888"), "{calls}");
+        assert!(!calls.contains("connect 192.168.1.66:37123"), "{calls}");
+
+        // Case 2: connect-port mDNS does not arrive within 8 polls -> HostOnly(ip), NEVER 37123!
+        let qr2 = QrSession::new().unwrap();
+        let qr2_name = qr2.service.clone();
+        let mut polls2 = 0usize;
+        let res2 = qr2
+            .try_pair_with_discovery(
+                &adb,
+                |_| {
+                    polls2 += 1;
+                    Ok(vec![Service {
+                        name: qr2_name.clone(),
+                        kind: "_adb-tls-pairing._tcp".into(),
+                        endpoint: "192.168.1.66:37123".into(),
+                    }])
+                },
+                Duration::ZERO,
+            )
+            .unwrap();
+        assert_eq!(polls2, 9, "1 initial discovery + 8 retry polls");
+        assert_eq!(
+            res2,
+            Some(QrPairResult::HostOnly("192.168.1.66".parse().unwrap()))
+        );
     }
 }

@@ -122,7 +122,7 @@ action只能为以下一种：
     )
 }
 
-fn check(adb: &Adb, device: &Device, cancel: &AtomicBool, deadline: Instant) -> Result<()> {
+fn check(adb: &Adb, device: &Device, cancel: &AtomicBool, deadline: Instant) -> Result<String> {
     ensure!(
         !cancel.load(Ordering::Relaxed),
         "已停止后续屏幕操作；已发出的模型请求可能仍在处理"
@@ -131,7 +131,7 @@ fn check(adb: &Adb, device: &Device, cancel: &AtomicBool, deadline: Instant) -> 
         Instant::now() < deadline,
         "桌面看屏协作已达到 10 分钟上限，已停止后续屏幕操作"
     );
-    device.verify(adb)?;
+    let transport = device.resolve_active_transport(adb)?;
     let (locked, interactive) = amoo_gui::read_screen(adb, device)?;
     ensure!(
         locked == Some(false),
@@ -141,7 +141,7 @@ fn check(adb: &Adb, device: &Device, cancel: &AtomicBool, deadline: Instant) -> 
         interactive == Some(true),
         "手机屏幕未点亮，已停止后续屏幕操作"
     );
-    Ok(())
+    Ok(transport)
 }
 
 pub(crate) struct Session {
@@ -153,6 +153,7 @@ pub(crate) struct Session {
     pending_run: Option<String>,
     pub(crate) unexpected_tools: bool,
     uploads: Vec<String>,
+    cleaned: bool,
 }
 impl Session {
     pub(crate) fn open(adb: &Adb, device: &Device) -> Result<Self> {
@@ -160,24 +161,37 @@ impl Session {
             .context("请先在手机登录 Amoo 账号")?;
         let mut bus = AgentBus::connect(adb, device)?;
         let key = bus.create_session()?;
+        if !device.serial.trim().is_empty() && !account_scope.trim().is_empty() {
+            let _ = crate::inference_sessions::register(
+                &crate::inference_sessions::default_context_root(),
+                &device.serial,
+                &account_scope,
+                &key,
+            );
+        }
+        let mut session = Self {
+            adb: adb.clone(),
+            device: device.clone(),
+            bus,
+            key: key.clone(),
+            account_scope: account_scope.clone(),
+            pending_run: None,
+            unexpected_tools: false,
+            uploads: vec![],
+            cleaned: false,
+        };
         ensure!(
             key.starts_with("agent:main:desktop-") && key.len() < 160,
             "模型未返回独立桌面会话，未继续"
         );
-        require_same_account(
+        if let Err(err) = require_same_account(
             &account_scope,
             crate::amoo_usage::account_scope_fresh(adb, device)?.as_deref(),
-        )?;
-        Ok(Self {
-            adb: adb.clone(),
-            device: device.clone(),
-            bus,
-            key,
-            account_scope,
-            pending_run: None,
-            unexpected_tools: false,
-            uploads: vec![],
-        })
+        ) {
+            let _ = session.clean();
+            return Err(err);
+        }
+        Ok(session)
     }
     fn check_account(&self) -> Result<()> {
         require_same_account(
@@ -274,6 +288,9 @@ impl Session {
         }
     }
     pub(crate) fn clean(&mut self) -> bool {
+        if self.cleaned && self.pending_run.is_none() && self.uploads.is_empty() {
+            return true;
+        }
         let same_account = self.check_account().is_ok();
         if same_account {
             if let Some(run) = self.pending_run.take() {
@@ -291,17 +308,25 @@ impl Session {
                 .is_ok();
         for directory in self.uploads.drain(..) {
             if let Some(id) = directory.strip_prefix("/sdcard/Download/Amoo Work/") {
-                if id.len() == 32
-                    && id.bytes().all(|b| b.is_ascii_hexdigit())
-                    && self.device.verify(&self.adb).is_ok()
-                {
-                    let _ = self
-                        .adb
-                        .shell(&self.device.transport, &["rm", "-rf", "--", &directory]);
+                if id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    if let Ok(transport) = self.device.resolve_active_transport(&self.adb) {
+                        let _ = self
+                            .adb
+                            .shell(&transport, &["rm", "-rf", "--", &directory]);
+                    }
                 }
             }
         }
+        if deleted {
+            self.cleaned = true;
+        }
         deleted
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        let _ = self.clean();
     }
 }
 
@@ -324,8 +349,8 @@ fn planner_called_tools(rows: &[Value], run: &str) -> bool {
 }
 
 fn screenshot(adb: &Adb, device: &Device) -> Result<(Vec<u8>, u32, u32)> {
-    device.verify(adb)?;
-    let png = adb.screenshot(&device.transport)?;
+    let transport = device.resolve_active_transport(adb)?;
+    let png = adb.screenshot(&transport)?;
     let image = image::load_from_memory(&png).context("手机截图无效")?;
     let (width, height) = (image.width(), image.height());
     ensure!(
@@ -366,7 +391,7 @@ pub fn probe(adb: &Adb, device: &Device, cancel: &AtomicBool) -> Result<GuiRunRe
     Ok(GuiRunResult {
         state: GuiRunState::Completed,
         message: "已完成看屏观察测试，没有执行手机点击或滑动；请核对模型观察与实际页面".into(),
-        invocation_id: session.key,
+        invocation_id: session.key.clone(),
         raw_result: Some(raw),
         elapsed_ms: start.elapsed().as_millis() as u64,
     })
@@ -374,6 +399,7 @@ pub fn probe(adb: &Adb, device: &Device, cancel: &AtomicBool) -> Result<GuiRunRe
 
 #[derive(Clone, Debug)]
 struct UiNode {
+    package: String,
     text: String,
     description: String,
     class: String,
@@ -408,6 +434,7 @@ fn nodes(xml: &str) -> Result<Vec<UiNode>> {
                     .collect::<std::result::Result<_, _>>()?;
                 if let Ok(bounds) = <Vec<u32> as TryInto<[u32; 4]>>::try_into(values) {
                     result.push(UiNode {
+                        package: map.remove("package").unwrap_or_default(),
                         text: map.remove("text").unwrap_or_default(),
                         description: map.remove("content-desc").unwrap_or_default(),
                         class: map.remove("class").unwrap_or_default(),
@@ -425,6 +452,94 @@ fn nodes(xml: &str) -> Result<Vec<UiNode>> {
     }
     Ok(result)
 }
+
+fn compute_nodes_fingerprint(list: &[UiNode]) -> (String, u64) {
+    let fg_pkg = list
+        .iter()
+        .map(|n| n.package.trim())
+        .find(|p| !p.is_empty() && *p != "com.android.systemui")
+        .or_else(|| list.iter().map(|n| n.package.trim()).find(|p| !p.is_empty()))
+        .unwrap_or("")
+        .to_string();
+    let has_non_sysui = list
+        .iter()
+        .any(|n| !n.package.is_empty() && n.package != "com.android.systemui");
+    let mut hash: u64 = 0xcbf29ce484222325;
+    let mut mix = |bytes: &[u8]| {
+        for &b in bytes {
+            hash ^= u64::from(b);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(0x100000001b3);
+    };
+    mix(fg_pkg.as_bytes());
+    for n in list {
+        if has_non_sysui && n.package == "com.android.systemui" {
+            continue;
+        }
+        mix(n.package.as_bytes());
+        mix(n.class.as_bytes());
+        mix(n.text.trim().as_bytes());
+        mix(n.description.trim().as_bytes());
+        for c in n.bounds {
+            mix(&c.to_le_bytes());
+        }
+        mix(&[
+            u8::from(n.clickable),
+            u8::from(n.checkable),
+            u8::from(n.scrollable),
+            u8::from(n.enabled),
+        ]);
+    }
+    (fg_pkg, hash)
+}
+
+fn snapshot_ui_observation(adb: &Adb, device: &Device) -> Option<(String, u64)> {
+    hierarchy(adb, device)
+        .ok()
+        .map(|list| compute_nodes_fingerprint(&list))
+}
+
+fn match_direct_click_node<'a>(
+    list: &'a [UiNode],
+    target_label: &str,
+) -> Option<(&'a UiNode, String)> {
+    let trimmed = target_label.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(node) = list.iter().find(|n| {
+        n.enabled
+            && (n.text.trim().eq_ignore_ascii_case(trimmed)
+                || n.description.trim().eq_ignore_ascii_case(trimmed))
+    }) {
+        let matched_label = if node.text.trim().eq_ignore_ascii_case(trimmed) {
+            node.text.trim().to_string()
+        } else {
+            node.description.trim().to_string()
+        };
+        return Some((node, matched_label));
+    }
+    if trimmed.chars().count() < 2 {
+        return None;
+    }
+    let target_lower = trimmed.to_lowercase();
+    for node in list {
+        if !node.enabled {
+            continue;
+        }
+        let t_trim = node.text.trim();
+        if t_trim.chars().count() >= 2 && t_trim.to_lowercase().starts_with(&target_lower) {
+            return Some((node, t_trim.to_string()));
+        }
+        let d_trim = node.description.trim();
+        if d_trim.chars().count() >= 2 && d_trim.to_lowercase().starts_with(&target_lower) {
+            return Some((node, d_trim.to_string()));
+        }
+    }
+    None
+}
 fn contains(node: &UiNode, x: u32, y: u32) -> bool {
     let [l, t, r, b] = node.bounds;
     x >= l && x < r && y >= t && y < b
@@ -440,6 +555,8 @@ fn risky(text: &str) -> bool {
         "安装",
         "支付",
         "付款",
+        "转账",
+        "提现",
         "购买",
         "发送",
         "发布",
@@ -447,6 +564,8 @@ fn risky(text: &str) -> bool {
         "重置",
         "恢复出厂",
         "清除",
+        "清空",
+        "注销",
         "格式化",
         "确认",
         "允许",
@@ -538,12 +657,16 @@ fn hierarchy(adb: &Adb, device: &Device) -> Result<Vec<UiNode>> {
         "/data/local/tmp/stepx-screen-{:032x}.xml",
         rand::random::<u128>()
     );
-    device.verify(adb)?;
+    let transport = device.resolve_active_transport(adb)?;
     let q = crate::adb::shell_quote(&remote);
-    let xml = adb.script(
-        &device.transport,
-        &format!("uiautomator dump --compressed {q} >/dev/null && cat {q}; rm -f {q}"),
-    )?;
+    let res = adb.script(
+        &transport,
+        &format!("rc=0; uiautomator dump --compressed {q} >/dev/null && cat {q} || rc=$?; rm -f {q}; exit $rc"),
+    );
+    if res.is_err() {
+        let _ = adb.shell(&transport, &["rm", "-f", "--", &remote]);
+    }
+    let xml = res?;
     ensure!(xml.contains("<hierarchy"), "无法读取手机当前界面结构");
     nodes(&xml)
 }
@@ -853,7 +976,7 @@ pub fn launch(adb: &Adb, device: &Device, app_name: &str) -> Result<crate::apps:
         "无法唯一确定目标应用，请输入应用名称（如：微信、设置、相机、支付宝）或完整包名",
     )?;
     crate::apps::validate_package(&package)?;
-    device.verify(adb)?;
+    let _transport = device.resolve_active_transport(adb)?;
     device.open_app(adb, &package)?;
     Ok(crate::apps::AppInfo {
         package,
@@ -923,7 +1046,7 @@ pub fn try_instant_screen_command(
 
     if matches!(
         t,
-        "截屏" | "截图" | "截取画面" | "截取手机画面" | "帮我截取手机画面"
+        "截屏" | "截图" | "保存截屏" | "截屏保存到相册"
     ) {
         let (_, message) = crate::toolbox::capture_phone_screenshot_to_gallery(adb, device)?;
         return finish(
@@ -936,32 +1059,57 @@ pub fn try_instant_screen_command(
         );
     }
 
-    // 1. Wake & Swipe Unlock
+    // 1a. Wake Screen Only (KEYCODE_WAKEUP without dismissing keyguard or swiping unlock)
     if matches!(
         t,
-        "点亮屏幕"
+        "亮屏"
+            | "点亮屏幕"
             | "点亮手机"
             | "点亮手机屏幕"
             | "帮我点亮手机屏幕"
             | "帮我点亮屏幕"
             | "唤醒屏幕"
             | "唤醒手机"
-            | "亮屏"
-            | "解锁"
-            | "解锁手机"
-            | "滑动解锁"
-            | "上滑解锁"
-            | "点亮并解锁"
-            | "点亮解锁"
     ) {
-        device.verify(adb)?;
+        let transport = device.resolve_active_transport(adb)?;
+        on_event(ScreenEvent::Status("正在唤醒点亮手机屏幕…".into()));
+        adb.shell(&transport, &["input", "keyevent", "224"])?;
+        thread::sleep(Duration::from_millis(350));
+        let png = capture_png(adb, device).ok();
+        return finish(
+            "点亮手机屏幕".into(),
+            "已唤醒点亮手机屏幕（未执行解锁操作），最新实时画面已同步到桌面。".into(),
+            png,
+            "wake_screen",
+            json!({}),
+            &mut on_event,
+        );
+    }
+
+    // 1b. Explicit Swipe Unlock
+    if matches!(
+        t,
+        "解锁" | "解锁手机" | "滑动解锁" | "上滑解锁" | "点亮并解锁" | "点亮解锁"
+    ) {
+        let transport = device.resolve_active_transport(adb)?;
         on_event(ScreenEvent::Status(
             "正在点亮手机屏幕并执行上滑解锁…".into(),
         ));
-        adb.shell(&device.transport, &["input", "keyevent", "224"])?;
+        adb.shell(&transport, &["input", "keyevent", "224"])?;
+        let wm_raw = adb.shell(&transport, &["wm", "size"]).unwrap_or_default();
+        let (sx, sy1) = crate::toolbox::scale_tap_coords_for_wm_size(&wm_raw, 540, 1850);
+        let (_, sy2) = crate::toolbox::scale_tap_coords_for_wm_size(&wm_raw, 540, 650);
         adb.shell(
-            &device.transport,
-            &["input", "swipe", "540", "1850", "540", "650", "300"],
+            &transport,
+            &[
+                "input",
+                "swipe",
+                &sx.to_string(),
+                &sy1.to_string(),
+                &sx.to_string(),
+                &sy2.to_string(),
+                "300",
+            ],
         )?;
         thread::sleep(Duration::from_millis(450));
         let png = capture_png(adb, device).ok();
@@ -977,8 +1125,8 @@ pub fn try_instant_screen_command(
 
     // 2. Lock Screen / Sleep
     if matches!(t, "锁屏" | "息屏" | "关闭屏幕" | "锁定屏幕" | "把手机锁屏") {
-        device.verify(adb)?;
-        adb.shell(&device.transport, &["input", "keyevent", "223"])?;
+        let transport = device.resolve_active_transport(adb)?;
+        adb.shell(&transport, &["input", "keyevent", "223"])?;
         return finish(
             "关闭并锁定手机屏幕".into(),
             "已发送手机锁屏指令，屏幕已关闭。".into(),
@@ -1003,7 +1151,7 @@ pub fn try_instant_screen_command(
             | "查看手机画面"
             | "手机现在显示什么"
     ) {
-        device.verify(adb)?;
+        let _transport = device.resolve_active_transport(adb)?;
         on_event(ScreenEvent::Status("正在截取手机当前实时画面…".into()));
         let png = capture_png(adb, device)?;
         let summary = device.visible_text(adb)
@@ -1039,7 +1187,7 @@ pub fn try_instant_screen_command(
             | "提取画面文字"
             | "屏幕上的文字"
     ) {
-        device.verify(adb)?;
+        let _transport = device.resolve_active_transport(adb)?;
         on_event(ScreenEvent::Status(
             "正在读取并提取手机当前屏幕文字…".into(),
         ));
@@ -1087,8 +1235,8 @@ pub fn try_instant_screen_command(
         }
         _ => None,
     } {
-        device.verify(adb)?;
-        adb.shell(&device.transport, &["input", "keyevent", keycode])?;
+        let transport = device.resolve_active_transport(adb)?;
+        adb.shell(&transport, &["input", "keyevent", keycode])?;
         thread::sleep(Duration::from_millis(350));
         let png = capture_png(adb, device).ok();
         return finish(
@@ -1132,9 +1280,9 @@ pub fn try_instant_screen_command(
         )),
         _ => None,
     } {
-        device.verify(adb)?;
+        let transport = device.resolve_active_transport(adb)?;
         on_event(ScreenEvent::Status(format!("正在打开手机「{label}」界面…")));
-        adb.shell(&device.transport, &["am", "start", "-a", intent_action])?;
+        adb.shell(&transport, &["am", "start", "-a", intent_action])?;
         thread::sleep(Duration::from_millis(750));
         let png = capture_png(adb, device).ok();
         return finish(
@@ -1166,7 +1314,7 @@ pub fn try_instant_screen_command(
         )),
         _ => None,
     } {
-        device.verify(adb)?;
+        let _transport = device.resolve_active_transport(adb)?;
         device.key(adb, keycode)?;
         thread::sleep(Duration::from_millis(550));
         let png = capture_png(adb, device).ok();
@@ -1203,7 +1351,11 @@ pub fn try_instant_screen_command(
 
     // 9. Direct UI Text Click ("点击 搜索", "点一下 确定", etc.)
     if let Some(target_label) = parse_direct_click_target(t) {
-        device.verify(adb)?;
+        ensure!(
+            !risky(&target_label),
+            "目标「{target_label}」涉及敏感或数据变更操作，已拒绝直接点击"
+        );
+        let _ = device.resolve_active_transport(adb)?;
         if !is_current_screen_target(app_name) {
             let _ = launch(adb, device, app_name);
             thread::sleep(Duration::from_millis(700));
@@ -1212,38 +1364,25 @@ pub fn try_instant_screen_command(
             "正在手机屏幕上查找并点击「{target_label}」…"
         )));
         let list = hierarchy(adb, device)?;
-        let target_lower = target_label.to_lowercase();
-        let matched = list
-            .iter()
-            .find(|n| {
-                n.enabled
-                    && (n.text.trim().eq_ignore_ascii_case(&target_label)
-                        || n.description.trim().eq_ignore_ascii_case(&target_label))
-            })
-            .or_else(|| {
-                list.iter().find(|n| {
-                    n.enabled
-                        && (n.text.to_lowercase().contains(&target_lower)
-                            || n.description.to_lowercase().contains(&target_lower))
-                })
-            });
-        if let Some(node) = matched {
+        if let Some((node, matched_label)) = match_direct_click_node(&list, &target_label) {
             let x = (node.bounds[0] + node.bounds[2]) / 2;
             let y = (node.bounds[1] + node.bounds[3]) / 2;
+            guard_click(&list, x, y, &matched_label)?;
+            let transport = device.resolve_active_transport(adb)?;
             adb.shell(
-                &device.transport,
+                &transport,
                 &["input", "tap", &x.to_string(), &y.to_string()],
             )?;
             thread::sleep(Duration::from_millis(700));
             let png = capture_png(adb, device).ok();
             return finish(
-                format!("点击界面元素：{target_label}"),
+                format!("点击界面元素：{matched_label}"),
                 format!(
-                    "已在手机屏幕上定位并点击「{target_label}」（坐标 {x}, {y}），最新画面已同步。"
+                    "已在手机屏幕上定位并点击「{matched_label}」（坐标 {x}, {y}），最新画面已同步。"
                 ),
                 png,
                 "direct_click",
-                json!({ "target": target_label, "x": x, "y": y }),
+                json!({ "target": target_label, "matched": matched_label, "x": x, "y": y }),
                 &mut on_event,
             );
         }
@@ -1265,9 +1404,9 @@ fn perform(
         Action::Click { x, y, target } => {
             let (x, y) = (pixel(*x, width), pixel(*y, height));
             guard_click(&hierarchy(adb, device)?, x, y, target)?;
-            check(adb, device, cancel, deadline)?;
+            let transport = check(adb, device, cancel, deadline)?;
             adb.shell(
-                &device.transport,
+                &transport,
                 &["input", "tap", &x.to_string(), &y.to_string()],
             )?;
             Ok(format!("点击导航项：{target}"))
@@ -1293,9 +1432,9 @@ fn perform(
                     .any(|n| contains(n, x1, y1) && (n.checkable || n.class.contains("SeekBar"))),
                 "滑动起点包含设置控件，没有滑动"
             );
-            check(adb, device, cancel, deadline)?;
+            let transport = check(adb, device, cancel, deadline)?;
             adb.shell(
-                &device.transport,
+                &transport,
                 &[
                     "input",
                     "swipe",
@@ -1342,7 +1481,7 @@ fn wait_if_paused(
     pause: &AtomicBool,
     deadline: Instant,
     emit: &mut dyn FnMut(ScreenEvent),
-) -> Result<()> {
+) -> Result<bool> {
     let mut notified = false;
     while pause.load(Ordering::Relaxed) {
         if cancel.load(Ordering::Relaxed) {
@@ -1360,7 +1499,8 @@ fn wait_if_paused(
         }
         thread::sleep(Duration::from_millis(120));
     }
-    check(adb, device, cancel, deadline)
+    check(adb, device, cancel, deadline)?;
+    Ok(notified)
 }
 
 pub fn run_with_pause(
@@ -1382,6 +1522,7 @@ pub fn run_with_pause(
     let started = Instant::now();
     let deadline = started + TOTAL_TIME;
     if cancel.load(Ordering::Relaxed) {
+        pause.store(false, Ordering::SeqCst);
         return Ok(GuiRunResult {
             state: GuiRunState::WaitingCancelled,
             message: "已停止后续屏幕操作。".into(),
@@ -1402,9 +1543,13 @@ pub fn run_with_pause(
         thread::sleep(Duration::from_millis(700));
         let mut previous = "目标应用已打开，等待读取真实画面".to_string();
         let mut unchanged = 0;
-        for number in 1..=MAX_STEPS {
+        let mut number = 1usize;
+        let mut stale_retries = 0usize;
+        while number <= MAX_STEPS {
             wait_if_paused(adb, device, cancel, pause, deadline, emit)?;
             let (png, width, height) = screenshot(adb, device)?;
+            let obs_ui_sig = snapshot_ui_observation(adb, device);
+            let think_started = Instant::now();
             emit(ScreenEvent::Screenshot {
                 number,
                 png: png.clone(),
@@ -1419,7 +1564,31 @@ pub fn run_with_pause(
                 deadline,
             )?;
             let decision = parse_decision(&text)?;
-            wait_if_paused(adb, device, cancel, pause, deadline, emit)?;
+            let was_paused = wait_if_paused(adb, device, cancel, pause, deadline, emit)?;
+            if !matches!(&decision.action, Action::Done { .. })
+                && (was_paused || think_started.elapsed() > Duration::from_secs(4))
+            {
+                if let (Some(before_sig), Some(fresh_sig)) =
+                    (&obs_ui_sig, snapshot_ui_observation(adb, device))
+                {
+                    if &fresh_sig != before_sig {
+                        stale_retries += 1;
+                        ensure!(
+                            stale_retries <= 6,
+                            "屏幕画面持续快速变化，已停止执行旧坐标以避免误点"
+                        );
+                        emit(ScreenEvent::Status(
+                            "检测到思考或暂停期间手机界面已变化，已跳过过期坐标并重新观察…"
+                                .into(),
+                        ));
+                        previous =
+                            "思考或暂停期间手机画面已变化，未执行上一轮旧坐标操作；请只根据最新截图重新判断"
+                                .to_string();
+                        continue;
+                    }
+                }
+            }
+            stale_retries = 0;
             // Status bar clocks/animations may change; guard_click additionally
             // verifies the actual visible label and point against a fresh tree.
             let before_hash = amoo_media::artifact_content_key(&png);
@@ -1469,6 +1638,7 @@ pub fn run_with_pause(
                     "未观察到画面变化"
                 }
             );
+            number += 1;
         }
         bail!("已达到 12 步上限，尚未确认目标完成，已停止后续屏幕操作")
     })();
@@ -1488,7 +1658,7 @@ pub fn run_with_pause(
     Ok(GuiRunResult {
         state,
         message,
-        invocation_id: session.key,
+        invocation_id: session.key.clone(),
         raw_result: Some(
             json!({"mode":"desktop_visual_read_only","steps":records,"session_deleted":deleted}),
         ),
@@ -1598,5 +1768,52 @@ mod tests {
             parse_direct_click_target("点击 确定"),
             Some("确定".to_string())
         );
+    }
+
+    #[test]
+    fn direct_click_rejects_reverse_substring_and_enforces_guard_click() {
+        let list = nodes(
+            r#"<hierarchy>
+                <node package="com.tencent.mm" text="删除" class="android.widget.Button" bounds="[0,100][200,200]" clickable="true" enabled="true" />
+                <node package="com.tencent.mm" text="确认" class="android.widget.Button" bounds="[220,100][420,200]" clickable="true" enabled="true" />
+                <node package="com.tencent.mm" text="关于手机信息" class="android.widget.TextView" bounds="[0,300][500,400]" clickable="true" enabled="true" />
+            </hierarchy>"#,
+        )
+        .unwrap();
+        assert!(match_direct_click_node(&list, "确认删除聊天记录").is_none());
+        assert!(match_direct_click_node(&list, "山").is_none());
+        let (matched, label) = match_direct_click_node(&list, "关于手机").unwrap();
+        assert_eq!(label, "关于手机信息");
+        assert!(guard_click(&list, matched.bounds[0] + 10, matched.bounds[1] + 10, &label).is_ok());
+
+        let (del_node, del_label) = match_direct_click_node(&list, "删除").unwrap();
+        assert!(guard_click(&list, del_node.bounds[0] + 10, del_node.bounds[1] + 10, &del_label).is_err());
+        assert!(risky("立即转账"));
+    }
+
+    #[test]
+    fn nodes_fingerprint_tracks_foreground_and_ignores_sysui_clock() {
+        let a = nodes(
+            r#"<hierarchy>
+                <node package="com.android.systemui" text="10:01" class="android.widget.TextView" bounds="[0,0][100,40]" enabled="true" />
+                <node package="com.android.settings" text="关于手机" class="android.widget.TextView" bounds="[0,100][400,200]" clickable="true" enabled="true" />
+            </hierarchy>"#,
+        )
+        .unwrap();
+        let b = nodes(
+            r#"<hierarchy>
+                <node package="com.android.systemui" text="10:02" class="android.widget.TextView" bounds="[0,0][100,40]" enabled="true" />
+                <node package="com.android.settings" text="关于手机" class="android.widget.TextView" bounds="[0,100][400,200]" clickable="true" enabled="true" />
+            </hierarchy>"#,
+        )
+        .unwrap();
+        let c = nodes(
+            r#"<hierarchy>
+                <node package="com.tencent.mm" text="微信" class="android.widget.TextView" bounds="[0,100][400,200]" clickable="true" enabled="true" />
+            </hierarchy>"#,
+        )
+        .unwrap();
+        assert_eq!(compute_nodes_fingerprint(&a), compute_nodes_fingerprint(&b));
+        assert_ne!(compute_nodes_fingerprint(&a), compute_nodes_fingerprint(&c));
     }
 }

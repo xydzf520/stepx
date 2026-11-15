@@ -62,7 +62,7 @@ pub mod reminder_governance_ui;
 mod tests;
 
 pub(in crate::ui) use actions::*;
-pub(in crate::ui) use calendar_alarms_timeline::*;
+pub(crate) use calendar_alarms_timeline::*;
 pub use canvas_drag::*;
 pub use layout_config::*;
 pub(in crate::ui) use messages_and_life::*;
@@ -799,15 +799,25 @@ impl Companion {
             + unread_sms;
         let now = Local::now();
         let now_ms = now.timestamp_millis();
+        let now_min = now.hour() * 60 + now.minute();
+        let weekday_idx = now.weekday().num_days_from_monday();
         let today_unexpired_alarms = suite
             .alarms
             .iter()
-            .filter(|a| a.is_today_valid_unexpired_at(now_ms, &self.reminder_governance))
+            .filter(|a| {
+                !a.is_e2e_probe()
+                    && resolve_alarm_status(a, now_ms, now_min, weekday_idx, &self.reminder_governance)
+                        .is_today_pending()
+            })
             .count();
         let enabled_alarms = suite
             .alarms
             .iter()
-            .filter(|a| a.is_valid_future_or_today_unexpired_at(now_ms, &self.reminder_governance))
+            .filter(|a| {
+                !a.is_e2e_probe()
+                    && resolve_alarm_status(a, now_ms, now_min, weekday_idx, &self.reminder_governance)
+                        .is_valid_active()
+            })
             .count();
         let cal_count = suite
             .calendar_events

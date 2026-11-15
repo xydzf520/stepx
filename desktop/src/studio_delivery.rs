@@ -77,11 +77,11 @@ pub fn validate_html(name: &str, bytes: &[u8]) -> Result<()> {
 }
 pub fn install_local(adb: &Adb, device: &Device, name: &str, html: &[u8]) -> Result<LocalReceipt> {
     validate_html(name, html)?;
-    device.verify(adb)?;
+    let mut transport = device.resolve_active_transport(adb)?;
     let digest = hash(html);
-    let begin = studio::phone_call_unverified(
+    let begin = studio::phone_call_on_transport(
         adb,
-        device,
+        &transport,
         json!({"op":"local-begin","name":name.trim(),"size":html.len(),"sha256":digest}),
     )?;
     let upload = begin["upload"]
@@ -92,22 +92,28 @@ pub fn install_local(adb: &Adb, device: &Device, name: &str, html: &[u8]) -> Res
     let result = (|| {
         let mut offset = 0;
         for chunk in html.chunks(CHUNK_BYTES) {
-            let r = studio::phone_call_unverified(
-                adb,
-                device,
-                json!({"op":"local-chunk","upload":upload,"offset":offset,"data":STANDARD.encode(chunk)}),
-            )?;
+            let payload = json!({"op":"local-chunk","upload":upload,"offset":offset,"data":STANDARD.encode(chunk)});
+            let r = match studio::phone_call_on_transport(adb, &transport, payload.clone()) {
+                Ok(v) => v,
+                Err(_) => {
+                    transport = device.resolve_active_transport(adb)?;
+                    studio::phone_call_on_transport(adb, &transport, payload)?
+                }
+            };
             offset += chunk.len();
             ensure!(
                 r["upload"] == upload && r["offset"].as_u64() == Some(offset as u64),
                 "手机分片确认不一致"
             );
         }
-        let raw = studio::phone_call_unverified(
-            adb,
-            device,
-            json!({"op":"local-commit","upload":upload}),
-        )?;
+        let commit_payload = json!({"op":"local-commit","upload":upload});
+        let raw = match studio::phone_call_on_transport(adb, &transport, commit_payload.clone()) {
+            Ok(v) => v,
+            Err(_) => {
+                transport = device.resolve_active_transport(adb)?;
+                studio::phone_call_on_transport(adb, &transport, commit_payload)?
+            }
+        };
         let receipt: LocalReceipt = serde_json::from_value(raw).context("手机作品保存回执无效")?;
         ensure!(
             receipt.id == upload
@@ -119,10 +125,60 @@ pub fn install_local(adb: &Adb, device: &Device, name: &str, html: &[u8]) -> Res
         Ok(receipt)
     })();
     if result.is_err() {
-        let _ =
-            studio::phone_call_unverified(adb, device, json!({"op":"local-abort","upload":upload}));
+        let abort_transport = device
+            .resolve_active_transport(adb)
+            .unwrap_or_else(|_| transport.clone());
+        let _ = studio::phone_call_on_transport(
+            adb,
+            &abort_transport,
+            json!({"op":"local-abort","upload":upload}),
+        );
     }
     result
+}
+
+pub fn companion_inbox_launch_args(id: &str) -> Vec<String> {
+    vec![
+        "am".into(),
+        "start".into(),
+        "-W".into(),
+        "-f".into(),
+        "0x14000000".into(),
+        "-n".into(),
+        "com.stepx.companion.app/.MainActivity".into(),
+        "--es".into(),
+        "stepx_open_inbox_id".into(),
+        id.into(),
+    ]
+}
+
+pub fn deliver_file_to_companion(
+    adb: &Adb,
+    device: &Device,
+    path: &std::path::Path,
+    open_after: bool,
+) -> Result<String> {
+    let meta = std::fs::symlink_metadata(path)?;
+    ensure!(
+        meta.is_file() && !meta.file_type().is_symlink(),
+        "交付文件必须是普通本地文件"
+    );
+    let _ = device.resolve_active_transport(adb)?;
+    let id = crate::companion_link::uuid();
+    let sha256 = crate::companion_link::digest(path)?;
+    let size = meta.len();
+    crate::companion_link::send_staged(adb, device, path, &id, &sha256, size)?;
+    if open_after {
+        let transport = device.resolve_active_transport(adb)?;
+        let args = companion_inbox_launch_args(&id);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = adb.shell(&transport, &refs)?;
+        ensure!(
+            out.contains("Status: ok") && !out.contains("Error:") && !out.contains("Exception"),
+            "文件已发送到伴侣收件箱，但手机未能直接打开收件详情"
+        );
+    }
+    Ok(id)
 }
 pub fn local_status(adb: &Adb, device: &Device) -> Result<Value> {
     studio::phone_call(adb, device, json!({"op":"local-status"}))
@@ -141,10 +197,10 @@ pub fn local_list(adb: &Adb, device: &Device) -> Result<Vec<LocalReceipt>> {
 }
 pub fn open_local(adb: &Adb, device: &Device, id: &str) -> Result<Value> {
     ensure!(local_id(id), "作品编号无效");
-    device.verify(adb)?;
+    let transport = device.resolve_active_transport(adb)?;
     let token = format!("{:032x}", rand::random::<u128>());
     let out = adb.shell(
-        &device.transport,
+        &transport,
         &[
             "am",
             "start",
@@ -167,9 +223,24 @@ pub fn open_local(adb: &Adb, device: &Device, id: &str) -> Result<Value> {
     );
     // A loaded document is not a functional-test verdict; the UI keeps the
     // distinction between delivery, page readiness and actual interaction QA.
+    let mut active_transport = transport;
     std::thread::sleep(std::time::Duration::from_millis(30));
     for _ in 0..40 {
-        let status = studio::phone_call_unverified(adb, device, json!({"op":"local-status"}))?;
+        let status = match studio::phone_call_on_transport(
+            adb,
+            &active_transport,
+            json!({"op":"local-status"}),
+        ) {
+            Ok(v) => v,
+            Err(_) => {
+                active_transport = device.resolve_active_transport(adb)?;
+                studio::phone_call_on_transport(
+                    adb,
+                    &active_transport,
+                    json!({"op":"local-status"}),
+                )?
+            }
+        };
         if status["lastOpen"] == id
             && status["openToken"] == token
             && status["readyAt"].as_u64().unwrap_or(0) > 0
@@ -189,7 +260,7 @@ fn scope_ok(scope: &str) -> bool {
     scope.len() == 64 && scope.bytes().all(|c| c.is_ascii_hexdigit())
 }
 fn cloud_phone_call(adb: &Adb, device: &Device, request: Value) -> Result<Value> {
-    device.verify(adb)?;
+    let transport = device.resolve_active_transport(adb)?;
     let encoded = STANDARD.encode(serde_json::to_vec(&request)?);
     ensure!(encoded.len() <= 32768, "官网操作请求过长");
     let command = [
@@ -209,7 +280,7 @@ fn cloud_phone_call(adb: &Adb, device: &Device, request: Value) -> Result<Value>
     .collect::<Vec<_>>()
     .join(" ");
     let out = adb.run_timeout(
-        &["-s", &device.transport, "shell", &command],
+        &["-s", &transport, "shell", &command],
         std::time::Duration::from_secs(60),
     )?;
     let raw = out
@@ -660,5 +731,18 @@ mod tests {
         assert_eq!(normal["scripts"], quoted["scripts"]);
         assert_eq!(quoted["companionManifest"]["name"], "'; echo surprise; #");
         assert!(normal.get("dependencies").is_none());
+    }
+
+    #[test]
+    fn companion_open_after_passes_stepx_open_inbox_id_extra() {
+        let args = companion_inbox_launch_args("11111111-2222-4333-8444-555555555555");
+        assert!(args.windows(2).any(|w| {
+            w[0] == "-n" && w[1] == "com.stepx.companion.app/.MainActivity"
+        }));
+        assert!(args.windows(3).any(|w| {
+            w[0] == "--es"
+                && w[1] == "stepx_open_inbox_id"
+                && w[2] == "11111111-2222-4333-8444-555555555555"
+        }));
     }
 }

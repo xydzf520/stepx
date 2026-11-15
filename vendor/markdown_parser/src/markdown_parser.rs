@@ -893,6 +893,10 @@ fn parse_code_block_line<'a, E: ContextError<&'a str> + ParseError<&'a str>>(
     input: &'a str,
     opening_fence_indent: usize,
 ) -> IResult<&'a str, &'a str, E> {
+    if input.is_empty() {
+        return Err(nom::Err::Error(make_error(input, ErrorKind::Eof)));
+    }
+
     // Parse a line that is not a closing fence
     verify(parse_line, move |line: &str| {
         let line_indent = line.chars().take_while(|c| *c == ' ').count();
@@ -917,18 +921,22 @@ fn parse_closing_fence<'a, E: ContextError<&'a str> + ParseError<&'a str>>(
     input: &'a str,
     opening_fence_indent: usize,
 ) -> IResult<&'a str, (), E> {
-    // Closing fence can be indented up to 3 spaces more than the opening fence
+    // Closing fence can be indented up to 3 spaces more than the opening fence,
+    // or the code block may remain unclosed at EOF (e.g. during streaming).
     let max_indent = opening_fence_indent + 3;
-    value(
-        (),
-        tuple((
-            take_while_m_n(0, max_indent, |c| c == ' '),
-            tag("```"),
-            take_while(|c| c == '`'),
-            space0,
-            alt((parse_line_ending, eof)),
-        )),
-    )(input)
+    alt((
+        value(
+            (),
+            tuple((
+                take_while_m_n(0, max_indent, |c| c == ' '),
+                tag("```"),
+                take_while(|c| c == '`'),
+                space0,
+                alt((parse_line_ending, eof)),
+            )),
+        ),
+        value((), eof),
+    ))(input)
 }
 
 /// Parse the language line of a code block.
@@ -937,13 +945,17 @@ fn parse_code_block_lang<'a, E: ContextError<&'a str> + ParseError<&'a str>>(
 ) -> IResult<&'a str, &'a str, E> {
     // Ideally, we can find a valid (non-empty) language after the first set of ```.
     // If we can't, we still want to parse the code block so we'll just mark the language as default.
-    map(parse_line, |line| {
-        if line.trim().is_empty() {
-            RUNNABLE_BLOCK_MARKDOWN_LANG
-        } else {
-            line
-        }
-    })(markdown)
+    // Per CommonMark, info strings for backtick code blocks cannot contain backticks.
+    map(
+        verify(parse_line, |line: &str| !line.contains('`')),
+        |line| {
+            if line.trim().is_empty() {
+                RUNNABLE_BLOCK_MARKDOWN_LANG
+            } else {
+                line
+            }
+        },
+    )(markdown)
 }
 
 /// Parse a single [line](https://spec.commonmark.org/0.30/#line).
@@ -1311,11 +1323,26 @@ fn parse_underline<'a>(state: &mut InlineState, remaining: &'a str) -> &'a str {
     remaining
 }
 
+fn opener_bottom_slot(closer: &Delimiter) -> usize {
+    let kind_idx = match closer.kind {
+        DelimiterKind::Asterisk => 0,
+        DelimiterKind::Underscore => 1,
+        DelimiterKind::Strikethrough => 2,
+        DelimiterKind::UnderlineStart => 3,
+        DelimiterKind::LinkStart => 4,
+    };
+    let count_idx = if closer.kind == DelimiterKind::Strikethrough {
+        closer.count.min(2)
+    } else {
+        closer.original_count % 3
+    };
+    (kind_idx * 3 + count_idx) * 2 + usize::from(closer.can_open)
+}
+
 /// Process emphasis delimiters on the state's delimiter stack, bounded by `stack_bottom`.
 ///
 /// This is approximately equivalent to the CommonMark [process emphasis](https://spec.commonmark.org/0.30/#phase-2-inline-structure)
 /// algorithm. However:
-/// * It omits `openers_bottom`, which is purely a performace optimization.
 /// * It uses a `Vec` rather than a linked list, which changes the structure a bit to work with lifetimes.
 /// * It also parses [GFM strikethrough](https://github.github.com/gfm/#strikethrough-extension-).
 fn process_emphasis(state: &mut InlineState, stack_bottom: Option<usize>) {
@@ -1335,6 +1362,7 @@ fn process_emphasis(state: &mut InlineState, stack_bottom: Option<usize>) {
     // * closer_index = closer_window_start
     // * minimum_index <= opener_index < closer_index
     let minimum_index = closer_window_start;
+    let mut openers_bottom = [minimum_index; 30];
 
     while let Some(offset_from_window) = state
         .delimiters
@@ -1350,13 +1378,16 @@ fn process_emphasis(state: &mut InlineState, stack_bottom: Option<usize>) {
         let (opener_range, after) = state.delimiters.split_at_mut(closer_index);
         // We know that `closer_index` is in bounds, which means it must be the first element of the second half.
         let closer = &mut after[0];
+        let bottom_slot = opener_bottom_slot(closer);
+        let bottom = openers_bottom[bottom_slot].clamp(minimum_index, closer_index);
 
-        // Find the closest possible opening delimiter.
-        match opener_range
+        // Find the closest possible opening delimiter above `bottom`.
+        match opener_range[bottom..closer_index]
             .iter_mut()
             .enumerate()
             .rev()
-            .find(|(index, delimiter)| *index >= minimum_index && delimiter.can_open_for(closer))
+            .find(|(_, delimiter)| delimiter.can_open_for(closer))
+            .map(|(rel_index, opener)| (bottom + rel_index, opener))
         {
             Some((opener_index, opener)) => {
                 // In each pass, process as many delimiters as possible. Paired `***` delimiters
@@ -1396,7 +1427,7 @@ fn process_emphasis(state: &mut InlineState, stack_bottom: Option<usize>) {
                 // are already mutably borrowed (we can also handle both the opener and the closer
                 // in a single pass this way).
 
-                closer.count -= consumed_delimiters;
+                closer.count = closer.count.saturating_sub(consumed_delimiters);
                 let removed_closer = if closer.count == 0 {
                     state.nodes.remove(closer.node_index);
                     used_delimiters_end += 1;
@@ -1417,7 +1448,7 @@ fn process_emphasis(state: &mut InlineState, stack_bottom: Option<usize>) {
                     false
                 };
 
-                opener.count -= consumed_delimiters;
+                opener.count = opener.count.saturating_sub(consumed_delimiters);
                 let removed_opener = if opener.count == 0 {
                     state.nodes.remove(opener.node_index);
                     used_delimiters_start -= 1;
@@ -1450,14 +1481,28 @@ fn process_emphasis(state: &mut InlineState, stack_bottom: Option<usize>) {
                     .drain(used_delimiters_start..used_delimiters_end)
                     .count();
 
+                for b in &mut openers_bottom {
+                    if *b >= used_delimiters_end {
+                        *b -= used_delimiters;
+                    } else if *b > used_delimiters_start {
+                        *b = used_delimiters_start;
+                    }
+                }
+
                 // We know that all removed delimiters are before the closer, so we need to shift
                 // the window accordingly.
                 closer_window_start -= used_delimiters;
             }
             None => {
+                openers_bottom[bottom_slot] = closer_index;
                 // This delimiter can't be used, so remove it.
                 if !closer.can_open {
                     state.delimiters.remove(closer_index);
+                    for b in &mut openers_bottom {
+                        if *b > closer_index {
+                            *b -= 1;
+                        }
+                    }
                 } else {
                     closer_window_start += 1;
                 }
@@ -1476,7 +1521,7 @@ fn process_emphasis(state: &mut InlineState, stack_bottom: Option<usize>) {
 /// Helper for [`process_emphasis`] that removes `count` delimiters of `kind` from `node`.
 ///
 /// In debug builds, this panics if `node` is not a run of `kind` delimiters.
-fn truncate_delimiters(node: &mut FormattedTextFragment, kind: DelimiterKind, count: u8) {
+fn truncate_delimiters(node: &mut FormattedTextFragment, kind: DelimiterKind, count: usize) {
     let delimiter = kind.as_str();
     if cfg!(debug_assertions) {
         let text = &node.text;
@@ -1488,7 +1533,7 @@ fn truncate_delimiters(node: &mut FormattedTextFragment, kind: DelimiterKind, co
     }
 
     node.text
-        .truncate(node.text.len() - count as usize * delimiter.len());
+        .truncate(node.text.len().saturating_sub(count.saturating_mul(delimiter.len())));
 }
 
 /// Helper to merge adjacent text fragments with the same styling. Such fragments might come from:
@@ -1515,6 +1560,7 @@ fn parse_inline_token<'a, E: ContextError<&'a str> + ParseError<&'a str>>(
     input: &'a str,
 ) -> IResult<&'a str, InlineToken<'a>, E> {
     let code_span = map(parse_code_span, InlineToken::CodeSpan);
+    let unclosed_backticks = map(is_a("`"), InlineToken::Text);
     let backslash_escape = map(parse_escape, InlineToken::BackslashEscape);
     let html_entity = map(parse_html_entity, InlineToken::HtmlEntity);
 
@@ -1536,6 +1582,7 @@ fn parse_inline_token<'a, E: ContextError<&'a str> + ParseError<&'a str>>(
             backslash_escape,
             html_entity,
             code_span,
+            unclosed_backticks,
             parse_inline_token_link_start,
             parse_inline_token_link_end,
             parse_inline_token_asterisk,
@@ -1654,7 +1701,11 @@ fn parse_delimiter_run<'a, E: ContextError<&'a str> + ParseError<&'a str>>(
     kind: DelimiterKind,
 ) -> impl FnMut(&'a str) -> IResult<&'a str, InlineToken<'a>, E> {
     map(
-        fold_many1(tag(kind.as_str()), || 0, |counter, _| counter + 1),
+        fold_many1(
+            tag(kind.as_str()),
+            || 0usize,
+            |counter: usize, _| counter.saturating_add(1),
+        ),
         move |count| InlineToken::Delimiter { kind, count },
     )
 }
@@ -1678,7 +1729,7 @@ fn parse_code_span<'a, E: ContextError<&'a str> + ParseError<&'a str>>(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum InlineToken<'a> {
     /// A run of `count` delimiter characters of `kind`.
-    Delimiter { kind: DelimiterKind, count: u8 },
+    Delimiter { kind: DelimiterKind, count: usize },
     /// A run of non-delimiter text.
     Text(&'a str),
     /// A backslash-escaped character.
@@ -1703,9 +1754,9 @@ struct Delimiter {
     kind: DelimiterKind,
     /// The count of repeated delimiter units. This is modified during parsing as delimiters are
     /// consumed.
-    count: u8,
+    count: usize,
     /// The count at the time the delimiter was parsed.
-    original_count: u8,
+    original_count: usize,
     /// Whether or not this delimiter is active (only applies to link delimiters).
     active: bool,
     /// The index of the [`FormattedTextFragment`] corresponding to this delimiter.
@@ -1724,7 +1775,7 @@ impl Delimiter {
     fn new(
         node_index: usize,
         kind: DelimiterKind,
-        count: u8,
+        count: usize,
         preceding_char: Option<char>,
         following_char: Option<char>,
     ) -> Self {
@@ -1777,7 +1828,7 @@ impl Delimiter {
 
     /// Convert this delimiter to literal text.
     fn to_text(&self) -> String {
-        self.kind.as_str().repeat(self.count as usize)
+        self.kind.as_str().repeat(self.count)
     }
 
     /// Whether or not this delimiter can open for the given closing delimiter.
@@ -1795,7 +1846,7 @@ impl Delimiter {
         // This check implements rules 9 and 10 from https://spec.commonmark.org/0.30/#can-open-emphasis.
         // It's odd, but results in the behavior you'd expect for overlapping cases like `*nest**ing***`.
         if (self.can_close || other.can_open)
-            && (self.original_count + other.original_count).is_multiple_of(3)
+            && (self.original_count % 3 + other.original_count % 3).is_multiple_of(3)
             && (!self.original_count.is_multiple_of(3) || !other.original_count.is_multiple_of(3))
         {
             return false;
@@ -1817,7 +1868,7 @@ enum DelimiterKind {
 
 impl DelimiterKind {
     /// Whether or not `count` is a valid run length for this delimiter.
-    fn valid_count(self, count: u8) -> bool {
+    fn valid_count(self, count: usize) -> bool {
         match self {
             // Emphasis and strong emphasis may be repeated arbitrarily.
             DelimiterKind::Asterisk | DelimiterKind::Underscore => true,

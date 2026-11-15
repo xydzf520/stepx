@@ -13,13 +13,15 @@ def main():
             raise ValueError('文件没有音轨')
         stream=container.streams.audio[0]
         duration=float(stream.duration*stream.time_base) if stream.duration and stream.time_base else (float(container.duration)/av.time_base if container.duration else None)
-        if duration is None or not math.isfinite(duration) or duration <= 0 or duration > 15*60:
-            raise ValueError('录音时长未知或超过15分钟，请先选择较短片段')
+        if duration is not None and (not math.isfinite(duration) or duration <= 0 or duration > 15*60):
+            raise ValueError('录音时长无效或超过15分钟，请先选择较短片段')
     from faster_whisper import WhisperModel
     model=WhisperModel(str(model_dir),device='cpu',compute_type='int8',cpu_threads=min(os.cpu_count() or 2,4),num_workers=1,local_files_only=True)
     segments, info=model.transcribe(str(source),beam_size=3,vad_filter=True,condition_on_previous_text=False)
     rows=[]
     for segment in segments:
+        if segment.end > 15*60:
+            raise ValueError('录音时长超过15分钟，请先选择较短片段')
         text=segment.text.strip()
         if text:
             rows.append({'start':round(segment.start,2),'end':round(segment.end,2),'text':text})

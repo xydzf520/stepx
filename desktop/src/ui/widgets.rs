@@ -1150,8 +1150,7 @@ impl Companion {
         let p = self.p();
         let field = &self.fields[index];
         let focused = self.input_has_focus(index);
-        let masked =
-            (index == super::F_PAIR_CODE && !self.show_secret) || index == super::F_LAB_KEY;
+        let masked = matches!(index, super::F_PAIR_CODE | super::F_LAB_KEY) && !self.show_secret;
         let mut value = if masked {
             "•".repeat(field.text.chars().count())
         } else {
@@ -1159,11 +1158,14 @@ impl Companion {
         };
         let mut caret_index = 0;
         if focused {
-            let safe_cursor = field.cursor.min(field.text.len());
+            let safe_cursor = crate::ui::keyboard_input::clamp_char_boundary(
+                &field.text,
+                field.cursor.min(field.text.len()),
+            );
             let cursor = if masked {
                 field.text[..safe_cursor].chars().count() * "•".len()
             } else {
-                safe_cursor
+                crate::ui::keyboard_input::clamp_char_boundary(&value, safe_cursor)
             };
             let preedit = if masked {
                 "•".repeat(field.preedit.chars().count())
@@ -1171,7 +1173,7 @@ impl Companion {
                 field.preedit.clone()
             };
             caret_index = value[..cursor].chars().count() + preedit.chars().count();
-            value.insert_str(cursor.min(value.len()), &preedit);
+            value.insert_str(cursor, &preedit);
         }
         let is_empty = field.text.is_empty() && field.preedit.is_empty();
         if value.is_empty() {

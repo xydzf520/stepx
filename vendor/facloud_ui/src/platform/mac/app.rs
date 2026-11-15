@@ -567,6 +567,7 @@ extern "C-unwind" fn warp_app_window_did_move(this: &mut Object) {
 extern "C-unwind" fn warp_app_window_will_close(this: &mut Object, window: &mut Object) {
     let app = unsafe { get_app(this) };
     let window_state = unsafe { get_window_state(window) };
+    window_state.clear_scene();
     app.callbacks.window_will_close(window_state.id());
 }
 
@@ -592,18 +593,29 @@ extern "C-unwind" fn cpu_will_sleep(this: &mut Object) {
 #[no_mangle]
 extern "C-unwind" fn warp_app_open_files(this: &mut Object, paths: id) {
     let paths = unsafe {
-        (0..paths.count())
-            .filter_map(|i| {
-                let path = paths.objectAtIndex(i);
-                match CStr::from_ptr(path.UTF8String() as *mut c_char).to_str() {
-                    Ok(string) => Some(PathBuf::from(string)),
-                    Err(err) => {
-                        log::error!("error converting path to string: {err}");
-                        None
+        if paths == nil {
+            Vec::new()
+        } else {
+            (0..paths.count())
+                .filter_map(|i| {
+                    let path = paths.objectAtIndex(i);
+                    if path == nil {
+                        return None;
                     }
-                }
-            })
-            .collect::<Vec<_>>()
+                    let ptr = path.UTF8String() as *const c_char;
+                    if ptr.is_null() {
+                        return None;
+                    }
+                    match CStr::from_ptr(ptr).to_str() {
+                        Ok(string) => Some(PathBuf::from(string)),
+                        Err(err) => {
+                            log::error!("error converting path to string: {err}");
+                            None
+                        }
+                    }
+                })
+                .collect::<Vec<_>>()
+        }
     };
     let app = unsafe { get_app(this) };
     app.callbacks.open_files(paths);
@@ -612,18 +624,33 @@ extern "C-unwind" fn warp_app_open_files(this: &mut Object, paths: id) {
 #[no_mangle]
 extern "C-unwind" fn warp_app_open_urls(this: &mut Object, urls: id) {
     let urls = unsafe {
-        (0..urls.count())
-            .filter_map(|i| {
-                let url = urls.objectAtIndex(i).absoluteString();
-                match CStr::from_ptr(url.UTF8String() as *mut c_char).to_str() {
-                    Ok(string) => Some(string.to_string()),
-                    Err(err) => {
-                        log::error!("error converting url to string: {err}");
-                        None
+        if urls == nil {
+            Vec::new()
+        } else {
+            (0..urls.count())
+                .filter_map(|i| {
+                    let raw_url = urls.objectAtIndex(i);
+                    if raw_url == nil {
+                        return None;
                     }
-                }
-            })
-            .collect::<Vec<_>>()
+                    let url = raw_url.absoluteString();
+                    if url == nil {
+                        return None;
+                    }
+                    let ptr = url.UTF8String() as *const c_char;
+                    if ptr.is_null() {
+                        return None;
+                    }
+                    match CStr::from_ptr(ptr).to_str() {
+                        Ok(string) => Some(string.to_string()),
+                        Err(err) => {
+                            log::error!("error converting url to string: {err}");
+                            None
+                        }
+                    }
+                })
+                .collect::<Vec<_>>()
+        }
     };
 
     let app = unsafe { get_app(this) };
@@ -639,22 +666,35 @@ extern "C-unwind" fn warp_app_os_appearance_changed(this: &mut Object) {
 // Calls the callback with None if no file was selected
 #[no_mangle]
 pub(crate) extern "C-unwind" fn warp_open_panel_file_selected(urls: id, callback: *mut c_void) {
+    if callback.is_null() {
+        return;
+    }
     // Start by converting the callback from a raw pointer back into a Box, to
     // avoid the memory leak that would occur if we left it in raw pointer form.
     let callback = unsafe { Box::from_raw(callback as *mut FilePickerCallback) };
 
     let paths = unsafe {
-        (0..urls.count())
-            .map(|i| {
-                let file_url = urls.objectAtIndex(i);
-                let file_path: id = msg_send![file_url, path];
-                let slice = std::slice::from_raw_parts(
-                    file_path.UTF8String() as *const std::ffi::c_uchar,
-                    file_path.len(),
-                );
-                std::str::from_utf8_unchecked(slice).to_string()
-            })
-            .collect::<Vec<_>>()
+        if urls == nil {
+            Vec::new()
+        } else {
+            (0..urls.count())
+                .filter_map(|i| {
+                    let file_url = urls.objectAtIndex(i);
+                    if file_url == nil {
+                        return None;
+                    }
+                    let file_path: id = msg_send![file_url, path];
+                    if file_path == nil {
+                        return None;
+                    }
+                    let ptr = file_path.UTF8String() as *const c_char;
+                    if ptr.is_null() {
+                        return None;
+                    }
+                    CStr::from_ptr(ptr).to_str().ok().map(str::to_owned)
+                })
+                .collect::<Vec<_>>()
+        }
     };
 
     if paths.is_empty() {
@@ -670,6 +710,9 @@ pub(crate) extern "C-unwind" fn warp_open_panel_file_selected(urls: id, callback
 // Calls the save callback with the selected path or None if cancelled
 #[no_mangle]
 pub(crate) extern "C-unwind" fn warp_save_panel_file_selected(url: id, callback: *mut c_void) {
+    if callback.is_null() {
+        return;
+    }
     let callback = unsafe { Box::from_raw(callback as *mut SaveFilePickerCallback) };
 
     let path = if url.is_null() {
@@ -677,11 +720,16 @@ pub(crate) extern "C-unwind" fn warp_save_panel_file_selected(url: id, callback:
     } else {
         unsafe {
             let file_path: id = msg_send![url, path];
-            let slice = std::slice::from_raw_parts(
-                file_path.UTF8String() as *const std::ffi::c_uchar,
-                file_path.len(),
-            );
-            Some(std::str::from_utf8_unchecked(slice).to_string())
+            if file_path == nil {
+                None
+            } else {
+                let ptr = file_path.UTF8String() as *const c_char;
+                if ptr.is_null() {
+                    None
+                } else {
+                    CStr::from_ptr(ptr).to_str().ok().map(str::to_owned)
+                }
+            }
         }
     };
 

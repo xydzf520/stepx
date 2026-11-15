@@ -65,7 +65,7 @@ impl WindowMemory {
             stepx_companion::window_preferences::Mode::MiniNotify => ShellMode::MiniNotify,
         }
     }
-    fn flush(&mut self) {
+    pub(super) fn flush(&mut self) {
         if self.saved == self.preferences {
             return;
         }
@@ -104,6 +104,18 @@ fn mix_color(a: ColorU, b: ColorU, t: f32) -> ColorU {
     ColorU::new(mix(a.r, b.r), mix(a.g, b.g), mix(a.b, b.b), mix(a.a, b.a))
 }
 
+pub(super) const FULL_MIN_INNER_SIZE: (f32, f32) = (900.0, 600.0);
+pub(super) const MINI_MIN_INNER_SIZE: (f32, f32) = (380.0, 440.0);
+
+pub(super) fn min_inner_size_for_mode(mode: ShellMode) -> Vector2F {
+    match mode {
+        ShellMode::Full => vec2f(FULL_MIN_INNER_SIZE.0, FULL_MIN_INNER_SIZE.1),
+        ShellMode::MiniAi | ShellMode::MiniNotify => {
+            vec2f(MINI_MIN_INNER_SIZE.0, MINI_MIN_INNER_SIZE.1)
+        }
+    }
+}
+
 /// Clamp to the current display, including displays with negative origins.
 fn fitted_bounds(current: RectF, display: RectF, size: Vector2F) -> RectF {
     let size = vec2f(
@@ -124,6 +136,24 @@ fn fitted_bounds(current: RectF, display: RectF, size: Vector2F) -> RectF {
 }
 
 impl Companion {
+    pub(super) fn apply_window_min_size(mode: ShellMode, ctx: &mut ViewContext<Self>) {
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        if let Some(window) =
+            facloud_ui::windowing::winit::winit_window_for_id(ctx, ctx.window_id())
+        {
+            let min = min_inner_size_for_mode(mode);
+            window.set_min_inner_size(Some(winit::dpi::LogicalSize::new(
+                min.x() as f64,
+                min.y() as f64,
+            )));
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(window) = ctx.windows().platform_window(ctx.window_id()) {
+            use facloud_ui::platform::mac::WindowExt;
+            window.as_ref().set_min_inner_size(min_inner_size_for_mode(mode));
+        }
+    }
+
     pub(super) fn set_compact_mode(&mut self, mode: ShellMode, ctx: &mut ViewContext<Self>) {
         if self.push.shell_mode == mode {
             return;
@@ -131,6 +161,7 @@ impl Companion {
         self.context_menu = None;
         self.clear_text_interaction();
         self.remember_window(ctx, true);
+        Self::apply_window_min_size(mode, ctx);
         let display = ctx.windows().active_display_bounds();
         let current = ctx
             .window_bounds(&ctx.window_id())
@@ -151,7 +182,10 @@ impl Companion {
                     ctx.window_id(),
                     fitted_bounds(bounds, display, {
                         let size = self.window_memory.preferences.full;
-                        vec2f(size.width, size.height)
+                        vec2f(
+                            size.width.max(FULL_MIN_INNER_SIZE.0),
+                            size.height.max(FULL_MIN_INNER_SIZE.1),
+                        )
                     }),
                 );
                 if let Some(window) = ctx.windows().platform_window(ctx.window_id()) {
@@ -183,7 +217,10 @@ impl Companion {
                     ctx.window_id(),
                     fitted_bounds(current, display, {
                         let size = self.window_memory.preferences.compact;
-                        vec2f(size.width, size.height)
+                        vec2f(
+                            size.width.max(MINI_MIN_INNER_SIZE.0),
+                            size.height.max(MINI_MIN_INNER_SIZE.1),
+                        )
                     }),
                 );
             }
@@ -479,13 +516,17 @@ impl Companion {
             Action::Push(PushAction::SetShellMode(ShellMode::Full)),
             Btn::Secondary,
         ));
-        controls.push(self.window_control_btn("compact-min", "—", false, Action::MinimizeWindow));
-        controls.push(self.window_control_btn("compact-close", "×", true, Action::CloseWindow));
+        if !cfg!(target_os = "macos") {
+            controls.push(self.window_control_btn("compact-min", "—", false, Action::MinimizeWindow));
+            controls.push(self.window_control_btn("compact-close", "×", true, Action::CloseWindow));
+        }
         let header = Container::new(self.between(
             self.line_w("StepX Companion", SUBHEAD, p.text, Weight::Semibold),
             self.hstack(S1, controls),
         ))
         .with_horizontal_padding(S3)
+        // Clear the macOS traffic lights (~78pt) in the top-left corner.
+        .with_padding_left(if cfg!(target_os = "macos") { 80. } else { S3 })
         .with_vertical_padding(if self.workspace.viewport.y() < 520. {
             S2
         } else {

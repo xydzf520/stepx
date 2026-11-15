@@ -230,7 +230,10 @@ impl Companion {
             && self.lan_cast.last_tick.elapsed() >= Duration::from_millis(500)
         {
             if let (Some(srv), Some(dev)) = (&self.lan_cast.server, &self.selected) {
-                srv.set_serial(dev.transport.clone());
+                srv.set_serial(stepx_companion::device::active_transport_for(
+                    &dev.serial,
+                    &dev.transport,
+                ));
             }
             self.lan_cast.last_tick = Instant::now();
             changed = true;
@@ -241,7 +244,10 @@ impl Companion {
     pub(super) fn ensure_lan_cast_server_started(&mut self) -> Result<LanCastStats, String> {
         if let Some(srv) = &self.lan_cast.server {
             if let Some(dev) = &self.selected {
-                srv.set_serial(dev.transport.clone());
+                srv.set_serial(stepx_companion::device::active_transport_for(
+                    &dev.serial,
+                    &dev.transport,
+                ));
             }
             return Ok(srv.stats());
         }
@@ -251,9 +257,11 @@ impl Companion {
         let Some(dev) = &self.selected else {
             return Err("请先连接 StepX 手机后再开启局域网投屏".into());
         };
+        let active_transport =
+            stepx_companion::device::active_transport_for(&dev.serial, &dev.transport);
         let srv = LanCastServer::start(
             adb.path.clone(),
-            dev.transport.clone(),
+            active_transport,
             self.lan_cast.quality,
             self.lan_cast.remote_control_enabled,
         )
@@ -270,8 +278,20 @@ impl Companion {
         self.lan_cast.scanning = true;
         let tx = self.lan_cast.tx.clone();
         let adb = Adb::discover().ok();
-        let serial = self.selected.as_ref().map(|d| d.transport.clone());
+        let dev = self.selected.clone();
         thread::spawn(move || {
+            let serial = match (&adb, &dev) {
+                (Some(adb), Some(d)) => Some(
+                    d.resolve_active_transport(adb).unwrap_or_else(|_| {
+                        stepx_companion::device::active_transport_for(&d.serial, &d.transport)
+                    }),
+                ),
+                (None, Some(d)) => Some(stepx_companion::device::active_transport_for(
+                    &d.serial,
+                    &d.transport,
+                )),
+                _ => None,
+            };
             let snap = lan_cast::discover_lan_receivers(adb.as_ref(), serial.as_deref());
             let _ = tx.send(LanCastWorkerEvent::DiscoveryDone(snap));
         });
@@ -318,11 +338,35 @@ impl Companion {
                 ctx.notify();
             }
             LanCastAction::StopServer => {
-                if let Some(mut srv) = self.lan_cast.server.take() {
-                    srv.stop();
-                }
-                self.lan_cast.active_pushed_id = None;
+                let pushed_receiver_id = self.lan_cast.active_pushed_id.take().or_else(|| {
+                    self.lan_cast
+                        .server
+                        .as_ref()
+                        .and_then(|srv| srv.stats().pushed_receiver_id)
+                });
                 self.lan_cast.active_pushed_name = None;
+                let pushed_receiver = pushed_receiver_id.and_then(|id| {
+                    self.lan_cast
+                        .discovery
+                        .as_ref()
+                        .and_then(|d| d.receivers.iter().find(|r| r.id == id))
+                        .cloned()
+                });
+                if let Some(mut srv) = self.lan_cast.server.take() {
+                    srv.set_pushed_receiver(None, None);
+                    if let Some(receiver) = pushed_receiver {
+                        thread::spawn(move || {
+                            let _ = lan_cast::stop_receiver_push(&receiver);
+                            srv.stop();
+                        });
+                    } else {
+                        srv.stop();
+                    }
+                } else if let Some(receiver) = pushed_receiver {
+                    thread::spawn(move || {
+                        let _ = lan_cast::stop_receiver_push(&receiver);
+                    });
+                }
                 let msg = "已停止局域网跨机投屏网关".to_string();
                 self.lan_cast.status_note = Some((msg.clone(), false));
                 self.status = msg;
@@ -386,8 +430,23 @@ impl Companion {
                 self.lan_cast.pushing_id = Some(receiver.id.clone());
                 let tx = self.lan_cast.tx.clone();
                 let adb = Adb::discover().ok();
-                let serial = self.selected.as_ref().map(|d| d.transport.clone());
+                let dev = self.selected.clone();
                 thread::spawn(move || {
+                    let serial = match (&adb, &dev) {
+                        (Some(adb), Some(d)) => Some(
+                            d.resolve_active_transport(adb).unwrap_or_else(|_| {
+                                stepx_companion::device::active_transport_for(
+                                    &d.serial,
+                                    &d.transport,
+                                )
+                            }),
+                        ),
+                        (None, Some(d)) => Some(stepx_companion::device::active_transport_for(
+                            &d.serial,
+                            &d.transport,
+                        )),
+                        _ => None,
+                    };
                     let res = lan_cast::push_stream_to_receiver(
                         &receiver,
                         &stats,
@@ -481,7 +540,11 @@ impl Companion {
                 let enable = *enable;
                 let tx = self.lan_cast.tx.clone();
                 thread::spawn(move || {
-                    let res = lan_cast::set_phone_miracast_enabled(&adb, &dev.transport, enable)
+                    let res = dev
+                        .resolve_active_transport(&adb)
+                        .and_then(|transport| {
+                            lan_cast::set_phone_miracast_enabled(&adb, &transport, enable)
+                        })
                         .map_err(|e| e.to_string());
                     let _ = tx.send(LanCastWorkerEvent::MiracastUpdated(res));
                 });
@@ -493,7 +556,10 @@ impl Companion {
                 };
                 let tx = self.lan_cast.tx.clone();
                 thread::spawn(move || {
-                    match lan_cast::open_phone_cast_settings(&adb, &dev.transport) {
+                    match dev
+                        .resolve_active_transport(&adb)
+                        .and_then(|transport| lan_cast::open_phone_cast_settings(&adb, &transport))
+                    {
                         Ok(()) => {
                             let _ = tx.send(LanCastWorkerEvent::Notice(
                                 "已在手机端打开系统「无线投屏 (Cast / Miracast)」设置界面".into(),
@@ -514,7 +580,9 @@ impl Companion {
                 let addr = addr.clone();
                 let tx = self.lan_cast.tx.clone();
                 thread::spawn(move || {
-                    match lan_cast::connect_phone_miracast(&adb, &dev.transport, &addr) {
+                    match dev.resolve_active_transport(&adb).and_then(|transport| {
+                        lan_cast::connect_phone_miracast(&adb, &transport, &addr)
+                    }) {
                         Ok(()) => {
                             let _ = tx.send(LanCastWorkerEvent::Notice(
                                 format!("已在手机端发起对 Miracast 无线显示器 ({addr}) 的连接"),

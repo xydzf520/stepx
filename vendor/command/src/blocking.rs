@@ -17,6 +17,10 @@ pub struct Command {
     pub(super) inner: std::process::Command,
     #[cfg(windows)]
     kill_on_parent_process_close: bool,
+    #[cfg(windows)]
+    has_breakaway_flag: bool,
+    #[cfg(windows)]
+    custom_creation_flags: u32,
     stdin_is_default: bool,
     stdout_is_default: bool,
     stderr_is_default: bool,
@@ -83,6 +87,10 @@ impl Command {
             inner,
             #[cfg(windows)]
             kill_on_parent_process_close: false,
+            #[cfg(windows)]
+            has_breakaway_flag: true,
+            #[cfg(windows)]
+            custom_creation_flags: 0,
             stdin_is_default: true,
             stdout_is_default: true,
             stderr_is_default: true,
@@ -98,6 +106,9 @@ impl Command {
     /// [1]: https://msdn.microsoft.com/en-us/library/windows/desktop/ms684863(v=vs.85).aspx
     pub fn creation_flags(&mut self, flags: u32) -> &mut Self {
         use std::os::windows::process::CommandExt;
+        let breakaway = windows::Win32::System::Threading::CREATE_BREAKAWAY_FROM_JOB.0;
+        self.has_breakaway_flag = (flags & breakaway) != 0;
+        self.custom_creation_flags = flags & !breakaway;
         let flags = windows::Win32::System::Threading::CREATE_NO_WINDOW.0 | flags;
         self.inner.creation_flags(flags);
         self
@@ -475,6 +486,21 @@ impl Command {
         self
     }
 
+    #[cfg(windows)]
+    fn clear_breakaway_on_access_denied(&mut self, err: &io::Error) -> bool {
+        const ERROR_ACCESS_DENIED: i32 = 5;
+        if self.has_breakaway_flag && err.raw_os_error() == Some(ERROR_ACCESS_DENIED) {
+            use std::os::windows::process::CommandExt;
+            self.has_breakaway_flag = false;
+            self.inner.creation_flags(
+                windows::Win32::System::Threading::CREATE_NO_WINDOW.0 | self.custom_creation_flags,
+            );
+            true
+        } else {
+            false
+        }
+    }
+
     /// Executes the command as a child process, returning a handle to it.
     ///
     /// By default, stdin, stdout and stderr are set to null (diverging from
@@ -502,7 +528,11 @@ impl Command {
             self.inner.stderr(Stdio::null());
         }
 
-        let child = self.inner.spawn();
+        let child = match self.inner.spawn() {
+            #[cfg(windows)]
+            Err(err) if self.clear_breakaway_on_access_denied(&err) => self.inner.spawn(),
+            res => res,
+        };
 
         #[cfg(windows)]
         if self.kill_on_parent_process_close
@@ -556,7 +586,11 @@ impl Command {
             self.inner.stderr(Stdio::piped());
         }
 
-        self.inner.output()
+        match self.inner.output() {
+            #[cfg(windows)]
+            Err(err) if self.clear_breakaway_on_access_denied(&err) => self.inner.output(),
+            res => res,
+        }
     }
 
     /// Executes a command as a child process, waiting for it to finish and
@@ -590,7 +624,11 @@ impl Command {
             self.inner.stderr(Stdio::null());
         }
 
-        self.inner.status()
+        match self.inner.status() {
+            #[cfg(windows)]
+            Err(err) if self.clear_breakaway_on_access_denied(&err) => self.inner.status(),
+            res => res,
+        }
     }
 
     /// Returns the path to the program that was given to [`std::process::Command::new`].

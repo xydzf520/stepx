@@ -459,6 +459,21 @@ def main():
 if __name__ == '__main__':
     try:
         main()
-    except (ValueError, KeyError, TypeError, ZeroDivisionError, OverflowError, zipfile.BadZipFile, ET.ParseError) as error:
+    except PermissionError:
+        sys.stderr.write('目标文件正在被其他程序占用，请关闭后重试\n')
+        sys.exit(2)
+    except (zipfile.BadZipFile, ET.ParseError, KeyError):
+        sys.stderr.write('文档格式已损坏或受密码保护，无法读取\n')
+        sys.exit(2)
+    except RuntimeError as error:
+        if 'encrypted' in str(error).lower() or 'password' in str(error).lower():
+            sys.stderr.write('文档格式已损坏或受密码保护，无法读取\n')
+        else:
+            sys.stderr.write((str(error) or '文档生成失败')[:400] + '\n')
+        sys.exit(2)
+    except (ValueError, TypeError, ZeroDivisionError, OverflowError) as error:
         sys.stderr.write(str(error)[:400] + '\n')
+        sys.exit(2)
+    except OSError:
+        sys.stderr.write('无法读写目标文档，请检查文件权限或磁盘空间\n')
         sys.exit(2)

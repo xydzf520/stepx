@@ -69,75 +69,175 @@ impl Drop for Watcher {
 }
 
 #[cfg(target_os = "linux")]
-pub fn locate(pid: u32) -> Option<MirrorWindow> {
-    use x11rb::{
-        connection::Connection,
-        protocol::xproto::{AtomEnum, ConnectionExt, MapState},
-    };
-    let (conn, screen) = x11rb::connect(None).ok()?;
-    let root = &conn.setup().roots[screen];
-    let atom = |name: &[u8]| {
-        conn.intern_atom(false, name)
-            .ok()?
-            .reply()
-            .ok()
-            .map(|a| a.atom)
-    };
-    let clients = atom(b"_NET_CLIENT_LIST")?;
-    let owner = atom(b"_NET_WM_PID")?;
-    let frames = atom(b"_NET_FRAME_EXTENTS")?;
-    let state = atom(b"_NET_WM_STATE")?;
-    let hidden = atom(b"_NET_WM_STATE_HIDDEN")?;
-    let prop = conn
-        .get_property(false, root.root, clients, AtomEnum::WINDOW, 0, 4096)
-        .ok()?
-        .reply()
-        .ok()?;
-    for win in prop.value32()? {
-        let Ok(cookie) = conn.get_property(false, win, owner, AtomEnum::CARDINAL, 0, 1) else {
-            continue;
-        };
-        let Ok(p) = cookie.reply() else {
-            continue;
-        };
-        if p.value32().and_then(|mut values| values.next()) != Some(pid) {
-            continue;
+struct CachedX11 {
+    conn: x11rb::rust_connection::RustConnection,
+    screen: usize,
+    clients: u32,
+    owner: u32,
+    frames: u32,
+    state: u32,
+    hidden: u32,
+}
+
+#[cfg(target_os = "linux")]
+impl CachedX11 {
+    fn connect() -> Option<Self> {
+        use x11rb::{connection::Connection, protocol::xproto::ConnectionExt};
+        let (conn, screen) = x11rb::connect(None).ok()?;
+        if screen >= conn.setup().roots.len() {
+            return None;
         }
-        let g = conn.get_geometry(win).ok()?.reply().ok()?;
-        let pos = conn
-            .translate_coordinates(win, root.root, 0, 0)
-            .ok()?
-            .reply()
-            .ok()?;
-        let attributes = conn.get_window_attributes(win).ok()?.reply().ok()?;
-        let states = conn
-            .get_property(false, win, state, AtomEnum::ATOM, 0, 64)
-            .ok()?
-            .reply()
-            .ok()?;
-        let minimized = states
-            .value32()
-            .is_some_and(|mut atoms| atoms.any(|a| a == hidden));
-        let extents = conn
-            .get_property(false, win, frames, AtomEnum::CARDINAL, 0, 4)
-            .ok()?
-            .reply()
-            .ok()?;
-        let e: Vec<_> = extents.value32().map(|v| v.collect()).unwrap_or_default();
-        let (l, r, t, b) = if e.len() == 4 {
-            (e[0], e[1], e[2], e[3])
-        } else {
-            (0, 0, 0, 0)
+        let atom = |name: &[u8]| {
+            conn.intern_atom(false, name)
+                .ok()?
+                .reply()
+                .ok()
+                .map(|a| a.atom)
         };
-        return Some(MirrorWindow {
-            x: pos.dst_x as f32 - l as f32,
-            y: pos.dst_y as f32 - t as f32,
-            width: g.width as f32 + (l + r) as f32,
-            height: g.height as f32 + (t + b) as f32,
-            visible: attributes.map_state == MapState::VIEWABLE && !minimized,
-            physical_pixels: true,
-            desktop_right: Some(root.width_in_pixels as f32),
-        });
+        Some(Self {
+            clients: atom(b"_NET_CLIENT_LIST")?,
+            owner: atom(b"_NET_WM_PID")?,
+            frames: atom(b"_NET_FRAME_EXTENTS")?,
+            state: atom(b"_NET_WM_STATE")?,
+            hidden: atom(b"_NET_WM_STATE_HIDDEN")?,
+            conn,
+            screen,
+        })
+    }
+
+    fn locate_window(&self, pid: u32) -> Result<Option<MirrorWindow>, ()> {
+        use x11rb::{
+            connection::Connection,
+            protocol::xproto::{AtomEnum, ConnectionExt, MapState},
+            rust_connection::ReplyError,
+        };
+        if self.conn.poll_for_event().is_err() {
+            return Err(());
+        }
+        let root = &self.conn.setup().roots[self.screen];
+        let prop = self
+            .conn
+            .get_property(false, root.root, self.clients, AtomEnum::WINDOW, 0, 4096)
+            .map_err(|_| ())?
+            .reply()
+            .map_err(|_| ())?;
+        let Some(windows) = prop.value32() else {
+            return Ok(None);
+        };
+        for win in windows {
+            let Ok(cookie) =
+                self.conn
+                    .get_property(false, win, self.owner, AtomEnum::CARDINAL, 0, 1)
+            else {
+                return Err(());
+            };
+            let p = match cookie.reply() {
+                Ok(reply) => reply,
+                Err(ReplyError::ConnectionError(_)) => return Err(()),
+                Err(ReplyError::X11Error(_)) => continue,
+            };
+            if p.value32().and_then(|mut values| values.next()) != Some(pid) {
+                continue;
+            }
+            let map_reply_err = |e: ReplyError| match e {
+                ReplyError::ConnectionError(_) => Err(()),
+                ReplyError::X11Error(_) => Ok(None),
+            };
+            let g = match self
+                .conn
+                .get_geometry(win)
+                .map_err(|_| ())?
+                .reply()
+                .map_err(map_reply_err)
+            {
+                Ok(v) => v,
+                Err(res) => return res,
+            };
+            let pos = match self
+                .conn
+                .translate_coordinates(win, root.root, 0, 0)
+                .map_err(|_| ())?
+                .reply()
+                .map_err(map_reply_err)
+            {
+                Ok(v) => v,
+                Err(res) => return res,
+            };
+            let attributes = match self
+                .conn
+                .get_window_attributes(win)
+                .map_err(|_| ())?
+                .reply()
+                .map_err(map_reply_err)
+            {
+                Ok(v) => v,
+                Err(res) => return res,
+            };
+            let states = match self
+                .conn
+                .get_property(false, win, self.state, AtomEnum::ATOM, 0, 64)
+                .map_err(|_| ())?
+                .reply()
+                .map_err(map_reply_err)
+            {
+                Ok(v) => v,
+                Err(res) => return res,
+            };
+            let minimized = states
+                .value32()
+                .is_some_and(|mut atoms| atoms.any(|a| a == self.hidden));
+            let extents = match self
+                .conn
+                .get_property(false, win, self.frames, AtomEnum::CARDINAL, 0, 4)
+                .map_err(|_| ())?
+                .reply()
+                .map_err(map_reply_err)
+            {
+                Ok(v) => v,
+                Err(res) => return res,
+            };
+            let e: Vec<_> = extents.value32().map(|v| v.collect()).unwrap_or_default();
+            let (l, r, t, b) = if e.len() == 4 {
+                (e[0], e[1], e[2], e[3])
+            } else {
+                (0, 0, 0, 0)
+            };
+            return Ok(Some(MirrorWindow {
+                x: pos.dst_x as f32 - l as f32,
+                y: pos.dst_y as f32 - t as f32,
+                width: g.width as f32 + (l + r) as f32,
+                height: g.height as f32 + (t + b) as f32,
+                visible: attributes.map_state == MapState::VIEWABLE && !minimized,
+                physical_pixels: true,
+                desktop_right: Some(root.width_in_pixels as f32),
+            }));
+        }
+        Ok(None)
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn locate(pid: u32) -> Option<MirrorWindow> {
+    static X11_CONN: std::sync::OnceLock<std::sync::Mutex<Option<CachedX11>>> =
+        std::sync::OnceLock::new();
+    let cache = X11_CONN.get_or_init(|| std::sync::Mutex::new(None));
+    let mut guard = cache.lock().ok()?;
+    if guard.is_none() {
+        *guard = CachedX11::connect();
+    }
+    if let Some(cached) = guard.as_ref() {
+        match cached.locate_window(pid) {
+            Ok(found) => return found,
+            Err(()) => {
+                *guard = CachedX11::connect();
+                if let Some(reconnected) = guard.as_ref() {
+                    if let Ok(found) = reconnected.locate_window(pid) {
+                        return found;
+                    }
+                }
+                *guard = None;
+            }
+        }
     }
     None
 }

@@ -463,6 +463,40 @@ impl Companion {
         metrics
     }
 
+    pub(super) fn companion_permission_issue(
+        &self,
+    ) -> Option<(&'static str, &'static str, Action)> {
+        if self.selected.is_none() || self.demo_mode {
+            return None;
+        }
+        if self.companion_status.checked && !self.companion_status.installed {
+            return Some((
+                "伴侣未安装",
+                "手机尚未安装 StepX 伴侣应用，实时通知、剪贴板同步与背屏能力暂未就绪。",
+                Action::CompanionInstall,
+            ));
+        }
+        if self.companion_status.checked && !self.companion_status.permission_granted {
+            return Some((
+                "伴侣权限缺失",
+                "StepX 伴侣缺少核心系统授权，部分跨端同步与控制功能受限。",
+                Action::ExecuteDoctorQuickAction(
+                    stepx_companion::doctor_harness::DoctorActionKind::RepairCompanionPermissions,
+                ),
+            ));
+        }
+        if self.push.loaded && !self.push.snapshot.listener_connected {
+            return Some((
+                "通知监听未开启",
+                "手机 NotificationListener 通知使用权尚未生效，实时消息与验证码无法推送。",
+                Action::ExecuteDoctorQuickAction(
+                    stepx_companion::doctor_harness::DoctorActionKind::RepairCompanionPermissions,
+                ),
+            ));
+        }
+        None
+    }
+
     pub(crate) fn device_block(&self) -> El {
         let p = self.p();
         let state = self.mouse_state("device-block");
@@ -538,7 +572,15 @@ impl Companion {
                         .with_cross_axis_alignment(CrossAxisAlignment::Start)
                         .with_child(self.lead(
                             6.,
-                            self.dot(p.success),
+                            self.dot(
+                                if self.companion_permission_issue().is_some()
+                                    || self.connection_watch.misses > 0
+                                {
+                                    p.warning
+                                } else {
+                                    p.success
+                                },
+                            ),
                             self.line_w(title, CAPTION, p.text, Weight::Semibold),
                         ))
                         .with_child(self.hstack(
@@ -877,12 +919,17 @@ impl Companion {
                     )
                     && t.unread_count > 0
             });
-        let msg_badge = if has_unread_msg {
+        let device_connected = self.selected.is_some() || self.demo_mode;
+        let msg_badge = if device_connected && has_unread_msg {
             SidebarBadge::RedDot
         } else {
             SidebarBadge::None
         };
-        let updatable_apps = self.store_updatable_count();
+        let updatable_apps = if device_connected {
+            self.store_updatable_count()
+        } else {
+            0
+        };
         let store_badge = if self.app_store.active_task_count() > 0 {
             SidebarBadge::SvgIcon(UiIcon::Download, p.accent)
         } else if updatable_apps > 0 {
@@ -896,52 +943,62 @@ impl Companion {
             SidebarBadge::None
         };
         let now_ms = chrono::Local::now().timestamp_millis();
-        let today_valid_cal = self
-            .back_screen
-            .stepos_suite
-            .calendar_events
-            .iter()
-            .filter(|e| {
-                e.is_today_valid_unexpired_at(
-                    now_ms,
-                    &self.back_screen.completed_calendar_events,
-                    &self.reminder_governance,
-                )
-            })
-            .count();
+        let today_valid_cal = if device_connected {
+            self.back_screen
+                .stepos_suite
+                .calendar_events
+                .iter()
+                .filter(|e| {
+                    e.is_today_valid_unexpired_at(
+                        now_ms,
+                        &self.back_screen.completed_calendar_events,
+                        &self.reminder_governance,
+                    )
+                })
+                .count()
+        } else {
+            0
+        };
         let cal_badge = if today_valid_cal > 0 {
             SidebarBadge::Count(today_valid_cal, p.indigo)
         } else {
             SidebarBadge::None
         };
-        let today_unexpired_alarms = self
-            .back_screen
-            .stepos_suite
-            .alarms
-            .iter()
-            .filter(|a| a.is_today_valid_unexpired_at(now_ms, &self.reminder_governance))
-            .count();
+        let today_unexpired_alarms = if device_connected {
+            self.back_screen
+                .stepos_suite
+                .alarms
+                .iter()
+                .filter(|a| a.is_today_valid_unexpired_at(now_ms, &self.reminder_governance))
+                .count()
+        } else {
+            0
+        };
         let alarm_badge = if today_unexpired_alarms > 0 {
             SidebarBadge::Count(today_unexpired_alarms, p.warning)
         } else {
             SidebarBadge::None
         };
-        let missed_calls: usize = self
-            .call_logs
-            .iter()
-            .filter(|r| {
-                if r.call_type != 3
-                    || r.date_ms <= 0
-                    || (now_ms > 1_700_000_000_000 && now_ms.saturating_sub(r.date_ms) > 86_400_000)
-                    || self.is_missed_call_followed_up(r)
-                {
-                    return false;
-                }
-                let id = format!("missed-call:{}:{}", r.number.trim(), r.date_ms);
-                !self.notification_center.read_ids.contains(&id)
-                    && !self.notification_center.dismissed_ids.contains(&id)
-            })
-            .count();
+        let missed_calls: usize = if device_connected {
+            self.call_logs
+                .iter()
+                .filter(|r| {
+                    if r.call_type != 3
+                        || r.date_ms <= 0
+                        || (now_ms > 1_700_000_000_000
+                            && now_ms.saturating_sub(r.date_ms) > 86_400_000)
+                        || self.is_missed_call_followed_up(r)
+                    {
+                        return false;
+                    }
+                    let id = format!("missed-call:{}:{}", r.number.trim(), r.date_ms);
+                    !self.notification_center.read_ids.contains(&id)
+                        && !self.notification_center.dismissed_ids.contains(&id)
+                })
+                .count()
+        } else {
+            0
+        };
         let phone_badge = if missed_calls > 0 {
             SidebarBadge::Count(missed_calls, p.danger)
         } else {
@@ -1133,6 +1190,9 @@ impl Companion {
                         .finish(),
                 )
                 .with_uniform_padding(12.)
+                // macOS traffic lights overlay the top ~28pt of the window;
+                // drop the sidebar content below them.
+                .with_padding_top(if cfg!(target_os = "macos") { 40. } else { 12. })
                 .with_background_color(p.sidebar)
                 .with_border(Border::right(1.).with_border_color(p.border))
                 .with_corner_radius(CornerRadius::with_top_left(Radius::Pixels(12.)))
@@ -1275,15 +1335,19 @@ impl Companion {
             "page-header-actions",
         )
         .finish();
+        // macOS already shows the native traffic lights; skip the duplicated
+        // in-app window controls there.
+        let control_buttons: Vec<El> = if cfg!(target_os = "macos") {
+            Vec::new()
+        } else {
+            vec![
+                self.window_control_btn("min", "—", false, Action::MinimizeWindow),
+                self.window_control_btn("max", "□", false, Action::MaximizeWindow),
+                self.window_control_btn("close", "×", true, Action::CloseWindow),
+            ]
+        };
         let controls = SavePosition::new(
-            self.hstack(
-                S2,
-                vec![
-                    self.window_control_btn("min", "—", false, Action::MinimizeWindow),
-                    self.window_control_btn("max", "□", false, Action::MaximizeWindow),
-                    self.window_control_btn("close", "×", true, Action::CloseWindow),
-                ],
-            ),
+            self.hstack(S2, control_buttons),
             "page-header-window-controls",
         )
         .finish();
@@ -1418,6 +1482,15 @@ impl Companion {
         } else {
             raw_detail
         };
+        let companion_issue = self.companion_permission_issue();
+        let effective_detail = if !self.error && matches!(detail.as_str(), "就绪" | "已就绪") {
+            companion_issue
+                .as_ref()
+                .map(|(label, _, _)| (*label).to_string())
+                .unwrap_or(detail)
+        } else {
+            detail
+        };
         let left = self.lead(
             S2,
             self.fixed_w(
@@ -1425,13 +1498,18 @@ impl Companion {
                 Align::new(if self.footer_loading() {
                     self.loading_line()
                 } else {
-                    self.dot(if self.initializing || self.connection_watch.misses > 0 {
-                        p.warning
-                    } else if self.selected.is_some() {
-                        p.success
-                    } else {
-                        p.text3
-                    })
+                    self.dot(
+                        if self.initializing
+                            || self.connection_watch.misses > 0
+                            || companion_issue.is_some()
+                        {
+                            p.warning
+                        } else if self.selected.is_some() {
+                            p.success
+                        } else {
+                            p.text3
+                        },
+                    )
                 })
                 .finish(),
             ),
@@ -1439,13 +1517,31 @@ impl Companion {
                 S1,
                 vec![
                     transport,
-                    self.line(detail, CAPTION, if self.error { p.danger } else { p.text2 }),
+                    self.line(
+                        effective_detail,
+                        CAPTION,
+                        if self.error {
+                            p.danger
+                        } else if companion_issue.is_some() {
+                            p.warning
+                        } else {
+                            p.text2
+                        },
+                    ),
                     if self.error {
                         self.button_icon(
                             "status-failure-details",
                             "原因与重试",
                             UiIcon::Info,
                             Action::ReviewHistory,
+                            Btn::Ghost,
+                        )
+                    } else if let Some((_, _, repair_action)) = companion_issue {
+                        self.button_icon(
+                            "status-repair-companion",
+                            "一键修复",
+                            UiIcon::Tools,
+                            repair_action,
                             Btn::Ghost,
                         )
                     } else {
@@ -2014,7 +2110,8 @@ impl Companion {
             .effective_ttl_ms(ReminderCategory::OtpCode);
         let sms_silent = self.push.prefs.effective_popup_mode("com.android.mms")
             == stepx_companion::desktop_notify::PopupMode::Silent;
-        let otp_candidate: Option<(String, String)> = (!sms_silent)
+        let otp_candidate: Option<(String, String)> =
+            ((self.selected.is_some() || self.demo_mode) && !sms_silent)
             .then(|| {
                 self.push
                     .snapshot

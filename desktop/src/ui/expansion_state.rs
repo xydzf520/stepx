@@ -155,7 +155,7 @@ impl Companion {
             .selected
             .as_ref()
             .zip(self.expansion.worker.as_ref())
-            .is_some_and(|(d, w)| d.serial == w.serial && d.transport == w.transport);
+            .is_some_and(|(d, w)| d.serial == w.serial);
         if !self.is_demo_device() && !matches {
             let different = self
                 .selected
@@ -415,82 +415,58 @@ impl Companion {
                     self.choose_paths(
                         stepx_companion::file_dialog::FileDialog::new().set_title("选择要归档到电脑扩容库的文件"),
                         DialogKind::OpenFiles,
-                        move |app, picked, _| {
+                        move |app, picked, ctx| {
                             app.ensure_file_dialog_device(&expected_device)?;
                             anyhow::ensure!(
                                 app.expansion.config.folder.as_ref() == Some(&base),
                                 "电脑扩容目录已变化，请重新选择文件"
                             );
-                            let vault = base.join("StepX Storage");
-                            let mut imported = 0usize;
-                            let now_ms = chrono::Utc::now().timestamp_millis();
-                            let today_label = format!("{} · 今天", chrono::Local::now().format("%Y-%m-%d"));
-                            for src in picked {
-                                if !src.is_file() {
-                                    continue;
+                            let cfg = app.expansion.config.clone();
+                            app.expansion.feedback = "正在归档所选文件到电脑扩容库…".into();
+                            let (tx, rx) = async_channel::bounded(1);
+                            std::thread::spawn(move || {
+                                let res = expansion::import_local_files(&cfg, &picked)
+                                    .map(|imported| {
+                                        let files = expansion::records(&cfg).unwrap_or_default();
+                                        (imported, files)
+                                    })
+                                    .map_err(|e| format!("{e:#}"));
+                                let _ = tx.send_blocking(res);
+                            });
+                            let expected_base = base.clone();
+                            ctx.spawn(async move { rx.recv().await }, move |me, result, ctx| {
+                                match result {
+                                    Ok(Ok((imported, files))) => {
+                                        if me.expansion.config.folder.as_ref()
+                                            == Some(&expected_base)
+                                        {
+                                            me.expansion.snapshot.files = files;
+                                        }
+                                        if let Some(w) = &me.expansion.worker {
+                                            let _ = w.commands.send(Command::Refresh);
+                                        }
+                                        me.expansion.feedback = if imported > 0 {
+                                            format!("已手动归档 {imported} 个文件到电脑扩容库")
+                                        } else {
+                                            "所选文件已在电脑扩容库中，无需重复归档".into()
+                                        };
+                                        me.record_notice(
+                                            "存储扩容",
+                                            me.expansion.feedback.clone(),
+                                        );
+                                    }
+                                    Ok(Err(err)) => {
+                                        me.expansion.feedback =
+                                            format!("手动归档未完成：{err}");
+                                        me.record_notice(
+                                            "存储扩容",
+                                            me.expansion.feedback.clone(),
+                                        );
+                                    }
+                                    Err(_) => {}
                                 }
-                                let Some(name) = src
-                                    .file_name()
-                                    .and_then(|s| s.to_str())
-                                    .map(|s| s.to_string())
-                                else {
-                                    continue;
-                                };
-                                let ext = src
-                                    .extension()
-                                    .and_then(|s| s.to_str())
-                                    .unwrap_or("")
-                                    .to_ascii_lowercase();
-                                let (kind, sub_folder, rel_prefix) = if matches!(
-                                    ext.as_str(),
-                                    "jpg" | "jpeg" | "png" | "webp" | "gif" | "heic" | "bmp" | "dng"
-                                ) {
-                                    ("photos", "照片与视频", "Pictures")
-                                } else if matches!(
-                                    ext.as_str(),
-                                    "mp4" | "mov" | "mkv" | "avi" | "webm" | "3gp" | "flv"
-                                ) {
-                                    ("videos", "照片与视频", "Movies")
-                                } else if matches!(
-                                    ext.as_str(),
-                                    "mp3" | "wav" | "flac" | "m4a" | "aac" | "ogg" | "opus" | "amr"
-                                ) {
-                                    ("audio", "录音与音频", "Music")
-                                } else {
-                                    ("documents", "社交与文档", "Documents")
-                                };
-                                let dest_dir = vault.join(sub_folder);
-                                let _ = std::fs::create_dir_all(&dest_dir);
-                                let dest_file = dest_dir.join(&name);
-                                if src != dest_file {
-                                    let _ = std::fs::copy(&src, &dest_file);
-                                }
-                                let size = std::fs::metadata(&dest_file)
-                                    .or_else(|_| std::fs::metadata(&src))
-                                    .map(|m| m.len())
-                                    .unwrap_or(0);
-                                let id = format!("local-{}-{imported}", now_ms as u64);
-                                let entry = json!({
-                                    "id": id,
-                                    "name": name,
-                                    "path": format!("{rel_prefix}/{name}"),
-                                    "kind": kind,
-                                    "state": "archived",
-                                    "size": size,
-                                    "modified": now_ms,
-                                    "mtimeMs": now_ms,
-                                    "archivedAt": now_ms,
-                                    "archivedAtMs": now_ms,
-                                    "dateGroup": today_label,
-                                    "localPath": dest_file.to_string_lossy().to_string(),
-                                });
-                                app.expansion.snapshot.files.insert(0, entry);
-                                imported += 1;
-                            }
-                            if imported > 0 {
-                                app.expansion.feedback = format!("已手动归档 {imported} 个文件到电脑扩容库");
-                                app.record_notice("存储扩容", app.expansion.feedback.clone());
-                            }
+                                ctx.notify();
+                            });
 
                             Ok(())
                         },
@@ -739,7 +715,8 @@ impl Companion {
                             {
                                 path.clone()
                             } else {
-                                let cache_dir = std::env::temp_dir().join("stepx-gallery-cache");
+                                let cache_dir =
+                                    stepx_companion::resources::user_state().join("cache/amoo-stage");
                                 let _ = std::fs::create_dir_all(&cache_dir);
                                 let dest = cache_dir.join(&name);
                                 if std::fs::copy(path, &dest).is_ok() {
@@ -771,14 +748,55 @@ impl Companion {
                         }
                         self.status = format!("已载入扩容原件「{name}」至 Amoo 对话框");
                     } else {
-                        let name = PathBuf::from(id)
+                        let candidate = PathBuf::from(id);
+                        let name = candidate
                             .file_name()
                             .and_then(|n| n.to_str())
                             .unwrap_or(id.as_str())
                             .to_string();
-                        self.fields[F_AMOO]
-                            .set(&format!("请帮我分析手机中的文件「{name}」（路径：{id}）"));
-                        self.status = format!("已将手机文件「{name}」带入 Amoo 对话框");
+                        let local_meta = (!self.demo_mode)
+                            .then(|| std::fs::symlink_metadata(&candidate).ok())
+                            .flatten()
+                            .filter(|m| m.file_type().is_file());
+                        if let Some(meta) = local_meta {
+                            let size_bytes = meta.len();
+                            let is_img = candidate
+                                .extension()
+                                .and_then(|e| e.to_str())
+                                .is_some_and(|e| {
+                                    matches!(
+                                        e.to_ascii_lowercase().as_str(),
+                                        "png" | "jpg" | "jpeg" | "webp" | "gif"
+                                    )
+                                });
+                            if is_img {
+                                self.work.insert_image_preview(
+                                    candidate.to_string_lossy().into_owned(),
+                                    candidate.clone(),
+                                );
+                            }
+                            if !self
+                                .amoo_attachments
+                                .iter()
+                                .any(|a| a.local_path.as_ref() == Some(&candidate))
+                            {
+                                self.amoo_attachments.push(AmooAttachment {
+                                    name: name.clone(),
+                                    size_label: storage::format_bytes(size_bytes),
+                                    is_image: is_img,
+                                    local_path: Some(candidate),
+                                });
+                            }
+                            if self.fields[F_AMOO].text.trim().is_empty() {
+                                self.fields[F_AMOO]
+                                    .set(&format!("请帮我分析这份文件：{name}"));
+                            }
+                            self.status = format!("已载入本地文件「{name}」至 Amoo 对话框");
+                        } else {
+                            self.fields[F_AMOO]
+                                .set(&format!("请帮我分析手机中的文件「{name}」（路径：{id}）"));
+                            self.status = format!("已将手机文件「{name}」带入 Amoo 对话框");
+                        }
                     }
                     self.workspace.sub_view = 0;
                     self.workspace.panel = 0;

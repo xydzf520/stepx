@@ -34,6 +34,25 @@ public final class ContextReadPolicyTest {
         check(ContextReadPolicy.isAudioRecordingName("meeting.MP3"));
         check(!ContextReadPolicy.isAudioRecordingName(".hidden.m4a"));
         check(!ContextReadPolicy.isAudioRecordingName("notes.txt"));
-        System.out.println("ContextReadPolicyTest: 26 assertions passed");
+        check("txt".equals(ContextReadPolicy.fileExtension("notes.TXT")));
+        check("".equals(ContextReadPolicy.fileExtension("README")));
+        check("".equals(ContextReadPolicy.fileExtension("txt")));
+        check("".equals(ContextReadPolicy.fileExtension(".txt")));
+        check("".equals(ContextReadPolicy.fileExtension("trailing.")));
+        try {
+            check(ContextReadPolicy.readBoundedLine(new java.io.ByteArrayInputStream(new byte[0]), 64) == null);
+            check("{\"op\":\"ping\"}".equals(ContextReadPolicy.readBoundedLine(
+                new java.io.ByteArrayInputStream("{\"op\":\"ping\"}\r\n".getBytes(java.nio.charset.StandardCharsets.UTF_8)), 64)));
+            boolean overflow = false;
+            try {
+                ContextReadPolicy.readBoundedLine(new java.io.ByteArrayInputStream(new byte[32770]), 32769);
+            } catch (IllegalArgumentException expected) {
+                overflow = true;
+            }
+            check(overflow);
+        } catch (java.io.IOException e) {
+            throw new AssertionError(e);
+        }
+        System.out.println("ContextReadPolicyTest: 34 assertions passed");
     }
 }

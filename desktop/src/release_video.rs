@@ -38,8 +38,9 @@ struct Shared {
     stop: AtomicBool,
 }
 pub struct Player {
-    tx: mpsc::SyncSender<Control>,
+    tx: Option<mpsc::SyncSender<Control>>,
     shared: Arc<Shared>,
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 impl Player {
     pub fn start() -> Self {
@@ -48,19 +49,36 @@ impl Player {
             state: Mutex::new(Snapshot::default()),
             stop: AtomicBool::new(false),
         });
-        let worker = shared.clone();
-        std::thread::spawn(move || {
-            if let Err(error) = run(rx, &worker) {
-                publish(&worker, |s| {
-                    s.error = Some(error);
+        let worker_shared = shared.clone();
+        let worker = match std::thread::Builder::new()
+            .name("release-video-decoder".into())
+            .spawn(move || {
+                if let Err(error) = run(rx, &worker_shared) {
+                    publish(&worker_shared, |s| {
+                        s.error = Some(error);
+                        s.playing = false;
+                    });
+                }
+            }) {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                publish(&shared, |s| {
+                    s.error = Some(error.to_string());
                     s.playing = false;
                 });
+                None
             }
-        });
-        Self { tx, shared }
+        };
+        Self {
+            tx: Some(tx),
+            shared,
+            worker,
+        }
     }
     pub fn control(&self, control: Control) {
-        let _ = self.tx.try_send(control);
+        if let Some(tx) = &self.tx {
+            let _ = tx.try_send(control);
+        }
     }
     /// Takes the only pending image. Slow consumers never accumulate frames.
     pub fn poll(&self, last_revision: u64) -> Option<Snapshot> {
@@ -81,7 +99,13 @@ impl Player {
 impl Drop for Player {
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::Release);
-        let _ = self.tx.try_send(Control::Pause);
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.try_send(Control::Pause);
+            drop(tx);
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 fn publish(shared: &Shared, update: impl FnOnce(&mut Snapshot)) {
@@ -94,6 +118,7 @@ fn run(rx: mpsc::Receiver<Control>, shared: &Shared) -> Result<(), String> {
     use openh264::decoder::Decoder;
     let mut decoder = Decoder::new().map_err(|e| e.to_string())?;
     let nals: Vec<&[u8]> = openh264::nal_units(BYTES).collect();
+    let mut rgb = Vec::new();
     let mut cursor = 0usize;
     let mut frame = 0u32;
     let mut playing = false;
@@ -102,12 +127,15 @@ fn run(rx: mpsc::Receiver<Control>, shared: &Shared) -> Result<(), String> {
     let mut due = Instant::now();
     while !shared.stop.load(Ordering::Acquire) {
         if let Some(control) = pending.take().or_else(|| rx.try_recv().ok()) {
+            if shared.stop.load(Ordering::Acquire) {
+                break;
+            }
             match control {
                 Control::Play => {
                     if cursor >= nals.len() {
+                        let _ = decoder.flush_remaining();
                         cursor = 0;
                         frame = 0;
-                        decoder = Decoder::new().map_err(|e| e.to_string())?;
                     }
                     playing = true;
                     due = Instant::now();
@@ -121,7 +149,7 @@ fn run(rx: mpsc::Receiver<Control>, shared: &Shared) -> Result<(), String> {
                     publish(shared, |s| s.playing = false);
                 }
                 Control::Seek(target) => {
-                    decoder = Decoder::new().map_err(|e| e.to_string())?;
+                    let _ = decoder.flush_remaining();
                     cursor = 0;
                     frame = 0;
                     due = Instant::now();
@@ -149,9 +177,15 @@ fn run(rx: mpsc::Receiver<Control>, shared: &Shared) -> Result<(), String> {
             });
             continue;
         }
+        if shared.stop.load(Ordering::Acquire) {
+            break;
+        }
         let nal = nals[cursor];
         cursor += 1;
         if let Some(yuv) = decoder.decode(nal).map_err(|e| e.to_string())? {
+            if shared.stop.load(Ordering::Acquire) {
+                break;
+            }
             let number = frame;
             frame += 1;
             if seek.is_some_and(|target| number < target) {
@@ -162,17 +196,23 @@ fn run(rx: mpsc::Receiver<Control>, shared: &Shared) -> Result<(), String> {
             if w == 0 || h == 0 || w > 1280 || h > 900 {
                 return Err("视频尺寸超出播放范围".into());
             }
-            let mut rgb = vec![0; yuv.rgb8_len()];
+            rgb.resize(yuv.rgb8_len(), 0);
             yuv.write_rgb8(&mut rgb);
+            if shared.stop.load(Ordering::Acquire) {
+                break;
+            }
             let mut jpeg = Vec::with_capacity(96 * 1024);
             image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 82)
                 .encode(&rgb, w as u32, h as u32, image::ExtendedColorType::Rgb8)
                 .map_err(|e| e.to_string())?;
+            if shared.stop.load(Ordering::Acquire) {
+                break;
+            }
             publish(shared, |s| {
                 s.frame = number;
                 s.jpeg = Some(jpeg);
             });
-            if playing {
+            if playing && !shared.stop.load(Ordering::Acquire) {
                 due += Duration::from_micros(1_000_000 / u64::from(FPS));
                 if Instant::now().saturating_duration_since(due) > Duration::from_millis(250) {
                     due = Instant::now();
@@ -247,6 +287,49 @@ mod tests {
             Arc::strong_count(&shared),
             1,
             "decoder worker must release its state after close"
+        );
+    }
+    #[test]
+    fn start_followed_by_drop_and_replay_loop_exit_cleanly_without_leaking_threads() {
+        // Immediate start() -> drop(player) terminates worker synchronously with zero leaked refs.
+        let player = Player::start();
+        let shared = player.shared.clone();
+        let immediate_drop = Instant::now();
+        drop(player);
+        assert!(shared.stop.load(Ordering::Acquire));
+        assert_eq!(
+            Arc::strong_count(&shared),
+            1,
+            "drop(player) must synchronously terminate the background OpenH264 worker"
+        );
+        assert!(
+            immediate_drop.elapsed() < Duration::from_millis(50),
+            "immediate drop took {:?}",
+            immediate_drop.elapsed()
+        );
+
+        // Seeking to the final frames, hitting EOF, replaying on the same single thread,
+        // and dropping mid-seek/play also terminates promptly without spawning extra threads.
+        let player = Player::start();
+        let shared = player.shared.clone();
+        player.control(Control::Seek(FRAME_COUNT - 2));
+        player.control(Control::Play);
+        wait_for(&player, |s| s.ended && !s.playing);
+        // Exactly 3 strong refs: `player.shared`, `worker_shared` (1 thread), and local `shared`.
+        assert_eq!(Arc::strong_count(&shared), 3);
+        player.control(Control::Play);
+        let restarted = wait_for(&player, |s| s.playing && s.frame <= 4 && s.jpeg.is_some());
+        assert!(!restarted.ended);
+        assert_eq!(Arc::strong_count(&shared), 3);
+        player.control(Control::Seek(FRAME_COUNT - 1));
+        let stop_started = Instant::now();
+        drop(player);
+        assert!(shared.stop.load(Ordering::Acquire));
+        assert_eq!(Arc::strong_count(&shared), 1);
+        assert!(
+            stop_started.elapsed() < Duration::from_millis(50),
+            "player drop took {:?}",
+            stop_started.elapsed()
         );
     }
 }

@@ -174,15 +174,65 @@ pub fn start_verify(firmware: Firmware, path: PathBuf) -> Result<Job> {
     req["path"] = json!(path);
     spawn(req, firmware, None)
 }
+struct OtaChildGuard(Option<std::process::Child>);
+
+impl OtaChildGuard {
+    fn kill_tree_and_wait(&mut self) {
+        let Some(mut child) = self.0.take() else {
+            return;
+        };
+        #[cfg(windows)]
+        {
+            let mut kill = std::process::Command::new("taskkill");
+            crate::resources::quiet_command(&mut kill);
+            let _ = kill
+                .args(["/PID", &child.id().to_string(), "/T", "/F"])
+                .status();
+        }
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    fn finish_cleanly(&mut self) {
+        let Some(mut child) = self.0.take() else {
+            return;
+        };
+        let wait_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) if Instant::now() < wait_deadline => {
+                    thread::sleep(Duration::from_millis(25));
+                }
+                _ => {
+                    self.0 = Some(child);
+                    self.kill_tree_and_wait();
+                    return;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for OtaChildGuard {
+    fn drop(&mut self) {
+        self.kill_tree_and_wait();
+    }
+}
+
 pub fn start_stage(adb: Adb, device: Device, package: VerifiedPackage) -> Result<Job> {
-    // The worker rechecks the serial before any phone operation; keep UI startup nonblocking.
+    let transport = device.resolve_active_transport(&adb)?;
     let mut req = request(&package.firmware)?;
     req["sha256"] = json!(package.sha256);
     req["verified_stat"] = json!(package.verified_stat);
     req["op"] = json!("stage");
     req["path"] = json!(package.path);
     req["adb"] = json!(adb.path);
-    req["transport"] = json!(device.transport);
+    req["transport"] = json!(transport);
     req["serial"] = json!(device.serial);
     req["remote"] = json!(format!(
         "/sdcard/Download/StepX-OTA/{:032x}/update.zip",
@@ -206,14 +256,30 @@ fn spawn(mut req: Value, firmware: Firmware, serial: Option<String>) -> Result<J
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let mut child = command
+    let child = command
         .spawn()
         .context("无法启动固件传输工具（需要 Python 3）")?;
-    let mut input = child.stdin.take().context("固件传输输入不可用")?;
-    serde_json::to_writer(&mut input, &req)?;
-    input.flush()?;
+    let mut guard = OtaChildGuard(Some(child));
+    let mut input = guard
+        .0
+        .as_mut()
+        .and_then(|c| c.stdin.take())
+        .context("固件传输输入不可用")?;
+    if let Err(err) = serde_json::to_writer(&mut input, &req).and_then(|()| {
+        input
+            .flush()
+            .map_err(serde_json::Error::io)
+    }) {
+        drop(input);
+        guard.kill_tree_and_wait();
+        return Err(err).context("写入固件传输请求失败");
+    }
     drop(input);
-    let stdout = child.stdout.take().context("固件传输出不可用")?;
+    let stdout = guard
+        .0
+        .as_mut()
+        .and_then(|c| c.stdout.take())
+        .context("固件传输出不可用")?;
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let flag = cancel.clone();
@@ -232,6 +298,7 @@ fn spawn(mut req: Value, firmware: Firmware, serial: Option<String>) -> Result<J
             }
         });
         let mut terminal = false;
+        let mut force_kill = false;
         let start = Instant::now();
         let mut cancelled_at = None;
         loop {
@@ -242,18 +309,14 @@ fn spawn(mut req: Value, firmware: Firmware, serial: Option<String>) -> Result<J
             if cancelled_at.is_some_and(|t| t.elapsed() > Duration::from_secs(20))
                 || start.elapsed() > Duration::from_secs(7200)
             {
-                #[cfg(unix)]
-                unsafe {
-                    libc::kill(-(child.id() as i32), libc::SIGKILL);
-                }
-                let _ = child.kill();
-                let _ = child.wait();
+                guard.kill_tree_and_wait();
                 let _ = tx.send(if cancelled_at.is_some() {
                     Event::Cancelled
                 } else {
                     Event::Failed("固件操作超时，已停止；可重试".into())
                 });
                 terminal = true;
+                force_kill = true;
                 break;
             }
             match line_rx.recv_timeout(Duration::from_millis(150)) {
@@ -263,21 +326,28 @@ fn spawn(mut req: Value, firmware: Firmware, serial: Option<String>) -> Result<J
                     };
                     match value["event"].as_str().unwrap_or("") {
                         "progress" => {
-                            let _ = tx.send(Event::Progress {
-                                phase: value["phase"].as_str().unwrap_or("").into(),
-                                done: value["done"].as_u64().unwrap_or(0),
-                                total: value["total"].as_u64().unwrap_or(0),
-                            });
+                            if tx
+                                .send(Event::Progress {
+                                    phase: value["phase"].as_str().unwrap_or("").into(),
+                                    done: value["done"].as_u64().unwrap_or(0),
+                                    total: value["total"].as_u64().unwrap_or(0),
+                                })
+                                .is_err()
+                            {
+                                flag.store(true, Ordering::Release);
+                            }
                         }
                         "failed" => {
                             let _ = tx.send(Event::Failed(
                                 value["message"].as_str().unwrap_or("固件处理失败").into(),
                             ));
                             terminal = true;
+                            force_kill = true;
                         }
                         "cancelled" => {
                             let _ = tx.send(Event::Cancelled);
                             terminal = true;
+                            force_kill = true;
                         }
                         "complete" => {
                             let result = (|| -> Result<Event> {
@@ -310,6 +380,9 @@ fn spawn(mut req: Value, firmware: Firmware, serial: Option<String>) -> Result<J
                                     Event::Downloaded(package)
                                 })
                             })();
+                            if result.is_err() {
+                                force_kill = true;
+                            }
                             let _ =
                                 tx.send(result.unwrap_or_else(|e| Event::Failed(e.to_string())));
                             terminal = true;
@@ -326,15 +399,19 @@ fn spawn(mut req: Value, firmware: Firmware, serial: Option<String>) -> Result<J
         }
         if !terminal {
             let _ = tx.send(Event::Failed("固件处理进程提前退出，未完成操作".into()));
+            guard.kill_tree_and_wait();
+        } else if force_kill {
+            guard.finish_cleanly();
+        } else {
+            guard.finish_cleanly();
         }
-        let _ = child.wait();
         drop(work);
     });
     Ok(Job { events: rx, cancel })
 }
 /// Removes only the exact temporary directory created for this staged package.
 pub fn remove_staged(adb: &Adb, device: &Device, staged: &StagedPackage) -> Result<()> {
-    device.verify(adb)?;
+    let transport = device.resolve_active_transport(adb)?;
     ensure!(device.serial == staged.serial, "手机身份不匹配");
     let folder = staged
         .remote_path
@@ -346,7 +423,7 @@ pub fn remove_staged(adb: &Adb, device: &Device, staged: &StagedPackage) -> Resu
         "固件暂存路径无效"
     );
     adb.shell(
-        &device.transport,
+        &transport,
         &["rm", "-rf", &format!("/sdcard/Download/StepX-OTA/{folder}")],
     )?;
     Ok(())
@@ -364,7 +441,7 @@ pub fn submit_install(
     report: &OtaReport,
     firmware: &Firmware,
 ) -> Result<InstallSubmission> {
-    device.verify(adb)?;
+    let mut transport = device.resolve_active_transport(adb)?;
     ensure!(
         report.serial == device.serial && staged.serial == device.serial,
         "固件与当前手机不匹配"
@@ -421,7 +498,7 @@ pub fn submit_install(
         "官方报告已过期，请重新检查更新"
     );
     let raw_props = adb.script(
-        &device.transport,
+        &transport,
         "v=$(getprop ro.build.mask.id); if [ -z \"$v\" ]; then v=$(getprop ro.build.aios_version); fi; printf '%s\\n' \"$v\"; getprop ro.product.device; getprop ro.build.version.incremental; getprop ro.build.fingerprint; getprop ro.build.date.utc; getprop ro.boot.shopdemo; getprop ro.sys.shopdemo; getprop ro.demo_mode",
     )?;
     let (current, props) = raw_props.split_once('\n').unwrap_or((&raw_props, ""));
@@ -433,7 +510,7 @@ pub fn submit_install(
     let actual = adb.run_timeout(
         &[
             "-s",
-            &device.transport,
+            &transport,
             "shell",
             &format!("sha256sum {}", crate::adb::shell_quote(&staged.remote_path)),
         ],
@@ -445,8 +522,9 @@ pub fn submit_install(
     );
     // Signature-protected official components are not bypassed with root or raw update_engine calls.
     let permission = crate::ota::install_status(adb, device)?;
+    transport = device.resolve_active_transport(adb)?;
     if permission.internal_permission != Some(true) {
-        open_official(adb, device)?;
+        open_official(adb, &transport)?;
         return Ok(InstallSubmission{message:"固件已传到手机并校验完成；系统未授权桌面后台安装，已打开手机官方更新页面，请由官方更新器确认安装".into(),accepted:false});
     }
     ensure!(
@@ -458,7 +536,7 @@ pub fn submit_install(
         .strip_prefix("/sdcard/")
         .context("固件路径无效")?;
     let output = adb.shell(
-        &device.transport,
+        &transport,
         &[
             "am",
             "broadcast",
@@ -481,12 +559,12 @@ pub fn submit_install(
         !output.contains("Permission Denial") && !output.contains("SecurityException"),
         "手机拒绝后台安装权限，请使用官方系统更新页面"
     );
-    open_official(adb, device)?;
+    open_official(adb, &transport)?;
     Ok(InstallSubmission{message:"已向官方更新器提交校验请求；尚未确认安装受理，请在手机官方更新页面查看结果。不会自动重启".into(),accepted:false})
 }
-fn open_official(adb: &Adb, device: &Device) -> Result<()> {
+fn open_official(adb: &Adb, transport: &str) -> Result<()> {
     adb.shell(
-        &device.transport,
+        transport,
         &[
             "am",
             "start",
@@ -647,10 +725,10 @@ pub struct StagingUsage {
     pub bytes: u64,
 }
 fn staged_directories(adb: &Adb, device: &Device) -> Result<Vec<(String, u64)>> {
-    device.verify(adb)?;
+    let transport = device.resolve_active_transport(adb)?;
     let root = "/sdcard/Download/StepX-OTA";
     let output = adb.script(
-        &device.transport,
+        &transport,
         "if [ -d /sdcard/Download/StepX-OTA ] && [ ! -L /sdcard/Download/StepX-OTA ]; then \
            for d in /sdcard/Download/StepX-OTA/*; do \
              if [ -d \"$d\" ] && [ ! -L \"$d\" ]; then \
@@ -711,7 +789,7 @@ pub fn cleanup_staged(adb: &Adb, device: &Device) -> Result<StagingUsage> {
     if dirs.is_empty() {
         return Ok(StagingUsage::default());
     }
-    device.verify(adb)?;
+    let transport = device.resolve_active_transport(adb)?;
     let mut script = String::new();
     let mut removed = StagingUsage::default();
     for (dir, bytes) in dirs {
@@ -725,6 +803,6 @@ pub fn cleanup_staged(adb: &Adb, device: &Device) -> Result<StagingUsage> {
         removed.count += 1;
         removed.bytes += bytes;
     }
-    adb.script(&device.transport, &script)?;
+    adb.script(&transport, &script)?;
     Ok(removed)
 }

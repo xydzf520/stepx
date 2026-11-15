@@ -41,9 +41,9 @@ def provider(adb, operation):
 
 
 def load_record(path):
-    value = json.loads(Path(path).read_text())
+    value = json.loads(Path(path).read_text(encoding='utf-8'))
     recovery.require(value.get('ability_package') == recovery.PACKAGE
-                     and value.get('ability_sha256') == recovery.APK_SHA256
+                     and value.get('ability_sha256') in recovery.ALLOWED_APK_SHA256S
                      and value.get('socket') == patcher.SOCKET
                      and value.get('scope') == 'current_ability_process',
                      'Installation record does not identify the pinned adapter')
@@ -68,11 +68,13 @@ def socket_present(adb):
 
 
 def verify_probe_identity(answer, record):
+    expected_hashes = {record['ability_sha256']} if 'ability_sha256' in record else set(recovery.ALLOWED_APK_SHA256S)
     recovery.require(answer.get('pid') == record['pid']
                      and answer.get('uid') == record['companion_uid']
                      and answer.get('target') == recovery.PACKAGE
                      and answer.get('socket') == patcher.SOCKET
-                     and answer.get('apk_sha256') == recovery.APK_SHA256,
+                     and answer.get('apk_sha256') in recovery.ALLOWED_APK_SHA256S
+                     and answer.get('apk_sha256') in expected_hashes,
                      'Endpoint is not the recorded native GUI adapter')
     recovery.require(answer.get('mode') == 'inspect_only'
                      and answer.get('execution_enabled') is False,

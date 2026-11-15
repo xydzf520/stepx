@@ -166,6 +166,104 @@ fn verify_bundle(root: &Path, bundle: &OutcomeBundle) -> Result<()> {
     }
     Ok(())
 }
+
+/// Returns true if the latest saved `OutcomeBundle` for `(scope_id, target)` has
+/// any `OutcomeFile` on disk whose current SHA-256 differs from `file.sha256`
+/// (indicating the user manually edited the generated Markdown).
+fn has_user_edited_outcome_for_target(
+    root: &Path,
+    scope_id: &str,
+    target: &Target,
+) -> Result<bool> {
+    let scope_dir = root.join(scope_id);
+    if !scope_dir.exists() {
+        return Ok(false);
+    }
+    let mut retired_manifests = std::collections::BTreeSet::new();
+    let mut seen_manifests = std::collections::BTreeSet::new();
+    let mut bundles = Vec::new();
+    let pipeline_dir = scope_dir.join("pipeline");
+    if pipeline_dir.is_dir() {
+        if let Ok(paths) = crate::data_store::snapshot_paths_page(&pipeline_dir, 0, 128) {
+            for path in paths {
+                let Ok(bytes) = state_bytes(&path) else {
+                    continue;
+                };
+                if bytes.len() > 2 * 1024 * 1024 {
+                    continue;
+                }
+                let Ok(job) = serde_json::from_slice::<Job>(&bytes) else {
+                    continue;
+                };
+                if job.schema != 1 || job.scope_id != scope_id || &job.target != target {
+                    continue;
+                }
+                for retired in &job.retired_outcomes {
+                    retired_manifests.insert(retired.bundle.manifest_path.clone());
+                }
+                if let Some(bundle) = job.bundle {
+                    if bundle.scope_id == scope_id && &bundle.target == target {
+                        seen_manifests.insert(bundle.manifest_path.clone());
+                        bundles.push(bundle);
+                    }
+                }
+            }
+        }
+    }
+    let outcomes_dir = scope_dir.join("outcomes");
+    if outcomes_dir.is_dir() {
+        if let Ok(entries) = fs::read_dir(&outcomes_dir) {
+            for entry in entries.flatten().take(512) {
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if !name.starts_with("bundle-") || !name.ends_with(".json") {
+                    continue;
+                }
+                let Ok(meta) = fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if meta.file_type().is_symlink() || !meta.is_file() || meta.len() > 2 * 1024 * 1024
+                {
+                    continue;
+                }
+                let Ok(bytes) = fs::read(&path) else {
+                    continue;
+                };
+                let Ok(bundle) = serde_json::from_slice::<OutcomeBundle>(&bytes) else {
+                    continue;
+                };
+                if bundle.scope_id == scope_id
+                    && &bundle.target == target
+                    && !retired_manifests.contains(&bundle.manifest_path)
+                    && seen_manifests.insert(bundle.manifest_path.clone())
+                {
+                    bundles.push(bundle);
+                }
+            }
+        }
+    }
+    let Some(latest) = bundles.into_iter().max_by(|a, b| {
+        a.created_ms
+            .cmp(&b.created_ms)
+            .then_with(|| a.manifest_path.cmp(&b.manifest_path))
+    }) else {
+        return Ok(false);
+    };
+    for file in &latest.files {
+        let Ok(meta) = fs::symlink_metadata(&file.path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            return Ok(true);
+        }
+        if meta.is_file() && crate::device::sha256_file(&file.path)? != file.sha256 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
 fn check_account(adb: &Adb, device: &Device, account: Option<&str>) -> Result<()> {
     let transport = device.resolve_active_transport(adb)?;
     ensure!(adb.shell(&transport, &["getprop", "ro.serialno"])?.trim() == device.serial, "手机传输连接已变化，停止自动回传");
@@ -370,6 +468,9 @@ fn run_inner(root: &Path, adb: &Adb, device: &Device, account: Option<&str>, tar
     ensure!(!lock_path.is_symlink(), "生成记录不能是链接");
     let lock = fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&lock_path)?;
     lock.try_lock().context("同一份成果正在生成，请稍后查看")?;
+    if automatic && has_user_edited_outcome_for_target(root, &request.scope_id, target)? {
+        bail!("检测到已有成果文件包含手动编辑，已跳过后台自动重新生成以保留你的修改");
+    }
     let state_path = dir.join(format!("{key}.json"));
     let mut job = if crate::data_store::exists(&state_path)? {
         ensure!(!state_path.is_symlink() && state_valid(&state_path), "生成记录无效");
@@ -1084,4 +1185,70 @@ mod tests {
         assert!(prompt.is_char_boundary(prompt.len()));
     }
 
+    #[test]
+    fn automatic_run_skips_target_when_latest_outcome_markdown_was_edited_by_user() {
+        let f = accepted_legacy_fixture();
+        let job: Job = serde_json::from_slice(&state_bytes(&f.state_path).unwrap()).unwrap();
+        let bundle = job.bundle.unwrap();
+        assert!(
+            !has_user_edited_outcome_for_target(
+                f.root.path(),
+                &f.request.scope_id,
+                &f.request.target
+            )
+            .unwrap()
+        );
+        // Simulate user editing the generated Markdown file on disk, then new phone discussions arriving.
+        let md_path = bundle.files[0].path.clone();
+        fs::write(&md_path, "# 用户手写批注\n\n保留我的修改，不要在后台自动覆盖。\n").unwrap();
+        assert!(
+            has_user_edited_outcome_for_target(
+                f.root.path(),
+                &f.request.scope_id,
+                &f.request.target
+            )
+            .unwrap()
+        );
+        let capture = context_ledger::Capture {
+            device: "layout-phone".into(),
+            account: Some("account".into()),
+            now_ms: 1_793_318_500_000,
+            utc_offset_seconds: 8 * 3600,
+            phone_discussions: vec![crate::phone_context::PhoneMessage {
+                device: "layout-phone".into(),
+                account: "account".into(),
+                session_key: "session".into(),
+                message_id: "message-2".into(),
+                role: "user".into(),
+                title: "会议资料".into(),
+                text: "请整理会议资料并补充周五议程安排。".into(),
+                timestamp_ms: Some(1_793_318_499_000),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        context_ledger::process(f.root.path(), &capture).unwrap();
+        let adb = Adb {
+            path: std::path::PathBuf::from("/bin/false"),
+        };
+        let device = Device {
+            serial: "layout-phone".into(),
+            ..Default::default()
+        };
+        let err = run_automatic(
+            f.root.path(),
+            &adb,
+            &device,
+            Some("account"),
+            &f.request.target,
+            &AtomicBool::new(false),
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("手动编辑"));
+        assert_eq!(
+            fs::read_to_string(&md_path).unwrap(),
+            "# 用户手写批注\n\n保留我的修改，不要在后台自动覆盖。\n"
+        );
+    }
 }

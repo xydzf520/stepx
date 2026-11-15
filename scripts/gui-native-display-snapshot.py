@@ -13,8 +13,12 @@ import json
 import os
 from pathlib import Path
 import re
+import sys
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / 'scripts') not in sys.path:
+    sys.path.insert(0, str(ROOT / 'scripts'))
+from source_integrity import python_source_sha256, read_python_source
 spec = importlib.util.spec_from_file_location('display_snapshot_permissions', ROOT / 'scripts/companion-permissions.py')
 permissions = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(permissions)
@@ -61,7 +65,7 @@ def validate_snapshot(value, pid):
 def build_worker(dex, identity):
     require(dex.startswith(b'dex\n') and len(dex) <= 64 * 1024 and hashlib.sha256(dex).hexdigest() == DEX_SHA256,
             'Unreviewed display snapshot DEX')
-    source = (permissions.WORKFLOW / 'module/inject.py').read_text()
+    source = read_python_source(permissions.WORKFLOW / 'module/inject.py').decode('utf-8')
     require(hashlib.sha256(source.encode()).hexdigest() == permissions.LOADER_SHA256, 'Audited loader changed')
     source, count = re.subn(r'dex=base64\.b64decode\([^\n]+?\);dexp=', 'dex=base64.b64decode(SNAPSHOT_DEX);dexp=', source)
     require(count == 1 and source.count("cstr('stepx.GmsProbe')") == 1, 'Unsupported loader template')
@@ -99,7 +103,7 @@ def compare(previous, current):
 
 def capture():
     permissions.guard(native=True)
-    require(hashlib.sha256((permissions.WORKFLOW / 'tools/root_worker.py').read_bytes()).hexdigest() == permissions.WORKER_SHA256,
+    require(python_source_sha256(permissions.WORKFLOW / 'tools/root_worker.py') == permissions.WORKER_SHA256,
             'Audited bounded worker changed')
     for path, expected in IMAGE_HASHES.items():
         require(permissions.shell('sha256sum', path).split()[0] == expected, 'Original system service image changed')
@@ -127,18 +131,20 @@ def main():
     parser.add_argument('--output', required=True, type=Path, help='New private proof file; never overwritten')
     parser.add_argument('--compare', type=Path, help='Earlier proof from the same running system_server')
     args = parser.parse_args()
-    fd = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, 'w') as output:
+    open_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_BINARY', 0)
+    fd = os.open(args.output, open_flags, 0o600)
+    with os.fdopen(fd, 'wb') as output:
         try:
             proof = capture()
             if args.compare:
-                proof['matches_previous'] = compare(json.loads(args.compare.read_text()), proof)
-            json.dump(proof, output, ensure_ascii=False, indent=2)
-            output.write('\n'); output.flush(); os.fsync(output.fileno())
+                proof['matches_previous'] = compare(json.loads(args.compare.read_text(encoding='utf-8')), proof)
+            output.write((json.dumps(proof, ensure_ascii=False, indent=2) + '\n').encode('utf-8'))
+            output.flush(); os.fsync(output.fileno())
             print(json.dumps(proof, ensure_ascii=False))
         except BaseException as error:
-            json.dump({'ok': False, 'error_type': type(error).__name__, 'global_rollback_verified': False}, output)
-            output.write('\n'); output.flush(); os.fsync(output.fileno())
+            failure = {'ok': False, 'error_type': type(error).__name__, 'global_rollback_verified': False}
+            output.write((json.dumps(failure, ensure_ascii=False) + '\n').encode('utf-8'))
+            output.flush(); os.fsync(output.fileno())
             raise
 
 

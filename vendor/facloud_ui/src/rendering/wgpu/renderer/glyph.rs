@@ -130,8 +130,9 @@ impl Pipeline {
         }
     }
 
-    pub(super) fn update_config(&mut self, glyph_config: &GlyphConfig) {
+    pub(super) fn begin_frame(&mut self, glyph_config: &GlyphConfig) {
         self.glyph_cache.update_config(glyph_config);
+        self.glyph_cache.trim_if_over_high_water_mark();
     }
 
     pub(super) fn initialize_for_layer(

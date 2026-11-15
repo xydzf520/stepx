@@ -47,6 +47,7 @@ final class CompanionBridgeRuntime {
     private final java.util.concurrent.atomic.AtomicLong phoneEpoch = new java.util.concurrent.atomic.AtomicLong();
     private long epoch;
     private String configNote = "";
+    private boolean monitorScheduled;
     private CompanionBridgeRuntime(Context context) {
         this.context = context;
         try {
@@ -57,22 +58,33 @@ final class CompanionBridgeRuntime {
                 persist();
             }
         } catch (Exception ignored) { record = new JSONObject(); }
-        scheduleMonitor();
+        ensureMonitorScheduled();
     }
-    private void scheduleMonitor() {
-        long delayMs;
+    private void ensureMonitorScheduled() {
+        boolean scheduleNow = false;
         synchronized (this) {
-            String st = record.optString("state");
-            boolean activeTask = !st.isEmpty() && !BridgePolicy.terminal(st);
-            delayMs = activeTask ? 1000L : 10000L;
+            if (!monitorScheduled && BridgePolicy.activeMonitorState(record.optString("state"))) {
+                monitorScheduled = true;
+                scheduleNow = true;
+            }
         }
-        monitor.schedule(this::monitorTick, delayMs, TimeUnit.MILLISECONDS);
+        if (scheduleNow) {
+            monitor.schedule(this::monitorTick, 1000L, TimeUnit.MILLISECONDS);
+        }
     }
     private void monitorTick() {
+        boolean reschedule = false;
         synchronized (this) {
             try { refresh(); } catch (Exception ignored) {}
+            if (BridgePolicy.activeMonitorState(record.optString("state"))) {
+                reschedule = true;
+            } else {
+                monitorScheduled = false;
+            }
         }
-        scheduleMonitor();
+        if (reschedule) {
+            monitor.schedule(this::monitorTick, 1000L, TimeUnit.MILLISECONDS);
+        }
     }
     private interface MainCall<T> { T run() throws Exception; }
     private <T> T onMain(MainCall<T> action) throws Exception {
@@ -295,6 +307,7 @@ final class CompanionBridgeRuntime {
             boolean resumed = onMain(service::resumeFromUser);
             require(resumed, "resume_rejected", "原任务不能继续，请在手机核对接管、屏幕锁定或执行上限");
             refresh();
+            ensureMonitorScheduled();
         }
         return status();
     }
@@ -395,6 +408,7 @@ final class CompanionBridgeRuntime {
     private void persist() throws Exception {
         record.put("updatedAt", System.currentTimeMillis());
         new Vault(context).put("stepx-bridge-task-v1", record.toString());
+        ensureMonitorScheduled();
     }
     private static final class BridgeFailure extends Exception {
         final String code;

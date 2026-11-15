@@ -244,9 +244,16 @@ impl TextureInfo {
         sampler: &Sampler,
         ctx: &WGPUContext,
     ) -> Self {
+        let max_dim = ctx.resources.device.limits().max_texture_dimension_2d;
+        let (width, height, rgba_bytes) = crate::rendering::prepare_rgba_texture_data(
+            asset.rgba_bytes(),
+            asset.width(),
+            asset.height(),
+            max_dim,
+        );
         let texture_size = Extent3d {
-            width: asset.width(),
-            height: asset.height(),
+            width,
+            height,
             depth_or_array_layers: 1,
         };
         let desc = TextureDescriptor {
@@ -261,7 +268,7 @@ impl TextureInfo {
         };
 
         let texture = ctx.resources.device.create_texture(&desc);
-        let bytes_per_row: u32 = 4 * asset.width();
+        let bytes_per_row: u32 = 4 * width;
         ctx.resources.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &texture,
@@ -269,7 +276,7 @@ impl TextureInfo {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            asset.rgba_bytes(),
+            &rgba_bytes,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(bytes_per_row),

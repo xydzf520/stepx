@@ -4,8 +4,8 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
-pub const FALLBACK_INTERVAL: Duration = Duration::from_secs(180);
-pub const STALE_AFTER: Duration = Duration::from_secs(300);
+pub const FALLBACK_INTERVAL: Duration = Duration::from_secs(90);
+pub const STALE_AFTER: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -119,6 +119,12 @@ impl BatteryCache {
         self.observed_at
             .is_some_and(|at| now.saturating_duration_since(at) >= STALE_AFTER)
     }
+    pub fn last_known_stale(&self, now: Instant) -> Option<(&BatteryState, Duration)> {
+        let reading = self.reading.as_ref()?;
+        let observed_at = self.observed_at?;
+        let age = now.saturating_duration_since(observed_at);
+        (age >= STALE_AFTER).then_some((reading, age))
+    }
     pub fn fallback_result(
         &mut self,
         started: Instant,
@@ -133,7 +139,10 @@ impl BatteryCache {
             Ok(value) if value.valid() => self.observe(&value, now),
             _ => {
                 self.failures = (self.failures + 1).min(3);
-                self.due_at = now + Duration::from_secs((180 * (1u64 << self.failures)).min(600));
+                self.due_at = now
+                    + Duration::from_secs(
+                        (FALLBACK_INTERVAL.as_secs() * (1u64 << self.failures)).min(600),
+                    );
                 false
             }
         }
@@ -186,9 +195,9 @@ mod tests {
         for (secs, level) in [(0, 66), (30, 65), (60, 67)] {
             assert!(cache.observe(&state(level, 3, 0), start + Duration::from_secs(secs)));
         }
-        assert!(!cache.observe(&state(67, 3, 0), start + Duration::from_secs(220)));
-        assert!(!cache.due(start + Duration::from_secs(399)));
-        assert!(cache.due(start + Duration::from_secs(400)));
+        assert!(!cache.observe(&state(67, 3, 0), start + Duration::from_secs(140)));
+        assert!(!cache.due(start + Duration::from_secs(229)));
+        assert!(cache.due(start + Duration::from_secs(230)));
         assert_eq!(cache.reading.unwrap().level, Some(67));
     }
     #[test]
@@ -196,19 +205,26 @@ mod tests {
         let start = Instant::now();
         let mut cache = BatteryCache::new(start);
         cache.observe(&state(66, 3, 0), start);
+        assert!(!cache.stale(start + Duration::from_secs(119)));
+        assert!(cache.last_known_stale(start + Duration::from_secs(119)).is_none());
+        assert!(cache.stale(start + Duration::from_secs(120)));
+        assert_eq!(
+            cache.last_known_stale(start + Duration::from_secs(125)),
+            Some((&state(66, 3, 0), Duration::from_secs(125)))
+        );
         cache.fallback_result(
             start,
             start + FALLBACK_INTERVAL,
             Err(anyhow::anyhow!("offline")),
         );
         assert_eq!(cache.reading.as_ref().unwrap().level, Some(66));
-        assert!(!cache.due(start + Duration::from_secs(539)));
-        assert!(cache.due(start + Duration::from_secs(540)));
+        assert!(!cache.due(start + Duration::from_secs(269)));
+        assert!(cache.due(start + Duration::from_secs(270)));
         assert!(cache.stale(start + STALE_AFTER));
-        cache.observe(&state(67, 2, 1), start + Duration::from_secs(541));
+        cache.observe(&state(67, 2, 1), start + Duration::from_secs(271));
         assert!(!cache.fallback_result(
-            start + Duration::from_secs(540),
-            start + Duration::from_secs(542),
+            start + Duration::from_secs(270),
+            start + Duration::from_secs(272),
             Ok(state(65, 3, 0))
         ));
         assert_eq!(cache.reading.unwrap(), state(67, 2, 1));

@@ -2,7 +2,7 @@
 //! Persistent Manual-Expire ("手动过期 · 不再提醒" / "稍后提醒" / "屏蔽来源") Governance Store.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 #[cfg(not(test))]
 use std::sync::{OnceLock, RwLock};
@@ -38,7 +38,7 @@ pub enum ReminderCategory {
 }
 
 impl ReminderCategory {
-    pub const ALL: [ReminderCategory; 11] = [
+    pub const ALL: [ReminderCategory; 12] = [
         Self::OtpCode,
         Self::TakeoutAndMobility,
         Self::ExpressPickup,
@@ -50,6 +50,7 @@ impl ReminderCategory {
         Self::ScheduleConflict,
         Self::WeatherAndLife,
         Self::LedgerAndTaskIssue,
+        Self::LiveTimer,
     ];
 
     pub fn label(self) -> &'static str {
@@ -279,8 +280,9 @@ pub struct HomeReminderGovernance {
     pub revision: u64,
     /// Keyed by `spec.primary_key`.
     pub entries: BTreeMap<String, ReminderGovernanceEntry>,
-    /// Secondary index mapping `alias_key -> primary_key`.
-    pub alias_index: BTreeMap<String, String>,
+    /// Secondary index mapping `alias_key -> {primary_key...}` (rebuilt on load/mutation so legacy string-valued maps never fail deserialization).
+    #[serde(skip)]
+    pub alias_index: BTreeMap<String, BTreeSet<String>>,
     /// Muted sources (`pkg:...`, `im:...`, `sms:...`).
     pub muted_sources: BTreeMap<String, MutedReminderSource>,
     /// Per-category TTL overrides in minutes (`ReminderCategory -> mins`).
@@ -449,10 +451,17 @@ impl HomeReminderGovernance {
     pub fn rebuild_alias_index(&mut self) {
         self.alias_index.clear();
         for (pk, entry) in &self.entries {
-            self.alias_index.insert(pk.clone(), pk.clone());
+            self.alias_index
+                .entry(pk.clone())
+                .or_default()
+                .insert(pk.clone());
             for alias in &entry.spec.alias_keys {
-                if !alias.trim().is_empty() {
-                    self.alias_index.insert(alias.clone(), pk.clone());
+                let trimmed = alias.trim();
+                if !trimmed.is_empty() {
+                    self.alias_index
+                        .entry(trimmed.to_string())
+                        .or_default()
+                        .insert(pk.clone());
                 }
             }
         }
@@ -466,8 +475,10 @@ impl HomeReminderGovernance {
         if let Some(entry) = self.entries.get(trimmed) {
             return Some(entry);
         }
-        let pk = self.alias_index.get(trimmed)?;
-        self.entries.get(pk)
+        let pks = self.alias_index.get(trimmed)?;
+        pks.iter()
+            .filter_map(|pk| self.entries.get(pk))
+            .max_by_key(|entry| entry.created_at_ms)
     }
 
     /// Returns whether `key` is force-kept (restored from auto-expiration) at `now_ms`.
@@ -477,17 +488,13 @@ impl HomeReminderGovernance {
             .is_some_and(|until| *until > now_ms)
     }
 
-    /// Evaluates whether a single canonical key is currently suppressed at `now_ms`.
-    pub fn is_key_suppressed(
-        &self,
+    fn entry_suppresses_key(
+        entry: &ReminderGovernanceEntry,
         key: &str,
         event_ts_ms: Option<i64>,
         event_rev: Option<&str>,
         now_ms: i64,
     ) -> bool {
-        let Some(entry) = self.lookup_entry(key) else {
-            return false;
-        };
         let k = key.trim();
         let is_recurring_channel = k.starts_with("im:")
             || k.starts_with("sms:")
@@ -515,6 +522,35 @@ impl HomeReminderGovernance {
         }
     }
 
+    /// Evaluates whether a single canonical key is currently suppressed at `now_ms`.
+    pub fn is_key_suppressed(
+        &self,
+        key: &str,
+        event_ts_ms: Option<i64>,
+        event_rev: Option<&str>,
+        now_ms: i64,
+    ) -> bool {
+        let trimmed = key.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        if let Some(entry) = self.entries.get(trimmed) {
+            if Self::entry_suppresses_key(entry, trimmed, event_ts_ms, event_rev, now_ms) {
+                return true;
+            }
+        }
+        if let Some(pks) = self.alias_index.get(trimmed) {
+            for pk in pks {
+                if let Some(entry) = self.entries.get(pk) {
+                    if Self::entry_suppresses_key(entry, trimmed, event_ts_ms, event_rev, now_ms) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// Evaluates whether any of the provided canonical keys or `mute_source_key` is suppressed at `now_ms`.
     pub fn is_any_key_suppressed(
         &self,
@@ -535,14 +571,30 @@ impl HomeReminderGovernance {
 
     /// Custom expire timestamp (`expire_at_ms`) if set for any of `keys`.
     pub fn custom_expire_at_ms(&self, keys: &[String]) -> Option<i64> {
+        let mut best: Option<i64> = None;
         for k in keys {
-            if let Some(entry) = self.lookup_entry(k) {
+            let trimmed = k.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Some(entry) = self.entries.get(trimmed) {
                 if let ReminderDisposition::CustomExpireAt { expire_at_ms } = entry.disposition {
-                    return Some(expire_at_ms);
+                    best = Some(best.map_or(expire_at_ms, |prev| prev.min(expire_at_ms)));
+                }
+            }
+            if let Some(pks) = self.alias_index.get(trimmed) {
+                for pk in pks {
+                    if let Some(entry) = self.entries.get(pk) {
+                        if let ReminderDisposition::CustomExpireAt { expire_at_ms } =
+                            entry.disposition
+                        {
+                            best = Some(best.map_or(expire_at_ms, |prev| prev.min(expire_at_ms)));
+                        }
+                    }
                 }
             }
         }
-        None
+        best
     }
 
     /// Effective auto-expiration TTL in milliseconds for `category`.
@@ -621,24 +673,42 @@ impl HomeReminderGovernance {
     /// Restores a suppressed or auto-expired reminder by any of its keys (`primary_key` or `alias_key`).
     pub fn restore_reminder(&mut self, key: &str, now_ms: i64) -> Option<ReminderTargetSpec> {
         let trimmed = key.trim();
-        let pk = self
+        let mut target_pks: Vec<String> = self
             .alias_index
             .get(trimmed)
-            .cloned()
-            .unwrap_or_else(|| trimmed.to_string());
-        let removed = self.entries.remove(&pk).map(|e| e.spec);
-        // Also whitelist in `force_keep_keys` for 24h in case it was auto-expired
-        self.force_keep_keys
-            .insert(pk.clone(), now_ms.saturating_add(86_400_000));
-        self.force_keep_keys
-            .insert(trimmed.to_string(), now_ms.saturating_add(86_400_000));
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default();
+        if target_pks.is_empty() && !trimmed.is_empty() {
+            target_pks.push(trimmed.to_string());
+        }
+        let mut removed: Option<ReminderTargetSpec> = None;
+        for pk in &target_pks {
+            if let Some(entry) = self.entries.remove(pk) {
+                for a in &entry.spec.alias_keys {
+                    if !a.trim().is_empty() {
+                        self.force_keep_keys
+                            .insert(a.trim().to_string(), now_ms.saturating_add(86_400_000));
+                    }
+                }
+                if removed.is_none() {
+                    removed = Some(entry.spec);
+                }
+            }
+            // Also whitelist in `force_keep_keys` for 24h in case it was auto-expired
+            self.force_keep_keys
+                .insert(pk.clone(), now_ms.saturating_add(86_400_000));
+        }
+        if !trimmed.is_empty() {
+            self.force_keep_keys
+                .insert(trimmed.to_string(), now_ms.saturating_add(86_400_000));
+        }
         mutate_active_governance(|guard| {
             guard
                 .recent_auto_expired
-                .retain(|n| n.primary_key != pk && n.primary_key != trimmed);
+                .retain(|n| !target_pks.contains(&n.primary_key) && n.primary_key != trimmed);
         });
         self.recent_auto_expired
-            .retain(|n| n.primary_key != pk && n.primary_key != trimmed);
+            .retain(|n| !target_pks.contains(&n.primary_key) && n.primary_key != trimmed);
         self.rebuild_alias_index();
         self.bump_revision();
         self.save();
@@ -700,8 +770,16 @@ impl HomeReminderGovernance {
 
 pub fn normalize_phone_or_addr(raw: &str) -> String {
     let trimmed = raw.trim();
+    if let Some(rest) = trimmed.strip_prefix("+86") {
+        let digits: String = rest.chars().filter(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() {
+            return digits;
+        }
+    }
     let digits: String = trimmed.chars().filter(|c| c.is_ascii_digit()).collect();
-    if digits.len() >= 11 && digits.starts_with("86") {
+    if digits.len() > 4 && digits.starts_with("0086") {
+        digits[4..].to_string()
+    } else if digits.len() == 13 && digits.starts_with("861") {
         digits[2..].to_string()
     } else if !digits.is_empty() {
         digits
@@ -716,6 +794,7 @@ pub fn canonical_keys_for_code_or_parcel(
     notif_key: Option<&str>,
     sms_addr: Option<&str>,
 ) -> Vec<String> {
+    let _ = sms_addr;
     let mut keys = Vec::new();
     if let Some(c) = code.map(str::trim).filter(|s| !s.is_empty()) {
         keys.push(format!("code:{}", c.to_uppercase()));
@@ -729,9 +808,6 @@ pub fn canonical_keys_for_code_or_parcel(
     if let Some(nk) = notif_key.map(str::trim).filter(|s| !s.is_empty()) {
         keys.push(format!("notif:{nk}"));
     }
-    if let Some(addr) = sms_addr.map(str::trim).filter(|s| !s.is_empty()) {
-        keys.push(format!("sms:{}", normalize_phone_or_addr(addr)));
-    }
     keys
 }
 
@@ -741,19 +817,13 @@ pub fn canonical_keys_for_delivery(
     thread_id: Option<&str>,
     sms_addr: Option<&str>,
 ) -> Vec<String> {
+    // Channel-wide keys (`delivery:{badge}`, `im:{tid}`, `sms:{addr}`) belong strictly to
+    // `muted_sources`, never item-level aliases—otherwise expiring one Meituan order or one
+    // service-account notice collaterally suppresses all other active orders from that brand/thread.
+    let _ = (badge, thread_id, sms_addr);
     let mut keys = Vec::new();
-    let b = badge.trim();
-    if !b.is_empty() {
-        keys.push(format!("delivery:{b}"));
-    }
     if let Some(nk) = notif_key.map(str::trim).filter(|s| !s.is_empty()) {
         keys.push(format!("notif:{nk}"));
-    }
-    if let Some(tid) = thread_id.map(str::trim).filter(|s| !s.is_empty()) {
-        keys.push(format!("im:{tid}"));
-    }
-    if let Some(addr) = sms_addr.map(str::trim).filter(|s| !s.is_empty()) {
-        keys.push(format!("sms:{}", normalize_phone_or_addr(addr)));
     }
     keys
 }
@@ -865,6 +935,122 @@ mod tests {
             Some("pkg:com.sankuai.meituan"),
             now_ms,
         ));
+        let _ = std::fs::remove_file(HomeReminderGovernance::storage_path());
+        set_active_governance(&HomeReminderGovernance::default());
+    }
+
+    #[test]
+    fn two_parcels_from_same_gateway_expire_independently_and_aliases_never_clobber() {
+        let mut gov = HomeReminderGovernance::default();
+        let now_ms = 1_760_000_000_000i64;
+
+        // Parcel A and Parcel B both arrive from the same Cainiao SMS gateway `10698000`
+        let keys_a = canonical_keys_for_code_or_parcel(
+            Some("3-1-1001"),
+            Some("SF1001"),
+            None,
+            Some("10698000"),
+        );
+        let keys_b = canonical_keys_for_code_or_parcel(
+            Some("3-1-1002"),
+            Some("ZTO1002"),
+            None,
+            Some("10698000"),
+        );
+        assert!(!keys_a.iter().any(|k| k.starts_with("sms:")));
+        assert!(!keys_b.iter().any(|k| k.starts_with("sms:")));
+
+        let spec_a = ReminderTargetSpec::new(
+            "code:3-1-1001",
+            ReminderCategory::ExpressPickup,
+            "取件码 · 3-1-1001",
+        )
+        .with_aliases(keys_a.clone())
+        .with_source("短信 10698000", Some("sms:10698000".into()))
+        .with_source_ts(now_ms - 10_000);
+        gov.manual_expire(spec_a, now_ms);
+
+        assert!(gov.is_any_key_suppressed(
+            &keys_a,
+            Some(now_ms - 10_000),
+            None,
+            Some("sms:10698000"),
+            now_ms,
+        ));
+        assert!(
+            !gov.is_any_key_suppressed(
+                &keys_b,
+                Some(now_ms - 5_000),
+                None,
+                Some("sms:10698000"),
+                now_ms,
+            ),
+            "Expiring one parcel from 10698000 must never collaterally hide a sibling parcel"
+        );
+
+        // Two Meituan delivery cards also remain independent unless muted_sources is used
+        let deliv_a = canonical_keys_for_delivery(
+            "美团外卖",
+            Some("mt-notif-1"),
+            Some("wx::meituan"),
+            Some("10690001"),
+        );
+        let deliv_b = canonical_keys_for_delivery(
+            "美团外卖",
+            Some("mt-notif-2"),
+            Some("wx::meituan"),
+            Some("10690001"),
+        );
+        gov.manual_expire(
+            ReminderTargetSpec::new(
+                "card:takeout-notif-1",
+                ReminderCategory::TakeoutAndMobility,
+                "美团外卖 · 订单1",
+            )
+            .with_aliases(deliv_a.clone()),
+            now_ms,
+        );
+        assert!(gov.is_any_key_suppressed(&deliv_a, Some(now_ms), None, None, now_ms));
+        assert!(!gov.is_any_key_suppressed(&deliv_b, Some(now_ms), None, None, now_ms));
+
+        // Shared alias across two entries: later snoozed entry must NOT clobber earlier manual-expired entry
+        let shared_alias = "notif:shared-parcel".to_string();
+        gov.manual_expire(
+            ReminderTargetSpec::new(
+                "code:8-8-8881",
+                ReminderCategory::ExpressPickup,
+                "包裹1",
+            )
+            .with_aliases(vec![shared_alias.clone()]),
+            now_ms,
+        );
+        gov.snooze_until(
+            ReminderTargetSpec::new(
+                "code:8-8-8882",
+                ReminderCategory::ExpressPickup,
+                "包裹2",
+            )
+            .with_aliases(vec![shared_alias.clone()]),
+            now_ms - 1, // snooze already elapsed
+            now_ms + 1,
+        );
+        assert_eq!(gov.alias_index.get(&shared_alias).map(|s| s.len()), Some(2));
+        assert!(
+            gov.is_key_suppressed(&shared_alias, None, None, now_ms + 10_000),
+            "Earlier ManualExpired entry must still suppress shared alias after later entry is added"
+        );
+
+        // LiveTimer is included in ReminderCategory::ALL
+        assert!(ReminderCategory::ALL.contains(&ReminderCategory::LiveTimer));
+
+        // Phone/address normalization strips +86 / 0086 and 13-digit 861..., without corrupting 12-digit 86... service numbers
+        assert_eq!(normalize_phone_or_addr("+86 138-0000-9367"), "13800009367");
+        assert_eq!(normalize_phone_or_addr("008613800009367"), "13800009367");
+        assert_eq!(normalize_phone_or_addr("8613800009367"), "13800009367");
+        assert_eq!(normalize_phone_or_addr("860571888888"), "860571888888");
+        assert_eq!(normalize_phone_or_addr("106980001234"), "106980001234");
+        assert_eq!(normalize_phone_or_addr("+8610698000"), "10698000");
+
         let _ = std::fs::remove_file(HomeReminderGovernance::storage_path());
         set_active_governance(&HomeReminderGovernance::default());
     }

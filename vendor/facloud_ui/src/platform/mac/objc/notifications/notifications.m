@@ -5,6 +5,14 @@
 
 void requestNotificationPermissionsWithCompletionHandler(
     void (^completion_handler)(NSUInteger outcome_type, id outcome_msg)) {
+    NSString *bundleIdentifier = [[NSBundle mainBundle] bundleIdentifier];
+    if (bundleIdentifier == nil || [bundleIdentifier length] == 0) {
+        if (completion_handler) {
+            completion_handler(2, @"Notifications require an application bundle identifier.");
+        }
+        return;
+    }
+
     UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
 
     [center
@@ -46,6 +54,14 @@ void requestNotificationPermissions(void *on_completion_callback) {
 void sendNotificationWithErrorHandler(NSString *title, NSString *body, NSString *data,
                                       void (^error_handler)(NSUInteger error_type, id error_msg),
                                       BOOL playSound) {
+    NSString *bundleIdentifier = [[NSBundle mainBundle] bundleIdentifier];
+    if (bundleIdentifier == nil || [bundleIdentifier length] == 0) {
+        if (error_handler) {
+            error_handler(1, @"Notifications require an application bundle identifier.");
+        }
+        return;
+    }
+
     UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
     [center getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings *settings) {
       if (settings.authorizationStatus == UNAuthorizationStatusDenied) {
@@ -56,8 +72,10 @@ void sendNotificationWithErrorHandler(NSString *title, NSString *body, NSString 
           // completion block runs on a GCD-dispatched queue that drains an ambient pool.
           UNMutableNotificationContent *content =
               [[[UNMutableNotificationContent alloc] init] autorelease];
-          content.title = [NSString localizedUserNotificationStringForKey:title arguments:nil];
-          content.body = [NSString localizedUserNotificationStringForKey:body arguments:nil];
+          content.title =
+              [NSString localizedUserNotificationStringForKey:(title ?: @"") arguments:nil];
+          content.body =
+              [NSString localizedUserNotificationStringForKey:(body ?: @"") arguments:nil];
 
           // Only play sound if the user setting allows it
           if (playSound) {
@@ -65,7 +83,7 @@ void sendNotificationWithErrorHandler(NSString *title, NSString *body, NSString 
           }
 
           content.userInfo = @{
-              @"DATA" : data,
+              @"DATA" : (data ?: @""),
           };
 
           // Configure the trigger to send the notification after 1 second.

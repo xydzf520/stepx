@@ -36,6 +36,7 @@ const TAB_KEY: u16 = '\t' as u16;
 const SHIFTED_TAB_KEY: u16 = 0x19;
 extern "C" {
     fn CGColorGetComponents(color: CGColorRef) -> *const CGFloat;
+    fn CGColorGetNumberOfComponents(color: CGColorRef) -> usize;
 }
 
 pub fn unicode_char_to_key(char: u16) -> Option<&'static str> {
@@ -88,11 +89,17 @@ pub fn unicode_char_to_key(char: u16) -> Option<&'static str> {
 ///
 /// This code is only unsafe since it requires interfacing with platform code.
 pub unsafe fn nsstring_as_str<'a>(nsstring: *const Object) -> Result<&'a str, Utf8Error> {
+    if nsstring.is_null() {
+        return Ok("");
+    }
     const UTF8_ENCODING: usize = 4;
 
-    let cstr: *const c_char = msg_send![nsstring, UTF8String];
+    let ptr: *const c_char = msg_send![nsstring, UTF8String];
     let len: usize = msg_send![nsstring, lengthOfBytesUsingEncoding: UTF8_ENCODING];
-    std::str::from_utf8(slice::from_raw_parts(cstr as *const u8, len))
+    if ptr.is_null() || len == 0 {
+        return Ok("");
+    }
+    std::str::from_utf8(slice::from_raw_parts(ptr as *const u8, len))
 }
 
 pub fn color_u_to_cg_color(color: ColorU) -> CGColor {
@@ -106,13 +113,29 @@ pub fn color_u_to_cg_color(color: ColorU) -> CGColor {
 
 pub fn cg_color_to_color_u(color: CGColor) -> ColorU {
     unsafe {
-        let components = CGColorGetComponents(color.as_concrete_TypeRef());
+        let color_ref = color.as_concrete_TypeRef();
+        if color_ref.is_null() {
+            return ColorU::new(0, 0, 0, 255);
+        }
+        let components = CGColorGetComponents(color_ref);
+        if components.is_null() {
+            return ColorU::new(0, 0, 0, 255);
+        }
 
-        ColorU::new(
-            (*components.offset(0) * 255.) as u8,
-            (*components.offset(1) * 255.) as u8,
-            (*components.offset(2) * 255.) as u8,
-            (*components.offset(3) * 255.) as u8,
-        )
+        let to_byte = |v: CGFloat| -> u8 { (v.clamp(0.0, 1.0) * 255.) as u8 };
+        match CGColorGetNumberOfComponents(color_ref) {
+            4 => ColorU::new(
+                to_byte(*components.add(0)),
+                to_byte(*components.add(1)),
+                to_byte(*components.add(2)),
+                to_byte(*components.add(3)),
+            ),
+            2 => {
+                let gray = to_byte(*components.add(0));
+                let alpha = to_byte(*components.add(1));
+                ColorU::new(gray, gray, gray, alpha)
+            }
+            _ => ColorU::new(0, 0, 0, 255),
+        }
     }
 }

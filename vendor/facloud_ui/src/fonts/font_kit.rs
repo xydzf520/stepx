@@ -14,7 +14,7 @@ use font_kit::font::Font;
 use font_kit::hinting::HintingOptions;
 use pathfinder_geometry::rect::RectI;
 use pathfinder_geometry::transform2d::Transform2F;
-use pathfinder_geometry::vector::{vec2i, Vector2F, Vector2I};
+use pathfinder_geometry::vector::{vec2i, Vector2F};
 
 #[cfg(target_os = "macos")]
 use crate::platform::mac::AutoreleasePoolGuard;
@@ -33,6 +33,10 @@ impl Rasterizer {
 
     pub fn insert(&self, font_id: FontId, font: Arc<Font>) {
         self.fonts.insert(font_id, font);
+    }
+
+    pub fn has_font(&self, font_id: FontId) -> bool {
+        self.fonts.contains_key(&font_id)
     }
 
     pub fn font_for_id(&self, font_id: FontId) -> Arc<Font> {
@@ -59,9 +63,13 @@ impl Rasterizer {
                     .enabled_for_scale_factor(scale.x()),
             },
         )?;
-        if raw_raster_bounds.size() == Vector2I::zero() {
-            // Don't adjust the size of a glyph with a default size of zero.
-            return Ok(raw_raster_bounds);
+        if raw_raster_bounds.size().x() <= 0 || raw_raster_bounds.size().y() <= 0 {
+            // Clamp negative raster bounds sizes to zero and don't expand zero/negative glyphs.
+            let clamped_size = vec2i(
+                raw_raster_bounds.size().x().max(0),
+                raw_raster_bounds.size().y().max(0),
+            );
+            return Ok(RectI::new(raw_raster_bounds.origin(), clamped_size));
         }
         // The default raster bounds provided by font-kit sometimes clip pixels
         // off of anti-aliased glyphs; add one pixel to the glyph bounds to
@@ -102,6 +110,17 @@ impl Rasterizer {
 
         let bounds =
             self.glyph_raster_bounds(font_id, point_size, glyph_id, scale, glyph_config)?;
+        if bounds.size().x() <= 0 || bounds.size().y() <= 0 {
+            return Ok(RasterizedGlyph {
+                canvas: facloud_ui_core::fonts::canvas::Canvas {
+                    pixels: Vec::new(),
+                    size: vec2i(0, 0),
+                    row_stride: 0,
+                    format,
+                },
+                is_emoji: self.font_for_id(font_id).is_colored() && !cfg!(windows),
+            });
+        }
         let mut canvas = Canvas::new(bounds.size(), raster_format_to_font_kit(format));
 
         let base_transform = Transform2F::from_scale(scale).translate(-bounds.origin().to_f32());

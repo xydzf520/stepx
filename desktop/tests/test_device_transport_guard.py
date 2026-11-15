@@ -46,10 +46,13 @@ class TransportGuardTests(unittest.TestCase):
         for transport in ['', '-d', 'phone other']:
             with self.subTest(transport=transport), self.assertRaisesRegex(RuntimeError, '先选择'): self.check(transport)
     def test_wireless_retains_firmware_guard(self):
-        with self.assertRaisesRegex(AssertionError, 'Unsupported firmware'): self.check('192.0.2.10:42123', 'PHONE123', firmware='other-build')
+        with self.assertRaises(common.WorkflowError) as ctx:
+            self.check('192.0.2.10:42123', 'PHONE123', firmware='other-build')
+        self.assertEqual(ctx.exception.code, 'unsupported_firmware')
     def test_unsupported_firmware_includes_actual_fingerprint(self):
-        with self.assertRaisesRegex(AssertionError, r'Unsupported firmware:.*other-build'):
+        with self.assertRaises(common.WorkflowError) as ctx:
             self.check('PHONE123', firmware='other-build')
+        self.assertEqual(ctx.exception.code, 'unsupported_firmware')
     def test_wireless_retains_native_hash_guard(self): self.check('192.0.2.10:42123', 'PHONE123', native=True)
 
 

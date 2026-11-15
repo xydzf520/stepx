@@ -53,7 +53,8 @@ class StructureTests(unittest.TestCase):
     def test_raw_html_and_metadata_blocks_do_not_need_html_json_escaping(self):
         text='```html\n'+HTML+'\n```\n```json\n'+json.dumps(dict(name='轻记',checks=CHECKS))+'\n```'
         program=lab.parse_program(text)
-        self.assertEqual(program['html'],HTML)
+        self.assertEqual(program['html'],lab.ensure_csp_meta(HTML))
+        self.assertIn('Content-Security-Policy',program['html'])
         self.assertEqual(program['name'],'轻记')
         with self.assertRaises(lab.Failure): lab.parse_program(text+'\nunexpected prose')
     def test_missing_or_invalid_function_checks_require_repair(self):
@@ -189,7 +190,7 @@ class BrowserTests(unittest.TestCase):
         events=[json.loads(line) for line in output.getvalue().splitlines()]
         self.assertEqual(events[-1]['event'],'complete')
         self.assertFalse((self.root/'round-2').exists())
-        self.assertEqual((self.root/'round-1/index.html').read_text(),HTML)
+        self.assertEqual((self.root/'round-1/index.html').read_text(),lab.ensure_csp_meta(HTML))
         report=json.loads((self.root/'round-1/report.json').read_text())
         self.assertTrue(report['passed'])
         self.assertTrue(report['acceptance_review']['notes'])

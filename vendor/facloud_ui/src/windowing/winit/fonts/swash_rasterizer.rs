@@ -35,7 +35,7 @@ impl FontDB {
             .font_id_map
             .read()
             .get_by_left(&font_id)
-            .unwrap();
+            .ok_or_else(|| anyhow!("No internal font ID found for {font_id:?}"))?;
         let image = self
             .swash_cache
             .write()
@@ -77,7 +77,7 @@ impl FontDB {
             .font_id_map
             .read()
             .get_by_left(&font_id)
-            .unwrap();
+            .ok_or_else(|| anyhow!("No internal font ID found for {font_id:?}"))?;
         // Get the raster image without caching--the parent FontDB handles all caching for us.
         let image = self
             .swash_cache
@@ -94,7 +94,7 @@ impl FontDB {
                 .0,
             )
             .clone()
-            .unwrap();
+            .ok_or_else(|| anyhow!("Failed to get raster image"))?;
 
         let (original_format, is_color) = match image.content {
             cosmic_text::SwashContent::Mask => (RasterFormat::A8, false),

@@ -13,26 +13,50 @@ fn test_extend_and_push_tree() {
     assert_eq!(tree1.items(), (0..20).chain(50..100).collect::<Vec<u8>>());
 }
 
+struct TestRng(u64);
+
+impl TestRng {
+    fn seed_from_u64(seed: u64) -> Self {
+        Self(seed.wrapping_add(0x9E3779B97F4A7C15))
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut z = self.0;
+        self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^ (z >> 31)
+    }
+
+    fn gen_range(&mut self, range: std::ops::Range<usize>) -> usize {
+        let len = range.end - range.start;
+        range.start + (self.next_u64() as usize % len)
+    }
+
+    fn gen_bool(&mut self) -> bool {
+        (self.next_u64() & 1) == 1
+    }
+
+    fn take_u8s(&mut self, count: usize) -> Vec<u8> {
+        (0..count).map(|_| self.next_u64() as u8).collect()
+    }
+}
+
 #[test]
 fn test_random() {
     for seed in 0..100 {
-        use rand::{distributions, prelude::*};
-
-        let rng = &mut StdRng::seed_from_u64(seed);
+        let rng = &mut TestRng::seed_from_u64(seed);
 
         let mut tree = SumTree::<u8>::new();
         let count = rng.gen_range(0..10);
-        tree.extend(rng.sample_iter(distributions::Standard).take(count));
+        tree.extend(rng.take_u8s(count));
 
         for _ in 0..5 {
             let splice_end = rng.gen_range(0..tree.extent::<Count>().0 + 1);
             let splice_start = rng.gen_range(0..splice_end + 1);
             let count = rng.gen_range(0..3);
             let tree_end = tree.extent::<Count>();
-            let new_items = rng
-                .sample_iter(distributions::Standard)
-                .take(count)
-                .collect::<Vec<u8>>();
+            let new_items = rng.take_u8s(count);
 
             let mut reference_items = tree.items();
             reference_items.splice(splice_start..splice_end, new_items.clone());
@@ -101,12 +125,12 @@ fn test_random() {
         for _ in 0..10 {
             let end = rng.gen_range(0..tree.extent::<Count>().0 + 1);
             let start = rng.gen_range(0..end + 1);
-            let start_bias = if rng.gen() {
+            let start_bias = if rng.gen_bool() {
                 SeekBias::Left
             } else {
                 SeekBias::Right
             };
-            let end_bias = if rng.gen() {
+            let end_bias = if rng.gen_bool() {
                 SeekBias::Left
             } else {
                 SeekBias::Right
@@ -450,4 +474,21 @@ impl Add<&Self> for Sum {
         self.0 += other.0;
         self
     }
+}
+
+#[test]
+fn test_empty_tree_seek_prev_next() {
+    let tree = SumTree::<u8>::new();
+    let mut cursor = tree.cursor::<Count, Count>();
+    cursor.seek(&Count(0), SeekBias::Right);
+    assert_eq!(cursor.item(), None);
+    assert_eq!(cursor.prev_item(), None);
+
+    cursor.prev();
+    assert_eq!(cursor.item(), None);
+    assert_eq!(cursor.prev_item(), None);
+
+    cursor.next();
+    assert_eq!(cursor.item(), None);
+    assert_eq!(cursor.prev_item(), None);
 }

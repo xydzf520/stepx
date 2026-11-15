@@ -945,6 +945,46 @@ pub fn any_synthetic_e2e_probe(parts: &[&str]) -> bool {
     parts.iter().any(|s| is_synthetic_e2e_probe_text(s))
 }
 
+fn resolve_parcel_or_code_event_ts_ms(
+    input: &HomeHubInput<'_>,
+    code: Option<&str>,
+    tracking: Option<&str>,
+) -> Option<i64> {
+    let code_trim = code.map(str::trim).filter(|s| !s.is_empty());
+    let track_trim = tracking
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.starts_with("取件码 ") && !s.starts_with("WX-"));
+    if code_trim.is_none() && track_trim.is_none() {
+        return None;
+    }
+    let matches_text = |text: &str| -> bool {
+        code_trim.is_some_and(|c| text.contains(c))
+            || track_trim.is_some_and(|t| text.contains(t))
+    };
+    let sms_ts = input
+        .sms
+        .iter()
+        .filter(|m| !m.outgoing && m.date_ms > 0 && matches_text(&m.body))
+        .map(|m| m.date_ms)
+        .max();
+    let notif_ts = input
+        .notifications
+        .iter()
+        .filter(|n| n.post_time_ms > 0 && (matches_text(&n.title) || matches_text(&n.text)))
+        .map(|n| n.post_time_ms)
+        .max();
+    let thread_ts = input
+        .threads
+        .iter()
+        .filter(|t| {
+            t.last_timestamp_ms > 0
+                && (matches_text(&t.title) || matches_text(&t.last_message))
+        })
+        .map(|t| t.last_timestamp_ms)
+        .max();
+    [sms_ts, notif_ts, thread_ts].into_iter().flatten().max()
+}
+
 /// Collects the Life-domain priority cards (`OtpAndPickup`, `TakeoutAndDelivery`, `ExpressParcel`)
 /// shared between `build_home_hub_report` and `build_life_context_cards_with_desktop`.
 fn collect_life_priority_cards(
@@ -993,6 +1033,12 @@ fn collect_life_priority_cards(
             continue;
         };
         if !verified_code.eq_ignore_ascii_case(code) {
+            continue;
+        }
+        if is_pickup
+            && crate::capsule_fulfillment::parcel_direction(&banner.raw_text)
+                == crate::capsule_fulfillment::Direction::Send
+        {
             continue;
         }
         let category = if is_pickup {
@@ -1077,32 +1123,39 @@ fn collect_life_priority_cards(
     // Check phone clipboard for OTP or pickup code
     if !is_completed_express_text(input.phone_clipboard) {
         if let Some((code, is_pickup)) = extract_otp_or_pickup_from_text(input.phone_clipboard) {
-            let mut keys = crate::home_reminder_governance::canonical_keys_for_code_or_parcel(
-                Some(&code),
-                None,
-                None,
-                None,
-            );
-            keys.push(format!("card:otp-clipboard-{code}"));
-            if !gov.is_any_key_suppressed(&keys, None, None, None, now_ms)
-                && seen_codes.insert(code.to_uppercase())
+            if !(is_pickup
+                && crate::capsule_fulfillment::parcel_direction(input.phone_clipboard)
+                    == crate::capsule_fulfillment::Direction::Send)
             {
-                let label = if is_pickup { "取件码" } else { "验证码" };
-                priority_cards.push(HomePriorityCard {
-                    id: format!("otp-clipboard-{code}"),
-                    kind: HomeCardKind::OtpAndPickup,
-                    urgency: 98,
-                    badge: format!("剪贴板{label}"),
-                    title: format!("{label} {code}"),
-                    subtitle: "来自手机剪贴板实时感知".to_string(),
-                    detail: input.phone_clipboard.trim().to_string(),
-                    timestamp_label: "刚刚".to_string(),
-                    code_or_number: Some(code),
-                    thread_id: None,
-                    notification_key: None,
-                    package_name: None,
-                    quick_replies: Vec::new(),
-                });
+                let mut keys = crate::home_reminder_governance::canonical_keys_for_code_or_parcel(
+                    Some(&code),
+                    None,
+                    None,
+                    None,
+                );
+                keys.push(format!("card:otp-clipboard-{code}"));
+                let clip_ts = resolve_parcel_or_code_event_ts_ms(input, Some(&code), None)
+                    .or_else(|| (now_ms > 0).then_some(now_ms));
+                if !gov.is_any_key_suppressed(&keys, clip_ts, None, None, now_ms)
+                    && seen_codes.insert(code.to_uppercase())
+                {
+                    let label = if is_pickup { "取件码" } else { "验证码" };
+                    priority_cards.push(HomePriorityCard {
+                        id: format!("otp-clipboard-{code}"),
+                        kind: HomeCardKind::OtpAndPickup,
+                        urgency: 98,
+                        badge: format!("剪贴板{label}"),
+                        title: format!("{label} {code}"),
+                        subtitle: "来自手机剪贴板实时感知".to_string(),
+                        detail: input.phone_clipboard.trim().to_string(),
+                        timestamp_label: "刚刚".to_string(),
+                        code_or_number: Some(code),
+                        thread_id: None,
+                        notification_key: None,
+                        package_name: None,
+                        quick_replies: Vec::new(),
+                    });
+                }
             }
         }
     }
@@ -1137,6 +1190,14 @@ fn collect_life_priority_cards(
             });
 
         if let Some((code, is_pickup)) = extracted {
+            if is_pickup
+                && crate::capsule_fulfillment::parcel_direction(&format!(
+                    "{} {}",
+                    notif.title, notif.text
+                )) == crate::capsule_fulfillment::Direction::Send
+            {
+                continue;
+            }
             let category = if is_pickup {
                 crate::home_reminder_governance::ReminderCategory::ExpressPickup
             } else {
@@ -1222,6 +1283,12 @@ fn collect_life_priority_cards(
             continue;
         }
         if let Some((code, is_pickup)) = extract_otp_or_pickup_from_text(&msg.body) {
+            if is_pickup
+                && crate::capsule_fulfillment::parcel_direction(&msg.body)
+                    == crate::capsule_fulfillment::Direction::Send
+            {
+                continue;
+            }
             let category = if is_pickup {
                 crate::home_reminder_governance::ReminderCategory::ExpressPickup
             } else {
@@ -1655,7 +1722,13 @@ fn collect_life_priority_cards(
     // 3. Express Parcels (HomeCardKind::ExpressParcel, urgency ~90..=92)
     // -------------------------------------------------------------------------
     for (idx, parcel) in input.express_parcels.iter().enumerate() {
-        if is_completed_express_text(&parcel.status) || is_completed_express_text(&parcel.station) {
+        if is_completed_express_text(&parcel.status)
+            || is_completed_express_text(&parcel.station)
+            || crate::capsule_fulfillment::parcel_direction(&format!(
+                "{} {}",
+                parcel.status, parcel.station
+            )) == crate::capsule_fulfillment::Direction::Send
+        {
             continue;
         }
         let pickup = parcel.pickup_code.trim();
@@ -1667,7 +1740,12 @@ fn collect_life_priority_cards(
             None,
         );
         keys.push(format!("card:express-parcel-{idx}-{tracking}"));
-        if gov.is_any_key_suppressed(&keys, None, None, None, now_ms) {
+        let parcel_ts = resolve_parcel_or_code_event_ts_ms(
+            input,
+            (!pickup.is_empty()).then_some(pickup),
+            (!tracking.is_empty()).then_some(tracking),
+        );
+        if gov.is_any_key_suppressed(&keys, parcel_ts, None, None, now_ms) {
             continue;
         }
         if !pickup.is_empty() && !seen_codes.insert(pickup.to_uppercase()) {
@@ -1751,7 +1829,10 @@ fn collect_life_priority_cards(
     }
 
     // Check clipboard for express tracking number not already in `express_parcels`
-    if !is_completed_express_text(input.phone_clipboard) {
+    if !is_completed_express_text(input.phone_clipboard)
+        && crate::capsule_fulfillment::parcel_direction(input.phone_clipboard)
+            != crate::capsule_fulfillment::Direction::Send
+    {
         if let Some((carrier, tracking_no)) =
             extract_express_from_text_flexible(input.phone_clipboard, false)
         {
@@ -1762,7 +1843,9 @@ fn collect_life_priority_cards(
                 None,
             );
             keys.push(format!("card:express-clipboard-{tracking_no}"));
-            if !gov.is_any_key_suppressed(&keys, None, None, None, now_ms)
+            let clip_ts = resolve_parcel_or_code_event_ts_ms(input, None, Some(&tracking_no))
+                .or_else(|| (now_ms > 0).then_some(now_ms));
+            if !gov.is_any_key_suppressed(&keys, clip_ts, None, None, now_ms)
                 && seen_tracking_nos.insert(tracking_no.to_ascii_uppercase())
             {
                 priority_cards.push(HomePriorityCard {
@@ -1796,6 +1879,10 @@ fn collect_life_priority_cards(
             || notif.text.trim_start().starts_with('{')
             || any_synthetic_e2e_probe(&[&notif.app_name, &notif.title, &notif.text])
             || is_completed_express_text(&notif.text)
+            || crate::capsule_fulfillment::parcel_direction(&format!(
+                "{} {}",
+                notif.title, notif.text
+            )) == crate::capsule_fulfillment::Direction::Send
             || receipts.text_is_completed(
                 &format!("{} {}", notif.title, notif.text),
                 notif.post_time_ms,
@@ -1897,6 +1984,8 @@ fn collect_life_priority_cards(
             || msg.read
             || any_synthetic_e2e_probe(&[&msg.address, &msg.body])
             || is_completed_express_text(&msg.body)
+            || crate::capsule_fulfillment::parcel_direction(&msg.body)
+                == crate::capsule_fulfillment::Direction::Send
             || receipts.text_is_completed(&msg.body, msg.date_ms)
         {
             continue;
@@ -2043,8 +2132,9 @@ pub fn build_home_hub_report(input: &HomeHubInput<'_>) -> HomeHubReport {
         if is_calendar_event_auto_expired_on_today(ev, input.hour, input.minute, now_ms, &gov) {
             continue;
         }
-        let is_ongoing = event_is_ongoing(ev, input.hour, input.minute);
-        let within_45m = is_ongoing || event_is_within_45_minutes(ev, input.hour, input.minute);
+        let eval_now_ms = resolve_clock_epoch_ms_at_hm(now_ms, input.hour, input.minute);
+        let is_ongoing = event_is_ongoing_at_ms(ev, eval_now_ms);
+        let within_45m = is_ongoing || event_is_within_45_minutes_at_ms(ev, eval_now_ms);
         if within_45m {
             upcoming_meeting_within_45m = true;
             if is_ongoing || active_meeting_context.is_none() {
@@ -3056,8 +3146,17 @@ pub(crate) fn build_life_context_cards_from_weather(
     let active_parcel = input.express_parcels.iter().find(|parcel| {
         let pickup = parcel.pickup_code.trim();
         let tracking = parcel.tracking_no.trim();
+        let parcel_ts = resolve_parcel_or_code_event_ts_ms(
+            input,
+            (!pickup.is_empty()).then_some(pickup),
+            (!tracking.is_empty()).then_some(tracking),
+        );
         !is_completed_express_text(&parcel.status)
             && !is_completed_express_text(&parcel.station)
+            && crate::capsule_fulfillment::parcel_direction(&format!(
+                "{} {}",
+                parcel.status, parcel.station
+            )) != crate::capsule_fulfillment::Direction::Send
             && !gov.is_any_key_suppressed(
                 &crate::home_reminder_governance::canonical_keys_for_code_or_parcel(
                     (!pickup.is_empty()).then_some(pickup),
@@ -3065,7 +3164,7 @@ pub(crate) fn build_life_context_cards_from_weather(
                     None,
                     None,
                 ),
-                None,
+                parcel_ts,
                 None,
                 None,
                 now_ms,
@@ -3946,6 +4045,32 @@ pub fn extract_schedule_checklist(description: &str) -> Vec<String> {
     Vec::new()
 }
 
+fn resolve_clock_epoch_ms_at_hm(now_ms: i64, hour: u32, minute: u32) -> i64 {
+    let base_dt = if now_ms > 0 {
+        Local
+            .timestamp_millis_opt(now_ms)
+            .single()
+            .unwrap_or_else(Local::now)
+    } else {
+        Local::now()
+    };
+    let h = hour % 24;
+    let m = minute % 60;
+    if chrono::Timelike::hour(&base_dt) == h && chrono::Timelike::minute(&base_dt) == m {
+        return base_dt.timestamp_millis();
+    }
+    if let Some(ndt) = base_dt.date_naive().and_hms_opt(h, m, 0) {
+        if let Some(dt) = Local
+            .from_local_datetime(&ndt)
+            .single()
+            .or_else(|| Local.from_local_datetime(&ndt).earliest())
+        {
+            return dt.timestamp_millis();
+        }
+    }
+    base_dt.timestamp_millis()
+}
+
 fn is_calendar_event_auto_expired_on_today(
     ev: &crate::toolbox::PhoneCalendarEvent,
     hour: u32,
@@ -3956,34 +4081,22 @@ fn is_calendar_event_auto_expired_on_today(
     if ev.all_day || ev.dtstart <= 0 {
         return false;
     }
+    let eval_now_ms = resolve_clock_epoch_ms_at_hm(now_ms, hour, minute);
     let cal_key = format!("cal:{}", ev.id);
-    if gov.is_force_kept(&cal_key, now_ms) {
+    if gov.is_force_kept(&cal_key, eval_now_ms) || gov.is_force_kept(&cal_key, now_ms) {
         return false;
     }
     let cal_keys = crate::home_reminder_governance::canonical_keys_for_calendar_event(ev.id);
     if let Some(custom_exp) = gov.custom_expire_at_ms(&cal_keys) {
-        return now_ms >= custom_exp;
+        return eval_now_ms >= custom_exp;
     }
-    let ttl_mins = gov
-        .effective_ttl_mins(crate::home_reminder_governance::ReminderCategory::ScheduleAndMeeting);
-    let end_ms = if ev.dtend > ev.dtstart {
-        ev.dtend
-    } else {
-        ev.dtstart + 1_800_000
-    };
-    let Some((start_ymd, start_h, start_m)) = timestamp_to_local_ymd_parts(ev.dtstart) else {
-        return false;
-    };
-    let Some((end_ymd, end_h, end_m)) = timestamp_to_local_ymd_parts(end_ms) else {
-        return false;
-    };
-    if end_ymd > start_ymd {
+    let ttl_ms = gov
+        .effective_ttl_ms(crate::home_reminder_governance::ReminderCategory::ScheduleAndMeeting);
+    let end_ms = ev.effective_end_ms();
+    if end_ms <= 0 {
         return false;
     }
-    let start_mins = start_h * 60 + start_m;
-    let end_mins = (end_h * 60 + end_m).max(start_mins);
-    let now_mins = (hour % 24) * 60 + (minute % 60);
-    let expired = now_mins >= end_mins.saturating_add(ttl_mins);
+    let expired = eval_now_ms >= end_ms.saturating_add(ttl_ms);
     if expired {
         crate::home_reminder_governance::record_auto_expired_notice(
             cal_key,
@@ -3994,7 +4107,7 @@ fn is_calendar_event_auto_expired_on_today(
                 ev.title.trim()
             },
             "会议/日程已结束自动过期",
-            now_ms,
+            eval_now_ms,
         );
     }
     expired
@@ -4124,12 +4237,31 @@ pub fn detect_schedule_alarm_conflicts(
         .and_then(|d| d.succ_opt())
         .map(|d| d.format("%Y-%m-%d").to_string());
 
+    let now_min = ((hour % 24) * 60 + (minute % 60)) as i32;
     let real_enabled_alarms: Vec<&crate::toolbox::PhoneAlarmItem> = alarms
         .iter()
-        .filter(|a| a.enabled && !is_synthetic_e2e_probe_text(&a.message))
+        .filter(|a| {
+            a.enabled
+                && !a.is_e2e_probe()
+                && !is_synthetic_e2e_probe_text(&a.message)
+                && !a.is_suppressed_at(now_ms, &gov)
+        })
         .collect();
+    let alarm_rings_on_event_date =
+        |a: &crate::toolbox::PhoneAlarmItem, ev_date_ymd: &str| -> bool {
+            if a.days_of_week != 0 {
+                let Ok(ev_date) = chrono::NaiveDate::parse_from_str(ev_date_ymd, "%Y-%m-%d") else {
+                    return true;
+                };
+                let ev_wd = chrono::Datelike::weekday(&ev_date).num_days_from_monday();
+                a.matches_weekday(ev_wd)
+            } else if (a.total_minutes() as i32) >= now_min {
+                ev_date_ymd == clean_today
+            } else {
+                tomorrow_ymd.as_deref() == Some(ev_date_ymd)
+            }
+        };
 
-    let now_min = ((hour % 24) * 60 + (minute % 60)) as i32;
     let early_keywords = [
         "出发", "自驾", "航班", "飞机", "高铁", "动车", "火车", "赶车", "早班", "晨会",
     ];
@@ -4194,7 +4326,13 @@ pub fn detect_schedule_alarm_conflicts(
             continue;
         }
 
-        let has_valid_wake_alarm = real_enabled_alarms.iter().any(|a| {
+        let alarms_for_day: Vec<&crate::toolbox::PhoneAlarmItem> = real_enabled_alarms
+            .iter()
+            .copied()
+            .filter(|a| alarm_rings_on_event_date(a, &ev_date_ymd))
+            .collect();
+
+        let has_valid_wake_alarm = alarms_for_day.iter().any(|a| {
             let alarm_min = a.hour as i32 * 60 + a.minutes as i32;
             (ev_total_min - 180..=ev_total_min - 15).contains(&alarm_min)
         });
@@ -4218,12 +4356,12 @@ pub fn detect_schedule_alarm_conflicts(
             || ev_title.contains("航班")
             || ev_title.contains("高铁");
 
-        let later_alarm = real_enabled_alarms
+        let later_alarm = alarms_for_day
             .iter()
             .filter(|a| (a.hour as i32 * 60 + a.minutes as i32) > ev_total_min - 15)
             .min_by_key(|a| a.hour as i32 * 60 + a.minutes as i32)
             .or_else(|| {
-                real_enabled_alarms
+                alarms_for_day
                     .iter()
                     .min_by_key(|a| a.hour as i32 * 60 + a.minutes as i32)
             });
@@ -4835,38 +4973,44 @@ pub fn build_selected_date_panorama(
         if any_synthetic_e2e_probe(&[&ev.title, &ev.location, &ev.description]) {
             continue;
         }
-        if is_today && !ev.all_day {
-            let ev_end_ms = if ev.dtend > ev.dtstart {
-                ev.dtend
-            } else if ev.dtstart > 0 {
-                ev.dtstart + 3_600_000
-            } else {
-                0
-            };
-            if ev_end_ms > 0 && now_ms.saturating_sub(ev_end_ms) > schedule_ttl_ms {
-                crate::home_reminder_governance::record_auto_expired_notice(
-                    format!("cal:{}", ev.id),
-                    crate::home_reminder_governance::ReminderCategory::ScheduleAndMeeting,
-                    ev.title.trim().to_string(),
-                    "会议/日程已结束自动过期",
-                    now_ms,
-                );
-                continue;
-            }
-        }
-        if gov_active {
-            let mut cal_keys =
-                crate::home_reminder_governance::canonical_keys_for_calendar_event(ev.id);
-            cal_keys.push(format!("schedule:{}", ev.id));
-            cal_keys.push(format!("card:pan-cal-{}-{idx}", ev.id));
-            if gov.is_any_key_suppressed(
+        let cal_key = format!("cal:{}", ev.id);
+        let mut cal_keys =
+            crate::home_reminder_governance::canonical_keys_for_calendar_event(ev.id);
+        cal_keys.push(format!("schedule:{}", ev.id));
+        cal_keys.push(format!("card:pan-cal-{}-{idx}", ev.id));
+        if gov_active
+            && gov.is_any_key_suppressed(
                 &cal_keys,
                 (ev.dtstart > 0).then_some(ev.dtstart),
                 None,
                 None,
                 now_ms,
-            ) {
-                continue;
+            )
+        {
+            continue;
+        }
+        if is_today && !ev.all_day {
+            let eval_now_ms = resolve_clock_epoch_ms_at_hm(now_ms, input.hour, input.minute);
+            let force_kept =
+                gov.is_force_kept(&cal_key, eval_now_ms) || gov.is_force_kept(&cal_key, now_ms);
+            if !force_kept {
+                if let Some(custom_exp) = gov.custom_expire_at_ms(&cal_keys) {
+                    if eval_now_ms >= custom_exp {
+                        continue;
+                    }
+                } else {
+                    let ev_end_ms = ev.effective_end_ms();
+                    if ev_end_ms > 0 && eval_now_ms.saturating_sub(ev_end_ms) > schedule_ttl_ms {
+                        crate::home_reminder_governance::record_auto_expired_notice(
+                            cal_key,
+                            crate::home_reminder_governance::ReminderCategory::ScheduleAndMeeting,
+                            ev.title.trim().to_string(),
+                            "会议/日程已结束自动过期",
+                            eval_now_ms,
+                        );
+                        continue;
+                    }
+                }
             }
         }
         schedule_count += 1;
@@ -5252,7 +5396,12 @@ pub fn build_selected_date_panorama(
                     "{}|{}|{}",
                     parcel.tracking_no, parcel.pickup_code, parcel.status
                 );
-                if gov.is_any_key_suppressed(&keys, None, Some(rev.as_str()), None, now_ms) {
+                let parcel_ts = resolve_parcel_or_code_event_ts_ms(
+                    input,
+                    non_empty_opt(&parcel.pickup_code).as_deref(),
+                    non_empty_opt(&parcel.tracking_no).as_deref(),
+                );
+                if gov.is_any_key_suppressed(&keys, parcel_ts, Some(rev.as_str()), None, now_ms) {
                     continue;
                 }
             }
@@ -5528,8 +5677,12 @@ pub fn build_weekly_overview_report(
     let now_ms = reference_now_ms_for_input(input, max_ts);
     let schedule_ttl_ms =
         gov.effective_ttl_ms(crate::home_reminder_governance::ReminderCategory::ScheduleAndMeeting);
+    let missed_call_ttl_ms =
+        gov.effective_ttl_ms(crate::home_reminder_governance::ReminderCategory::MissedCall);
+    let eval_today_now_ms = resolve_clock_epoch_ms_at_hm(now_ms, input.hour, input.minute);
 
     // 0. Schedule × Alarm cross-signal conflicts
+    let mut cross_day_conflict_dups = 0usize;
     for conflict in &schedule_conflicts {
         if gov_active {
             let mut keys = crate::home_reminder_governance::canonical_keys_for_calendar_event(
@@ -5541,10 +5694,15 @@ pub fn build_weekly_overview_report(
                 continue;
             }
         }
+        let mut matched_in_week = 0usize;
         for idx in 0..7usize {
             if day_ymds[idx] == conflict.event_date_ymd || day_is_today[idx] {
                 issue_counts[idx] += 1;
+                matched_in_week += 1;
             }
+        }
+        if matched_in_week > 1 {
+            cross_day_conflict_dups += matched_in_week - 1;
         }
     }
 
@@ -5560,20 +5718,21 @@ pub fn build_weekly_overview_report(
         {
             continue;
         }
-        if gov_active {
-            let mut cal_keys =
-                crate::home_reminder_governance::canonical_keys_for_calendar_event(ev.id);
-            cal_keys.push(format!("schedule:{}", ev.id));
-            cal_keys.push(format!("card:pan-cal-{}-{ev_idx}", ev.id));
-            if gov.is_any_key_suppressed(
+        let cal_key = format!("cal:{}", ev.id);
+        let mut cal_keys =
+            crate::home_reminder_governance::canonical_keys_for_calendar_event(ev.id);
+        cal_keys.push(format!("schedule:{}", ev.id));
+        cal_keys.push(format!("card:pan-cal-{}-{ev_idx}", ev.id));
+        if gov_active
+            && gov.is_any_key_suppressed(
                 &cal_keys,
                 (ev.dtstart > 0).then_some(ev.dtstart),
                 None,
                 None,
                 now_ms,
-            ) {
-                continue;
-            }
+            )
+        {
+            continue;
         }
         let title_trim = ev.title.trim();
         let canonical_title = if title_trim.is_empty() {
@@ -5584,15 +5743,21 @@ pub fn build_weekly_overview_report(
         for idx in 0..7usize {
             if (matched_mask & (1 << idx)) != 0 {
                 if day_is_today[idx] && !ev.all_day {
-                    let ev_end_ms = if ev.dtend > ev.dtstart {
-                        ev.dtend
-                    } else if ev.dtstart > 0 {
-                        ev.dtstart + 3_600_000
-                    } else {
-                        0
-                    };
-                    if ev_end_ms > 0 && now_ms.saturating_sub(ev_end_ms) > schedule_ttl_ms {
-                        continue;
+                    let force_kept = gov.is_force_kept(&cal_key, eval_today_now_ms)
+                        || gov.is_force_kept(&cal_key, now_ms);
+                    if !force_kept {
+                        if let Some(custom_exp) = gov.custom_expire_at_ms(&cal_keys) {
+                            if eval_today_now_ms >= custom_exp {
+                                continue;
+                            }
+                        } else {
+                            let ev_end_ms = ev.effective_end_ms();
+                            if ev_end_ms > 0
+                                && eval_today_now_ms.saturating_sub(ev_end_ms) > schedule_ttl_ms
+                            {
+                                continue;
+                            }
+                        }
                     }
                 }
                 schedule_counts[idx] += 1;
@@ -5615,6 +5780,31 @@ pub fn build_weekly_overview_report(
         if any_synthetic_e2e_probe(&[&item.badge, &item.title, &item.detail]) {
             continue;
         }
+        if gov_active {
+            let item_id = item.id.trim();
+            let item_ts_ms = if item.timestamp > 1_000_000_000_000 {
+                item.timestamp
+            } else if item.timestamp > 0 {
+                item.timestamp * 1000
+            } else {
+                0
+            };
+            let keys = [
+                format!("ledger:{item_id}"),
+                format!("task:{item_id}"),
+                format!("card:{item_id}"),
+                item_id.to_string(),
+            ];
+            if gov.is_any_key_suppressed(
+                &keys,
+                (item_ts_ms > 0).then_some(item_ts_ms),
+                None,
+                None,
+                now_ms,
+            ) {
+                continue;
+            }
+        }
         let item_title_trim = item.title.trim();
         let dup_schedule = !item_title_trim.is_empty()
             && schedule_titles[idx]
@@ -5636,7 +5826,7 @@ pub fn build_weekly_overview_report(
     }
 
     // 3. Missed Calls & Call Logs
-    for call in input.call_logs {
+    for (call_idx, call) in input.call_logs.iter().enumerate() {
         let target_idx = if let Some((ymd_tuple, _, _)) = timestamp_to_local_ymd_parts(call.date_ms)
         {
             find_day_idx(ymd_tuple)
@@ -5648,7 +5838,55 @@ pub fn build_weekly_overview_report(
         let Some(idx) = target_idx else {
             continue;
         };
+        if gov_active {
+            let norm_num = crate::home_reminder_governance::normalize_phone_or_addr(&call.number);
+            let call_key = format!("call:{norm_num}");
+            let keys = [
+                call_key.clone(),
+                format!("missed-call:{}:{}", call.number.trim(), call.date_ms),
+                format!("card:pan-call-missed-{call_idx}"),
+                format!("card:pan-call-{call_idx}"),
+            ];
+            if gov.is_any_key_suppressed(
+                &keys,
+                (call.date_ms > 0).then_some(call.date_ms),
+                None,
+                (!norm_num.is_empty()).then_some(call_key.as_str()),
+                now_ms,
+            ) {
+                continue;
+            }
+        }
         if call.call_type == 3 {
+            let norm_num = crate::home_reminder_governance::normalize_phone_or_addr(&call.number);
+            let has_newer_call = !norm_num.is_empty()
+                && input.call_logs.iter().any(|c2| {
+                    c2.call_type != 3
+                        && c2.date_ms > call.date_ms
+                        && crate::home_reminder_governance::normalize_phone_or_addr(&c2.number)
+                            == norm_num
+                });
+            let has_newer_outgoing_sms = !norm_num.is_empty()
+                && input.sms.iter().any(|m| {
+                    m.outgoing
+                        && m.date_ms > call.date_ms
+                        && crate::home_reminder_governance::normalize_phone_or_addr(&m.address)
+                            == norm_num
+                });
+            if day_is_today[idx] {
+                let call_key = format!("call:{norm_num}");
+                if !gov.is_force_kept(&call_key, now_ms) {
+                    if has_newer_call || has_newer_outgoing_sms {
+                        continue;
+                    }
+                    if call.date_ms > 0 && now_ms.saturating_sub(call.date_ms) > missed_call_ttl_ms
+                    {
+                        continue;
+                    }
+                }
+            } else if has_newer_call || has_newer_outgoing_sms {
+                continue;
+            }
             issue_counts[idx] += 1;
         } else {
             communication_counts[idx] += 1;
@@ -5656,7 +5894,12 @@ pub fn build_weekly_overview_report(
     }
 
     // 4. IM Threads
-    for thread in input.threads {
+    for (thread_idx, thread) in input
+        .threads
+        .iter()
+        .filter(|t| is_panorama_thread_eligible(t))
+        .enumerate()
+    {
         let target_idx = if let Some((ymd_tuple, _, _)) =
             timestamp_to_local_ymd_parts(thread.last_timestamp_ms)
         {
@@ -5669,8 +5912,22 @@ pub fn build_weekly_overview_report(
         let Some(idx) = target_idx else {
             continue;
         };
-        if !is_panorama_thread_eligible(thread) {
-            continue;
+        if gov_active {
+            let im_key = format!("im:{}", thread.thread_id.trim());
+            let mut keys = crate::home_reminder_governance::canonical_keys_for_im_thread(
+                &thread.thread_id,
+                non_empty_opt(&thread.notification_key).as_deref(),
+            );
+            keys.push(format!("card:pan-im-{thread_idx}-{}", thread.thread_id));
+            if gov.is_any_key_suppressed(
+                &keys,
+                (thread.last_timestamp_ms > 0).then_some(thread.last_timestamp_ms),
+                None,
+                Some(im_key.as_str()),
+                now_ms,
+            ) {
+                continue;
+            }
         }
         if thread.unread_count > 0 {
             issue_counts[idx] += 1;
@@ -5679,7 +5936,7 @@ pub fn build_weekly_overview_report(
     }
 
     // 5. SMS messages
-    for msg in input.sms {
+    for (sms_idx, msg) in input.sms.iter().enumerate() {
         let Some((ymd_tuple, _, _)) = timestamp_to_local_ymd_parts(msg.date_ms) else {
             continue;
         };
@@ -5688,6 +5945,26 @@ pub fn build_weekly_overview_report(
         };
         if any_synthetic_e2e_probe(&[&msg.address, &msg.body]) {
             continue;
+        }
+        if gov_active {
+            let norm_addr = crate::home_reminder_governance::normalize_phone_or_addr(&msg.address);
+            let sms_key = format!("sms:{norm_addr}");
+            let mut keys = vec![sms_key.clone(), format!("card:pan-sms-{sms_idx}")];
+            if let Some((code, _)) = extract_otp_or_pickup_from_text(&msg.body) {
+                keys.push(format!("code:{}", code.trim().to_ascii_uppercase()));
+            }
+            if let Some((_, no)) = extract_express_from_text_flexible(&msg.body, true) {
+                keys.push(format!("parcel:{}", no.trim().to_ascii_uppercase()));
+            }
+            if gov.is_any_key_suppressed(
+                &keys,
+                (msg.date_ms > 0).then_some(msg.date_ms),
+                None,
+                (!norm_addr.is_empty()).then_some(sms_key.as_str()),
+                now_ms,
+            ) {
+                continue;
+            }
         }
         if is_life_sms_message(msg) {
             life_counts[idx] += 1;
@@ -5700,21 +5977,70 @@ pub fn build_weekly_overview_report(
     }
 
     // 6 & 7. Active Express Parcels & Phone Remote Agent Files on today
-    let genuine_remote_count = input
-        .remote_agent_files
-        .iter()
-        .filter(|p| {
-            let trimmed = p.trim();
-            !trimmed.is_empty() && !is_synthetic_e2e_probe_text(trimmed)
-        })
-        .count();
+    let mut active_parcel_count = 0usize;
+    let mut genuine_remote_count = 0usize;
+    for (parcel_idx, parcel) in input.express_parcels.iter().enumerate() {
+        if is_completed_express_text(&parcel.status)
+            || is_completed_express_text(&parcel.station)
+            || crate::capsule_fulfillment::parcel_direction(&format!(
+                "{} {}",
+                parcel.status, parcel.station
+            )) == crate::capsule_fulfillment::Direction::Send
+        {
+            continue;
+        }
+        if gov_active {
+            let mut keys = crate::home_reminder_governance::canonical_keys_for_code_or_parcel(
+                non_empty_opt(&parcel.pickup_code).as_deref(),
+                non_empty_opt(&parcel.tracking_no).as_deref(),
+                None,
+                None,
+            );
+            if !parcel.tracking_no.trim().is_empty() {
+                keys.push(format!(
+                    "parcel:{}",
+                    parcel.tracking_no.trim().to_ascii_uppercase()
+                ));
+            }
+            keys.push(format!("card:pan-parcel-{parcel_idx}"));
+            let rev = format!(
+                "{}|{}|{}",
+                parcel.tracking_no, parcel.pickup_code, parcel.status
+            );
+            let parcel_ts = resolve_parcel_or_code_event_ts_ms(
+                input,
+                non_empty_opt(&parcel.pickup_code).as_deref(),
+                non_empty_opt(&parcel.tracking_no).as_deref(),
+            );
+            if gov.is_any_key_suppressed(&keys, parcel_ts, Some(rev.as_str()), None, now_ms) {
+                continue;
+            }
+        }
+        active_parcel_count += 1;
+    }
+    for (file_idx, path) in input.remote_agent_files.iter().enumerate() {
+        let trimmed = path.trim();
+        if trimmed.is_empty() || is_synthetic_e2e_probe_text(trimmed) {
+            continue;
+        }
+        if gov_active {
+            let keys = [
+                format!("card:pan-remote-file-{file_idx}"),
+                format!("file:{trimmed}"),
+            ];
+            if gov.is_any_key_suppressed(&keys, None, None, None, now_ms) {
+                continue;
+            }
+        }
+        genuine_remote_count += 1;
+    }
     if let Some(ti) = today_idx {
-        life_counts[ti] += input.express_parcels.len();
+        life_counts[ti] += active_parcel_count;
         work_counts[ti] += genuine_remote_count;
     }
 
     // 8. Phone Push Notifications (deduplicated against IM threads)
-    for notif in input.notifications {
+    for (notif_idx, notif) in input.notifications.iter().enumerate() {
         let title_trim = notif.title.trim();
         let text_trim = notif.text.trim();
         if notif.dismissed
@@ -5739,6 +6065,26 @@ pub fn build_weekly_overview_report(
             || is_notification_duplicated_by_thread(notif, title_trim, text_trim, input.threads)
         {
             continue;
+        }
+        if gov_active {
+            let mut keys = vec![
+                format!("notif:{}", notif.key.trim()),
+                format!("card:pan-notif-{notif_idx}"),
+            ];
+            if let Some((code, _)) = extract_otp_or_pickup_from_parts(&[title_trim, text_trim]) {
+                keys.push(format!("code:{}", code.trim().to_ascii_uppercase()));
+            }
+            let pkg_src = (!notif.package_name.trim().is_empty())
+                .then(|| format!("pkg:{}", notif.package_name.trim().to_ascii_lowercase()));
+            if gov.is_any_key_suppressed(
+                &keys,
+                (notif.post_time_ms > 0).then_some(notif.post_time_ms),
+                None,
+                pkg_src.as_deref(),
+                now_ms,
+            ) {
+                continue;
+            }
         }
         match classify_panorama_notification_kind(notif, title_trim, text_trim) {
             SelectedDateEntryKind::Life => life_counts[idx] += 1,
@@ -5785,8 +6131,9 @@ pub fn build_weekly_overview_report(
         });
     }
 
+    total_issues = total_issues.saturating_sub(cross_day_conflict_dups);
     total_work_items = total_work_items.max(input.work_deliverables_count);
-    total_life_items = total_life_items.max(input.express_parcels.len());
+    total_life_items = total_life_items.max(active_parcel_count);
 
     let busiest = days
         .iter()
@@ -7107,7 +7454,12 @@ pub fn extract_live_express_parcels_with_receipts(
     }
 
     let clip = phone_clipboard.trim();
-    if !clip.is_empty() && !is_synthetic_e2e_probe_text(clip) && !is_completed_express_text(clip) {
+    if !clip.is_empty()
+        && !is_synthetic_e2e_probe_text(clip)
+        && !is_completed_express_text(clip)
+        && crate::capsule_fulfillment::parcel_direction(clip)
+            != crate::capsule_fulfillment::Direction::Send
+    {
         let allow_kw = is_express_notification("剪贴板", "", clip);
         let extracted = extract_express_from_text_flexible(clip, allow_kw);
         let pickup = extract_otp_or_pickup_from_text(clip)
@@ -7192,7 +7544,7 @@ pub fn extract_eta_window_from_text(
         Some((h, m, pos))
     };
 
-    let mut matched: Option<(u32, u32, String)> = None;
+    let mut matched: Option<(Option<(u32, u32)>, u32, u32, String)> = None;
     for i in 0..chars.len() {
         let Some((h1, m1, after_first)) = parse_hh_mm(i) else {
             continue;
@@ -7208,7 +7560,12 @@ pub fn extract_eta_window_from_text(
                 pos += 1;
             }
             if let Some((h2, m2, _)) = parse_hh_mm(pos) {
-                matched = Some((h2, m2, format!("{h1:02}:{m1:02}~{h2:02}:{m2:02}")));
+                matched = Some((
+                    Some((h1, m1)),
+                    h2,
+                    m2,
+                    format!("{h1:02}:{m1:02}~{h2:02}:{m2:02}"),
+                ));
                 break;
             }
         }
@@ -7228,13 +7585,13 @@ pub fn extract_eta_window_from_text(
                 || suffix.contains("送达")
                 || suffix.contains("到达")
             {
-                matched = Some((h, m, format!("{h:02}:{m:02}")));
+                matched = Some((None, h, m, format!("{h:02}:{m:02}")));
                 break;
             }
         }
     }
 
-    let (target_h, target_m, range_display) = matched?;
+    let (start_hm, target_h, target_m, range_display) = matched?;
     let base_ms = if ref_post_ms > 1_700_000_000_000 {
         ref_post_ms
     } else if now_ms > 1_700_000_000_000 {
@@ -7249,23 +7606,59 @@ pub fn extract_eta_window_from_text(
     let base_dt = Local
         .timestamp_millis_opt(base_ms)
         .single()
+        .or_else(|| Local.timestamp_millis_opt(base_ms).earliest())
         .unwrap_or_else(Local::now);
-    let ndt = base_dt.date_naive().and_hms_opt(target_h, target_m, 0)?;
-    let dt = Local
-        .from_local_datetime(&ndt)
-        .single()
-        .or_else(|| Local.from_local_datetime(&ndt).earliest())?;
-    let mut eta_end_ms = dt.timestamp_millis();
+    let resolve_local_ms = |ndt: chrono::NaiveDateTime| -> i64 {
+        match Local.from_local_datetime(&ndt) {
+            chrono::LocalResult::Single(dt) => dt.timestamp_millis(),
+            chrono::LocalResult::Ambiguous(earliest, _) => earliest.timestamp_millis(),
+            chrono::LocalResult::None => {
+                let shifted = ndt + chrono::Duration::hours(1);
+                Local
+                    .from_local_datetime(&shifted)
+                    .earliest()
+                    .map(|dt| dt.timestamp_millis())
+                    .unwrap_or_else(|| {
+                        ndt.and_utc().timestamp_millis()
+                            - (base_dt.offset().local_minus_utc() as i64 * 1000)
+                    })
+            }
+        }
+    };
+
+    let mut target_date = base_dt.date_naive();
+    let explicit_tomorrow = trimmed.contains("明天") || trimmed.contains("明日");
+    if explicit_tomorrow {
+        target_date = target_date.succ_opt().unwrap_or(target_date);
+    }
+    if let Some((h1, m1)) = start_hm {
+        // If evaluated right after midnight (e.g. 00:05) for a cross-midnight window starting at 23:30,
+        // anchor `start_date` to the preceding evening before applying `end <= start -> +1 day`.
+        let mut start_date = target_date;
+        if !explicit_tomorrow && chrono::Timelike::hour(&base_dt) < 6 && h1 >= 18 {
+            start_date = start_date.pred_opt().unwrap_or(start_date);
+        }
+        target_date = if (target_h, target_m) <= (h1, m1) {
+            start_date.succ_opt().unwrap_or(start_date)
+        } else {
+            start_date
+        };
+    }
+
+    let ndt = target_date.and_hms_opt(target_h, target_m, 0)?;
+    let mut eta_end_ms = resolve_local_ms(ndt);
     let ref_check_ms = if ref_post_ms > 1_700_000_000_000 {
         ref_post_ms
     } else {
         base_ms
     };
-    if trimmed.contains("明天")
-        || trimmed.contains("明日")
-        || (ref_check_ms > 0 && eta_end_ms + 6 * 3_600_000 < ref_check_ms)
-    {
-        eta_end_ms += 86_400_000;
+    if !explicit_tomorrow && ref_check_ms > 0 && eta_end_ms + 6 * 3_600_000 < ref_check_ms {
+        let next_date = target_date.succ_opt().unwrap_or(target_date);
+        if let Some(next_ndt) = next_date.and_hms_opt(target_h, target_m, 0) {
+            eta_end_ms = resolve_local_ms(next_ndt);
+        } else {
+            eta_end_ms += 86_400_000;
+        }
     }
     let suffix_word = if trimmed.contains("到达") && !trimmed.contains("送达") {
         "到达"
@@ -7494,9 +7887,19 @@ pub fn classify_delivery_or_mobility_signal(
                 .any(|k| content_contains(k)));
     let is_ride = contains_ascii_ignore_case(p, b"autonavi.minimap")
         || contains_ascii_ignore_case(p, b"didi")
-        || ["打车", "快车", "专车", "网约车", "行程", "司机", "上车点"]
-            .iter()
-            .any(|kw| any_contains(kw));
+        || [
+            "滴滴",
+            "高德打车",
+            "打车",
+            "快车",
+            "专车",
+            "网约车",
+            "行程",
+            "司机",
+            "上车点",
+        ]
+        .iter()
+        .any(|kw| any_contains(kw));
     let is_tea = p.eq_ignore_ascii_case("com.lucky.luckyclient")
         || p.eq_ignore_ascii_case("com.heytea.android")
         || p.eq_ignore_ascii_case("com.chagee.app")
@@ -7541,6 +7944,22 @@ pub fn classify_delivery_or_mobility_signal(
         || is_ride
         || is_tea;
     if !has_brand && !is_takeout_kw {
+        return None;
+    }
+
+    let is_terminal_completed = [
+        "已取餐",
+        "取餐完成",
+        "订单已完成",
+        "行程已结束",
+        "行程结束",
+        "已安全到达",
+        "到达目的地",
+        "感谢您的评价",
+    ]
+    .iter()
+    .any(|kw| content_contains(kw));
+    if is_terminal_completed {
         return None;
     }
 
@@ -7976,6 +8395,75 @@ fn event_is_on_date(ev: &crate::toolbox::PhoneCalendarEvent, today_ymd: &str) ->
     event_is_on_date_tuple(ev, parse_ymd_tuple(ymd))
 }
 
+/// Epoch-ms-accurate ongoing check across `[dtstart, effective_end_ms())` (including cross-midnight and multi-day events).
+pub fn event_is_ongoing_at_ms(ev: &crate::toolbox::PhoneCalendarEvent, now_ms: i64) -> bool {
+    if ev.all_day || ev.dtstart <= 0 || now_ms <= 0 {
+        return false;
+    }
+    let end_ms = ev.effective_end_ms();
+    end_ms > ev.dtstart && now_ms >= ev.dtstart && now_ms < end_ms
+}
+
+fn event_is_within_45_minutes_at_ms(ev: &crate::toolbox::PhoneCalendarEvent, now_ms: i64) -> bool {
+    if ev.all_day || ev.dtstart <= 0 || now_ms <= 0 {
+        return false;
+    }
+    let diff_ms = ev.dtstart.saturating_sub(now_ms);
+    if (-15 * 60_000..=45 * 60_000).contains(&diff_ms) {
+        return true;
+    }
+    event_is_ongoing_at_ms(ev, now_ms)
+}
+
+fn candidate_epoch_ms_for_event_hm(
+    ev: &crate::toolbox::PhoneCalendarEvent,
+    hour: u32,
+    minute: u32,
+) -> Vec<i64> {
+    let mut out = Vec::with_capacity(2);
+    let Some(start_dt) = Local
+        .timestamp_millis_opt(ev.dtstart)
+        .single()
+        .or_else(|| Local.timestamp_millis_opt(ev.dtstart).earliest())
+    else {
+        return out;
+    };
+    let end_ms = ev.effective_end_ms();
+    let end_dt = Local
+        .timestamp_millis_opt(end_ms)
+        .single()
+        .or_else(|| Local.timestamp_millis_opt(end_ms).earliest())
+        .unwrap_or(start_dt);
+    let start_date = start_dt.date_naive();
+    let end_date = end_dt.date_naive();
+    let wall_today = Local::now().date_naive();
+    let h = hour % 24;
+    let m = minute % 60;
+    let push_date = |date: chrono::NaiveDate, vec: &mut Vec<i64>| {
+        if let Some(ndt) = date.and_hms_opt(h, m, 0) {
+            if let Some(dt) = Local
+                .from_local_datetime(&ndt)
+                .single()
+                .or_else(|| Local.from_local_datetime(&ndt).earliest())
+            {
+                let ms = dt.timestamp_millis();
+                if !vec.contains(&ms) {
+                    vec.push(ms);
+                }
+            }
+        }
+    };
+    if wall_today >= start_date && wall_today <= end_date {
+        push_date(wall_today, &mut out);
+    } else {
+        push_date(start_date, &mut out);
+        if end_date > start_date && end_ms.saturating_sub(ev.dtstart) < 86_400_000 {
+            push_date(end_date, &mut out);
+        }
+    }
+    out
+}
+
 fn event_is_within_45_minutes(
     ev: &crate::toolbox::PhoneCalendarEvent,
     hour: u32,
@@ -7984,28 +8472,9 @@ fn event_is_within_45_minutes(
     if ev.all_day || ev.dtstart <= 0 {
         return false;
     }
-    let Some((start_ymd, start_h, start_m)) = timestamp_to_local_ymd_parts(ev.dtstart) else {
-        return false;
-    };
-    let ev_mins = (start_h * 60 + start_m) as i32;
-    let now_mins = ((hour % 24) * 60 + (minute % 60)) as i32;
-    let diff = ev_mins - now_mins;
-    if (-15..=45).contains(&diff) {
-        return true;
-    }
-    if diff < -15 && ev.dtend > ev.dtstart {
-        if let Some((end_ymd, end_h, end_m)) = timestamp_to_local_ymd_parts(ev.dtend) {
-            let end_mins = if end_ymd > start_ymd {
-                1440
-            } else {
-                (end_h * 60 + end_m) as i32
-            };
-            if now_mins <= end_mins {
-                return true;
-            }
-        }
-    }
-    false
+    candidate_epoch_ms_for_event_hm(ev, hour, minute)
+        .into_iter()
+        .any(|now_ms| event_is_within_45_minutes_at_ms(ev, now_ms))
 }
 
 /// Returns true if the calendar event has already started and has not yet ended at `(hour, minute)`.
@@ -8013,25 +8482,9 @@ pub fn event_is_ongoing(ev: &crate::toolbox::PhoneCalendarEvent, hour: u32, minu
     if ev.all_day || ev.dtstart <= 0 {
         return false;
     }
-    let Some((start_ymd, start_h, start_m)) = timestamp_to_local_ymd_parts(ev.dtstart) else {
-        return false;
-    };
-    let start_mins = (start_h * 60 + start_m) as i32;
-    let now_mins = ((hour % 24) * 60 + (minute % 60)) as i32;
-    if now_mins < start_mins {
-        return false;
-    }
-    if ev.dtend > ev.dtstart {
-        if let Some((end_ymd, end_h, end_m)) = timestamp_to_local_ymd_parts(ev.dtend) {
-            let end_mins = if end_ymd > start_ymd {
-                1440
-            } else {
-                (end_h * 60 + end_m) as i32
-            };
-            return now_mins < end_mins;
-        }
-    }
-    now_mins - start_mins <= 30
+    candidate_epoch_ms_for_event_hm(ev, hour, minute)
+        .into_iter()
+        .any(|now_ms| event_is_ongoing_at_ms(ev, now_ms))
 }
 
 /// Formats an active or upcoming meeting title with its expected end time (`预计 HH:MM 结束`) when available.
@@ -8050,30 +8503,7 @@ pub fn format_active_meeting_context(ev: &crate::toolbox::PhoneCalendarEvent) ->
 
 /// Extracts an online meeting or web URL (`https://...` or `http://...`) from a calendar description or location.
 pub fn extract_meeting_url(text: &str) -> Option<String> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let start_idx = trimmed
-        .find("https://")
-        .or_else(|| trimmed.find("http://"))?;
-    let tail = &trimmed[start_idx..];
-    let raw_url: String = tail
-        .chars()
-        .take_while(|c| {
-            c.is_ascii()
-                && !c.is_whitespace()
-                && !matches!(c, ')' | '(' | ']' | '[' | '>' | '<' | '"' | '\'')
-        })
-        .collect();
-    let cleaned = raw_url
-        .trim_end_matches(|c: char| matches!(c, '.' | ',' | ';'))
-        .to_string();
-    if cleaned.len() > "https://a.b".len() {
-        Some(cleaned)
-    } else {
-        None
-    }
+    crate::meeting_brief::extract_first_url(text)
 }
 
 fn extract_first_integer(text: &str) -> Option<u32> {
@@ -9763,7 +10193,7 @@ mod tests {
                 hour: 8,
                 minutes: 0,
                 enabled: true,
-                days_of_week: 31,
+                days_of_week: 127,
                 vibrate: true,
                 message: "起床".into(),
             },
@@ -11146,5 +11576,324 @@ mod tests {
         assert_eq!(jd_parcels.len(), 1);
         assert_eq!(jd_parcels[0].carrier, "京东快递");
         assert_eq!(jd_parcels[0].status, "运输中");
+    }
+
+    #[test]
+    fn weekday_only_alarm_does_not_suppress_saturday_flight_wake_warning() {
+        // Friday 2026-11-13 21:00 -> Saturday 2026-11-14 08:00 flight
+        let sat_flight_ms = Local
+            .with_ymd_and_hms(2026, 11, 14, 8, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let flight = PhoneCalendarEvent {
+            id: 9101,
+            title: "飞往深圳早班航班".into(),
+            dtstart: sat_flight_ms,
+            dtend: sat_flight_ms + 7_200_000,
+            all_day: false,
+            location: "虹桥T2".into(),
+            description: "08:00 起飞".into(),
+            source: "手机日历".into(),
+            recurring: Some(false),
+        };
+        let mon_fri_alarm = PhoneAlarmItem {
+            id: 1,
+            hour: 7,
+            minutes: 30,
+            days_of_week: 0b001_1111, // Mon..Fri only
+            enabled: true,
+            vibrate: true,
+            message: "工作日早起".into(),
+        };
+        let probe_alarm = PhoneAlarmItem {
+            id: 2,
+            hour: 6,
+            minutes: 30,
+            days_of_week: 0b111_1111,
+            enabled: true,
+            vibrate: true,
+            message: "StepX自动化验证".into(),
+        };
+
+        let conflicts = detect_schedule_alarm_conflicts(
+            "2026-11-13",
+            21,
+            0,
+            &[flight.clone()],
+            &[mon_fri_alarm.clone(), probe_alarm],
+        );
+        assert_eq!(
+            conflicts.len(),
+            1,
+            "Mon-Fri 07:30 alarm and E2E probe must not suppress Saturday 08:00 flight warning"
+        );
+        assert_eq!(conflicts[0].conflict_badge, "缺少早起闹钟");
+
+        // Adding a valid one-shot 06:30 alarm on Friday 21:00 (`450 < 1260` => rings Saturday morning) clears the conflict
+        let one_shot_sat = PhoneAlarmItem {
+            id: 3,
+            hour: 6,
+            minutes: 30,
+            days_of_week: 0,
+            enabled: true,
+            vibrate: true,
+            message: "赶飞机".into(),
+        };
+        let cleared = detect_schedule_alarm_conflicts(
+            "2026-11-13",
+            21,
+            0,
+            std::slice::from_ref(&flight),
+            &[mon_fri_alarm, one_shot_sat.clone()],
+        );
+        assert!(cleared.is_empty());
+
+        // Suppressing `alarm:3` in governance brings the missing-alarm warning back
+        let orig_gov = crate::home_reminder_governance::active_governance();
+        let mut test_gov = crate::home_reminder_governance::HomeReminderGovernance::default();
+        test_gov.manual_expire(
+            crate::home_reminder_governance::ReminderTargetSpec::new(
+                "alarm:3",
+                crate::home_reminder_governance::ReminderCategory::ScheduleConflict,
+                "闹钟 06:30",
+            ),
+            chrono::Utc::now().timestamp_millis(),
+        );
+        crate::home_reminder_governance::set_active_governance(&test_gov);
+        let suppressed_conflicts = detect_schedule_alarm_conflicts(
+            "2026-11-13",
+            21,
+            0,
+            std::slice::from_ref(&flight),
+            &[one_shot_sat],
+        );
+        assert_eq!(suppressed_conflicts.len(), 1);
+        crate::home_reminder_governance::set_active_governance(&orig_gov);
+    }
+
+    #[test]
+    fn outgoing_parcels_and_completed_takeout_or_rideshare_do_not_leak_into_active_cards() {
+        let now_ms = Local::now().timestamp_millis();
+        let today_ymd = Local::now().format("%Y-%m-%d").to_string();
+        for phrase in [
+            "您的外卖已取餐，祝您用餐愉快",
+            "瑞幸咖啡取餐完成，期待再次光临",
+            "美团外卖订单已完成",
+            "滴滴快车行程已结束，欢迎下次乘坐",
+            "本次行程结束，请带好随身物品",
+            "您已安全到达目的地",
+            "快车已到达目的地，请从右侧下车",
+            "感谢您的评价，祝您生活愉快",
+        ] {
+            assert_eq!(
+                classify_delivery_or_mobility_signal("com.sankuai.meituan", "美团", "订单通知", phrase),
+                None,
+                "Terminal phrase should be filtered: {phrase}"
+            );
+            assert_eq!(
+                classify_delivery_or_mobility_signal("com.sdu.didi.psnger", "滴滴", "行程通知", phrase),
+                None,
+                "Terminal rideshare phrase should be filtered: {phrase}"
+            );
+        }
+
+        let outgoing_sms = Message {
+            provider_id: Some(1),
+            address: "95338".into(),
+            body: "【顺丰速运】您寄出的快件 SF1234567890123 正在派送中".into(),
+            date_ms: now_ms - 30_000,
+            outgoing: false,
+            kind: 1,
+            read: false,
+            subscription: None,
+        };
+        let outgoing_notif = PushNotification {
+            key: "sf-send-1".into(),
+            seq_id: 901,
+            package_name: "com.sf.activity".into(),
+            app_name: "顺丰速运".into(),
+            title: "寄件动态".into(),
+            text: "您寄出的快件 SF9988776655443 已揽收".into(),
+            post_time_ms: now_ms - 20_000,
+            active: true,
+            read: false,
+            dismissed: false,
+            ..Default::default()
+        };
+        let outgoing_clip = "您寄出的顺丰快递 SF5566778899001 正在运输";
+        assert!(
+            extract_live_express_parcels_with_threads(
+                std::slice::from_ref(&outgoing_sms),
+                std::slice::from_ref(&outgoing_notif),
+                &[],
+                outgoing_clip,
+                &[],
+            )
+            .is_empty()
+        );
+        let wb = empty_wellbeing();
+        let input = HomeHubInput {
+            hour: 12,
+            minute: 0,
+            today_ymd: &today_ymd,
+            device_connected: true,
+            device_model: "StepPhone",
+            firmware_profile: "StepOS",
+            threads: &[],
+            notifications: &[outgoing_notif],
+            otp_banners: &[],
+            sms: &[outgoing_sms],
+            call_logs: &[],
+            express_parcels: &[],
+            calendar_events: &[],
+            alarms: &[],
+            wellbeing: &wb,
+            phone_clipboard: outgoing_clip,
+            remote_agent_files: &[],
+            work_deliverables_count: 0,
+            pomodoro_running: false,
+            pomodoro_remaining_secs: 0,
+            dnd_on: false,
+        };
+        let report = build_home_hub_report(&input);
+        assert!(
+            !report
+                .priority_cards
+                .iter()
+                .any(|c| c.kind == HomeCardKind::ExpressParcel),
+            "Outgoing (Direction::Send) parcels must never surface as incoming ExpressParcel cards"
+        );
+    }
+
+    #[test]
+    fn cross_midnight_eta_calendar_bounds_and_weekly_overview_dedup_work() {
+        // 1. Cross-midnight ETA window `23:30-00:20` advances end date by +1 day
+        let post_2335 = Local
+            .with_ymd_and_hms(2026, 11, 4, 23, 35, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let expected_0020_next_day = Local
+            .with_ymd_and_hms(2026, 11, 5, 0, 20, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let (eta_end, range_lbl, pill_lbl) = extract_eta_window_from_text(
+            "您的夜宵预计 23:30-00:20 送达",
+            post_2335,
+            post_2335 + 60_000,
+        )
+        .expect("cross-midnight ETA window");
+        assert_eq!(eta_end, expected_0020_next_day);
+        assert_eq!(range_lbl, "23:30~00:20");
+        assert_eq!(pill_lbl, "00:20送达");
+
+        // 2. Cross-midnight calendar event `23:30` -> `00:30` next day
+        let ev_start = Local
+            .with_ymd_and_hms(2026, 11, 4, 23, 30, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let ev_end = Local
+            .with_ymd_and_hms(2026, 11, 5, 0, 30, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let night_ev = PhoneCalendarEvent {
+            id: 9201,
+            title: "跨国跨夜联调".into(),
+            dtstart: ev_start,
+            dtend: ev_end,
+            all_day: false,
+            location: "线上".into(),
+            description: String::new(),
+            source: "日历".into(),
+            recurring: Some(false),
+        };
+        assert!(event_is_ongoing(&night_ev, 23, 45));
+        assert!(event_is_ongoing(&night_ev, 0, 15));
+        assert!(!event_is_ongoing(&night_ev, 0, 30));
+
+        let day2_1400 = Local
+            .with_ymd_and_hms(2026, 11, 5, 14, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let gov = crate::home_reminder_governance::HomeReminderGovernance::default();
+        assert!(
+            is_calendar_event_auto_expired_on_today(&night_ev, 14, 0, day2_1400, &gov),
+            "Cross-midnight event ending 00:30 today must auto-expire by 14:00 today"
+        );
+
+        // 3. Weekly overview does not double-count tomorrow's early-schedule conflict in `total_issues`
+        //    and filters callback-resolved missed calls
+        let thu_flight_start = Local
+            .with_ymd_and_hms(2026, 11, 5, 7, 30, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let early_flight = PhoneCalendarEvent {
+            id: 9202,
+            title: "早班高铁出发".into(),
+            dtstart: thu_flight_start,
+            dtend: thu_flight_start + 3_600_000,
+            all_day: false,
+            location: "上海虹桥".into(),
+            description: String::new(),
+            source: "日历".into(),
+            recurring: Some(false),
+        };
+        let wed_now_ms = Local
+            .with_ymd_and_hms(2026, 11, 4, 20, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let call_logs = vec![
+            CallRecord {
+                number: "13800009367".into(),
+                name: "王总".into(),
+                call_type: 3, // missed
+                date_ms: wed_now_ms - 600_000,
+                duration_sec: 0,
+            },
+            CallRecord {
+                number: "+86 13800009367".into(),
+                name: "王总".into(),
+                call_type: 2, // outgoing callback
+                date_ms: wed_now_ms - 300_000,
+                duration_sec: 45,
+            },
+        ];
+        let wb = empty_wellbeing();
+        let input = HomeHubInput {
+            hour: 20,
+            minute: 0,
+            today_ymd: "2026-11-04", // Wednesday; flight is Thursday 2026-11-05 (same week!)
+            device_connected: true,
+            device_model: "StepPhone",
+            firmware_profile: "StepOS",
+            threads: &[],
+            notifications: &[],
+            otp_banners: &[],
+            sms: &[],
+            call_logs: &call_logs,
+            express_parcels: &[],
+            calendar_events: &[early_flight],
+            alarms: &[],
+            wellbeing: &wb,
+            phone_clipboard: "",
+            remote_agent_files: &[],
+            work_deliverables_count: 0,
+            pomodoro_running: false,
+            pomodoro_remaining_secs: 0,
+            dnd_on: false,
+        };
+        let weekly = build_weekly_overview_report("2026-11-04", &input, &[]);
+        // Only 1 real issue exists (tomorrow's missing wake alarm; missed call was resolved by callback)
+        assert_eq!(
+            weekly.total_issues, 1,
+            "Tomorrow's early-schedule alarm conflict must be counted once in total_issues, and callback-resolved missed call excluded"
+        );
     }
 }

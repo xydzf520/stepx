@@ -65,7 +65,7 @@ public final class PushControlProvider extends ContentProvider {
                 throw new IllegalArgumentException("请求无效");
             }
             JSONObject q = new JSONObject(new String(Base64.decode(arg, Base64.DEFAULT), StandardCharsets.UTF_8));
-            result = handleRequest(getContext(), q);
+            result = handleRequest(getContext(), q, true);
         } catch (Exception error) {
             Throwable cause = error.getCause() == null ? error : error.getCause();
             result = new JSONObject();
@@ -76,14 +76,19 @@ public final class PushControlProvider extends ContentProvider {
         } finally {
             Binder.restoreCallingIdentity(identity);
         }
+        String serializedResult = PushStore.trimSerializedPayloadIfNeeded(result, PushStore.MAX_BINDER_SNAPSHOT_CHARS);
         out.putString(
             "result",
-            Base64.encodeToString(result.toString().getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP)
+            Base64.encodeToString(serializedResult.getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP)
         );
         return out;
     }
 
     static JSONObject handleRequest(Context context, JSONObject q) throws Exception {
+        return handleRequest(context, q, false);
+    }
+
+    static JSONObject handleRequest(Context context, JSONObject q, boolean viaBinder) throws Exception {
         String op = q.optString("op", "").trim();
         // A call UUID/state read must not queue behind storage, GUI, or a listener rebind.
         if ("call_state".equals(op)) return PhoneCallMonitor.snapshot();
@@ -116,11 +121,16 @@ public final class PushControlProvider extends ContentProvider {
         }
 
         if ("snapshot".equals(op)) {
-            if (listenerConnected && PushNotificationService.instance != null && q.optBoolean("rescan", false)) {
-                PushNotificationService.instance.scanActiveNotifications();
+            PushNotificationService svc = PushNotificationService.instance;
+            boolean rescan = q.optBoolean("rescan", false);
+            boolean forceRescan = q.optBoolean("force_rescan", q.optBoolean("forceRescan", false));
+            if (listenerConnected && svc != null && rescan) {
+                if (forceRescan || !PushNotificationService.isConnected() || !svc.hasRecentFullScan(PushNotificationService.RESCAN_COOLDOWN_MS)) {
+                    svc.scanActiveNotifications();
+                }
             }
             long sinceRevision = q.optLong("sinceRevision", q.optLong("since_revision", 0L));
-            JSONObject snap = store.snapshot(sinceRevision);
+            JSONObject snap = store.snapshot(sinceRevision, viaBinder);
             snap.put("listenerConnected", listenerConnected);
             snap.put("accessibilityConnected", accessibilityConnected);
             snap.put("wifiAdbEnabled", wifiAdbEnabled);
@@ -375,7 +385,7 @@ public final class PushControlProvider extends ContentProvider {
         NotificationChannel channel = new NotificationChannel(
             LIVE_CAPSULE_CHANNEL_ID,
             "StepX 实况胶囊",
-            NotificationManager.IMPORTANCE_HIGH
+            NotificationManager.IMPORTANCE_LOW
         );
         channel.setSound(null, null);
         channel.enableVibration(false);

@@ -48,6 +48,12 @@ impl Manager {
         }
     }
 
+    /// Resets the atlas manager back to an empty initial page.
+    pub fn reset(&mut self) {
+        self.current_allocator = Allocator::new(self.atlas_size);
+        self.current_texture_id = TextureId::initial_value();
+    }
+
     /// Allocates a region of `size` into a texture. Returns a [`TextureOffset`] denoting the region
     /// that was allocated.
     pub fn insert(&mut self, size: Vector2I) -> Result<TextureOffset> {

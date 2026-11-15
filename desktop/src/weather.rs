@@ -24,7 +24,44 @@ static WEATHER_CACHE_REVISION: AtomicU64 = AtomicU64::new(1);
 // overwrite a more recent selection while its background request is in flight.
 static WEATHER_CITY_REVISION: AtomicU64 = AtomicU64::new(1);
 
-static PREFERRED_CITY_MEM: Mutex<Option<String>> = Mutex::new(None);
+static PREFERRED_CITY_MEM: Mutex<Option<Option<String>>> = Mutex::new(None);
+static GEOCODING_MEM_CACHE: LazyLock<Mutex<HashMap<String, (f64, f64, String)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum WeatherSourceMode {
+    /// Automatically prefer connected phone GPS location when no city was manually pinned.
+    #[default]
+    Auto,
+    /// Explicitly bound to the selected phone's GPS location (`手机定位`).
+    PhoneLocation,
+    /// Explicitly bound to a manually chosen city forecast.
+    ManualCity,
+}
+
+impl WeatherSourceMode {
+    pub fn from_city_choice(city: &str, explicit_preferred: Option<&str>) -> Self {
+        let trimmed = city.trim();
+        if trimmed == "手机定位" {
+            Self::PhoneLocation
+        } else if trimmed.is_empty() {
+            match explicit_preferred {
+                Some("手机定位") => Self::PhoneLocation,
+                Some(_) => Self::ManualCity,
+                None => Self::Auto,
+            }
+        } else if trimmed == "上海" && explicit_preferred.is_none() {
+            Self::Auto
+        } else {
+            Self::ManualCity
+        }
+    }
+
+    pub fn allows_phone_sync(self) -> bool {
+        !matches!(self, Self::ManualCity)
+    }
+}
+
 #[derive(Clone)]
 struct CachedWeatherSnapshot {
     snapshot: WeatherSnapshot,
@@ -749,15 +786,29 @@ fn clean_amoo_weather_advice_line(raw: &str) -> String {
     cleaned.chars().take(28).collect()
 }
 
-fn discover_online_phone_transport() -> Option<(crate::adb::Adb, String)> {
-    let adb = crate::adb::Adb::discover().ok()?;
-    let raw_devices = adb
-        .run_timeout(&["devices", "-l"], Duration::from_secs(2))
-        .ok()?;
-    let transport = crate::device::parse_devices(&raw_devices)
-        .into_iter()
-        .find(|d| d.state == "device")?;
-    Some((adb, transport.id))
+fn resolve_selected_phone_target(
+    adb_override: Option<&crate::adb::Adb>,
+    selected_device: Option<&crate::device::Device>,
+    source_mode: WeatherSourceMode,
+) -> Option<(crate::adb::Adb, String, crate::device::Device)> {
+    if !source_mode.allows_phone_sync() {
+        return None;
+    }
+    let dev = selected_device?;
+    let target_serial = if !dev.transport.trim().is_empty() {
+        dev.transport.trim().to_string()
+    } else {
+        dev.serial.trim().to_string()
+    };
+    if target_serial.is_empty() {
+        return None;
+    }
+    let adb = match adb_override {
+        Some(a) => a.clone(),
+        None if !cfg!(test) => crate::adb::Adb::discover().ok()?,
+        None => return None,
+    };
+    Some((adb, target_serial, dev.clone()))
 }
 
 /// Reads `/sdcard/Android/data/com.stepx.companion.app/files/weather_daily_advice.json` from the phone
@@ -808,7 +859,9 @@ fn save_desktop_daily_advice_cache(advice: &CachedDailyWeatherAdvice) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn call_amoo_for_tomorrow_advice(
+    adb_and_device: Option<(&crate::adb::Adb, &crate::device::Device)>,
     city: &str,
     today_cond: &str,
     today_low: i32,
@@ -828,15 +881,24 @@ fn call_amoo_for_tomorrow_advice(
         return None;
     }
 
-    let (adb, transport_id) = discover_online_phone_transport()?;
-    let device = crate::device::Device::inspect(&adb, &transport_id).ok()?;
-    let mut bus = crate::amoo::AgentBus::connect(&adb, &device).ok()?;
+    let (adb, selected_dev) = adb_and_device?;
+    let transport_id = if !selected_dev.transport.trim().is_empty() {
+        selected_dev.transport.trim()
+    } else {
+        selected_dev.serial.trim()
+    };
+    if transport_id.is_empty() {
+        return None;
+    }
+    let device = crate::device::Device::inspect(adb, transport_id)
+        .unwrap_or_else(|_| selected_dev.clone());
+    let mut bus = crate::amoo::AgentBus::connect(adb, &device).ok()?;
     let session_key = bus.create_session().ok()?;
 
-    let account = crate::amoo_usage::account_scope_fresh(&adb, &device)
+    let account = crate::amoo_usage::account_scope_fresh(adb, &device)
         .ok()
         .flatten()
-        .or_else(|| crate::amoo_usage::account_scope(&adb, &device).ok().flatten())
+        .or_else(|| crate::amoo_usage::account_scope(adb, &device).ok().flatten())
         .unwrap_or_else(|| "weather-ephemeral-scope".to_string());
     let _ = crate::inference_sessions::register(
         &crate::inference_sessions::default_context_root(),
@@ -910,15 +972,17 @@ fn call_amoo_for_tomorrow_advice(
     reply_text
 }
 
-/// Resolves daily weather advice for `snapshot` on `today_ymd` using `mem_cache`,
-/// desktop disk cache (`~/.cache/stepx-companion/weather_daily_advice.json`), and
-/// phone on-device cache (`/sdcard/Android/data/com.stepx.companion.app/files/weather_daily_advice.json`),
-/// calling Amoo at most once per calendar day (`date_ymd == today_ymd`).
-pub fn resolve_daily_weather_advice_for_date(
+/// Device- and source-mode-aware daily weather advice resolver.
+/// Never picks an arbitrary first ADB device: uses only `selected_device` when
+/// `source_mode.allows_phone_sync()` is true.
+pub fn resolve_daily_weather_advice_for_date_and_device(
     snapshot: &WeatherSnapshot,
     today_ymd: &str,
     mem_cache: &Mutex<Option<CachedDailyWeatherAdvice>>,
     use_disk_cache: bool,
+    adb_override: Option<&crate::adb::Adb>,
+    selected_device: Option<&crate::device::Device>,
+    source_mode: WeatherSourceMode,
 ) -> CachedDailyWeatherAdvice {
     // 1. Check in-memory cache first (0 ADB calls).
     if let Ok(guard) = mem_cache.lock() {
@@ -946,14 +1010,14 @@ pub fn resolve_daily_weather_advice_for_date(
         }
     }
 
-    // 3. Before invoking AgentBus on the phone, check if `/sdcard/Android/data/com.stepx.companion.app/files/weather_daily_advice.json`
-    //    on the phone already holds today's (`today_ymd`, `snapshot.city`) advice.
-    let online_phone = if use_disk_cache && !cfg!(test) {
-        discover_online_phone_transport()
+    // 3. Before invoking AgentBus on the selected phone, check if its on-device
+    //    `weather_daily_advice.json` already holds today's (`today_ymd`, `snapshot.city`) advice.
+    let phone_target = if use_disk_cache || adb_override.is_some() {
+        resolve_selected_phone_target(adb_override, selected_device, source_mode)
     } else {
         None
     };
-    if let Some((ref adb, ref serial)) = online_phone {
+    if let Some((ref adb, ref serial, _)) = phone_target {
         if let Some(phone_cached) =
             read_phone_daily_weather_advice(adb, serial, today_ymd, &snapshot.city)
         {
@@ -968,9 +1032,13 @@ pub fn resolve_daily_weather_advice_for_date(
         }
     }
 
-    // 4. Generate today's advice via Amoo (or concise local synthesis when offline).
+    // 4. Generate today's advice via Amoo on `selected_device` (or concise local synthesis when offline/manual).
     let t = snapshot.tomorrow_point();
+    let adb_and_dev = phone_target
+        .as_ref()
+        .map(|(adb, _, dev)| (adb, dev));
     let (tomorrow_advice, generated_by_amoo) = match call_amoo_for_tomorrow_advice(
+        adb_and_dev,
         &snapshot.city,
         &snapshot.condition,
         snapshot.low_c,
@@ -1013,12 +1081,89 @@ pub fn resolve_daily_weather_advice_for_date(
 
     if use_disk_cache {
         save_desktop_daily_advice_cache(&resolved);
-        if let Some((ref adb, ref serial)) = online_phone {
+    }
+    if use_disk_cache || adb_override.is_some() {
+        if let Some((ref adb, ref serial, _)) = phone_target {
             let _ = write_phone_daily_weather_advice(adb, serial, &resolved);
         }
     }
 
     resolved
+}
+
+/// Resolves daily weather advice for `snapshot` on `today_ymd` using `mem_cache`,
+/// desktop disk cache (`~/.cache/stepx-companion/weather_daily_advice.json`), and
+/// an unambiguous single connected phone when applicable.
+pub fn resolve_daily_weather_advice_for_date(
+    snapshot: &WeatherSnapshot,
+    today_ymd: &str,
+    mem_cache: &Mutex<Option<CachedDailyWeatherAdvice>>,
+    use_disk_cache: bool,
+) -> CachedDailyWeatherAdvice {
+    let unique_device = if use_disk_cache
+        && !cfg!(test)
+        && snapshot.region_label.contains("系统天气 MCP")
+    {
+        crate::adb::Adb::discover()
+            .ok()
+            .and_then(|adb| discover_unique_weather_phone(&adb).ok())
+    } else {
+        None
+    };
+    let mode = if snapshot.region_label.contains("系统天气 MCP") {
+        WeatherSourceMode::PhoneLocation
+    } else {
+        WeatherSourceMode::ManualCity
+    };
+    resolve_daily_weather_advice_for_date_and_device(
+        snapshot,
+        today_ymd,
+        mem_cache,
+        use_disk_cache,
+        None,
+        unique_device.as_ref(),
+        mode,
+    )
+}
+
+/// Device-scoped daily weather advice resolver accepting `selected_device` and `WeatherSourceMode`.
+/// Never picks an arbitrary first ADB device when multiple or zero phones are connected.
+pub fn resolve_daily_weather_advice_for_device(
+    snapshot: &WeatherSnapshot,
+    selected_device: Option<&crate::device::Device>,
+    source_mode: WeatherSourceMode,
+) -> CachedDailyWeatherAdvice {
+    let today_ymd = Local::now().format("%Y-%m-%d").to_string();
+    if cfg!(test) {
+        let local_cache = Mutex::new(None);
+        return resolve_daily_weather_advice_for_date_and_device(
+            snapshot,
+            &today_ymd,
+            &local_cache,
+            false,
+            None,
+            selected_device,
+            source_mode,
+        );
+    }
+    resolve_daily_weather_advice_for_date_and_device(
+        snapshot,
+        &today_ymd,
+        &DAILY_ADVICE_MEM_CACHE,
+        true,
+        None,
+        selected_device,
+        source_mode,
+    )
+}
+
+/// Alias for `resolve_daily_weather_advice_for_device`.
+pub fn resolve_daily_weather_advice_with_device(
+    snapshot: &WeatherSnapshot,
+    selected_device: Option<&crate::device::Device>,
+    source_mode: WeatherSourceMode,
+) -> CachedDailyWeatherAdvice {
+    resolve_daily_weather_advice_for_device(snapshot, selected_device, source_mode)
 }
 
 /// Resolves once-per-day Amoo weather advice for `snapshot`.
@@ -1038,9 +1183,11 @@ pub fn resolve_daily_amoo_tomorrow_advice(snapshot: &WeatherSnapshot) -> CachedD
     resolve_daily_weather_advice(snapshot)
 }
 
-/// Reads `~/.config/stepx-companion/weather_city.txt`, defaulting to `"上海"`.
-pub fn load_preferred_city() -> String {
-    load_preferred_city_with(&PREFERRED_CITY_MEM, || {
+/// Returns `Some(city)` only when the user has explicitly saved a preferred city
+/// (via `save_preferred_city` or `~/.config/stepx-companion/weather_city.txt`),
+/// or `None` when unset so connected phones can report their real GPS location weather.
+pub fn load_preferred_city_explicit() -> Option<String> {
+    load_preferred_city_explicit_with(&PREFERRED_CITY_MEM, || {
         if cfg!(test) {
             return None;
         }
@@ -1048,40 +1195,75 @@ pub fn load_preferred_city() -> String {
     })
 }
 
-fn load_preferred_city_with(
-    cache: &Mutex<Option<String>>,
+/// Reads `~/.config/stepx-companion/weather_city.txt`, defaulting to `"上海"` when unset.
+pub fn load_preferred_city() -> String {
+    load_preferred_city_explicit().unwrap_or_else(|| "上海".to_string())
+}
+
+fn load_preferred_city_explicit_with(
+    cache: &Mutex<Option<Option<String>>>,
     read_saved: impl FnOnce() -> Option<String>,
-) -> String {
+) -> Option<String> {
     if let Ok(guard) = cache.lock() {
-        if let Some(ref c) = *guard {
-            if !c.trim().is_empty() {
-                return c.trim().to_string();
-            }
+        if let Some(ref resolved) = *guard {
+            return resolved
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string);
         }
     }
     // Read outside the lock. A user may select another city while disk I/O is
-    // pending; the newer in-memory choice wins over both disk data and fallback.
+    // pending; the newer in-memory choice wins over disk data.
     let loaded = read_saved()
         .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "上海".to_string());
+        .filter(|value| !value.is_empty());
     if let Ok(mut guard) = cache.lock() {
         if guard.is_none() {
             *guard = Some(loaded.clone());
         }
-        return guard.as_deref().map(str::trim)
+        return guard
+            .as_ref()
+            .and_then(|opt| opt.as_deref())
+            .map(str::trim)
             .filter(|value| !value.is_empty())
-            .unwrap_or(&loaded).to_string();
+            .map(ToString::to_string);
     }
     loaded
 }
 
+#[cfg(test)]
+fn load_preferred_city_with(
+    cache: &Mutex<Option<Option<String>>>,
+    read_saved: impl FnOnce() -> Option<String>,
+) -> String {
+    load_preferred_city_explicit_with(cache, read_saved).unwrap_or_else(|| "上海".to_string())
+}
+
+/// Clears any explicitly pinned preferred city so auto phone-GPS location takes precedence again.
+pub fn clear_preferred_city() {
+    save_preferred_city("");
+}
+
 /// Writes preferred city to `~/.config/stepx-companion/weather_city.txt` unless `cfg!(test)`.
+/// Passing an empty string clears the explicit preference back to unset (`None`).
 pub fn save_preferred_city(city: &str) {
     let trimmed = city.trim();
-    let normalized = if trimmed.is_empty() { "上海" } else { trimmed };
+    if trimmed.is_empty() {
+        if let Ok(mut guard) = PREFERRED_CITY_MEM.lock() {
+            *guard = Some(None);
+            WEATHER_CITY_REVISION.fetch_add(1, Ordering::Relaxed);
+        }
+        WEATHER_CACHE_REVISION.fetch_add(1, Ordering::Relaxed);
+        if !cfg!(test) {
+            if let Some(path) = preferred_city_config_path() {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        return;
+    }
     if let Ok(mut guard) = PREFERRED_CITY_MEM.lock() {
-        *guard = Some(normalized.to_string());
+        *guard = Some(Some(trimmed.to_string()));
         WEATHER_CITY_REVISION.fetch_add(1, Ordering::Relaxed);
     }
     WEATHER_CACHE_REVISION.fetch_add(1, Ordering::Relaxed);
@@ -1092,7 +1274,37 @@ pub fn save_preferred_city(city: &str) {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::fs::write(path, normalized);
+        let _ = std::fs::write(path, trimmed);
+    }
+}
+
+/// Device-scoped in-memory read for Home report construction.
+/// When `device_key` is `Some`, device-bound phone snapshots must match that device key
+/// (online city forecasts with `device_key == None` remain reusable).
+/// When the user has not explicitly pinned a city (`load_preferred_city_explicit().is_none()`),
+/// phone GPS snapshots from any city (e.g. Beijing/Shenzhen) are returned cleanly.
+pub fn cached_weather_snapshot_for(device_key: Option<&str>) -> Option<WeatherSnapshot> {
+    let explicit_preferred = load_preferred_city_explicit();
+    let cached = SNAPSHOT_MEM_CACHE.lock().ok().and_then(|c| c.clone())?;
+    if !cached.fresh_at(Instant::now()) {
+        return None;
+    }
+    if let Some(req_key) = device_key {
+        let req_trimmed = req_key.trim();
+        if let Some(ref snap_dev_key) = cached.device_key {
+            if req_trimmed.is_empty() || snap_dev_key != req_trimmed {
+                return None;
+            }
+        }
+    }
+    let snapshot = cached.snapshot;
+    if explicit_preferred
+        .as_deref()
+        .is_none_or(|city| weather_city_matches(&snapshot, city))
+    {
+        Some(snapshot)
+    } else {
+        None
     }
 }
 
@@ -1101,20 +1313,7 @@ pub fn save_preferred_city(city: &str) {
 /// None means the current city has no published snapshot yet; do not present
 /// synthesized temperatures as current weather while waiting for that job.
 pub fn cached_weather_snapshot() -> Option<WeatherSnapshot> {
-    let preferred = PREFERRED_CITY_MEM.lock().ok().and_then(|c| c.clone());
-    let cached = SNAPSHOT_MEM_CACHE.lock().ok().and_then(|c| c.clone())?;
-    if !cached.fresh_at(Instant::now()) {
-        return None;
-    }
-    let snapshot = cached.snapshot;
-    if preferred
-        .as_deref()
-        .is_none_or(|city| weather_city_matches(&snapshot, city))
-    {
-        Some(snapshot)
-    } else {
-        None
-    }
+    cached_weather_snapshot_for(None)
 }
 
 fn weather_city_matches(snapshot: &WeatherSnapshot, city: &str) -> bool {
@@ -1218,6 +1417,43 @@ fn publish_live_weather_snapshot(snapshot: &WeatherSnapshot, city_revision: u64)
     publish_weather_snapshot_for_device_selection(snapshot, city_revision, None)
 }
 
+const WEATHER_STALE_IF_ERROR_TTL: Duration = Duration::from_secs(24 * 3600);
+
+fn parse_disk_weather_snapshot(
+    raw: &str,
+    age: Duration,
+    max_age: Duration,
+    target_city: &str,
+) -> Option<WeatherSnapshot> {
+    if age >= max_age {
+        return None;
+    }
+    let parsed = serde_json::from_str::<WeatherSnapshot>(raw).ok()?;
+    // Older disk files have no hardware identity. Treat phone snapshots as unbound instead of guessing.
+    let matches_request =
+        !parsed.region_label.contains("系统天气 MCP") && weather_city_matches(&parsed, target_city);
+    matches_request.then_some(parsed)
+}
+
+fn load_disk_weather_snapshot(
+    target_city: &str,
+    max_age: Duration,
+) -> Option<(WeatherSnapshot, Duration)> {
+    if cfg!(test) {
+        return None;
+    }
+    let path = weather_snapshot_cache_path()?;
+    let age = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|mtime| SystemTime::now().duration_since(mtime).ok())?;
+    if age >= max_age {
+        return None;
+    }
+    let raw = std::fs::read_to_string(&path).ok()?;
+    parse_disk_weather_snapshot(&raw, age, max_age, target_city).map(|parsed| (parsed, age))
+}
+
 /// Legacy city forecast lookup with a strict two-hour memory/disk lifetime.
 /// No device selection is available here, so unbound phone snapshots are ignored.
 /// Device-aware UI callers use the explicit phone fetch and guarded publication APIs.
@@ -1235,32 +1471,20 @@ pub fn load_or_default_weather(city: Option<&str>) -> WeatherSnapshot {
     }
 
     if !cfg!(test) {
-        if let Some(path) = weather_snapshot_cache_path() {
-            let age = std::fs::metadata(&path)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|mtime| SystemTime::now().duration_since(mtime).ok());
-            if let Some(age) = age.filter(|age| *age < WEATHER_DISPLAY_CACHE_TTL) {
-                if let Ok(raw) = std::fs::read_to_string(&path) {
-                    if let Ok(parsed) = serde_json::from_str::<WeatherSnapshot>(&raw) {
-                        // Older disk files have no hardware identity. Treat
-                        // phone snapshots as unbound instead of guessing.
-                        let matches_request = !parsed.region_label.contains("系统天气 MCP")
-                            && weather_city_matches(&parsed, &target_city);
-                        if matches_request {
-                            if let Ok(mut guard) = SNAPSHOT_MEM_CACHE.lock() {
-                                *guard = Some(CachedWeatherSnapshot {
-                                    snapshot: parsed.clone(),
-                                    stored_at: Instant::now().checked_sub(age).unwrap_or_else(Instant::now),
-                                    device_key: None,
-                                });
-                            }
-                            WEATHER_CACHE_REVISION.fetch_add(1, Ordering::Relaxed);
-                            return parsed;
-                        }
-                    }
-                }
+        if let Some((parsed, age)) =
+            load_disk_weather_snapshot(&target_city, WEATHER_DISPLAY_CACHE_TTL)
+        {
+            if let Ok(mut guard) = SNAPSHOT_MEM_CACHE.lock() {
+                *guard = Some(CachedWeatherSnapshot {
+                    snapshot: parsed.clone(),
+                    stored_at: Instant::now()
+                        .checked_sub(age)
+                        .unwrap_or_else(Instant::now),
+                    device_key: None,
+                });
             }
+            WEATHER_CACHE_REVISION.fetch_add(1, Ordering::Relaxed);
+            return parsed;
         }
 
         if explicit_city.is_none()
@@ -1272,29 +1496,149 @@ pub fn load_or_default_weather(city: Option<&str>) -> WeatherSnapshot {
             if let Ok(live) = fetch_live_weather_snapshot(&target_city) {
                 return live;
             }
-            return WeatherSnapshot::default_for_city(&target_city);
+        }
+
+        if let Some((stale, _)) =
+            load_disk_weather_snapshot(&target_city, WEATHER_STALE_IF_ERROR_TTL)
+        {
+            return stale;
         }
     }
 
     WeatherSnapshot::default_for_city(&target_city)
 }
 
-/// Maps city name to `(latitude, longitude, region_label)`.
-pub fn city_coordinates(city: &str) -> (f64, f64, String) {
-    match city.trim() {
-        "上海" | "上海 · 奉贤区" | "奉贤区" => {
-            (30.9646, 121.5024, "上海 · 奉贤区".to_string())
-        }
-        "苏州" => (31.2989, 120.5853, "苏州 · 华东".to_string()),
-        "杭州" => (30.2741, 120.1551, "杭州 · 华东".to_string()),
-        "南京" => (32.0603, 118.7969, "南京 · 华东".to_string()),
-        "北京" => (39.9042, 116.4074, "北京 · 华北".to_string()),
-        "深圳" => (22.5431, 114.0579, "深圳 · 华南".to_string()),
-        other => {
-            let name = if other.is_empty() { "上海" } else { other };
-            (30.9646, 121.5024, format!("{name} · 华东"))
+fn percent_encode_query_component(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() * 3);
+    for b in input.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(*b, b'-' | b'_' | b'.' | b'~') {
+            out.push(*b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
         }
     }
+    out
+}
+
+/// Parses Open-Meteo Geocoding API JSON (`https://geocoding-api.open-meteo.com/v1/search`)
+/// into `(latitude, longitude, region_label)` or returns an explicit `Err` if no match exists.
+pub fn parse_open_meteo_geocoding_response(
+    query_city: &str,
+    raw_json: &str,
+) -> Result<(f64, f64, String), String> {
+    let val: serde_json::Value = serde_json::from_str(raw_json)
+        .map_err(|e| format!("Open-Meteo 地理编码解析失败: {e}"))?;
+    let first = val
+        .get("results")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .ok_or_else(|| format!("未找到城市「{query_city}」的地理坐标"))?;
+    let lat = first
+        .get("latitude")
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| format!("城市「{query_city}」缺少纬度信息"))?;
+    let lon = first
+        .get("longitude")
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| format!("城市「{query_city}」缺少经度信息"))?;
+    let resolved_name = first
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(query_city);
+    let admin = first
+        .get("admin1")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            first
+                .get("country")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        });
+    let region_label = match admin {
+        Some(sub) if sub != resolved_name && sub != query_city => {
+            format!("{resolved_name} · {sub}")
+        }
+        _ => resolved_name.to_string(),
+    };
+    Ok((lat, lon, region_label))
+}
+
+/// Maps city name to `(latitude, longitude, region_label)`.
+/// Uses preset coordinates for built-in cities and queries the Open-Meteo Geocoding API
+/// for other cities; returns an explicit `Err` rather than fake Shanghai coordinates
+/// when a city cannot be resolved.
+pub fn city_coordinates(city: &str) -> Result<(f64, f64, String), String> {
+    let trimmed = city.trim();
+    if trimmed.is_empty() {
+        return Err("城市名称不能为空".to_string());
+    }
+    if trimmed == "手机定位" {
+        return Err("未选择手机，无法通过手机定位查询在线城市坐标".to_string());
+    }
+
+    match trimmed {
+        "上海" | "上海市" | "上海 · 奉贤区" | "奉贤区" => {
+            return Ok((30.9646, 121.5024, "上海 · 奉贤区".to_string()));
+        }
+        "苏州" | "苏州市" => return Ok((31.2989, 120.5853, "苏州 · 华东".to_string())),
+        "杭州" | "杭州市" => return Ok((30.2741, 120.1551, "杭州 · 华东".to_string())),
+        "南京" | "南京市" => return Ok((32.0603, 118.7969, "南京 · 华东".to_string())),
+        "北京" | "北京市" => return Ok((39.9042, 116.4074, "北京 · 华北".to_string())),
+        "深圳" | "深圳市" => return Ok((22.5431, 114.0579, "深圳 · 华南".to_string())),
+        _ => {}
+    }
+
+    if let Ok(guard) = GEOCODING_MEM_CACHE.lock() {
+        if let Some(found) = guard.get(trimmed) {
+            return Ok(found.clone());
+        }
+    }
+
+    if cfg!(test) {
+        return Err(format!("未知城市「{trimmed}」，无法解析地理坐标"));
+    }
+
+    let lookup_term = trimmed
+        .split('·')
+        .next_back()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(trimmed);
+    let encoded = percent_encode_query_component(lookup_term);
+    let geocode_url = format!(
+        "https://geocoding-api.open-meteo.com/v1/search?name={encoded}&count=1&language=zh&format=json"
+    );
+    let mut cmd = std::process::Command::new("curl");
+    crate::resources::quiet_command(&mut cmd);
+    cmd.args([
+        "-sS",
+        "--connect-timeout",
+        "2.5",
+        "--max-time",
+        "4",
+        &geocode_url,
+    ]);
+    let output = crate::adb::run_process(cmd, None, Duration::from_secs(5))
+        .map_err(|e| format!("查询城市「{trimmed}」地理编码失败: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "查询城市「{trimmed}」地理编码返回非零状态 ({}): {}",
+            output.status,
+            stderr.trim()
+        ));
+    }
+    let raw_json = String::from_utf8_lossy(&output.stdout);
+    let resolved = parse_open_meteo_geocoding_response(trimmed, &raw_json)?;
+    if let Ok(mut guard) = GEOCODING_MEM_CACHE.lock() {
+        guard.insert(trimmed.to_string(), resolved.clone());
+    }
+    Ok(resolved)
 }
 
 /// Maps WMO weather code to concise Chinese condition label.
@@ -1316,8 +1660,11 @@ fn is_rainy_wmo_code(code: i64) -> bool {
     matches!(code, 51..=67 | 80..=82 | 95..=99)
 }
 
-fn wind_speed_kmh_to_level(wind_kmh: f64) -> u8 {
-    if wind_kmh < 6.0 {
+/// Maps wind speed in km/h to standard Beaufort wind scale (`0..=12`).
+pub fn wind_speed_kmh_to_level(wind_kmh: f64) -> u8 {
+    if wind_kmh < 1.0 {
+        0
+    } else if wind_kmh < 6.0 {
         1
     } else if wind_kmh < 12.0 {
         2
@@ -1327,8 +1674,39 @@ fn wind_speed_kmh_to_level(wind_kmh: f64) -> u8 {
         4
     } else if wind_kmh < 39.0 {
         5
-    } else {
+    } else if wind_kmh < 50.0 {
         6
+    } else if wind_kmh < 62.0 {
+        7
+    } else if wind_kmh < 75.0 {
+        8
+    } else if wind_kmh < 89.0 {
+        9
+    } else if wind_kmh < 103.0 {
+        10
+    } else if wind_kmh < 118.0 {
+        11
+    } else {
+        12
+    }
+}
+
+/// Returns standard Chinese Beaufort wind description for `level` (`0..=12`).
+pub fn beaufort_wind_description(level: u8) -> &'static str {
+    match level {
+        0 => "无风",
+        1 => "软风",
+        2 => "轻风",
+        3 => "微风",
+        4 => "和风",
+        5 => "清风",
+        6 => "强风",
+        7 => "疾风",
+        8 => "大风",
+        9 => "烈风",
+        10 => "狂风",
+        11 => "暴风",
+        _ => "飓风",
     }
 }
 
@@ -1424,7 +1802,7 @@ pub fn parse_open_meteo_response(
         .and_then(|v| v.as_f64())
         .unwrap_or(10.0);
     let wind_level = wind_speed_kmh_to_level(wind_kmh);
-    let wind_label = format!("微风 {wind_level}级");
+    let wind_label = format!("{} {wind_level}级", beaufort_wind_description(wind_level));
 
     // Parse daily array
     let mut daily: Vec<WeatherDailyPoint> = Vec::new();
@@ -1511,7 +1889,14 @@ pub fn parse_open_meteo_response(
 
     // Parse hourly array
     let mut hourly: Vec<WeatherHourlyPoint> = Vec::new();
-    let now_hour = Local::now().hour() as usize;
+    let now_hour = current
+        .get("time")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.split('T').nth(1))
+        .and_then(|hm| hm.split(':').next())
+        .and_then(|h| h.parse::<usize>().ok())
+        .filter(|&h| h < 24)
+        .unwrap_or_else(|| Local::now().hour() as usize);
     if let Some(hourly_obj) = val.get("hourly") {
         let temps = hourly_obj
             .get("temperature_2m")
@@ -1747,15 +2132,15 @@ pub fn parse_stepos_appfunction_weather_json(
         .unwrap_or(70)
         .clamp(0, 100) as u8;
 
+    let wind_scale = json_i64(realtime.get("windScale")).unwrap_or(2).clamp(0, 17);
     let wind_dir = {
         let d = json_str(realtime.get("windDirection"));
         if d.is_empty() {
-            "微风".to_string()
+            beaufort_wind_description(wind_scale as u8).to_string()
         } else {
             d
         }
     };
-    let wind_scale = json_i64(realtime.get("windScale")).unwrap_or(2).max(1);
     let wind_label = format!("{wind_dir} {wind_scale}级");
 
     let air_obj = realtime.get("airQuality").map(json_first);
@@ -1802,15 +2187,17 @@ pub fn parse_stepos_appfunction_weather_json(
             };
             let d_cond = {
                 let wd = json_str(item.get("weatherDay"));
+                let wn = json_str(item.get("weatherNight"));
                 if !wd.is_empty() {
-                    wd
-                } else {
-                    let wn = json_str(item.get("weatherNight"));
-                    if !wn.is_empty() {
-                        wn
+                    if wn.contains('雨') && !wd.contains('雨') {
+                        format!("{wd}转{wn}")
                     } else {
-                        condition.clone()
+                        wd
                     }
+                } else if !wn.is_empty() {
+                    wn
+                } else {
+                    condition.clone()
                 }
             };
             let d_high = json_i64(item.get("tempHigh"))
@@ -2135,6 +2522,21 @@ fn ensure_weather_selection_current(city_revision: u64) -> Result<(), String> {
     }
 }
 
+pub(crate) fn build_open_meteo_forecast_url(lat: f64, lon: f64) -> String {
+    format!(
+        "https://api.open-meteo.com/v1/forecast?latitude={lat:.4}&longitude={lon:.4}&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m&hourly=temperature_2m,precipitation_probability,weather_code&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max&timezone=auto&forecast_days=5"
+    )
+}
+
+fn cached_phone_weather_for_device(device: &crate::device::Device) -> Option<WeatherSnapshot> {
+    let serial_key = phone_weather_cache_key(device)?;
+    let mut guard = WEATHER_SNAPSHOT_CACHE.lock().ok()?;
+    guard.retain(|_, (cached_at, _)| cached_at.elapsed() < WEATHER_SNAPSHOT_TTL);
+    guard.get(&serial_key).and_then(|(cached_at, snapshot)| {
+        (cached_at.elapsed() < WEATHER_SNAPSHOT_TTL).then(|| snapshot.clone())
+    })
+}
+
 /// Fetch for the UI's captured device. This worker does not publish shared UI
 /// data: the callback must first reject a changed device or city selection.
 /// None never discovers a random ADB device. Phone location also never falls
@@ -2144,23 +2546,48 @@ pub fn fetch_live_weather_snapshot_for_device_selection(
     city_revision: u64,
     device: Option<&crate::device::Device>,
 ) -> Result<WeatherSnapshot, String> {
+    fetch_live_weather_snapshot_with_adb(city, city_revision, device, None)
+}
+
+pub(crate) fn fetch_live_weather_snapshot_with_adb(
+    city: &str,
+    city_revision: u64,
+    device: Option<&crate::device::Device>,
+    adb_override: Option<&crate::adb::Adb>,
+) -> Result<WeatherSnapshot, String> {
     ensure_weather_selection_current(city_revision)?;
-    let requested_city = if city.trim().is_empty() {
-        load_preferred_city()
+    let explicit_pref = load_preferred_city_explicit();
+    let raw_trimmed = city.trim();
+    let prefer_any_phone_gps = raw_trimmed == "手机定位"
+        || (explicit_pref.is_none() && (raw_trimmed.is_empty() || raw_trimmed == "上海"))
+        || (raw_trimmed.is_empty() && explicit_pref.as_deref() == Some("手机定位"));
+    let requested_city = if raw_trimmed.is_empty() {
+        explicit_pref.clone().unwrap_or_else(|| "上海".to_string())
     } else {
-        city.trim().to_string()
+        raw_trimmed.to_string()
     };
     let trimmed = requested_city.as_str();
-    let is_other_preset = matches!(trimmed, "苏州" | "杭州" | "南京" | "北京" | "深圳");
-    if !is_other_preset {
+    let try_phone_mcp = prefer_any_phone_gps
+        || matches!(trimmed, "上海" | "上海 · 奉贤区" | "奉贤区");
+    if try_phone_mcp {
         let phone_result = match device {
-            Some(device) => crate::adb::Adb::discover()
-                .map_err(|e| format!("未找到 ADB: {e}"))
-                .and_then(|adb| fetch_weather_for_phone(&adb, device)),
+            Some(device) => {
+                if let Some(cached) = cached_phone_weather_for_device(device) {
+                    Ok(cached)
+                } else if let Some(adb) = adb_override {
+                    fetch_weather_for_phone(adb, device)
+                } else {
+                    crate::adb::Adb::discover()
+                        .map_err(|e| format!("未找到 ADB: {e}"))
+                        .and_then(|adb| fetch_weather_for_phone(&adb, device))
+                }
+            }
             None => Err("未选择手机，无法读取手机定位；请选择手机或指定城市".into()),
         };
         match phone_result {
-            Ok(snapshot) if weather_city_matches(&snapshot, trimmed) => {
+            Ok(snapshot)
+                if prefer_any_phone_gps || weather_city_matches(&snapshot, trimmed) =>
+            {
                 ensure_weather_selection_current(city_revision)?;
                 return Ok(snapshot);
             }
@@ -2174,31 +2601,53 @@ pub fn fetch_live_weather_snapshot_for_device_selection(
     } else {
         trimmed.to_string()
     };
-    let (lat, lon, region_label) = city_coordinates(&target_city);
-    let url = format!(
-        "https://api.open-meteo.com/v1/forecast?latitude={lat:.4}&longitude={lon:.4}&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m&hourly=temperature_2m,precipitation_probability,weather_code&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max&timezone=Asia%2FShanghai&forecast_days=5"
-    );
+    let live_result = city_coordinates(&target_city).and_then(|(lat, lon, region_label)| {
+        if cfg!(test) {
+            return Err("测试环境禁止直接发起 Open-Meteo 网络请求".to_string());
+        }
+        let url = build_open_meteo_forecast_url(lat, lon);
+        let mut cmd = std::process::Command::new("curl");
+        crate::resources::quiet_command(&mut cmd);
+        cmd.args([
+            "-sS",
+            "--connect-timeout",
+            "2.5",
+            "--max-time",
+            "6",
+            &url,
+        ]);
+        crate::adb::run_process(cmd, None, Duration::from_secs(7))
+            .map_err(|e| format!("调用 curl 获取天气失败: {e}"))
+            .and_then(|output| {
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    return Err(format!(
+                        "获取实时天气返回非零状态 ({}): {}",
+                        output.status,
+                        stderr.trim()
+                    ));
+                }
+                let raw_json = String::from_utf8_lossy(&output.stdout);
+                parse_open_meteo_response(&target_city, &region_label, &raw_json)
+            })
+    });
 
-    let output = std::process::Command::new("curl")
-        .args(["-sS", "--max-time", "3", &url])
-        .output()
-        .map_err(|e| format!("调用 curl 获取天气失败: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "获取实时天气返回非零状态 ({}): {}",
-            output.status,
-            stderr.trim()
-        ));
-    }
-
-    let raw_json = String::from_utf8_lossy(&output.stdout);
-    let snapshot = parse_open_meteo_response(&target_city, &region_label, &raw_json)?;
+    let (snapshot, from_stale_cache) = match live_result {
+        Ok(snapshot) => (snapshot, false),
+        Err(err) => {
+            if let Some((stale, _)) =
+                load_disk_weather_snapshot(&target_city, WEATHER_STALE_IF_ERROR_TTL)
+            {
+                (stale, true)
+            } else {
+                return Err(err);
+            }
+        }
+    };
 
     ensure_weather_selection_current(city_revision)?;
 
-    if !cfg!(test) {
+    if !cfg!(test) && !from_stale_cache {
         if let Some(path) = weather_snapshot_cache_path() {
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
@@ -2215,6 +2664,48 @@ pub fn fetch_live_weather_snapshot_for_device_selection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn weather_stale_if_error_disk_cache_honors_24h_bound_and_city_match() {
+        let mut snap = WeatherSnapshot::default_for_city("杭州");
+        snap.temp_c = 19;
+        let raw = serde_json::to_string(&snap).unwrap();
+        assert_eq!(
+            parse_disk_weather_snapshot(
+                &raw,
+                Duration::from_secs(6 * 3600),
+                WEATHER_STALE_IF_ERROR_TTL,
+                "杭州",
+            )
+            .unwrap()
+            .temp_c,
+            19
+        );
+        assert!(parse_disk_weather_snapshot(
+            &raw,
+            Duration::from_secs(24 * 3600),
+            WEATHER_STALE_IF_ERROR_TTL,
+            "杭州",
+        )
+        .is_none());
+        assert!(parse_disk_weather_snapshot(
+            &raw,
+            Duration::from_secs(600),
+            WEATHER_STALE_IF_ERROR_TTL,
+            "北京",
+        )
+        .is_none());
+        let mut mcp_snap = snap;
+        mcp_snap.region_label = "手机定位 · 系统天气 MCP".into();
+        let mcp_raw = serde_json::to_string(&mcp_snap).unwrap();
+        assert!(parse_disk_weather_snapshot(
+            &mcp_raw,
+            Duration::from_secs(600),
+            WEATHER_STALE_IF_ERROR_TTL,
+            "杭州",
+        )
+        .is_none());
+    }
 
     #[test]
     fn weather_legacy_discovery_refuses_ambiguous_endpoints() {
@@ -2315,19 +2806,36 @@ mod tests {
         assert!(error.contains("未选择手机") || error.contains("城市已变更"));
     }
 
+    static TEST_GLOBAL_STATE_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn preferred_city_load_restores_disk_once_and_preserves_a_newer_selection() {
         let cache = Mutex::new(None);
         assert_eq!(load_preferred_city_with(&cache, || Some(" 杭州\n".into())), "杭州");
         assert_eq!(load_preferred_city_with(&cache, || panic!("must use memory")), "杭州");
+
+        let unset_cache = Mutex::new(None);
+        assert_eq!(load_preferred_city_explicit_with(&unset_cache, || None), None);
+        assert_eq!(
+            load_preferred_city_explicit_with(&unset_cache, || panic!("must cache unset None")),
+            None
+        );
+        assert_eq!(
+            load_preferred_city_with(&unset_cache, || panic!("must cache unset None")),
+            "上海"
+        );
+
         for saved in [Some("杭州".to_string()), None] {
             let cache = Mutex::new(None);
             let city = load_preferred_city_with(&cache, || {
-                *cache.lock().unwrap() = Some("苏州".to_string());
+                *cache.lock().unwrap() = Some(Some("苏州".to_string()));
                 saved
             });
             assert_eq!(city, "苏州");
-            assert_eq!(cache.lock().unwrap().as_deref(), Some("苏州"));
+            assert_eq!(
+                cache.lock().unwrap().as_ref().and_then(|v| v.as_deref()),
+                Some("苏州")
+            );
         }
     }
 
@@ -2475,11 +2983,17 @@ mod tests {
 
     #[test]
     fn preferred_city_roundtrip_in_memory_during_test() {
+        let _guard = TEST_GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         save_preferred_city("苏州");
+        assert_eq!(load_preferred_city_explicit().as_deref(), Some("苏州"));
         assert_eq!(load_preferred_city(), "苏州");
         let snap = load_or_default_weather(None);
         assert_eq!(snap.city, "苏州");
         save_preferred_city("上海");
+        assert_eq!(load_preferred_city_explicit().as_deref(), Some("上海"));
+        assert_eq!(load_preferred_city(), "上海");
+        clear_preferred_city();
+        assert_eq!(load_preferred_city_explicit(), None);
         assert_eq!(load_preferred_city(), "上海");
     }
 
@@ -2720,14 +3234,15 @@ mod tests {
         assert_eq!(snap.daily[0].ymd, "2026-11-05");
         assert_eq!(snap.daily[0].advice, "穿薄外套，不用带伞");
         assert_eq!(snap.daily[1].date_label, "明天");
-        assert_eq!(snap.daily[1].advice, "穿长袖或薄卫衣，不用带伞");
+        assert_eq!(snap.daily[1].condition, "多云转小雨");
+        assert_eq!(snap.daily[1].advice, "穿长袖或薄卫衣，记得带伞");
         assert_eq!(snap.tomorrow_temp_delta_label(), "+2°C");
-        assert!(!snap.tomorrow_umbrella_needed());
-        assert_eq!(snap.tomorrow_headline(), "明天 多云 15°~20°C");
-        assert_eq!(snap.tomorrow_advice(), "穿长袖或薄卫衣，不用带伞");
+        assert!(snap.tomorrow_umbrella_needed());
+        assert_eq!(snap.tomorrow_headline(), "明天 多云转小雨 15°~20°C");
+        assert_eq!(snap.tomorrow_advice(), "穿长袖或薄卫衣，记得带伞");
         assert_eq!(
             snap.build_tomorrow_schedule_note(),
-            "【明日天气提醒 · 上海 · 奉贤区】明天 多云 15°~20°C · 穿长袖或薄卫衣，不用带伞"
+            "【明日天气提醒 · 上海 · 奉贤区】明天 多云转小雨 15°~20°C · 穿长袖或薄卫衣，记得带伞"
         );
         assert_eq!(snap.hourly.len(), 2);
         assert_eq!(snap.hourly[0].hour_label, "现在");
@@ -2938,5 +3453,287 @@ exit 0
                 .is_none(),
             "stale date on phone must not match next day"
         );
+    }
+
+    #[test]
+    fn unset_preferred_city_uses_phone_gps_in_beijing_or_shenzhen_and_scopes_cache_by_device() {
+        let _guard = TEST_GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_preferred_city();
+        assert_eq!(load_preferred_city_explicit(), None);
+        assert_eq!(load_preferred_city(), "上海");
+
+        let bj_phone = crate::device::Device {
+            serial: "STEPOS_BJ_PHONE_01".to_string(),
+            transport: "STEPOS_BJ_PHONE_01".to_string(),
+            ..Default::default()
+        };
+        let mut bj_gps = WeatherSnapshot::default_for_city("北京");
+        bj_gps.city = "北京 · 海淀区".to_string();
+        bj_gps.region_label = "手机定位 · 系统天气 MCP".to_string();
+        bj_gps.from_live_api = true;
+        bj_gps.temp_c = 13;
+
+        {
+            let mut cache = WEATHER_SNAPSHOT_CACHE.lock().unwrap();
+            cache.insert(bj_phone.serial.clone(), (Instant::now(), bj_gps.clone()));
+        }
+
+        // UI startup passes `load_preferred_city()` ("上海") when city_for_fetch is empty.
+        // Because `load_preferred_city_explicit()` is `None`, the Beijing phone's real GPS
+        // weather must be returned instead of being discarded for Shanghai!
+        let rev = weather_selection_revision();
+        let fetched =
+            fetch_live_weather_snapshot_for_device_selection("上海", rev, Some(&bj_phone))
+                .expect("should accept Beijing phone GPS when no city was explicitly pinned");
+        assert_eq!(fetched.city, "北京 · 海淀区");
+        assert_eq!(fetched.temp_c, 13);
+
+        publish_weather_snapshot_for_device_selection(&fetched, rev, Some(&bj_phone))
+            .expect("publish Beijing phone GPS");
+        assert_eq!(
+            cached_weather_snapshot_for(Some("STEPOS_BJ_PHONE_01"))
+                .as_ref()
+                .map(|s| s.city.as_str()),
+            Some("北京 · 海淀区")
+        );
+        assert!(
+            cached_weather_snapshot_for(Some("STEPOS_OTHER_PHONE_02")).is_none(),
+            "device-scoped cache must reject another phone's serial"
+        );
+        assert!(
+            cached_weather_snapshot_for(Some("")).is_none(),
+            "device-scoped cache must reject empty device key for phone-bound GPS snapshot"
+        );
+        assert_eq!(
+            cached_weather_snapshot().as_ref().map(|s| s.city.as_str()),
+            Some("北京 · 海淀区")
+        );
+
+        // Once the user manually pins "上海", Beijing GPS is no longer treated as matching "上海".
+        save_preferred_city("上海");
+        assert_eq!(load_preferred_city_explicit().as_deref(), Some("上海"));
+        assert!(
+            cached_weather_snapshot_for(Some("STEPOS_BJ_PHONE_01")).is_none(),
+            "explicitly pinned Shanghai must not display Beijing GPS cache"
+        );
+
+        // Clean up global test state
+        clear_preferred_city();
+        if let Ok(mut cache) = WEATHER_SNAPSHOT_CACHE.lock() {
+            cache.remove(&bj_phone.serial);
+        }
+        if let Ok(mut snap_cache) = SNAPSHOT_MEM_CACHE.lock() {
+            *snap_cache = None;
+        }
+    }
+
+    #[test]
+    fn open_meteo_timezone_auto_unknown_city_error_and_beaufort_wind_labels() {
+        let url = build_open_meteo_forecast_url(39.9042, 116.4074);
+        assert!(url.contains("timezone=auto"));
+        assert!(!url.contains("Asia%2FShanghai"));
+
+        // Unknown city names must return Err instead of fake Shanghai coordinates.
+        assert!(city_coordinates("不存在的火星城市").is_err());
+        assert!(city_coordinates("").is_err());
+        let _guard = TEST_GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let rev = weather_selection_revision();
+        let err =
+            fetch_live_weather_snapshot_for_device_selection("不存在的火星城市", rev, None)
+                .expect_err("unknown city must fail cleanly instead of faking Shanghai");
+        assert!(err.contains("不存在的火星城市"));
+        drop(_guard);
+
+        // Geocoding parser handles valid Open-Meteo geocoding results and empty results.
+        let geocode_ok = r#"{"results":[{"name":"成都","latitude":30.6667,"longitude":104.0667,"admin1":"四川","country":"中国"}]}"#;
+        let (lat, lon, label) =
+            parse_open_meteo_geocoding_response("成都", geocode_ok).expect("valid geocoding");
+        assert!((lat - 30.6667).abs() < 1e-3);
+        assert!((lon - 104.0667).abs() < 1e-3);
+        assert_eq!(label, "成都 · 四川");
+        assert!(parse_open_meteo_geocoding_response("虚构城", r#"{"results":[]}"#).is_err());
+
+        // Beaufort wind scale descriptions across calm, gentle, strong, and gale winds.
+        assert_eq!((wind_speed_kmh_to_level(0.4), beaufort_wind_description(0)), (0, "无风"));
+        assert_eq!((wind_speed_kmh_to_level(8.5), beaufort_wind_description(2)), (2, "轻风"));
+        assert_eq!((wind_speed_kmh_to_level(15.2), beaufort_wind_description(3)), (3, "微风"));
+        assert_eq!((wind_speed_kmh_to_level(45.0), beaufort_wind_description(6)), (6, "强风"));
+        assert_eq!((wind_speed_kmh_to_level(68.0), beaufort_wind_description(8)), (8, "大风"));
+        assert_eq!((wind_speed_kmh_to_level(125.0), beaufort_wind_description(12)), (12, "飓风"));
+
+        let strong_wind_json = r#"{
+            "current": {
+                "time": "2026-11-05T14:00",
+                "temperature_2m": 12.0,
+                "relative_humidity_2m": 40,
+                "apparent_temperature": 9.0,
+                "weather_code": 1,
+                "wind_speed_10m": 45.0
+            },
+            "hourly": {
+                "temperature_2m": [12.0, 12.0, 12.0, 12.0, 12.0, 12.0],
+                "precipitation_probability": [0, 0, 0, 0, 0, 0],
+                "weather_code": [1, 1, 1, 1, 1, 1]
+            },
+            "daily": {
+                "time": ["2026-11-05", "2026-11-06"],
+                "weather_code": [1, 0],
+                "temperature_2m_max": [15.0, 16.0],
+                "temperature_2m_min": [6.0, 7.0],
+                "precipitation_probability_max": [5, 5]
+            }
+        }"#;
+        let parsed =
+            parse_open_meteo_response("北京", "北京 · 华北", strong_wind_json).expect("valid json");
+        assert_eq!(parsed.wind_label, "强风 6级");
+    }
+
+    #[test]
+    fn stepos_weather_night_rain_triggers_today_umbrella_warning() {
+        let night_rain_json = r#"{
+          "androidAppfunctionsReturnValue": [{
+            "data": [{
+              "region": [{"province": ["广东省"], "city": ["南山区"]}],
+              "realtime": [{
+                "temp": ["26"],
+                "sendibleTemp": ["27"],
+                "weather": ["多云"],
+                "humidity": ["72"],
+                "windDirection": [""],
+                "windScale": ["5"],
+                "uvi": [4],
+                "updateTime": ["2026-11-05 11:00:00"],
+                "airQuality": [{"aqi": [22], "quality": ["优"]}]
+              }],
+              "daily": [{
+                "fullDate": ["2026-11-05"],
+                "week": ["今天"],
+                "tempLow": ["21"],
+                "tempHigh": ["28"],
+                "weatherDay": ["晴"],
+                "weatherNight": ["雷阵雨"],
+                "pop": [15],
+                "lifeIndexes": []
+              }]
+            }]
+          }]
+        }"#;
+        let snap = parse_stepos_appfunction_weather_json(night_rain_json, None)
+            .expect("valid stepos night rain json");
+        assert_eq!(snap.city, "广东 · 南山区");
+        assert_eq!(snap.wind_label, "清风 5级");
+        assert_eq!(snap.daily[0].condition, "晴转雷阵雨");
+        assert!(snap.umbrella_needed);
+        assert!(snap.commute_advice.contains("带伞"));
+        assert!(snap.backscreen_badge.contains("带伞"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_daily_weather_advice_for_device_uses_only_selected_device_and_respects_source_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join("adb_selected_calls.log");
+        let phone_b_advice = dir.path().join("phone_b_advice.json");
+        let script_path = dir.path().join("fake_adb_multi.sh");
+
+        let preseeded = CachedDailyWeatherAdvice {
+            date_ymd: "2026-11-05".to_string(),
+            city: "深圳 · 南山区".to_string(),
+            today_short: "穿短袖，不用带伞".to_string(),
+            tomorrow_advice: "手机B缓存建议：明日带伞".to_string(),
+            generated_by_amoo: true,
+        };
+        std::fs::write(
+            &phone_b_advice,
+            serde_json::to_string(&preseeded).unwrap(),
+        )
+        .unwrap();
+
+        let script = format!(
+            r#"#!/usr/bin/env bash
+echo "$@" >> "{log}"
+if [ "$1" = "devices" ]; then
+  printf "List of devices attached\nPHONE_A_FIRST\tdevice\nPHONE_B_SELECTED\tdevice\n"
+  exit 0
+fi
+if [ "$1" = "-s" ] && [ "$2" = "PHONE_B_SELECTED" ]; then
+  case "$*" in
+    *"cat '/sdcard/Android/data/com.stepx.companion.app/files/weather_daily_advice.json'"*)
+      cat "{phone_b}"
+      exit 0
+      ;;
+  esac
+fi
+exit 1
+"#,
+            log = log_path.display(),
+            phone_b = phone_b_advice.display(),
+        );
+        std::fs::write(&script_path, script).unwrap();
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+
+        let adb = crate::adb::Adb { path: script_path };
+        let phone_b = crate::device::Device {
+            serial: "PHONE_B_SELECTED".to_string(),
+            transport: "PHONE_B_SELECTED".to_string(),
+            ..Default::default()
+        };
+        let mut snap = WeatherSnapshot::default_for_city("深圳");
+        snap.city = "深圳 · 南山区".to_string();
+        snap.region_label = "手机定位 · 系统天气 MCP".to_string();
+
+        // 1. ManualCity mode must NOT touch ADB even when phone_b is selected.
+        let manual_cache = Mutex::new(None);
+        let manual_res = resolve_daily_weather_advice_for_date_and_device(
+            &snap,
+            "2026-11-05",
+            &manual_cache,
+            false,
+            Some(&adb),
+            Some(&phone_b),
+            WeatherSourceMode::ManualCity,
+        );
+        assert!(!manual_res.generated_by_amoo);
+        assert!(
+            std::fs::read_to_string(&log_path).unwrap_or_default().is_empty(),
+            "ManualCity mode must spawn 0 ADB commands"
+        );
+
+        // 2. None selected_device in PhoneLocation mode must NOT discover or pick PHONE_A_FIRST.
+        let none_cache = Mutex::new(None);
+        let _ = resolve_daily_weather_advice_for_date_and_device(
+            &snap,
+            "2026-11-05",
+            &none_cache,
+            false,
+            Some(&adb),
+            None,
+            WeatherSourceMode::PhoneLocation,
+        );
+        assert!(
+            std::fs::read_to_string(&log_path).unwrap_or_default().is_empty(),
+            "unselected device must spawn 0 ADB commands and never pick first ADB device"
+        );
+
+        // 3. Selected phone_b in PhoneLocation mode reads directly from PHONE_B_SELECTED.
+        let selected_cache = Mutex::new(None);
+        let selected_res = resolve_daily_weather_advice_for_date_and_device(
+            &snap,
+            "2026-11-05",
+            &selected_cache,
+            false,
+            Some(&adb),
+            Some(&phone_b),
+            WeatherSourceMode::PhoneLocation,
+        );
+        assert_eq!(selected_res, preseeded);
+        let calls = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(calls.contains("-s PHONE_B_SELECTED"));
+        assert!(!calls.contains("PHONE_A_FIRST"));
+        assert!(!calls.contains("devices"));
     }
 }

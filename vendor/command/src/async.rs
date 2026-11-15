@@ -14,6 +14,8 @@ use std::process::{ExitStatus, Output, Stdio};
 /// `CREATE_NO_WINDOW` flag to avoid a console window temporarily popping up.
 pub struct Command {
     pub(super) inner: async_process::Command,
+    #[cfg(windows)]
+    extra_creation_flags: u32,
     stdin_is_default: bool,
     stdout_is_default: bool,
     stderr_is_default: bool,
@@ -115,6 +117,7 @@ impl Command {
 
         Self {
             inner,
+            extra_creation_flags,
             stdin_is_default: true,
             stdout_is_default: true,
             stderr_is_default: true,
@@ -346,6 +349,29 @@ impl Command {
         self
     }
 
+    fn spawn_configured(&mut self) -> io::Result<Child> {
+        #[cfg(windows)]
+        {
+            const ERROR_ACCESS_DENIED: i32 = 5;
+            match self.inner.spawn() {
+                Err(err) if err.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {
+                    use async_process::windows::CommandExt;
+                    self.inner.creation_flags(
+                        windows::Win32::System::Threading::CREATE_NO_WINDOW.0
+                            | self.extra_creation_flags,
+                    );
+                    self.inner.spawn()
+                }
+                res => res,
+            }
+        }
+
+        #[cfg(not(windows))]
+        {
+            self.inner.spawn()
+        }
+    }
+
     /// Executes the command and returns the [`Child`] handle to it.
     ///
     /// If not configured, stdin, stdout and stderr will be set to [`Stdio::null()`].
@@ -370,7 +396,7 @@ impl Command {
             self.inner.stderr(Stdio::null());
         }
 
-        self.inner.spawn()
+        self.spawn_configured()
     }
 
     /// Executes the command, waits for it to exit, and returns the exit status.
@@ -391,17 +417,11 @@ impl Command {
     /// # std::io::Result::Ok(()) });
     /// ```
     pub fn status(&mut self) -> impl Future<Output = io::Result<ExitStatus>> {
-        if self.stdin_is_default {
-            self.inner.stdin(Stdio::null());
+        let child = self.spawn();
+        async move {
+            let mut child = child?;
+            child.status().await
         }
-        if self.stdout_is_default {
-            self.inner.stdout(Stdio::null());
-        }
-        if self.stderr_is_default {
-            self.inner.stderr(Stdio::null());
-        }
-
-        self.inner.status()
     }
 
     /// Executes the command and collects its output.
@@ -432,7 +452,8 @@ impl Command {
             self.inner.stderr(Stdio::piped());
         }
 
-        self.inner.output()
+        let child = self.spawn_configured();
+        async move { child?.output().await }
     }
 }
 

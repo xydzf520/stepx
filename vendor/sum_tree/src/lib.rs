@@ -6,9 +6,9 @@ pub use cursor::FilterCursor;
 
 mod cursor;
 
-#[cfg(feature = "test-util")]
+#[cfg(any(test, feature = "test-util"))]
 const TREE_BASE: usize = 2;
-#[cfg(not(feature = "test-util"))]
+#[cfg(not(any(test, feature = "test-util")))]
 const TREE_BASE: usize = 6;
 
 pub trait Item: Clone + fmt::Debug {
@@ -61,7 +61,7 @@ impl<T: Item> SumTree<T> {
         tree
     }
 
-    #[cfg(feature = "test-util")]
+    #[cfg(any(test, feature = "test-util"))]
     pub fn items(&self) -> Vec<T> {
         let mut cursor = self.cursor::<(), ()>();
         cursor.descend_to_first_item(self, |_| true);

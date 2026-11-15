@@ -315,6 +315,16 @@ impl Presenter {
         }
     }
 
+    /// Releases the retained [`Scene`] and view element trees so any strong
+    /// `Arc<StaticImage>` references held by the last frame are dropped promptly
+    /// when a window closes.
+    pub fn clear_scene(&mut self) {
+        self.scene = None;
+        self.rendered_views.clear();
+        self.parents.clear();
+        self.position_cache = PositionCache::default();
+    }
+
     pub fn invalidate(&mut self, invalidation: WindowInvalidation, app: &AppContext) {
         // Don't try to update views that were also removed
         for &view_id in invalidation.updated.difference(&invalidation.removed) {

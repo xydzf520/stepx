@@ -94,18 +94,6 @@ impl Companion {
                         }
                         if !target.sms_address.is_empty() {
                             self.mark_sms_thread_read(&target.sms_address);
-                            let norm = stepx_companion::home_reminder_governance::normalize_phone_or_addr(
-                                &target.sms_address,
-                            );
-                            for c in &mut self.call_logs {
-                                if stepx_companion::home_reminder_governance::normalize_phone_or_addr(
-                                    &c.number,
-                                ) == norm
-                                    && c.call_type == 3
-                                {
-                                    c.call_type = 1;
-                                }
-                            }
                         }
                         if !target.im_thread_id.is_empty() {
                             for t in &mut self.push.snapshot.threads {
@@ -294,8 +282,6 @@ impl Companion {
                         self.status = format!("已切换至「{tab_lbl}」标签页");
                     }
                     HomeReminderAction::PurgeExpiredNow => {
-                        let today = now_local.date_naive();
-                        let now_min = now_local.hour() * 60 + now_local.minute();
                         let mut purged = 0usize;
                         let ended_events: Vec<_> = self
                             .back_screen
@@ -303,25 +289,13 @@ impl Companion {
                             .calendar_events
                             .iter()
                             .filter(|ev| {
-                                let (ey, em, ed) = ev.date_ymd();
-                                if (ey, em, ed) != (today.year(), today.month(), today.day())
-                                    || ev.all_day
+                                if ev.is_e2e_probe()
                                     || self.calendar_event_action_limit(ev.id).is_some()
                                     || self.back_screen.completed_calendar_events.contains(&ev.id)
                                 {
                                     return false;
                                 }
-                                let end_min =
-                                    stepx_companion::home_hub::timestamp_to_local_ymd_parts(
-                                        if ev.dtend > ev.dtstart {
-                                            ev.dtend / 1000
-                                        } else {
-                                            ev.dtstart / 1000 + 3600
-                                        },
-                                    )
-                                    .map(|(_, h, m)| h * 60 + m)
-                                    .unwrap_or(23 * 60 + 59);
-                                end_min <= now_min
+                                super::calendar_event_is_ended_at(ev, now_ms)
                             })
                             .map(|ev| (ev.id, ev.title.clone(), ev.time_range_label()))
                             .collect();
@@ -352,9 +326,24 @@ impl Companion {
                         };
                     }
                     HomeReminderAction::ClearAllGovernanceEntries => {
+                        let muted_keys: Vec<String> = self
+                            .reminder_governance
+                            .muted_sources
+                            .keys()
+                            .cloned()
+                            .collect();
+                        for source_key in muted_keys {
+                            self.reminder_governance.unmute_source(&source_key);
+                        }
                         self.reminder_governance.clear_all_suppressed();
                         self.back_screen.dismissed_capsule_ids.clear();
-                        self.status = "已清空全部手动过期与稍后提醒记录".into();
+                        self.push.prefs.dismissed_pickup_codes.clear();
+                        let _ = self.push.prefs.save();
+                        self.back_screen.completed_calendar_events.clear();
+                        self.back_screen.save_completed_calendar_events();
+                        self.sync_live_express_parcels();
+                        self.sync_notification_center();
+                        self.status = "已恢复全部已屏蔽/已归档提醒".into();
                     }
                 }
             }
@@ -1022,12 +1011,13 @@ impl Companion {
             Action::HomeSelectReplyTarget {
                 key,
                 thread_id,
-                package_name: _,
+                package_name,
                 title,
             } => {
                 self.push.selected_key = Some(key.clone());
                 self.push.replying_key = Some(key.clone());
                 self.push.selected_im_thread = Some(thread_id.clone());
+                self.pin_home_reply_target(key, thread_id, package_name, title);
                 self.focus = Some(F_PUSH_REPLY);
                 if let Some(c) = ctx {
                     self.focus_field(F_PUSH_REPLY, c);
@@ -1106,6 +1096,7 @@ impl Companion {
                         .trim()
                         .to_string();
                     self.fields[F_PUSH_REPLY].clear();
+                    self.clear_home_reply_target_lock();
                     return self.apply_home_action(
                         &Action::HomeQuickSmsReply {
                             number,
@@ -1129,6 +1120,9 @@ impl Companion {
                     self.fields[F_PUSH_REPLY].clear();
                     self.dispatch_im_reply(thread_id, package_name, title, text, Some(key));
                     self.status = format!("已发送回复至「{title}」：{text}");
+                }
+                if self.fields[F_PUSH_REPLY].text.is_empty() && self.focus != Some(F_PUSH_REPLY) {
+                    self.clear_home_reply_target_lock();
                 }
                 self.error = false;
             }
@@ -1490,33 +1484,7 @@ impl Companion {
                 }
             }
             Action::WeatherSelectDay(day_idx) => {
-                self.error = false;
-                let max_idx = self.weather_snapshot.daily.len().saturating_sub(1);
-                self.weather_selected_day = (*day_idx).min(max_idx);
-                if let Some(day) = self
-                    .weather_snapshot
-                    .daily
-                    .get(self.weather_selected_day)
-                    .cloned()
-                {
-                    let slot_desc = format!(
-                        "{}（{}）{} {}°~{}°C，{}",
-                        day.date_label, day.ymd, day.condition, day.low_c, day.high_c, day.advice
-                    );
-                    let prompt = self
-                        .weather_snapshot
-                        .build_weather_context_prompt(Some(&slot_desc), &[]);
-                    self.fields[F_HOME_COMMAND].set(&prompt);
-                    self.status = format!(
-                        "已选中「{} · {}」：{} {}°~{}°C（{}）",
-                        self.weather_snapshot.city,
-                        day.date_label,
-                        day.condition,
-                        day.low_c,
-                        day.high_c,
-                        day.advice
-                    );
-                }
+                self.apply_weather_select_day(*day_idx);
             }
             Action::WeatherBringToAmoo(focus) => {
                 let schedule_titles: Vec<String> = self
@@ -1531,7 +1499,6 @@ impl Companion {
                 let prompt = self
                     .weather_snapshot
                     .build_weather_context_prompt(focus.as_deref(), &schedule_titles);
-                self.fields[F_HOME_COMMAND].set(&prompt);
                 self.fields[F_AMOO].set(&prompt);
                 self.page = Page::Amoo;
                 self.workspace.sub_view = 0;

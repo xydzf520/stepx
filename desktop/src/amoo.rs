@@ -25,38 +25,62 @@ static AMOO_CONTEXT_CACHE: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, (Instant, Value)>>,
 > = std::sync::OnceLock::new();
 
-fn should_inject_device_telemetry(text: &str) -> bool {
+pub(crate) fn needs_device_telemetry(text: &str) -> bool {
     let lower = text.to_lowercase();
     [
         "保修",
         "三包",
-        "激活",
+        "激活时间",
+        "激活日期",
+        "手机激活",
         "序列号",
-        "sn",
+        "本机sn",
+        "手机sn",
         "asn",
+        "cmiit",
         "关于本机",
         "本机信息",
         "手机配置",
-        "硬件",
-        "型号",
+        "手机硬件",
+        "手机型号",
+        "本机型号",
+        "手机电量",
+        "剩余电量",
         "电池健康",
         "电池寿命",
+        "电池容量",
         "soh",
         "循环次数",
         "充电循环",
-        "旁路",
-        "快充",
-        "电池容量",
-        "温度",
-        "发热",
-        "发烫",
-        "热力",
-        "npu",
-        "算力",
+        "旁路充电",
+        "手机快充",
+        "手机发烫",
+        "机身发烫",
+        "电池发烫",
+        "手机发热",
+        "机身发热",
+        "手机温度",
+        "电池温度",
+        "机身温度",
+        "手机卡顿",
+        "手机很卡",
+        "手机内存",
+        "运行内存",
+        "手机存储",
+        "机身存储",
+        "存储空间不足",
+        "手机空间不足",
         "手机状态",
+        "本机状态",
+        "npu算力",
+        "手机算力",
     ]
     .iter()
     .any(|kw| lower.contains(kw))
+}
+
+fn should_inject_device_telemetry(text: &str) -> bool {
+    needs_device_telemetry(text)
 }
 
 fn format_live_device_telemetry_block(raw: &str, device: &Device) -> Option<String> {
@@ -1063,6 +1087,7 @@ impl AgentBus {
                         "localabstract:agentbus",
                         Some(self.port),
                     );
+                    crate::device::invalidate_verified_transport(&self.device.transport);
                     if let Ok(active) = self.device.resolve_active_transport(&self.adb) {
                         if active != self.device.transport {
                             self.adb
@@ -1127,6 +1152,7 @@ impl AgentBus {
     }
 
     fn reconnect_stream(&mut self) -> Result<()> {
+        crate::device::invalidate_verified_transport(&self.device.transport);
         if let Ok(active) = self.device.resolve_active_transport(&self.adb) {
             if active != self.device.transport {
                 self.adb
@@ -1574,14 +1600,19 @@ impl AgentBus {
         selected: Option<&str>,
         pending: &[String],
     ) -> Result<RealAmooData> {
-        let snapshot_started = Instant::now();
-        let scope_before_res = crate::amoo_usage::account_scope(&self.adb, &self.device);
-        let scope_before = scope_before_res.as_ref().ok().cloned().flatten();
+        let scope_before = crate::amoo_usage::account_scope(&self.adb, &self.device)
+            .ok()
+            .flatten();
         let payload = self.call("sessions.list", json!({"limit":100}))?;
         let rows = payload["sessions"]
             .as_array()
             .context("Amoo 未返回会话列表")?;
         let mut data = parse_sessions(rows)?;
+        data.sessions.retain(|s| {
+            selected == Some(s.key.as_str())
+                || pending.contains(&s.key)
+                || !crate::inference_sessions::is_temporary_session_key(&s.key)
+        });
         data.account_scope = scope_before;
         data.gateway_version = self.version.clone();
         data.gateway_online = true;
@@ -1644,14 +1675,9 @@ impl AgentBus {
             );
             session.history_loaded = true;
         }
-        let scope_after =
-            if scope_before_res.is_ok() && snapshot_started.elapsed() < Duration::from_secs(5) {
-                data.account_scope.clone()
-            } else {
-                crate::amoo_usage::account_scope(&self.adb, &self.device)
-                    .ok()
-                    .flatten()
-            };
+        let scope_after = crate::amoo_usage::account_scope_fresh(&self.adb, &self.device)
+            .ok()
+            .flatten();
         if data.account_scope != scope_after {
             bail!("同步期间手机 Amoo 账号已改变，请重新同步；未合并不同账号的记录");
         }
@@ -1750,8 +1776,12 @@ impl AgentBus {
     }
 
     pub fn create_session(&mut self) -> Result<String> {
+        self.create_temporary_session("desktop-")
+    }
+
+    pub fn create_temporary_session(&mut self, prefix: &str) -> Result<String> {
         // The same protocol as Amoo's createOpenClawSession; never reset an existing key.
-        let key = format!("agent:main:desktop-{:032x}", rand::random::<u128>());
+        let key = format!("agent:main:{prefix}{:032x}", rand::random::<u128>());
         let payload = self.call("sessions.reset", json!({"key":key,"reason":"new"}))?;
         Ok(payload
             .get("key")
@@ -3146,7 +3176,40 @@ mod tests {
     fn live_device_telemetry_matches_hardware_queries_and_strips_marker_from_user_history() {
         assert!(should_inject_device_telemetry("看下手机的保修情况"));
         assert!(should_inject_device_telemetry("电池健康度和循环次数"));
+        for explicit in [
+            "手机电量",
+            "剩余电量",
+            "手机发烫",
+            "手机发热",
+            "手机卡顿",
+            "手机内存",
+            "手机存储",
+            "存储空间不足",
+        ] {
+            assert!(
+                should_inject_device_telemetry(explicit),
+                "expected telemetry for {explicit}"
+            );
+        }
         assert!(!should_inject_device_telemetry("上海的天气"));
+        for false_positive in [
+            "电影",
+            "电脑",
+            "电视",
+            "电话",
+            "银行卡",
+            "信用卡",
+            "打卡",
+            "麻辣烫",
+            "时间复杂度",
+            "空间复杂度",
+            "解析 json 数据",
+        ] {
+            assert!(
+                !should_inject_device_telemetry(false_positive),
+                "unexpected telemetry for {false_positive}"
+            );
+        }
 
         let device = Device {
             transport: "STEPX_TEST_DEVICE".into(),

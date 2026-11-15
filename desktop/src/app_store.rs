@@ -2340,7 +2340,101 @@ pub fn merge_and_deduplicate_apps(apps: Vec<StoreApp>) -> Vec<StoreApp> {
         }
     }
 
+    register_apps_offer_digests(&out);
     out
+}
+
+static OFFER_DIGEST_REGISTRY: OnceLock<Mutex<HashMap<String, (String, String)>>> = OnceLock::new();
+static CURATED_DIGESTS_SEEDED: OnceLock<()> = OnceLock::new();
+
+fn normalize_hex_digest(raw: &str, expected_len: usize) -> String {
+    let trimmed = raw
+        .trim()
+        .strip_prefix("sha256:")
+        .or_else(|| raw.trim().strip_prefix("md5:"))
+        .unwrap_or(raw.trim())
+        .trim();
+    if trimmed.len() == expected_len && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        trimmed.to_ascii_lowercase()
+    } else {
+        String::new()
+    }
+}
+
+fn offer_digest_registry() -> &'static Mutex<HashMap<String, (String, String)>> {
+    OFFER_DIGEST_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn record_offer_digests(url: &str, md5: &str, sha256: &str) {
+    let clean_url = url.trim();
+    if clean_url.is_empty() {
+        return;
+    }
+    let norm_md5 = normalize_hex_digest(md5, 32);
+    let norm_sha256 = normalize_hex_digest(sha256, 64);
+    if norm_md5.is_empty() && norm_sha256.is_empty() {
+        return;
+    }
+    let Ok(mut guard) = offer_digest_registry().lock() else {
+        return;
+    };
+    let mut insert_for = |u: String| {
+        if u.is_empty() {
+            return;
+        }
+        let entry = guard.entry(u).or_insert_with(|| (String::new(), String::new()));
+        if !norm_md5.is_empty() {
+            entry.0 = norm_md5.clone();
+        }
+        if !norm_sha256.is_empty() {
+            entry.1 = norm_sha256.clone();
+        }
+    };
+    insert_for(clean_url.to_string());
+    if clean_url.contains("sjy.00008/") || clean_url.contains("sjy.00009/") {
+        insert_for(
+            clean_url
+                .replace("sjy.00008/", "sjy.00022/")
+                .replace("sjy.00009/", "sjy.00022/"),
+        );
+    }
+    if clean_url.contains("store-drcn.hispace.dbankcloud.com/") {
+        let base = clean_url.split('?').next().unwrap_or(clean_url);
+        insert_for(base.replace(
+            "https://store-drcn.hispace.dbankcloud.com/",
+            "https://appdl-drcn.dbankcdn.com/",
+        ));
+    }
+}
+
+fn register_apps_offer_digests(apps: &[StoreApp]) {
+    for app in apps {
+        for offer in &app.sources {
+            if !offer.md5.trim().is_empty() {
+                record_offer_digests(&offer.download_url, &offer.md5, "");
+            }
+        }
+    }
+}
+
+fn lookup_offer_digests(raw_url: &str, final_url: &str) -> (String, String) {
+    CURATED_DIGESTS_SEEDED.get_or_init(|| {
+        let catalog = curated_catalog();
+        register_apps_offer_digests(&catalog);
+    });
+    if let Ok(guard) = offer_digest_registry().lock() {
+        for candidate in [raw_url.trim(), final_url.trim()] {
+            if candidate.is_empty() {
+                continue;
+            }
+            if let Some((m, s)) = guard.get(candidate) {
+                if !m.is_empty() || !s.is_empty() {
+                    return (m.clone(), s.clone());
+                }
+            }
+        }
+    }
+    (String::new(), String::new())
 }
 
 fn store_cache_root() -> PathBuf {
@@ -5942,7 +6036,8 @@ fn run_python_json(script: &str, args: &[&str], timeout_secs: u64) -> Result<ser
     for a in args {
         cmd.arg(a);
     }
-    let out = cmd.output().context("failed to execute python helper")?;
+    let out = crate::adb::run_process(cmd, None, std::time::Duration::from_secs(25))
+        .context("failed to execute python helper")?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(anyhow!("python helper failed: {}", stderr.trim()));
@@ -6686,19 +6781,28 @@ def merge_batch(batch):
                 cur["md5"] = item["md5"]
                 cur["download_url"] = item["download_url"]
 
-with ThreadPoolExecutor(max_workers=20) as ex:
+import os as _os, time as _time
+_deadline = _time.monotonic() + min(timeout, 20.0)
+ex = ThreadPoolExecutor(max_workers=20)
+try:
     futs = (
         [ex.submit(run_tencent_job, j) for j in tc_jobs]
         + [ex.submit(run_aptoide_job, j) for j in APTOIDE_JOBS]
         + [ex.submit(run_fdroid_job, j) for j in FDROID_QUERIES]
     )
     for fut in futs:
+        rem = _deadline - _time.monotonic()
+        if rem <= 0:
+            break
         try:
-            merge_batch(fut.result(timeout=7.5))
+            merge_batch(fut.result(timeout=min(7.5, rem)))
         except Exception:
             pass
+finally:
+    ex.shutdown(wait=False, cancel_futures=True)
 
-print(json.dumps(list(by_pkg_src.values()), ensure_ascii=False))
+print(json.dumps(list(by_pkg_src.values()), ensure_ascii=False), flush=True)
+_os._exit(0)
 "#;
 
 pub fn fetch_online_catalog_from_upstream() -> Result<(Vec<StoreApp>, String, usize)> {
@@ -7492,9 +7596,12 @@ def search_fdroid(q):
         pass
     return out
 
+import os as _os
 primary_q = query.split()[0] if " " in query else query
 items = []
-with ThreadPoolExecutor(max_workers=8) as ex:
+deadline = time.monotonic() + min(timeout, 9.5)
+ex = ThreadPoolExecutor(max_workers=8)
+try:
     futs = []
     for hq in queries_list[:3]:
         futs.append(ex.submit(search_huawei, hq))
@@ -7504,12 +7611,18 @@ with ThreadPoolExecutor(max_workers=8) as ex:
     for aq in queries_list[:2]:
         futs.append(ex.submit(search_aptoide, aq.split()[0] if " " in aq else aq))
     for fut in futs:
+        rem = deadline - time.monotonic()
+        if rem <= 0:
+            break
         try:
-            items.extend(fut.result(timeout=6.8))
+            items.extend(fut.result(timeout=min(6.8, rem)))
         except Exception:
             pass
+finally:
+    ex.shutdown(wait=False, cancel_futures=True)
 
-print(json.dumps(items, ensure_ascii=False))
+print(json.dumps(items, ensure_ascii=False), flush=True)
+_os._exit(0)
 "#;
 
 pub fn search_multi_source(query: &str) -> Result<Vec<StoreApp>> {
@@ -8190,7 +8303,10 @@ def task_aptoide_versions():
         pass
     return hists
 
-with ThreadPoolExecutor(max_workers=4) as ex:
+import os as _os
+deadline = time.monotonic() + min(timeout, 8.0)
+ex = ThreadPoolExecutor(max_workers=4)
+try:
     f_tc = ex.submit(task_tencent)
     f_hw = ex.submit(task_huawei)
     f_am = ex.submit(task_aptoide_meta)
@@ -8200,13 +8316,13 @@ with ThreadPoolExecutor(max_workers=4) as ex:
     hw = {}
     am = {}
     av = []
-    try: tc = f_tc.result(timeout=5.0)
+    try: tc = f_tc.result(timeout=max(0.05, min(5.0, deadline - time.monotonic())))
     except Exception: pass
-    try: hw = f_hw.result(timeout=5.0)
+    try: hw = f_hw.result(timeout=max(0.05, min(5.0, deadline - time.monotonic())))
     except Exception: pass
-    try: am = f_am.result(timeout=5.0)
+    try: am = f_am.result(timeout=max(0.05, min(5.0, deadline - time.monotonic())))
     except Exception: pass
-    try: av = f_av.result(timeout=5.0)
+    try: av = f_av.result(timeout=max(0.05, min(5.0, deadline - time.monotonic())))
     except Exception: pass
 
     out["description"] = tc.get("description") or hw.get("description") or am.get("description") or ""
@@ -8221,8 +8337,11 @@ with ThreadPoolExecutor(max_workers=4) as ex:
     if am.get("offer"):
         out["extra_sources"].append(am["offer"])
     out["historical_versions"].extend(av)
+finally:
+    ex.shutdown(wait=False, cancel_futures=True)
 
-print(json.dumps(out, ensure_ascii=False))
+print(json.dumps(out, ensure_ascii=False), flush=True)
+_os._exit(0)
 "#;
 
 pub fn fetch_app_full_detail(app: &StoreApp) -> Result<StoreAppDetailPayload> {
@@ -8315,6 +8434,12 @@ pub fn fetch_app_full_detail(app: &StoreApp) -> Result<StoreAppDetailPayload> {
         if let Some(extras) = val.get("extra_sources").and_then(|v| v.as_array()) {
             for ex in extras {
                 if let Ok(offer) = serde_json::from_value::<StoreSourceOffer>(ex.clone()) {
+                    let sha256 = ex
+                        .get("sha256")
+                        .or_else(|| ex.get("sha_256"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    record_offer_digests(&offer.download_url, &offer.md5, sha256);
                     if !offer.download_url.trim().is_empty()
                         && !payload
                             .extra_sources
@@ -8489,18 +8614,27 @@ def check_one(pkg):
         pass
     return None
 
+import os as _os
 results = []
-with ThreadPoolExecutor(max_workers=8) as ex:
+deadline = time.monotonic() + min(timeout + 2.5, 9.0)
+ex = ThreadPoolExecutor(max_workers=8)
+try:
     futs = [ex.submit(check_one, pkg) for pkg in pkgs[:18]]
     for fut in futs:
+        rem = deadline - time.monotonic()
+        if rem <= 0:
+            break
         try:
-            r = fut.result(timeout=3.8)
+            r = fut.result(timeout=min(3.8, rem))
             if r:
                 results.append(r)
         except Exception:
             pass
+finally:
+    ex.shutdown(wait=False, cancel_futures=True)
 
-print(json.dumps(results, ensure_ascii=False))
+print(json.dumps(results, ensure_ascii=False), flush=True)
+_os._exit(0)
 "#;
 
 pub fn check_updates_for_installed(
@@ -8675,11 +8809,12 @@ os.replace(tmp, dest)
 "#;
 
 const PY_BATCH_DOWNLOAD_ASSETS: &str = r#"
-import sys, os, re, json, threading, urllib.request, urllib.parse
-from concurrent.futures import ThreadPoolExecutor
+import sys, os, re, json, time, threading, urllib.request, urllib.parse
+from concurrent.futures import ThreadPoolExecutor, wait
 
 timeout = float(sys.argv[1])
-jobs = json.loads(sys.argv[2])
+raw_jobs = sys.argv[2] if len(sys.argv) > 2 else sys.stdin.read()
+jobs = json.loads(raw_jobs or "[]")
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 print_lock = threading.Lock()
 
@@ -8748,7 +8883,7 @@ def fetch_one(job):
         tmp = f"{dest}.{os.getpid()}.{threading.get_ident()}.part"
         req = urllib.request.Request(real_url, headers={"User-Agent": UA})
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            data = r.read()
+            data = r.read(8 * 1024 * 1024)
         if not is_raster(data, min_b):
             return
         with open(tmp, "wb") as f:
@@ -8759,9 +8894,118 @@ def fetch_one(job):
     except Exception:
         pass
 
-with ThreadPoolExecutor(max_workers=8) as ex:
-    list(ex.map(fetch_one, jobs))
+ex = ThreadPoolExecutor(max_workers=8)
+try:
+    futs = [ex.submit(fetch_one, j) for j in jobs]
+    wait(futs, timeout=22.0)
+finally:
+    ex.shutdown(wait=False, cancel_futures=True)
+sys.stdout.flush()
+os._exit(0)
 "#;
+
+struct AppStoreChildGuard(Option<std::process::Child>);
+
+impl AppStoreChildGuard {
+    fn kill_and_wait(&mut self) {
+        let Some(mut child) = self.0.take() else {
+            return;
+        };
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        #[cfg(windows)]
+        {
+            let mut tk = std::process::Command::new("taskkill");
+            resources::quiet_command(&mut tk);
+            let _ = tk
+                .args(["/PID", &child.id().to_string(), "/T", "/F"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .output();
+        }
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    fn wait_status(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        match self.0.take() {
+            Some(mut child) => child.wait(),
+            None => Err(std::io::Error::other("child process already taken")),
+        }
+    }
+}
+
+impl Drop for AppStoreChildGuard {
+    fn drop(&mut self) {
+        self.kill_and_wait();
+    }
+}
+
+fn run_batch_asset_stream(
+    timeout_arg: &str,
+    jobs_json: String,
+    deadline_dur: std::time::Duration,
+    mut on_line: impl FnMut(&str),
+) {
+    let mut cmd = resources::python_command();
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let Ok(child) = cmd
+        .args(["-c", PY_BATCH_DOWNLOAD_ASSETS, timeout_arg])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return;
+    };
+    let mut guard = AppStoreChildGuard(Some(child));
+    if let Some(mut stdin) = guard.0.as_mut().and_then(|c| c.stdin.take()) {
+        let bytes = jobs_json.into_bytes();
+        std::thread::spawn(move || {
+            let _ = std::io::Write::write_all(&mut stdin, &bytes);
+        });
+    }
+    let Some(stdout) = guard.0.as_mut().and_then(|c| c.stdout.take()) else {
+        return;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = std::time::Instant::now() + deadline_dur;
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            guard.kill_and_wait();
+            break;
+        }
+        match rx.recv_timeout(deadline - now) {
+            Ok(line) => on_line(&line),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                guard.kill_and_wait();
+                break;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = guard.wait_status();
+                break;
+            }
+        }
+    }
+}
 
 fn download_small_asset(url: &str, dest: &Path) -> Option<PathBuf> {
     if is_valid_raster_file(dest, 128) {
@@ -8772,12 +9016,11 @@ fn download_small_asset(url: &str, dest: &Path) -> Option<PathBuf> {
         return None;
     }
     let dest_str = dest.to_string_lossy().into_owned();
-    let status = resources::python_command()
-        .args(["-c", PY_DOWNLOAD_ASSET, "10", u, &dest_str])
-        .status()
-        .ok()?;
+    let mut cmd = resources::python_command();
+    cmd.args(["-c", PY_DOWNLOAD_ASSET, "10", u, &dest_str]);
+    let out = crate::adb::run_process(cmd, None, std::time::Duration::from_secs(25)).ok()?;
     invalidate_raster_file_cache(dest);
-    if status.success() && is_valid_raster_file(dest, 128) {
+    if out.status.success() && is_valid_raster_file(dest, 128) {
         Some(dest.to_path_buf())
     } else {
         None
@@ -8828,32 +9071,27 @@ pub fn stream_batch_icons<F: FnMut(String, PathBuf)>(items: &[(String, String)],
     if pending_jobs.is_empty() {
         return;
     }
-    let Ok(jobs_json) = serde_json::to_string(&pending_jobs) else {
-        return;
-    };
-    let Ok(mut child) = resources::python_command()
-        .args(["-c", PY_BATCH_DOWNLOAD_ASSETS, "6", &jobs_json])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return;
-    };
-    if let Some(stdout) = child.stdout.take() {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines().map_while(Result::ok) {
-            if let Some(rest) = line.strip_prefix("OK\t") {
-                if let Some((pkg_key, dest_str)) = rest.split_once('\t') {
-                    let path = PathBuf::from(dest_str.trim());
-                    invalidate_raster_file_cache(&path);
-                    if is_valid_raster_file(&path, 128) {
-                        on_cached(pkg_key.trim().to_string(), path);
+    for chunk in pending_jobs.chunks(64) {
+        let Ok(jobs_json) = serde_json::to_string(chunk) else {
+            continue;
+        };
+        run_batch_asset_stream(
+            "6",
+            jobs_json,
+            std::time::Duration::from_secs(25),
+            |line| {
+                if let Some(rest) = line.strip_prefix("OK\t") {
+                    if let Some((pkg_key, dest_str)) = rest.split_once('\t') {
+                        let path = PathBuf::from(dest_str.trim());
+                        invalidate_raster_file_cache(&path);
+                        if is_valid_raster_file(&path, 128) {
+                            on_cached(pkg_key.trim().to_string(), path);
+                        }
                     }
                 }
-            }
-        }
+            },
+        );
     }
-    let _ = child.wait();
 }
 
 pub fn stream_batch_screenshots<F: FnMut(String, usize, PathBuf)>(
@@ -8893,17 +9131,11 @@ pub fn stream_batch_screenshots<F: FnMut(String, usize, PathBuf)>(
     let Ok(jobs_json) = serde_json::to_string(&pending_jobs) else {
         return;
     };
-    let Ok(mut child) = resources::python_command()
-        .args(["-c", PY_BATCH_DOWNLOAD_ASSETS, "8", &jobs_json])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return;
-    };
-    if let Some(stdout) = child.stdout.take() {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines().map_while(Result::ok) {
+    run_batch_asset_stream(
+        "8",
+        jobs_json,
+        std::time::Duration::from_secs(25),
+        |line| {
             if let Some(rest) = line.strip_prefix("OK\t") {
                 if let Some((idx_str, dest_str)) = rest.split_once('\t') {
                     if let Ok(idx) = idx_str.trim().parse::<usize>() {
@@ -8915,9 +9147,8 @@ pub fn stream_batch_screenshots<F: FnMut(String, usize, PathBuf)>(
                     }
                 }
             }
-        }
-    }
-    let _ = child.wait();
+        },
+    );
 }
 
 const PY_RESOLVE_URL: &str = r#"
@@ -9100,9 +9331,9 @@ pub fn resolve_apk_download_url(raw_url: &str, package: &str) -> Result<String> 
     {
         return Ok(trimmed.to_string());
     }
-    let out = resources::python_command()
-        .args(["-c", PY_RESOLVE_URL, "10", trimmed, package])
-        .output()
+    let mut cmd = resources::python_command();
+    cmd.args(["-c", PY_RESOLVE_URL, "10", trimmed, package]);
+    let out = crate::adb::run_process(cmd, None, std::time::Duration::from_secs(25))
         .context("解析下载直链失败")?;
     let resolved = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if resolved.starts_with("http://") || resolved.starts_with("https://") {
@@ -9113,11 +9344,17 @@ pub fn resolve_apk_download_url(raw_url: &str, package: &str) -> Result<String> 
 }
 
 const PY_DOWNLOAD_APK_STREAM: &str = r#"
-import sys, os, re, json, time, urllib.request, urllib.parse
+import sys, os, re, json, time, hashlib, urllib.request, urllib.parse
 
 url = (sys.argv[1] if len(sys.argv) > 1 else "").strip()
 dest = sys.argv[2]
 pkg = (sys.argv[3] if len(sys.argv) > 3 else "").strip()
+_raw_md5 = (sys.argv[4] if len(sys.argv) > 4 else "").strip().lower()
+_raw_sha256 = (sys.argv[5] if len(sys.argv) > 5 else "").strip().lower()
+expected_md5 = _raw_md5 if re.fullmatch(r"[0-9a-f]{32}", _raw_md5) else ""
+expected_sha256 = _raw_sha256 if re.fullmatch(r"[0-9a-f]{64}", _raw_sha256) else ""
+has_pinned_digest = bool(expected_md5 or expected_sha256)
+UNTRUSTED_PROXY_PREFIXES = ("https://ghfast.top/", "https://gh-proxy.com/")
 
 UA_MOBILE = "Mozilla/5.0 (Linux; Android 16; PZ261A) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
 UA_DESKTOP = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
@@ -9413,13 +9650,129 @@ def resolve_aptoide_search(p):
         pass
     return out
 
+def strip_untrusted_proxy(u):
+    u = (u or "").strip()
+    for prefix in UNTRUSTED_PROXY_PREFIXES:
+        if u.startswith(prefix):
+            inner = u[len(prefix):].strip()
+            return inner if inner.startswith("https://") else ""
+    return u
+
+def expand_with_domestic_mirrors(u, allow_untrusted_proxies=None):
+    u = (u or "").strip()
+    if not u:
+        return []
+    if allow_untrusted_proxies is None:
+        allow_untrusted_proxies = has_pinned_digest
+    if not allow_untrusted_proxies and u.startswith(UNTRUSTED_PROXY_PREFIXES):
+        u = strip_untrusted_proxy(u)
+        if not u:
+            return []
+    if u.startswith(("https://github.com/", "https://raw.githubusercontent.com/")):
+        if allow_untrusted_proxies:
+            return [u, f"https://ghfast.top/{u}", f"https://gh-proxy.com/{u}"]
+        return [u]
+    if u.startswith("https://f-droid.org/repo/"):
+        tail = u[len("https://f-droid.org/repo/"):]
+        return [
+            u,
+            f"https://mirrors.tuna.tsinghua.edu.cn/fdroid/repo/{tail}",
+            f"https://mirror.iscas.ac.cn/fdroid/repo/{tail}",
+        ]
+    return [u]
+
+def is_strong_etag(val):
+    val = (val or "").strip()
+    return bool(val and not val.upper().startswith("W/"))
+
+def can_resume_part_for_url(cand_url, meta, has_pinned):
+    meta = meta if isinstance(meta, dict) else {}
+    meta_url = (meta.get("url") or "").strip()
+    meta_etag = (meta.get("etag") or "").strip()
+    if not meta_url:
+        if has_pinned:
+            return (True, meta_etag if is_strong_etag(meta_etag) else "")
+        return (False, "")
+    if cand_url == meta_url:
+        return (True, meta_etag if is_strong_etag(meta_etag) else "")
+    if has_pinned:
+        return (True, "")
+    if is_strong_etag(meta_etag):
+        return (True, meta_etag)
+    return (False, "")
+
+def validate_content_range_206(cr, expected_start, expected_total, content_length, resp_etag, cand_url, meta, has_pinned):
+    meta = meta if isinstance(meta, dict) else {}
+    meta_url = (meta.get("url") or "").strip()
+    meta_etag = (meta.get("etag") or "").strip()
+    meta_total = int(meta.get("total") or 0)
+    eff_expected_total = int(expected_total or meta_total or 0)
+    if expected_start <= 0:
+        return (False, 0)
+    if cand_url != meta_url and not has_pinned:
+        if not (is_strong_etag(meta_etag) and is_strong_etag(resp_etag) and resp_etag.strip() == meta_etag):
+            return (False, 0)
+    cr_clean = (cr or "").strip()
+    if cr_clean:
+        m = re.fullmatch(r"bytes\s+(\d+)-(\d+)/(\d+|\*)", cr_clean, re.I)
+        if not m:
+            return (False, 0)
+        start = int(m.group(1))
+        end = int(m.group(2))
+        tot_token = m.group(3)
+        if start != expected_start or end < start or tot_token == "*":
+            return (False, 0)
+        parsed_tot = int(tot_token)
+        if parsed_tot != end + 1:
+            return (False, 0)
+        if eff_expected_total > 0 and parsed_tot != eff_expected_total:
+            return (False, 0)
+        if content_length > 0 and content_length != (end - start + 1):
+            return (False, 0)
+        return (True, parsed_tot)
+    if cand_url != meta_url:
+        return (False, 0)
+    if content_length <= 0:
+        return (False, 0)
+    resolved_tot = expected_start + int(content_length)
+    if eff_expected_total > 0 and resolved_tot != eff_expected_total:
+        return (False, 0)
+    return (True, resolved_tot)
+
+def verify_apk_file_digests(path, exp_md5, exp_sha256):
+    exp_md5 = (exp_md5 or "").strip().lower()
+    exp_sha256 = (exp_sha256 or "").strip().lower()
+    if not exp_md5 and not exp_sha256:
+        return (True, "")
+    h_md5 = hashlib.md5() if exp_md5 else None
+    h_sha256 = hashlib.sha256() if exp_sha256 else None
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(262144)
+            if not chunk:
+                break
+            if h_md5 is not None:
+                h_md5.update(chunk)
+            if h_sha256 is not None:
+                h_sha256.update(chunk)
+    if h_sha256 is not None and h_sha256.hexdigest().lower() != exp_sha256:
+        return (False, f"APK SHA-256 校验失败 (expected {exp_sha256}, got {h_sha256.hexdigest().lower()})")
+    if h_md5 is not None and h_md5.hexdigest().lower() != exp_md5:
+        return (False, f"APK MD5 校验失败 (expected {exp_md5}, got {h_md5.hexdigest().lower()})")
+    return (True, "")
+
 def iter_candidates(initial_url, target_pkg):
+    initial_url = (initial_url or "").strip()
+    if not has_pinned_digest and initial_url.startswith(UNTRUSTED_PROXY_PREFIXES):
+        initial_url = strip_untrusted_proxy(initial_url)
     seen = set()
     def emit(u):
         u = (u or "").strip()
         if not u or u in seen:
             return None
         if not (u.startswith("http://") or u.startswith("https://")):
+            return None
+        if not has_pinned_digest and u.startswith(UNTRUSTED_PROXY_PREFIXES):
             return None
         seen.add(u)
         return u
@@ -9436,9 +9789,10 @@ def iter_candidates(initial_url, target_pkg):
         or "appgallery.huawei.com/app/" in initial_url
     )
     if initial_url and not is_page_url:
-        c = emit(initial_url)
-        if c:
-            yield c
+        for expanded in expand_with_domestic_mirrors(initial_url):
+            c = emit(expanded)
+            if c:
+                yield c
 
     if not target_pkg and "appgallery.huawei.com/app/" not in initial_url:
         return
@@ -9463,90 +9817,226 @@ def iter_candidates(initial_url, target_pkg):
 
 os.makedirs(os.path.dirname(dest), exist_ok=True)
 tmp = dest + ".part"
+meta_path = dest + ".part.meta.json"
+legacy_meta_path = dest + ".part.meta"
 last_err = "未找到可用的 APK 下载源"
+STALL_WINDOW_SECS = 15.0
+STALL_MIN_BYTES = 64 * 1024
 
-candidates = list(iter_candidates(url, pkg))
+def unlink_part():
+    for p in (tmp, meta_path, meta_path + ".tmp", legacy_meta_path, tmp + ".fresh"):
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
+
+def load_part_meta():
+    try:
+        if os.path.isfile(meta_path):
+            with open(meta_path, "r", encoding="utf-8") as mf:
+                obj = json.load(mf)
+            if isinstance(obj, dict):
+                return {
+                    "url": str(obj.get("url") or "").strip(),
+                    "etag": str(obj.get("etag") or "").strip(),
+                    "total": int(obj.get("total") or 0),
+                }
+    except Exception:
+        pass
+    return {"url": "", "etag": "", "total": 0}
+
+def save_part_meta(src_url, etag, tot):
+    meta_obj = {
+        "url": str(src_url or "").strip(),
+        "etag": str(etag or "").strip() if is_strong_etag(etag) else "",
+        "total": max(0, int(tot or 0)),
+    }
+    try:
+        tmp_meta = meta_path + ".tmp"
+        with open(tmp_meta, "w", encoding="utf-8") as mf:
+            json.dump(meta_obj, mf)
+        os.replace(tmp_meta, meta_path)
+    except Exception:
+        pass
+    return meta_obj
+
+if os.path.isfile(tmp):
+    try:
+        sz0 = os.path.getsize(tmp)
+        if sz0 >= 4:
+            with open(tmp, "rb") as vf:
+                if vf.read(4) != b"PK\x03\x04":
+                    unlink_part()
+        elif sz0 == 0:
+            unlink_part()
+    except Exception:
+        pass
+
+import urllib.error
+candidates = []
+seen_expanded = set()
+for raw_cand in iter_candidates(url, pkg):
+    for expanded in expand_with_domestic_mirrors(raw_cand):
+        if expanded not in seen_expanded:
+            seen_expanded.add(expanded)
+            candidates.append(expanded)
 hw_fallback_tried = False
 idx = 0
 while idx < len(candidates):
     cand_url = candidates[idx]
     idx += 1
     try:
-        try:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-        except Exception:
-            pass
-        total = 0
-        downloaded = 0
-        max_downloaded = 0
+        meta = load_part_meta()
+        total = int(meta.get("total") or 0)
+        downloaded = os.path.getsize(tmp) if os.path.isfile(tmp) else 0
+        if downloaded > 0:
+            allow_resume_cand, _ = can_resume_part_for_url(cand_url, meta, has_pinned_digest)
+            if not allow_resume_cand or (total > 0 and downloaded > total):
+                unlink_part()
+                meta = {"url": "", "etag": "", "total": 0}
+                downloaded = 0
+                total = 0
+        max_downloaded = downloaded
         stalled_attempts = 0
-        for attempt in range(6):
+        stream_eof = False
+        print(f"PROGRESS {downloaded} {total}", flush=True)
+        for attempt in range(4):
+            meta = load_part_meta()
+            total = int(meta.get("total") or 0)
+            downloaded = os.path.getsize(tmp) if os.path.isfile(tmp) else 0
             headers = {"User-Agent": UA_MOBILE}
             if downloaded > 0:
-                headers["Range"] = f"bytes={downloaded}-"
+                allow_range, if_range_hdr = can_resume_part_for_url(cand_url, meta, has_pinned_digest)
+                if not allow_range:
+                    unlink_part()
+                    meta = {"url": "", "etag": "", "total": 0}
+                    downloaded = 0
+                    total = 0
+                else:
+                    headers["Range"] = f"bytes={downloaded}-"
+                    if if_range_hdr:
+                        headers["If-Range"] = if_range_hdr
             req = urllib.request.Request(cand_url, headers=headers)
             try:
-                with urllib.request.urlopen(req, timeout=25) as r:
+                with urllib.request.urlopen(req, timeout=15) as r:
                     status = getattr(r, "status", 200) or 200
-                    if downloaded > 0 and status == 200:
-                        downloaded = 0
-                    if downloaded == 0:
-                        first_chunk = r.read(131072)
+                    cr = (r.headers.get("Content-Range") or "").strip()
+                    resp_etag = (r.headers.get("ETag") or "").strip()
+                    cl_hdr = int(r.headers.get("Content-Length") or 0)
+                    can_resume = False
+                    if downloaded > 0 and status == 206:
+                        ok_206, resolved_tot = validate_content_range_206(
+                            cr, downloaded, total, cl_hdr, resp_etag, cand_url, meta, has_pinned_digest
+                        )
+                        if not ok_206:
+                            unlink_part()
+                            meta = {"url": "", "etag": "", "total": 0}
+                            downloaded = 0
+                            total = 0
+                            last_err = f"断点续传范围校验失败 (Content-Range={cr!r}): {cand_url}"
+                            continue
+                        can_resume = True
+                        total = resolved_tot
+                        eff_etag = resp_etag if is_strong_etag(resp_etag) else meta.get("etag", "")
+                        meta = save_part_meta(cand_url, eff_etag, total)
+                    window_start = time.monotonic()
+                    window_bytes = 0
+                    if not can_resume:
+                        first_chunk = r.read(65536)
                         if len(first_chunk) < 4 or first_chunk[:4] != b"PK\x03\x04":
                             last_err = f"下载源返回的不是有效 APK (ZIP) 安装包: {cand_url}"
+                            if downloaded == 0:
+                                unlink_part()
                             downloaded = -1
                             break
-                        total = int(r.headers.get("Content-Length") or 0)
-                        downloaded = len(first_chunk)
-                        with open(tmp, "wb") as f:
-                            f.write(first_chunk)
-                            print(f"PROGRESS {downloaded} {total}", flush=True)
-                            while True:
-                                chunk = r.read(131072)
-                                if not chunk:
-                                    break
-                                f.write(chunk)
-                                downloaded += len(chunk)
-                                print(f"PROGRESS {downloaded} {total}", flush=True)
+                        cl_fresh = cl_hdr
+                        fresh_total = cl_fresh if cl_fresh > 0 else 0
+                        fresh_etag = resp_etag if is_strong_etag(resp_etag) else ""
+                        fresh_path = tmp if downloaded == 0 else (tmp + ".fresh")
+                        if fresh_path == tmp:
+                            total = fresh_total
+                            meta = save_part_meta(cand_url, fresh_etag, total)
+                        cur_fresh = len(first_chunk)
+                        window_bytes = cur_fresh
+                        try:
+                            with open(fresh_path, "wb") as f:
+                                f.write(first_chunk)
+                                print(f"PROGRESS {max(downloaded, cur_fresh)} {total or fresh_total}", flush=True)
+                                while True:
+                                    chunk = r.read(65536)
+                                    now = time.monotonic()
+                                    if not chunk:
+                                        stream_eof = True
+                                        break
+                                    f.write(chunk)
+                                    cur_fresh += len(chunk)
+                                    window_bytes += len(chunk)
+                                    print(f"PROGRESS {max(downloaded, cur_fresh)} {total or fresh_total}", flush=True)
+                                    if now - window_start >= STALL_WINDOW_SECS:
+                                        if window_bytes < STALL_MIN_BYTES:
+                                            f.flush()
+                                            raise TimeoutError("download stalled (<64KB/15s)")
+                                        window_start = now
+                                        window_bytes = 0
+                                f.flush()
+                        finally:
+                            if fresh_path != tmp and os.path.isfile(fresh_path):
+                                if os.path.getsize(fresh_path) >= downloaded:
+                                    os.replace(fresh_path, tmp)
+                                    total = fresh_total
+                                    meta = save_part_meta(cand_url, fresh_etag, total)
+                                else:
+                                    try: os.remove(fresh_path)
+                                    except Exception: pass
+                        downloaded = os.path.getsize(tmp) if os.path.isfile(tmp) else 0
                     else:
-                        if total <= 0:
-                            cr = (r.headers.get("Content-Range") or "").strip()
-                            if "/" in cr:
-                                try:
-                                    total = int(cr.split("/")[-1].strip())
-                                except Exception:
-                                    pass
-                            if total <= 0:
-                                cl = int(r.headers.get("Content-Length") or 0)
-                                if cl > 0:
-                                    total = downloaded + cl
                         with open(tmp, "ab") as f:
                             while True:
-                                chunk = r.read(131072)
+                                chunk = r.read(65536)
+                                now = time.monotonic()
                                 if not chunk:
+                                    stream_eof = True
                                     break
                                 f.write(chunk)
                                 downloaded += len(chunk)
+                                window_bytes += len(chunk)
                                 print(f"PROGRESS {downloaded} {total}", flush=True)
+                                if now - window_start >= STALL_WINDOW_SECS:
+                                    if window_bytes < STALL_MIN_BYTES:
+                                        f.flush()
+                                        raise TimeoutError("download stalled (<64KB/15s)")
+                                    window_start = now
+                                    window_bytes = 0
+                            f.flush()
+            except urllib.error.HTTPError as he:
+                last_err = f"{cand_url}: HTTP {he.code}"
+                if he.code == 416:
+                    unlink_part()
+                    meta = {"url": "", "etag": "", "total": 0}
+                    downloaded = 0
+                    total = 0
+                    continue
+                break
             except Exception as stream_err:
                 last_err = f"{cand_url}: {stream_err}"
+                downloaded = os.path.getsize(tmp) if os.path.isfile(tmp) else 0
                 if downloaded > max_downloaded:
                     max_downloaded = downloaded
                     stalled_attempts = 0
                 else:
                     stalled_attempts += 1
-                if attempt >= 5 or stalled_attempts >= 2:
-                    raise
+                if attempt >= 3 or stalled_attempts >= 1:
+                    break
                 continue
-            if downloaded < 0 or (total > 0 and downloaded >= total) or (total == 0 and downloaded > 0):
+            if downloaded < 0 or (total > 0 and downloaded >= total) or (total == 0 and downloaded > 0 and stream_eof):
                 break
             if downloaded > max_downloaded:
                 max_downloaded = downloaded
                 stalled_attempts = 0
             else:
                 stalled_attempts += 1
-            if stalled_attempts >= 2:
+            if stalled_attempts >= 1:
                 break
         if downloaded < 0:
             if not hw_fallback_tried and pkg and any(h in cand_url for h in ("dbankcdn.com/", "dbankcloud.com/", "huawei.com/")):
@@ -9555,11 +10045,13 @@ while idx < len(candidates):
                     if hw_cand and hw_cand not in candidates:
                         candidates.append(hw_cand)
             continue
-        if total > 0 and downloaded < total:
-            try:
-                os.remove(tmp)
-            except Exception:
-                pass
+        downloaded = os.path.getsize(tmp) if os.path.isfile(tmp) else 0
+        if total > 0 and downloaded > total:
+            unlink_part()
+            last_err = f"APK 下载大小异常 ({downloaded}/{total} bytes): {cand_url}"
+            continue
+        if (total > 0 and downloaded < total) or (total == 0 and not stream_eof) or downloaded < 4:
+            # Preserve .part so same-source UI Retry or hash/ETag-verified mirrors resume safely.
             last_err = f"APK 下载未完成 ({downloaded}/{total} bytes): {cand_url}"
             if not hw_fallback_tried and pkg and any(h in cand_url for h in ("dbankcdn.com/", "dbankcloud.com/", "huawei.com/")):
                 hw_fallback_tried = True
@@ -9570,22 +10062,25 @@ while idx < len(candidates):
         with open(tmp, "rb") as f:
             magic = f.read(4)
         if magic != b"PK\x03\x04":
-            try:
-                os.remove(tmp)
-            except Exception:
-                pass
+            unlink_part()
             last_err = f"APK 校验失败: {cand_url}"
             continue
+        ok_digest, digest_err = verify_apk_file_digests(tmp, expected_md5, expected_sha256)
+        if not ok_digest:
+            unlink_part()
+            last_err = f"{digest_err}: {cand_url}"
+            continue
         os.replace(tmp, dest)
+        for mp in (meta_path, meta_path + ".tmp", legacy_meta_path):
+            try:
+                if os.path.exists(mp):
+                    os.remove(mp)
+            except Exception:
+                pass
         print("DONE", flush=True)
         sys.exit(0)
     except Exception as e:
         last_err = f"{cand_url}: {e}"
-        try:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-        except Exception:
-            pass
         if not hw_fallback_tried and pkg and any(h in cand_url for h in ("dbankcdn.com/", "dbankcloud.com/", "huawei.com/")):
             hw_fallback_tried = True
             for hw_cand in resolve_huawei(pkg, url):
@@ -9593,9 +10088,46 @@ while idx < len(candidates):
                     candidates.append(hw_cand)
         continue
 
-sys.stderr.write(f"下载的文件不是有效的 APK (ZIP) 安装包 ({last_err})\n")
+sys.stderr.write(f"下载未完成或下载源暂不可用，已保留断点进度 ({last_err})\n")
 sys.exit(3)
 "#;
+
+fn verify_cached_apk_digests(path: &Path, expected_md5: &str, expected_sha256: &str) -> bool {
+    if expected_md5.is_empty() && expected_sha256.is_empty() {
+        return true;
+    }
+    if !expected_sha256.is_empty() {
+        use sha2::{Digest, Sha256};
+        let Ok(mut f) = fs::File::open(path) else {
+            return false;
+        };
+        let mut hasher = Sha256::new();
+        if std::io::copy(&mut f, &mut hasher).is_err() {
+            return false;
+        }
+        let actual = format!("{:x}", hasher.finalize());
+        if !actual.eq_ignore_ascii_case(expected_sha256) {
+            return false;
+        }
+    }
+    if !expected_md5.is_empty() {
+        let mut cmd = resources::python_command();
+        let path_str = path.to_string_lossy().into_owned();
+        cmd.args([
+            "-c",
+            "import hashlib,sys;h=hashlib.md5();\nwith open(sys.argv[1],'rb') as f:\n for b in iter(lambda:f.read(262144),b''):h.update(b)\nsys.exit(0 if h.hexdigest().lower()==sys.argv[2].lower() else 1)",
+            &path_str,
+            expected_md5,
+        ]);
+        let Ok(out) = crate::adb::run_process(cmd, None, std::time::Duration::from_secs(15)) else {
+            return false;
+        };
+        if !out.status.success() {
+            return false;
+        }
+    }
+    true
+}
 
 pub fn download_apk_with_progress<F: FnMut(u64, u64)>(
     raw_url: &str,
@@ -9604,6 +10136,7 @@ pub fn download_apk_with_progress<F: FnMut(u64, u64)>(
     mut on_progress: F,
 ) -> Result<PathBuf> {
     let final_url = resolve_apk_download_url(raw_url, package)?;
+    let (expected_md5, expected_sha256) = lookup_offer_digests(raw_url, &final_url);
     let apks_dir = store_cache_root().join("apks");
     fs::create_dir_all(&apks_dir).context("创建 APK 缓存目录失败")?;
     use std::hash::{Hash, Hasher};
@@ -9633,7 +10166,10 @@ pub fn download_apk_with_progress<F: FnMut(u64, u64)>(
                 }
             }
         }
-        if valid_apk && crate::device::check_store_apk(&dest, package).is_ok() {
+        if valid_apk
+            && verify_cached_apk_digests(&dest, &expected_md5, &expected_sha256)
+            && crate::device::check_store_apk(&dest, package).is_ok()
+        {
             on_progress(file_len, file_len);
             return Ok(dest);
         } else {
@@ -9642,30 +10178,89 @@ pub fn download_apk_with_progress<F: FnMut(u64, u64)>(
     }
 
     let dest_str = dest.to_string_lossy().into_owned();
-    let mut child = resources::python_command()
-        .args(["-c", PY_DOWNLOAD_APK_STREAM, &final_url, &dest_str, package])
+    let mut cmd = resources::python_command();
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let child = cmd
+        .args([
+            "-c",
+            PY_DOWNLOAD_APK_STREAM,
+            &final_url,
+            &dest_str,
+            package,
+            &expected_md5,
+            &expected_sha256,
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .context("启动 APK 下载进程失败")?;
+    let mut guard = AppStoreChildGuard(Some(child));
 
-    if let Some(stdout) = child.stdout.take() {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines().map_while(Result::ok) {
-            if let Some(rest) = line.strip_prefix("PROGRESS ") {
-                let mut parts = rest.split_whitespace();
-                if let (Some(dl_s), Some(tot_s)) = (parts.next(), parts.next()) {
-                    if let (Ok(dl), Ok(tot)) = (dl_s.parse::<u64>(), tot_s.parse::<u64>()) {
-                        on_progress(dl, tot);
+    let stderr_handle = guard.0.as_mut().and_then(|c| c.stderr.take()).map(|stderr| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut std::io::Read::take(stderr, 64 * 1024), &mut buf);
+            buf
+        })
+    });
+
+    let stdout = guard
+        .0
+        .as_mut()
+        .and_then(|c| c.stdout.take())
+        .context("读取 APK 下载输出流失败")?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let stall_timeout = std::time::Duration::from_secs(45);
+    loop {
+        match rx.recv_timeout(stall_timeout) {
+            Ok(Ok(line)) => {
+                if let Some(rest) = line.strip_prefix("PROGRESS ") {
+                    let mut parts = rest.split_whitespace();
+                    if let (Some(dl_s), Some(tot_s)) = (parts.next(), parts.next()) {
+                        if let (Ok(dl), Ok(tot)) = (dl_s.parse::<u64>(), tot_s.parse::<u64>()) {
+                            on_progress(dl, tot);
+                        }
                     }
                 }
             }
+            Ok(Err(_)) => {
+                guard.kill_and_wait();
+                if let Some(h) = stderr_handle {
+                    let _ = h.join();
+                }
+                return Err(anyhow!("读取 APK 下载进度流失败，已保留断点进度，请重试"));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                guard.kill_and_wait();
+                if let Some(h) = stderr_handle {
+                    let _ = h.join();
+                }
+                return Err(anyhow!(
+                    "APK 下载连接响应超时（45 秒无进度），已保留断点文件，请点击重试继续下载"
+                ));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
 
-    let output = child.wait_with_output().context("等待 APK 下载完成失败")?;
-    if !output.status.success() {
-        let err_msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let status = guard.wait_status().context("等待 APK 下载完成失败")?;
+    let stderr_bytes = stderr_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    if !status.success() {
+        let err_msg = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
         return Err(anyhow!(if err_msg.is_empty() {
             "APK 下载失败".to_string()
         } else {
@@ -9676,7 +10271,10 @@ pub fn download_apk_with_progress<F: FnMut(u64, u64)>(
     if !dest.is_file() {
         return Err(anyhow!("APK 下载完成后未找到目标文件"));
     }
-    crate::device::check_store_apk(&dest, package)?;
+    if let Err(err) = crate::device::check_store_apk(&dest, package) {
+        let _ = fs::remove_file(&dest);
+        return Err(err);
+    }
     Ok(dest)
 }
 
@@ -10979,5 +11577,85 @@ print("OK")
         assert!(!PY_MULTI_SEARCH.contains("aab=1"));
         assert!(!PY_FETCH_DETAIL.contains("aab=1"));
         assert!(!PY_DOWNLOAD_APK_STREAM.contains("aab=1"));
+    }
+
+    #[test]
+    fn download_stream_blocks_cross_mirror_splicing_enforces_digests_and_drops_unpinned_proxies() {
+        record_offer_digests(
+            "https://example.test/pinned.apk",
+            "0123456789abcdef0123456789abcdef",
+            "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+        );
+        let (md5, sha256) = lookup_offer_digests("https://example.test/pinned.apk", "");
+        assert_eq!(md5, "0123456789abcdef0123456789abcdef");
+        assert_eq!(
+            sha256,
+            "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+        );
+
+        let harness = r#"
+import hashlib, json, os, sys, tempfile
+script = sys.stdin.read()
+prefix = script.split('os.makedirs(os.path.dirname(dest)')[0]
+
+# 1. Unpinned GitHub URL must NOT include ghfast.top / gh-proxy.com
+ns_unpinned = {}
+sys.argv = ['probe', 'https://github.com/org/repo/releases/download/v1/app.apk', '/tmp/x.apk', 'com.ex.app', '', '']
+exec(compile(prefix, 'store-unpinned', 'exec'), ns_unpinned)
+cands_unpinned = list(ns_unpinned['iter_candidates']('https://github.com/org/repo/releases/download/v1/app.apk', 'com.ex.app'))
+assert cands_unpinned == ['https://github.com/org/repo/releases/download/v1/app.apk'], cands_unpinned
+
+# 2. Pinned GitHub URL MAY expand mirrors because full digest is verified before replace
+ns_pinned = {}
+sys.argv = ['probe', 'https://github.com/org/repo/releases/download/v1/app.apk', '/tmp/x.apk', 'com.ex.app', '0123456789abcdef0123456789abcdef', '']
+exec(compile(prefix, 'store-pinned', 'exec'), ns_pinned)
+cands_pinned = ns_pinned['expand_with_domestic_mirrors']('https://github.com/org/repo/releases/download/v1/app.apk')
+assert 'https://ghfast.top/https://github.com/org/repo/releases/download/v1/app.apk' in cands_pinned
+
+# 3. Cross-mirror resume rejected without ETag or pinned digest; allowed with matching strong ETag + exact Content-Range total
+meta_no_etag = {'url': 'https://mirror-a.example/app.apk', 'etag': '', 'total': 1000}
+assert ns_unpinned['can_resume_part_for_url']('https://mirror-b.example/app.apk', meta_no_etag, False) == (False, '')
+assert ns_unpinned['can_resume_part_for_url']('https://mirror-a.example/app.apk', meta_no_etag, False) == (True, '')
+
+meta_with_etag = {'url': 'https://mirror-a.example/app.apk', 'etag': '"abc123"', 'total': 1000}
+assert ns_unpinned['can_resume_part_for_url']('https://mirror-b.example/app.apk', meta_with_etag, False) == (True, '"abc123"')
+assert ns_unpinned['validate_content_range_206']('bytes 500-999/1000', 500, 1000, 500, '"abc123"', 'https://mirror-b.example/app.apk', meta_with_etag, False) == (True, 1000)
+# Mismatched total length on 206 rejected!
+assert ns_unpinned['validate_content_range_206']('bytes 500-1099/1100', 500, 1000, 600, '"abc123"', 'https://mirror-b.example/app.apk', meta_with_etag, False) == (False, 0)
+# Missing or different ETag across mirrors when unpinned rejected!
+assert ns_unpinned['validate_content_range_206']('bytes 500-999/1000', 500, 1000, 500, '"other"', 'https://mirror-b.example/app.apk', meta_with_etag, False) == (False, 0)
+
+# 4. Digest verification catches corrupt bytes
+with tempfile.NamedTemporaryFile(delete=False) as tf:
+    payload = b'PK\x03\x04test-apk-payload'
+    tf.write(payload)
+    p = tf.name
+try:
+    good_md5 = hashlib.md5(payload).hexdigest()
+    good_sha = hashlib.sha256(payload).hexdigest()
+    assert ns_unpinned['verify_apk_file_digests'](p, good_md5, good_sha)[0] is True
+    assert ns_unpinned['verify_apk_file_digests'](p, '0'*32, '')[0] is False
+    assert ns_unpinned['verify_apk_file_digests'](p, '', '0'*64)[0] is False
+finally:
+    os.remove(p)
+"#;
+        let mut cmd = resources::python_command();
+        cmd.args(["-c", harness])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        std::io::Write::write_all(
+            child.stdin.as_mut().unwrap(),
+            PY_DOWNLOAD_APK_STREAM.as_bytes(),
+        )
+        .unwrap();
+        drop(child.stdin.take());
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "python store security test failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }

@@ -1771,29 +1771,57 @@ impl Element for FormattedTextElement {
                         let mut style = Properties::default();
                         let mut text_style = TextStyle::default();
 
-                        if let Some(style) = link_styles_iter.peek() {
-                            if style.highlight_indices[0] + glyph_offset
-                                == prev_index + character_count
+                        let start_char_index = prev_index + character_count;
+
+                        while let Some(style) = link_styles_iter.peek() {
+                            let end_char_index = style
+                                .highlight_indices
+                                .last()
+                                .copied()
+                                .unwrap_or(0)
+                                .saturating_add(1)
+                                .saturating_add(glyph_offset);
+                            if style.highlight_indices.is_empty()
+                                || end_char_index <= start_char_index
                             {
-                                current_link_style = Some((*style).clone());
                                 link_styles_iter.next();
+                            } else {
+                                break;
                             }
                         }
 
-                        let start_char_index = prev_index + character_count;
+                        if current_link_style.is_none() {
+                            if let Some(style) = link_styles_iter.peek() {
+                                if style.highlight_indices[0].saturating_add(glyph_offset)
+                                    <= start_char_index
+                                {
+                                    current_link_style = Some((*style).clone());
+                                    link_styles_iter.next();
+                                }
+                            }
+                        }
+
                         let style_char_len;
 
                         if let Some(link_style) = &current_link_style {
                             text_style = link_style.highlight.text_style;
-                            let end_char_index = *link_style.highlight_indices.last().unwrap_or(&0)
-                                + 1
-                                + glyph_offset;
-                            if end_char_index - start_char_index
-                                <= fragment_char_count - character_count
+                            let end_char_index = link_style
+                                .highlight_indices
+                                .last()
+                                .copied()
+                                .unwrap_or(0)
+                                .saturating_add(1)
+                                .saturating_add(glyph_offset);
+                            let remaining_link_chars =
+                                end_char_index.saturating_sub(start_char_index);
+                            if remaining_link_chars == 0 {
+                                current_link_style = None;
+                                continue;
+                            } else if remaining_link_chars <= fragment_char_count - character_count
                             {
                                 // If the length of the currently registered link style is less than the remaining length of the current fragment,
                                 // then the style should be applied to the link only.
-                                style_char_len = end_char_index - start_char_index;
+                                style_char_len = remaining_link_chars;
                                 // Reset the current link style since it has been fully applied.
                                 current_link_style = None;
                             } else {
@@ -1805,9 +1833,11 @@ impl Element for FormattedTextElement {
                         } else if let Some(style) = link_styles_iter.peek() {
                             // If we are not currently working with a link style, then the length of the current style should be the minimum
                             // of the remaining length of the fragment or the remaining length until the next link style within the fragment.
-                            style_char_len = (style.highlight_indices[0] + glyph_offset
-                                - start_char_index)
-                                .min(fragment_char_count - character_count);
+                            style_char_len = style.highlight_indices[0]
+                                .saturating_add(glyph_offset)
+                                .saturating_sub(start_char_index)
+                                .min(fragment_char_count - character_count)
+                                .max(1);
                         } else {
                             // If there's no more link styles, then the length of the current style should be the remaining length of the fragment.
                             style_char_len = fragment_char_count - character_count;
@@ -1989,22 +2019,38 @@ impl Element for FormattedTextElement {
                             return;
                         }
 
+                        let target_glyph_index = pos.glyph_index.saturating_add(glyph_offset);
                         let mut row_index = 0;
-                        let mut glyph_accum = 0;
+                        let mut glyph_accum: usize = 0;
                         for row in text_frame.lines() {
-                            if row.end_index() > (pos.glyph_index + glyph_offset) - glyph_accum {
+                            let row_len = if row.last_glyph().is_some() {
+                                row.end_index().saturating_sub(row.first_index())
+                            } else {
+                                0
+                            };
+                            let row_end =
+                                if row.last_glyph().is_some() && row.first_index() >= glyph_accum {
+                                    row.end_index()
+                                } else {
+                                    glyph_accum.saturating_add(row_len)
+                                };
+                            if row_len > 0
+                                && row_end.saturating_sub(glyph_accum)
+                                    > target_glyph_index.saturating_sub(glyph_accum)
+                            {
                                 break;
                             }
                             row_index += 1;
-                            glyph_accum += row.end_index();
+                            glyph_accum = row_end.max(glyph_accum.saturating_add(1));
                         }
+                        row_index = row_index.min(text_frame.lines().len().saturating_sub(1));
 
                         saved_glyph_position.position =
                             SavedGlyphPosition::LaidOutTextFramePosition(
                                 FormattedTextSelectionLocation {
                                     frame_index,
                                     row_index,
-                                    glyph_index: pos.glyph_index + glyph_offset,
+                                    glyph_index: target_glyph_index,
                                 },
                             );
                     }
@@ -2058,10 +2104,11 @@ impl Element for FormattedTextElement {
 
         let mut size = vec2f(frame_width, frame_height);
         if should_expand_to_max_width {
-            if max_width.is_infinite() {
-                panic!("The max width was infinite when stretch set to true");
+            if max_width.is_finite() {
+                size.set_x(max_width);
+            } else {
+                size.set_x(size.x().max(constraint.min.x()));
             }
-            size.set_x(max_width);
         }
         self.size = Some(size);
         size

@@ -59,7 +59,7 @@ struct SearchRequest {
 }
 enum ScanResult {
     Found(u64, Vec<Hit>),
-    Desktop(Vec<FileRecord>, bool),
+    Desktop(Vec<FileRecord>, bool, HashMap<PathBuf, String>),
     Phone(String, Result<(Vec<FileRecord>, bool), String>),
     Opened(Result<String, String>),
 }
@@ -92,6 +92,8 @@ pub(super) struct SearchState {
     preserve: Option<String>,
     desktop_files: Vec<FileRecord>,
     phone_files: Vec<FileRecord>,
+    note_snippets: HashMap<PathBuf, String>,
+    live_signature: Option<u64>,
     scope: Option<(String, Option<String>)>,
     device: Option<String>,
     tx: mpsc::Sender<ScanResult>,
@@ -167,6 +169,8 @@ impl Default for SearchState {
             built: Instant::now() - Duration::from_secs(10),
             desktop_files: vec![],
             phone_files: vec![],
+            note_snippets: HashMap::new(),
+            live_signature: None,
             scope: None,
             device: None,
             tx,
@@ -477,7 +481,7 @@ impl Companion {
             );
             for out in &t.outputs {
                 add(
-                    format!("local:{}", out.path.display()),
+                    format!("local:work:{}", out.path.display()),
                     Kind::Work,
                     false,
                     out.name.clone(),
@@ -583,7 +587,7 @@ impl Companion {
         for g in &self.back_screen.gallery_items {
             add(
                 format!(
-                    "{}:{}",
+                    "gallery:{}:{}",
                     if g.category == "expansion" {
                         "local"
                     } else {
@@ -640,6 +644,8 @@ impl Companion {
                 Target::Studio(w.id.clone()),
             );
         }
+        let trashed_paths: std::collections::HashSet<&str> =
+            self.trashed.iter().map(|t| t.original.as_str()).collect();
         // Reuse discovery metadata, especially the phone arrival timestamps
         // absent from its full filename index. No extra device or disk polling.
         for f in self.recent_files.desktop.iter().chain(self.recent_files.phone.iter()) {
@@ -647,8 +653,11 @@ impl Companion {
             if phone && f.device.as_ref() != self.search.device.as_ref() {
                 continue;
             }
+            if phone && trashed_paths.contains(&*f.path.to_string_lossy()) {
+                continue;
+            }
             add(
-                format!("{}:{}", if phone { "phone" } else { "local" }, f.path.display()),
+                format!("file:{}:{}", if phone { "phone" } else { "local" }, f.path.display()),
                 if f.kind == stepx_companion::recent_files::Kind::Image { Kind::Image } else { Kind::File },
                 phone,
                 f.name(),
@@ -660,7 +669,7 @@ impl Companion {
         }
         for w in self.work.files.iter().filter(|w| !w.is_dir) {
             add(
-                format!("local:{}", w.path.display()),
+                format!("file:local:{}", w.path.display()),
                 if search::image_path(&w.path) {
                     Kind::Image
                 } else {
@@ -676,7 +685,7 @@ impl Companion {
         }
         for w in &self.work.artifacts {
             add(
-                format!("local:{}", w.path.display()),
+                format!("local:work:{}", w.path.display()),
                 Kind::Work,
                 false,
                 w.name.clone(),
@@ -687,8 +696,11 @@ impl Companion {
             );
         }
         for f in self.files.iter().filter(|f| !f.directory) {
+            if trashed_paths.contains(f.path.as_str()) {
+                continue;
+            }
             add(
-                format!("phone:{}", f.path),
+                format!("file:phone:{}", f.path),
                 if search::image_path(std::path::Path::new(&f.path)) {
                     Kind::Image
                 } else {
@@ -707,9 +719,12 @@ impl Companion {
             (&self.search.phone_files, true),
         ] {
             for f in files {
+                if phone && trashed_paths.contains(&*f.path.to_string_lossy()) {
+                    continue;
+                }
                 add(
                     format!(
-                        "{}:{}",
+                        "file:{}:{}",
                         if phone { "phone" } else { "local" },
                         f.path.display()
                     ),
@@ -764,9 +779,14 @@ impl Companion {
             );
         }
         // Use the same scope-filtered source as the home page; no other account's summaries.
-        for (title, body, path, at) in self.context.search_documents() {
+        for (title, mut body, path, at) in self.context.search_documents() {
+            if body.is_empty() {
+                if let Some(snippet) = self.search.note_snippets.get(&path) {
+                    body = snippet.clone();
+                }
+            }
             add(
-                format!("context:{}", path.display()),
+                format!("note:{}", path.display()),
                 Kind::Summary,
                 false,
                 title,
@@ -802,7 +822,65 @@ impl Companion {
         self.search.docs = std::sync::Arc::new(docs);
         self.search.targets = targets;
         self.search.built = Instant::now();
+        self.search.live_signature = Some(self.search_live_signature());
         self.filter_search();
+    }
+    fn search_live_signature(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.files.len().hash(&mut h);
+        if let Some(first) = self.files.first() {
+            first.path.hash(&mut h);
+        }
+        if let Some(last) = self.files.last() {
+            last.path.hash(&mut h);
+        }
+        self.trashed.is_some().hash(&mut h);
+        if let Some(last) = &self.trashed {
+            last.original.hash(&mut h);
+        }
+        self.back_screen.gallery_items.len().hash(&mut h);
+        if let Some(first) = self.back_screen.gallery_items.first() {
+            first.remote_path.hash(&mut h);
+        }
+        if let Some(last) = self.back_screen.gallery_items.last() {
+            last.remote_path.hash(&mut h);
+        }
+        self.sms.len().hash(&mut h);
+        self.apps.len().hash(&mut h);
+        self.recent_files.desktop.len().hash(&mut h);
+        self.recent_files.phone.len().hash(&mut h);
+        self.work.files.len().hash(&mut h);
+        self.work.artifacts.len().hash(&mut h);
+        self.studio.works.len().hash(&mut h);
+        self.amoo_sessions.len().hash(&mut h);
+        self.workspace.journal.tasks.len().hash(&mut h);
+        h.finish()
+    }
+    pub(super) fn invalidate_search_path(&mut self, removed_path: &str) {
+        let target = removed_path.trim();
+        if target.is_empty() {
+            return;
+        }
+        self.search
+            .phone_files
+            .retain(|f| f.path.to_string_lossy() != target);
+        self.search
+            .desktop_files
+            .retain(|f| f.path.to_string_lossy() != target);
+        self.search
+            .note_snippets
+            .retain(|p, _| p.to_string_lossy() != target);
+        self.recent_files
+            .phone
+            .retain(|f| f.path.to_string_lossy() != target);
+        self.recent_files
+            .desktop
+            .retain(|f| f.path.to_string_lossy() != target);
+        self.search.built = Instant::now() - Duration::from_secs(11);
+        if self.search.open || self.page == Page::Search || !self.search.docs.is_empty() {
+            self.rebuild_search();
+        }
     }
     fn filter_search(&mut self) {
         self.search.dirty = false;
@@ -854,11 +932,35 @@ impl Companion {
             self.search.desktop_busy = true;
             let tx = self.search.tx.clone();
             let workspace = self.work.workspace.clone();
+            let note_paths: Vec<PathBuf> = self
+                .context
+                .search_documents()
+                .into_iter()
+                .filter_map(|(_, body, path, _)| body.is_empty().then_some(path))
+                .take(64)
+                .collect();
             std::thread::spawn(move || {
                 let roots =
                     stepx_companion::recent_files::Preferences::load().roots(workspace.as_deref());
                 let (files, limited) = search::desktop_files(&roots);
-                let _ = tx.send(ScanResult::Desktop(files, limited));
+                let mut note_snippets = HashMap::new();
+                for path in note_paths {
+                    use std::io::Read;
+                    if let Ok(meta) = std::fs::symlink_metadata(&path) {
+                        if meta.file_type().is_file() {
+                            if let Ok(file) = std::fs::File::open(&path) {
+                                let mut buf = Vec::with_capacity(8192);
+                                if file.take(8192).read_to_end(&mut buf).is_ok() {
+                                    let snippet = String::from_utf8_lossy(&buf).into_owned();
+                                    if !snippet.trim().is_empty() {
+                                        note_snippets.insert(path, snippet);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                let _ = tx.send(ScanResult::Desktop(files, limited, note_snippets));
             });
         }
         if !self.search.phone_busy {
@@ -883,25 +985,34 @@ impl Companion {
             self.search.closing = None;
             ctx.notify();
         }
-        let device = self
-            .selected
-            .as_ref()
-            .map(|d| d.serial.clone())
-            .or_else(|| self.last_connected_serial.clone());
+        let device = self.selected.as_ref().map(|d| d.serial.clone());
         let scope = self.context.productivity_scope();
+        let mut changed = false;
+        let mut rebuild = false;
         if self.search.device != device || self.search.scope != scope {
             self.search.scope = scope;
             self.search.device = device;
             self.search.phone_files.clear();
+            self.search.note_snippets.clear();
             self.search.docs = std::sync::Arc::new(vec![]);
             self.search.generation = self.search.generation.wrapping_add(1);
             self.search.targets.clear();
             self.search.hits.clear();
             self.search.scanned = None;
-            self.search.built = Instant::now() - Duration::from_secs(10);
+            self.search.built = Instant::now() - Duration::from_secs(11);
+            changed = true;
+            rebuild = true;
         }
-        let mut changed = false;
-        let mut rebuild = false;
+        let sig = self.search_live_signature();
+        if let Some(prev) = self.search.live_signature {
+            if prev != sig {
+                self.search.live_signature = Some(sig);
+                self.search.built = Instant::now() - Duration::from_secs(11);
+                rebuild = true;
+            }
+        } else {
+            self.search.live_signature = Some(sig);
+        }
         let mut activate = None;
         while let Ok(result) = self.search.rx.try_recv() {
             match result {
@@ -935,10 +1046,11 @@ impl Companion {
                         self.search.activate_when_ready = false;
                     }
                 }
-                ScanResult::Desktop(files, limited) => {
+                ScanResult::Desktop(files, limited, note_snippets) => {
                     rebuild = true;
                     self.search.desktop_busy = false;
                     self.search.desktop_files = files;
+                    self.search.note_snippets = note_snippets;
                     if limited {
                         self.search.note =
                             "文件较多，本次已建立部分索引；可缩小范围或重新更新".into();
@@ -1025,7 +1137,9 @@ impl Companion {
         }
         match a {
             SearchAction::Open => {
-                self.push.shell_mode = ShellMode::Full;
+                if self.push.shell_mode != ShellMode::Full {
+                    self.set_compact_mode(ShellMode::Full, ctx);
+                }
                 self.search.closing = None;
                 if !self.search.open {
                     self.search.previous_focus = self.focus;
@@ -1055,6 +1169,9 @@ impl Companion {
                 self.focus = self.search.previous_focus.take();
             }
             SearchAction::AllResults => {
+                if self.push.shell_mode != ShellMode::Full {
+                    self.set_compact_mode(ShellMode::Full, ctx);
+                }
                 if self.page != Page::Search {
                     self.search.previous = self.page;
                 }
@@ -1105,6 +1222,9 @@ impl Companion {
                 let Some(target) = self.search.targets.get(id).cloned() else {
                     return;
                 };
+                if self.push.shell_mode != ShellMode::Full {
+                    self.set_compact_mode(ShellMode::Full, ctx);
+                }
                 let query = self.fields[F_GLOBAL_SEARCH].text.trim().to_string();
                 if !query.is_empty() {
                     self.search.recent.retain(|s| s != &query);
@@ -1302,9 +1422,13 @@ impl Companion {
                 self.handle_action(&Action::BackScreen(BackScreenAction::SelectPreset(p)), ctx);
             }
             Target::Local(path) => {
-                if !path.exists() {
-                    self.search.note = "文件已移动或删除，请更新搜索结果".into();
-                    self.search.open = true;
+                if work_state::is_html_deliverable_path(&path) {
+                    if let Err(err) = self.open_html_in_studio_sandbox(path, None) {
+                        self.record_notice("文件打开未完成", &format!("{err:#}"));
+                        self.status = format!("文件打开未完成：{err:#}");
+                        self.error = true;
+                        self.search.note = format!("{err:#}");
+                    }
                     return;
                 }
                 if self.search.opening {
@@ -1313,7 +1437,16 @@ impl Companion {
                 self.search.opening = true;
                 let tx = self.search.tx.clone();
                 std::thread::spawn(move || {
-                    let result = open_search_file(&path).map_err(|e| e.to_string());
+                    let result = (|| -> Result<String> {
+                        let meta = std::fs::symlink_metadata(&path)
+                            .map_err(|_| anyhow::anyhow!("文件已移动或删除，请更新搜索结果"))?;
+                        anyhow::ensure!(
+                            meta.file_type().is_file() || meta.file_type().is_dir(),
+                            "文件已移动或删除，请更新搜索结果"
+                        );
+                        open_search_file(&path)
+                    })()
+                    .map_err(|e| e.to_string());
                     let _ = tx.send(ScanResult::Opened(result));
                 });
             }

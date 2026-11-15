@@ -22,6 +22,16 @@ final class CompanionMdiRuntime {
         String old=new Vault(c).get("stepx-mdi-record-v1");if(!old.isEmpty())record=new JSONObject(old);
         if(!record.optString("taskName").isEmpty()&&!record.optBoolean("released")){
             restartCleanup=true;record.put("state","interrupted").put("detail","进程重启，正在回收上次虚拟屏");
+            new Thread(()->{
+                try{
+                    recover();
+                    synchronized(CompanionMdiRuntime.this){
+                        if(!active()&&"interrupted".equals(record.optString("state"))){
+                            record.put("state","stopped").put("detail","已自动回收上次虚拟屏");save();
+                        }
+                    }
+                }catch(Exception ignored){}
+            },"StepX-MDI-Recover").start();
         }
     }catch(Exception ignored){}}
     synchronized boolean active(){return pendingStart||(worker!=null&&worker.isAlive());}
@@ -31,7 +41,10 @@ final class CompanionMdiRuntime {
         if(op.equals("status"))return status();
         if(op.equals("start")){
             if(active())throw new IllegalStateException("后台任务仍在运行，请先停止");
-            if(restartCleanup||(!record.optString("taskName").isEmpty()&&!record.optBoolean("released")))throw new IllegalStateException("上次虚拟屏尚未回收，请先停止上次任务");
+            if(restartCleanup||(!record.optString("taskName").isEmpty()&&!record.optBoolean("released"))){
+                try{recover();}
+                catch(Exception cleanup){throw new IllegalStateException("上次虚拟屏尚未回收，请先停止上次任务");}
+            }
             String id=q.getString("requestId"),goal=q.getString("goal").trim();
             if(!BridgePolicy.requestId(id)||goal.isEmpty()||goal.length()>4000||PrivateText.credential(goal))throw new IllegalArgumentException("任务目标无效");
             if(id.equals(record.optString("requestId"))){if(!goal.equals(record.optString("goal")))throw new IllegalArgumentException("重复任务目标不一致");return status();}
@@ -39,6 +52,7 @@ final class CompanionMdiRuntime {
             if(!new RoutineAccess(context).allows(config,new AppAccess(context).approved()))throw new IllegalStateException("请先确认模型与应用授权范围");
             JSONObject probe=CompanionMdiBus.probe();if(!probe.optBoolean("ok"))throw new IllegalStateException(probe.optString("error"));
             stop=false;paused=false;pendingStart=true;++revision;
+            deletePreview();
             record=new JSONObject().put("requestId",id).put("goal",goal).put("state","planning")
                 .put("executionMode","background").put("taskName","stepx-mdi-"+UUID.randomUUID())
                 .put("detail","正在规划后台任务").put("createdAt",System.currentTimeMillis()).put("released",true)
@@ -48,10 +62,12 @@ final class CompanionMdiRuntime {
             catch(Exception e){pendingStart=false;record.put("state","failed").put("detail","后台任务服务未启动，请在手机伴侣内重试");save();throw e;}
             return status().put("accepted",true);
         }
-        if(!q.optString("requestId").equals(record.optString("requestId")))throw new SecurityException("不是当前后台任务");
+        boolean allowUnmatchedStop="stop".equals(op)&&BridgePolicy.allowUnmatchedMdiStop(
+            active(),restartCleanup,record.optString("taskName"),record.optBoolean("released",true));
+        if(!allowUnmatchedStop&&!q.optString("requestId").equals(record.optString("requestId")))throw new SecurityException("不是当前后台任务");
         if(op.equals("stop")){
             stop=true;paused=false;++revision;ModelClient m=model;if(m!=null)m.cancel();notifyAll();
-            if(!active()){recover();record.put("state","stopped").put("detail","后台任务已停止，虚拟屏已释放");save();}
+            if(!active()){recover();deletePreview();record.put("state","stopped").put("detail","后台任务已停止，虚拟屏已释放");save();}
             else update("cancelling","正在停止并回收虚拟屏");
         }else if(op.equals("pause")){
             if(!active())throw new IllegalStateException("没有运行中的后台任务");
@@ -105,8 +121,26 @@ final class CompanionMdiRuntime {
         return new RoutineAccess(context).allows(config,Collections.singleton(pkg));
     }
     private void recover()throws Exception {
-        if(!record.optString("taskName").isEmpty()&&!record.optBoolean("released")){call("mdi_task_finish",new JSONObject().put("ignoreActions",true));record.put("released",true);}
-        restartCleanup=false;save();
+        String taskName;
+        boolean needFinish;
+        synchronized(this){
+            taskName=record.optString("taskName");
+            needFinish=!taskName.isEmpty()&&!record.optBoolean("released");
+        }
+        if(needFinish){
+            try(CompanionMdiBus b=new CompanionMdiBus()){
+                b.call("mdi_task_finish",new JSONObject().put("taskName",taskName).put("ignoreActions",true));
+            }catch(Exception e){
+                if(!BridgePolicy.mdiAlreadyReleasedError(e.getMessage()))throw e;
+            }
+        }
+        synchronized(this){
+            if(taskName.equals(record.optString("taskName"))){
+                if(needFinish)record.put("released",true);
+                restartCleanup=false;
+                save();
+            }
+        }
     }
     private void run(){String finalState="failed",detail="后台任务未完成";long deadline=SystemClock.elapsedRealtime()+720000;
         try {
@@ -185,7 +219,13 @@ final class CompanionMdiRuntime {
                     }
                     if(!stable){if(++stale>4)throw new IllegalStateException("目标控件持续变化，已停止以避免误操作");continue;}stale=0;
                     checkpoint(deadline);if(rev!=revision)continue;
-                    try{synchronized(this){if(stop||paused||rev!=revision)continue;execute(action,screen.getInt("width"),screen.getInt("height"));count("actions");}}
+                    try{
+                        boolean skipAction;
+                        synchronized(this){skipAction=stop||paused||rev!=revision;}
+                        if(skipAction)continue;
+                        execute(action,screen.getInt("width"),screen.getInt("height"));
+                        count("actions");
+                    }
                     catch(IllegalArgumentException|JSONException invalid){if(++malformed>2)throw invalid;history.put(new JSONObject().put("invalid_action",safeError(invalid)).put("instruction","所有动作坐标必须为 0～1000。控件树已归一化，无需换算。"));continue;}
                     malformed=0;history.put(new JSONObject().put("type",type).put("target",decision.optString("observation")).put("step",step+1));if(history.length()>10)history.remove(0);
                     Thread.sleep(type.equals("swipe")?900:600);
@@ -202,6 +242,15 @@ final class CompanionMdiRuntime {
             synchronized(this){worker=null;pendingStart=false;}
             context.stopService(new Intent(context,CompanionMdiService.class));
         }
+    }
+    private void deletePreview(){
+        try{
+            java.io.File directory=context.getExternalFilesDir(null);
+            if(directory!=null){
+                new java.io.File(directory,"mdi-preview.jpg").delete();
+                new java.io.File(directory,"mdi-preview.tmp").delete();
+            }
+        }catch(Exception ignored){}
     }
     private void cachePreview(JSONObject image)throws Exception {
         java.io.File directory=context.getExternalFilesDir(null);if(directory==null)return;

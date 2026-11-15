@@ -7,7 +7,13 @@ use super::super::{
     backscreen_state::BackScreenAction, icons::UiIcon, theme::*, widgets::*, Action, Companion,
     PushAction, F_ALARM_LABEL, F_ALARM_TIME, F_CALENDAR_TIME, F_PHONE_SCHEDULE_TITLE,
 };
-use super::{calendar_style::DayMarks, home::home_event_date_bounds};
+use super::{
+    calendar_style::DayMarks,
+    home::{
+        calendar_event_effective_end_ms, calendar_event_is_ended_at, home_event_date_bounds,
+        resolve_alarm_status, ResolvedAlarmStatus,
+    },
+};
 use chrono::{Datelike, Days, Local, NaiveDate, Timelike};
 use facloud_ui::{
     color::ColorU,
@@ -90,10 +96,17 @@ impl CalendarEventValidity {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AlarmValidity {
-    TodayValidUnexpired { diff_mins: u32 },
-    PassedTodayRepeating,
-    FutureDayRepeating,
-    ExpiredOneShot,
+    TodayValidUnexpired {
+        diff_mins: u32,
+    },
+    Tomorrow {
+        diff_mins: u32,
+    },
+    FutureWeekday {
+        day_offset: u32,
+        target_weekday: u32,
+        diff_mins: u32,
+    },
     ManuallyExpired,
     Disabled,
 }
@@ -113,6 +126,27 @@ fn fmt_alarm_countdown(diff_mins: u32) -> String {
 
 impl AlarmValidity {
     #[inline]
+    fn from_resolved(resolved: ResolvedAlarmStatus) -> Self {
+        match resolved {
+            ResolvedAlarmStatus::TodayPending { diff_mins } => {
+                Self::TodayValidUnexpired { diff_mins }
+            }
+            ResolvedAlarmStatus::Tomorrow { diff_mins } => Self::Tomorrow { diff_mins },
+            ResolvedAlarmStatus::FutureWeekday {
+                day_offset,
+                target_weekday,
+                diff_mins,
+            } => Self::FutureWeekday {
+                day_offset,
+                target_weekday,
+                diff_mins,
+            },
+            ResolvedAlarmStatus::ManuallyExpired => Self::ManuallyExpired,
+            ResolvedAlarmStatus::Disabled => Self::Disabled,
+        }
+    }
+
+    #[inline]
     fn is_today_unexpired(self) -> bool {
         matches!(self, Self::TodayValidUnexpired { .. })
     }
@@ -122,20 +156,29 @@ impl AlarmValidity {
         matches!(
             self,
             Self::TodayValidUnexpired { .. }
-                | Self::PassedTodayRepeating
-                | Self::FutureDayRepeating
+                | Self::Tomorrow { .. }
+                | Self::FutureWeekday { .. }
         )
+    }
+
+    #[inline]
+    fn next_offset_mins(self) -> Option<u32> {
+        match self {
+            Self::TodayValidUnexpired { diff_mins }
+            | Self::Tomorrow { diff_mins }
+            | Self::FutureWeekday { diff_mins, .. } => Some(diff_mins),
+            Self::ManuallyExpired | Self::Disabled => None,
+        }
     }
 
     #[inline]
     fn sort_rank(self) -> u8 {
         match self {
             Self::TodayValidUnexpired { .. } => 0,
-            Self::PassedTodayRepeating => 1,
-            Self::FutureDayRepeating => 2,
-            Self::ExpiredOneShot => 3,
-            Self::ManuallyExpired => 4,
-            Self::Disabled => 5,
+            Self::Tomorrow { .. } => 1,
+            Self::FutureWeekday { .. } => 2,
+            Self::ManuallyExpired => 3,
+            Self::Disabled => 4,
         }
     }
 
@@ -146,9 +189,12 @@ impl AlarmValidity {
                 p.success_text,
                 p.success_soft,
             ),
-            Self::PassedTodayRepeating => ("明天再响".into(), p.warning, p.warning_soft),
-            Self::FutureDayRepeating => ("今天不响".into(), p.accent, p.accent_soft),
-            Self::ExpiredOneShot => ("已过".into(), p.text3, p.card2),
+            Self::Tomorrow { .. } => ("明日响铃".into(), p.warning, p.warning_soft),
+            Self::FutureWeekday { target_weekday, .. } => (
+                ResolvedAlarmStatus::future_weekday_ring_label(target_weekday).into(),
+                p.accent,
+                p.accent_soft,
+            ),
             Self::ManuallyExpired => ("已过期".into(), p.text3, p.card2),
             Self::Disabled => ("未开启".into(), p.text3, p.card2),
         }
@@ -213,28 +259,30 @@ impl Companion {
         if self.calendar_event_is_suppressed(ev, now_ms) {
             return CalendarEventValidity::ManuallyExpired;
         }
-        let (ey, em, ed) = ev.date_ymd();
-        let Some(target_date) = NaiveDate::from_ymd_opt(ey, em, ed) else {
+        let Some((first_date, last_date)) = home_event_date_bounds(ev) else {
             return CalendarEventValidity::PastDate;
         };
-        let effective_end_ms = if ev.dtend > ev.dtstart {
-            ev.dtend
-        } else {
-            ev.dtstart + 3_600_000
-        };
-        let day_diff = (target_date - today).num_days();
-        if day_diff < 0 {
-            if !ev.all_day && ev.dtstart <= now_ms && effective_end_ms > now_ms {
-                CalendarEventValidity::OngoingToday
-            } else {
-                CalendarEventValidity::PastDate
+        if ev.all_day {
+            if last_date < today || calendar_event_is_ended_at(ev, now_ms) {
+                return CalendarEventValidity::PastDate;
             }
+            if first_date <= today && today <= last_date {
+                return CalendarEventValidity::UpcomingToday { mins_until: None };
+            }
+            return CalendarEventValidity::UpcomingFuture {
+                days_until: (first_date - today).num_days(),
+            };
+        }
+        let effective_end_ms = calendar_event_effective_end_ms(ev);
+        if ev.dtstart <= now_ms && effective_end_ms > now_ms && !calendar_event_is_ended_at(ev, now_ms)
+        {
+            return CalendarEventValidity::OngoingToday;
+        }
+        let day_diff = (first_date - today).num_days();
+        if day_diff < 0 {
+            CalendarEventValidity::PastDate
         } else if day_diff == 0 {
-            if ev.all_day {
-                CalendarEventValidity::UpcomingToday { mins_until: None }
-            } else if ev.dtstart <= now_ms && effective_end_ms > now_ms {
-                CalendarEventValidity::OngoingToday
-            } else if ev.dtstart > now_ms {
+            if ev.dtstart > now_ms {
                 let mins = ((ev.dtstart - now_ms) / 60_000).max(1);
                 CalendarEventValidity::UpcomingToday {
                     mins_until: Some(mins),
@@ -256,33 +304,13 @@ impl Companion {
         now_min: u32,
         weekday_idx: u32,
     ) -> AlarmValidity {
-        let is_suppressed = self.reminder_governance.is_any_key_suppressed(
-            &[format!("alarm:{}", a.id), format!("capsule:alarm-{}", a.id)],
-            None,
-            None,
-            None,
+        AlarmValidity::from_resolved(resolve_alarm_status(
+            a,
             now_ms,
-        );
-        if is_suppressed {
-            return AlarmValidity::ManuallyExpired;
-        }
-        if !a.enabled {
-            return AlarmValidity::Disabled;
-        }
-        let matches_today =
-            a.days_of_week == 0 || (a.days_of_week & (1u32 << weekday_idx.min(6))) != 0;
-        let alarm_min = (a.hour as u32) * 60 + (a.minutes as u32);
-        if matches_today && alarm_min > now_min {
-            AlarmValidity::TodayValidUnexpired {
-                diff_mins: alarm_min - now_min,
-            }
-        } else if matches_today && a.days_of_week != 0 {
-            AlarmValidity::PassedTodayRepeating
-        } else if !matches_today && a.days_of_week != 0 {
-            AlarmValidity::FutureDayRepeating
-        } else {
-            AlarmValidity::ExpiredOneShot
-        }
+            now_min,
+            weekday_idx,
+            &self.reminder_governance,
+        ))
     }
 
     pub(super) fn calendar_actions(&self) -> Vec<El> {
@@ -1063,8 +1091,13 @@ impl Companion {
             .collect();
         visible_alarms.sort_by_key(|a| {
             let v = self.alarm_validity(a, now_ms, now_min, weekday_idx);
-            let alarm_min = a.hour.saturating_mul(60).saturating_add(a.minutes);
-            (v.sort_rank(), alarm_min, a.id)
+            let alarm_min = (a.hour as u32) * 60 + (a.minutes as u32);
+            (
+                v.sort_rank(),
+                v.next_offset_mins().unwrap_or(u32::MAX),
+                alarm_min,
+                a.id,
+            )
         });
 
         let mut today_unexpired_count = 0usize;
@@ -1616,5 +1649,105 @@ mod calendar_layout_review_tests {
                 });
             }
         });
+    }
+
+    #[test]
+    fn schedule_alarm_validity_handles_evening_one_shot_and_mwf_repeating_alarms() {
+        let mut app = Companion::new_for_test();
+        app.reminder_governance = Default::default();
+        let p = app.p();
+        let now_ms = 1_794_000_000_000i64;
+
+        let one_shot_730 = stepx_companion::toolbox::PhoneAlarmItem {
+            id: 11,
+            hour: 7,
+            minutes: 30,
+            enabled: true,
+            days_of_week: 0,
+            message: "早班航班".into(),
+            ..Default::default()
+        };
+        let v_evening = app.alarm_validity(&one_shot_730, now_ms, 22 * 60, 1);
+        assert!(v_evening.is_valid_active());
+        assert!(!v_evening.is_today_unexpired());
+        assert_eq!(v_evening.badge(&p).0, "明日响铃");
+
+        let mwf_800 = stepx_companion::toolbox::PhoneAlarmItem {
+            id: 12,
+            hour: 8,
+            minutes: 0,
+            enabled: true,
+            days_of_week: (1 << 0) | (1 << 2) | (1 << 4),
+            message: "周一三五例会".into(),
+            ..Default::default()
+        };
+        // Viewed on Tuesday (weekday_idx = 1) at 10:00 -> rings Wednesday ("明日响铃")
+        let v_tue = app.alarm_validity(&mwf_800, now_ms, 10 * 60, 1);
+        assert!(v_tue.is_valid_active());
+        assert_eq!(v_tue.badge(&p).0, "明日响铃");
+
+        // Viewed on Monday (weekday_idx = 0) at 19:00 -> rings Wednesday ("周三响铃")
+        let v_mon_night = app.alarm_validity(&mwf_800, now_ms, 19 * 60, 0);
+        assert!(v_mon_night.is_valid_active());
+        assert_eq!(v_mon_night.badge(&p).0, "周三响铃");
+
+        // Disabled alarm -> "未开启"
+        let mut disabled = mwf_800.clone();
+        disabled.enabled = false;
+        let v_off = app.alarm_validity(&disabled, now_ms, 10 * 60, 1);
+        assert!(!v_off.is_valid_active());
+        assert_eq!(v_off.badge(&p).0, "未开启");
+    }
+
+    #[test]
+    fn schedule_calendar_validity_keeps_ongoing_and_multiday_all_day_events_active() {
+        use chrono::TimeZone;
+        let mut app = Companion::new_for_test();
+        app.reminder_governance = Default::default();
+        app.back_screen.completed_calendar_events.clear();
+
+        let today = NaiveDate::from_ymd_opt(2026, 11, 11).unwrap();
+        let now_ms = Local
+            .from_local_datetime(&today.and_hms_opt(10, 30, 0).unwrap())
+            .single()
+            .unwrap()
+            .timestamp_millis();
+
+        // Ongoing timed meeting 10:00..11:00
+        let ongoing = stepx_companion::toolbox::PhoneCalendarEvent {
+            id: 201,
+            title: "正在进行中的产品评审".into(),
+            dtstart: now_ms - 30 * 60_000,
+            dtend: now_ms + 30 * 60_000,
+            all_day: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            app.calendar_event_validity(&ongoing, today, now_ms),
+            CalendarEventValidity::OngoingToday
+        );
+
+        // Multi-day all-day event Nov 10..Nov 12 (exclusive end Nov 13 00:00)
+        let d_nov10 = Local
+            .from_local_datetime(&NaiveDate::from_ymd_opt(2026, 11, 10).unwrap().and_hms_opt(0, 0, 0).unwrap())
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let d_nov13 = Local
+            .from_local_datetime(&NaiveDate::from_ymd_opt(2026, 11, 13).unwrap().and_hms_opt(0, 0, 0).unwrap())
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let multiday_all_day = stepx_companion::toolbox::PhoneCalendarEvent {
+            id: 202,
+            title: "跨天封闭开发周".into(),
+            dtstart: d_nov10,
+            dtend: d_nov13,
+            all_day: true,
+            ..Default::default()
+        };
+        assert!(app
+            .calendar_event_validity(&multiday_all_day, today, now_ms)
+            .is_today_valid_unexpired());
     }
 }

@@ -1,7 +1,9 @@
 //! Local, cancellable speech. Never uploads conversation text or uses a model API key.
 use anyhow::{ensure, Context, Result};
+#[cfg(target_os = "linux")]
+use std::io::Read;
 use std::{
-    io::{Read, Write},
+    io::Write,
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
@@ -32,16 +34,21 @@ pub fn spoken_text(source: &str) -> String {
         .collect()
 }
 pub struct Playback {
-    child: Child,
+    child: Option<Child>,
     started: Instant,
-    _text: tempfile::NamedTempFile,
+    #[cfg(not(target_os = "linux"))]
+    _text: Option<tempfile::NamedTempFile>,
 }
 impl Playback {
     pub fn start(text: &str) -> Result<Self> {
         let text = spoken_text(text);
         ensure!(!text.trim().is_empty(), "这条消息没有可朗读的文字");
-        let mut file = tempfile::NamedTempFile::new()?;
-        file.write_all(text.as_bytes())?;
+        #[cfg(not(target_os = "linux"))]
+        let file = {
+            let mut file = tempfile::NamedTempFile::new()?;
+            file.write_all(text.as_bytes())?;
+            file
+        };
         let mut command;
         #[cfg(target_os = "linux")]
         {
@@ -60,8 +67,13 @@ impl Playback {
             command.args(["-NoProfile","-NonInteractive","-Command","Add-Type -AssemblyName System.Speech; $s=New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.Speak([System.IO.File]::ReadAllText($env:STEPX_SPEECH_FILE)); $s.Dispose()"])
                 .env("STEPX_SPEECH_FILE",file.path()).creation_flags(0x08000000);
         }
+        #[cfg(target_os = "linux")]
+        let stdin_cfg = Stdio::piped();
+        #[cfg(not(target_os = "linux"))]
+        let stdin_cfg = Stdio::null();
+        #[allow(unused_mut)]
         let mut child = command
-            .stdin(Stdio::piped())
+            .stdin(stdin_cfg)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -71,15 +83,18 @@ impl Playback {
             if let Some(mut stdin) = child.stdin.take() {
                 if let Err(e) = stdin.write_all(text.as_bytes()) {
                     let _ = child.kill();
-                    let _ = child.wait();
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                    });
                     return Err(e.into());
                 }
             }
         }
         Ok(Self {
-            child,
+            child: Some(child),
             started: Instant::now(),
-            _text: file,
+            #[cfg(not(target_os = "linux"))]
+            _text: Some(file),
         })
     }
     pub fn poll(&mut self) -> Result<bool> {
@@ -87,8 +102,16 @@ impl Playback {
             self.stop();
             anyhow::bail!("朗读超时，已停止");
         }
-        match self.child.try_wait()? {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(true);
+        };
+        match child.try_wait()? {
             Some(status) => {
+                self.child = None;
+                #[cfg(not(target_os = "linux"))]
+                {
+                    self._text = None;
+                }
                 ensure!(status.success(),"电脑语音服务不可用。Linux 请安装 espeak-ng 与中文语音数据；Windows / macOS 请在系统设置中添加中文语音。");
                 Ok(true)
             }
@@ -96,8 +119,16 @@ impl Playback {
         }
     }
     pub fn stop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        #[cfg(not(target_os = "linux"))]
+        let text_file = self._text.take();
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            std::thread::spawn(move || {
+                let _ = child.wait();
+                #[cfg(not(target_os = "linux"))]
+                drop(text_file);
+            });
+        }
     }
 }
 impl Drop for Playback {
@@ -164,23 +195,37 @@ pub fn helper() -> Result<()> {
         }
     }
     for (program, args) in [
-        ("spd-say", &["-w", "-l", "cmn", text.as_str()][..]),
-        ("espeak-ng", &["-v", "cmn", text.as_str()][..]),
+        ("spd-say", &["-w", "-l", "cmn", "--pipe-mode"][..]),
+        ("espeak-ng", &["--stdin", "-v", "cmn"][..]),
     ] {
-        if let Ok(status) = Command::new(program)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-        {
-            if status.success() {
-                return Ok(());
-            }
+        if run_tts_cli_via_stdin(program, args, &text) {
+            return Ok(());
         }
     }
     anyhow::bail!("Install espeak-ng")
 }
+
+#[cfg(any(target_os = "linux", test))]
+fn run_tts_cli_via_stdin(program: &str, args: &[&str], text: &str) -> bool {
+    let Ok(mut child) = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        if stdin.write_all(text.as_bytes()).is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return false;
+        }
+    }
+    child.wait().is_ok_and(|status| status.success())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,5 +235,36 @@ mod tests {
             spoken_text("## 你好\n**世界**\n```rust\nsecret()\n```\n再见\0"),
             "你好\n世界\n再见"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_tts_pipes_text_over_stdin_without_exposing_argv() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let argv_file = dir.path().join("argv.txt");
+        let stdin_file = dir.path().join("stdin.txt");
+        let script = dir.path().join("fake-tts.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\ncat > \"{}\"\n",
+                argv_file.display(),
+                stdin_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let secret = "绝密聊天内容-不应出现在ps命令行";
+        assert!(run_tts_cli_via_stdin(
+            script.to_str().unwrap(),
+            &["--stdin", "-v", "cmn"],
+            secret,
+        ));
+        let recorded_argv = std::fs::read_to_string(&argv_file).unwrap();
+        let recorded_stdin = std::fs::read_to_string(&stdin_file).unwrap();
+        assert!(!recorded_argv.contains(secret));
+        assert_eq!(recorded_stdin, secret);
     }
 }

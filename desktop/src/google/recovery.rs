@@ -42,6 +42,7 @@ struct State {
     epoch: u64,
     flight: Option<u64>,
     authorized: bool,
+    one_shot: bool,
     busy: bool,
     next_check: Instant,
     failures: u32,
@@ -54,6 +55,7 @@ impl Default for State {
             epoch: 0,
             flight: None,
             authorized: false,
+            one_shot: false,
             busy: false,
             next_check: Instant::now(),
             failures: 0,
@@ -79,25 +81,29 @@ impl RecoveryCoordinator {
             serial: device.serial.clone(),
             transport: device.transport.clone(),
         };
-        let ticket = {
+        let run_spec = {
             let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let pending_one_shot = state.one_shot && state.identity.is_none();
             if state.identity.as_ref() != Some(&identity) || state.authorized != authorized {
                 state.epoch = state.epoch.wrapping_add(1);
                 state.identity = Some(identity);
                 state.authorized = authorized;
+                state.one_shot = pending_one_shot;
                 state.failures = 0;
                 state.next_check = Instant::now();
                 state.snapshot = RecoverySnapshot::default();
             }
             state.busy = communication_busy;
-            if !authorized {
-                state.snapshot.phase = RecoveryPhase::Cancelled;
-                state.snapshot.message = "Google 自动维护已暂停".into();
+            if !authorized && !state.one_shot && state.flight.is_none() {
+                if state.snapshot.phase == RecoveryPhase::Idle {
+                    state.snapshot.phase = RecoveryPhase::Cancelled;
+                    state.snapshot.message = "Google 自动维护已暂停".into();
+                }
                 None
             } else if state.flight.is_some() {
                 None
             } else if communication_busy {
-                if Instant::now() >= state.next_check {
+                if (authorized || state.one_shot) && Instant::now() >= state.next_check {
                     state.snapshot.phase = RecoveryPhase::Waiting;
                     state.snapshot.message = "等待通话或当前操作结束后检查 Google 服务".into();
                 }
@@ -108,15 +114,17 @@ impl RecoveryCoordinator {
                 None
             } else if Instant::now() >= state.next_check {
                 let ticket = state.epoch;
+                let one_shot = state.one_shot;
+                state.one_shot = false;
                 state.flight = Some(ticket);
                 state.snapshot.phase = RecoveryPhase::Checking;
                 state.snapshot.message = "正在后台检查 Google 服务".into();
-                Some(ticket)
+                Some((ticket, one_shot))
             } else {
                 None
             }
         };
-        if let Some(ticket) = ticket {
+        if let Some((ticket, one_shot)) = run_spec {
             let worker = self.clone();
             let device = device.clone();
             let adb = adb.clone();
@@ -124,7 +132,7 @@ impl RecoveryCoordinator {
                 .name("google-maintenance".into())
                 .spawn(move || {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        worker.run(ticket, &device, &adb)
+                        worker.run(ticket, one_shot, &device, &adb)
                     }))
                     .unwrap_or_else(|_| Err(anyhow::anyhow!("Google maintenance worker stopped")));
                     worker.finish(ticket, result);
@@ -145,6 +153,19 @@ impl RecoveryCoordinator {
             .as_ref()
             .is_some_and(|id| id.serial == serial)
         {
+            state.one_shot = true;
+            state.next_check = Instant::now();
+        }
+    }
+    pub fn force_request_now(&self, serial: &str) {
+        let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if state
+            .identity
+            .as_ref()
+            .is_some_and(|id| id.serial == serial)
+            || (state.identity.is_none() && !serial.trim().is_empty())
+        {
+            state.one_shot = true;
             state.next_check = Instant::now();
         }
     }
@@ -155,16 +176,24 @@ impl RecoveryCoordinator {
     pub fn cancel(&self) {
         let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         state.epoch = state.epoch.wrapping_add(1);
-        state.authorized = false;
+        state.one_shot = false;
+        state.next_check = Instant::now() + Duration::from_secs(300);
         state.snapshot.phase = RecoveryPhase::Cancelled;
         state.snapshot.message = "Google 自动维护已暂停".into();
+        // Preserve state.authorized so finishing a manual install/maintain does
+        // not falsely observe an authorization transition and re-trigger a
+        // duplicate background cycle.
         // A step already running is bounded and may have a durable reservation.
         // Do not kill it half-way through device mutation or overlap a new step.
     }
     pub fn disconnect(&self) {
-        self.cancel();
         let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        state.epoch = state.epoch.wrapping_add(1);
+        state.authorized = false;
+        state.one_shot = false;
         state.identity = None;
+        state.snapshot.phase = RecoveryPhase::Cancelled;
+        state.snapshot.message = "Google 自动维护已暂停".into();
     }
     pub fn snapshot(&self, serial: &str) -> RecoverySnapshot {
         let state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -183,16 +212,26 @@ impl RecoveryCoordinator {
             .as_secs();
         snapshot
     }
+    fn can_check(&self, ticket: u64, one_shot: bool) -> bool {
+        let state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        state.epoch == ticket && (state.authorized || one_shot) && !state.busy
+    }
     fn can_continue(&self, ticket: u64) -> bool {
         let state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         state.epoch == ticket && state.authorized && !state.busy
     }
-    fn run(&self, ticket: u64, device: &Device, adb: &Adb) -> anyhow::Result<Value> {
-        if !self.can_continue(ticket) {
+    fn run(
+        &self,
+        ticket: u64,
+        one_shot: bool,
+        device: &Device,
+        adb: &Adb,
+    ) -> anyhow::Result<Value> {
+        if !self.can_check(ticket, one_shot) {
             return Ok(deferred());
         }
         let result = run_action(device, adb, "auto-status")?;
-        if result["repair_allowed"].as_bool() != Some(true) {
+        if result["repair_allowed"].as_bool() != Some(true) || !self.can_continue(ticket) {
             return Ok(result);
         }
         {
@@ -432,5 +471,59 @@ mod tests {
         c.retry_now("phone");
         assert!(!c.can_continue(7));
         assert_eq!(c.snapshot("phone").phase, RecoveryPhase::Cancelled);
+    }
+
+    #[test]
+    fn cancel_preserves_authorization_and_defers_duplicate_cycle_after_manual_action() {
+        let c = coordinator();
+        c.finish(
+            7,
+            Ok(serde_json::json!({"state":"healthy","retry_after_seconds":300})),
+        );
+        c.cancel();
+        let phone = Device {
+            serial: "phone".into(),
+            transport: "wifi".into(),
+            ..Default::default()
+        };
+        let adb = Adb {
+            path: "must-not-run".into(),
+        };
+        // Manual install runs with busy=true, then finishes with busy=false while authorized=true.
+        assert_eq!(
+            c.tick(&phone, &adb, true, true).phase,
+            RecoveryPhase::Cancelled
+        );
+        let after = c.tick(&phone, &adb, true, false);
+        assert!(!after.in_flight);
+        assert!(after.retry_after_seconds > 240);
+    }
+
+    #[test]
+    fn paused_coordinator_allows_one_shot_check_without_granting_mutation() {
+        let c = RecoveryCoordinator::default();
+        let phone = Device {
+            serial: "phone".into(),
+            transport: "wifi".into(),
+            ..Default::default()
+        };
+        let adb = Adb {
+            path: "must-not-run".into(),
+        };
+        // Initial tick while paused marks Cancelled without spawning.
+        let initial = c.tick(&phone, &adb, false, false);
+        assert_eq!(initial.phase, RecoveryPhase::Cancelled);
+        assert!(!initial.in_flight);
+
+        // Explicit check arms one_shot even while paused; busy tick defers to Waiting,
+        // proving one_shot bypassed the paused gate without changing authorized.
+        c.force_request_now("phone");
+        let waiting = c.tick(&phone, &adb, false, true);
+        assert_eq!(waiting.phase, RecoveryPhase::Waiting);
+        let epoch = c.inner.lock().unwrap().epoch;
+        assert!(!c.inner.lock().unwrap().authorized);
+        c.inner.lock().unwrap().busy = false;
+        assert!(c.can_check(epoch, true));
+        assert!(!c.can_continue(epoch));
     }
 }

@@ -12,7 +12,7 @@ void warp_update_ime_state(WarpHostView *, BOOL);
 void warp_handle_drag_and_drop(WarpHostView *, NSArray *, NSPoint);
 void warp_handle_file_drag(WarpHostView *, NSPoint);
 void warp_handle_file_drag_exit(WarpHostView *);
-NSRect warp_ime_position(WarpHostView *, NSRect *);
+NSRect warp_ime_position(WarpHostView *, NSRect);
 id warp_get_accessibility_contents(WarpHostView *);
 void warp_marked_text_updated(WarpHostView *, NSString *, NSRange);
 void warp_marked_text_cleared(WarpHostView *);
@@ -182,7 +182,9 @@ void warp_marked_text_cleared(WarpHostView *);
     // Dispatch TypedCharacter event after KeyDown has been dispatched.
     if ([textToInsert length] > 0 && !handled) {
         warp_handle_insert_text(self, (NSString *)textToInsert);
-        [self unmarkText];
+        if (wasComposing || [self hasMarkedText]) {
+            [self unmarkText];
+        }
     }
 
     return handled;
@@ -256,7 +258,6 @@ void warp_marked_text_cleared(WarpHostView *);
     CAMetalLayer *layer = [CAMetalLayer layer];
     layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
     layer.device = metalDevice;
-    layer.allowsNextDrawableTimeout = NO;
     layer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
     layer.needsDisplayOnBoundsChange = YES;
     layer.presentsWithTransaction = YES;
@@ -406,8 +407,7 @@ void warp_marked_text_cleared(WarpHostView *);
     NSWindow *window = self.window;
     if (self.readyForWarp) {
         NSRect contentRect = [window contentRectForFrameRect:[window frame]];
-        NSRect rect = warp_ime_position(self, &contentRect);
-        return rect;
+        return warp_ime_position(self, contentRect);
     } else {
         return NSZeroRect;
     }
@@ -420,6 +420,12 @@ void warp_marked_text_cleared(WarpHostView *);
 // Referenced glfw for this implementation.
 // https://github.com/glfw/glfw/blob/7ef34eb06de54dd9186d3d21a401b2ef819b59e7/src/cocoa_window.m#L814
 - (void)insertText:(id)string replacementRange:(NSRange)replacementRange {
+    if (!string) {
+        if (!interpretingKeyEvents && [self hasMarkedText]) {
+            [self unmarkText];
+        }
+        return;
+    }
     if (self.readyForWarp) {
         NSMutableString *characters = [[NSMutableString alloc] init];
 
@@ -447,7 +453,7 @@ void warp_marked_text_cleared(WarpHostView *);
     }
     // When handling the key down Enter, we might need to rely on the IME being open
     // to accept the marked text as-is and so can't call unmarkText.
-    if (!interpretingKeyEvents) {
+    if (!interpretingKeyEvents && [self hasMarkedText]) {
         [self unmarkText];
     }
 }
@@ -466,6 +472,10 @@ void warp_marked_text_cleared(WarpHostView *);
 - (void)setMarkedText:(id)string
         selectedRange:(NSRange)selectedRange
      replacementRange:(NSRange)replacementRange {
+    if (!string) {
+        [self unmarkText];
+        return;
+    }
     [markedText release];
     if ([string isKindOfClass:[NSAttributedString class]])
         markedText = [[NSMutableAttributedString alloc] initWithAttributedString:string];

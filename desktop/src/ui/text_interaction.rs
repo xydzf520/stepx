@@ -9,12 +9,10 @@ impl Input {
         if !self.preedit.is_empty() {
             return false;
         }
-        let mut pos = position.min(self.text.len());
-        while !self.text.is_char_boundary(pos) {
-            pos -= 1;
-        }
+        let pos = crate::ui::keyboard_input::clamp_char_boundary(&self.text, position);
         if extend {
-            self.anchor.get_or_insert(self.cursor);
+            let cur = crate::ui::keyboard_input::clamp_char_boundary(&self.text, self.cursor);
+            self.anchor.get_or_insert(cur);
         } else {
             self.anchor = Some(pos);
         }
@@ -70,7 +68,7 @@ impl Input {
             } else {
                 self.redo.push(old);
             }
-            self.cursor = cursor;
+            self.cursor = crate::ui::keyboard_input::clamp_char_boundary(&self.text, cursor);
             self.all = false;
             self.anchor = None;
             self.preedit.clear();
@@ -81,9 +79,11 @@ impl Input {
         if self.all {
             return Some(0..self.text.len());
         }
+        let cur = crate::ui::keyboard_input::clamp_char_boundary(&self.text, self.cursor);
         self.anchor
-            .filter(|a| *a != self.cursor)
-            .map(|a| a.min(self.cursor)..a.max(self.cursor))
+            .map(|a| crate::ui::keyboard_input::clamp_char_boundary(&self.text, a))
+            .filter(|a| *a != cur)
+            .map(|a| a.min(cur)..a.max(cur))
     }
     pub(super) fn delete_selection(&mut self) -> bool {
         let Some(range) = self.selection_range() else {
@@ -194,7 +194,12 @@ impl Companion {
         let f = &self.fields[index];
         let focused = self.input_has_focus(index);
         let insertion = if focused { f.preedit.len() } else { 0 };
-        let masked = (index == F_PAIR_CODE && !self.show_secret) || index == F_LAB_KEY;
+        let masked = matches!(index, F_PAIR_CODE | F_LAB_KEY) && !self.show_secret;
+        let actual_line_len = if f.text.is_empty() && f.preedit.is_empty() {
+            0
+        } else {
+            line.len()
+        };
         let mask_map = masked.then(|| {
             masked_byte_map(
                 &f.text,
@@ -241,6 +246,7 @@ impl Companion {
             mask_map,
             index,
             offset,
+            actual_line_len,
             cursor: f.cursor,
             insertion,
             dragging: f.dragging,
@@ -258,7 +264,8 @@ fn masked_byte_map(text: &str, cursor: usize, preedit_chars: usize) -> Vec<usize
         .map(|(i, _)| i)
         .chain(std::iter::once(text.len()))
         .collect();
-    let caret = text[..cursor].chars().count();
+    let safe_cursor = crate::ui::keyboard_input::clamp_char_boundary(text, cursor);
+    let caret = text[..safe_cursor].chars().count();
     (0..source.len() + preedit_chars)
         .map(|i| source[display_to_original(i, caret, preedit_chars).min(source.len() - 1)])
         .collect()
@@ -306,6 +313,7 @@ struct EditableLine {
     mask_map: Option<Vec<usize>>,
     index: usize,
     offset: usize,
+    actual_line_len: usize,
     cursor: usize,
     insertion: usize,
     dragging: bool,
@@ -408,7 +416,8 @@ impl Element for EditableLine {
                 IsRect::False,
             )
             .map(|v| v.iter().map(|f| f.text.len()).sum::<usize>())
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .min(self.actual_line_len);
         let byte = self
             .mask_map
             .as_ref()
@@ -462,5 +471,15 @@ mod tests {
     fn caret_is_not_part_of_copied_text() {
         assert_eq!(display_to_original(9, 3, 3), 6);
         assert_eq!(display_to_original(4, 3, 3), 3);
+    }
+    #[test]
+    fn empty_or_trailing_line_clamps_clicked_column_offset() {
+        // An empty middle line in "abc\n\ndef" renders a 1-byte space " " for line height,
+        // but `actual_line_len` is 0; clamping `prefix` prevents jumping onto "def".
+        let offset = 4usize; // start of the empty line after "abc\n"
+        let actual_line_len = 0usize;
+        let raw_prefix = 1usize; // hit-test right of synthetic " "
+        let clamped_prefix = raw_prefix.min(actual_line_len);
+        assert_eq!(display_to_original(offset + clamped_prefix, 8, 0), 4);
     }
 }

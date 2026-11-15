@@ -18,8 +18,62 @@ use std::{
 #[derive(Serialize, Deserialize)]
 struct Endpoint {
     port: u16,
-    token: [u8; 32],
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default)]
     pid: u32,
+}
+
+fn generate_token() -> String {
+    format!("{:032x}", rand::random::<u128>())
+}
+
+fn accept_error_backoff(kind: std::io::ErrorKind) -> Option<Duration> {
+    match kind {
+        std::io::ErrorKind::Interrupted
+        | std::io::ErrorKind::WouldBlock
+        | std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::ConnectionReset
+        | std::io::ErrorKind::TimedOut => None,
+        _ => Some(Duration::from_millis(50)),
+    }
+}
+
+fn handle_activation_connection(
+    connection: &mut TcpStream,
+    expected_token: Option<&str>,
+    notify: &AtomicBool,
+) {
+    let timeout = Some(Duration::from_millis(250));
+    let _ = connection.set_read_timeout(timeout);
+    let _ = connection.set_write_timeout(timeout);
+    let expected = match expected_token.filter(|t| !t.is_empty()) {
+        Some(token) => format!("activate {token}"),
+        None => "activate".to_string(),
+    };
+    let mut buf = [0u8; 128];
+    let mut filled = 0usize;
+    while filled < expected.len() {
+        match connection.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                filled += n;
+                if buf[..filled].contains(&b'\n') {
+                    break;
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    let received = std::str::from_utf8(&buf[..filled])
+        .ok()
+        .map(|s| s.trim_end_matches(['\r', '\n']));
+    if received == Some(expected.as_str()) {
+        notify.store(true, Ordering::Release);
+        let _ = connection.write_all(b"ACK");
+        let _ = connection.flush();
+    }
 }
 
 pub enum Claim {
@@ -71,35 +125,53 @@ impl Instance {
         let address = listener.local_addr()?;
         let endpoint = Endpoint {
             port: address.port(),
-            token: rand::random(),
+            token: Some(generate_token()),
             pid: std::process::id(),
         };
         let mut metadata = tempfile::NamedTempFile::new_in(directory)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            metadata
+                .as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
         serde_json::to_writer(&mut metadata, &endpoint)?;
         metadata.flush()?;
+        metadata.as_file().sync_all()?;
         metadata.persist(&endpoint_path).map_err(|e| e.error)?;
+        #[cfg(unix)]
+        if let Ok(dir_file) = File::open(directory) {
+            let _ = dir_file.sync_all();
+        }
         let requested = Arc::new(AtomicBool::new(false));
         let stopped = Arc::new(AtomicBool::new(false));
         let (notify, stop) = (requested.clone(), stopped.clone());
+        let expected_token = endpoint.token;
         let worker = thread::Builder::new()
             .name("desktop-activation".into())
-            .spawn(move || {
-                for connection in listener.incoming() {
-                    if stop.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let Ok(mut connection) = connection else {
-                        break;
-                    };
-                    let timeout = Some(Duration::from_millis(250));
-                    let _ = connection.set_read_timeout(timeout);
-                    let _ = connection.set_write_timeout(timeout);
-                    let mut token = [0u8; 32];
-                    if connection.read_exact(&mut token).is_ok() && token == endpoint.token {
-                        notify.store(true, Ordering::Release);
-                        let _ = connection.write_all(b"OK");
-                    }
+            .spawn(move || loop {
+                if stop.load(Ordering::Acquire) {
+                    break;
                 }
+                let mut connection = match listener.accept() {
+                    Ok((connection, _peer)) => {
+                        if stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        connection
+                    }
+                    Err(error) => {
+                        if stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        if let Some(backoff) = accept_error_backoff(error.kind()) {
+                            thread::sleep(backoff);
+                        }
+                        continue;
+                    }
+                };
+                handle_activation_connection(&mut connection, expected_token.as_deref(), &notify);
             })?;
         Ok(Claim::Primary(Self {
             _lock: lock,
@@ -126,19 +198,27 @@ fn activate(path: &Path) -> Result<()> {
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     #[cfg(windows)]
-    unsafe {
-        // The launcher has the foreground grant from the user's click. Pass it
-        // to the existing process before it restores/focuses the main window.
-        #[link(name = "user32")]
-        extern "system" {
-            fn AllowSetForegroundWindow(process_id: u32) -> i32;
+    if endpoint.pid != 0 {
+        unsafe {
+            // The launcher has the foreground grant from the user's click. Pass it
+            // to the existing process before it restores/focuses the main window.
+            #[link(name = "user32")]
+            extern "system" {
+                fn AllowSetForegroundWindow(process_id: u32) -> i32;
+            }
+            AllowSetForegroundWindow(endpoint.pid);
         }
-        AllowSetForegroundWindow(endpoint.pid);
     }
-    stream.write_all(&endpoint.token)?;
-    let mut reply = [0u8; 2];
+    let request = match endpoint.token.as_deref().filter(|t| !t.is_empty()) {
+        Some(token) => format!("activate {token}"),
+        None => "activate".to_string(),
+    };
+    stream.write_all(request.as_bytes())?;
+    stream.flush()?;
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let mut reply = [0u8; 3];
     stream.read_exact(&mut reply)?;
-    anyhow::ensure!(&reply == b"OK", "客户端唤起响应无效");
+    anyhow::ensure!(&reply == b"ACK", "客户端唤起响应无效");
     Ok(())
 }
 
@@ -184,9 +264,131 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
         socket.write_all(&[0u8; 32]).unwrap();
-        let mut reply = [0u8; 2];
+        let mut reply = [0u8; 3];
         assert!(socket.read_exact(&mut reply).is_err());
         assert!(!first.requested.load(Ordering::Acquire));
+    }
+    #[test]
+    fn authenticated_activate_succeeds_and_rejects_unauthenticated_or_wrong_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let Claim::Primary(first) = Instance::claim(dir.path()).unwrap() else {
+            panic!()
+        };
+        let endpoint_path = dir.path().join("desktop-instance.json");
+        let endpoint: Endpoint =
+            serde_json::from_slice(&std::fs::read(&endpoint_path).unwrap()).unwrap();
+        let token = endpoint
+            .token
+            .expect("primary instance must persist hex token");
+        assert_eq!(token.len(), 32);
+        assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&endpoint_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        // Unauthenticated / wrong-token / scanner probes must all be rejected without killing listener.
+        for bad_payload in [
+            "".as_bytes(),
+            b"activate",
+            b"activate\n",
+            b"activate 00000000000000000000000000000000",
+            b"GET / HTTP/1.1\r\n\r\n",
+        ] {
+            let mut probe = TcpStream::connect(first.address).unwrap();
+            probe
+                .set_read_timeout(Some(Duration::from_millis(400)))
+                .unwrap();
+            if !bad_payload.is_empty() {
+                probe.write_all(bad_payload).unwrap();
+            }
+            let _ = probe.shutdown(std::net::Shutdown::Write);
+            let mut reply = [0u8; 3];
+            assert!(probe.read_exact(&mut reply).is_err());
+            assert!(!first.requested.load(Ordering::Acquire));
+        }
+
+        // Valid authenticated command succeeds and returns ACK.
+        let mut auth = TcpStream::connect(first.address).unwrap();
+        auth.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        auth.write_all(format!("activate {token}").as_bytes())
+            .unwrap();
+        let mut reply = [0u8; 3];
+        auth.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"ACK");
+        assert!(first.requested.swap(false, Ordering::AcqRel));
+
+        // Legacy endpoint JSON without `token` still deserializes cleanly via #[serde(default)].
+        let legacy: Endpoint = serde_json::from_str(r#"{"port":12345,"pid":42}"#).unwrap();
+        assert_eq!(legacy.port, 12345);
+        assert_eq!(legacy.token, None);
+    }
+    #[test]
+    fn transient_aborted_connections_and_accept_errors_do_not_kill_listener() {
+        assert_eq!(accept_error_backoff(std::io::ErrorKind::Interrupted), None);
+        assert_eq!(accept_error_backoff(std::io::ErrorKind::WouldBlock), None);
+        assert_eq!(
+            accept_error_backoff(std::io::ErrorKind::ConnectionAborted),
+            None
+        );
+        assert_eq!(
+            accept_error_backoff(std::io::ErrorKind::ConnectionReset),
+            None
+        );
+        assert_eq!(
+            accept_error_backoff(std::io::ErrorKind::Other),
+            Some(Duration::from_millis(50))
+        );
+        #[cfg(unix)]
+        {
+            let emfile = std::io::Error::from_raw_os_error(libc::EMFILE);
+            let enfile = std::io::Error::from_raw_os_error(libc::ENFILE);
+            assert_eq!(
+                accept_error_backoff(emfile.kind()),
+                Some(Duration::from_millis(50))
+            );
+            assert_eq!(
+                accept_error_backoff(enfile.kind()),
+                Some(Duration::from_millis(50))
+            );
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let Claim::Primary(first) = Instance::claim(dir.path()).unwrap() else {
+            panic!()
+        };
+        for _ in 0..16 {
+            if let Ok(conn) = TcpStream::connect(first.address) {
+                #[cfg(unix)]
+                unsafe {
+                    use std::os::fd::AsRawFd;
+                    let linger = libc::linger {
+                        l_onoff: 1,
+                        l_linger: 0,
+                    };
+                    let _ = libc::setsockopt(
+                        conn.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_LINGER,
+                        (&linger as *const libc::linger).cast(),
+                        std::mem::size_of::<libc::linger>() as libc::socklen_t,
+                    );
+                }
+                drop(conn);
+            }
+        }
+        assert!(!first.requested.load(Ordering::Acquire));
+        assert!(matches!(
+            Instance::claim(dir.path()).unwrap(),
+            Claim::Activated
+        ));
+        assert!(first.requested.swap(false, Ordering::AcqRel));
     }
     #[test]
     fn child_holds_lock() {

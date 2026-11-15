@@ -222,7 +222,18 @@ pub fn detect_lan_ipv4() -> String {
     "127.0.0.1".to_string()
 }
 
-/// Generate a crisp PNG QR code for the given URL.
+fn private_lan_cast_runtime_dir() -> Option<PathBuf> {
+    let dir = crate::resources::user_state().join("lan-cast");
+    std::fs::create_dir_all(&dir).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    Some(dir)
+}
+
+/// Generate a crisp PNG QR code for the given URL inside a user-private 0700 directory.
 pub fn generate_cast_qr_png(url: &str, port: u16) -> Option<PathBuf> {
     let code = QrCode::new(url.as_bytes()).ok()?;
     let colors = code.to_colors();
@@ -245,8 +256,31 @@ pub fn generate_cast_qr_png(url: &str, port: u16) -> Option<PathBuf> {
             }
         }
     }
-    let out_path = std::env::temp_dir().join(format!("stepx-lan-cast-qr-{port}.png"));
-    DynamicImage::ImageLuma8(img).save(&out_path).ok()?;
+    let dir = private_lan_cast_runtime_dir()?;
+    let out_path = dir.join(format!(
+        "stepx-lan-cast-qr-{port}-{:016x}.png",
+        rand::random::<u64>()
+    ));
+    let mut png_bytes = std::io::Cursor::new(Vec::new());
+    DynamicImage::ImageLuma8(img)
+        .write_to(&mut png_bytes, image::ImageFormat::Png)
+        .ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&out_path)
+            .ok()?;
+        f.write_all(png_bytes.get_ref()).ok()?;
+        let _ = std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&out_path, png_bytes.get_ref()).ok()?;
+    }
     Some(out_path)
 }
 
@@ -676,8 +710,42 @@ pub fn discover_lan_receivers(adb: Option<&Adb>, serial: Option<&str>) -> LanDis
     }
 }
 
+const MAX_SSDP_HTTP_BODY_BYTES: u64 = 256 * 1024;
+
+fn validate_ssdp_location_target(
+    location: &str,
+    expected_responder_ip: Option<std::net::IpAddr>,
+) -> Option<(std::net::IpAddr, u16, String)> {
+    let parsed = url::Url::parse(location).ok()?;
+    if parsed.scheme() != "http" {
+        return None;
+    }
+    let host = parsed.host_str()?.trim_matches(['[', ']']);
+    let loc_ip: std::net::IpAddr = host.parse().ok()?;
+    if let Some(expected_ip) = expected_responder_ip {
+        if loc_ip != expected_ip {
+            return None;
+        }
+    } else if loc_ip.is_loopback() || loc_ip.is_unspecified() || loc_ip.is_multicast() {
+        return None;
+    }
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    let path = if parsed.query().is_some() {
+        format!("{}?{}", parsed.path(), parsed.query().unwrap_or_default())
+    } else {
+        parsed.path().to_string()
+    };
+    Some((loc_ip, port, path))
+}
+
+fn read_bounded_ssdp_response(stream: &mut impl Read) -> Vec<u8> {
+    let mut resp = Vec::new();
+    let _ = stream.take(MAX_SSDP_HTTP_BODY_BYTES).read_to_end(&mut resp);
+    resp
+}
+
 fn discover_ssdp_receivers() -> Vec<LanCastReceiver> {
-    let mut locations: HashMap<String, (String, Option<String>)> = HashMap::new();
+    let mut locations: HashMap<String, (std::net::IpAddr, String, Option<String>)> = HashMap::new();
     let Ok(sock) = UdpSocket::bind("0.0.0.0:0") else {
         return Vec::new();
     };
@@ -719,9 +787,11 @@ fn discover_ssdp_receivers() -> Vec<LanCastReceiver> {
                     }
                 }
                 if let Some(loc) = location {
-                    locations
-                        .entry(loc)
-                        .or_insert((st_hdr, server_hdr.or_else(|| Some(src.ip().to_string()))));
+                    locations.entry(loc).or_insert((
+                        src.ip(),
+                        st_hdr,
+                        server_hdr.or_else(|| Some(src.ip().to_string())),
+                    ));
                 }
             }
             Err(_) => break,
@@ -729,8 +799,10 @@ fn discover_ssdp_receivers() -> Vec<LanCastReceiver> {
     }
 
     let mut out = Vec::new();
-    for (loc, (st, server_hint)) in locations {
-        if let Some(receiver) = fetch_and_parse_upnp_location(&loc, &st, server_hint.as_deref()) {
+    for (loc, (responder_ip, st, server_hint)) in locations {
+        if let Some(receiver) =
+            fetch_and_parse_upnp_location(&loc, &st, server_hint.as_deref(), Some(responder_ip))
+        {
             out.push(receiver);
         }
     }
@@ -802,17 +874,11 @@ fn fetch_and_parse_upnp_location(
     location: &str,
     st: &str,
     server_hint: Option<&str>,
+    expected_responder_ip: Option<std::net::IpAddr>,
 ) -> Option<LanCastReceiver> {
-    let parsed = url::Url::parse(location).ok()?;
-    let host = parsed.host_str()?.to_string();
-    let port = parsed.port_or_known_default().unwrap_or(80);
-    let path = if parsed.query().is_some() {
-        format!("{}?{}", parsed.path(), parsed.query().unwrap_or_default())
-    } else {
-        parsed.path().to_string()
-    };
-
-    let addr = format!("{host}:{port}").to_socket_addrs().ok()?.next()?;
+    let (loc_ip, port, path) = validate_ssdp_location_target(location, expected_responder_ip)?;
+    let host = loc_ip.to_string();
+    let addr = SocketAddr::new(loc_ip, port);
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(380)).ok()?;
     let _ = stream.set_read_timeout(Some(Duration::from_millis(450)));
     let _ = stream.set_write_timeout(Some(Duration::from_millis(350)));
@@ -820,8 +886,7 @@ fn fetch_and_parse_upnp_location(
         "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\nUser-Agent: StepX-Companion/1.0\r\n\r\n"
     );
     stream.write_all(req.as_bytes()).ok()?;
-    let mut resp = Vec::new();
-    let _ = stream.read_to_end(&mut resp);
+    let resp = read_bounded_ssdp_response(&mut stream);
     let text = String::from_utf8_lossy(&resp);
     let (headers, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
 
@@ -1363,6 +1428,41 @@ pub fn connect_phone_miracast(adb: &Adb, serial: &str, address: &str) -> Result<
 // Embedded Multi-Protocol LAN Broadcast Server (MPEG-TS + HLS + MJPEG + Web UI)
 // ============================================================================
 
+fn session_to_media_tokens() -> &'static Mutex<HashMap<String, String>> {
+    static MAP: std::sync::OnceLock<Mutex<HashMap<String, String>>> = std::sync::OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn active_pushed_receivers() -> &'static Mutex<HashMap<u16, LanCastReceiver>> {
+    static MAP: std::sync::OnceLock<Mutex<HashMap<u16, LanCastReceiver>>> =
+        std::sync::OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn rewrite_push_url_to_media_token(raw_url: &str) -> Result<String> {
+    let parsed = url::Url::parse(raw_url).context("无效的媒体流推送地址")?;
+    let path = parsed.path();
+    let Some(after_session) = path.strip_prefix("/session/") else {
+        bail!("媒体流地址缺少会话标识");
+    };
+    let Some((tok, rest_no_slash)) = after_session.split_once('/') else {
+        bail!("媒体流地址缺少流端点路径");
+    };
+    let endpoint = format!("/{rest_no_slash}");
+    if !is_readonly_media_path(&endpoint) {
+        bail!("禁止将控制或会话管理链接推送至局域网播放设备");
+    }
+    let media_tok = session_to_media_tokens()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(tok)
+        .cloned()
+        .unwrap_or_else(|| tok.to_string());
+    let mut out = parsed.clone();
+    out.set_path(&format!("/session/{media_tok}{endpoint}"));
+    Ok(out.to_string())
+}
+
 #[derive(Default)]
 struct SharedStreamState {
     latest_jpeg: Vec<u8>,
@@ -1373,6 +1473,7 @@ struct SharedStreamState {
     phone_height: u32,
     fps_x10: u32,
     ts_subscribers: Vec<std::sync::mpsc::SyncSender<Vec<u8>>>,
+    h264_subscribers: Vec<std::sync::mpsc::SyncSender<Vec<u8>>>,
     hls_segments: VecDeque<(u64, Vec<u8>)>,
     hls_next_seq: u64,
     pushed_receiver_id: Option<String>,
@@ -1389,6 +1490,7 @@ pub struct LanCastServer {
     host_ip: String,
     qr_png_path: Option<PathBuf>,
     session_token: String,
+    media_token: String,
     shared: Arc<(Mutex<SharedStreamState>, Condvar)>,
     h264_child_pid: Arc<AtomicU64>,
     serial_slot: Arc<Mutex<String>>,
@@ -1401,6 +1503,7 @@ impl LanCastServer {
         quality: LanCastQuality,
         remote_control_enabled: bool,
     ) -> Result<Self> {
+        let _ = remote_control_enabled;
         let host_ip = detect_lan_ipv4();
         let mut bound_listener = None;
         let mut bound_port = DEFAULT_CAST_PORT;
@@ -1415,11 +1518,21 @@ impl LanCastServer {
         let _ = listener.set_nonblocking(true);
 
         let session_token = format!("{:032x}", rand::random::<u128>());
+        let mut media_token = format!("{:032x}", rand::random::<u128>());
+        while media_token == session_token {
+            media_token = format!("{:032x}", rand::random::<u128>());
+        }
+        session_to_media_tokens()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(session_token.clone(), media_token.clone());
+
         let web_url = format!("http://{host_ip}:{bound_port}/session/{session_token}/cast");
         let qr_png_path = generate_cast_qr_png(&web_url, bound_port);
 
         let stop_flag = Arc::new(AtomicBool::new(false));
-        let remote_control = Arc::new(AtomicBool::new(remote_control_enabled));
+        // Always default remote_control to false on start unless explicitly enabled via set_remote_control(true).
+        let remote_control = Arc::new(AtomicBool::new(false));
         let quality_atom = Arc::new(AtomicU8::new(quality.as_u8()));
         let active_clients = Arc::new(AtomicU64::new(0));
         let bytes_broadcast = Arc::new(AtomicU64::new(0));
@@ -1482,12 +1595,14 @@ impl LanCastServer {
             let ser_slot = serial_slot.clone();
             let hip = host_ip.clone();
             let token = session_token.clone();
+            let mtoken = media_token.clone();
             thread::spawn(move || {
                 http_accept_loop(
                     listener,
                     bound_port,
                     hip,
                     token,
+                    mtoken,
                     adb_p,
                     ser_slot,
                     stop,
@@ -1509,6 +1624,7 @@ impl LanCastServer {
             host_ip,
             qr_png_path,
             session_token,
+            media_token,
             shared,
             h264_child_pid,
             serial_slot,
@@ -1536,18 +1652,19 @@ impl LanCastServer {
     }
 
     pub fn stats(&self) -> LanCastStats {
-        let guard = self.shared.0.lock().unwrap();
+        let guard = self.shared.0.lock().unwrap_or_else(|p| p.into_inner());
         let port = self.port;
         let host_ip = &self.host_ip;
-        let token = &self.session_token;
+        let session_token = &self.session_token;
+        let media_token = &self.media_token;
         LanCastStats {
             running: !self.stop_flag.load(Ordering::Relaxed),
             port,
             host_ip: host_ip.clone(),
-            web_url: format!("http://{host_ip}:{port}/session/{token}/cast"),
-            ts_url: format!("http://{host_ip}:{port}/session/{token}/live.ts"),
-            hls_url: format!("http://{host_ip}:{port}/session/{token}/live.m3u8"),
-            mjpeg_url: format!("http://{host_ip}:{port}/session/{token}/stream.mjpeg"),
+            web_url: format!("http://{host_ip}:{port}/session/{session_token}/cast"),
+            ts_url: format!("http://{host_ip}:{port}/session/{media_token}/live.ts"),
+            hls_url: format!("http://{host_ip}:{port}/session/{media_token}/live.m3u8"),
+            mjpeg_url: format!("http://{host_ip}:{port}/session/{media_token}/stream.mjpeg"),
             qr_png_path: self.qr_png_path.clone(),
             active_clients: self.active_clients.load(Ordering::Relaxed) as usize,
             frames_captured: guard.frame_seq,
@@ -1563,11 +1680,18 @@ impl LanCastServer {
     }
 
     pub fn set_remote_control(&self, enabled: bool) {
-        self.remote_control.store(enabled, Ordering::Relaxed);
+        self.remote_control.store(enabled, Ordering::SeqCst);
     }
 
     pub fn set_quality(&self, quality: LanCastQuality) {
-        self.quality.store(quality.as_u8(), Ordering::Relaxed);
+        let next = quality.as_u8();
+        let prev = self.quality.swap(next, Ordering::SeqCst);
+        if prev != next {
+            let pid = self.h264_child_pid.swap(0, Ordering::SeqCst);
+            if pid > 0 {
+                terminate_cast_child_pid(pid);
+            }
+        }
     }
 
     pub fn set_pushed_receiver(&self, id: Option<String>, name: Option<String>) {
@@ -1578,11 +1702,29 @@ impl LanCastServer {
     }
 
     pub fn stop(&mut self) {
-        self.stop_flag.store(true, Ordering::Relaxed);
+        let was_stopped = self.stop_flag.swap(true, Ordering::SeqCst);
         self.shared.1.notify_all();
-        let pid = self.h264_child_pid.swap(0, Ordering::Relaxed);
+        let pid = self.h264_child_pid.swap(0, Ordering::SeqCst);
         if pid > 0 {
             terminate_cast_child_pid(pid);
+        }
+        if let Some(qr_path) = self.qr_png_path.take() {
+            let _ = std::fs::remove_file(qr_path);
+        }
+        session_to_media_tokens()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.session_token);
+        if !was_stopped {
+            let maybe_rx = active_pushed_receivers()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&self.port);
+            if let Some(rx) = maybe_rx {
+                thread::spawn(move || {
+                    let _ = stop_receiver_push(&rx);
+                });
+            }
         }
     }
 }
@@ -1627,10 +1769,41 @@ fn resolve_active_cast_serial(_adb_path: &PathBuf, serial_slot: &Arc<Mutex<Strin
     serial_slot.lock().map(|g| g.clone()).unwrap_or_default()
 }
 
+fn probe_scrcpy_version(binary: &PathBuf) -> Option<String> {
+    let mut cmd = Command::new(binary);
+    #[cfg(target_os = "linux")]
+    if let Some(parent) = binary.parent().filter(|p| !p.as_os_str().is_empty()) {
+        let mut dirs = vec![parent.to_path_buf()];
+        if let Some(existing) = std::env::var_os("LD_LIBRARY_PATH") {
+            for p in std::env::split_paths(&existing) {
+                if !p.as_os_str().is_empty() && !dirs.contains(&p) {
+                    dirs.push(p);
+                }
+            }
+        }
+        if let Ok(joined) = std::env::join_paths(&dirs) {
+            cmd.env("LD_LIBRARY_PATH", joined);
+        }
+        crate::mirror::configure_linux_bundled_lib_path(&mut cmd, binary);
+    }
+    cmd.arg("--version");
+    crate::resources::quiet_command(&mut cmd);
+    let out = crate::adb::run_process(cmd, None, Duration::from_secs(2)).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .filter(|v| v.chars().next().is_some_and(|c| c.is_ascii_digit()))
+        .map(str::to_string)
+}
+
 fn find_scrcpy_server_jar() -> Option<(PathBuf, String)> {
-    let mut candidates = Vec::new();
+    let mut candidates: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
     if let Some(env_path) = std::env::var_os("SCRCPY_SERVER_PATH") {
-        candidates.push(PathBuf::from(env_path));
+        candidates.push((PathBuf::from(env_path), None));
     }
     for bin in [
         std::env::var_os("STEPX_SCRCPY").map(PathBuf::from),
@@ -1642,19 +1815,25 @@ fn find_scrcpy_server_jar() -> Option<(PathBuf, String)> {
     .flatten()
     {
         if let Some(parent) = bin.parent() {
-            candidates.push(parent.join("scrcpy-server"));
+            candidates.push((parent.join("scrcpy-server"), Some(bin.clone())));
+            candidates.push((
+                parent.join("../share/scrcpy/scrcpy-server"),
+                Some(bin.clone()),
+            ));
         }
     }
-    candidates.push(
+    candidates.push((
         crate::resources::root().join(".tools/root/scrcpy-linux-x86_64-v5.0.1/scrcpy-server"),
-    );
+        None,
+    ));
     if let Some(home) = crate::resources::user_home() {
-        candidates.push(
+        candidates.push((
             PathBuf::from(home)
                 .join(".local/opt/stepx-companion/tools/root/scrcpy-linux-x86_64-v5.0.1/scrcpy-server"),
-        );
+            None,
+        ));
     }
-    for path in candidates {
+    for (path, scrcpy_bin) in candidates {
         if path.is_file() {
             let ver = path
                 .parent()
@@ -1662,8 +1841,9 @@ fn find_scrcpy_server_jar() -> Option<(PathBuf, String)> {
                 .and_then(|n| n.to_str())
                 .and_then(|s| s.rsplit("-v").next())
                 .filter(|v| v.chars().next().is_some_and(|c| c.is_ascii_digit()))
-                .unwrap_or("5.0.1")
-                .to_string();
+                .map(str::to_string)
+                .or_else(|| scrcpy_bin.as_ref().and_then(probe_scrcpy_version))
+                .unwrap_or_else(|| "5.0.1".to_string());
             return Some((path, ver));
         }
     }
@@ -1762,7 +1942,11 @@ fn frame_pacer_loop(
     let tick_interval = Duration::from_millis(250);
     let mut window_start = Instant::now();
     // Existing buffered frames predate this measurement window.
-    let mut last_seq_seen = shared.0.lock().unwrap().frame_seq;
+    let mut last_seq_seen = shared
+        .0
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .frame_seq;
     let mut bootstrap_attempted = false;
     let started_at = Instant::now();
 
@@ -1773,7 +1957,7 @@ fn frame_pacer_loop(
         }
 
         let need_bootstrap = {
-            let guard = shared.0.lock().unwrap();
+            let guard = shared.0.lock().unwrap_or_else(|p| p.into_inner());
             guard.latest_jpeg.is_empty() && started_at.elapsed() >= Duration::from_millis(350)
         };
         if need_bootstrap && !bootstrap_attempted {
@@ -1784,7 +1968,7 @@ fn frame_pacer_loop(
             if let Some((orig_w, orig_h, jpeg_bytes)) =
                 capture_single_screencap_jpeg(&adb_path, &active_serial, max_dim)
             {
-                let mut guard = shared.0.lock().unwrap();
+                let mut guard = shared.0.lock().unwrap_or_else(|p| p.into_inner());
                 if guard.latest_jpeg.is_empty() {
                     guard.latest_jpeg = jpeg_bytes;
                     guard.frame_seq = guard.frame_seq.wrapping_add(1);
@@ -1797,7 +1981,7 @@ fn frame_pacer_loop(
             }
         }
 
-        let mut guard = shared.0.lock().unwrap();
+        let mut guard = shared.0.lock().unwrap_or_else(|p| p.into_inner());
         if !guard.latest_jpeg.is_empty() {
             // Static screens keep the last frame without redundant network traffic.
             let elapsed = window_start.elapsed().as_secs_f32();
@@ -1863,7 +2047,8 @@ fn unified_h264_cast_loop(
                                 let mut enc = JpegEncoder::new_with_quality(&mut jpeg_bytes, 80);
                                 if enc.encode_image(&rgb_img).is_ok() {
                                     last_jpeg_encode = Instant::now();
-                                    let mut guard = shared.0.lock().unwrap();
+                                    let mut guard =
+                                        shared.0.lock().unwrap_or_else(|p| p.into_inner());
                                     guard.latest_jpeg = jpeg_bytes;
                                     guard.hw_frames_decoded =
                                         guard.hw_frames_decoded.wrapping_add(1);
@@ -1882,7 +2067,7 @@ fn unified_h264_cast_loop(
         let (ts_pkt, has_idr) = muxer.mux_annexb_chunk(chunk, pts_90khz);
         if !ts_pkt.is_empty() {
             current_hls_buf.extend_from_slice(&ts_pkt);
-            let mut guard = shared.0.lock().unwrap();
+            let mut guard = shared.0.lock().unwrap_or_else(|p| p.into_inner());
             if has_idr {
                 guard.latest_annexb_idr = chunk.to_vec();
             }
@@ -1890,6 +2075,11 @@ fn unified_h264_cast_loop(
                 || (has_idr && last_hls_cut.elapsed() >= Duration::from_millis(1200))
                 || last_hls_cut.elapsed() >= Duration::from_millis(2000);
             guard.ts_subscribers.retain(|tx| match tx.try_send(ts_pkt.clone()) {
+                Ok(()) => true,
+                Err(std::sync::mpsc::TrySendError::Full(_)) => true,
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+            });
+            guard.h264_subscribers.retain(|tx| match tx.try_send(chunk.to_vec()) {
                 Ok(()) => true,
                 Err(std::sync::mpsc::TrySendError::Full(_)) => true,
                 Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
@@ -1948,7 +2138,8 @@ fn unified_h264_cast_loop(
                     if let Some((w_s, h_s)) = dim.trim().split_once('x') {
                         if let (Ok(pw), Ok(ph)) = (w_s.parse::<u32>(), h_s.parse::<u32>()) {
                             if pw > 0 && ph > 0 {
-                                let mut guard = shared.0.lock().unwrap();
+                                let mut guard =
+                                    shared.0.lock().unwrap_or_else(|p| p.into_inner());
                                 guard.phone_width = pw;
                                 guard.phone_height = ph;
                             }
@@ -2073,6 +2264,9 @@ fn unified_h264_cast_loop(
                         let mut idle_ticks = 0u32;
 
                         while !stop.load(Ordering::Relaxed) {
+                            if quality_atom.load(Ordering::Relaxed) != q.as_u8() {
+                                break;
+                            }
                             // Check if user/connection_watch switched to a different transport
                             if let Ok(slot_g) = serial_slot.lock() {
                                 if !slot_g.is_empty() && *slot_g != active_serial {
@@ -2105,7 +2299,10 @@ fn unified_h264_cast_loop(
                                     // Every ~1s of static screen, re-mux the latest IDR into MPEG-TS/HLS so live players never stall
                                     if idle_ticks % 4 == 0 {
                                         let last_idr = {
-                                            let guard = shared.0.lock().unwrap();
+                                            let guard = shared
+                                                .0
+                                                .lock()
+                                                .unwrap_or_else(|p| p.into_inner());
                                             guard.latest_annexb_idr.clone()
                                         };
                                         if !last_idr.is_empty() {
@@ -2128,10 +2325,17 @@ fn unified_h264_cast_loop(
                     let _ = child.kill();
                     let _ = child.wait();
                     pid_slot.store(0, Ordering::Relaxed);
-                    let _ = adb.run_timeout(
-                        &["-s", &active_serial, "forward", "--remove", &forward_spec],
-                        Duration::from_secs(1),
-                    );
+                    if !active_serial.is_empty() {
+                        let _ = adb.run_timeout(
+                            &["-s", &active_serial, "forward", "--remove", &forward_spec],
+                            Duration::from_secs(1),
+                        );
+                    } else {
+                        let _ = adb.run_timeout(
+                            &["forward", "--remove", &forward_spec],
+                            Duration::from_secs(1),
+                        );
+                    }
                     if !stop.load(Ordering::Relaxed) {
                         if let Ok(resolved) = crate::device::resolve_online_transport(
                             &adb,
@@ -2193,6 +2397,9 @@ fn unified_h264_cast_loop(
             let mut buf = [0u8; 32 * 1024];
             let mut pending = Vec::with_capacity(64 * 1024);
             while !stop.load(Ordering::Relaxed) {
+                if quality_atom.load(Ordering::Relaxed) != q.as_u8() {
+                    break;
+                }
                 match stdout.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
@@ -2215,14 +2422,118 @@ fn unified_h264_cast_loop(
     }
 }
 
+const MAX_TOTAL_HTTP_CONNECTIONS: u64 = 64;
+const MAX_MEDIA_STREAM_CLIENTS: u64 = 24;
+const PRE_AUTH_HEADER_TIMEOUT: Duration = Duration::from_secs(3);
+
 struct HttpConnectionPermit(Arc<AtomicU64>);
 impl Drop for HttpConnectionPermit {
     fn drop(&mut self) { self.0.fetch_sub(1, Ordering::Relaxed); }
 }
+
+struct ActiveStreamPermit(Arc<AtomicU64>);
+impl ActiveStreamPermit {
+    fn try_acquire(counter: &Arc<AtomicU64>) -> Option<Self> {
+        loop {
+            let cur = counter.load(Ordering::Relaxed);
+            if cur >= MAX_MEDIA_STREAM_CLIENTS {
+                return None;
+            }
+            if counter
+                .compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Some(Self(counter.clone()));
+            }
+        }
+    }
+}
+impl Drop for ActiveStreamPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CastTokenScope {
+    Session,
+    MediaOnly,
+}
+
 fn authorized_cast_path<'a>(raw_path: &'a str, token: &str) -> Option<&'a str> {
     let prefix = format!("/session/{token}");
     raw_path.strip_prefix(&prefix).filter(|p| p.starts_with('/'))
 }
+
+fn authorize_cast_request<'a>(
+    raw_path: &'a str,
+    session_token: &str,
+    media_token: &str,
+) -> Option<(&'a str, CastTokenScope)> {
+    if let Some(p) = authorized_cast_path(raw_path, session_token) {
+        return Some((p, CastTokenScope::Session));
+    }
+    if !media_token.is_empty() {
+        if let Some(p) = authorized_cast_path(raw_path, media_token) {
+            return Some((p, CastTokenScope::MediaOnly));
+        }
+    }
+    None
+}
+
+fn is_readonly_media_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/live.ts" | "/live.m3u8" | "/live.h264" | "/stream.mjpg" | "/stream.mjpeg" | "/frame.jpg"
+    ) || (path.starts_with("/seg/") && path.ends_with(".ts"))
+}
+
+fn is_json_content_type(ct: Option<&str>) -> bool {
+    let Some(raw) = ct else {
+        return false;
+    };
+    let mime = raw.split(';').next().unwrap_or("").trim();
+    mime.eq_ignore_ascii_case("application/json")
+}
+
+fn is_allowed_cast_origin(
+    origin_hdr: Option<&str>,
+    host_hdr: Option<&str>,
+    host_ip: &str,
+    port: u16,
+) -> bool {
+    let Some(origin) = origin_hdr.map(str::trim).filter(|s| !s.is_empty()) else {
+        return true;
+    };
+    if origin.eq_ignore_ascii_case("null") {
+        return false;
+    }
+    let Ok(parsed) = url::Url::parse(origin) else {
+        return false;
+    };
+    if parsed.scheme() != "http" {
+        return false;
+    }
+    let Some(ohost) = parsed.host_str() else {
+        return false;
+    };
+    let oport = parsed.port_or_known_default().unwrap_or(80);
+    let origin_authority = if parsed.port().is_some() {
+        format!("{ohost}:{oport}")
+    } else {
+        ohost.to_string()
+    };
+    if let Some(h) = host_hdr.map(str::trim).filter(|s| !s.is_empty()) {
+        if origin_authority.eq_ignore_ascii_case(h) {
+            return true;
+        }
+    }
+    oport == port
+        && (ohost.eq_ignore_ascii_case(host_ip)
+            || ohost == "127.0.0.1"
+            || ohost.eq_ignore_ascii_case("localhost"))
+}
+
 fn read_cast_line(reader: &mut impl BufRead) -> std::io::Result<String> {
     let mut line = String::new();
     reader.take(8193).read_line(&mut line)?;
@@ -2237,7 +2548,8 @@ fn http_accept_loop(
     listener: TcpListener,
     port: u16,
     host_ip: String,
-    token: String,
+    session_token: String,
+    media_token: String,
     adb_path: PathBuf,
     serial_slot: Arc<Mutex<String>>,
     stop: Arc<AtomicBool>,
@@ -2250,7 +2562,7 @@ fn http_accept_loop(
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((mut stream, _peer)) => {
-                if connections.load(Ordering::Relaxed) >= 32 {
+                if connections.load(Ordering::Relaxed) >= MAX_TOTAL_HTTP_CONNECTIONS {
                     let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n");
                     continue;
                 }
@@ -2264,14 +2576,16 @@ fn http_accept_loop(
                 let adb_c = adb_path.clone();
                 let ser_c = serial_slot.clone();
                 let hip_c = host_ip.clone();
-                let token_c = token.clone();
+                let stoken_c = session_token.clone();
+                let mtoken_c = media_token.clone();
                 thread::spawn(move || {
                     let _permit = permit;
-                    handle_http_client(
+                    handle_http_client_with_media_token(
                         stream,
                         port,
                         hip_c,
-                        token_c,
+                        stoken_c,
+                        mtoken_c,
                         adb_c,
                         ser_c,
                         stop_c,
@@ -2292,12 +2606,44 @@ fn http_accept_loop(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 fn handle_http_client(
-    mut stream: TcpStream,
+    stream: TcpStream,
     port: u16,
     host_ip: String,
     token: String,
+    adb_path: PathBuf,
+    serial_slot: Arc<Mutex<String>>,
+    stop: Arc<AtomicBool>,
+    remote_control: Arc<AtomicBool>,
+    active_clients: Arc<AtomicU64>,
+    bytes_broadcast: Arc<AtomicU64>,
+    shared: Arc<(Mutex<SharedStreamState>, Condvar)>,
+) {
+    let mtok = format!("{token}-media");
+    handle_http_client_with_media_token(
+        stream,
+        port,
+        host_ip,
+        token,
+        mtok,
+        adb_path,
+        serial_slot,
+        stop,
+        remote_control,
+        active_clients,
+        bytes_broadcast,
+        shared,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_http_client_with_media_token(
+    mut stream: TcpStream,
+    port: u16,
+    host_ip: String,
+    session_token: String,
+    media_token: String,
     adb_path: PathBuf,
     serial_slot: Arc<Mutex<String>>,
     stop: Arc<AtomicBool>,
@@ -2312,7 +2658,7 @@ fn handle_http_client(
     if stream.set_nonblocking(false).is_err() {
         return;
     }
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_read_timeout(Some(PRE_AUTH_HEADER_TIMEOUT));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_nodelay(true);
 
@@ -2324,13 +2670,23 @@ fn handle_http_client(
     let mut parts = req_line.split_whitespace();
     let method = parts.next().unwrap_or("").to_uppercase();
     let raw_path = parts.next().unwrap_or("").split('?').next().unwrap_or("");
-    let Some(path) = authorized_cast_path(raw_path, &token) else {
+    let Some((path, scope)) = authorize_cast_request(raw_path, &session_token, &media_token) else {
         let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
         return;
     };
+    if scope == CastTokenScope::MediaOnly
+        && (!matches!(method.as_str(), "GET" | "HEAD") || !is_readonly_media_path(path))
+    {
+        let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
+        return;
+    }
     if stop.load(Ordering::Relaxed) { return; }
     let mut content_len = 0usize;
     let mut total_headers = req_line.len();
+    let mut content_type_hdr: Option<String> = None;
+    let mut cast_control_hdr: Option<String> = None;
+    let mut origin_hdr: Option<String> = None;
+    let mut host_hdr: Option<String> = None;
     loop {
         let Ok(line) = read_cast_line(&mut reader) else { return; };
         total_headers += line.len();
@@ -2338,10 +2694,22 @@ fn handle_http_client(
         if line == "\r\n" || line == "\n" { break; }
         let lower = line.to_ascii_lowercase();
         if lower.starts_with("transfer-encoding:") { return; }
-        if let Some(rest) = lower.strip_prefix("content-length:") {
-            let Ok(len) = rest.trim().parse::<usize>() else { return; };
-            if len > 16384 { return; }
-            content_len = len;
+        if let Some((k, v)) = line.split_once(':') {
+            let k_trim = k.trim();
+            let v_trim = v.trim();
+            if k_trim.eq_ignore_ascii_case("content-length") {
+                let Ok(len) = v_trim.parse::<usize>() else { return; };
+                if len > 16384 { return; }
+                content_len = len;
+            } else if k_trim.eq_ignore_ascii_case("content-type") {
+                content_type_hdr = Some(v_trim.to_string());
+            } else if k_trim.eq_ignore_ascii_case("x-stepx-cast-control") {
+                cast_control_hdr = Some(v_trim.to_string());
+            } else if k_trim.eq_ignore_ascii_case("origin") {
+                origin_hdr = Some(v_trim.to_string());
+            } else if k_trim.eq_ignore_ascii_case("host") {
+                host_hdr = Some(v_trim.to_string());
+            }
         }
     }
     let mut body = vec![0u8; content_len];
@@ -2351,9 +2719,20 @@ fn handle_http_client(
         return;
     }
 
+    let active_url_token = match scope {
+        CastTokenScope::Session => &session_token,
+        CastTokenScope::MediaOnly => &media_token,
+    };
+
     match (method.as_str(), path) {
         ("GET", "/") | ("GET", "/cast") | ("GET", "/index.html") => {
-            let html = build_web_receiver_html(&host_ip, port, remote_control.load(Ordering::Relaxed), &token);
+            let html = build_web_receiver_html(
+                &host_ip,
+                port,
+                remote_control.load(Ordering::Relaxed),
+                &session_token,
+                &media_token,
+            );
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nContent-Length: {}\r\nReferrer-Policy: no-referrer\r\n\r\n",
                 html.len()
@@ -2363,12 +2742,12 @@ fn handle_http_client(
         }
         ("GET", "/frame.jpg") => {
             let jpeg = {
-                let guard = shared.0.lock().unwrap();
+                let guard = shared.0.lock().unwrap_or_else(|p| p.into_inner());
                 if guard.latest_jpeg.is_empty() {
                     let (g, _) = shared
                         .1
                         .wait_timeout(guard, Duration::from_millis(2500))
-                        .unwrap();
+                        .unwrap_or_else(|p| p.into_inner());
                     g.latest_jpeg.clone()
                 } else {
                     guard.latest_jpeg.clone()
@@ -2387,19 +2766,26 @@ fn handle_http_client(
                 bytes_broadcast.fetch_add(jpeg.len() as u64, Ordering::Relaxed);
             }
         }
-        ("GET", "/stream.mjpeg") => {
-            active_clients.fetch_add(1, Ordering::Relaxed);
+        ("HEAD", "/stream.mjpg") | ("HEAD", "/stream.mjpeg") => {
+            let hdr = b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=stepxframe\r\nCache-Control: no-store, no-cache\r\nReferrer-Policy: no-referrer\r\n\r\n";
+            let _ = stream.write_all(hdr);
+        }
+        ("GET", "/stream.mjpg") | ("GET", "/stream.mjpeg") => {
+            let Some(_stream_permit) = ActiveStreamPermit::try_acquire(&active_clients) else {
+                let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n");
+                return;
+            };
             let hdr = b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=stepxframe\r\nCache-Control: no-store, no-cache\r\nPragma: no-cache\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n\r\n";
             if stream.write_all(hdr).is_ok() {
                 let mut last_seq = 0u64;
                 while !stop.load(Ordering::Relaxed) {
                     let (jpeg, seq) = {
-                        let guard = shared.0.lock().unwrap();
+                        let guard = shared.0.lock().unwrap_or_else(|p| p.into_inner());
                         if guard.frame_seq == last_seq {
                             let (g, _) = shared
                                 .1
                                 .wait_timeout(guard, Duration::from_millis(500))
-                                .unwrap();
+                                .unwrap_or_else(|p| p.into_inner());
                             (g.latest_jpeg.clone(), g.frame_seq)
                         } else {
                             (guard.latest_jpeg.clone(), guard.frame_seq)
@@ -2422,19 +2808,55 @@ fn handle_http_client(
                     bytes_broadcast.fetch_add(jpeg.len() as u64, Ordering::Relaxed);
                 }
             }
-            active_clients.fetch_sub(1, Ordering::Relaxed);
+        }
+        ("HEAD", "/live.h264") => {
+            let hdr = "HTTP/1.1 200 OK\r\nContent-Type: video/H264\r\nReferrer-Policy: no-referrer\r\nCache-Control: no-store\r\n\r\n";
+            let _ = stream.write_all(hdr.as_bytes());
+        }
+        ("GET", "/live.h264") => {
+            let Some(_stream_permit) = ActiveStreamPermit::try_acquire(&active_clients) else {
+                let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n");
+                return;
+            };
+            let hdr = "HTTP/1.1 200 OK\r\nContent-Type: video/H264\r\nReferrer-Policy: no-referrer\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
+            if stream.write_all(hdr.as_bytes()).is_ok() {
+                let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
+                let bootstrap = {
+                    let mut guard = shared.0.lock().unwrap_or_else(|p| p.into_inner());
+                    guard.h264_subscribers.push(tx);
+                    (!guard.latest_annexb_idr.is_empty()).then(|| guard.latest_annexb_idr.clone())
+                };
+                if let Some(init_bytes) = bootstrap {
+                    let _ = stream.write_all(&init_bytes);
+                }
+                while !stop.load(Ordering::Relaxed) {
+                    match rx.recv_timeout(Duration::from_millis(800)) {
+                        Ok(chunk) => {
+                            if stream.write_all(&chunk).is_err() {
+                                break;
+                            }
+                            bytes_broadcast.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+            }
         }
         ("HEAD", "/live.ts") => {
             let hdr = "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\ntransferMode.dlna.org: Streaming\r\ncontentFeatures.dlna.org: DLNA.ORG_PN=AVC_TS_MP_HD_AAC_MULT5;DLNA.ORG_OP=00;DLNA.ORG_CI=1;DLNA.ORG_FLAGS=8d700000000000000000000000000000\r\nReferrer-Policy: no-referrer\r\nCache-Control: no-store\r\n\r\n";
             let _ = stream.write_all(hdr.as_bytes());
         }
         ("GET", "/live.ts") => {
-            active_clients.fetch_add(1, Ordering::Relaxed);
+            let Some(_stream_permit) = ActiveStreamPermit::try_acquire(&active_clients) else {
+                let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n");
+                return;
+            };
             let hdr = "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\ntransferMode.dlna.org: Streaming\r\ncontentFeatures.dlna.org: DLNA.ORG_PN=AVC_TS_MP_HD_AAC_MULT5;DLNA.ORG_OP=00;DLNA.ORG_CI=1;DLNA.ORG_FLAGS=8d700000000000000000000000000000\r\nReferrer-Policy: no-referrer\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
             if stream.write_all(hdr.as_bytes()).is_ok() {
                 let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
                 let bootstrap = {
-                    let mut guard = shared.0.lock().unwrap();
+                    let mut guard = shared.0.lock().unwrap_or_else(|p| p.into_inner());
                     guard.ts_subscribers.push(tx);
                     guard.hls_segments.back().map(|(_, b)| b.clone())
                 };
@@ -2451,7 +2873,7 @@ fn handle_http_client(
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                             let keepalive = {
-                                let guard = shared.0.lock().unwrap();
+                                let guard = shared.0.lock().unwrap_or_else(|p| p.into_inner());
                                 guard.hls_segments.back().map(|(_, b)| b.clone())
                             };
                             if let Some(chunk) = keepalive {
@@ -2464,17 +2886,22 @@ fn handle_http_client(
                     }
                 }
             }
-            active_clients.fetch_sub(1, Ordering::Relaxed);
+        }
+        ("HEAD", "/live.m3u8") => {
+            let hdr = "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nReferrer-Policy: no-referrer\r\nCache-Control: no-store\r\n\r\n";
+            let _ = stream.write_all(hdr.as_bytes());
         }
         ("GET", "/live.m3u8") => {
             let playlist = {
-                let guard = shared.0.lock().unwrap();
+                let guard = shared.0.lock().unwrap_or_else(|p| p.into_inner());
                 let first_seq = guard.hls_segments.front().map(|(s, _)| *s).unwrap_or(0);
                 let mut m3u8 = format!(
                     "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:3\n#EXT-X-MEDIA-SEQUENCE:{first_seq}\n"
                 );
                 for (seq, _) in &guard.hls_segments {
-                    m3u8.push_str(&format!("#EXTINF:2.000,\n/session/{token}/seg/{seq}.ts\n"));
+                    m3u8.push_str(&format!(
+                        "#EXTINF:2.000,\n/session/{active_url_token}/seg/{seq}.ts\n"
+                    ));
                 }
                 m3u8
             };
@@ -2489,7 +2916,7 @@ fn handle_http_client(
             let seq_str = p.trim_start_matches("/seg/").trim_end_matches(".ts");
             let seq = seq_str.parse::<u64>().unwrap_or(0);
             let seg = {
-                let guard = shared.0.lock().unwrap();
+                let guard = shared.0.lock().unwrap_or_else(|p| p.into_inner());
                 guard
                     .hls_segments
                     .iter()
@@ -2510,7 +2937,7 @@ fn handle_http_client(
             }
         }
         ("GET", "/api/status") => {
-            let guard = shared.0.lock().unwrap();
+            let guard = shared.0.lock().unwrap_or_else(|p| p.into_inner());
             let json = serde_json::json!({
                 "ok": true,
                 "fps": guard.fps_x10 as f32 / 10.0,
@@ -2530,6 +2957,24 @@ fn handle_http_client(
             let _ = stream.write_all(json.as_bytes());
         }
         ("POST", "/api/control") => {
+            if scope != CastTokenScope::Session
+                || !is_json_content_type(content_type_hdr.as_deref())
+                || cast_control_hdr.as_deref() != Some("1")
+                || !is_allowed_cast_origin(
+                    origin_hdr.as_deref(),
+                    host_hdr.as_deref(),
+                    &host_ip,
+                    port,
+                )
+            {
+                let msg = r#"{"ok":false,"error":"请求未通过投屏控制安全校验"}"#;
+                let hdr = format!(
+                    "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nReferrer-Policy: no-referrer\r\nContent-Length: {}\r\n\r\n{msg}",
+                    msg.len()
+                );
+                let _ = stream.write_all(hdr.as_bytes());
+                return;
+            }
             if !remote_control.load(Ordering::Relaxed) {
                 let msg = r#"{"ok":false,"error":"远端触控反控已在桌面端关闭"}"#;
                 let hdr = format!(
@@ -2540,7 +2985,7 @@ fn handle_http_client(
                 return;
             }
             let (pw, ph) = {
-                let guard = shared.0.lock().unwrap();
+                let guard = shared.0.lock().unwrap_or_else(|p| p.into_inner());
                 (guard.phone_width.max(1), guard.phone_height.max(1))
             };
             let payload_str = String::from_utf8_lossy(&body);
@@ -2647,17 +3092,27 @@ pub fn push_stream_to_receiver(
                 .control_url
                 .as_deref()
                 .context("该 DLNA 设备未暴露 AVTransport 控制端点")?;
-            dlna_soap_set_uri_and_play(control_url, &stats.ts_url, "StepX 手机实时投屏")?;
+            let safe_ts_url = rewrite_push_url_to_media_token(&stats.ts_url)?;
+            dlna_soap_set_uri_and_play(control_url, &safe_ts_url, "StepX 手机实时投屏")?;
+            active_pushed_receivers()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(stats.port, receiver.clone());
             Ok(format!(
                 "已通过 DLNA AVTransport 协议向「{}」({}) 推送手机实时画面 ({})",
-                receiver.name, receiver.ip, stats.ts_url
+                receiver.name, receiver.ip, safe_ts_url
             ))
         }
         LanCastProtocol::AirPlay => {
-            airplay_push_hls(&receiver.ip, receiver.port, &stats.hls_url)?;
+            let safe_hls_url = rewrite_push_url_to_media_token(&stats.hls_url)?;
+            airplay_push_hls(&receiver.ip, receiver.port, &safe_hls_url)?;
+            active_pushed_receivers()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(stats.port, receiver.clone());
             Ok(format!(
                 "已通过 Apple AirPlay 协议向「{}」({}) 推送手机 HLS 直播流 ({})",
-                receiver.name, receiver.ip, stats.hls_url
+                receiver.name, receiver.ip, safe_hls_url
             ))
         }
         LanCastProtocol::GoogleCast => {
@@ -2703,6 +3158,10 @@ pub fn push_stream_to_receiver(
 }
 
 pub fn stop_receiver_push(receiver: &LanCastReceiver) -> Result<()> {
+    active_pushed_receivers()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retain(|_, rx| rx.id != receiver.id);
     match receiver.protocol {
         LanCastProtocol::DlnaUpnp => {
             if let Some(control_url) = &receiver.control_url {
@@ -2731,7 +3190,10 @@ pub fn open_stream_in_local_player(url: &str, prefer_vlc: bool) -> Result<String
                 cmd.stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::null());
-                cmd.spawn().context("无法启动本地流媒体播放器")?;
+                let mut child = cmd.spawn().context("无法启动本地流媒体播放器")?;
+                thread::spawn(move || {
+                    let _ = child.wait();
+                });
                 return Ok(format!("已使用 {bin} 打开局域网直播流 {url}"));
             }
         }
@@ -2758,13 +3220,17 @@ pub fn open_stream_in_local_player(url: &str, prefer_vlc: bool) -> Result<String
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    cmd.spawn().context("无法打开系统浏览器")?;
+    let mut child = cmd.spawn().context("无法打开系统浏览器")?;
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
     Ok(url.to_string())
 }
 
 fn dlna_soap_set_uri_and_play(control_url: &str, stream_url: &str, title: &str) -> Result<()> {
+    let safe_stream_url = rewrite_push_url_to_media_token(stream_url)?;
     let didl = format!(
-        r#"&lt;DIDL-Lite xmlns=&quot;urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/&quot; xmlns:dc=&quot;http://purl.org/dc/elements/1.1/&quot; xmlns:upnp=&quot;urn:schemas-upnp-org:metadata-1-0/upnp/&quot;&gt;&lt;item id=&quot;0&quot; parentID=&quot;-1&quot; restricted=&quot;1&quot;&gt;&lt;dc:title&gt;{title}&lt;/dc:title&gt;&lt;upnp:class&gt;object.item.videoItem&lt;/upnp:class&gt;&lt;res protocolInfo=&quot;http-get:*:video/mp2t:DLNA.ORG_PN=AVC_TS_MP_HD_AAC_MULT5;DLNA.ORG_OP=00;DLNA.ORG_CI=1;DLNA.ORG_FLAGS=8d700000000000000000000000000000&quot;&gt;{stream_url}&lt;/res&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;"#
+        r#"&lt;DIDL-Lite xmlns=&quot;urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/&quot; xmlns:dc=&quot;http://purl.org/dc/elements/1.1/&quot; xmlns:upnp=&quot;urn:schemas-upnp-org:metadata-1-0/upnp/&quot;&gt;&lt;item id=&quot;0&quot; parentID=&quot;-1&quot; restricted=&quot;1&quot;&gt;&lt;dc:title&gt;{title}&lt;/dc:title&gt;&lt;upnp:class&gt;object.item.videoItem&lt;/upnp:class&gt;&lt;res protocolInfo=&quot;http-get:*:video/mp2t:DLNA.ORG_PN=AVC_TS_MP_HD_AAC_MULT5;DLNA.ORG_OP=00;DLNA.ORG_CI=1;DLNA.ORG_FLAGS=8d700000000000000000000000000000&quot;&gt;{safe_stream_url}&lt;/res&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;"#
     );
     let set_body = format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
@@ -2772,7 +3238,7 @@ fn dlna_soap_set_uri_and_play(control_url: &str, stream_url: &str, title: &str) 
   <s:Body>
     <u:SetAVTransportURI xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
       <InstanceID>0</InstanceID>
-      <CurrentURI>{stream_url}</CurrentURI>
+      <CurrentURI>{safe_stream_url}</CurrentURI>
       <CurrentURIMetaData>{didl}</CurrentURIMetaData>
     </u:SetAVTransportURI>
   </s:Body>
@@ -2853,6 +3319,7 @@ fn send_soap_action(control_url: &str, soap_action: &str, xml_body: &str) -> Res
 }
 
 fn airplay_push_hls(ip: &str, port: u16, hls_url: &str) -> Result<()> {
+    let safe_hls_url = rewrite_push_url_to_media_token(hls_url)?;
     let addr = format!("{ip}:{port}")
         .to_socket_addrs()?
         .next()
@@ -2861,7 +3328,7 @@ fn airplay_push_hls(ip: &str, port: u16, hls_url: &str) -> Result<()> {
         TcpStream::connect_timeout(&addr, Duration::from_secs(2)).context("连接 AirPlay 设备超时")?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-    let body = format!("Content-Location: {hls_url}\nStart-Position: 0.0\n\n");
+    let body = format!("Content-Location: {safe_hls_url}\nStart-Position: 0.0\n\n");
     let req = format!(
         "POST /play HTTP/1.1\r\nHost: {ip}:{port}\r\nUser-Agent: MediaControl/1.0\r\nContent-Type: text/parameters\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
@@ -2938,7 +3405,18 @@ fn html_unescape(s: &str) -> String {
         .replace("&#39;", "'")
 }
 
-fn build_web_receiver_html(host_ip: &str, port: u16, remote_enabled: bool, token: &str) -> String {
+fn build_web_receiver_html(
+    host_ip: &str,
+    port: u16,
+    remote_enabled: bool,
+    token: &str,
+    media_token: &str,
+) -> String {
+    let stream_tok = if media_token.is_empty() {
+        token
+    } else {
+        media_token
+    };
     let remote_badge = if remote_enabled {
         "远端触控反控：已开启"
     } else {
@@ -3069,13 +3547,13 @@ fn build_web_receiver_html(host_ip: &str, port: u16, remote_enabled: bool, token
   <div class="toolbar">
     <button id="btnMjpeg" class="active" onclick="switchMode('mjpeg')">极速互动流 (MJPEG)</button>
     <button id="btnHls" onclick="switchMode('hls')">高清视频流 (H.264 HLS)</button>
-    <a class="btn" href="/session/{token}/live.ts" target="_blank">下载/VLC打开 MPEG-TS 流</a>
+    <a class="btn" href="/session/{stream_tok}/live.ts" target="_blank">下载/VLC打开 MPEG-TS 流</a>
     <button onclick="toggleFullscreen()">全屏显示</button>
   </div>
 </header>
 <main>
   <div class="stage" id="stageBox">
-    <img id="mjpegView" src="/session/{token}/stream.mjpeg" alt="StepX Live Screen" draggable="false"/>
+    <img id="mjpegView" src="/session/{stream_tok}/stream.mjpeg" alt="StepX Live Screen" draggable="false"/>
     <video id="hlsView" controls autoplay muted playsinline></video>
   </div>
   <aside class="rail">
@@ -3097,16 +3575,25 @@ fn build_web_receiver_html(host_ip: &str, port: u16, remote_enabled: bool, token
     </div>
     <h3>多协议流地址</h3>
     <div class="meta">
-      <div><strong>MPEG-TS (DLNA/VLC):</strong><br/>http://{host_ip}:{port}/session/{token}/live.ts</div>
-      <div style="margin-top:6px;"><strong>Apple HLS (AirPlay):</strong><br/>http://{host_ip}:{port}/session/{token}/live.m3u8</div>
+      <div><strong>MPEG-TS (DLNA/VLC):</strong><br/>http://{host_ip}:{port}/session/{stream_tok}/live.ts</div>
+      <div style="margin-top:6px;"><strong>Apple HLS (AirPlay):</strong><br/>http://{host_ip}:{port}/session/{stream_tok}/live.m3u8</div>
     </div>
   </aside>
 </main>
 <script>
 const img = document.getElementById('mjpegView');
 const vid = document.getElementById('hlsView');
+const CONTROL_HEADERS = {{ 'Content-Type': 'application/json', 'X-StepX-Cast-Control': '1' }};
 let downPt = null;
 let downAt = 0;
+
+function postControl(payload) {{
+  return fetch('/session/{token}/api/control', {{
+    method: 'POST',
+    headers: CONTROL_HEADERS,
+    body: JSON.stringify(payload)
+  }});
+}}
 
 function normPt(ev) {{
   const r = img.getBoundingClientRect();
@@ -3128,29 +3615,23 @@ img.addEventListener('pointerup', (e) => {{
   const dist = Math.hypot(dx, dy);
   const dur = Math.min(1000, Math.max(100, Date.now() - downAt));
   if (dist < 0.025) {{
-    fetch('/session/{token}/api/control', {{
-      method: 'POST',
-      body: JSON.stringify({{ action: 'tap', x: upPt.x, y: upPt.y }})
-    }});
+    postControl({{ action: 'tap', x: upPt.x, y: upPt.y }});
   }} else {{
-    fetch('/session/{token}/api/control', {{
-      method: 'POST',
-      body: JSON.stringify({{ action: 'swipe', x1: downPt.x, y1: downPt.y, x2: upPt.x, y2: upPt.y, duration: dur }})
-    }});
+    postControl({{ action: 'swipe', x1: downPt.x, y1: downPt.y, x2: upPt.x, y2: upPt.y, duration: dur }});
   }}
   downPt = null;
 }});
 
 function sendKey(code) {{
-  fetch('/session/{token}/api/control', {{ method: 'POST', body: JSON.stringify({{ action: 'key', code }}) }});
+  postControl({{ action: 'key', code }});
 }}
 function sendSwipe(x1, y1, x2, y2) {{
-  fetch('/session/{token}/api/control', {{ method: 'POST', body: JSON.stringify({{ action: 'swipe', x1, y1, x2, y2, duration: 240 }}) }});
+  postControl({{ action: 'swipe', x1, y1, x2, y2, duration: 240 }});
 }}
 function sendText() {{
   const el = document.getElementById('txtInput');
   if (!el.value) return;
-  fetch('/session/{token}/api/control', {{ method: 'POST', body: JSON.stringify({{ action: 'text', text: el.value }}) }});
+  postControl({{ action: 'text', text: el.value }});
   el.value = '';
 }}
 function switchMode(mode) {{
@@ -3159,13 +3640,13 @@ function switchMode(mode) {{
   if (mode === 'hls') {{
     img.style.display = 'none';
     vid.style.display = 'block';
-    vid.src = '/session/{token}/live.m3u8';
+    vid.src = '/session/{stream_tok}/live.m3u8';
     vid.play().catch(()=>{{}});
   }} else {{
     vid.pause();
     vid.style.display = 'none';
     img.style.display = 'block';
-    img.src = '/session/{token}/stream.mjpeg?t=' + Date.now();
+    img.src = '/session/{stream_tok}/stream.mjpeg?t=' + Date.now();
   }}
 }}
 function toggleFullscreen() {{
@@ -3191,17 +3672,34 @@ setInterval(() => {{
 mod tests {
     use super::*;
 
-    fn request_for_test(path: &str, method: &str, remote: bool) -> String {
+    fn request_for_test_with_headers(
+        path: &str,
+        method: &str,
+        remote: bool,
+        extra_headers: &str,
+        active_stream_count: u64,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let request = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n{extra_headers}Content-Length: 0\r\n\r\n",
+            addr.port()
+        );
         let worker = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            handle_http_client(stream, addr.port(), "127.0.0.1".into(), "secret-test".into(),
-                PathBuf::from("must-not-run-adb"), Arc::new(Mutex::new("fixture".into())),
-                Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(remote)),
-                Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)),
-                Arc::new((Mutex::new(SharedStreamState::default()), Condvar::new())));
+            handle_http_client(
+                stream,
+                addr.port(),
+                "127.0.0.1".into(),
+                "secret-test".into(),
+                PathBuf::from("must-not-run-adb"),
+                Arc::new(Mutex::new("fixture".into())),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(remote)),
+                Arc::new(AtomicU64::new(active_stream_count)),
+                Arc::new(AtomicU64::new(0)),
+                Arc::new((Mutex::new(SharedStreamState::default()), Condvar::new())),
+            );
         });
         let mut client = TcpStream::connect(addr).unwrap();
         client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
@@ -3212,6 +3710,10 @@ mod tests {
         result
     }
 
+    fn request_for_test(path: &str, method: &str, remote: bool) -> String {
+        request_for_test_with_headers(path, method, remote, "", 0)
+    }
+
     #[test]
     fn cast_requires_session_link_and_control_is_post_only() {
         for path in ["/cast", "/api/status", "/frame.jpg", "/session/wrong/live.ts"] {
@@ -3220,13 +3722,61 @@ mod tests {
         assert!(request_for_test("/session/secret-test/api/status", "GET", false).starts_with("HTTP/1.1 200"));
         assert!(request_for_test("/session/secret-test/api/control", "GET", true).starts_with("HTTP/1.1 405"));
         assert!(request_for_test("/session/secret-test/api/control", "POST", false).starts_with("HTTP/1.1 403"));
-        assert!(request_for_test("/session/secret-test/api/control", "POST", true).starts_with("HTTP/1.1 400"));
+        // Without CSRF headers, POST /api/control must be rejected with 403 even when remote_control == true
+        assert!(request_for_test("/session/secret-test/api/control", "POST", true).starts_with("HTTP/1.1 403"));
+        let csrf_hdrs = "Content-Type: application/json; charset=utf-8\r\nX-StepX-Cast-Control: 1\r\n";
+        assert!(
+            request_for_test_with_headers("/session/secret-test/api/control", "POST", true, csrf_hdrs, 0)
+                .starts_with("HTTP/1.1 400")
+        );
+        // Cross-origin Origin header must be rejected
+        let bad_origin = "Content-Type: application/json\r\nX-StepX-Cast-Control: 1\r\nOrigin: http://evil.example\r\n";
+        assert!(
+            request_for_test_with_headers("/session/secret-test/api/control", "POST", true, bad_origin, 0)
+                .starts_with("HTTP/1.1 403")
+        );
+        // Media token allows read-only streams ONLY and NEVER /api/control, /api/status, or /cast
+        assert!(request_for_test("/session/secret-test-media/live.m3u8", "GET", true).starts_with("HTTP/1.1 200"));
+        assert!(request_for_test("/session/secret-test-media/live.ts", "HEAD", true).starts_with("HTTP/1.1 200"));
+        assert!(request_for_test("/session/secret-test-media/live.h264", "HEAD", true).starts_with("HTTP/1.1 200"));
+        assert!(request_for_test("/session/secret-test-media/stream.mjpg", "HEAD", true).starts_with("HTTP/1.1 200"));
+        assert!(
+            request_for_test_with_headers("/session/secret-test-media/api/control", "POST", true, csrf_hdrs, 0)
+                .starts_with("HTTP/1.1 403")
+        );
+        assert!(request_for_test("/session/secret-test-media/api/status", "GET", true).starts_with("HTTP/1.1 403"));
+        assert!(request_for_test("/session/secret-test-media/cast", "GET", true).starts_with("HTTP/1.1 403"));
+
+        // Control and status remain available even when media stream cap is saturated
+        assert!(
+            request_for_test_with_headers(
+                "/session/secret-test/api/status",
+                "GET",
+                true,
+                "",
+                MAX_MEDIA_STREAM_CLIENTS,
+            )
+            .starts_with("HTTP/1.1 200")
+        );
+        assert!(
+            request_for_test_with_headers(
+                "/session/secret-test-media/live.ts",
+                "GET",
+                true,
+                "",
+                MAX_MEDIA_STREAM_CLIENTS,
+            )
+            .starts_with("HTTP/1.1 503")
+        );
+
         let html = request_for_test("/session/secret-test/cast", "GET", false);
-        assert!(html.contains("/session/secret-test/stream.mjpeg"));
+        assert!(html.contains("/session/secret-test-media/stream.mjpeg"));
         assert!(html.contains("/session/secret-test/api/control"));
-        assert!(html.contains("href=\"/session/secret-test/live.ts\""));
+        assert!(html.contains("'X-StepX-Cast-Control': '1'"));
+        assert!(html.contains("'Content-Type': 'application/json'"));
+        assert!(html.contains("href=\"/session/secret-test-media/live.ts\""));
         assert!(html.contains("http://127.0.0.1:"));
-        assert!(html.contains("/session/secret-test/live.ts</div>"));
+        assert!(html.contains("/session/secret-test-media/live.ts</div>"));
         assert!(!html.contains("href=\"/live.ts\""));
         assert!(!html.contains("Access-Control-Allow-Origin: *"));
         assert!(authorized_cast_path("/session/secret-test/api/status", "next-session").is_none());
@@ -3447,12 +3997,65 @@ Interface: 192.168.1.10 --- 0x6
     }
 
     #[test]
-    fn qr_png_generation_creates_valid_png_file() {
+    fn qr_png_generation_creates_private_png_and_ssdp_validates_responder_and_bounds() {
         let path = generate_cast_qr_png("http://10.0.1.134:19780/cast", 19780)
             .expect("QR PNG should be generated");
         assert!(path.is_file());
+        assert!(!path.starts_with(std::env::temp_dir()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            let dir_mode = std::fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(file_mode, 0o600);
+            assert_eq!(dir_mode, 0o700);
+        }
         let bytes = std::fs::read(&path).unwrap();
         assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        let _ = std::fs::remove_file(&path);
+
+        // SSDP LOCATION host IP must match UDP responder IP and bound body to 256 KiB
+        let responder: std::net::IpAddr = "192.168.1.42".parse().unwrap();
+        assert!(
+            validate_ssdp_location_target("http://192.168.1.42:49152/desc.xml", Some(responder))
+                .is_some()
+        );
+        assert!(
+            validate_ssdp_location_target("http://192.168.1.99:49152/desc.xml", Some(responder))
+                .is_none()
+        );
+        assert!(
+            validate_ssdp_location_target("http://evil.local:49152/desc.xml", Some(responder))
+                .is_none()
+        );
+        let huge = vec![b'A'; 512 * 1024];
+        let capped = read_bounded_ssdp_response(&mut std::io::Cursor::new(huge));
+        assert_eq!(capped.len(), MAX_SSDP_HTTP_BODY_BYTES as usize);
+
+        // DLNA / AirPlay URL rewrite swaps session_token -> media_token
+        session_to_media_tokens()
+            .lock()
+            .unwrap()
+            .insert("sess_tok_abc".into(), "media_tok_xyz".into());
+        let rewritten =
+            rewrite_push_url_to_media_token("http://10.0.1.2:19780/session/sess_tok_abc/live.ts")
+                .unwrap();
+        assert_eq!(
+            rewritten,
+            "http://10.0.1.2:19780/session/media_tok_xyz/live.ts"
+        );
+        assert!(
+            rewrite_push_url_to_media_token("http://10.0.1.2:19780/session/sess_tok_abc/api/control")
+                .is_err()
+        );
+        session_to_media_tokens()
+            .lock()
+            .unwrap()
+            .remove("sess_tok_abc");
     }
 
     #[test]

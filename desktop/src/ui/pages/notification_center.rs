@@ -42,7 +42,51 @@ fn popup_display_title(item: &UnifiedNotificationItem, full: bool) -> String {
             return "验证码".into();
         }
     }
+    if let NotificationPopupWidget::ExpressPickup {
+        pickup_code,
+        carrier,
+        ..
+    } = &item.popup_widget
+    {
+        let has_real_code =
+            super::super::notification_center_state::is_real_pickup_code_label(pickup_code);
+        if !full {
+            return "取件提醒".into();
+        }
+        if has_real_code && !pickup_code.trim().is_empty() && title.contains(pickup_code.trim()) {
+            let clean_carrier = carrier.trim();
+            if !clean_carrier.is_empty() && !clean_carrier.contains(pickup_code.trim()) {
+                return super::super::notification_center_state::truncate_concise(clean_carrier, 24);
+            }
+            return "取件提醒".into();
+        }
+    }
+    if !full && (item.is_red_packet() || title.contains("红包") || item.full_body.contains("红包")) {
+        return "红包通知".into();
+    }
     super::super::notification_center_state::truncate_concise(title, 24)
+}
+
+fn masked_drawer_summary(item: &UnifiedNotificationItem) -> String {
+    match &item.popup_widget {
+        NotificationPopupWidget::OtpCode { .. } => "收到一条验证码通知 · 内容已隐藏".into(),
+        NotificationPopupWidget::ExpressPickup { .. } => "收到一条取件/配送通知 · 内容已隐藏".into(),
+        NotificationPopupWidget::ClipboardPreview { .. } => "手机剪贴板已同步 · 内容已隐藏".into(),
+        NotificationPopupWidget::LiveCall { ringing, .. } => {
+            if *ringing {
+                "手机来电响铃中".into()
+            } else {
+                "当前通话进行中".into()
+            }
+        }
+        _ if item.is_red_packet()
+            || item.title.contains("红包")
+            || item.full_body.contains("红包") =>
+        {
+            "收到一条红包通知 · 内容已隐藏".into()
+        }
+        _ => "新消息 · 内容已隐藏".into(),
+    }
 }
 
 fn with_control_alias(el: El, alias_id: &str) -> El {
@@ -105,6 +149,8 @@ impl facloud_ui::Element for PopupPreview {
 struct PopupPointerGuard {
     child: El,
     bounds: Option<RectF>,
+    current_hovered: bool,
+    last_dispatched: std::rc::Rc<std::cell::Cell<Option<bool>>>,
 }
 
 impl facloud_ui::Element for PopupPointerGuard {
@@ -121,7 +167,10 @@ impl facloud_ui::Element for PopupPointerGuard {
     fn dispatch_event(&mut self, e: &DispatchedEvent, ctx: &mut EventContext, app: &facloud_ui::AppContext) -> bool {
         if let Event::MouseMoved { position, .. } = e.raw_event() {
             let hovered = self.bounds.is_some_and(|bounds| bounds.contains_point(*position));
-            ctx.dispatch_typed_action(Action::NotificationCenter(NotificationCenterAction::PopupHoverChanged(hovered)));
+            if self.current_hovered != hovered && self.last_dispatched.get() != Some(hovered) {
+                self.last_dispatched.set(Some(hovered));
+                ctx.dispatch_typed_action(Action::NotificationCenter(NotificationCenterAction::PopupHoverChanged(hovered)));
+            }
         }
         self.child.dispatch_event(e, ctx, app)
     }
@@ -1371,7 +1420,8 @@ impl Companion {
                 &if clear_batch { "notif-popup-clear-batch".to_string() } else { format!("notif-popup-snooze-{id}") },
             ));
         }
-        let full = self.push.prefs.effective_popup_mode(&item.package_name).shows_full_body_and_reply()
+        let mode = self.push.prefs.effective_popup_mode(&item.package_name);
+        let full = (mode.shows_full_body_and_reply() && !self.push.prefs.privacy_mask)
             || matches!(item.popup_widget, NotificationPopupWidget::LiveCall { .. });
         let height = if full { 194. } else { 118. };
         // Keep the native popup's current size. The close/back control and the
@@ -1381,8 +1431,15 @@ impl Companion {
             .with_height(height - 68.).finish();
         let body = ConstrainedBox::new(Container::new(self.vstack(6., vec![header, menu]))
             .with_uniform_padding(14.).finish()).with_height(height - 2.).finish();
+        let body: El = Box::new(PopupPointerGuard {
+            child: body,
+            bounds: None,
+            current_hovered: self.notification_center.popup_hovered,
+            last_dispatched: self.notification_center.last_dispatched_hover.clone(),
+        });
+        let menu_red_packet = full && item.is_red_packet();
         let card = if standalone {
-            self.standalone_popup_card(body, POPUP_CARD_W, item.is_red_packet())
+            self.standalone_popup_card(body, POPUP_CARD_W, menu_red_packet)
         } else {
             self.elevated_overlay_card(body, POPUP_CARD_W, false)
         };
@@ -1390,22 +1447,25 @@ impl Companion {
     }
 
     pub(crate) fn render_360_popup_card_for_window(&self, standalone_window: bool) -> Option<El> {
-        if self.notification_center.drawer_open
+        let item = self.notification_active_popup()?;
+        let is_live_call = item.id.starts_with("live-call:")
+            || matches!(item.popup_widget, NotificationPopupWidget::LiveCall { .. });
+        if !is_live_call
+            && self.notification_center.drawer_open
             && (!standalone_window || self.desktop_popup.main_window_active)
         {
             return None;
         }
-        let item = self.notification_active_popup()?;
         let mode = self.push.prefs.effective_popup_mode(&item.package_name);
-        if !mode.allows_popup() {
+        if !is_live_call && !mode.allows_popup() {
             return None;
         }
         if self.notification_center.popup_menu_item_id.as_deref() == Some(item.id.as_str()) {
             return Some(self.popup_reminder_menu(item, standalone_window));
         }
-        let full = mode.shows_full_body_and_reply();
+        let full = mode.shows_full_body_and_reply() && !self.push.prefs.privacy_mask;
         let p = self.p();
-        let red_packet = item.is_red_packet();
+        let red_packet = full && item.is_red_packet();
         let (packet_ink, packet_bg, _) = red_packet_colors(p.dark);
         let title = popup_display_title(item, full);
         let open =
@@ -1627,31 +1687,43 @@ impl Companion {
                 size: None,
             });
             rows.push(Expanded::new(1., Clipped::new(preview).finish()).finish());
-            let can_reply = (!red_packet || !self.fields[super::super::F_TOAST_REPLY].text.is_empty()) && matches!(
-                item.popup_widget,
-                NotificationPopupWidget::InlineImReply {
-                    can_reply: true,
-                    ..
-                }
-            );
+            let sending_reply = self.notification_center.is_reply_sending(&item.id);
+            let can_reply = item.supports_inline_reply()
+                && (!red_packet
+                    || !self.fields[super::super::F_TOAST_REPLY].text.is_empty()
+                    || sending_reply)
+                && matches!(
+                    item.popup_widget,
+                    NotificationPopupWidget::InlineImReply {
+                        can_reply: true,
+                        ..
+                    }
+                );
             let footer = if can_reply {
-                self.hstack(
-                    6.,
-                    vec![
+                if sending_reply {
+                    self.between(
                         pager,
-                        Expanded::new(1., self.input(super::super::F_TOAST_REPLY, "回复…", None))
-                            .finish(),
-                        self.icon_action(
-                            "notif-popup-send-reply",
-                            "发送回复",
-                            UiIcon::Send,
-                            vec![Action::NotificationCenter(
-                                NotificationCenterAction::SubmitPopupReply(item.id.clone()),
-                            )],
-                            true,
-                        ),
-                    ],
-                )
+                        self.line_w("正在发送回复…", 12., p.accent, Weight::Medium),
+                    )
+                } else {
+                    self.hstack(
+                        6.,
+                        vec![
+                            pager,
+                            Expanded::new(1., self.input(super::super::F_TOAST_REPLY, "回复…", None))
+                                .finish(),
+                            self.icon_action(
+                                "notif-popup-send-reply",
+                                "发送回复",
+                                UiIcon::Send,
+                                vec![Action::NotificationCenter(
+                                    NotificationCenterAction::SubmitPopupReply(item.id.clone()),
+                                )],
+                                true,
+                            ),
+                        ],
+                    )
+                }
             } else if let NotificationPopupWidget::LiveCall { id, ringing } = &item.popup_widget {
                 self.live_call_controls(id, *ringing)
             } else if let NotificationPopupWidget::CallerBadge { number, .. } = &item.popup_widget {
@@ -1706,7 +1778,12 @@ impl Companion {
             .with_cursor(Cursor::PointingHand)
             .on_click(move |ctx, _, _| ctx.dispatch_typed_action(open_details.clone()))
             .finish();
-        let body: El = Box::new(PopupPointerGuard { child: body, bounds: None });
+        let body: El = Box::new(PopupPointerGuard {
+            child: body,
+            bounds: None,
+            current_hovered: self.notification_center.popup_hovered,
+            last_dispatched: self.notification_center.last_dispatched_hover.clone(),
+        });
         let body = with_control_alias(body, "notif-popup-card");
         let width = if full {
             POPUP_CARD_W_FULL
@@ -1851,14 +1928,25 @@ impl Companion {
     /// Fixed geometry: neither hovering nor becoming read inserts controls into the row.
     fn render_notification_item_card(&self, item: &UnifiedNotificationItem) -> El {
         let p = self.p();
+        let privacy_mask = self.push.prefs.privacy_mask;
         let avatar = self.notification_row_avatar(item);
+        let display_title = if privacy_mask {
+            popup_display_title(item, false)
+        } else {
+            item.title.clone()
+        };
+        let display_summary = if privacy_mask {
+            masked_drawer_summary(item)
+        } else {
+            item.summary.clone()
+        };
         let title = self.hstack(
             6.,
             vec![
                 Expanded::new(
                     1.,
                     self.line_w(
-                        &item.title,
+                        display_title,
                         BODY,
                         p.text,
                         if item.unread {
@@ -1905,7 +1993,7 @@ impl Companion {
             vec![
                 title,
                 with_control_alias(
-                    self.line(&item.summary, CAPTION, p.text2),
+                    self.line(display_summary, CAPTION, p.text2),
                     &format!("notif-summary-{}", item.id),
                 ),
                 self.line(metadata, MICRO, p.text2),
@@ -2950,6 +3038,13 @@ mod tests {
 
         for (idx, widget) in widgets.into_iter().enumerate() {
             let item_id = format!("test-popup-{idx}");
+            let can_inline = matches!(
+                widget,
+                NotificationPopupWidget::InlineImReply {
+                    can_reply: true,
+                    ..
+                }
+            );
             app.notification_center.items = vec![
                 UnifiedNotificationItem {
                     id: item_id.clone(),
@@ -2961,6 +3056,7 @@ mod tests {
                     sender: "测试发送人".into(),
                     full_body: "360 风格五区图形化桌面通知卡片完整未截断正文内容".into(),
                     banner_body: "微信 · 收到来自「测试发送人」的新消息".into(),
+                    can_inline_reply: can_inline,
                     source_badge: "测试提醒".into(),
                     title: format!("测试卡片 #{idx}"),
                     summary: "360 风格五区图形化桌面通知卡片".into(),
@@ -2984,6 +3080,7 @@ mod tests {
                     sender: "第二条发送人".into(),
                     full_body: "支持多条消息叠层翻页".into(),
                     banner_body: "微信 · 收到来自「第二条发送人」的新消息".into(),
+                    can_inline_reply: false,
                     source_badge: "微信".into(),
                     title: "第二条消息".into(),
                     summary: "支持多条消息叠层翻页".into(),

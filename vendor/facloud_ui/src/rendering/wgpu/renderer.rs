@@ -75,9 +75,16 @@ impl Renderer {
         let Resources { device, queue, .. } = resources;
 
         // Don't initiate the render if we are trying to render into a
-        // zero-sized window.
-        if window_size.is_zero() {
+        // zero-sized or sub-pixel window.
+        if window_size.x() < 1.0 || window_size.y() < 1.0 {
             return Ok(());
+        }
+
+        if resources
+            .device_lost
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(Error::DeviceLost);
         }
 
         let mut ctx = WGPUContext {
@@ -128,7 +135,16 @@ impl Renderer {
                 match with_error_scope(device, || {
                     surface_texture.present();
                 }) {
-                    (_, None) => Ok(()),
+                    (_, None) => {
+                        if resources
+                            .device_lost
+                            .load(std::sync::atomic::Ordering::SeqCst)
+                        {
+                            Err(Error::DeviceLost)
+                        } else {
+                            Ok(())
+                        }
+                    }
                     (_, Some(error)) => Err(error),
                 }
             }
@@ -199,12 +215,19 @@ fn capture_surface_texture(
     let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(align) * align;
     let buffer_size = (padded_bytes_per_row * height) as u64;
 
-    let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("Frame capture staging buffer"),
-        size: buffer_size,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
+    let (staging_buffer, buffer_err) = with_error_scope(device, || {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Frame capture staging buffer"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        })
     });
+    if let Some(err) = buffer_err {
+        return Err(format!(
+            "Failed to allocate frame capture staging buffer: {err:#}"
+        ));
+    }
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("Frame capture encoder"),

@@ -649,6 +649,9 @@ impl Window {
                 ime_active: Cell::new(false),
                 capture_callback: RefCell::new(None),
             });
+            if let Some(size) = options.min_inner_size {
+                window_state.set_min_inner_size(size);
+            }
 
             (*native_window).set_ivar(WINDOW_STATE_IVAR, Ivar::from_state(&window_state));
             (*native_view).set_ivar(WINDOW_STATE_IVAR, Ivar::from_state(&window_state));
@@ -1084,6 +1087,10 @@ impl WindowState {
         self.window_id
     }
 
+    pub(super) fn clear_scene(&self) {
+        let _ = self.next_scene.borrow_mut().take();
+    }
+
     /// Returns the logical (resolution-agnostic) size of the current window.
     pub fn logical_size(&self) -> Vector2F {
         let view_frame = unsafe { NSView::frame(self.native_window.contentView()) };
@@ -1179,6 +1186,13 @@ impl WindowState {
         }
     }
 
+    fn set_min_inner_size(&self, size: Vector2F) {
+        unsafe {
+            self.native_window
+                .setContentMinSize_(NSSize::new(size.x() as f64, size.y() as f64));
+        }
+    }
+
     fn set_titlebar_height(&self, height: f64) {
         unsafe {
             set_titlebar_height(self.native_window, height);
@@ -1245,6 +1259,9 @@ pub trait WindowExt {
 
     /// Sets whether or not to show the native macOS window buttons (traffic lights).
     fn set_window_buttons(&self, window_buttons: bool);
+
+    /// Sets the minimum content size in logical points.
+    fn set_min_inner_size(&self, size: Vector2F);
 }
 
 /// Utility for interacting with the native [`Window`] implementation. The native window is always
@@ -1270,6 +1287,12 @@ impl WindowExt for &dyn platform::Window {
     fn set_window_buttons(&self, window_buttons: bool) {
         if let Some(window) = native_window(*self) {
             window.0.set_window_buttons(window_buttons)
+        }
+    }
+
+    fn set_min_inner_size(&self, size: Vector2F) {
+        if let Some(window) = native_window(*self) {
+            window.0.set_min_inner_size(size);
         }
     }
 }
@@ -1575,11 +1598,37 @@ extern "C-unwind" fn warp_update_ime_state(this: &mut Object, ime_active: bool) 
     state.ime_active.set(ime_active);
 }
 
-/// Converts an NSRange to a Rust Range<usize>
-/// NSRange has location (start) and length, while Rust Range has start and end
-fn nsrange_to_rust_range(ns_range: NSRange) -> std::ops::Range<usize> {
-    let start = ns_range.location as usize;
-    let end = start + ns_range.length as usize;
+const NS_NOT_FOUND: NSUInteger = NSInteger::MAX as NSUInteger;
+
+/// Converts an NSRange (UTF-16 code-unit offsets) to valid UTF-8 byte offsets in `text`.
+fn nsrange_to_rust_range(text: &str, ns_range: NSRange) -> std::ops::Range<usize> {
+    if ns_range.location >= NS_NOT_FOUND || text.is_empty() {
+        return 0..0;
+    }
+    let utf16_start = ns_range.location as usize;
+    let utf16_end = if ns_range.length >= NS_NOT_FOUND {
+        usize::MAX
+    } else {
+        utf16_start.saturating_add(ns_range.length as usize)
+    };
+
+    let mut utf16_pos = 0usize;
+    let mut byte_start = None;
+    let mut byte_end = None;
+
+    for (byte_idx, ch) in text.char_indices() {
+        if byte_start.is_none() && utf16_pos >= utf16_start {
+            byte_start = Some(byte_idx);
+        }
+        if byte_end.is_none() && utf16_pos >= utf16_end {
+            byte_end = Some(byte_idx);
+            break;
+        }
+        utf16_pos += ch.len_utf16();
+    }
+
+    let start = byte_start.unwrap_or(text.len());
+    let end = byte_end.unwrap_or(text.len()).max(start);
     start..end
 }
 
@@ -1591,7 +1640,7 @@ extern "C-unwind" fn warp_marked_text_updated(
 ) {
     let state = unsafe { get_window_state(this) };
     let marked_text = unsafe { to_string(marked_text) };
-    let selected_range = nsrange_to_rust_range(selected_range);
+    let selected_range = nsrange_to_rust_range(&marked_text, selected_range);
     app::callback_dispatcher()
         .for_window(&Window(state.clone()))
         .dispatch_event(Event::SetMarkedText {
@@ -1643,11 +1692,14 @@ pub extern "C-unwind" fn warp_app_window_moved(this: id, rect: NSRect) {
 /// Removes the WindowState ivar from an Objective-C object, nulls out the ivar
 /// pointer within the object, and returns the reference-counted pointer to the
 /// state.
-unsafe fn remove_state_ivar_from_object(object: &mut Object) -> Rc<WindowState> {
+unsafe fn remove_state_ivar_from_object(object: &mut Object) -> Option<Rc<WindowState>> {
     let wrapper_ptr: *mut c_void = *object.get_ivar(WINDOW_STATE_IVAR);
+    if wrapper_ptr.is_null() {
+        return None;
+    }
     let state = Ivar::take_state(wrapper_ptr);
     object.set_ivar(WINDOW_STATE_IVAR, ptr::null::<c_void>());
-    state
+    Some(state)
 }
 
 // dealloc is called by AppKit when our NSWindow subclass is deallocating,
@@ -1660,13 +1712,17 @@ pub extern "C-unwind" fn warp_dealloc_window(native_window: &mut Object) {
     unsafe {
         // Remove the window state from the content NSView and drop a reference.
         let view_id: id = msg_send![native_window, contentView];
-        let native_view = &mut (*view_id);
-        let _ = remove_state_ivar_from_object(native_view);
+        if view_id != nil {
+            let native_view = &mut (*view_id);
+            let _ = remove_state_ivar_from_object(native_view);
+        }
 
         // Remove the window state from the NSWindowDelegate and drop a reference.
         let delegate_id: id = msg_send![native_window, delegate];
-        let native_window_delegate = &mut (*delegate_id);
-        let _ = remove_state_ivar_from_object(native_window_delegate);
+        if delegate_id != nil {
+            let native_window_delegate = &mut (*delegate_id);
+            let _ = remove_state_ivar_from_object(native_window_delegate);
+        }
 
         // Remove the window state from the NSWindow.
         state = remove_state_ivar_from_object(native_window);
@@ -1763,8 +1819,19 @@ fn transform_origin_from_rect_coord_to_frame_coord(origin: Vector2F, size: Vecto
 
 /// Converts an Objective-C `Object` into a `String`
 unsafe fn to_string(value: *mut Object) -> String {
-    let slice = slice::from_raw_parts(value.UTF8String() as *const c_uchar, value.len());
-    str::from_utf8_unchecked(slice).to_string()
+    if value.is_null() {
+        return String::new();
+    }
+    let ptr = value.UTF8String() as *const c_uchar;
+    let len = value.len();
+    if ptr.is_null() || len == 0 {
+        return String::new();
+    }
+    let slice = slice::from_raw_parts(ptr, len);
+    match str::from_utf8(slice) {
+        Ok(s) => s.to_string(),
+        Err(_) => String::from_utf8_lossy(slice).into_owned(),
+    }
 }
 
 #[cfg(test)]

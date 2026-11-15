@@ -169,6 +169,74 @@ impl MirrorOptions {
     }
 }
 
+pub(crate) fn configure_linux_bundled_lib_path(command: &mut Command, binary: &std::path::Path) {
+    #[cfg(target_os = "linux")]
+    {
+        let mut search_dirs: Vec<PathBuf> = Vec::new();
+        let mut push_unique = |candidate: PathBuf| {
+            if candidate.is_dir() && !search_dirs.contains(&candidate) {
+                search_dirs.push(candidate);
+            }
+        };
+        let mut inspect_bin_dir = |bin_dir: &std::path::Path| {
+            push_unique(bin_dir.to_path_buf());
+            if let Some(tools_root) = bin_dir.parent() {
+                push_unique(tools_root.join("lib"));
+                for prefix in [tools_root.join("root/usr"), tools_root.join("root")] {
+                    if let Ok(entries) = std::fs::read_dir(&prefix) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            let name = entry.file_name();
+                            if name.to_string_lossy().starts_with("lib") && path.is_dir() {
+                                push_unique(path.clone());
+                                if let Ok(sub_entries) = std::fs::read_dir(&path) {
+                                    for sub in sub_entries.flatten() {
+                                        let sub_path = sub.path();
+                                        if sub
+                                            .file_name()
+                                            .to_string_lossy()
+                                            .contains("linux")
+                                            && sub_path.is_dir()
+                                        {
+                                            push_unique(sub_path);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        if let Some(parent) = binary.parent() {
+            if !parent.as_os_str().is_empty() {
+                inspect_bin_dir(parent);
+            }
+        }
+        if let Ok(canon) = binary.canonicalize() {
+            if let Some(parent) = canon.parent() {
+                inspect_bin_dir(parent);
+            }
+        }
+        if !search_dirs.is_empty() {
+            if let Some(existing) = std::env::var_os("LD_LIBRARY_PATH") {
+                for p in std::env::split_paths(&existing) {
+                    if !p.as_os_str().is_empty() && !search_dirs.contains(&p) {
+                        search_dirs.push(p);
+                    }
+                }
+            }
+            if let Ok(joined) = std::env::join_paths(&search_dirs) {
+                command.env("LD_LIBRARY_PATH", joined);
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (command, binary);
+    }
+}
+
 fn scrcpy_capabilities(binary: &PathBuf) -> Result<(bool, bool, String)> {
     static CACHE: OnceLock<Mutex<HashMap<PathBuf, (bool, bool, String)>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -178,6 +246,7 @@ fn scrcpy_capabilities(binary: &PathBuf) -> Result<(bool, bool, String)> {
         }
     }
     let mut help_command = Command::new(binary);
+    configure_linux_bundled_lib_path(&mut help_command, binary);
     help_command.arg("--help");
     let help = run_process(help_command, None, Duration::from_secs(5))
         .context("无法运行投屏组件，请重新安装 desktop")?;
@@ -206,11 +275,105 @@ pub fn start_with_options(
 pub struct MirrorSession {
     child: Child,
     log: Log,
+    log_pending: Arc<std::sync::atomic::AtomicUsize>,
     exited: bool,
     frame_received: bool,
     audio_route: MirrorAudioRoute,
     audio_downgraded: bool,
     window: crate::mirror_window::Watcher,
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_linux_with_pdeathsig(mut command: Command) -> std::io::Result<Child> {
+    use std::os::unix::process::CommandExt;
+    use std::sync::{mpsc, OnceLock};
+
+    type SpawnReq = (Command, mpsc::SyncSender<std::io::Result<Child>>);
+    static SPAWNER: OnceLock<mpsc::Sender<SpawnReq>> = OnceLock::new();
+
+    let parent_pid = unsafe { libc::getpid() };
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() != parent_pid {
+                libc::kill(libc::getpid(), libc::SIGTERM);
+            }
+            Ok(())
+        });
+    }
+
+    let tx = SPAWNER.get_or_init(|| {
+        let (req_tx, req_rx) = mpsc::channel::<SpawnReq>();
+        let _ = thread::Builder::new()
+            .name("stepx-mirror-spawner".into())
+            .spawn(move || {
+                while let Ok((mut cmd, reply_tx)) = req_rx.recv() {
+                    let res = cmd.spawn();
+                    drop(cmd);
+                    let _ = reply_tx.send(res);
+                }
+            });
+        req_tx
+    });
+
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    tx.send((command, reply_tx))
+        .map_err(|_| std::io::Error::other("mirror spawner thread unavailable"))?;
+    reply_rx
+        .recv()
+        .map_err(|_| std::io::Error::other("mirror spawner thread dropped reply"))?
+}
+
+fn resolve_mirror_serial(adb: &Adb, serial: &str) -> Result<String> {
+    let trimmed = serial.trim();
+    if !trimmed.is_empty() {
+        return Ok(
+            crate::device::resolve_online_transport(adb, trimmed, "", "", &[])
+                .unwrap_or_else(|_| trimmed.to_string()),
+        );
+    }
+    let out = adb.run(&["devices", "-l"])?;
+    let online_ids: Vec<String> = out
+        .lines()
+        .filter_map(|line| {
+            if line.starts_with("List of") || line.starts_with('*') {
+                return None;
+            }
+            let mut parts = line.split_whitespace();
+            let id = parts.next()?;
+            let state = parts.next()?;
+            (state == "device").then(|| id.to_string())
+        })
+        .collect();
+    if online_ids.is_empty() {
+        bail!("当前未检测到已连接并授权的手机，请先连接手机后再开启投屏");
+    }
+    if online_ids.len() == 1 {
+        return Ok(online_ids[0].clone());
+    }
+    let mut verified_serial: Option<String> = None;
+    for id in &online_ids {
+        let hw = adb
+            .run_timeout(
+                &["-s", id, "shell", "getprop", "ro.serialno"],
+                Duration::from_secs(2),
+            )
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        match (&verified_serial, hw) {
+            (None, Some(s)) => verified_serial = Some(s),
+            (Some(prev), Some(s)) if *prev == s => {}
+            _ => bail!("检测到多台已连接手机，请先指定要投屏的目标设备"),
+        }
+    }
+    Ok(online_ids
+        .iter()
+        .find(|id| !id.contains(':') && !id.starts_with("adb-"))
+        .unwrap_or(&online_ids[0])
+        .clone())
 }
 
 impl MirrorSession {
@@ -238,8 +401,7 @@ impl MirrorSession {
             bail!("投屏组件版本不兼容，无法在投屏时保持手机亮屏。请更新 scrcpy（当前验证版本 5.0.1）或重新安装完整版 desktop。");
         }
         let has_audio_dup = help_text.contains("--audio-dup");
-        let resolved = crate::device::resolve_online_transport(adb, serial, "", "", &[])
-            .unwrap_or_else(|_| serial.to_string());
+        let resolved = resolve_mirror_serial(adb, serial)?;
         // Wake phone display if it went to sleep on wireless standby so SurfaceFlinger emits the initial frame immediately.
         let _ = adb.run_timeout(
             &["-s", &resolved, "shell", "input", "keyevent", "224"],
@@ -251,6 +413,7 @@ impl MirrorSession {
             let (max_size, max_fps, bit_rate) =
                 options.quality_params_for_transport(is_wireless);
             let mut command = Command::new(&binary);
+            configure_linux_bundled_lib_path(&mut command, &binary);
             #[cfg(target_os = "linux")]
             if std::env::var_os("DISPLAY").is_some() {
                 // XWayland permits the control rail to follow the SDL window.
@@ -325,9 +488,15 @@ impl MirrorSession {
             Ok(s) => (s, false),
             Err(first_err) => {
                 // If wireless audio forwarding, an audio encoder failure, or an mDNS transport
-                // caused startup failure, try alternate online transport or fallback with `--no-audio`.
-                let alt = crate::device::resolve_online_transport(adb, "", "", "PZ261A", &[])
-                    .ok()
+                // caused startup failure, try an alternate online transport for the SAME requested
+                // serial (never guessing a wildcard model across phones) or fallback with `--no-audio`.
+                let trimmed_serial = serial.trim();
+                let alt = (!trimmed_serial.is_empty())
+                    .then(|| {
+                        crate::device::resolve_online_transport(adb, trimmed_serial, "", "", &[])
+                            .ok()
+                    })
+                    .flatten()
                     .filter(|t| t != &resolved);
                 let is_wireless_or_audio_err = resolved.contains(':')
                     || resolved.starts_with("adb-")
@@ -370,6 +539,10 @@ impl MirrorSession {
     fn spawn(mut command: Command, timeout: Duration) -> Result<Self> {
         crate::resources::quiet_command(&mut command);
         let log = Arc::new(Mutex::new(Vec::new()));
+        #[cfg(unix)]
+        let log_pending = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        #[cfg(windows)]
+        let log_pending = Arc::new(std::sync::atomic::AtomicUsize::new(2));
         command.stdin(Stdio::null());
         // scrcpy buffers stdout when redirected to a pipe/file. A terminal keeps
         // the first decoded frame notification visible before the process exits.
@@ -406,24 +579,39 @@ impl MirrorSession {
             command.creation_flags(0x0800_0000);
             command.stdout(Stdio::piped()).stderr(Stdio::piped());
         }
-        let child = command.spawn().context("无法启动投屏窗口")?;
-        drop(command);
+        #[cfg(unix)]
+        collect_log(output, log.clone(), log_pending.clone());
+        #[cfg(target_os = "linux")]
+        let child = spawn_linux_with_pdeathsig(command).context("无法启动投屏窗口")?;
+        #[cfg(not(target_os = "linux"))]
+        let child = {
+            let c = command.spawn().context("无法启动投屏窗口")?;
+            drop(command);
+            c
+        };
         let window = crate::mirror_window::Watcher::new(child.id());
         let mut session = Self {
             child,
             window,
             log,
+            log_pending,
             exited: false,
             frame_received: false,
             audio_route: MirrorAudioRoute::default(),
             audio_downgraded: false,
         };
-        #[cfg(unix)]
-        collect_log(output, session.log.clone());
         #[cfg(windows)]
         {
-            collect_log(session.child.stdout.take().unwrap(), session.log.clone());
-            collect_log(session.child.stderr.take().unwrap(), session.log.clone());
+            collect_log(
+                session.child.stdout.take().unwrap(),
+                session.log.clone(),
+                session.log_pending.clone(),
+            );
+            collect_log(
+                session.child.stderr.take().unwrap(),
+                session.log.clone(),
+                session.log_pending.clone(),
+            );
         }
         let started = Instant::now();
         loop {
@@ -469,8 +657,12 @@ impl MirrorSession {
     }
 
     pub fn exit_detail(&self, status: ExitStatus) -> String {
-        // Give the log reader a chance to consume the last error written at exit.
-        thread::sleep(Duration::from_millis(30));
+        let wait_start = Instant::now();
+        while self.log_pending.load(std::sync::atomic::Ordering::Acquire) > 0
+            && wait_start.elapsed() < Duration::from_millis(250)
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
         format!("{}（{}）", failure_detail(&self.log_text()), status)
     }
 
@@ -525,7 +717,11 @@ impl Drop for MirrorSession {
     }
 }
 
-fn collect_log(mut reader: impl Read + Send + 'static, log: Log) {
+fn collect_log(
+    mut reader: impl Read + Send + 'static,
+    log: Log,
+    pending: Arc<std::sync::atomic::AtomicUsize>,
+) {
     thread::spawn(move || {
         let mut buf = [0; 4096];
         loop {
@@ -542,6 +738,7 @@ fn collect_log(mut reader: impl Read + Send + 'static, log: Log) {
                 Err(_) => break,
             }
         }
+        pending.fetch_sub(1, std::sync::atomic::Ordering::Release);
     });
 }
 
@@ -740,5 +937,53 @@ sleep 5
         let started_msg = session.started_message();
         assert!(started_msg.contains("手机端播放"), "{started_msg}");
         assert!(!started_msg.contains("声音：电脑端播放"), "{started_msg}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_serial_rejects_ambiguous_multi_device_without_pz261a_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fake_adb = dir.path().join("adb");
+        let adb_script = r#"#!/usr/bin/env bash
+if [[ "$*" == "devices -l" ]]; then
+  printf 'List of devices attached\n192.168.1.10:5555 device model:PZ261A product:pandora\n192.168.1.11:5555 device model:PZ261A product:pandora\n'
+  exit 0
+fi
+if [[ "$*" == *"-s 192.168.1.10:5555 shell getprop ro.serialno"* ]]; then
+  echo "PHONE_A"
+  exit 0
+fi
+if [[ "$*" == *"-s 192.168.1.11:5555 shell getprop ro.serialno"* ]]; then
+  echo "PHONE_B"
+  exit 0
+fi
+exit 1
+"#;
+        std::fs::write(&fake_adb, adb_script).unwrap();
+        std::fs::set_permissions(&fake_adb, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let adb = Adb { path: fake_adb };
+        let err = resolve_mirror_serial(&adb, "").unwrap_err().to_string();
+        assert!(err.contains("多台已连接手机"), "unexpected error: {err}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_thread_spawn_survives_thread_exit_with_pdeathsig() {
+        let mut session = thread::spawn(|| {
+            MirrorSession::spawn(
+                command("echo 'INFO: Texture: 718x1600'; exec sleep 30"),
+                Duration::from_secs(2),
+            )
+            .unwrap()
+        })
+        .join()
+        .unwrap();
+        thread::sleep(Duration::from_millis(80));
+        assert!(
+            session.try_wait().unwrap().is_none(),
+            "scrcpy child must stay alive after calling worker thread exits"
+        );
+        session.stop();
     }
 }

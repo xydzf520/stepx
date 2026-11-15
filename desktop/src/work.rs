@@ -255,9 +255,21 @@ impl Workspace {
         Ok(files)
     }
     pub fn search_files(&self, relative: &str, query: &str) -> Result<Vec<Value>> {
+        self.search_files_with_cancel(relative, query, None)
+    }
+    pub fn search_files_with_cancel(
+        &self,
+        relative: &str,
+        query: &str,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Vec<Value>> {
+        if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+            bail!("桌面任务已停止");
+        }
         let query = Some(query)
             .filter(|q| !q.is_empty() && q.len() < 500)
             .context("请输入 1–500 字节的检索内容")?;
+        let deadline = Instant::now() + Duration::from_secs(15);
         let mut matches = vec![];
         for file in self
             .list_files(relative)?
@@ -265,21 +277,33 @@ impl Workspace {
             .filter(|f| !f.directory && !is_ignored_workspace_entry(&f.name))
             .take(100)
         {
-            if let Ok(text) = self.read_text(&file.relative_path) {
-                for (index, line) in text
-                    .lines()
-                    .enumerate()
-                    .filter(|(_, line)| line.contains(query))
-                    .take(5)
-                {
-                    matches.push(json!({
-                        "path": file.relative_path,
-                        "line": index + 1,
-                        "text": line.chars().take(500).collect::<String>()
-                    }));
-                }
+            if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+                bail!("桌面任务已停止");
             }
-            if matches.len() >= 50 {
+            if Instant::now() >= deadline {
+                break;
+            }
+            match self.read_text_with_cancel(&file.relative_path, cancel) {
+                Ok(text) => {
+                    for (index, line) in text
+                        .lines()
+                        .enumerate()
+                        .filter(|(_, line)| line.contains(query))
+                        .take(5)
+                    {
+                        matches.push(json!({
+                            "path": file.relative_path,
+                            "line": index + 1,
+                            "text": line.chars().take(500).collect::<String>()
+                        }));
+                    }
+                }
+                Err(_) if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) => {
+                    bail!("桌面任务已停止");
+                }
+                Err(_) => {}
+            }
+            if matches.len() >= 50 || Instant::now() >= deadline {
                 break;
             }
         }
@@ -301,14 +325,24 @@ impl Workspace {
         serde_json::from_slice(&bytes).context("表格预览格式无效")
     }
     pub fn read_text(&self, relative: &str) -> Result<String> {
+        self.read_text_with_cancel(relative, None)
+    }
+    pub fn read_text_with_cancel(
+        &self,
+        relative: &str,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<String> {
+        if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+            bail!("桌面任务已停止");
+        }
         let path = self.path(relative, true)?;
         let meta = fs::metadata(&path)?;
         if !meta.is_file() || meta.len() > MAX_FILE {
             bail!("仅可读取 32 MB 以内的普通文件");
         }
         match extension(&path).as_str() {
-            "docx" | "xlsx" | "pptx" => extract_office(&path),
-            "pdf" => extract_pdf(&path),
+            "docx" | "xlsx" | "pptx" => extract_office_with_cancel(&path, cancel),
+            "pdf" => extract_pdf_with_cancel(&path, cancel),
             _ => {
                 let bytes = read_bounded(&path, MAX_TEXT + 1)?;
                 let truncated = bytes.len() > MAX_TEXT;
@@ -1368,15 +1402,16 @@ fn run_selected(
                 Some(key) => key.to_string(),
                 None => bus.create_session()?,
             };
-            let _ = tx.send(WorkEvent::SessionReady(key.clone()));
-            if let Some(model) = request.model.as_deref().filter(|m| !m.is_empty()) {
-                // Implemented by the actual capability discovery module; no guessed model IDs.
-                bus.set_session_model(&key, model)?;
+            let cleanup_temporary_session =
+                crate::inference_sessions::is_temporary_session_key(&key);
+            if cleanup_temporary_session {
+                crate::inference_sessions::begin(&device.serial, Some(&account_scope), &key);
             }
+            let _ = tx.send(WorkEvent::SessionReady(key.clone()));
             let mut backend = PhoneBackend {
                 account_scope,
                 bus,
-                key,
+                key: key.clone(),
                 events: tx.clone(),
                 adb: adb.clone(),
                 device: device.clone(),
@@ -1388,7 +1423,12 @@ fn run_selected(
                     .filter(|path| crate::amoo_media::mime_type(path).starts_with("image/"))
                     .cloned()
                     .collect(),
+                cleanup_temporary_session,
             };
+            if let Some(model) = request.model.as_deref().filter(|m| !m.is_empty()) {
+                // Implemented by the actual capability discovery module; no guessed model IDs.
+                backend.bus.set_session_model(&key, model)?;
+            }
             run_loop(
                 &workspace,
                 &request.prompt,
@@ -1493,7 +1533,8 @@ sys.stdout.buffer.write(str(content).encode("utf-8"))
             .arg("-c")
             .arg(script)
             .arg(&self.config_path);
-        let output = adb::run_process(command, Some(payload), Duration::from_secs(95))?;
+        let output =
+            run_python_json_limited(command, Some(payload), Duration::from_secs(95), Some(cancel))?;
         if !output.status.success() {
             bail!(
                 "本地模型调用失败：{}",
@@ -1521,6 +1562,26 @@ pub(crate) struct PhoneBackend {
     adb: Adb,
     device: Device,
     image_attachments: Vec<PathBuf>,
+    cleanup_temporary_session: bool,
+}
+impl Drop for PhoneBackend {
+    fn drop(&mut self) {
+        if self.cleanup_temporary_session {
+            let _ = self.bus.call_with_timeout(
+                "sessions.delete",
+                json!({
+                    "key": self.key,
+                    "deleteTranscript": true,
+                }),
+                Duration::from_secs(4),
+            );
+            crate::inference_sessions::finish(
+                &self.device.serial,
+                Some(&self.account_scope),
+                &self.key,
+            );
+        }
+    }
 }
 impl PhoneBackend {
     pub(crate) fn for_lab(adb: Adb, device: Device, events: Sender<WorkEvent>) -> Result<Self> {
@@ -1550,7 +1611,8 @@ impl PhoneBackend {
             "手机账号已变化，未创建跨账号复核会话，未改用独立 API"
         );
         let mut bus = AgentBus::connect(&adb, &device)?;
-        let key = bus.create_session()?;
+        let key = bus.create_temporary_session("stepx-work-")?;
+        crate::inference_sessions::begin(&device.serial, Some(&account_scope), &key);
         let _ = events.send(WorkEvent::SessionReady(key.clone()));
         Ok(Self {
             account_scope,
@@ -1560,6 +1622,7 @@ impl PhoneBackend {
             adb,
             device,
             image_attachments: Vec::new(),
+            cleanup_temporary_session: true,
         })
     }
     pub(crate) fn generate(&mut self, message: &str, cancel: &AtomicBool) -> Result<String> {
@@ -1587,19 +1650,21 @@ impl Backend for PhoneBackend {
                 Some(&mut self.bus),
             )?;
             if cancel.load(Ordering::SeqCst) {
-                let _ = self.adb.shell(
-                    &self.device.transport,
-                    &["rm", "-rf", "--", &uploaded.directory],
-                );
+                if let Ok(transport) = self.device.resolve_active_transport(&self.adb) {
+                    let _ = self
+                        .adb
+                        .shell(&transport, &["rm", "-rf", "--", &uploaded.directory]);
+                }
                 bail!("桌面任务已停止，图片未提交给模型");
             }
             if crate::amoo_usage::account_scope_fresh(&self.adb, &self.device)?.as_deref()
                 != Some(self.account_scope.as_str())
             {
-                let _ = self.adb.shell(
-                    &self.device.transport,
-                    &["rm", "-rf", "--", &uploaded.directory],
-                );
+                if let Ok(transport) = self.device.resolve_active_transport(&self.adb) {
+                    let _ = self
+                        .adb
+                        .shell(&transport, &["rm", "-rf", "--", &uploaded.directory]);
+                }
                 bail!("手机账号已变化，图片请求未发送，未改用独立 API");
             }
             let pending = self.bus.send_with_attachments(
@@ -1909,8 +1974,11 @@ fn run_loop(
             let result = match cached {
                 Some(value) => Ok(value),
                 None => validate_requested_slides(&call, slide_count)
-                    .and_then(|_| execute_tool(ws, &run, &call, tx)),
+                    .and_then(|_| execute_tool_with_cancel(ws, &run, &call, tx, Some(cancel))),
             };
+            if cancel.load(Ordering::SeqCst) {
+                return Ok(());
+            }
             let (success, data) = match result {
                 Ok(value) => (true, value),
                 Err(error) => (false, json!({"error":format!("{error:#}")})),
@@ -2021,7 +2089,20 @@ fn initial_prompt(prompt: &str, attachments: &[String]) -> String {
         serde_json::to_string(attachments).unwrap_or_default()
     )
 }
+#[cfg(test)]
 fn execute_tool(ws: &Workspace, run: &str, call: &Value, tx: &Sender<WorkEvent>) -> Result<Value> {
+    execute_tool_with_cancel(ws, run, call, tx, None)
+}
+fn execute_tool_with_cancel(
+    ws: &Workspace,
+    run: &str,
+    call: &Value,
+    tx: &Sender<WorkEvent>,
+    cancel: Option<&AtomicBool>,
+) -> Result<Value> {
+    if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+        bail!("桌面任务已停止");
+    }
     let name = call["tool"].as_str().context("缺少工具名")?;
     let path = call["path"].as_str().unwrap_or("");
     if name == "write_spreadsheet" { validate_model_spreadsheet_cells(call)?; }
@@ -2029,17 +2110,22 @@ fn execute_tool(ws: &Workspace, run: &str, call: &Value, tx: &Sender<WorkEvent>)
         "list_files" => Ok(json!({"files":ws.list_files(path)?})),
         "read_file" => {
             let resolved = resolve_read_path(ws, run, path)?;
-            Ok(json!({"path":resolved,"text":ws.read_text(&resolved)?}))
+            Ok(json!({"path":resolved,"text":ws.read_text_with_cancel(&resolved, cancel)?}))
         },
         "search_files" => {
+            if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+                bail!("桌面任务已停止");
+            }
             let query = call["query"]
                 .as_str()
                 .filter(|q| !q.is_empty() && q.len() < 500)
                 .context("请输入 1–500 字节的检索内容")?;
-            let matches = ws.search_files(path, query)?;
+            let matches = ws.search_files_with_cancel(path, query, cancel)?;
             Ok(json!({"matches":matches,"scope":"当前目录，最多检索 100 个文件"}))
         }
-        "csv_summary" => csv_summary(&ws.read_text(&resolve_read_path(ws, run, path)?)?),
+        "csv_summary" => {
+            csv_summary(&ws.read_text_with_cancel(&resolve_read_path(ws, run, path)?, cancel)?)
+        }
         "write_file" => {
             if !matches!(
                 extension(Path::new(path)).as_str(),
@@ -2106,9 +2192,9 @@ fn execute_tool(ws: &Workspace, run: &str, call: &Value, tx: &Sender<WorkEvent>)
                 }
                 let mut snapshot = tempfile::NamedTempFile::new()?;
                 snapshot.write_all(&bytes)?;
-                generate_office_with_source(name, call, Some(snapshot.path()))?
+                generate_office_with_source_and_cancel(name, call, Some(snapshot.path()), cancel)?
             } else {
-                generate_office(name, call)?
+                generate_office_with_source_and_cancel(name, call, None, cancel)?
             };
             emit_artifact(ws.write_new(run, path, &data)?, tx)
         }
@@ -2256,7 +2342,106 @@ fn read_bounded(path: &Path, max: usize) -> Result<Vec<u8>> {
     open_read(path)?.take(max as u64).read_to_end(&mut bytes)?;
     Ok(bytes)
 }
-fn extract_pdf(path: &Path) -> Result<String> {
+fn kill_child_process_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as i32;
+        if pid > 0 {
+            unsafe {
+                let _ = libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn run_python_json_limited(
+    mut command: Command,
+    stdin: Option<Vec<u8>>,
+    timeout: Duration,
+    cancel: Option<&AtomicBool>,
+) -> Result<std::process::Output> {
+    use std::process::Stdio;
+    if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+        bail!("桌面任务已停止");
+    }
+    if stdin.is_some() {
+        command.stdin(Stdio::piped());
+    } else {
+        command.stdin(Stdio::null());
+    }
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let mut child = command.spawn().context("无法启动本地辅助进程")?;
+    let stdin_writer = match (stdin, child.stdin.take()) {
+        (Some(payload), Some(mut pipe)) => Some(thread::spawn(move || {
+            let _ = pipe.write_all(&payload);
+            let _ = pipe.flush();
+        })),
+        _ => None,
+    };
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let stdout_reader = thread::spawn(move || -> Vec<u8> {
+        let mut buf = Vec::new();
+        if let Some(pipe) = stdout_pipe {
+            let _ = pipe
+                .take((MAX_OUTPUT + 64 * 1024) as u64)
+                .read_to_end(&mut buf);
+        }
+        buf
+    });
+    let stderr_reader = thread::spawn(move || -> Vec<u8> {
+        let mut buf = Vec::new();
+        if let Some(pipe) = stderr_pipe {
+            let _ = pipe.take(64 * 1024).read_to_end(&mut buf);
+        }
+        buf
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+            kill_child_process_group(&mut child);
+            let _ = stdin_writer.map(|h| h.join());
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            bail!("桌面任务已停止");
+        }
+        if let Some(status) = child.try_wait().context("等待辅助进程状态失败")? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            kill_child_process_group(&mut child);
+            let _ = stdin_writer.map(|h| h.join());
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            bail!("文档处理超时，请稍后重试");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    if let Some(writer) = stdin_writer {
+        let _ = writer.join();
+    }
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn extract_pdf_with_cancel(path: &Path, cancel: Option<&AtomicBool>) -> Result<String> {
     let binary = adb::find_executable("pdftotext")
         .context("此电脑尚未安装 PDF 文本读取工具 pdftotext，可先转换为文本后添加")?;
     let temp = tempfile::tempdir()?;
@@ -2266,7 +2451,7 @@ fn extract_pdf(path: &Path) -> Result<String> {
         .args(["-f", "1", "-l", "100", "-layout"])
         .arg(path)
         .arg(&out);
-    let output = adb::run_process(command, None, Duration::from_secs(20))?;
+    let output = run_python_json_limited(command, None, Duration::from_secs(20), cancel)?;
     if !output.status.success() {
         bail!("PDF 文本提取失败，文件可能加密或是扫描图片");
     }
@@ -2281,6 +2466,14 @@ fn extract_pdf(path: &Path) -> Result<String> {
     Ok(text)
 }
 fn python(code: &str, args: &[&Path], stdin: Option<Vec<u8>>) -> Result<Vec<u8>> {
+    python_with_cancel(code, args, stdin, None)
+}
+fn python_with_cancel(
+    code: &str,
+    args: &[&Path],
+    stdin: Option<Vec<u8>>,
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<u8>> {
     // Use the packaged interpreter. A script file also avoids Windows' 32K
     // command-line limit for Office generation and long installation paths.
     let dir = crate::resources::user_state().join("runtime-scripts");
@@ -2323,11 +2516,12 @@ fn python(code: &str, args: &[&Path], stdin: Option<Vec<u8>>) -> Result<Vec<u8>>
     for arg in args {
         command.arg(arg);
     }
-    let output = adb::run_process(command, stdin, Duration::from_secs(20))?;
+    let output = run_python_json_limited(command, stdin, Duration::from_secs(20), cancel)?;
     if !output.status.success() {
         bail!(
             "Office 文件处理失败：{}",
             String::from_utf8_lossy(&output.stderr)
+                .trim()
                 .chars()
                 .take(300)
                 .collect::<String>()
@@ -2335,14 +2529,23 @@ fn python(code: &str, args: &[&Path], stdin: Option<Vec<u8>>) -> Result<Vec<u8>>
     }
     Ok(output.stdout)
 }
+#[cfg(test)]
 fn extract_office(path: &Path) -> Result<String> {
-    let bytes = python(include_str!("work_extract.py"), &[path], None)?;
+    extract_office_with_cancel(path, None)
+}
+fn extract_office_with_cancel(path: &Path, cancel: Option<&AtomicBool>) -> Result<String> {
+    let bytes = python_with_cancel(include_str!("work_extract.py"), &[path], None, cancel)?;
     Ok(String::from_utf8(bytes).context("文档文字编码无效")?)
 }
 fn generate_office(name: &str, call: &Value) -> Result<Vec<u8>> {
-    generate_office_with_source(name, call, None)
+    generate_office_with_source_and_cancel(name, call, None, None)
 }
-fn generate_office_with_source(name: &str, call: &Value, source: Option<&Path>) -> Result<Vec<u8>> {
+fn generate_office_with_source_and_cancel(
+    name: &str,
+    call: &Value,
+    source: Option<&Path>,
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<u8>> {
     let mut input = call.clone();
     input["tool"] = json!(name);
     let payload = serde_json::to_vec(&input)?;
@@ -2417,7 +2620,7 @@ def main():"#;
     } else {
         std::borrow::Cow::Borrowed(base_script)
     };
-    let bytes = python(&script, &args, Some(payload))?;
+    let bytes = python_with_cancel(&script, &args, Some(payload), cancel)?;
     if !bytes.starts_with(b"PK\x03\x04") || bytes.len() > MAX_OUTPUT {
         bail!("生成的 Office 文件无效或过大");
     }
@@ -3232,5 +3435,43 @@ mod tests {
         let hits = ws.search_files("", "secret keyword").unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0]["path"], "real.md");
+    }
+
+    #[test]
+    fn python_helper_and_search_files_respect_cancellation_and_corrupt_office_errors() {
+        if adb::find_executable("python3").is_none() {
+            return;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let trigger = cancel.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(120));
+            trigger.store(true, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        let mut cmd = crate::resources::python_command();
+        cmd.arg("-I").arg("-c").arg("import time; time.sleep(10)");
+        let err =
+            run_python_json_limited(cmd, Some(vec![b'x'; 96 * 1024]), Duration::from_secs(15), Some(&cancel))
+                .unwrap_err();
+        assert!(err.to_string().contains("已停止"));
+        assert!(started.elapsed() < Duration::from_secs(3));
+
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("note.md"), "alpha beta").unwrap();
+        let ws = Workspace::open(temp.path()).unwrap();
+        let cancelled = AtomicBool::new(true);
+        assert!(ws
+            .search_files_with_cancel("", "alpha", Some(&cancelled))
+            .is_err());
+
+        let corrupt_docx = temp.path().join("corrupt.docx");
+        fs::write(&corrupt_docx, b"not-a-valid-zip-file").unwrap();
+        let msg = extract_office(&corrupt_docx).unwrap_err().to_string();
+        assert!(
+            msg.contains("文档格式已损坏或受密码保护，无法读取"),
+            "unexpected error: {msg}"
+        );
+        assert!(!msg.contains("Traceback"));
     }
 }

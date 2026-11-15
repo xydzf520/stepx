@@ -77,7 +77,7 @@ public final class Bridge {
                 BackScreenMcpTools.runLoop(args);
                 return;
             }
-            String line = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8)).readLine();
+            String line = ContextReadPolicy.readBoundedLine(System.in, 32769);
             if (line == null || line.length() > 32768) throw new IllegalArgumentException("请求为空或过长");
             JSONObject request = new JSONObject(line);
             JSONObject result = dispatch(request.getString("op"), request);
@@ -115,7 +115,7 @@ public final class Bridge {
             case "read_alarms": return queryRows("content://com.android.alarmclock/alarms",
                 new String[]{"_id", "hour", "minutes", "daysofweek", "enabled", "vibrate", "label"},
                 "_id ASC", null, null, 1000);
-            case "read_calls": return queryRows("content://call_log/calls", new String[]{"number", "name", "type", "date", "duration"}, "date DESC, _id DESC");
+            case "read_calls": return queryRows("content://call_log/calls", new String[]{"number", "name", "type", "date", "duration"}, "date DESC, _id DESC", null, null, ContextReadPolicy.pageLimit(request.optInt("limit", 500)));
             case "read_contacts": return readContacts();
             case "create_contact": return createContact(request);
             case "capabilities": return capabilities();
@@ -265,23 +265,46 @@ public final class Bridge {
             }
         } catch (Throwable ignored) {
         }
-        String[] simUris = new String[]{
-            "content://icc/adn",
-            "content://icc/adn/subId/1",
-            "content://icc/adn/subId/2",
-            "content://icc/sdn"
-        };
-        for (String simUri : simUris) {
-            try {
-                JSONArray simRows = queryRows(
-                    simUri,
-                    new String[]{"name", "number"},
-                    null
-                ).optJSONArray("rows");
-                if (simRows == null) continue;
-                for (int i = 0; i < simRows.length(); i++) {
-                    JSONObject r = simRows.optJSONObject(i);
-                    if (r == null) continue;
+        List<String> simUris = new ArrayList<>();
+        List<Integer> activeSubIds = activeSubscriptionIds();
+        if (!activeSubIds.isEmpty()) {
+            simUris.add("content://icc/adn");
+            for (Integer subId : activeSubIds) {
+                if (subId != null && subId >= 0) {
+                    simUris.add("content://icc/adn/subId/" + subId);
+                }
+            }
+            simUris.add("content://icc/sdn");
+        }
+        if (!simUris.isEmpty()) {
+            final List<JSONObject> simCollected = Collections.synchronizedList(new ArrayList<>());
+            final CountDownLatch latch = new CountDownLatch(1);
+            Thread simWorker = new Thread(() -> {
+                try {
+                    for (String simUri : simUris) {
+                        try {
+                            JSONArray simRows = queryRows(
+                                simUri,
+                                new String[]{"name", "number"},
+                                null
+                            ).optJSONArray("rows");
+                            if (simRows == null) continue;
+                            for (int i = 0; i < simRows.length(); i++) {
+                                JSONObject r = simRows.optJSONObject(i);
+                                if (r != null) simCollected.add(r);
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                } finally {
+                    latch.countDown();
+                }
+            }, "stepx-sim-contacts");
+            simWorker.setDaemon(true);
+            simWorker.start();
+            latch.await(1500, TimeUnit.MILLISECONDS);
+            synchronized (simCollected) {
+                for (JSONObject r : simCollected) {
                     String name = r.optString("name", "").trim();
                     String num = r.optString("number", "").trim();
                     if (num.isEmpty() || "null".equalsIgnoreCase(num)) continue;
@@ -294,10 +317,34 @@ public final class Bridge {
                             .put("data1", num));
                     }
                 }
-            } catch (Throwable ignored) {
             }
         }
         return new JSONObject().put("rows", merged).put("has_more", false);
+    }
+
+    static List<Integer> activeSubscriptionIds() {
+        List<Integer> ids = new ArrayList<>();
+        try {
+            Class<?> initializer = Class.forName("android.telephony.TelephonyFrameworkInitializer");
+            if (initializer.getMethod("getTelephonyServiceManager").invoke(null) == null) {
+                Class<?> manager = Class.forName("android.os.TelephonyServiceManager");
+                initializer.getMethod("setTelephonyServiceManager", manager)
+                    .invoke(null, manager.getConstructor().newInstance());
+            }
+            SubscriptionManager sm = context.getSystemService(SubscriptionManager.class);
+            if (sm != null) {
+                List<SubscriptionInfo> list = sm.getActiveSubscriptionInfoList();
+                if (list != null) {
+                    for (SubscriptionInfo sim : list) {
+                        if (sim != null && sim.getSubscriptionId() >= 0) {
+                            ids.add(sim.getSubscriptionId());
+                        }
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return ids;
     }
 
     static JSONObject createContact(JSONObject req) throws Exception {
@@ -416,7 +463,7 @@ public final class Bridge {
     static JSONObject readSms(JSONObject request) throws Exception {
         String[] columns = new String[]{"_id", "address", "body", "date", "type", "read", "sub_id"};
         if (!request.has("after_date_ms") && !request.has("limit")) {
-            return queryRows("content://sms", columns, "date DESC, _id DESC");
+            return queryRows("content://sms", columns, "date DESC, _id DESC", null, null, ContextReadPolicy.pageLimit(1000));
         }
         long date = Math.max(0L, request.optLong("after_date_ms", 0L));
         long id = Math.max(0L, request.optLong("after_id", 0L));

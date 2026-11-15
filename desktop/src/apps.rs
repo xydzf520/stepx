@@ -742,9 +742,6 @@ pub fn parse_dumpsys_package(package: &str, raw: &str) -> AppRuntimeDetails {
         .permissions
         .sort_by_key(|p| (permission_chinese_label(&p.name).is_none(), !p.granted));
     details.permissions.truncate(16);
-    if details.permissions.is_empty() {
-        details.permissions = demo_details(package).permissions;
-    }
     details
 }
 
@@ -805,8 +802,8 @@ pub fn set_permission(
     grant: bool,
 ) -> Result<()> {
     validate_package(package)?;
+    let app = info(adb, device, package)?;
     let transport = device.resolve_active_transport(adb)?;
-    let app = info(adb, device, package).unwrap_or_default();
     let user = app.user_id.to_string();
     if permission == "android.permission.SYSTEM_ALERT_WINDOW" {
         let _ = adb.shell(
@@ -874,11 +871,9 @@ pub fn set_permission(
 
 pub fn set_enabled(adb: &Adb, device: &Device, package: &str, enable: bool) -> Result<()> {
     validate_package(package)?;
+    let app = info(adb, device, package)?;
     let transport = device.resolve_active_transport(adb)?;
-    let user = info(adb, device, package)
-        .map(|a| a.user_id)
-        .unwrap_or(0)
-        .to_string();
+    let user = app.user_id.to_string();
     adb.shell(
         &transport,
         &[
@@ -894,18 +889,20 @@ pub fn set_enabled(adb: &Adb, device: &Device, package: &str, enable: bool) -> R
 
 pub fn clear_storage(adb: &Adb, device: &Device, package: &str, clear_data: bool) -> Result<()> {
     validate_package(package)?;
+    let app = info(adb, device, package)?;
     let transport = device.resolve_active_transport(adb)?;
-    let user = info(adb, device, package)
-        .map(|a| a.user_id)
-        .unwrap_or(0)
-        .to_string();
+    let user = app.user_id.to_string();
     if clear_data {
         adb.shell(&transport, &["pm", "clear", "--user", &user, package])?;
     } else {
-        let _ = adb.shell(
-            &transport,
-            &["rm", "-rf", &format!("/sdcard/Android/data/{package}/cache")],
-        );
+        let cache_dir = format!("/storage/emulated/{user}/Android/data/{package}/cache");
+        let _ = adb.shell(&transport, &["rm", "-rf", &cache_dir]);
+        if user == "0" {
+            let _ = adb.shell(
+                &transport,
+                &["rm", "-rf", &format!("/sdcard/Android/data/{package}/cache")],
+            );
+        }
         let _ = adb.shell(&transport, &["pm", "trim-caches", "999G"]);
     }
     Ok(())
@@ -1168,5 +1165,59 @@ mod tests {
             .permissions
             .iter()
             .any(|p| p.name == "android.permission.RECORD_AUDIO" && !p.granted));
+
+        let zero_perm_dumpsys = "
+          Packages:
+            Package [com.example.calculator] (654321):
+              userId=10300
+              versionCode=10 minSdk=28 targetSdk=34
+              dataDir=/data/user/0/com.example.calculator
+        ";
+        let zero_perm = parse_dumpsys_package("com.example.calculator", zero_perm_dumpsys);
+        assert!(
+            zero_perm.permissions.is_empty(),
+            "zero-permission package must never fabricate demo permissions"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_and_permission_mutations_fail_closed_when_package_info_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let calls = dir.path().join("calls.log");
+        let fake_adb = dir.path().join("adb");
+        std::fs::write(
+            &fake_adb,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\ncase \"$*\" in\n  *devices\\ -l*) printf 'List of devices attached\\nUSB999 device model:PZ261A product:pandora\\n'; exit 0;;\n  *ro.serialno*) echo SERIAL999; exit 0;;\n  *) echo 'error: dumpsys timeout' >&2; exit 1;;\nesac\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_adb, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let adb = Adb { path: fake_adb };
+        let dev = Device {
+            transport: "USB999".into(),
+            serial: "SERIAL999".into(),
+            model: "PZ261A".into(),
+            android: "16".into(),
+            product: "pandora".into(),
+        };
+        assert!(clear_storage(&adb, &dev, "com.tencent.mm", true).is_err());
+        assert!(set_enabled(&adb, &dev, "com.tencent.mm", false).is_err());
+        assert!(
+            set_permission(&adb, &dev, "com.tencent.mm", "android.permission.CAMERA", true)
+                .is_err()
+        );
+        let log = std::fs::read_to_string(&calls).unwrap_or_default();
+        assert!(
+            !log.contains("pm clear --user 0"),
+            "must never fall back to wiping user 0 when info() fails: {log}"
+        );
+        assert!(
+            !log.contains("disable-user --user 0"),
+            "must never fall back to disabling user 0 when info() fails: {log}"
+        );
     }
 }

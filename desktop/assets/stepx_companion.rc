@@ -1,2 +1,36 @@
 // Keep this ID aligned with facloud_ui's IDI_ICON.
 0x101 ICON "assets/stepx_companion_icon.ico"
+
+#include <winresrc.h>
+
+// Stringify the version in the resource compiler so shell quoting is irrelevant.
+#define STEPX_STR2(x) #x
+#define STEPX_STR(x) STEPX_STR2(x)
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION    STEPX_FILEVERSION
+PRODUCTVERSION STEPX_FILEVERSION
+FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+FILEFLAGS      0x0L
+FILEOS         VOS_NT_WINDOWS32
+FILETYPE       VFT_APP
+FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "xydzf520"
+            VALUE "FileDescription", "StepX Companion"
+            VALUE "FileVersion", STEPX_STR(STEPX_VERSION_TEXT)
+            VALUE "InternalName", "stepx-companion"
+            VALUE "OriginalFilename", "stepx-companion.exe"
+            VALUE "ProductName", "StepX Companion"
+            VALUE "ProductVersion", STEPX_STR(STEPX_VERSION_TEXT)
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

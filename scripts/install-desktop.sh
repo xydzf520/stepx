@@ -5,16 +5,31 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export PATH="$HOME/.cargo/bin:$PATH"
 if [ -z "${BINDGEN_EXTRA_CLANG_ARGS:-}" ] && command -v gcc >/dev/null 2>&1; then
     GCC_INC="$(gcc -print-file-name=include 2>/dev/null || true)"
-    if [ -n "$GCC_INC" ] && [ -d "$GCC_INC" ]; then
+    if [ -n "$GCC_INC" ] && [ "$GCC_INC" != "include" ] && [ -d "$GCC_INC" ]; then
         export BINDGEN_EXTRA_CLANG_ARGS="-isystem $GCC_INC"
     fi
+fi
+STEPX_PY=""
+for cand in python3.13 python3.12 python3.11 python3; do
+    if command -v "$cand" >/dev/null 2>&1 && "$cand" -c 'import sys; sys.exit(sys.version_info < (3, 11))'; then
+        STEPX_PY="$cand"
+        break
+    fi
+done
+if [ -z "$STEPX_PY" ]; then
+    echo "install-desktop.sh: Python 3.11+ is required (scripts use tomllib)" >&2
+    exit 1
+fi
+OS="$(uname -s)"
+if [ "$OS" = "Darwin" ]; then
+    export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-11.0}"
 fi
 cd "$ROOT/desktop"
 if [ -x "$ROOT/scripts/prune-rust-target.sh" ]; then
     "$ROOT/scripts/prune-rust-target.sh" || true
 fi
 if [ "${STEPX_SKIP_BUILD:-0}" != "1" ]; then
-    python3 "$ROOT/scripts/apply-ui-window-compat.py"
+    "$STEPX_PY" "$ROOT/scripts/apply-ui-window-compat.py"
     if [ "${STEPX_PROFILE:-release}" = "release" ]; then
         cargo build --release --locked
     else
@@ -31,22 +46,29 @@ else
     STEPX_BIN_SRC="target/debug/stepx-companion"
 fi
 
-OS="$(uname -s)"
 if [ "$OS" = "Linux" ] && [ "$(uname -m)" = "x86_64" ] && [ ! -x "$ROOT/.tools/bin/adb" ]; then
     "$ROOT/scripts/setup-desktop-tools.sh"
 fi
 if [ "$OS" = "Darwin" ]; then
     APP_DIR="${STEPX_MAC_APP_DIR:-$HOME/Applications/StepX Companion.app}"
     mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources/tools"
-    install -m755 "$STEPX_BIN_SRC" "$APP_DIR/Contents/MacOS/stepx-companion.new"
-    mv "$APP_DIR/Contents/MacOS/stepx-companion.new" "$APP_DIR/Contents/MacOS/stepx-companion"
+    cp -f "$STEPX_BIN_SRC" "$APP_DIR/Contents/MacOS/stepx-companion.tmp"
+    chmod 755 "$APP_DIR/Contents/MacOS/stepx-companion.tmp"
+    mv -f "$APP_DIR/Contents/MacOS/stepx-companion.tmp" "$APP_DIR/Contents/MacOS/stepx-companion"
     if [ -d "$ROOT/.tools/bin" ]; then
-        cp -a "$ROOT/.tools/bin" "$APP_DIR/Contents/Resources/tools/"
-        [ -d "$ROOT/.tools/root" ] && cp -a "$ROOT/.tools/root" "$APP_DIR/Contents/Resources/tools/" || true
+        mkdir -p "$APP_DIR/Contents/Resources/tools/bin"
+        cp -LRf "$ROOT/.tools/bin/." "$APP_DIR/Contents/Resources/tools/bin/"
     fi
+    if [ -d "$ROOT/.tools/root" ]; then
+        mkdir -p "$APP_DIR/Contents/Resources/tools/root"
+        cp -LRf "$ROOT/.tools/root/." "$APP_DIR/Contents/Resources/tools/root/"
+    fi
+    rm -rf "$APP_DIR/Contents/Resources/scripts" "$APP_DIR/Contents/Resources/handoff" "$APP_DIR/Contents/Resources/desktop" "$APP_DIR/Contents/Resources/.runtime"
     mkdir -p "$APP_DIR/Contents/Resources/desktop"
-    python3 "$ROOT/scripts/stage-release-resources.py" "$ROOT" "$APP_DIR/Contents/Resources"
-    python3 "$ROOT/scripts/package-runtime.py" "$APP_DIR/Contents/Resources"
+    "$STEPX_PY" "$ROOT/scripts/stage-release-resources.py" "$ROOT" "$APP_DIR/Contents/Resources"
+    if [ "${STEPX_SKIP_RUNTIME:-0}" != "1" ]; then
+        ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/Library/Android/sdk}}" "$STEPX_PY" "$ROOT/scripts/package-runtime.py" "$APP_DIR/Contents/Resources"
+    fi
     STEPX_ICON_WORK="$(mktemp -d)"
     mkdir -p "$STEPX_ICON_WORK/StepXCompanion.iconset"
     for size in 16 32 128 256 512; do
@@ -63,6 +85,8 @@ if [ "$OS" = "Darwin" ]; then
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
     <key>CFBundleDisplayName</key>
     <string>StepX Companion</string>
     <key>CFBundleName</key>
@@ -70,7 +94,7 @@ if [ "$OS" = "Darwin" ]; then
     <key>CFBundleIconFile</key>
     <string>StepXCompanion.icns</string>
     <key>CFBundleIdentifier</key>
-    <string>com.stepx.companion</string>
+    <string>io.github.xydzf520.stepx</string>
     <key>CFBundleVersion</key>
     <string>$STEPX_APP_VERSION</string>
     <key>CFBundleShortVersionString</key>
@@ -79,35 +103,82 @@ if [ "$OS" = "Darwin" ]; then
     <string>stepx-companion</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>用于语音输入</string>
+    <key>NSCameraUsageDescription</key>
+    <string>用于扫码连接</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>用于在局域网发现并连接您授权的手机。</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_adb-tls-pairing._tcp</string>
+        <string>_adb-tls-connect._tcp</string>
+        <string>_adb._tcp</string>
+        <string>_airplay._tcp</string>
+        <string>_googlecast._tcp</string>
+        <string>_raop._tcp</string>
+    </array>
 </dict>
 </plist>
 PLIST
+    xattr -cr "$APP_DIR"
+    "$STEPX_PY" - "$ROOT/scripts" "$APP_DIR/Contents/Resources" <<'PY'
+import importlib.util, stat, subprocess, sys
+from pathlib import Path
+scripts = Path(sys.argv[1])
+resources = Path(sys.argv[2])
+spec = importlib.util.spec_from_file_location('package_release', scripts / 'package-release.py')
+sys.path.insert(0, str(scripts))
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+for macho in mod.macho_binaries(resources):
+    mode = macho.stat().st_mode
+    if not (mode & stat.S_IWUSR):
+        macho.chmod(mode | stat.S_IWUSR)
+    subprocess.run(['codesign', '--force', '--sign', '-', str(macho)], check=True)
+PY
+    codesign --force --deep --sign - "$APP_DIR"
     echo "已安装 macOS 应用：$APP_DIR"
     exit 0
 fi
 
 STEPX_INSTALL_DIR="${STEPX_INSTALL_DIR:-$HOME/.local/opt/stepx-companion}"
 STEPX_DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}"
+rm -rf "$STEPX_INSTALL_DIR/scripts" "$STEPX_INSTALL_DIR/handoff" "$STEPX_INSTALL_DIR/desktop" "$STEPX_INSTALL_DIR/.runtime"
 mkdir -p "$STEPX_INSTALL_DIR/tools" "$STEPX_INSTALL_DIR/desktop" "$STEPX_DATA_DIR/applications" "$STEPX_DATA_DIR/icons" "$STEPX_DATA_DIR/icons/hicolor/256x256/apps" "$HOME/.local/bin"
-install -m755 "$STEPX_BIN_SRC" "$STEPX_INSTALL_DIR/stepx-companion.new"
-mv "$STEPX_INSTALL_DIR/stepx-companion.new" "$STEPX_INSTALL_DIR/stepx-companion"
+cp -f "$STEPX_BIN_SRC" "$STEPX_INSTALL_DIR/stepx-companion.tmp"
+chmod 755 "$STEPX_INSTALL_DIR/stepx-companion.tmp"
+mv -f "$STEPX_INSTALL_DIR/stepx-companion.tmp" "$STEPX_INSTALL_DIR/stepx-companion"
 ln -sfn "$STEPX_INSTALL_DIR/stepx-companion" "$HOME/.local/bin/stepx-companion"
-python3 "$ROOT/scripts/stage-release-resources.py" "$ROOT" "$STEPX_INSTALL_DIR"
+"$STEPX_PY" "$ROOT/scripts/stage-release-resources.py" "$ROOT" "$STEPX_INSTALL_DIR"
 if [ -d "$ROOT/.tools/bin" ]; then
-    cp -a "$ROOT/.tools/bin" "$ROOT/.tools/root" "$STEPX_INSTALL_DIR/tools/"
+    cp -af "$ROOT/.tools/bin" "$STEPX_INSTALL_DIR/tools/"
 fi
-if [ "${STEPX_SKIP_RUNTIME:-0}" != "1" ] && { [ ! -f "$STEPX_INSTALL_DIR/runtime/android-build-tools/lib/apk-identity.jar" ] || [ "${STEPX_FORCE_RUNTIME:-0}" = "1" ]; }; then
-    if [ -z "${JAVA_HOME:-}" ] && [ ! -d "$HOME/.local/opt/android-studio/jbr" ] && [ -d "/opt/android-studio/jbr" ]; then
-        export JAVA_HOME="/opt/android-studio/jbr"
+if [ -d "$ROOT/.tools/root" ]; then
+    cp -af "$ROOT/.tools/root" "$STEPX_INSTALL_DIR/tools/"
+fi
+if [ "${STEPX_SKIP_RUNTIME:-0}" != "1" ]; then
+    if [ -z "${JAVA_HOME:-}" ] || [ ! -d "${JAVA_HOME}/jmods" ]; then
+        for candidate in /usr/lib/jvm/java-21-openjdk-* /usr/lib/jvm/java-17-openjdk-* /usr/lib/jvm/* "$HOME/.local/opt/android-studio/jbr" /opt/android-studio/jbr; do
+            if [ -d "$candidate/jmods" ] && [ -x "$candidate/bin/jlink" ]; then
+                export JAVA_HOME="$candidate"
+                break
+            fi
+        done
     fi
-    ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/Android/Sdk}}" JAVA_HOME="${JAVA_HOME:-$HOME/.local/opt/android-studio/jbr}" python3 "$ROOT/scripts/package-runtime.py" "$STEPX_INSTALL_DIR"
+    ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/Android/Sdk}}" "$STEPX_PY" "$ROOT/scripts/package-runtime.py" "$STEPX_INSTALL_DIR"
 fi
-python3 - "$STEPX_INSTALL_DIR/stepx-companion" "$STEPX_DATA_DIR" <<'PY'
+"$STEPX_PY" - "$STEPX_INSTALL_DIR/stepx-companion" "$STEPX_DATA_DIR" <<'PY'
 import ast, hashlib, pathlib, shutil, subprocess, sys
 raw_binary = sys.argv[1]
 binary = raw_binary.replace('\\', '\\\\').replace('"', '\\"').replace('`', '\\`').replace('$', '\\$').replace('%', '%%')
+try_exec = raw_binary.replace('\\', '\\\\').replace(' ', '\\s').replace('\t', '\\t').replace('\n', '\\n').replace('\r', '\\r')
 data_dir = pathlib.Path(sys.argv[2]).resolve()
 entry = data_dir/'applications/stepx-companion.desktop'
 source = pathlib.Path('assets/stepx_companion_icon.png')
@@ -128,13 +199,13 @@ Name[zh_CN]=StepX Companion
 Name[en]=StepX Companion
 Comment=连接 StepX，协同手机与电脑
 Exec="{binary}"
-TryExec={raw_binary}
+TryExec={try_exec}
 Icon={icon}
 Terminal=false
 StartupNotify=true
 Categories=Utility;
 StartupWMClass=stepx-companion
-''')
+''', encoding='utf-8')
 entry_tmp.replace(entry)
 
 # Ensure GNOME / Ubuntu Dock favorite-apps contains stepx-companion.desktop and refreshes its entry.

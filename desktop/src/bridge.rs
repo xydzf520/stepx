@@ -46,9 +46,54 @@ pub fn mark_bridge_jar_cached(transport: &str) {
 
 pub fn invalidate_bridge_cache(transport: &str) {
     let key = transport.trim();
-    if let Ok(mut guard) = bridge_cache().lock() {
-        guard.retain(|(t, _)| t != key);
+    if key.is_empty() {
+        return;
     }
+    let mut keys_to_evict = vec![key.to_string()];
+    if let Some(serial) = crate::device::known_serial_for_transport(key) {
+        if !serial.is_empty() && !keys_to_evict.contains(&serial) {
+            keys_to_evict.push(serial.clone());
+        }
+        for known_tp in crate::device::known_transports_for_serial(&serial) {
+            if !known_tp.is_empty() && !keys_to_evict.contains(&known_tp) {
+                keys_to_evict.push(known_tp);
+            }
+        }
+        if let Some(active) = crate::device::current_active_transport_for_serial(&serial) {
+            if !active.is_empty() && !keys_to_evict.contains(&active) {
+                keys_to_evict.push(active);
+            }
+        }
+        for backup in crate::device::backup_transports_for(&[key, &serial]) {
+            if !backup.is_empty() && !keys_to_evict.contains(&backup) {
+                keys_to_evict.push(backup);
+            }
+        }
+    } else {
+        for known_tp in crate::device::known_transports_for_serial(key) {
+            if !known_tp.is_empty() && !keys_to_evict.contains(&known_tp) {
+                keys_to_evict.push(known_tp);
+            }
+        }
+        if let Some(active) = crate::device::current_active_transport_for_serial(key) {
+            if !active.is_empty() && !keys_to_evict.contains(&active) {
+                keys_to_evict.push(active);
+            }
+        }
+        for backup in crate::device::backup_transports_for(&[key]) {
+            if !backup.is_empty() && !keys_to_evict.contains(&backup) {
+                keys_to_evict.push(backup);
+            }
+        }
+    }
+    if let Ok(mut guard) = bridge_cache().lock() {
+        guard.retain(|(t, _)| !keys_to_evict.iter().any(|ev| ev == t));
+    }
+}
+
+pub fn invalidate_bridge_cache_for_device(serial: &str, transport: &str) {
+    invalidate_bridge_cache(transport);
+    invalidate_bridge_cache(serial);
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,9 +309,14 @@ pub fn call_bridge_on_transport(
         Err(err) if was_cached && should_retry_cached_bridge(&err) => {
             invalidate_bridge_cache(transport);
             ensure_bridge_jar_on_transport(adb, transport)?;
-            run_bridge_once_on_transport(adb, transport, request, timeout)
+            run_bridge_once_on_transport(adb, transport, request, timeout).inspect_err(|_| {
+                invalidate_bridge_cache(transport);
+            })
         }
-        Err(err) => Err(err),
+        Err(err) => {
+            invalidate_bridge_cache(transport);
+            Err(err)
+        }
     }
 }
 
@@ -282,20 +332,70 @@ pub fn call_bridge(
     if was_cached {
         mark_bridge_jar_cached(&active_transport);
         mark_bridge_jar_cached(&device.serial);
+    } else if let Err(err) = ensure_bridge_jar_on_transport(adb, &active_transport) {
+        invalidate_bridge_cache_for_device(&device.serial, &active_transport);
+        invalidate_bridge_cache(&device.transport);
+        if crate::adb::is_data_transport_failure(&err) {
+            crate::device::invalidate_verified_transport(&active_transport);
+            let next_transport = crate::device::recover_transport(
+                adb,
+                &active_transport,
+                Duration::from_secs(5),
+            )
+            .or_else(|| device.resolve_active_transport(adb).ok());
+            if let Some(next_transport) = next_transport {
+                ensure_bridge_jar_on_transport(adb, &next_transport)?;
+                mark_bridge_jar_cached(&device.serial);
+                return run_bridge_once_on_transport(adb, &next_transport, request, timeout)
+                    .inspect_err(|_| {
+                        invalidate_bridge_cache_for_device(&device.serial, &next_transport);
+                        invalidate_bridge_cache(&device.transport);
+                    });
+            }
+        }
+        return Err(err);
     } else {
-        ensure_bridge_jar_on_transport(adb, &active_transport)?;
         mark_bridge_jar_cached(&device.serial);
     }
     match run_bridge_once_on_transport(adb, &active_transport, request, timeout) {
         Ok(val) => Ok(val),
+        Err(err) if crate::adb::is_data_transport_failure(&err) => {
+            crate::device::invalidate_verified_transport(&active_transport);
+            invalidate_bridge_cache_for_device(&device.serial, &active_transport);
+            invalidate_bridge_cache(&device.transport);
+            let next_transport = crate::device::recover_transport(
+                adb,
+                &active_transport,
+                Duration::from_secs(5),
+            )
+            .or_else(|| device.resolve_active_transport(adb).ok());
+            let Some(next_transport) = next_transport else {
+                return Err(err);
+            };
+            ensure_bridge_jar_on_transport(adb, &next_transport)?;
+            mark_bridge_jar_cached(&device.serial);
+            run_bridge_once_on_transport(adb, &next_transport, request, timeout).inspect_err(|_| {
+                invalidate_bridge_cache_for_device(&device.serial, &next_transport);
+                invalidate_bridge_cache(&device.transport);
+            })
+        }
         Err(err) if was_cached && should_retry_cached_bridge(&err) => {
-            invalidate_bridge_cache(&active_transport);
-            invalidate_bridge_cache(&device.serial);
+            invalidate_bridge_cache_for_device(&device.serial, &active_transport);
+            invalidate_bridge_cache(&device.transport);
             ensure_bridge_jar_on_transport(adb, &active_transport)?;
             mark_bridge_jar_cached(&device.serial);
-            run_bridge_once_on_transport(adb, &active_transport, request, timeout)
+            run_bridge_once_on_transport(adb, &active_transport, request, timeout).inspect_err(
+                |_| {
+                    invalidate_bridge_cache_for_device(&device.serial, &active_transport);
+                    invalidate_bridge_cache(&device.transport);
+                },
+            )
         }
-        Err(err) => Err(err),
+        Err(err) => {
+            invalidate_bridge_cache_for_device(&device.serial, &active_transport);
+            invalidate_bridge_cache(&device.transport);
+            Err(err)
+        }
     }
 }
 
@@ -2011,5 +2111,58 @@ mod tests {
         assert_eq!(st.clipboard, "SF1234567890123");
         assert!(st.dnd_on);
         assert_eq!(st.brightness_percent, 65);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bridge_cache_invalidation_clears_both_serial_and_transport_on_failure_and_reset() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let serial = "BRIDGE_CACHE_SER_UNIT";
+        let wireless = "10.0.2.88:41234";
+        crate::device::forget_known_serial(serial);
+        crate::device::record_verified_serial_for_transport(serial, wireless);
+
+        mark_bridge_jar_cached(serial);
+        mark_bridge_jar_cached(wireless);
+        assert!(is_bridge_jar_cached(serial));
+        assert!(is_bridge_jar_cached(wireless));
+
+        // 1. Invalidating by transport clears BOTH transport and verified serial
+        invalidate_bridge_cache(wireless);
+        assert!(!is_bridge_jar_cached(wireless));
+        assert!(!is_bridge_jar_cached(serial));
+
+        // 2. Transport reset (`device::invalidate_verified_transport`) clears BOTH
+        mark_bridge_jar_cached(serial);
+        mark_bridge_jar_cached(wireless);
+        crate::device::invalidate_verified_transport(wireless);
+        assert!(!is_bridge_jar_cached(wireless));
+        assert!(!is_bridge_jar_cached(serial));
+
+        // 3. Bridge execution failure clears BOTH serial and transport entries
+        let dir = tempfile::tempdir().unwrap();
+        let fake_adb = dir.path().join("adb");
+        let script = format!(
+            "#!/bin/sh\ncase \"$*\" in\n  *ro.serialno*) echo '{serial}'; exit 0;;\n  *) echo 'STEPX_RESULT:{{\"ok\":false,\"error\":\"boom\"}}'; exit 0;;\nesac\n"
+        );
+        std::fs::write(&fake_adb, script).unwrap();
+        std::fs::set_permissions(&fake_adb, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let adb = Adb { path: fake_adb };
+        let device = Device {
+            serial: serial.into(),
+            transport: wireless.into(),
+            model: "PZ261A".into(),
+            android: "16".into(),
+            product: "pandora".into(),
+        };
+        crate::device::record_verified_serial_for_transport(serial, wireless);
+        mark_bridge_jar_cached(serial);
+        mark_bridge_jar_cached(wireless);
+
+        assert!(call_bridge(&adb, &device, &json!({"op": "capabilities"}), Duration::from_secs(2)).is_err());
+        assert!(!is_bridge_jar_cached(wireless));
+        assert!(!is_bridge_jar_cached(serial));
+        crate::device::forget_known_serial(serial);
     }
 }

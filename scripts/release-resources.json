@@ -82,6 +82,7 @@
     "scripts/test-companion-reconnect.py",
     "scripts/test-companion-update.py",
     "scripts/test-host-runtime.py",
+    "scripts/test-metal-glyph-fade.py",
     "scripts/test-neo-agent-install.py",
     "scripts/test-studio-lab.py",
     "scripts/test_companion_apk.py",
@@ -111,6 +112,7 @@
     "docs/RELEASE_0_2_182.md",
     "docs/RELEASE_0_2_182_CUMULATIVE.md",
     "docs/RELEASE_0_2_183.md",
+    "docs/RELEASE_0_2_184.md",
     "docs/google-install-recovery-0.2.183.md"
   ],
   "runtime_files": [
@@ -508,7 +510,33 @@
     "desktop/assets/release-notes/0.2.182/sources.json",
     "desktop/assets/release-notes/0.2.182/tools.png",
     "desktop/assets/release-notes/0.2.182/tour.h264",
-    "desktop/assets/release-notes/0.2.182/tour.mp4"
+    "desktop/assets/release-notes/0.2.182/tour.mp4",
+    "desktop/assets/release-notes/0.2.183.json",
+    "desktop/assets/release-notes/0.2.183/agent.png",
+    "desktop/assets/release-notes/0.2.183/capsule.png",
+    "desktop/assets/release-notes/0.2.183/connection.png",
+    "desktop/assets/release-notes/0.2.183/files.png",
+    "desktop/assets/release-notes/0.2.183/home.png",
+    "desktop/assets/release-notes/0.2.183/messages.png",
+    "desktop/assets/release-notes/0.2.183/phone.png",
+    "desktop/assets/release-notes/0.2.183/search.png",
+    "desktop/assets/release-notes/0.2.183/sources.json",
+    "desktop/assets/release-notes/0.2.183/tools.png",
+    "desktop/assets/release-notes/0.2.183/tour.h264",
+    "desktop/assets/release-notes/0.2.183/tour.mp4",
+    "desktop/assets/release-notes/0.2.184.json",
+    "desktop/assets/release-notes/0.2.184/agent.png",
+    "desktop/assets/release-notes/0.2.184/capsule.png",
+    "desktop/assets/release-notes/0.2.184/connection.png",
+    "desktop/assets/release-notes/0.2.184/files.png",
+    "desktop/assets/release-notes/0.2.184/home.png",
+    "desktop/assets/release-notes/0.2.184/messages.png",
+    "desktop/assets/release-notes/0.2.184/phone.png",
+    "desktop/assets/release-notes/0.2.184/search.png",
+    "desktop/assets/release-notes/0.2.184/sources.json",
+    "desktop/assets/release-notes/0.2.184/tools.png",
+    "desktop/assets/release-notes/0.2.184/tour.h264",
+    "desktop/assets/release-notes/0.2.184/tour.mp4"
   ],
   "reviewed_media_sha256": {
     "04775fef84a54afd8e157c82d9f6be474ba7a815cd715a1bc56bec898e0f2295": {
@@ -925,7 +953,11 @@
     "docs/videos/StepX-product-0.2.180.mp4",
     "docs/videos/StepX-product-0.2.180.srt",
     "docs/videos/storyboard.json",
-    "handoff/google-play-stepx/java/GmsProbe.java"
+    "handoff/google-play-stepx/java/GmsProbe.java",
+    "licenses/FaCloud-LICENSE-AGPL",
+    "licenses/FaCloud-LICENSE-MIT",
+    "licenses/FaCloud-LICENSES.md",
+    "licenses/FaCloud-NOTICE"
   ],
   "public_removed_files": [
     "docs/videos/StepX-0.2.60-to-0.2.177-contact-sheet.jpg",

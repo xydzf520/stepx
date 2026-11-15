@@ -26,6 +26,22 @@ import urllib.request
 MAX_HTML = 2 * 1024 * 1024
 MAX_RESPONSE = 8 * 1024 * 1024
 CSP = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; media-src data: blob:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; worker-src 'none'; sandbox allow-scripts allow-same-origin"
+CSP_META = '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; script-src \'unsafe-inline\'; style-src \'unsafe-inline\'; img-src data: blob:; media-src data: blob:; font-src data:; connect-src \'none\'; form-action \'none\'">'
+
+def ensure_csp_meta(html):
+    if not isinstance(html, str):
+        return html
+    if re.search(r'<meta\b[^>]*http-equiv\s*=\s*["\']?Content-Security-Policy\b', html, re.I):
+        return html
+    head_match = re.search(r'<head(?:\s[^>]*)?>', html, re.I)
+    if head_match:
+        pos = head_match.end()
+        return html[:pos] + '\n' + CSP_META + html[pos:]
+    html_match = re.search(r'<html(?:\s[^>]*)?>', html, re.I)
+    if html_match:
+        pos = html_match.end()
+        return html[:pos] + '\n<head>' + CSP_META + '</head>' + html[pos:]
+    return CSP_META + '\n' + html
 
 class Failure(Exception):
     pass
@@ -328,7 +344,10 @@ def parse_program(text):
         raise Failure('生成结果结构无效')
     html = value.get('html')
     checks = value.get('checks')
-    if not isinstance(html, str) or len(html.encode()) > MAX_HTML or not re.search(r'<html\b', html, re.I) or not re.search(r'<body\b', html, re.I):
+    if not isinstance(html, str) or not re.search(r'<html\b', html, re.I) or not re.search(r'<body\b', html, re.I):
+        raise Failure('需要不超过 2 MiB 的完整 HTML 文档')
+    html = ensure_csp_meta(html)
+    if len(html.encode()) > MAX_HTML:
         raise Failure('需要不超过 2 MiB 的完整 HTML 文档')
     # Rendering a page is not evidence that its requested workflow works.
     # Missing/invalid acceptance steps must trigger repair, never a fabricated pass.
@@ -386,6 +405,7 @@ class Browser:
     def __init__(self, executable, headless=True):
         self.pending, self.serial, self.session = {}, 0, None
         self.lock = threading.RLock()
+        self.write_queue = queue.Queue()
         self.errors, self.blocked = [], []
         self.origin = None
         self.profile = tempfile.mkdtemp(prefix='stepx-lab-')
@@ -415,6 +435,7 @@ class Browser:
                 wrapper = 'import os,sys; a=int(sys.argv[1]); b=int(sys.argv[2]); x=os.dup(a); y=os.dup(b); os.dup2(x,3); os.dup2(y,4); os.set_inheritable(3,True); os.set_inheritable(4,True); [os.close(fd) for fd in {a,b,x,y}-{3,4}]; os.execv(sys.argv[3],sys.argv[3:])'
                 self.proc = subprocess.Popen([sys.executable,'-c',wrapper,str(incoming),str(outgoing),*args], pass_fds=(incoming,outgoing), **kwargs)
             os.close(incoming); os.close(outgoing)
+            threading.Thread(target=self._write_loop, daemon=True).start()
             threading.Thread(target=self.read, daemon=True).start()
             # A cold browser start on a newly installed machine can exceed 12 seconds.
             self.call('Browser.getVersion', timeout=30)
@@ -430,6 +451,18 @@ class Browser:
             self.close()
             detail = str(error) if isinstance(error, Failure) else type(error).__name__
             raise Failure('无法启动隔离浏览器验收，请检查 Chrome 或 Edge 安装（'+detail+'）') from None
+    def _write_loop(self):
+        try:
+            while True:
+                data = self.write_queue.get()
+                if data is None:
+                    break
+                view = memoryview(data)
+                while view:
+                    count = os.write(self.writer, view)
+                    view = view[count:]
+        except Exception:
+            pass
     def send(self, method, params=None, session=None, expect=True):
         with self.lock:
             self.serial += 1
@@ -441,9 +474,9 @@ class Browser:
             if session:
                 message['sessionId'] = session
             data = json.dumps(message, separators=(',',':')).encode()+b'\0'
-            while data:
-                count = os.write(self.writer, data)
-                data = data[count:]
+        # Enqueue onto the dedicated writer thread so Fetch.requestPaused replies
+        # dispatched inside self.read() never block the stdout pipe reader thread.
+        self.write_queue.put(data)
         return ident, waiter
     def read(self):
         buffer = b''
@@ -518,6 +551,9 @@ class Browser:
             with contextlib.suppress(Exception):
                 if self.proc.poll() is None:
                     self.proc.kill(); self.proc.wait(timeout=2)
+        if hasattr(self, 'write_queue'):
+            with contextlib.suppress(Exception):
+                self.write_queue.put(None)
         for field in ['reader','writer']:
             with contextlib.suppress(Exception): os.close(getattr(self,field))
         shutil.rmtree(self.profile,ignore_errors=True)
@@ -715,7 +751,7 @@ def main():
         result = verify(request['browser'],program,Path(request['output']))
         emit('result',report=result)
     elif operation == 'preview':
-        html = Path(request['html']).read_text(encoding='utf-8')
+        html = ensure_csp_meta(Path(request['html']).read_text(encoding='utf-8'))
         browser = Browser(request['browser'],headless=False)
         try:
             with serving(html) as origin:

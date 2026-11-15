@@ -20,8 +20,8 @@ pub fn hashed_asset_path(asset_path: &Path, sha256_hash: &[u8]) -> PathBuf {
     // manually.
     let mut new_name = asset_path
         .file_stem()
-        .expect("Path should not be empty")
-        .to_os_string();
+        .map(|stem| stem.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("asset"));
     new_name.push("-");
     new_name.push(hash_str);
     if let Some(extension) = asset_path.extension() {
@@ -29,7 +29,11 @@ pub fn hashed_asset_path(asset_path: &Path, sha256_hash: &[u8]) -> PathBuf {
         new_name.push(extension);
     }
 
-    asset_path.with_file_name(new_name)
+    if asset_path.file_name().is_some() {
+        asset_path.with_file_name(new_name)
+    } else {
+        asset_path.join(new_name)
+    }
 }
 
 /// Returns a domain-relative URL of an async asset based on it's hashed asset path.
@@ -40,7 +44,7 @@ pub fn hashed_asset_url(hashed_asset_path: &Path) -> String {
     // - The prod load balancer paths: https://console.cloud.google.com/net-services/loadbalancing/edit/http/app-warp-dev-lb?hl=en&project=astral-field-294621
     format!(
         "/assets/client/static/{}",
-        hashed_asset_path.to_str().unwrap()
+        hashed_asset_path.to_string_lossy()
     )
 }
 
@@ -54,4 +58,36 @@ pub fn make_absolute_url(relative_url: &str) -> String {
         .expect("Can't get window origin.");
 
     format!("{origin}{relative_url}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hashed_asset_helpers_do_not_panic_on_empty_or_non_utf8_paths() {
+        let hash = [0xab, 0xcd];
+        assert_eq!(
+            hashed_asset_path(Path::new("icons/logo.png"), &hash),
+            PathBuf::from("icons/logo-abcd.png")
+        );
+        assert_eq!(
+            hashed_asset_path(Path::new(""), &hash),
+            PathBuf::from("asset-abcd")
+        );
+        assert_eq!(
+            hashed_asset_url(Path::new("icons/logo-abcd.png")),
+            "/assets/client/static/icons/logo-abcd.png"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
+            let non_utf8 = Path::new(OsStr::from_bytes(b"icons/bad-\xff-name.png"));
+            let hashed = hashed_asset_path(non_utf8, &hash);
+            let url = hashed_asset_url(&hashed);
+            assert!(url.starts_with("/assets/client/static/icons/bad-"));
+        }
+    }
 }

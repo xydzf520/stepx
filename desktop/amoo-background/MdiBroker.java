@@ -19,12 +19,9 @@ final class MdiBroker {
     private static long probeUntil;
     private static final ScheduledExecutorService timer=Executors.newSingleThreadScheduledExecutor();
     static {timer.scheduleWithFixedDelay(()->{synchronized(MdiBroker.class){if(!owner.isEmpty()&&SystemClock.elapsedRealtime()-touched>120000)try{finish();}catch(Exception ignored){}}},15,15,TimeUnit.SECONDS);}
-    static synchronized JSONObject handle(Context c,JSONObject q)throws Exception {
+    static JSONObject handle(Context c,JSONObject q)throws Exception {
         if(android.os.Process.myUid()!=1000)throw new SecurityException("MDI 需要已适配的系统服务");
-        context=c;String method=q.getString("method");JSONObject args=q.optJSONObject("params");if(args==null)args=new JSONObject();
-        if(method.equals("probe")){
-            if(active==null&&SystemClock.elapsedRealtime()>probeUntil)try(MdiTransport bus=new MdiTransport(context)){bus.probe();probeUntil=SystemClock.elapsedRealtime()+30000;}
-            return new JSONObject().put("content",new JSONObject().put("ok",true).put("transportReady",true).put("busy",!owner.isEmpty()).put("serviceUid",android.os.Process.myUid()).put("transport","official-mcp-binder"));}
+        String method=q.getString("method");JSONObject args=q.optJSONObject("params");if(args==null)args=new JSONObject();
         if(method.equals("mcp_call")||method.equals("tools/call")){
             String toolName=args.optString("name",args.optString("tool","")).trim();
             JSONObject toolArgs=args.optJSONObject("arguments");
@@ -36,35 +33,55 @@ final class MdiBroker {
             }
             if(!MdiTransport.isAllowedTool(toolName)||MdiTransport.isMdiTool(toolName))throw new IllegalArgumentException("不支持的系统 MCP 工具："+toolName);
             android.content.ComponentName target=MdiTransport.resolveServiceComponent(toolName);
-            try(MdiTransport bus=new MdiTransport(context,target)){
+            try(MdiTransport bus=new MdiTransport(c,target)){
                 Object content=bus.call(toolName,toolArgs);
                 return new JSONObject().put("content",content).put("service",target.flattenToShortString());
             }
         }
         if(MdiTransport.isAllowedTool(method)&&!MdiTransport.isMdiTool(method)){
             android.content.ComponentName target=MdiTransport.resolveServiceComponent(method);
-            try(MdiTransport bus=new MdiTransport(context,target)){
+            try(MdiTransport bus=new MdiTransport(c,target)){
                 Object content=bus.call(method,args);
                 return new JSONObject().put("content",content).put("service",target.flattenToShortString());
             }
         }
-        String name=args.getString("taskName");
-        if(!name.matches("stepx-mdi-[a-f0-9-]{16,64}"))throw new SecurityException("MDI 任务标识无效");
-        if(method.equals("lease")){if(!name.equals(owner))throw new SecurityException("MDI 任务已回收");touched=SystemClock.elapsedRealtime();return new JSONObject().put("content","renewed");}
-        if(method.equals("mdi_task_finish")){
-            if(owner.isEmpty())return new JSONObject().put("content","already released");
-            if(!name.equals(owner))throw new SecurityException("不是当前 MDI 任务");finish();return new JSONObject().put("content","released");
-        }
-        if(((KeyguardManager)c.getSystemService(Context.KEYGUARD_SERVICE)).isKeyguardLocked())throw new SecurityException("请先手动解锁手机，MDI 不绕过锁屏");
-        if(method.equals("mdi_task_create")){
-            if(!owner.isEmpty())throw new IllegalStateException("MDI 已有任务，等待结束或自动回收");
-            // Persist ownership before the call; a timeout may still create a native task.
-            owner=name;touched=SystemClock.elapsedRealtime();args.put("reuse",false);
-        }else if(!name.equals(owner))throw new SecurityException("MDI 任务不属于伴侣");
-        touched=SystemClock.elapsedRealtime();
-        if(active==null)active=new MdiTransport(context);
-        {Object content=method.equals("mdi_capture")?capture():active.call(method,args);
-            if(method.equals("mdi_task_create"))displayId=((JSONObject)content).getInt("displayId");
+        synchronized(MdiBroker.class){
+            context=c;
+            if(method.equals("probe")){
+                if(active==null&&SystemClock.elapsedRealtime()>probeUntil)try(MdiTransport bus=new MdiTransport(context)){bus.probe();probeUntil=SystemClock.elapsedRealtime()+30000;}
+                return new JSONObject().put("content",new JSONObject().put("ok",true).put("transportReady",true).put("busy",!owner.isEmpty()).put("serviceUid",android.os.Process.myUid()).put("transport","official-mcp-binder"));}
+            String name=args.getString("taskName");
+            if(!name.matches("stepx-mdi-[a-f0-9-]{16,64}"))throw new SecurityException("MDI 任务标识无效");
+            if(method.equals("lease")){if(!name.equals(owner))throw new SecurityException("MDI 任务已回收");touched=SystemClock.elapsedRealtime();return new JSONObject().put("content","renewed");}
+            if(method.equals("mdi_task_finish")){
+                if(owner.isEmpty())return new JSONObject().put("content","already released");
+                if(!name.equals(owner))throw new SecurityException("不是当前 MDI 任务");finish();return new JSONObject().put("content","released");
+            }
+            if(((KeyguardManager)c.getSystemService(Context.KEYGUARD_SERVICE)).isKeyguardLocked())throw new SecurityException("请先手动解锁手机，MDI 不绕过锁屏");
+            if(method.equals("mdi_task_create")){
+                if(!owner.isEmpty())throw new IllegalStateException("MDI 已有任务，等待结束或自动回收");
+                // Persist ownership before the call; a timeout may still create a native task.
+                owner=name;touched=SystemClock.elapsedRealtime();args.put("reuse",false);
+                boolean dispatched=false;
+                try{
+                    if(active==null)active=new MdiTransport(context);
+                    dispatched=true;
+                    Object content=active.call(method,args);
+                    displayId=((JSONObject)content).getInt("displayId");
+                    return new JSONObject().put("content",content);
+                }catch(Exception createFailure){
+                    if(dispatched){
+                        try{finish();}catch(Exception ignored){}
+                    }else{
+                        owner="";displayId=-1;
+                        if(active!=null){try{active.close();}catch(Exception ignored){}active=null;}
+                    }
+                    throw createFailure;
+                }
+            }else if(!name.equals(owner))throw new SecurityException("MDI 任务不属于伴侣");
+            touched=SystemClock.elapsedRealtime();
+            if(active==null)active=new MdiTransport(context);
+            Object content=method.equals("mdi_capture")?capture():active.call(method,args);
             if(method.equals("mdi_capture")){
                 Bitmap b=(Bitmap)content;
                 int width=b.getWidth(),height=b.getHeight();Bitmap scaled=Bitmap.createScaledBitmap(b,540,Math.max(1,height*540/width),true);
@@ -94,9 +111,16 @@ final class MdiBroker {
     }
     static synchronized void shutdown(){timer.shutdownNow();try{if(!owner.isEmpty())finish();}catch(Exception ignored){}finally{if(active!=null)active.close();active=null;owner="";displayId=-1;}}
     private static void finish()throws Exception {
-        if(active==null)active=new MdiTransport(context);
-        JSONObject args=new JSONObject().put("taskName",owner).put("ignoreActions",true);
-        try{active.call("mdi_task_finish",args);}catch(Exception interrupted){active.close();active=new MdiTransport(context);active.call("mdi_task_finish",args);}
-        owner="";displayId=-1;active.close();active=null;
+        String finishingOwner=owner;
+        try{
+            if(!finishingOwner.isEmpty()){
+                if(active==null)active=new MdiTransport(context);
+                JSONObject args=new JSONObject().put("taskName",finishingOwner).put("ignoreActions",true);
+                try{active.call("mdi_task_finish",args);}catch(Exception interrupted){try{active.close();}catch(Exception ignored){}active=new MdiTransport(context);active.call("mdi_task_finish",args);}
+            }
+        }finally{
+            owner="";displayId=-1;
+            if(active!=null){try{active.close();}catch(Exception ignored){}active=null;}
+        }
     }
 }

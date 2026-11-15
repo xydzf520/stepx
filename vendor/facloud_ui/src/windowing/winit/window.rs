@@ -698,6 +698,9 @@ struct RenderingResources {
     renderer: Renderer,
 }
 
+const INITIAL_RECREATE_BACKOFF_MS: u64 = 100;
+const MAX_RECREATE_BACKOFF_MS: u64 = 5_000;
+
 struct Inner {
     window: Arc<winit::window::Window>,
     #[cfg(windows)]
@@ -705,6 +708,7 @@ struct Inner {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     gpu_power_preference: GPUPowerPreference,
     backend_preference: Option<wgpu::Backend>,
+    downrank_non_nvidia_vulkan_adapters: bool,
     rendering_resources: Option<RenderingResources>,
     /// Callback that reports when a GPU device is selected. We need to store this on the window
     /// because we may attempt to recreate resources (which in turns reselects a GPU device) to
@@ -713,6 +717,9 @@ struct Inner {
     active_drag_resize_direction: Option<ResizeDirection>,
     surface_size: Vector2F,
     surface_requires_reconfiguration: bool,
+    last_recreate_attempt: Option<instant::Instant>,
+    recreate_backoff_ms: u64,
+    recovery_timer_scheduled: bool,
     /// The window level isn't just needed at window creation. The window level may get un-set in
     /// some desktop environments, e.g. when the window is hidden and un-hidden. We don't want this
     /// behavior, and so we must re-set the window level. In order to re-set it, we must store the
@@ -848,6 +855,7 @@ impl Window {
             is_cloaked: true,
             gpu_power_preference,
             backend_preference,
+            downrank_non_nvidia_vulkan_adapters,
             rendering_resources: Some(RenderingResources {
                 resources,
                 renderer,
@@ -856,6 +864,9 @@ impl Window {
             active_drag_resize_direction: None,
             surface_size: initial_surface_size,
             surface_requires_reconfiguration: false,
+            last_recreate_attempt: None,
+            recreate_backoff_ms: 0,
+            recovery_timer_scheduled: false,
             level: window_level_for_style(window_options.style),
         }));
         Ok(window_id)
@@ -869,6 +880,12 @@ impl Window {
         };
 
         let window_size = inner.physical_size().to_vec2f();
+        if window_size.x() < 1.0 || window_size.y() < 1.0 {
+            // While minimized (`0x0`), preserve the last non-zero `surface_size` and skip
+            // configuring a zero-sized wgpu surface.
+            inner.surface_requires_reconfiguration = false;
+            return Ok(());
+        }
 
         let Some(RenderingResources { resources, .. }) = inner.rendering_resources.as_mut() else {
             return Ok(());
@@ -900,18 +917,43 @@ impl Window {
         new_scene: Option<Rc<Scene>>,
         font_cache: &fonts::Cache,
     ) -> Result<(), renderer::Error> {
-        let mut scene = self.scene.borrow_mut();
-
-        if scene.is_none() {
-            *scene = new_scene;
-        }
-
-        let Some(scene) = scene.clone() else {
-            log::error!(
-                "A redraw of the window was requested but no scene was available to render"
-            );
-            return Ok(());
+        let scene = {
+            let mut scene_slot = self.scene.borrow_mut();
+            if scene_slot.is_none() {
+                *scene_slot = new_scene;
+            }
+            let Some(scene) = scene_slot.clone() else {
+                log::error!(
+                    "A redraw of the window was requested but no scene was available to render"
+                );
+                return Ok(());
+            };
+            scene
         };
+
+        let recreate_downrank = {
+            let inner = self.inner.borrow();
+            let Some(inner) = inner.as_ref() else {
+                log::warn!("Tried to render a window before it had been fully initialized");
+                return Ok(());
+            };
+            let phys_size = inner.physical_size().to_vec2f();
+            if phys_size.x() < 1.0 || phys_size.y() < 1.0 {
+                return Ok(());
+            }
+            if inner.rendering_resources.is_none() {
+                let backoff_ready = inner.last_recreate_attempt.map_or(true, |last| {
+                    last.elapsed() >= instant::Duration::from_millis(inner.recreate_backoff_ms)
+                });
+                backoff_ready.then_some(inner.downrank_non_nvidia_vulkan_adapters)
+            } else {
+                None
+            }
+        };
+
+        if let Some(downrank) = recreate_downrank {
+            self.recreate_renderer(downrank);
+        }
 
         let mut inner = self.inner.borrow_mut();
         let Some(inner) = inner.as_mut() else {
@@ -970,9 +1012,10 @@ impl Window {
         Ok(())
     }
 
-    /// Drops the window's renderer and all associated resources.
+    /// Drops the window's renderer and all associated resources for recovery/sleep.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn drop_renderer(&self, display_handle: Box<dyn wgpu::wgt::WgpuHasDisplayHandle>) {
+        let _ = self.scene.borrow_mut().take();
         let mut inner = self.inner.borrow_mut();
         let Some(inner) = inner.as_mut() else {
             log::warn!("Tried to drop a window's renderer before it had been fully initialized");
@@ -981,10 +1024,22 @@ impl Window {
 
         let _ = inner.rendering_resources.take();
 
-        // Forceably drop and recreate our cached `wgpu::Instance` after dropping the renderer.
-        // Without this, certain NVIDIA drivers deadlock upon recreating the resources with the
-        // existing `Instance`.
+        // Reset the cached `wgpu::Instance` only when no other windows still hold live
+        // `wgpu::Resources` (guarded inside `reset_wgpu_instance`).
         crate::rendering::wgpu::reset_wgpu_instance(display_handle);
+    }
+
+    /// Drops the window's renderer and retained scene when closing this window, without
+    /// touching the shared `wgpu::Instance` used by other open windows.
+    pub fn drop_renderer_for_close(&self) {
+        let _ = self.scene.borrow_mut().take();
+        let _ = self.capture_callback.borrow_mut().take();
+        let mut inner = self.inner.borrow_mut();
+        let Some(inner) = inner.as_mut() else {
+            return;
+        };
+
+        let _ = inner.rendering_resources.take();
     }
 
     /// Recreates the window's renderer and all associated resources.
@@ -998,19 +1053,45 @@ impl Window {
             return;
         };
 
+        // Drop any stale surface/device on this window before creating a replacement surface.
+        let _ = inner.rendering_resources.take();
+        inner.downrank_non_nvidia_vulkan_adapters = downrank_non_nvidia_vulkan_adapters;
+        inner.recovery_timer_scheduled = false;
+        inner.last_recreate_attempt = Some(instant::Instant::now());
+
+        let phys_size = inner.physical_size().to_vec2f();
+        let target_surface_size = if phys_size.x() >= 1.0 && phys_size.y() >= 1.0 {
+            phys_size
+        } else {
+            inner.surface_size
+        }
+        .max(Vector2F::splat(1.0));
+        inner.surface_size = target_surface_size;
+
         let resources = match Resources::new(
             inner.window.clone(),
             inner.gpu_power_preference,
             inner.backend_preference,
             &inner.on_gpu_device_selected,
-            inner.surface_size,
+            target_surface_size,
             downrank_non_nvidia_vulkan_adapters,
         )
         .context("Failed to recreate window renderer")
         {
             Ok(resources) => resources,
             Err(err) => {
-                log::error!("{err:#}");
+                inner.recreate_backoff_ms = if inner.recreate_backoff_ms == 0 {
+                    INITIAL_RECREATE_BACKOFF_MS
+                } else {
+                    inner
+                        .recreate_backoff_ms
+                        .saturating_mul(2)
+                        .min(MAX_RECREATE_BACKOFF_MS)
+                };
+                log::error!(
+                    "{err:#} (will retry in {}ms)",
+                    inner.recreate_backoff_ms
+                );
                 return;
             }
         };
@@ -1019,10 +1100,44 @@ impl Window {
 
         let renderer = Renderer::new(&resources, GlyphConfig::default());
 
+        inner.last_recreate_attempt = None;
+        inner.recreate_backoff_ms = 0;
+        inner.surface_requires_reconfiguration = phys_size != target_surface_size;
         let _ = inner.rendering_resources.insert(RenderingResources {
             resources,
             renderer,
         });
+        inner.window.request_redraw();
+    }
+
+    pub(super) fn take_pending_recovery_timer(&self) -> Option<(winit::window::WindowId, instant::Duration)> {
+        let mut inner = self.inner.borrow_mut();
+        let inner = inner.as_mut()?;
+        if inner.rendering_resources.is_none()
+            && inner.recreate_backoff_ms > 0
+            && !inner.recovery_timer_scheduled
+        {
+            inner.recovery_timer_scheduled = true;
+            Some((
+                inner.window.id(),
+                instant::Duration::from_millis(inner.recreate_backoff_ms),
+            ))
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn on_recovery_timer_fired(&self) {
+        let mut inner = self.inner.borrow_mut();
+        let Some(inner) = inner.as_mut() else {
+            return;
+        };
+        inner.recovery_timer_scheduled = false;
+        if inner.rendering_resources.is_none() {
+            // Clear `last_recreate_attempt` so the ensuing redraw is not skipped by sub-ms timer jitter.
+            inner.last_recreate_attempt = None;
+            inner.window.request_redraw();
+        }
     }
 
     pub fn has_scene(&self) -> bool {

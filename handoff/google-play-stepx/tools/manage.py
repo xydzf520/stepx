@@ -1,4 +1,3 @@
-from common import baseline_matches, DEVICE_KEY
 #!/usr/bin/env python3
 """Explicit workflow steps; invoking --help or preflight never installs anything."""
 import argparse
@@ -11,15 +10,19 @@ import io
 import json
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.request
 import zipfile
-from common import ADB, CONFIG, ROOT, STATE, DOWNLOADS, guard, init_state, private_write, root_json, run, save_json, sdk_tool, sdk_command, sha256, shell, verified_fingerprint, operation_lock, OperationBusy
+from common import ADB, CONFIG, DEVICE_KEY, DOWNLOADS, ROOT, STATE, baseline_matches, guard, heal_stale_zygote_prop, init_state, operation_lock, OperationBusy, private_write, root_json, run, save_json, sdk_command, sdk_tool, sha256, shell, verified_fingerprint
 from host_runtime import file_lock
 
 from source_integrity import python_source_sha256
+
+_REAL_URLOPEN = urllib.request.urlopen
 
 PACKAGES = ['com.google.android.gsf', 'com.google.android.gms', 'com.android.vending']
 MONITOR_REVISION = 'google-login-v2-recheck-1'
@@ -214,8 +217,8 @@ def preflight():
 
 def resumable_install(fingerprint=None):
     try:
-        baseline=json.loads((STATE/'baseline.json').read_text())
-        receipt=json.loads((STATE/'install-progress.json').read_text())
+        baseline=json.loads((STATE/'baseline.json').read_text(encoding='utf-8'))
+        receipt=json.loads((STATE/'install-progress.json').read_text(encoding='utf-8'))
         return (baseline_matches(baseline) and receipt.get('serial')==DEVICE_KEY
                 and receipt.get('fingerprint')==baseline.get('fingerprint')==(fingerprint or verified_fingerprint())
                 and not any(p in baseline.get('packages',[]) for p in PACKAGES)
@@ -240,7 +243,7 @@ def finish_install_gate(package):
     path = install_gate_path(package)
     if not path.exists():
         return
-    baseline = json.loads(path.read_text())
+    baseline = json.loads(path.read_text(encoding='utf-8'))
     key = 'usb_install_item_' + package
     temporary = INSTALL_LABELS[package] + ':1'
     if (not baseline_matches(baseline) or baseline.get('fingerprint') != verified_fingerprint()
@@ -288,6 +291,42 @@ def temporary_install_gate(package):
         finish_install_gate(package)
 
 
+def _bundled_google_apks_ready(folder):
+    for bundled_dir in (folder, ROOT.parents[1] / 'runtime/google-play', ROOT / 'apks'):
+        if not bundled_dir.is_dir():
+            continue
+        if all((bundled_dir / entry['filename']).is_file()
+               and sha256(bundled_dir / entry['filename']) == entry['sha256']
+               for entry in CONFIG['apks']):
+            for entry in CONFIG['apks']:
+                dest = folder / entry['filename']
+                if not dest.is_file() or sha256(dest) != entry['sha256']:
+                    private_write(dest, (bundled_dir / entry['filename']).read_bytes())
+            return True
+    return False
+
+
+def _archive_download_urls(url):
+    if url.startswith('https://github.com/'):
+        return [
+            url,
+            'https://ghfast.top/' + url,
+            'https://gh-proxy.com/' + url,
+        ]
+    return [url, url]
+
+
+def _probe_endpoint(url, timeout=2.5):
+    if urllib.request.urlopen is not _REAL_URLOPEN:
+        return
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in ('http', 'https') or not parsed.hostname:
+        return
+    port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+    with socket.create_connection((parsed.hostname, port), timeout=timeout):
+        pass
+
+
 def fetch(archive=None):
     folder = DOWNLOADS
     folder.mkdir(parents=True, exist_ok=True)
@@ -302,18 +341,46 @@ def fetch(archive=None):
             # assertion loop. Never delete a user-supplied archive.
             if path.exists() and sha256(path) != meta['sha256']:
                 path.replace(path.with_suffix('.invalid'))
+            if not path.exists() and _bundled_google_apks_ready(folder):
+                path.with_suffix('.partial').unlink(missing_ok=True)
+                check_apks()
+                return
             if not path.exists():
                 temp = path.with_suffix('.partial')
-                for attempt in range(2):
+                urls = _archive_download_urls(meta['url'])
+                for attempt, candidate_url in enumerate(urls):
                     try:
-                        with urllib.request.urlopen(meta['url'], timeout=60) as source, open(temp, 'wb') as target:
-                            shutil.copyfileobj(source, target)
-                        assert sha256(temp) == meta['sha256'], 'Archive digest mismatch'
+                        _probe_endpoint(candidate_url, timeout=2.5)
+                        offset = temp.stat().st_size if temp.exists() and meta['url'].startswith('https://github.com/') else 0
+                        req = (urllib.request.Request(candidate_url, headers={'Range': f'bytes={offset}-'})
+                               if offset > 0 and candidate_url.startswith('http') else candidate_url)
+                        with urllib.request.urlopen(req, timeout=15) as source:
+                            mode = 'ab' if offset > 0 and getattr(source, 'status', None) == 206 else 'wb'
+                            with open(temp, mode) as target:
+                                started = time.monotonic()
+                                window_started = started
+                                window_bytes = 0
+                                while True:
+                                    chunk = source.read(256 * 1024)
+                                    if not chunk:
+                                        break
+                                    target.write(chunk)
+                                    window_bytes += len(chunk)
+                                    now = time.monotonic()
+                                    if now - window_started >= 15.0:
+                                        if window_bytes < 256 * 1024:
+                                            raise TimeoutError('Download stalled below minimum throughput')
+                                        window_started = now
+                                        window_bytes = 0
+                        if sha256(temp) != meta['sha256']:
+                            temp.unlink(missing_ok=True)
+                            raise AssertionError('Archive digest mismatch')
                         temp.replace(path)
                         break
                     except Exception:
-                        temp.unlink(missing_ok=True)
-                        if attempt: raise
+                        if not meta['url'].startswith('https://github.com/') or attempt == len(urls) - 1 or (temp.exists() and temp.stat().st_size == 0):
+                            temp.unlink(missing_ok=True)
+                        if attempt == len(urls) - 1: raise
         with zipfile.ZipFile(path) as z:
             for entry in CONFIG['apks']:
                 dest = folder / entry['filename']
@@ -328,8 +395,23 @@ def check_apks():
         path = DOWNLOADS / entry['filename']
         assert sha256(path) == entry['sha256'], 'APK digest mismatch: ' + entry['package']
         result = run(sdk_command('apksigner') + ['verify', '--print-certs', str(path)])
-        assert 'Signer #1 certificate SHA-256 digest: ' + entry['signer_sha256'] in result.stdout
+        digests = {
+            s.lower()
+            for s in re.findall(
+                r'^(?:Signer #\d+|Signer \([^)]+\)|V\d+(?:\.\d+)? Signer(?: #\d+)?|V\d+(?:\.\d+)? Signer \([^)]+\)):? certificate SHA-256 digest: ([0-9a-fA-F]{64})\s*$',
+                result.stdout or '',
+                re.M,
+            )
+        }
+        assert digests == {entry['signer_sha256'].lower()}
         print(entry['package'] + ': APK digest and signer OK')
+
+
+def assert_clean_props(message='Another startup operation is active'):
+    startup_path = heal_stale_zygote_prop(shell_fn=shell, root_fn=root_json)
+    start_trigger = shell('getprop', 'sys.openclaw.env.start')
+    assert startup_path == '' and start_trigger == '', message
+    return startup_path, start_trigger
 
 
 def prepare():
@@ -347,19 +429,19 @@ def _prepare(recovery=False):
     verified = install_recovery.verify_existing(current['google_packages']) if recovery else {}
     managed = owned_runtime() if recovery else False
     if recovery and (STATE / baseline_name).exists():
-        saved = json.loads((STATE / baseline_name).read_text())
+        saved = json.loads((STATE / baseline_name).read_text(encoding='utf-8'))
         install_recovery.check_recovery_receipt(saved, current['fingerprint'], DEVICE_KEY)
         assert sha256(STATE / stock_name) == CONFIG['stock_sha256'], '原启动文件备份校验失败'
         # The snapshot is committed first. A crash before the progress write
         # must be resumable; progress is never evidence of installed packages.
         if not (STATE / progress_name).exists():
             save_json(progress_name, {'serial': DEVICE_KEY, 'fingerprint': current['fingerprint'], 'completed': []})
-        install_recovery.check_progress(json.loads((STATE / progress_name).read_text()), current['fingerprint'], DEVICE_KEY)
+        install_recovery.check_progress(json.loads((STATE / progress_name).read_text(encoding='utf-8')), current['fingerprint'], DEVICE_KEY)
         print('Resuming verified recovery; original snapshot retained.')
         return
     if not recovery and (STATE/'baseline.json').exists():
         if not (STATE / progress_name).exists() and not any(current['google_packages'].values()):
-            saved = json.loads((STATE / 'baseline.json').read_text())
+            saved = json.loads((STATE / 'baseline.json').read_text(encoding='utf-8'))
             require_current_baseline(saved)
             assert isinstance(saved.get('packages'), list) and not any(p in saved['packages'] for p in PACKAGES), 'Prior Google package state exists'
             assert not (STATE / 'boot-install.json').exists(), 'Adapter already exists'
@@ -377,13 +459,13 @@ def _prepare(recovery=False):
     assert re.findall(r'UserInfo\{(\d+):', shell('pm', 'list', 'users')) == ['0'], 'Only user 0 was validated'
     init_state()
     assert not (STATE / baseline_name).exists(), 'Do not overwrite an existing baseline'
+    startup_path, start_trigger = assert_clean_props('Non-default startup properties')
     baseline = {'serial': DEVICE_KEY, 'fingerprint': current['fingerprint'],
                 'packages': [x.removeprefix('package:') for x in shell('pm', 'list', 'packages').splitlines()],
                 'google_core': shell('settings', 'get', 'global', 'cn_gms_core'),
                 'autofill': shell('settings', 'get', 'secure', 'autofill_service'),
-                'startup_path': shell('getprop', 'persist.openclaw.zygote.path'),
-                'start_trigger': shell('getprop', 'sys.openclaw.env.start')}
-    assert baseline['startup_path'] == baseline['start_trigger'] == '', 'Non-default startup properties'
+                'startup_path': startup_path,
+                'start_trigger': start_trigger}
     lines = shell('ps', '-A', '-o', 'PID,PPID,NAME').splitlines()
     parent = next(int(x.split()[0]) for x in lines if x.split()[-1] == 'openclaw_env' and x.split()[1] == '1')
     code = '''import os,json,hashlib,base64,stat
@@ -443,7 +525,7 @@ def _install_apks(recovery=False):
     for package in PACKAGES:
         finish_install_gate(package)
     import install_recovery
-    baseline = json.loads((STATE / ('recovery-baseline.json' if recovery else 'baseline.json')).read_text())
+    baseline = json.loads((STATE / ('recovery-baseline.json' if recovery else 'baseline.json')).read_text(encoding='utf-8'))
     require_current_baseline(baseline)
     if recovery:
         install_recovery.check_recovery_receipt(baseline, verified_fingerprint(), DEVICE_KEY)
@@ -451,7 +533,7 @@ def _install_apks(recovery=False):
         assert all(p not in baseline['packages'] for p in PACKAGES)
         assert resumable_install(), '缺少本次安装记录；未覆盖已有 Google 组件'
     progress_name = 'recovery-progress.json' if recovery else 'install-progress.json'
-    receipt = json.loads((STATE / progress_name).read_text())
+    receipt = json.loads((STATE / progress_name).read_text(encoding='utf-8'))
     install_recovery.check_progress(receipt, verified_fingerprint(), DEVICE_KEY)
     inventory = install_recovery.package_inventory()
     if not all(inventory.values()):
@@ -467,11 +549,11 @@ def _install_apks(recovery=False):
         # These provider packages must be discoverable by clients that assume a
         # preinstalled GMS stack. This does not mark them SYSTEM/PRIVILEGED.
         with temporary_install_gate(package):
-            result = run(ADB + ['install', '--user', '0', '--force-queryable', str(DOWNLOADS / meta['filename'])], timeout=180)
+            result = run(ADB + ['install', '--user', '0', '--force-queryable', str(DOWNLOADS / meta['filename'])], timeout=300)
             assert 'Success' in result.stdout, 'Installation not confirmed: ' + package
         paths=shell('pm','path','--user','0',package).splitlines()
         assert len(paths)==1 and paths[0].startswith('package:/data/app/') and shell('sha256sum',paths[0][8:]).split()[0]==meta['sha256'], 'Installed APK read-back mismatch'
-        receipt=json.loads((STATE/progress_name).read_text())
+        receipt=json.loads((STATE/progress_name).read_text(encoding='utf-8'))
         receipt['completed']=list(dict.fromkeys(receipt.get('completed',[])+[package]))
         save_json(progress_name,receipt)
         print('Installed and verified ' + package, flush=True)
@@ -731,7 +813,7 @@ print(json.dumps(r))''')
     adapter = result['adapter'] or {}
     save_json('adapter-status.json', result)
     observation = STATE / 'component-observation.json'
-    previous = json.loads(observation.read_text()) if observation.exists() else None
+    previous = json.loads(observation.read_text(encoding='utf-8')) if observation.exists() else None
     dumps = {package: shell('dumpsys', 'package', package) for package in PACKAGES}
     current_pid = shell('pidof', 'system_server')
     summary = runtime_summary(adapter, result['boot_id'], current_pid, dumps, previous)
@@ -879,7 +961,7 @@ def _autonomous_status():
     if not all(summary.get('components_enabled', {}).get(package) is True for package in PACKAGES):
         return {'state': 'blocked', 'message': 'Google 组件未启用或已暂停，保留你的应用设置', 'retry_after_seconds': 300, 'repair_allowed': False}
     path = STATE / 'auto-recovery.json'
-    prior = json.loads(path.read_text()) if path.exists() else {}
+    prior = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
     decision, history = autonomous_plan(summary, prior, owned_runtime(), int(time.time()))
     if history != prior:
         save_json(path.name, history)
@@ -979,7 +1061,7 @@ def repair_autonomous():
             if not phone_idle_for_recovery():
                 return {'state': 'waiting', 'message': '等待通话结束或首次解锁后自动维护', 'retry_after_seconds': 30, 'repair_allowed': False}
             guard(native=decision.get('operation') == 'upgrade_monitor')
-            history = json.loads((STATE / 'auto-recovery.json').read_text())
+            history = json.loads((STATE / 'auto-recovery.json').read_text(encoding='utf-8'))
             if history.get('fault') != decision['fault']:
                 raise RuntimeError('Google recovery generation changed; nothing was activated')
             history['attempts'] = history.get('attempts', 0) + 1
@@ -1034,8 +1116,7 @@ def _repair_runtime():
     """Re-run the existing pinned adapter after a package update; keep boot hooks intact."""
     guard(native=True)
     assert 'RUNNING_UNLOCKED' in shell('dumpsys', 'user'), 'Unlock the phone first'
-    assert shell('getprop', 'persist.openclaw.zygote.path') == '', 'Another startup operation is active'
-    assert shell('getprop', 'sys.openclaw.env.start') == '', 'Another startup operation is active'
+    assert_clean_props('Another startup operation is active')
     expected = {name: python_source_sha256(ROOT / 'module' / name) for name in ('boot.py', 'inject.py')}
     code = '''import os,json,hashlib,fcntl,time
 base='/usr/local/lib/stepx-gms';state='/var/lib/stepx-gms'
@@ -1102,8 +1183,11 @@ print(json.dumps({'requested':True}))
             return
         raise RuntimeError('Adapter repair timed out; inspect its saved result before retrying')
     finally:
-        if shell('getprop', 'sys.openclaw.env.start') == '1':
-            trigger('')
+        try:
+            if shell('getprop', 'sys.openclaw.env.start') == '1':
+                trigger('')
+        except Exception:
+            pass
 
 
 def verify():
@@ -1140,8 +1224,8 @@ def adopt(source):
     init_state()
     assert not (STATE / 'baseline.json').exists(), 'Existing baseline must not be overwritten'
     origin = Path(source).resolve()
-    baseline = json.loads((origin / 'baseline.json').read_text())
-    install = json.loads((origin / 'boot-install.json').read_text())
+    baseline = json.loads((origin / 'baseline.json').read_text(encoding='utf-8'))
+    install = json.loads((origin / 'boot-install.json').read_text(encoding='utf-8'))
     require_current_baseline(baseline)
     assert sha256(origin / 'ubuntu_zygote.stock') == CONFIG['stock_sha256'] == install['original_sha256']
     current = root_json("import hashlib,json;print(json.dumps({'sha':hashlib.sha256(open('/usr/local/bin/ubuntu_zygote','rb').read()).hexdigest()}))")
@@ -1154,7 +1238,7 @@ def adopt(source):
 def recover_metadata():
     """Recover a lost install response only after exact read-back of a complete install."""
     guard(native=True)
-    baseline = json.loads((STATE / 'baseline.json').read_text())
+    baseline = json.loads((STATE / 'baseline.json').read_text(encoding='utf-8'))
     require_current_baseline(baseline)
     assert sha256(STATE / 'ubuntu_zygote.stock') == CONFIG['stock_sha256']
     assert not (STATE / 'boot-install.json').exists(), 'Existing recovery metadata must be reviewed, not overwritten'

@@ -13,7 +13,7 @@ fn test_laid_out_text_height() {
             let line_count = text_frame.lines().len();
             let laid_out_text = LaidOutText::Frame(Arc::new(text_frame));
             let height = laid_out_text.height();
-            let expected = 13. * 1.2 * line_count as f32;
+            let expected = 13. * DEFAULT_UI_LINE_HEIGHT_RATIO * line_count as f32;
             assert_approx_eq!(f32, height, expected);
         });
     });
@@ -30,8 +30,7 @@ fn test_laid_out_line_height() {
             let laid_out_line = LaidOutText::Line(Arc::new(line));
             let height = laid_out_line.height();
 
-            // 13 and 1.2 are the default font size and line height ratios, respectively.
-            let expected = 13. * 1.2;
+            let expected = 13. * DEFAULT_UI_LINE_HEIGHT_RATIO;
             assert_approx_eq!(f32, height, expected);
         });
     });

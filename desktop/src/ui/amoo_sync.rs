@@ -16,6 +16,7 @@ struct SyncRequest {
     generation: u64,
 }
 pub(super) struct SyncWorker {
+    serial: String,
     transport: String,
     sender: mpsc::Sender<SyncRequest>,
     pub(super) reset_baseline: Arc<std::sync::atomic::AtomicBool>,
@@ -26,6 +27,7 @@ impl SyncWorker {
     fn start(adb: Adb, device: Device) -> Self {
         let (sender, receiver) = mpsc::channel::<SyncRequest>();
         let (delta_tx, delta_rx) = mpsc::channel::<Vec<amoo::StreamDelta>>();
+        let serial = device.serial.clone();
         let transport = device.transport.clone();
         let reset_baseline = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_reset = reset_baseline.clone();
@@ -80,15 +82,19 @@ impl SyncWorker {
                 while let Ok(newer) = receiver.try_recv() {
                     request = newer;
                 }
+                let was_pending = active_pending;
                 active_pending = !request.pending.is_empty();
                 worker_pending.store(active_pending, std::sync::atomic::Ordering::Relaxed);
                 if worker_reset.swap(false, std::sync::atomic::Ordering::SeqCst) {
                     previous = None;
                 }
                 // Escalation releases the previous passive observer on this worker,
-                // never on the UI thread. A warm task bus already supports observe reads
-                // and is released automatically when the worker idles out.
-                if bus.as_ref().is_some_and(|(task, _)| !*task && request.task) {
+                // never on the UI thread. Keep the task bus alive while pending replies
+                // are streaming so the 55ms real-time stream loop runs; downgrade when
+                // pending replies finish.
+                if bus.as_ref().is_some_and(|(task, _)| {
+                    (!*task && request.task) || (*task && was_pending && !active_pending && !request.task)
+                }) {
                     bus = None;
                 }
                 let started = Instant::now();
@@ -119,13 +125,22 @@ impl SyncWorker {
                     }
                     Ok(data)
                 };
-                let result = try_snapshot(request.task, false)
-                    .map_err(|e| format!("{e:#}"));
-                if result.is_err() || bus.as_ref().is_some_and(|(task, _)| *task) {
+                let mut result = try_snapshot(request.task, false);
+                if result.is_err() && reused {
+                    stepx_companion::device::invalidate_verified_transport(&device.transport);
+                    result = try_snapshot(request.task, true);
+                }
+                let result = result.map_err(|e| format!("{e:#}"));
+                let keep_streaming =
+                    active_pending || worker_pending.load(std::sync::atomic::Ordering::Relaxed);
+                if result.is_err() || (!keep_streaming && bus.as_ref().is_some_and(|(task, _)| *task))
+                {
                     bus = None;
                 }
                 if std::env::var_os("STEPX_PERF_TRACE").is_some() {
-                    eprintln!(
+                    use std::io::Write as _;
+                    let _ = writeln!(
+                        std::io::stderr(),
                         "AMOO_SYNC ok={} reused={} elapsed_ms={}",
                         result.is_ok(),
                         reused,
@@ -154,6 +169,7 @@ impl SyncWorker {
             }
         });
         Self {
+            serial,
             transport,
             sender,
             reset_baseline,
@@ -245,7 +261,7 @@ impl Companion {
             .amoo_ui
             .snapshot_worker
             .as_ref()
-            .is_none_or(|w| w.transport != device.transport)
+            .is_none_or(|w| w.serial != device.serial || w.transport != device.transport)
         {
             self.amoo_ui.snapshot_worker = Some(SyncWorker::start(adb, device));
         }
@@ -374,11 +390,7 @@ impl Companion {
                 if !delta.full_text.is_empty() {
                     *text_buf = stepx_companion::amoo_gui_chat::display_text(&delta.full_text);
                 } else if !delta.delta_text.is_empty() {
-                    if !text_buf.is_empty() && delta.delta_text.starts_with(text_buf.as_str()) {
-                        *text_buf = delta.delta_text.clone();
-                    } else if !text_buf.ends_with(&delta.delta_text) {
-                        text_buf.push_str(&delta.delta_text);
-                    }
+                    merge_stream_delta_text(text_buf, &delta.delta_text);
                 }
                 if !text_buf.trim().is_empty() {
                     updated_text = Some(text_buf.clone());
@@ -417,10 +429,10 @@ impl Companion {
                     let turn_idx = task.turns.len().saturating_sub(1);
                     if let Some(last) = task.turns.last_mut() {
                         let old_turn = last.text.clone();
-                        if !delta.full_text.is_empty() || live_text.len() >= last.text.len() {
+                        if !delta.full_text.is_empty() || session_idx.is_some() {
                             last.text = live_text;
-                        } else if !last.text.ends_with(&live_text) {
-                            last.text.push_str(&live_text);
+                        } else {
+                            merge_stream_delta_text(&mut last.text, &live_text);
                         }
                         turn_motion = Some((task_id, turn_idx, old_turn, last.text.clone()));
                     }
@@ -693,5 +705,58 @@ mod tests {
         app.demote_busy_if_background();
         assert!(!app.busy);
         assert_eq!(app.bg_receivers.len(), 1);
+    }
+
+    #[test]
+    fn stream_delta_merger_preserves_repeated_tokens_fences_and_cumulative_snapshots() {
+        let mut buf = String::new();
+        for tok in ["1", "0", "0"] {
+            merge_stream_delta_text(&mut buf, tok);
+        }
+        assert_eq!(buf, "100");
+
+        let mut dashes = String::new();
+        for tok in ["-", "-", "-"] {
+            merge_stream_delta_text(&mut dashes, tok);
+        }
+        assert_eq!(dashes, "---");
+
+        let mut fence = String::new();
+        for tok in ["`", "`", "`", "rust\nfn main() {}\n", "`", "`", "`"] {
+            merge_stream_delta_text(&mut fence, tok);
+        }
+        assert_eq!(fence, "```rust\nfn main() {}\n```");
+
+        let mut snap = String::new();
+        merge_stream_delta_text(&mut snap, "你好，");
+        merge_stream_delta_text(&mut snap, "你好，正在整理结果");
+        merge_stream_delta_text(&mut snap, "你好，正在整理结果");
+        assert_eq!(snap, "你好，正在整理结果");
+    }
+}
+
+fn is_single_repeated_char(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    chars.all(|c| c == first)
+}
+
+fn merge_stream_delta_text(text_buf: &mut String, delta_text: &str) {
+    if delta_text.is_empty() {
+        return;
+    }
+    let repeated_char = is_single_repeated_char(delta_text);
+    if !text_buf.is_empty()
+        && delta_text.len() > text_buf.len()
+        && delta_text.starts_with(text_buf.as_str())
+        && !repeated_char
+    {
+        *text_buf = delta_text.to_string();
+    } else if delta_text == text_buf.as_str() && text_buf.len() >= 4 && !repeated_char {
+        // Ignore exact full-buffer duplicate re-emitted by stream gateway.
+    } else {
+        text_buf.push_str(delta_text);
     }
 }

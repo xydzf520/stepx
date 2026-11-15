@@ -67,9 +67,10 @@ impl Companion {
         let mut value = field.text.clone();
         let mut caret = 0;
         if focused {
-            let cursor = field.cursor.min(value.len());
-            caret = cursor + field.preedit.len();
-            value.insert_str(cursor, &format!("{}│", field.preedit));
+            let cursor =
+                crate::ui::keyboard_input::clamp_char_boundary(&value, field.cursor.min(value.len()));
+            caret = value[..cursor].chars().count() + field.preedit.chars().count();
+            value.insert_str(cursor, &field.preedit);
         }
         let empty = field.text.is_empty() && field.preedit.is_empty();
         if value.is_empty() {
@@ -85,11 +86,12 @@ impl Companion {
                 Container::new(
                     self.pane_scroll(
                         self.studio_lab.prompt_scroll.clone(),
-                        Text::new(value, self.font, BODY)
-                            .with_saved_char_position(caret, format!("input-caret:{F_LAB_PROMPT}"))
-                            .with_color(if empty && !focused { p.text3 } else { p.text })
-                            .with_line_height_ratio(1.4)
-                            .finish(),
+                        self.multiline_field_text(
+                            &value,
+                            caret,
+                            F_LAB_PROMPT,
+                            if empty { p.text3 } else { p.text },
+                        ),
                     ),
                 )
                 .with_uniform_padding(S3)
@@ -106,6 +108,7 @@ impl Companion {
             .finish()
         })
         .with_cursor(Cursor::IBeam)
+        .with_defer_events_to_children()
         .on_mouse_down(|ctx, _, _| ctx.dispatch_typed_action(Action::Focus(F_LAB_PROMPT)))
         .on_right_click(|ctx, _, at| {
             ctx.dispatch_typed_action(Action::ContextOpen(
@@ -967,7 +970,15 @@ impl Companion {
                         })
                         .collect(),
                 ),
-                self.caption("API Key"),
+                self.between(
+                    self.caption("API Key"),
+                    self.button(
+                        "lab-toggle-key-visibility",
+                        if self.show_secret { "隐藏密钥" } else { "显示密钥" },
+                        Action::ToggleShowSecret,
+                        Btn::Ghost,
+                    ),
+                ),
                 self.input(
                     F_LAB_KEY,
                     if self.studio_lab.config.has_key {

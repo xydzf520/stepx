@@ -9,6 +9,41 @@ const DWELL: Duration = Duration::from_millis(5500);
 const TRANSITION: Duration = Duration::from_millis(420);
 const HEIGHT: f32 = 30.;
 const PAD: f32 = 7.;
+pub(super) const MAX_CAPSULE_MOTION_ENTRIES: usize = 128;
+const PROXIMITY_WINDOW_MINS: i32 = 60;
+
+fn parse_leading_hm_minutes(text: &str) -> Option<i32> {
+    let trimmed = text.trim();
+    let hm = trimmed.get(0..5)?;
+    let (h_str, m_str) = hm.split_once(':')?;
+    let h: i32 = h_str.parse().ok()?;
+    let m: i32 = m_str.parse().ok()?;
+    if (0..=23).contains(&h) && (0..=59).contains(&m) {
+        Some(h * 60 + m)
+    } else {
+        None
+    }
+}
+
+fn is_visual_within_schedule_proximity(v: &Visual) -> bool {
+    let is_schedule = v.id.starts_with("cal-") && !v.id.starts_with("cal-notif-") && v.domain == "日程";
+    let is_alarm = v.id.starts_with("alarm-") && v.domain == "闹钟";
+    if !is_schedule && !is_alarm {
+        return true;
+    }
+    let Some(target_min) = parse_leading_hm_minutes(&v.metric) else {
+        return true;
+    };
+    let now_local = chrono::Local::now();
+    let now_min = (chrono::Timelike::hour(&now_local) as i32) * 60
+        + (chrono::Timelike::minute(&now_local) as i32);
+    let diff = target_min - now_min;
+    if is_alarm {
+        (0..=PROXIMITY_WINDOW_MINS).contains(&diff)
+    } else {
+        diff <= PROXIMITY_WINDOW_MINS
+    }
+}
 
 #[derive(Clone)]
 pub(super) struct Visual {
@@ -66,6 +101,13 @@ impl Carousel {
     pub fn sync(&mut self, items: Vec<Visual>, enabled: bool, popover_open: bool, now: Instant) {
         #[cfg(feature = "ui-capture")]
         let items = self.preview.clone().unwrap_or(items);
+        let mut items: Vec<Visual> = items
+            .into_iter()
+            .filter(is_visual_within_schedule_proximity)
+            .collect();
+        if items.len() > MAX_CAPSULE_MOTION_ENTRIES {
+            items.truncate(MAX_CAPSULE_MOTION_ENTRIES);
+        }
         if items.is_empty() {
             self.items.clear();
             self.outgoing = None;
@@ -191,11 +233,22 @@ impl Carousel {
 
     pub fn presentations(&self) -> Vec<Visual> {
         let mut rows = self.items.clone();
+        if rows.len() > MAX_CAPSULE_MOTION_ENTRIES {
+            rows.truncate(MAX_CAPSULE_MOTION_ENTRIES);
+        }
         for visual in [&self.current, &self.outgoing].into_iter().flatten() {
             if !rows
                 .iter()
                 .any(|v| v.id == visual.id && v.revision == visual.revision)
             {
+                if rows.len() >= MAX_CAPSULE_MOTION_ENTRIES && !rows.is_empty() {
+                    if let Some(evict_idx) = rows.iter().rposition(|v| {
+                        self.current.as_ref().is_none_or(|c| c.paint_key() != v.paint_key())
+                            && self.outgoing.as_ref().is_none_or(|o| o.paint_key() != v.paint_key())
+                    }) {
+                        rows.remove(evict_idx);
+                    }
+                }
                 rows.push(visual.clone());
             }
         }
@@ -281,7 +334,34 @@ pub(super) struct CapsuleMotion {
 }
 
 impl CapsuleMotion {
-    pub fn new(state: Rc<RefCell<Carousel>>, rows: Vec<(String, El)>, dark: bool) -> Self {
+    pub fn new(state: Rc<RefCell<Carousel>>, mut rows: Vec<(String, El)>, dark: bool) -> Self {
+        if rows.len() > MAX_CAPSULE_MOTION_ENTRIES {
+            let (cur_key, out_key) = {
+                let st = state.borrow();
+                (
+                    st.current.as_ref().map(Visual::paint_key),
+                    st.outgoing.as_ref().map(Visual::paint_key),
+                )
+            };
+            let mut kept = Vec::with_capacity(MAX_CAPSULE_MOTION_ENTRIES);
+            let mut seen = std::collections::HashSet::with_capacity(MAX_CAPSULE_MOTION_ENTRIES);
+            for (k, el) in rows.drain(..) {
+                let is_active = cur_key.as_deref() == Some(k.as_str())
+                    || out_key.as_deref() == Some(k.as_str());
+                if (kept.len() < MAX_CAPSULE_MOTION_ENTRIES || is_active) && seen.insert(k.clone()) {
+                    if kept.len() >= MAX_CAPSULE_MOTION_ENTRIES {
+                        if let Some(evict_idx) = kept.iter().rposition(|(ek, _): &(String, El)| {
+                            cur_key.as_deref() != Some(ek.as_str())
+                                && out_key.as_deref() != Some(ek.as_str())
+                        }) {
+                            kept.remove(evict_idx);
+                        }
+                    }
+                    kept.push((k, el));
+                }
+            }
+            rows = kept;
+        }
         Self {
             state,
             rows,
@@ -719,5 +799,31 @@ mod tests {
         }
         assert_eq!(smooth(0.), 0.);
         assert_eq!(smooth(1.), 1.);
+    }
+
+    #[test]
+    fn prunes_stale_entries_above_128_while_preserving_active_transition() {
+        let now = Instant::now();
+        let mut state = Carousel::default();
+        state.sync(vec![visual("active-outgoing")], true, false, now);
+        let many: Vec<Visual> = (0..220).map(|i| visual(&format!("notif-{i}"))).collect();
+        state.sync(many, true, false, now + Duration::from_secs(1));
+        let presentations = state.presentations();
+        assert!(
+            presentations.len() <= MAX_CAPSULE_MOTION_ENTRIES,
+            "presentations must be bounded to <= 128, got {}",
+            presentations.len()
+        );
+        assert!(presentations.iter().any(|v| v.id == "active-outgoing"));
+        assert!(presentations.iter().any(|v| v.id == "notif-0"));
+
+        let rc = Rc::new(RefCell::new(state));
+        let raw_rows: Vec<(String, El)> = (0..200)
+            .map(|i| (format!("row-{i}"), Empty::new().finish()))
+            .chain([("active-outgoing".into(), Empty::new().finish())])
+            .collect();
+        let motion = CapsuleMotion::new(rc, raw_rows, false);
+        assert!(motion.rows.len() <= MAX_CAPSULE_MOTION_ENTRIES);
+        assert!(motion.rows.iter().any(|(k, _)| k == "active-outgoing"));
     }
 }

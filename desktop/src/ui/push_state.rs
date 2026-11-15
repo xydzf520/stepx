@@ -211,6 +211,7 @@ pub(super) struct PushUiState {
     pub parcel_receipts: stepx_companion::parcel_state::CompletionIndex,
     pub active_toasts: Vec<DesktopToastItem>,
     pub seen_toast_keys: HashSet<String>,
+    pub seen_toast_order: std::collections::VecDeque<String>,
     pub shell_mode: ShellMode,
     pub pin_window: bool,
     pub clipboard_preview: String,
@@ -221,6 +222,7 @@ pub(super) struct PushUiState {
 }
 
 pub(super) const MAX_SEEN_TOAST_KEYS: usize = 2048;
+pub(super) const RETAIN_RECENT_SEEN_TOAST_KEYS: usize = 1024;
 const MAX_IM_DRAFTS: usize = 128;
 
 impl PushUiState {
@@ -239,11 +241,22 @@ impl PushUiState {
         true
     }
 
-    fn snapshot_active_toast_keys(next: &PushSnapshot) -> HashSet<String> {
+    pub(super) fn snapshot_active_toast_keys(next: &PushSnapshot) -> HashSet<String> {
         let mut active_keys = HashSet::with_capacity(
-            next.notifications.len() * 2 + next.threads.len() * 2 + next.otp_banners.len(),
+            next.notifications.len() * 3 + next.threads.len() * 4 + next.otp_banners.len(),
         );
         for n in &next.notifications {
+            let base_key = if !n.key.is_empty() {
+                n.key.clone()
+            } else {
+                format!("seq:{}", n.seq_id)
+            };
+            active_keys.insert(format!(
+                "{}::{}::{}",
+                base_key,
+                n.post_time_ms,
+                n.text.trim()
+            ));
             if !n.key.is_empty() {
                 active_keys.insert(n.key.clone());
             }
@@ -252,9 +265,21 @@ impl PushUiState {
         for t in &next.threads {
             if !t.thread_id.is_empty() {
                 active_keys.insert(t.thread_id.clone());
+                active_keys.insert(format!(
+                    "{}::{}::{}",
+                    t.thread_id,
+                    t.last_timestamp_ms,
+                    t.last_message.trim()
+                ));
             }
             if !t.notification_key.is_empty() {
                 active_keys.insert(t.notification_key.clone());
+                active_keys.insert(format!(
+                    "{}::{}::{}",
+                    t.notification_key,
+                    t.last_timestamp_ms,
+                    t.last_message.trim()
+                ));
             }
         }
         for b in &next.otp_banners {
@@ -265,53 +290,91 @@ impl PushUiState {
         active_keys
     }
 
-    /// Bound `seen_toast_keys` at `MAX_SEEN_TOAST_KEYS` (2048) entries by retaining
-    /// keys still present in the current `PushSnapshot` and evicting stale keys when full.
-    pub(super) fn cap_seen_toast_keys(&mut self, next: &PushSnapshot) {
-        if self.seen_toast_keys.len() < MAX_SEEN_TOAST_KEYS {
-            return;
-        }
-        let active_keys = Self::snapshot_active_toast_keys(next);
-        if !active_keys.is_empty() {
-            self.seen_toast_keys.retain(|k| active_keys.contains(k));
-        }
-        while self.seen_toast_keys.len() > MAX_SEEN_TOAST_KEYS {
-            let victim = self
+    pub(super) fn sync_seen_toast_order(&mut self) {
+        self.seen_toast_order.retain(|k| self.seen_toast_keys.contains(k));
+        if self.seen_toast_order.len() < self.seen_toast_keys.len() {
+            let known: HashSet<String> = self.seen_toast_order.iter().cloned().collect();
+            let mut missing: Vec<String> = self
                 .seen_toast_keys
                 .iter()
-                .find(|k| !active_keys.contains(*k))
-                .or_else(|| self.seen_toast_keys.iter().next())
-                .cloned();
-            let Some(victim) = victim else {
-                break;
-            };
-            self.seen_toast_keys.remove(&victim);
+                .filter(|k| !known.contains(*k))
+                .cloned()
+                .collect();
+            missing.sort();
+            for k in missing {
+                self.seen_toast_order.push_back(k);
+            }
         }
     }
 
+    /// Bound `seen_toast_keys` at `MAX_SEEN_TOAST_KEYS` (2048) entries by retaining
+    /// active composite keys plus a recent FIFO/LRU tail (`RETAIN_RECENT_SEEN_TOAST_KEYS`),
+    /// never wiping all seen keys to zero.
+    pub(super) fn cap_seen_toast_keys(&mut self, next: &PushSnapshot) {
+        if self.seen_toast_keys.len() <= MAX_SEEN_TOAST_KEYS {
+            return;
+        }
+        self.sync_seen_toast_order();
+        let active_keys = Self::snapshot_active_toast_keys(next);
+        let mut keep: HashSet<String> = self
+            .seen_toast_keys
+            .iter()
+            .filter(|k| active_keys.contains(*k))
+            .take(MAX_SEEN_TOAST_KEYS)
+            .cloned()
+            .collect();
+        let target_keep = RETAIN_RECENT_SEEN_TOAST_KEYS
+            .max(keep.len())
+            .min(MAX_SEEN_TOAST_KEYS);
+        for k in self.seen_toast_order.iter().rev() {
+            if keep.len() >= target_keep {
+                break;
+            }
+            if self.seen_toast_keys.contains(k) {
+                keep.insert(k.clone());
+            }
+        }
+        self.seen_toast_keys.retain(|k| keep.contains(k));
+        self.seen_toast_order.retain(|k| self.seen_toast_keys.contains(k));
+    }
+
     pub(super) fn enforce_seen_toast_keys_bound(&mut self, next: &PushSnapshot) {
+        self.sync_seen_toast_order();
         if self.seen_toast_keys.len() > MAX_SEEN_TOAST_KEYS {
             self.cap_seen_toast_keys(next);
         }
     }
 
     pub(super) fn insert_seen_toast_key(&mut self, key: String, next: &PushSnapshot) {
-        if !self.seen_toast_keys.contains(&key) && self.seen_toast_keys.len() >= MAX_SEEN_TOAST_KEYS
-        {
+        if self.seen_toast_keys.contains(&key) {
+            self.seen_toast_order.retain(|k| k != &key);
+            self.seen_toast_order.push_back(key);
+            return;
+        }
+        if self.seen_toast_keys.len() >= MAX_SEEN_TOAST_KEYS {
+            self.sync_seen_toast_order();
             let active_keys = Self::snapshot_active_toast_keys(next);
             while self.seen_toast_keys.len() >= MAX_SEEN_TOAST_KEYS {
                 let victim = self
-                    .seen_toast_keys
+                    .seen_toast_order
                     .iter()
-                    .find(|k| !active_keys.contains(*k))
-                    .or_else(|| self.seen_toast_keys.iter().next())
-                    .cloned();
+                    .position(|k| !active_keys.contains(k))
+                    .and_then(|idx| self.seen_toast_order.remove(idx))
+                    .or_else(|| self.seen_toast_order.pop_front())
+                    .or_else(|| {
+                        self.seen_toast_keys
+                            .iter()
+                            .find(|k| !active_keys.contains(*k))
+                            .or_else(|| self.seen_toast_keys.iter().next())
+                            .cloned()
+                    });
                 let Some(victim) = victim else {
                     break;
                 };
                 self.seen_toast_keys.remove(&victim);
             }
         }
+        self.seen_toast_order.push_back(key.clone());
         self.seen_toast_keys.insert(key);
     }
 }
@@ -356,6 +419,7 @@ impl Default for PushUiState {
             },
             active_toasts: Vec::new(),
             seen_toast_keys: HashSet::new(),
+            seen_toast_order: std::collections::VecDeque::new(),
             shell_mode: ShellMode::Full,
             pin_window: false,
             clipboard_preview: String::new(),
@@ -603,7 +667,7 @@ impl Companion {
                 active: true,
                 is_clearable: true,
                 read: is_read,
-                can_reply: true,
+                can_reply: otp.is_none() && delivery.is_none(),
                 thread_id: format!("sms:{}", m.address.trim()),
                 otp_code: otp,
                 ..Default::default()
@@ -745,12 +809,12 @@ impl Companion {
             let mut syn_can_reply = false;
             if let Some(tid) = item.id.strip_prefix("im-thread:") {
                 syn_thread_id = tid.to_string();
-                syn_can_reply = true;
+                syn_can_reply = item.can_inline_reply;
             } else if let Some(rest) = item.id.strip_prefix("sms:") {
                 let addr = rest.split(':').next().unwrap_or(rest).trim();
                 if !addr.is_empty() {
                     syn_thread_id = format!("sms:{addr}");
-                    syn_can_reply = true;
+                    syn_can_reply = item.can_inline_reply;
                 }
                 if let Some(m) = self
                     .sms
@@ -935,7 +999,8 @@ impl Companion {
                     m.date_ms,
                     code
                 );
-                if self.push.seen_toast_keys.insert(seen_key) {
+                if self.push.seen_toast_keys.insert(seen_key.clone()) {
+                    self.push.seen_toast_order.push_back(seen_key);
                     return Some(code);
                 }
             }
@@ -1328,7 +1393,11 @@ impl Companion {
                     .retain(|t| t.otp_code.as_deref() != Some(code.as_str()));
                 self.sync_notification_center();
                 self.sync_desktop_popup_window(ctx);
-                self.status = format!("已复制验证码 {code}");
+                self.status = if self.push.prefs.privacy_mask {
+                    "已复制验证码 ••••••".to_string()
+                } else {
+                    format!("已复制验证码 {code}")
+                };
             }
             PushAction::OpenUrl(url) => {
                 ctx.clipboard()
@@ -2832,6 +2901,19 @@ impl Companion {
         }
     }
 
+    fn restore_failed_im_draft(&mut self, tid: String, text: String) {
+        if text.trim().is_empty() {
+            return;
+        }
+        if self.push.selected_im_thread.as_ref() == Some(&tid)
+            && self.fields[F_IM_REPLY].text.is_empty()
+        {
+            self.fields[F_IM_REPLY].set(&text);
+        } else {
+            self.push.im_drafts.entry(tid).or_insert(text);
+        }
+    }
+
     pub(super) fn dispatch_im_reply(
         &mut self,
         thread_id: &str,
@@ -2840,8 +2922,47 @@ impl Companion {
         text: &str,
         notif_key: Option<&str>,
     ) {
+        let _ = self.dispatch_im_reply_inner(
+            thread_id,
+            package_name,
+            title,
+            text,
+            notif_key,
+            true,
+        );
+    }
+
+    pub(super) fn dispatch_im_reply_for_popup(
+        &mut self,
+        thread_id: &str,
+        package_name: &str,
+        title: &str,
+        text: &str,
+        notif_key: Option<&str>,
+    ) -> Option<String> {
+        let mark_read_immediately = self.demo_mode;
+        self.dispatch_im_reply_inner(
+            thread_id,
+            package_name,
+            title,
+            text,
+            notif_key,
+            mark_read_immediately,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_im_reply_inner(
+        &mut self,
+        thread_id: &str,
+        package_name: &str,
+        title: &str,
+        text: &str,
+        notif_key: Option<&str>,
+        mark_read_immediately: bool,
+    ) -> Option<String> {
         if text.trim().is_empty() {
-            return;
+            return None;
         }
         if self
             .push
@@ -2855,7 +2976,7 @@ impl Companion {
             })
         {
             self.status = "这条回复仍在发送队列中，请等待手机确认".into();
-            return;
+            return None;
         }
         let now_ms = chrono::Utc::now().timestamp_millis();
         self.push.next_client_msg_seq = self.push.next_client_msg_seq.wrapping_add(1);
@@ -2863,9 +2984,20 @@ impl Companion {
         if !self.demo_mode && self.selected.is_none() {
             self.status = "手机已断开，消息未发送".into();
             self.error = true;
-            return;
+            return None;
         }
         let immediate_sent = self.demo_mode || self.selected.is_none();
+        let saved_unread: Vec<(String, usize)> = if !mark_read_immediately && !immediate_sent {
+            self.push
+                .snapshot
+                .threads
+                .iter()
+                .filter(|t| t.unread_count > 0)
+                .map(|t| (t.thread_id.clone(), t.unread_count))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let (effective_tid, effective_title) = record_local_outgoing_attempt(
             &mut self.push.snapshot,
             thread_id,
@@ -2877,22 +3009,37 @@ impl Companion {
             now_ms,
             immediate_sent,
         );
-
-        for n in &mut self.push.snapshot.notifications {
-            if n.thread_id == effective_tid
-                || n.thread_id == thread_id
-                || notif_key.is_some_and(|k| n.key == k)
-                || (n.package_name == package_name
-                    && (n.title == effective_title || n.title == title))
-            {
-                n.read = true;
+        if !mark_read_immediately && !immediate_sent {
+            for (tid, count) in saved_unread {
+                if let Some(t) = self
+                    .push
+                    .snapshot
+                    .threads
+                    .iter_mut()
+                    .find(|t| t.thread_id == tid)
+                {
+                    t.unread_count = count;
+                }
             }
         }
-        self.push.active_toasts.retain(|t| {
-            t.thread_id != effective_tid
-                && t.thread_id != thread_id
-                && notif_key.is_none_or(|k| t.notification_key != k)
-        });
+
+        if mark_read_immediately || immediate_sent {
+            for n in &mut self.push.snapshot.notifications {
+                if n.thread_id == effective_tid
+                    || n.thread_id == thread_id
+                    || notif_key.is_some_and(|k| n.key == k)
+                    || (n.package_name == package_name
+                        && (n.title == effective_title || n.title == title))
+                {
+                    n.read = true;
+                }
+            }
+            self.push.active_toasts.retain(|t| {
+                t.thread_id != effective_tid
+                    && t.thread_id != thread_id
+                    && notif_key.is_none_or(|k| t.notification_key != k)
+            });
+        }
         self.sync_notification_center();
         Self::scroll_to_end(&self.sms_messages_scroll);
 
@@ -2902,7 +3049,7 @@ impl Companion {
             self.push.reply_error = None;
             self.push.last_reply_status = Some("已通过后台发送回复".to_string());
             self.status = format!("已通过后台发送回复（{effective_title}）");
-            return;
+            return Some(client_msg_id);
         }
 
         if immediate_sent {
@@ -2912,7 +3059,7 @@ impl Companion {
             let status_msg = format!("已通过后台发送回复「{effective_title}」：{text}");
             self.push.last_reply_status = Some(status_msg.clone());
             self.status = status_msg;
-            return;
+            return Some(client_msg_id);
         }
 
         if self.selected.is_some() {
@@ -2926,7 +3073,7 @@ impl Companion {
             };
             self.push.reply_queue.push_back(QueuedReplyJob {
                 device_serial: self.selected.as_ref().unwrap().serial.clone(),
-                client_msg_id,
+                client_msg_id: client_msg_id.clone(),
                 thread_id: effective_tid,
                 package_name: package_name.to_string(),
                 title: clean_ttl,
@@ -2935,6 +3082,7 @@ impl Companion {
             });
             self.pump_reply_queue();
         }
+        Some(client_msg_id)
     }
 
     pub(super) fn pump_reply_queue(&mut self) {
@@ -2947,34 +3095,81 @@ impl Companion {
             self.status = waiting;
             return;
         }
-        let Some(job) = self.push.reply_queue.pop_front() else {
+        let Some(first_job) = self.push.reply_queue.pop_front() else {
             self.push.sending_thread = None;
             self.push.reply_in_flight = false;
             return;
         };
         let Some(device) = self.selected.clone() else {
+            let reason = "手机已断开，回复未发送".to_string();
+            let mut evicted = vec![first_job];
+            evicted.extend(self.push.reply_queue.drain(..));
+            for qjob in evicted {
+                let mut restored = apply_reply_failure_for_attempt(
+                    &mut self.push.snapshot,
+                    &qjob.client_msg_id,
+                    &reason,
+                );
+                if restored.is_empty() {
+                    restored.push((qjob.thread_id.clone(), qjob.text.clone()));
+                }
+                for (tid, text) in restored {
+                    self.restore_failed_im_draft(tid, text);
+                }
+                self.on_popup_im_reply_finished(&qjob.client_msg_id, Err(reason.clone()));
+            }
             self.push.active_reply_job = None;
             self.push.sending_thread = None;
             self.push.reply_in_flight = false;
-            self.push.reply_queue.clear();
+            self.push.reply_error = Some(reason.clone());
+            self.push.last_reply_status = Some(reason.clone());
+            self.status = reason;
+            self.error = true;
             return;
         };
-        if device.serial != job.device_serial {
-            apply_reply_failure_for_attempt(
-                &mut self.push.snapshot,
-                &job.client_msg_id,
-                "手机已切换，回复未发送",
-            );
-            self.push.reply_error = Some("手机已切换，旧手机的排队回复已停止".into());
-            self.status = self.push.reply_error.clone().unwrap();
+
+        let mut next_valid_job = None;
+        let mut candidates = std::collections::VecDeque::from([first_job]);
+        candidates.extend(self.push.reply_queue.drain(..));
+        let mut had_switched_failure = false;
+        while let Some(candidate) = candidates.pop_front() {
+            if candidate.device_serial != device.serial {
+                had_switched_failure = true;
+                let reason = "手机已切换，回复未发送".to_string();
+                let mut restored = apply_reply_failure_for_attempt(
+                    &mut self.push.snapshot,
+                    &candidate.client_msg_id,
+                    &reason,
+                );
+                if restored.is_empty() {
+                    restored.push((candidate.thread_id.clone(), candidate.text.clone()));
+                }
+                for (tid, text) in restored {
+                    self.restore_failed_im_draft(tid, text);
+                }
+                self.on_popup_im_reply_finished(&candidate.client_msg_id, Err(reason));
+            } else if next_valid_job.is_none() {
+                next_valid_job = Some(candidate);
+            } else {
+                self.push.reply_queue.push_back(candidate);
+            }
+        }
+        if had_switched_failure && next_valid_job.is_none() {
+            let err_msg = "手机已切换，旧手机的排队回复已停止".to_string();
+            self.push.reply_error = Some(err_msg.clone());
+            self.push.last_reply_status = Some(err_msg.clone());
+            self.status = err_msg;
             self.error = true;
             self.push.sending_thread = None;
             self.push.reply_in_flight = false;
-            self.push
-                .reply_queue
-                .retain(|queued| queued.device_serial == device.serial);
             return;
         }
+        let Some(job) = next_valid_job else {
+            self.push.sending_thread = None;
+            self.push.reply_in_flight = false;
+            return;
+        };
+
         self.push.active_reply_job = Some(job.clone());
         self.push.sending_thread = Some(job.thread_id.clone());
         self.push.reply_in_flight = true;
@@ -2994,6 +3189,12 @@ impl Companion {
         let tx = self.push.outcome_tx.clone();
         let serial = device.serial.clone();
         std::thread::spawn(move || {
+            let mut guard = ReplyWorkerGuard::new(
+                tx.clone(),
+                serial.clone(),
+                job.thread_id.clone(),
+                job.client_msg_id.clone(),
+            );
             let res = Adb::discover()
                 .and_then(|adb| {
                     let transport = device.resolve_active_transport(&adb)?;
@@ -3017,12 +3218,7 @@ impl Companion {
                     )
                 })
                 .map_err(|e| format!("{e:#}"));
-            let _ = tx.send(PushOutcome::ReplyFinished(
-                serial,
-                job.thread_id,
-                job.client_msg_id,
-                res,
-            ));
+            guard.complete(res);
         });
     }
 
@@ -3033,16 +3229,17 @@ impl Companion {
         client_msg_id: &str,
         result: Result<ReplyReceipt, String>,
     ) {
-        if !self.demo_mode
-            && (self.selected.as_ref().is_none_or(|d| d.serial != serial)
-                || !self.push.active_reply_job.as_ref().is_some_and(|job| {
-                    job.device_serial == serial
-                        && job.thread_id == thread_id
-                        && job.client_msg_id == client_msg_id
-                }))
-        {
+        let matches_active = self.push.active_reply_job.as_ref().is_some_and(|job| {
+            job.device_serial == serial
+                && job.thread_id == thread_id
+                && job.client_msg_id == client_msg_id
+        });
+        if !self.demo_mode && !matches_active {
             return;
         }
+        let active_job = self.push.active_reply_job.take();
+        let device_still_matches =
+            self.demo_mode || self.selected.as_ref().is_some_and(|d| d.serial == serial);
         let result = result.and_then(|mut receipt| {
             if !receipt.ok
                 || (!receipt.client_msg_id.is_empty() && receipt.client_msg_id != client_msg_id)
@@ -3056,7 +3253,22 @@ impl Companion {
         });
         match result {
             Ok(receipt) => {
-                apply_reply_success_to_snapshot(&mut self.push.snapshot, &receipt);
+                if device_still_matches || self.selected.is_none() {
+                    apply_reply_success_to_snapshot(&mut self.push.snapshot, &receipt);
+                    for t in &mut self.push.snapshot.threads {
+                        if t.thread_id == thread_id || t.thread_id == receipt.thread_id {
+                            t.unread_count = 0;
+                        }
+                    }
+                    for n in &mut self.push.snapshot.notifications {
+                        if n.thread_id == thread_id || n.thread_id == receipt.thread_id {
+                            n.read = true;
+                        }
+                    }
+                    self.push.active_toasts.retain(|t| {
+                        t.thread_id != thread_id && t.thread_id != receipt.thread_id
+                    });
+                }
                 let message = if receipt.message.is_empty() || receipt.message == "已发送" {
                     "手机已确认发送回复".to_string()
                 } else {
@@ -3066,18 +3278,18 @@ impl Companion {
                 self.push.reply_error = None;
                 self.status = message;
                 self.error = false;
+                self.on_popup_im_reply_finished(client_msg_id, Ok(()));
             }
             Err(error) => {
-                let restored =
+                let mut restored =
                     apply_reply_failure_for_attempt(&mut self.push.snapshot, client_msg_id, &error);
-                for (tid, text) in restored {
-                    if self.push.selected_im_thread.as_ref() == Some(&tid)
-                        && self.fields[F_IM_REPLY].text.is_empty()
-                    {
-                        self.fields[F_IM_REPLY].set(&text);
-                    } else {
-                        self.push.im_drafts.entry(tid).or_insert(text);
+                if restored.is_empty() && !reply_failure_is_uncertain(&error) {
+                    if let Some(job) = &active_job {
+                        restored.push((job.thread_id.clone(), job.text.clone()));
                     }
+                }
+                for (tid, text) in restored {
+                    self.restore_failed_im_draft(tid, text);
                 }
                 self.status = if reply_failure_is_uncertain(&error) {
                     format!("回复状态未核实：{error}；请先查看手机会话，避免重复发送")
@@ -3085,8 +3297,9 @@ impl Companion {
                     format!("回复未完成：{error}")
                 };
                 self.push.last_reply_status = Some(self.status.clone());
-                self.push.reply_error = Some(error);
+                self.push.reply_error = Some(error.clone());
                 self.error = true;
+                self.on_popup_im_reply_finished(client_msg_id, Err(error));
             }
         }
         self.push.active_reply_job = None;
@@ -3194,7 +3407,11 @@ impl Companion {
                                 if let Some(code) = &toast.otp_code {
                                     ctx.clipboard()
                                         .write(ClipboardContent::plain_text(code.clone()));
-                                    self.status = format!("已自动复制验证码 {code} 到剪贴板");
+                                    self.status = if self.push.prefs.privacy_mask {
+                                        "已自动复制验证码 •••••• 到剪贴板".to_string()
+                                    } else {
+                                        format!("已自动复制验证码 {code} 到剪贴板")
+                                    };
                                 }
                             }
                             // Unified 360-style single-window popup replaces OS CLI toasts
@@ -3306,7 +3523,7 @@ impl Companion {
                                 self.push.active_toasts.push(DesktopToastItem {
                                     id: popup.id,
                                     timestamp_ms: now_ms,
-                                    can_reply: true,
+                                    can_reply: popup.can_inline_reply,
                                     ..Default::default()
                                 });
                             }
@@ -3321,6 +3538,8 @@ impl Companion {
             }
             PushOutcome::ReplyFinished(serial, thread_id, client_msg_id, res) => {
                 self.finish_im_reply(&serial, &thread_id, &client_msg_id, res);
+                self.sync_notification_center();
+                self.sync_desktop_popup_window(ctx);
             }
             PushOutcome::ActiveWindowSynced(serial, res) => {
                 if !self.demo_mode && self.selected.as_ref().is_none_or(|d| d.serial != serial) {
@@ -3446,7 +3665,11 @@ impl Companion {
         if let Some(code) = self.maybe_auto_copy_sms_otp() {
             ctx.clipboard()
                 .write(ClipboardContent::plain_text(code.clone()));
-            self.status = format!("已自动复制验证码 {code} 到剪贴板");
+            self.status = if self.push.prefs.privacy_mask {
+                "已自动复制验证码 •••••• 到剪贴板".to_string()
+            } else {
+                format!("已自动复制验证码 {code} 到剪贴板")
+            };
             changed = true;
         }
         while let Ok(mut outcome) = self.push.outcome_rx.try_recv() {
@@ -3509,6 +3732,54 @@ impl Companion {
             .active_toasts
             .retain(|toast| demo || center.is_current_popup_time(toast.timestamp_ms, now_ms));
         self.push.active_toasts.len() != previous
+    }
+}
+
+struct ReplyWorkerGuard {
+    tx: mpsc::Sender<PushOutcome>,
+    serial: String,
+    thread_id: String,
+    client_msg_id: String,
+    completed: bool,
+}
+
+impl ReplyWorkerGuard {
+    fn new(
+        tx: mpsc::Sender<PushOutcome>,
+        serial: String,
+        thread_id: String,
+        client_msg_id: String,
+    ) -> Self {
+        Self {
+            tx,
+            serial,
+            thread_id,
+            client_msg_id,
+            completed: false,
+        }
+    }
+
+    fn complete(&mut self, res: Result<ReplyReceipt, String>) {
+        self.completed = true;
+        let _ = self.tx.send(PushOutcome::ReplyFinished(
+            std::mem::take(&mut self.serial),
+            std::mem::take(&mut self.thread_id),
+            std::mem::take(&mut self.client_msg_id),
+            res,
+        ));
+    }
+}
+
+impl Drop for ReplyWorkerGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            let _ = self.tx.send(PushOutcome::ReplyFinished(
+                std::mem::take(&mut self.serial),
+                std::mem::take(&mut self.thread_id),
+                std::mem::take(&mut self.client_msg_id),
+                Err("后台回复工作线程异常中断，回复未完成".into()),
+            ));
+        }
     }
 }
 
@@ -4957,5 +5228,104 @@ mod tests {
         });
         assert_eq!(app.maybe_auto_copy_sms_otp().as_deref(), Some("839201"));
         assert_eq!(app.maybe_auto_copy_sms_otp(), None);
+    }
+
+    #[test]
+    fn disconnect_or_worker_panic_clears_active_reply_job_and_restores_drafts() {
+        let (_dir, _guard, mut app) = pending_reply_app();
+        // Queue a second reply behind the active one, then simulate transient disconnect.
+        app.push.reply_queue.push_back(QueuedReplyJob {
+            device_serial: "phone-a".into(),
+            client_msg_id: "client-b".into(),
+            thread_id: "thread-b".into(),
+            package_name: "com.tencent.mm".into(),
+            title: "thread-b".into(),
+            text: "other pending reply".into(),
+            mode: ReplyMode::Auto,
+        });
+        app.selected = None;
+
+        // Finishing the in-flight job while selected is None must NOT wedge active_reply_job,
+        // and must fail + restore both the active job and the queued job.
+        app.finish_im_reply(
+            "phone-a",
+            "thread-a",
+            "client-a",
+            Err("设备已断开".into()),
+        );
+        assert!(app.push.active_reply_job.is_none());
+        assert!(app.push.reply_queue.is_empty());
+        assert!(!app.push.reply_in_flight);
+        assert_eq!(app.fields[F_IM_REPLY].text, "first reply");
+        assert_eq!(
+            app.push.im_drafts.get("thread-b").map(String::as_str),
+            Some("other pending reply")
+        );
+
+        // Verify ReplyWorkerGuard sends a terminal Err on panic instead of hanging forever.
+        let (tx, rx) = mpsc::channel();
+        let panic_res = std::panic::catch_unwind(|| {
+            let _guard = ReplyWorkerGuard::new(
+                tx,
+                "phone-a".into(),
+                "thread-a".into(),
+                "client-panic".into(),
+            );
+            panic!("simulated reply worker panic");
+        });
+        assert!(panic_res.is_err());
+        match rx.try_recv().expect("drop guard must send terminal ReplyFinished") {
+            PushOutcome::ReplyFinished(s, tid, cid, Err(err)) => {
+                assert_eq!(s, "phone-a");
+                assert_eq!(tid, "thread-a");
+                assert_eq!(cid, "client-panic");
+                assert!(err.contains("异常中断"));
+            }
+            other => panic!("unexpected outcome: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn cap_seen_toast_keys_retains_composite_active_keys_and_recent_tail_without_wiping() {
+        let mut push = PushUiState::default();
+        let snap = PushSnapshot {
+            revision: 10,
+            notifications: vec![push::PushNotification {
+                key: "0|com.tencent.mm|1|null|100".into(),
+                package_name: "com.tencent.mm".into(),
+                title: "张三".into(),
+                text: "你好世界".into(),
+                post_time_ms: 1_775_000_000_000,
+                can_reply: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let active_composite = "0|com.tencent.mm|1|null|100::1775000000000::你好世界".to_string();
+        push.seen_toast_keys.insert(active_composite.clone());
+        push.seen_toast_order.push_back(active_composite.clone());
+        for i in 0..2100 {
+            let k = format!("0|com.other|{}|null|100::{}::msg-{i}", i, 1_775_000_000_000_i64 + i);
+            push.seen_toast_keys.insert(k.clone());
+            push.seen_toast_order.push_back(k);
+        }
+        assert!(push.seen_toast_keys.len() > MAX_SEEN_TOAST_KEYS);
+
+        push.cap_seen_toast_keys(&snap);
+        assert!(
+            push.seen_toast_keys.contains(&active_composite),
+            "active composite key must survive cap_seen_toast_keys"
+        );
+        assert!(
+            push.seen_toast_keys.len() >= RETAIN_RECENT_SEEN_TOAST_KEYS,
+            "recent FIFO/LRU tail must be retained instead of wiping to zero (got {})",
+            push.seen_toast_keys.len()
+        );
+        assert!(push.seen_toast_keys.len() <= MAX_SEEN_TOAST_KEYS);
+        assert!(
+            push.seen_toast_keys
+                .contains("0|com.other|2099|null|100::1775000002099::msg-2099"),
+            "newest seen keys must be preserved"
+        );
     }
 }

@@ -90,6 +90,37 @@ fn read_links(dir: &Path, scope_id: &str) -> Result<Links> {
     Ok(links)
 }
 
+/// Extracts the first `http://` or `https://` URL from `text`, stopping cleanly at
+/// non-ASCII / CJK punctuation (`c > '\u{007f}'`), whitespace, control characters,
+/// or surrounding brackets/quotes.
+pub fn extract_first_url(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let start_idx = trimmed
+        .find("https://")
+        .or_else(|| trimmed.find("http://"))?;
+    let tail = &trimmed[start_idx..];
+    let raw_url: String = tail
+        .chars()
+        .take_while(|c| {
+            *c <= '\u{007f}'
+                && !c.is_whitespace()
+                && !c.is_ascii_control()
+                && !matches!(c, ')' | '(' | ']' | '[' | '>' | '<' | '"' | '\'')
+        })
+        .collect();
+    let cleaned = raw_url
+        .trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | '!' | '?'))
+        .to_string();
+    if cleaned.len() > "https://a.b".len() {
+        Some(cleaned)
+    } else {
+        None
+    }
+}
+
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Ok(meta) = fs::symlink_metadata(path) {
         ensure!(
@@ -244,9 +275,7 @@ pub fn create(
         event.source_label()
     );
     markdown.push_str(&format!("- 整理时间：{}\n\n", absolute(now_ms)));
-    if let Some(url) =
-        crate::home_hub::extract_meeting_url(&format!("{} {}", event.location, event.description))
-    {
+    if let Some(url) = extract_first_url(&format!("{} {}", event.location, event.description)) {
         markdown.push_str(&format!("- 入会链接：{url}\n\n"));
     }
     if !event.description.trim().is_empty() {
@@ -431,5 +460,33 @@ mod tests {
         assert!(brief.path.is_file());
         let second = create(root.path(), "phone", Some("b"), &event, 1_793_330_000_000).unwrap();
         assert_ne!(brief.path.parent(), second.path.parent());
+    }
+
+    #[test]
+    fn extract_first_url_stops_at_cjk_punctuation_and_non_ascii_suffix() {
+        assert_eq!(
+            extract_first_url("https://meeting.tencent.com/dm/AbCdEfGh，请准时参加").as_deref(),
+            Some("https://meeting.tencent.com/dm/AbCdEfGh")
+        );
+        assert_eq!(
+            extract_first_url("会议链接：https://vc.feishu.cn/j/123456789（密码8888）").as_deref(),
+            Some("https://vc.feishu.cn/j/123456789")
+        );
+        let root = tempfile::tempdir().unwrap();
+        let event = PhoneCalendarEvent {
+            id: 2,
+            dtstart: 1_793_332_800_000,
+            dtend: 1_793_336_400_000,
+            title: "周会".into(),
+            description: "腾讯会议：https://meeting.tencent.com/dm/AbCdEfGh，请准时参加".into(),
+            ..Default::default()
+        };
+        let brief = create(root.path(), "phone", Some("a"), &event, 1_793_330_000_000).unwrap();
+        assert!(brief
+            .markdown
+            .contains("- 入会链接：https://meeting.tencent.com/dm/AbCdEfGh\n"));
+        assert!(!brief
+            .markdown
+            .contains("- 入会链接：https://meeting.tencent.com/dm/AbCdEfGh，"));
     }
 }

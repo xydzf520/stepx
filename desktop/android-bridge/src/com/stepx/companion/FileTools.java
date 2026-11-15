@@ -101,7 +101,7 @@ final class FileTools {
             boolean restore = action.equals("restore");
             String name = source.getFileName().toString();
             String originalName = restore && name.endsWith(".gz") ? name.substring(0, name.length() - 3) : name;
-            String ext = originalName.substring(originalName.lastIndexOf('.') + 1).toLowerCase(Locale.ROOT);
+            String ext = ContextReadPolicy.fileExtension(originalName);
             if (!TEXT_EXT.contains(ext) || (restore && !name.endsWith(".gz")))
                 throw new IOException("仅支持文本文档压缩与还原（txt、log、csv、json、xml、md、html、css、svg）");
             if (before.size() > MAX_BYTES) throw new IOException("仅支持不超过 256 MiB 的文件");

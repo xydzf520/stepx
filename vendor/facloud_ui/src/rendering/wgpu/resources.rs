@@ -124,6 +124,14 @@ impl Resources {
                 log::warn!("The current device is lost. Reason: {device_lost_reason:?}. Message: {message}")
             });
 
+            let uncaptured_error_flag = device_lost.clone();
+            device.on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+                uncaptured_error_flag.store(true, Ordering::SeqCst);
+                log::error!("Uncaptured wgpu error (flagging renderer for recovery): {error:#}");
+            }));
+
+            super::increment_active_resources();
+
             Ok(Self {
                 device,
                 device_lost,
@@ -154,7 +162,7 @@ impl Resources {
 
     /// Updates the size of the underlying surface.
     pub fn update_surface_size(&self, size: Vector2F) -> Result<(), SurfaceConfigureError> {
-        if size.x() > 0. && size.y() > 0. {
+        if size.x() >= 1. && size.y() >= 1. {
             let mut surface_config = self.surface_config.borrow_mut();
             surface_config.width = size.x() as u32;
             surface_config.height = size.y() as u32;
@@ -910,14 +918,26 @@ async fn configure_surface(
     device: &Device,
     surface_config: &SurfaceConfiguration,
 ) -> Result<(), SurfaceConfigureError> {
-    let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let oom_scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let internal_scope = device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let validation_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
     surface.configure(device, surface_config);
-    match error_scope.pop().await {
+    // Error scopes are a LIFO stack on the device and must be popped in reverse order.
+    let validation_err = validation_scope.pop().await;
+    let internal_err = internal_scope.pop().await;
+    let oom_err = oom_scope.pop().await;
+    match oom_err.or(internal_err).or(validation_err) {
         Some(err) => Err(SurfaceConfigureError::Error {
             source: err,
             config: surface_config.clone(),
         }),
         None => Ok(()),
+    }
+}
+
+impl Drop for Resources {
+    fn drop(&mut self) {
+        super::decrement_active_resources();
     }
 }
 

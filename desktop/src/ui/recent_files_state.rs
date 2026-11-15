@@ -13,6 +13,7 @@ pub(super) enum RecentFilesAction {
     Folders,
     AddFolder,
     ToggleFolder(PathBuf),
+    RemoveCustomFolder(PathBuf),
     Open(String),
     Reveal(String),
     Transfer(String),
@@ -299,6 +300,18 @@ impl Companion {
                 }
                 self.save_recent_preferences();
             }
+            RecentFilesAction::RemoveCustomFolder(path) => {
+                let before_len = self.recent_files.prefs.folders.len();
+                self.recent_files.prefs.folders.retain(|p| p != path);
+                self.recent_files.prefs.hidden.retain(|p| p != path);
+                self.recent_files
+                    .desktop
+                    .retain(|f| !f.path.starts_with(path));
+                self.recent_files.rebuild_order();
+                if self.recent_files.prefs.folders.len() != before_len {
+                    self.save_recent_preferences();
+                }
+            }
             RecentFilesAction::AddFolder => {
                 if self.recent_files.operation.is_some() {
                     self.recent_files.note = "已有文件操作进行中，完成后可添加文件夹".into();
@@ -530,18 +543,46 @@ impl Companion {
             roots.sort();
             roots.dedup();
             for (i, path) in roots.iter().enumerate() {
-                body.push(self.between(
-                    self.line(path.to_string_lossy(), MICRO, p.text2),
+                let is_custom = state.prefs.folders.contains(path)
+                    && !state.default_roots.contains(path)
+                    && self.work.workspace.as_ref() != Some(path);
+                let controls = if is_custom {
+                    self.hstack(
+                        S1,
+                        vec![
+                            self.button(
+                                format!("recent-folder-toggle-{i}"),
+                                if state.prefs.hidden.contains(path) {
+                                    "启用"
+                                } else {
+                                    "暂停"
+                                },
+                                action(RecentFilesAction::ToggleFolder(path.clone())),
+                                Btn::Ghost,
+                            ),
+                            self.button(
+                                format!("recent-folder-{i}"),
+                                "移除",
+                                action(RecentFilesAction::RemoveCustomFolder(path.clone())),
+                                Btn::Ghost,
+                            ),
+                        ],
+                    )
+                } else {
                     self.button(
                         format!("recent-folder-{i}"),
                         if state.prefs.hidden.contains(path) {
                             "启用"
                         } else {
-                            "移除"
+                            "隐藏"
                         },
                         action(RecentFilesAction::ToggleFolder(path.clone())),
                         Btn::Ghost,
-                    ),
+                    )
+                };
+                body.push(self.between(
+                    self.line(path.to_string_lossy(), MICRO, p.text2),
+                    controls,
                 ));
             }
             body.push(self.button_icon(

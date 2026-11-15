@@ -846,29 +846,44 @@ impl Companion {
                             .find(|f| !f.is_dir)
                             .map(|f| (f.name.clone(), f.path.clone()))
                     });
-                let prompt = if let Some((name, path)) = latest {
-                    let snippet = std::fs::read_to_string(&path)
-                        .ok()
-                        .map(|s| s.chars().take(2000).collect::<String>())
-                        .filter(|s| !s.trim().is_empty());
-                    if let Some(text) = snippet {
-                        format!(
-                            "请基于以下专业交付文档/数据（{}），制作一个可交互的移动端数据看板与实用应用：\n\n{}",
-                            name,
-                            text.trim()
-                        )
-                    } else {
-                        format!(
-                            "请基于以下专业交付文档/数据（文件：{}），制作一个可交互的移动端数据看板与实用应用：\n包含关键指标卡片、分类筛选、交互式图表和本地数据持久化。",
-                            name
-                        )
-                    }
+                if let Some((name, path)) = latest {
+                    let workspace_root = self.work.workspace.clone();
+                    self.status = format!("正在提取「{name}」文档内容…");
+                    let (tx, rx) = async_channel::bounded(1);
+                    std::thread::spawn(move || {
+                        let snippet = extract_work_file_snippet_for_lab(
+                            workspace_root.as_deref(),
+                            &path,
+                        );
+                        let prompt = if let Some(text) = snippet.filter(|s| !s.trim().is_empty()) {
+                            format!(
+                                "请基于以下专业交付文档/数据（{}），制作一个可交互的移动端数据看板与实用应用：\n\n{}",
+                                name,
+                                text.trim()
+                            )
+                        } else {
+                            format!(
+                                "请基于以下专业交付文档/数据（文件：{}），制作一个可交互的移动端数据看板与实用应用：\n包含关键指标卡片、分类筛选、交互式图表和本地数据持久化。",
+                                name
+                            )
+                        };
+                        let _ = tx.send_blocking(prompt);
+                    });
+                    ctx.spawn(async move { rx.recv().await }, |me, result, ctx| {
+                        if let Ok(prompt) = result {
+                            me.fields[F_LAB_PROMPT].set(&prompt);
+                            me.focus_field(F_LAB_PROMPT, ctx);
+                            me.status =
+                                "已导入专业交付数据看板需求，可点击开始创作生成交互应用".into();
+                            ctx.notify();
+                        }
+                    });
                 } else {
-                    "请基于以下专业交付文档/数据，制作一个可交互的移动端数据看板与实用应用：\n1. 顶部展示核心 KPI 指标卡片与达成率进度条；\n2. 支持按分类/周期筛选明细数据并实时重算汇总；\n3. 支持新增记录、状态标记与本地 localStorage 持久化；\n4. 适配 390×844 手机竖屏与桌面深色主题。".into()
-                };
-                self.fields[F_LAB_PROMPT].set(&prompt);
-                self.focus_field(F_LAB_PROMPT, ctx);
-                self.status = "已导入专业交付数据看板需求，可点击开始创作生成交互应用".into();
+                    let prompt = "请基于以下专业交付文档/数据，制作一个可交互的移动端数据看板与实用应用：\n1. 顶部展示核心 KPI 指标卡片与达成率进度条；\n2. 支持按分类/周期筛选明细数据并实时重算汇总；\n3. 支持新增记录、状态标记与本地 localStorage 持久化；\n4. 适配 390×844 手机竖屏与桌面深色主题。";
+                    self.fields[F_LAB_PROMPT].set(prompt);
+                    self.focus_field(F_LAB_PROMPT, ctx);
+                    self.status = "已导入专业交付数据看板需求，可点击开始创作生成交互应用".into();
+                }
             }
             A::ToggleReport => self.studio_lab.report_open = !self.studio_lab.report_open,
             A::DeleteArtifactAt(i) => {
@@ -904,9 +919,9 @@ impl Companion {
                 if let Some(a) = self.studio_lab_selected().cloned() {
                     self.submit("正在打开交互预览…", move |_| {
                         Ok(Outcome::StudioLab(StudioLabOutcome::Note(
-                            studio_lab::open_preview_window(&a)
+                            open_lab_artifact_in_isolated_sandbox(&a)
                                 .map(|_| "已打开独立离线预览窗口，可实际操作试玩".into())
-                                .map_err(|e| e.to_string()),
+                                .map_err(|e| format!("{e:#}")),
                         )))
                     });
                 }
@@ -1300,6 +1315,199 @@ impl Companion {
             self.studio_lab.error = Some(error);
         }
     }
+}
+
+impl Companion {
+    pub(super) fn open_html_in_studio_sandbox(
+        &mut self,
+        path: PathBuf,
+        lab_id: Option<&str>,
+    ) -> Result<()> {
+        anyhow::ensure!(!self.busy, "请等待当前操作完成后再打开预览");
+        let matched = lab_id
+            .and_then(|id| self.studio_lab.artifacts.iter().find(|a| a.id == id))
+            .or_else(|| self.studio_lab.artifacts.iter().find(|a| a.html_path == path))
+            .cloned();
+        if let Some(ref a) = matched {
+            if let Some(idx) = self.studio_lab.artifacts.iter().position(|x| x.id == a.id) {
+                self.studio_lab.selected = Some(idx);
+            }
+        }
+        let lab_id_owned = lab_id.map(str::to_owned);
+        self.submit("正在打开独立离线预览窗口…", move |_| {
+            let note = (|| -> Result<String> {
+                if let Some(ref artifact) = matched {
+                    open_lab_artifact_in_isolated_sandbox(artifact)?;
+                    return Ok("已在独立离线预览窗口打开，可安全交互试玩".into());
+                }
+                if let Some(ref id) = lab_id_owned {
+                    if let Ok(list) = studio_lab::list_artifacts() {
+                        if let Some(found) = list.into_iter().find(|a| &a.id == id || a.html_path == path) {
+                            open_lab_artifact_in_isolated_sandbox(&found)?;
+                            return Ok("已在独立离线预览窗口打开，可安全交互试玩".into());
+                        }
+                    }
+                }
+                let staged = stage_local_html_for_sandbox_preview(&path)?;
+                open_lab_artifact_in_isolated_sandbox(&staged)?;
+                Ok("已在 Studio 隔离离线沙箱中打开本地网页成果".into())
+            })()
+            .map_err(|e| format!("{e:#}"));
+            Ok(Outcome::StudioLab(StudioLabOutcome::Note(note)))
+        });
+        Ok(())
+    }
+}
+
+fn open_lab_artifact_in_isolated_sandbox(artifact: &studio_lab::LabArtifact) -> Result<()> {
+    stepx_companion::studio_browser::browser_path().context(
+        "未检测到可用于隔离离线预览的浏览器（Chrome / Edge / Chromium），已阻止在系统默认浏览器中直接打开本地网页文件",
+    )?;
+    studio_lab::open_preview(artifact)
+}
+
+fn stage_local_html_for_sandbox_preview(path: &std::path::Path) -> Result<studio_lab::LabArtifact> {
+    let meta = std::fs::symlink_metadata(path).context("网页文件不存在或无法读取")?;
+    anyhow::ensure!(
+        !meta.file_type().is_symlink() && meta.is_file(),
+        "仅支持预览普通本地网页文件，不跟随符号链接"
+    );
+    anyhow::ensure!(
+        meta.len() > 0 && meta.len() <= 2 * 1024 * 1024,
+        "网页文件为空或超过 2 MB 安全预览上限"
+    );
+    let canonical = path.canonicalize().context("网页文件路径无效")?;
+    let runs = studio_lab::runs_directory()?;
+    std::fs::create_dir_all(&runs)?;
+    let runs_canonical = runs.canonicalize().unwrap_or_else(|_| runs.clone());
+    if canonical.starts_with(&runs_canonical)
+        && canonical.file_name().and_then(|s| s.to_str()) == Some("index.html")
+    {
+        let root = canonical
+            .parent()
+            .unwrap_or(&runs_canonical)
+            .to_path_buf();
+        return Ok(studio_lab::LabArtifact {
+            id: "staged-direct".into(),
+            name: "本地网页预览".into(),
+            report_path: root.join("report.json"),
+            root,
+            html_path: canonical,
+            screenshot_path: None,
+            passed: true,
+            round: 1,
+            summary: "隔离离线预览".into(),
+            created_at: 0,
+        });
+    }
+    let mtime_nanos = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let key = format!("{}|{}|{}", canonical.to_string_lossy(), meta.len(), mtime_nanos);
+    let digest = stepx_companion::work::cache_key_digest(key.as_bytes());
+    let short_digest: String = digest.chars().take(16).collect();
+    let id = format!("staged-{short_digest}");
+    let round_dir = runs.join(&id).join("round-1");
+    std::fs::create_dir_all(&round_dir)?;
+    let dest_html = round_dir.join("index.html");
+    std::fs::copy(&canonical, &dest_html).context("准备隔离预览文件失败")?;
+    let title = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("本地网页成果")
+        .to_string();
+    Ok(studio_lab::LabArtifact {
+        id,
+        name: title,
+        report_path: round_dir.join("report.json"),
+        root: round_dir,
+        html_path: dest_html,
+        screenshot_path: None,
+        passed: true,
+        round: 1,
+        summary: "隔离离线预览".into(),
+        created_at: 0,
+    })
+}
+
+fn extract_work_file_snippet_for_lab(
+    workspace_root: Option<&std::path::Path>,
+    path: &std::path::Path,
+) -> Option<String> {
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let candidate_root = workspace_root
+        .map(std::path::Path::to_path_buf)
+        .or_else(|| path.parent().map(std::path::Path::to_path_buf));
+    if let Some(root) = candidate_root {
+        if let Ok(ws) = stepx_companion::work::Workspace::open(&root) {
+            if let Ok(rel) = ws.relative(path) {
+                if matches!(ext.as_str(), "xlsx" | "xls") {
+                    if let Ok(data) = ws.spreadsheet_preview(&rel) {
+                        let mut out = String::new();
+                        if let Some(sheets) = data["sheets"].as_array() {
+                            for sheet in sheets.iter().take(3) {
+                                let sheet_name = sheet["name"].as_str().unwrap_or("工作表");
+                                out.push_str(&format!("### {sheet_name}\n"));
+                                if let Some(rows) = sheet["rows"].as_array() {
+                                    for row in rows.iter().take(20) {
+                                        if let Some(cells) = row["cells"].as_array() {
+                                            let line = cells
+                                                .iter()
+                                                .take(8)
+                                                .map(|c| c.as_str().unwrap_or("").trim())
+                                                .collect::<Vec<_>>()
+                                                .join(" | ");
+                                            if !line.replace('|', "").trim().is_empty() {
+                                                out.push_str(&line);
+                                                out.push('\n');
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let trimmed: String = out.chars().take(2000).collect();
+                        if !trimmed.trim().is_empty() {
+                            return Some(trimmed);
+                        }
+                    }
+                }
+                if let Ok(text) = ws.read_text(&rel) {
+                    let trimmed: String = text.chars().take(2000).collect();
+                    if !trimmed.trim().is_empty() {
+                        return Some(trimmed);
+                    }
+                }
+            }
+        }
+    }
+    if matches!(
+        ext.as_str(),
+        "md" | "markdown" | "txt" | "csv" | "tsv" | "json" | "html" | "htm"
+    ) {
+        use std::io::Read as _;
+        let meta = std::fs::symlink_metadata(path).ok()?;
+        if !meta.is_file() || meta.file_type().is_symlink() {
+            return None;
+        }
+        let file = std::fs::File::open(path).ok()?;
+        let mut buf = Vec::with_capacity(64 * 1024);
+        file.take(512 * 1024).read_to_end(&mut buf).ok()?;
+        let text = String::from_utf8_lossy(&buf);
+        let snippet: String = text.chars().take(2000).collect();
+        if !snippet.trim().is_empty() {
+            return Some(snippet);
+        }
+    }
+    None
 }
 
 fn remove_artifact_root_dir(root: &std::path::Path) {

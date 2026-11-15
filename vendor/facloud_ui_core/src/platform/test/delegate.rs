@@ -184,7 +184,7 @@ impl platform::WindowManager for WindowManager {
 }
 
 impl platform::Delegate for AppDelegate {
-    #[cfg(feature = "test-util")]
+    #[cfg(any(test, feature = "test-util"))]
     fn get_cursor_shape(&self) -> Cursor {
         *self.cursor_shape.lock()
     }
@@ -299,7 +299,7 @@ impl platform::Delegate for AppDelegate {
 }
 
 impl platform::Delegate for IntegrationTestDelegate {
-    #[cfg(feature = "test-util")]
+    #[cfg(any(test, feature = "test-util"))]
     fn get_cursor_shape(&self) -> Cursor {
         *self.cursor_shape.lock()
     }

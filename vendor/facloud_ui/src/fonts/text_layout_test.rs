@@ -68,12 +68,14 @@ fn test_fixed_width_tab_size_matches_spaces_width() -> Result<()> {
     Ok(())
 }
 
-/// Read the bundled Roboto font's bytes from the filesystem.
-fn load_roboto_bytes() -> Vec<Vec<u8>> {
+/// Read the bundled Roboto font's bytes from the filesystem, falling back to an installed
+/// proportional sans-serif family (preserving its internal family name so weight/style queries
+/// resolve Regular, Bold, and Italic faces accurately) when running inside workspaces without Roboto.
+fn load_roboto_bytes() -> Option<(&'static str, Vec<Vec<u8>>)> {
     use std::{fs::read, path::PathBuf};
     let root = env!("CARGO_MANIFEST_DIR");
-    let typeface_files = ["Roboto-Italic.ttf", "Roboto-Bold.ttf", "Roboto-Regular.ttf"];
-    typeface_files
+    let roboto_files = ["Roboto-Italic.ttf", "Roboto-Bold.ttf", "Roboto-Regular.ttf"];
+    if let Ok(bytes) = roboto_files
         .iter()
         .map(|font_file| {
             let path = [
@@ -81,19 +83,75 @@ fn load_roboto_bytes() -> Vec<Vec<u8>> {
             ]
             .iter()
             .collect::<PathBuf>();
-            Ok(read(path)?)
+            read(path)
         })
-        .collect::<Result<Vec<_>>>()
-        .expect("should be able to read roboto font bytes from filesystem")
+        .collect::<std::io::Result<Vec<_>>>()
+    {
+        return Some(("Roboto", bytes));
+    }
+
+    for (family_name, candidate_set) in [
+        (
+            "Noto Sans",
+            [
+                "/usr/share/fonts/truetype/noto/NotoSans-Italic.ttf",
+                "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+                "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+            ],
+        ),
+        (
+            "Nimbus Sans",
+            [
+                "/usr/share/fonts/opentype/urw-base35/NimbusSans-Italic.otf",
+                "/usr/share/fonts/opentype/urw-base35/NimbusSans-Bold.otf",
+                "/usr/share/fonts/opentype/urw-base35/NimbusSans-Regular.otf",
+            ],
+        ),
+        (
+            "Liberation Sans",
+            [
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Italic.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            ],
+        ),
+    ] {
+        if let Ok(bytes) = candidate_set
+            .iter()
+            .map(read)
+            .collect::<std::io::Result<Vec<_>>>()
+        {
+            return Some((family_name, bytes));
+        }
+    }
+
+    None
 }
 
 pub(crate) fn init_fonts() -> (FontDB, FamilyId) {
     let mut font_db = FontDB::new();
-    let font_bytes = load_roboto_bytes();
-    let roboto = font_db
-        .load_from_bytes("Roboto", font_bytes)
-        .expect("should be able to load Roboto font for test");
-    (font_db, roboto)
+    if let Some((family_name, font_bytes)) = load_roboto_bytes() {
+        let roboto = font_db
+            .load_from_bytes(family_name, font_bytes)
+            .expect("should be able to load test font bytes");
+        return (font_db, roboto);
+    }
+
+    for family_name in [
+        "Roboto",
+        "Noto Sans",
+        "Helvetica Neue",
+        "Arial",
+        "Liberation Sans",
+        "Segoe UI",
+        "DejaVu Sans",
+    ] {
+        if let Ok(family) = font_db.load_from_system(family_name) {
+            return (font_db, family);
+        }
+    }
+
+    panic!("should be able to load Roboto or fallback sans-serif font for test");
 }
 
 pub(crate) fn collect_glyph_indices(frame: &TextFrame) -> Vec<Vec<usize>> {

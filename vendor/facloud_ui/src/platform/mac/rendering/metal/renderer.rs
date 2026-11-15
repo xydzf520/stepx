@@ -244,9 +244,14 @@ impl Renderer {
         ctx: &MetalDrawContext,
         should_capture: bool,
     ) -> Option<CapturedFrame> {
+        if ctx.drawable_size.x() < 1.0 || ctx.drawable_size.y() < 1.0 {
+            return None;
+        }
+
         self.resources
             .glyph_cache
             .update_config(&scene.rendering_config().glyphs);
+        self.resources.glyph_cache.trim_if_over_high_water_mark();
 
         let render_pass = RenderPass::new(&mut self.command_queue, ctx.drawable);
 
@@ -291,6 +296,12 @@ impl<'a> Frame<'a> {
             zfar: 1.0,
         });
 
+        let drawable_tex = self.ctx.drawable.texture();
+        let max_w = (self.ctx.drawable_size.x().max(0.0) as u64).min(drawable_tex.width());
+        let max_h = (self.ctx.drawable_size.y().max(0.0) as u64).min(drawable_tex.height());
+        if max_w == 0 || max_h == 0 {
+            return;
+        }
         for layer in self.scene.layers() {
             if let Some(bounds) = layer.clip_bounds {
                 // Make sure the scissor rect doesn't extend beyond the boundaries
@@ -300,12 +311,21 @@ impl<'a> Frame<'a> {
                 let device_bounds = RectF::new(Vector2F::zero(), self.ctx.drawable_size);
                 let bounds = (bounds * self.scene.scale_factor()).intersection(device_bounds);
                 if let Some(intersection) = bounds {
+                    let x = (intersection.origin_x().round().max(0.0) as u64).min(max_w);
+                    let y = (intersection.origin_y().round().max(0.0) as u64).min(max_h);
+                    let width = (intersection.width().round().max(0.0) as u64)
+                        .min(max_w.saturating_sub(x));
+                    let height = (intersection.height().round().max(0.0) as u64)
+                        .min(max_h.saturating_sub(y));
+                    if width == 0 || height == 0 {
+                        continue;
+                    }
                     self.command_encoder
                         .set_scissor_rect(metal::MTLScissorRect {
-                            x: intersection.origin_x().round() as u64,
-                            y: intersection.origin_y().round() as u64,
-                            width: intersection.width().round() as u64,
-                            height: intersection.height().round() as u64,
+                            x,
+                            y,
+                            width,
+                            height,
                         });
                 } else {
                     // The layer's clip bounds don't intersect the window bounds
@@ -317,8 +337,8 @@ impl<'a> Frame<'a> {
                     .set_scissor_rect(metal::MTLScissorRect {
                         x: 0_u64,
                         y: 0_u64,
-                        width: self.ctx.drawable_size.x() as u64,
-                        height: self.ctx.drawable_size.y() as u64,
+                        width: max_w,
+                        height: max_h,
                     });
             }
             self.draw_rects(layer);
@@ -408,12 +428,22 @@ impl<'a> Frame<'a> {
             [uniforms].as_ptr() as *const _,
         );
 
+        const MAX_METAL_TEXTURE_DIMENSION: u32 = 8192;
         let (_, texture) = self
             .resources
             .texture_cache
             .get_or_insert_by_asset(asset, |asset| {
-                let width = asset.size().x() as u64;
-                let height = asset.size().y() as u64;
+                let raw_width = asset.size().x().max(0) as u32;
+                let raw_height = asset.size().y().max(0) as u32;
+                let (clamped_w, clamped_h, rgba_bytes) =
+                    crate::rendering::prepare_rgba_texture_data(
+                        asset.rgba_bytes(),
+                        raw_width,
+                        raw_height,
+                        MAX_METAL_TEXTURE_DIMENSION,
+                    );
+                let width = u64::from(clamped_w);
+                let height = u64::from(clamped_h);
 
                 let texture_descriptor = metal::TextureDescriptor::new();
                 texture_descriptor.set_pixel_format(metal::MTLPixelFormat::RGBA8Unorm);
@@ -433,7 +463,7 @@ impl<'a> Frame<'a> {
                 texture.replace_region(
                     region,
                     0,
-                    asset.rgba_bytes().as_ptr() as *const c_void,
+                    rgba_bytes.as_ptr() as *const c_void,
                     bytes_per_row,
                 );
 
@@ -961,17 +991,34 @@ impl super::super::Renderer for Renderer {
             return;
         };
 
-        let drawable = unsafe {
+        let drawable_size = window.physical_size();
+        if drawable_size.x() < 1.0 || drawable_size.y() < 1.0 {
+            return;
+        }
+
+        let Some(drawable) = (unsafe {
             let native_view = window.native_view();
-            let layer: id = msg_send![native_view, layer];
-            let drawable: &metal::MetalDrawableRef = msg_send![layer, nextDrawable];
-            drawable
+            if native_view.is_null() {
+                None
+            } else {
+                let layer: id = msg_send![native_view, layer];
+                if layer.is_null() {
+                    None
+                } else {
+                    let drawable: Option<&metal::MetalDrawableRef> =
+                        msg_send![layer, nextDrawable];
+                    drawable
+                }
+            }
+        }) else {
+            log::warn!("Skipping Metal render pass because nextDrawable returned nil");
+            return;
         };
 
         let ctx = &MetalDrawContext {
             device: metal_device,
             drawable,
-            drawable_size: window.physical_size(),
+            drawable_size,
             rasterize_glyph_fn: &|glyph_key, scale, subpixel_alignment, glyph_config, format| {
                 font_cache.rasterized_glyph(
                     glyph_key,
@@ -1006,6 +1053,13 @@ fn insert_glyph_into_texture(
     glyph: &RasterizedGlyph,
     texture: &mut metal::Texture,
 ) {
+    if region.pixel_region.width() <= 0
+        || region.pixel_region.height() <= 0
+        || glyph.canvas.size.x() <= 0
+        || glyph.canvas.size.y() <= 0
+    {
+        return;
+    }
     let region = metal::MTLRegion {
         origin: metal::MTLOrigin {
             x: region.pixel_region.origin_x() as u64,

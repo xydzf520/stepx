@@ -3,7 +3,10 @@ mod resources;
 mod shader_types;
 mod texture_with_bind_group;
 
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, LazyLock, Mutex,
+};
 
 use wgpu::wgt::WgpuHasDisplayHandle;
 
@@ -15,9 +18,38 @@ use crate::platform::GraphicsBackend;
 use crate::{rendering::GPUPowerPreference, windowing};
 
 static WGPU_INSTANCE: LazyLock<Mutex<Option<Arc<wgpu::Instance>>>> = LazyLock::new(Mutex::default);
+static ACTIVE_WGPU_RESOURCES: AtomicUsize = AtomicUsize::new(0);
 
-/// Drops and recreates the global shared [`wgpu::Instance`].
+pub(crate) fn increment_active_resources() {
+    ACTIVE_WGPU_RESOURCES.fetch_add(1, Ordering::SeqCst);
+}
+
+pub(crate) fn decrement_active_resources() {
+    let mut current = ACTIVE_WGPU_RESOURCES.load(Ordering::SeqCst);
+    loop {
+        let next = current.saturating_sub(1);
+        match ACTIVE_WGPU_RESOURCES.compare_exchange_weak(
+            current,
+            next,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => break,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+/// Drops and recreates the global shared [`wgpu::Instance`] when no other window
+/// resources are still using it.
 pub fn reset_wgpu_instance(display_handle: Box<dyn wgpu::wgt::WgpuHasDisplayHandle>) {
+    if ACTIVE_WGPU_RESOURCES.load(Ordering::SeqCst) > 0 {
+        log::debug!(
+            "Skipping global wgpu::Instance reset because other window resources are still active"
+        );
+        return;
+    }
+
     // Drop the existing wgpu instance.
     {
         let mut instance = WGPU_INSTANCE
@@ -77,36 +109,11 @@ pub fn init_wgpu_instance(display_handle: Box<dyn WgpuHasDisplayHandle>) {
             tx.send(()).expect("Failed to send lock acquired signal");
         }
 
-        instance_lock_guard.get_or_insert_with(|| {
-            #[cfg(target_os = "linux")]
-            {
-                use crate::windowing::{winit::app::WINDOWING_SYSTEM, WindowingSystem};
-                // If the user hasn't enabled (and is making use of) native Wayland
-                // support, due to the fact that we force use of X11 in
-                // ui/src/windowing/winit/app.rs, we need to make sure wgpu doesn't
-                // attempt to configure the instance to use Wayland, as that causes
-                // crashes due to a mismatch between the instance and the window
-                // handle we pass in later when constructing GPU resources.
-                if WINDOWING_SYSTEM
-                    .get()
-                    .is_some_and(|windowing_system| *windowing_system == WindowingSystem::X11)
-                    || std::env::var_os("WAYLAND_DISPLAY").is_none()
-                {
-                    let old_wayland_display = std::env::var_os("WAYLAND_DISPLAY");
-                    std::env::set_var("WAYLAND_DISPLAY", "");
-                    let instance = create_instance();
-                    match old_wayland_display {
-                        Some(wayland_display) => {
-                            std::env::set_var("WAYLAND_DISPLAY", wayland_display)
-                        }
-                        None => std::env::remove_var("WAYLAND_DISPLAY"),
-                    };
-                    return instance;
-                }
-            }
-
-            create_instance()
-        });
+        // `InstanceDescriptor.display` carries the exact X11 or Wayland display handle
+        // owned by `winit::event_loop::EventLoop`, and `Instance::create_surface` binds
+        // directly to each `winit::window::Window`'s raw window/display handle without
+        // mutating process-wide environment variables like `WAYLAND_DISPLAY`.
+        instance_lock_guard.get_or_insert_with(create_instance);
     };
 
     cfg_if::cfg_if! {
@@ -143,7 +150,12 @@ fn get_wgpu_instance() -> Arc<wgpu::Instance> {
 
 /// Returns the set of wgpu backends that we can select from.
 fn wgpu_backend_options() -> wgpu::Backends {
-    wgpu::Backends::from_env().unwrap_or(wgpu::Backends::all())
+    #[cfg(target_os = "linux")]
+    let default_backends = wgpu::Backends::VULKAN | wgpu::Backends::GL;
+    #[cfg(not(target_os = "linux"))]
+    let default_backends = wgpu::Backends::all();
+
+    wgpu::Backends::from_env().unwrap_or(default_backends)
 }
 
 #[cfg(not(target_family = "wasm"))]

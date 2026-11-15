@@ -19,6 +19,7 @@ pub(super) struct LiveCallUi {
     observer: Option<mpsc::Receiver<(String, anyhow::Result<LiveCall>)>>,
     observed: Option<Instant>,
     observer_serial: String,
+    observer_errors: u8,
     last_observed_call: Option<(String, LiveCall)>,
     records: Option<mpsc::Receiver<(String, anyhow::Result<Vec<CallRecord>>)>>,
     records_pending: bool,
@@ -130,6 +131,58 @@ mod tests {
         assert_eq!(audio_receipt(Some("phone"), "phone", &latest, &reply, "call", 20_200), Some(latest));
         let idle = LiveCall { state:"idle".into(), observed_ms:20_200, ..reply.clone() };
         assert!(audio_receipt(Some("phone"), "phone", &idle, &reply, "call", 20_200).is_none());
+    }
+
+    #[test]
+    fn consecutive_observer_errors_or_idle_clear_ghost_live_call_and_active_number() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = crate::ui::TestUiConfigDirGuard::set(dir.path());
+        let mut app = Companion::new_for_test();
+        app.demo_mode = false;
+        app.selected = Some(stepx_companion::device::Device {
+            serial: "phone-1".into(),
+            ..Default::default()
+        });
+        let now = chrono::Utc::now().timestamp_millis();
+        app.push.snapshot.live_call = LiveCall {
+            available: true,
+            id: "call-1".into(),
+            state: "active".into(),
+            number: "13800009367".into(),
+            observed_ms: now,
+            ..Default::default()
+        };
+        app.active_call_number = Some("13800009367".into());
+
+        // First transient transport error keeps the ongoing call.
+        assert!(!app.apply_live_call_observer_outcome(
+            "phone-1".into(),
+            Err(anyhow::anyhow!("transient timeout")),
+        ));
+        assert_eq!(app.push.snapshot.live_call.state, "active");
+        assert!(app.active_call_number.is_some());
+
+        // Second consecutive transport error clears ghost call and active_call_number.
+        assert!(app.apply_live_call_observer_outcome(
+            "phone-1".into(),
+            Err(anyhow::anyhow!("device offline")),
+        ));
+        assert_eq!(app.push.snapshot.live_call.state, "idle");
+        assert!(app.push.snapshot.live_call.id.is_empty());
+        assert!(app.active_call_number.is_none());
+
+        // Returning to idle from a live poll also clears active_call_number.
+        app.active_call_number = Some("13800009996".into());
+        assert!(app.apply_live_call_observer_outcome(
+            "phone-1".into(),
+            Ok(LiveCall {
+                available: true,
+                state: "idle".into(),
+                observed_ms: now + 5_000,
+                ..Default::default()
+            }),
+        ));
+        assert!(app.active_call_number.is_none());
     }
 }
 
@@ -263,6 +316,9 @@ impl Companion {
                 match result {
                     Ok(call) => {
                         self.live_calls.feedback = if call.state == "idle" { "通话已结束" } else { "手机已确认接听" }.into();
+                        if call.state == "idle" {
+                            self.active_call_number = None;
+                        }
                         // A newer stream event may already describe another call.
                         if self.push.snapshot.live_call.id == self.live_calls.owner {
                             if call.state == "idle" { self.live_calls.records_pending = true; }
@@ -368,6 +424,97 @@ impl Companion {
             "microphone_muted":self.live_calls.audio.as_ref().map(|audio| audio.microphone_muted())})
     }
 
+    pub(super) fn clear_ghost_live_call(&mut self) -> bool {
+        self.live_calls.cancel_audio();
+        let had_live_call = self.push.snapshot.live_call.state != "idle"
+            || !self.push.snapshot.live_call.id.is_empty()
+            || !self.push.snapshot.live_call.number.is_empty()
+            || !self.push.snapshot.live_call.name.is_empty()
+            || self.push.snapshot.live_call.multiple_calls;
+        let had_active_number = self.active_call_number.take().is_some();
+        if had_live_call {
+            let available = self.push.snapshot.live_call.available;
+            self.push.snapshot.live_call = LiveCall {
+                available,
+                state: "idle".into(),
+                observed_ms: chrono::Utc::now().timestamp_millis(),
+                ..Default::default()
+            };
+        }
+        self.live_calls.last_observed_call = None;
+        had_live_call || had_active_number
+    }
+
+    pub(super) fn apply_live_call_observer_outcome(
+        &mut self,
+        serial: String,
+        result: anyhow::Result<LiveCall>,
+    ) -> bool {
+        if self.selected.is_none() {
+            return !self.is_demo_device() && self.clear_ghost_live_call();
+        }
+        if !self.selected.as_ref().is_some_and(|device| device.serial == serial) {
+            return false;
+        }
+        match result {
+            Ok(call) => {
+                self.live_calls.observer_errors = 0;
+                let cleared_num = if call.state == "idle" {
+                    self.active_call_number.take().is_some()
+                } else {
+                    false
+                };
+                if call.observed_ms >= self.push.snapshot.live_call.observed_ms {
+                    let changed = call.id != self.push.snapshot.live_call.id
+                        || call.state != self.push.snapshot.live_call.state
+                        || call.number != self.push.snapshot.live_call.number
+                        || call.name != self.push.snapshot.live_call.name
+                        || call.multiple_calls != self.push.snapshot.live_call.multiple_calls
+                        || call.available != self.push.snapshot.live_call.available
+                        || cleared_num;
+                    // Normal message snapshots can already contain idle.
+                    // Detect call completion against this observer's own
+                    // previous state, so they cannot consume the transition.
+                    if call.state == "idle"
+                        && self.live_calls.last_observed_call.as_ref().is_some_and(
+                            |(last_serial, last)| {
+                                last_serial == &serial
+                                    && matches!(last.state.as_str(), "ringing" | "active")
+                            },
+                        )
+                    {
+                        self.live_calls.records_pending = true;
+                    }
+                    self.live_calls.last_observed_call = Some((serial, call.clone()));
+                    self.push.snapshot.live_call = call;
+                    changed
+                } else {
+                    cleared_num
+                }
+            }
+            Err(_) => {
+                self.live_calls.observer_errors =
+                    self.live_calls.observer_errors.saturating_add(1);
+                if self.live_calls.observer_errors >= 2 {
+                    if self.live_calls.last_observed_call.as_ref().is_some_and(
+                        |(last_serial, last)| {
+                            last_serial == &serial
+                                && matches!(last.state.as_str(), "ringing" | "active")
+                        },
+                    ) || matches!(
+                        self.push.snapshot.live_call.state.as_str(),
+                        "ringing" | "active"
+                    ) {
+                        self.live_calls.records_pending = true;
+                    }
+                    self.clear_ghost_live_call()
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
     fn tick_live_call_observer(&mut self, ctx: &mut ViewContext<Self>) {
         if self.is_demo_device() { return; }
         if let Some(receiver) = &self.live_calls.observer {
@@ -375,31 +522,32 @@ impl Companion {
                 Err(mpsc::TryRecvError::Empty) => return,
                 result => {
                     self.live_calls.observer = None;
-                    if let Ok((serial, Ok(call))) = result {
-                        if self.selected.as_ref().is_some_and(|device| device.serial == serial)
-                            && call.observed_ms >= self.push.snapshot.live_call.observed_ms {
-                            let changed = call.id != self.push.snapshot.live_call.id
-                                || call.state != self.push.snapshot.live_call.state
-                                || call.number != self.push.snapshot.live_call.number
-                                || call.name != self.push.snapshot.live_call.name
-                                || call.multiple_calls != self.push.snapshot.live_call.multiple_calls
-                                || call.available != self.push.snapshot.live_call.available;
-                            // Normal message snapshots can already contain idle.
-                            // Detect call completion against this observer's own
-                            // previous state, so they cannot consume the transition.
-                            if call.state == "idle" && self.live_calls.last_observed_call.as_ref().is_some_and(|(last_serial, last)|
-                                last_serial == &serial && matches!(last.state.as_str(), "ringing" | "active")) {
-                                self.live_calls.records_pending = true;
-                            }
-                            self.live_calls.last_observed_call = Some((serial, call.clone()));
-                            self.push.snapshot.live_call = call;
-                            if changed { self.sync_notification_center(); ctx.notify(); }
+                    let changed = match result {
+                        Ok((serial, call_res)) => {
+                            self.apply_live_call_observer_outcome(serial, call_res)
                         }
+                        Err(_) => {
+                            let serial = self.live_calls.observer_serial.clone();
+                            self.apply_live_call_observer_outcome(
+                                serial,
+                                Err(anyhow::anyhow!("live call observer disconnected")),
+                            )
+                        }
+                    };
+                    if changed {
+                        self.sync_notification_center();
+                        ctx.notify();
                     }
                 }
             }
         }
-        let Some(device) = self.selected.clone() else { return; };
+        let Some(device) = self.selected.clone() else {
+            if !self.is_demo_device() && self.clear_ghost_live_call() {
+                self.sync_notification_center();
+                ctx.notify();
+            }
+            return;
+        };
         if self.live_calls.observer_serial == device.serial
             && self.live_calls.observed.is_some_and(|last| last.elapsed() < Duration::from_millis(900)) { return; }
         self.live_calls.observer_serial = device.serial.clone();

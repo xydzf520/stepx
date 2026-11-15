@@ -1133,7 +1133,7 @@ impl AppContext {
             });
     }
 
-    #[cfg(feature = "test-util")]
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn register_spawned_future(&mut self, future: SpawnedFuture) -> FutureId {
         let future_id = FutureId::new();
         self.spawned_futures.insert(future_id, future);
@@ -1141,7 +1141,7 @@ impl AppContext {
         future_id
     }
 
-    #[cfg(not(feature = "test-util"))]
+    #[cfg(not(any(test, feature = "test-util")))]
     pub(crate) fn register_spawned_future(&mut self, _future: SpawnedFuture) -> FutureId {
         FutureId::new()
     }
@@ -1152,7 +1152,7 @@ impl AppContext {
     ///
     /// This is useful for tests to ensure that calls to `ctx#spawn` have
     /// completed before asserting correct state.
-    #[cfg(feature = "test-util")]
+    #[cfg(any(test, feature = "test-util"))]
     pub fn await_spawned_future(&mut self, future_id: FutureId) -> future::BoxFuture<'static, ()> {
         match self.spawned_futures.remove(&future_id) {
             None => futures::future::ready(()).boxed(),
@@ -2679,7 +2679,9 @@ impl AppContext {
         WindowManager::handle(self).update(self, |windowing_state, ctx| {
             windowing_state.remove_window(window_id, ctx);
         });
-        self.presenters.remove(&window_id);
+        if let Some(presenter) = self.presenters.remove(&window_id) {
+            presenter.borrow_mut().clear_scene();
+        }
         self.invalidation_callbacks.remove(&window_id);
         self.window_invalidations.remove(&window_id);
         autotracking::close_window(window_id);

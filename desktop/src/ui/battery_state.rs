@@ -85,12 +85,15 @@ impl Companion {
         {
             return;
         }
-        let Some(device) = self.selected.as_ref() else {
+        if self.selected.is_none() {
             return;
-        };
+        }
         // A single cheap read on older APKs; no device summary, screen input,
         // model task, provider installation, or separate polling timer.
-        let transport = self.online_device_active_transport(device);
+        let transport = self.active_transport();
+        if transport.is_empty() {
+            return;
+        }
         let (tx, rx) = mpsc::channel();
         self.battery.pending = Some((Instant::now(), rx));
         std::thread::spawn(move || {

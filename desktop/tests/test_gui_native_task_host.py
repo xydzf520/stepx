@@ -260,10 +260,8 @@ class TaskHostGuardTests(unittest.TestCase):
         tree = ast.parse(source)
         src = next(node for node in tree.body if isinstance(node, ast.Assign)
                    and any(isinstance(target, ast.Name) and target.id == 'src' for target in node.targets))
-        gateway = next(node.value for node in tree.body if isinstance(node, ast.Expr)
-                       and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name)
-                       and node.value.func.id == 'gw')
-        value = record(); payload = runner.DEX.read_bytes()
+        stage_def = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'stage_source')
+        value = record(); payload = runner.DEX.read_bytes() if runner.DEX.is_file() else (b'dex\n035\x00' + b'x' * 16384)
         value['dex_sha256'] = hashlib.sha256(payload).hexdigest()
         code = runner.build_start_worker(value, payload, {'CLASSPATH': runner.REMOTE_DIR + '/' + value['dex_name']})
         payload_assignment = next(node for node in ast.parse(code).body if isinstance(node, ast.Assign)
@@ -274,11 +272,21 @@ class TaskHostGuardTests(unittest.TestCase):
         transported = eval(compile(ast.Expression(src.value), '<real-src>', 'eval'),
                            dict(code=code, result='/tmp/stepx-worker-test.json', os=os))
         compile(transported, '<real-worker>', 'exec')
-        argument = eval(compile(ast.Expression(gateway.args[0]), '<real-gateway-argument>', 'eval'),
-                        dict(src=transported, wrapper='/tmp/stepx-gms-worker-ffffffffff.py', base64=base64))
+        gw_calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            wrapper = str(Path(tmp) / 'stepx-gms-worker-ffffffffff.py')
+            def fake_gw(cmd):
+                gw_calls.append(cmd)
+                exec(cmd, {})
+            ns = {'gw': fake_gw, 'base64': base64, 'hashlib': hashlib}
+            exec(compile(ast.Module(body=[stage_def], type_ignores=[]), '<stage_source>', 'exec'), ns)
+            ns['stage_source'](wrapper, transported)
+            self.assertEqual(Path(wrapper).read_text(encoding='utf-8'), transported)
+        self.assertTrue(gw_calls)
         # Linux limits a single exec argument to 128 KiB on this host. Keep
-        # 16 KiB spare for the real path/record fields absent from this fixture.
-        self.assertLess(len(argument.encode()), 112 * 1024)
+        # 16 KiB spare for every chunked gateway call.
+        for argument in gw_calls:
+            self.assertLess(len(argument.encode()), 112 * 1024)
 
     def execute_collect(self, mutation=None, live=None, externally_exited=True, result_changes=None):
         """Execute the actual emitted unlink/read block against disposable files."""

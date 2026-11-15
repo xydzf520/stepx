@@ -10,27 +10,43 @@ use wgpu::{
 
 use super::Error;
 
-/// Calls the provided function, capturing and returning any validation errors
-/// detected by wgpu.
+/// Calls the provided function, capturing and returning any out-of-memory,
+/// internal, or validation errors detected by wgpu.
 #[must_use]
 pub fn with_error_scope<T>(
     device: &wgpu::Device,
     callback: impl FnOnce() -> T,
 ) -> (T, Option<Error>) {
-    let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let oom_scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let internal_scope = device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let validation_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
     let ret = callback();
     // On native platforms, the future returned by `pop_error_scope` resolves
     // immediately.  On wasm, it may take longer due to asynchronous browser
     // APIs, but it's necessary to wait here to know if it is safe to continue.
-    let error_future = error_scope.pop();
+    // Error scopes are a LIFO stack on `wgpu::Device` and MUST be popped in reverse order.
+    let validation_future = validation_scope.pop();
+    let internal_future = internal_scope.pop();
+    let oom_future = oom_scope.pop();
     cfg_if::cfg_if! {
         if #[cfg(target_family = "wasm")] {
-            let error = crate::r#async::block_on(error_future);
+            let validation_err = crate::r#async::block_on(validation_future);
+            let internal_err = crate::r#async::block_on(internal_future);
+            let oom_err = crate::r#async::block_on(oom_future);
         } else {
             use futures::FutureExt;
-            let error = error_future.now_or_never().expect("always resolves immediately");
+            let validation_err = validation_future
+                .now_or_never()
+                .expect("always resolves immediately");
+            let internal_err = internal_future
+                .now_or_never()
+                .expect("always resolves immediately");
+            let oom_err = oom_future
+                .now_or_never()
+                .expect("always resolves immediately");
         }
     }
+    let error = oom_err.or(internal_err).or(validation_err);
     (ret, error.map(Into::into))
 }
 

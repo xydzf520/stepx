@@ -22,12 +22,15 @@ REPOSITORY = 'https://github.com/JiayuStudio/stepx-neo-lab.git'
 ORIGINAL = 'studio.jiayu.neoagent'
 PACKAGE = 'com.stepx.companion.neo'
 ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT / 'scripts') not in sys.path:
+    sys.path.insert(0, str(ROOT / 'scripts'))
+from host_runtime import migrate_legacy_state, optional_tool_home, subprocess_options, user_state_root
 ANDROID = '{http://schemas.android.com/apk/res/android}'
 ET.register_namespace('android', ANDROID[1:-1])
 
 
 def run(args, **kwargs):
-    subprocess.run([str(x) for x in args], check=True, **kwargs)
+    subprocess.run([str(x) for x in args], check=True, **subprocess_options(), **kwargs)
 
 
 def tool(name, directory):
@@ -56,18 +59,26 @@ def rewrite_method(source, signature, body):
 
 
 def main():
+    default_runtime = user_state_root() / 'neo-agent-build'
+    home = optional_tool_home()
+    default_config_base = Path(os.environ['XDG_CONFIG_HOME']) if os.environ.get('XDG_CONFIG_HOME') else ((home / '.config') if home is not None else (user_state_root() / 'config'))
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--upstream', type=Path, help='Existing clean checkout at the pinned commit; otherwise fetch into private runtime')
-    parser.add_argument('--runtime-dir', type=Path, default=Path.home() / '.local/state/stepx-companion/neo-agent-build')
+    parser.add_argument('--runtime-dir', type=Path, default=default_runtime)
     parser.add_argument('--jdk', type=Path, default=os.environ.get('STEPX_JDK') or os.environ.get('JAVA_HOME'))
     parser.add_argument('--sdk', type=Path, default=os.environ.get('ANDROID_SDK_ROOT') or os.environ.get('ANDROID_HOME'))
-    parser.add_argument('--signing-dir', type=Path, default=Path(os.environ.get('XDG_CONFIG_HOME', Path.home()/'.config')) / 'stepx-companion/signing')
+    parser.add_argument('--signing-dir', type=Path, default=default_config_base / 'stepx-companion/signing')
     parser.add_argument('--embedded', action='store_true', help='Build a single private StepX Companion APK containing the Neo runtime')
     args = parser.parse_args()
     if not args.jdk or not args.sdk:
         parser.error('Set --jdk/JAVA_HOME and --sdk/ANDROID_SDK_ROOT')
     if args.embedded:
         run([sys.executable,Path(__file__).with_name('test_embedded.py')])
+    if args.runtime_dir == default_runtime and not os.environ.get('STEPX_STATE_DIR') and not default_runtime.exists() and home is not None:
+        legacy_base = Path(os.environ.get('XDG_STATE_HOME') or (home / '.local/state'))
+        legacy_runtime = legacy_base / 'stepx-companion/neo-agent-build'
+        if legacy_runtime != default_runtime and legacy_runtime.exists():
+            migrate_legacy_state(legacy_runtime, default_runtime)
     runtime = args.runtime_dir.expanduser().resolve()
     if runtime == ROOT or ROOT in runtime.parents:
         raise RuntimeError('The private build must be outside the public checkout')

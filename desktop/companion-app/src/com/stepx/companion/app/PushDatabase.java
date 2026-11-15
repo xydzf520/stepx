@@ -27,21 +27,29 @@ final class PushDatabase {
         db=SQLiteDatabase.openOrCreateDatabase(path.getPath(),null,new android.database.DatabaseErrorHandler(){
             public void onCorruption(SQLiteDatabase corrupted){throw new android.database.sqlite.SQLiteDatabaseCorruptException("消息数据库损坏，保留原文件等待恢复");}
         });
-        db.enableWriteAheadLogging();
-        db.execSQL("PRAGMA synchronous=FULL");
-        try(Cursor timeout=db.rawQuery("PRAGMA busy_timeout=3000",null)){timeout.moveToFirst();}
-        if (db.getVersion()>1) {db.close();throw new IOException("消息数据库需要更新版客户端");}
-        if (db.getVersion()==0) {
-            db.beginTransaction();
-            try {
-                db.execSQL("CREATE TABLE meta (name TEXT PRIMARY KEY, body TEXT NOT NULL)");
-                db.execSQL("CREATE TABLE records (section TEXT NOT NULL,id TEXT NOT NULL,position INTEGER NOT NULL,body TEXT NOT NULL,PRIMARY KEY(section,id))");
-                db.execSQL("CREATE INDEX records_page ON records(section,position)");
-                db.setVersion(1);db.setTransactionSuccessful();
-            } finally {db.endTransaction();}
-        }
-        try(Cursor c=db.rawQuery("PRAGMA quick_check(1)",null)) {
-            if(!c.moveToFirst() || !"ok".equals(c.getString(0))) {db.close();throw new IOException("消息数据库完整性检查失败，停止覆盖");}
+        try {
+            try(Cursor timeout=db.rawQuery("PRAGMA busy_timeout=3000",null)){timeout.moveToFirst();}
+            db.enableWriteAheadLogging();
+            try(Cursor timeout=db.rawQuery("PRAGMA busy_timeout=3000",null)){timeout.moveToFirst();}
+            db.execSQL("PRAGMA synchronous=NORMAL");
+            if (db.getVersion()>1) throw new IOException("消息数据库需要更新版客户端");
+            if (db.getVersion()==0) {
+                db.beginTransaction();
+                try {
+                    db.execSQL("CREATE TABLE meta (name TEXT PRIMARY KEY, body TEXT NOT NULL)");
+                    db.execSQL("CREATE TABLE records (section TEXT NOT NULL,id TEXT NOT NULL,position INTEGER NOT NULL,body TEXT NOT NULL,PRIMARY KEY(section,id))");
+                    db.execSQL("CREATE INDEX records_page ON records(section,position)");
+                    db.setVersion(1);db.setTransactionSuccessful();
+                } finally {db.endTransaction();}
+            }
+            try(Cursor c=db.rawQuery("PRAGMA quick_check(1)",null)) {
+                if(!c.moveToFirst() || !"ok".equals(c.getString(0))) throw new IOException("消息数据库完整性检查失败，停止覆盖");
+            }
+        } catch (Throwable t) {
+            try { db.close(); } catch (Throwable ignored) {}
+            if (t instanceof Exception) throw (Exception) t;
+            if (t instanceof Error) throw (Error) t;
+            throw new IOException(t);
         }
     }
     synchronized JSONObject[] load(File legacy) throws Exception {

@@ -33,7 +33,7 @@ impl<'a> Frame<'a> {
         glyph_pipeline: &'a mut glyph::Pipeline,
         image_pipeline: &'a mut image::Pipeline,
     ) -> Self {
-        glyph_pipeline.update_config(&scene.rendering_config().glyphs);
+        glyph_pipeline.begin_frame(&scene.rendering_config().glyphs);
 
         let mut layer_state = vec![];
         let mut per_frame_state = PerFrameState::default();

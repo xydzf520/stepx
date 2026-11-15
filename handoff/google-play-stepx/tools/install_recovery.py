@@ -47,8 +47,15 @@ def verify_installed_package(package):
                 if sha256(local) != expected or digest_on_phone(remote) != expected:
                     raise WorkflowError('package_changed', 'Google 组件正在更新，请等待更新结束后继续；未覆盖已有版本。', True)
                 result = run(sdk_command('apksigner') + ['verify', '--print-certs', str(local)], timeout=90)
-                signers = re.findall(r'^Signer #\d+ certificate SHA-256 digest: ([0-9a-fA-F]{64})\s*$', result.stdout, re.M)
-                if [s.lower() for s in signers] != [meta['signer_sha256']]:
+                signers = {
+                    s.lower()
+                    for s in re.findall(
+                        r'^(?:Signer #\d+|Signer \([^)]+\)|V\d+(?:\.\d+)? Signer(?: #\d+)?|V\d+(?:\.\d+)? Signer \([^)]+\)):? certificate SHA-256 digest: ([0-9a-fA-F]{64})\s*$',
+                        result.stdout or '',
+                        re.M,
+                    )
+                }
+                if signers != {meta['signer_sha256'].lower()}:
                     raise WorkflowError('untrusted_package', '已有 Google 组件的签名不在已验证范围，已停止安装和授权。请核对组件来源；账号和应用保持原样。')
     # Do not accept a package generation that changed while it was inspected.
     if (shell('pm', 'path', '--user', '0', package).splitlines() != paths
@@ -90,7 +97,7 @@ def require_fresh_rollback(baseline, fingerprint, device_key):
             or any(p in baseline['packages'] for p in PACKAGES)):
         raise WorkflowError('recovery_identity', '无法确认这是首次安装，已停止卸载并保留数据。')
     try:
-        receipt = json.loads((STATE / 'install-progress.json').read_text())
+        receipt = json.loads((STATE / 'install-progress.json').read_text(encoding='utf-8'))
     except (OSError, ValueError):
         raise WorkflowError('recovery_identity', '首次安装记录缺失或损坏，不能据此卸载已有 Google 组件。') from None
     check_progress(receipt, fingerprint, device_key)

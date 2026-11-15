@@ -16,7 +16,7 @@ public final class StudioLocalActivity extends Activity {
     @Override public void onCreate(Bundle state){super.onCreate(state);design=new CompanionUi(this);loadWork(getIntent());}
     @Override protected void onNewIntent(Intent intent){super.onNewIntent(intent);setIntent(intent);loadWork(intent);}
     private void loadWork(Intent intent){
-        id=intent!=null?intent.getStringExtra("id"):null;String token=intent!=null?intent.getStringExtra("openToken"):null;if(token==null)token=UUID.randomUUID().toString();getSharedPreferences("studio-local-state",0).edit().putString("lastOpen",id).putString("openToken",token).putLong("readyAt",0).putString("title","").putInt("errorCount",0).putString("lastError","").apply();
+        id=StudioActivity.sanitizeId(intent!=null?intent.getStringExtra("id"):null);String token=StudioActivity.sanitizeId(intent!=null?intent.getStringExtra("openToken"):null);if(token==null)token=UUID.randomUUID().toString();getSharedPreferences("studio-local-state",0).edit().putString("lastOpen",id).putString("openToken",token).putLong("readyAt",0).putString("title","").putInt("errorCount",0).putString("lastError","").apply();
         try{html=StudioLocal.html(this,id);workName=StudioLocal.item(this,id).getString("name");
             if(web==null){
                 page=new LinearLayout(this);page.setOrientation(LinearLayout.VERTICAL);page.setBackgroundColor(Color.WHITE);

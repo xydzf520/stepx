@@ -54,10 +54,8 @@ import java.util.concurrent.atomic.AtomicReference;
  */
 public final class ChatUiBridge {
     private static final String APEX_CALLBACK_DESCRIPTOR = "com.stepx.companion.app.IApexCallback";
-    private static final String READONLY_BRIDGE_DEX_PATH = "/data/local/tmp/stepx-companion-bridge.apk";
 
     private static volatile Boolean sApexAvailable;
-    private static volatile boolean sSelfApexBlocked = false;
     private static volatile ClassLoader sAbilityClassLoader;
 
     private ChatUiBridge() {}
@@ -342,7 +340,8 @@ public final class ChatUiBridge {
             String pkg = ctx != null ? ctx.getPackageName() : extras.getString("targetFindPackage", "");
             int sw = rootView.getWidth() > 0 ? rootView.getWidth() : 1080;
             int sh = rootView.getHeight() > 0 ? rootView.getHeight() : 2400;
-            UiNode rootNode = buildUiNodeFromLiveView(rootView, 0);
+            int[] remainingMediaChars = new int[]{ MAX_CAPTURE_MEDIA_B64_CHARS };
+            UiNode rootNode = buildUiNodeFromLiveView(rootView, 0, remainingMediaChars);
 
             JSONObject payload = new JSONObject();
             payload.put("ok", true);
@@ -353,12 +352,23 @@ public final class ChatUiBridge {
             if (rootNode != null) {
                 payload.put("root", rootNode.toJson());
             }
+            String payloadJson = payload.toString();
+            if (payloadJson.length() > MAX_APEX_PARCEL_CHARS && rootNode != null) {
+                stripNodeMediaRecursive(rootNode, false);
+                payload.put("root", rootNode.toJson());
+                payloadJson = payload.toString();
+                if (payloadJson.length() > MAX_APEX_PARCEL_CHARS) {
+                    stripNodeMediaRecursive(rootNode, true);
+                    payload.put("root", rootNode.toJson());
+                    payloadJson = payload.toString();
+                }
+            }
 
             Parcel data = Parcel.obtain();
             Parcel reply = Parcel.obtain();
             try {
                 data.writeInterfaceToken(APEX_CALLBACK_DESCRIPTOR);
-                data.writeString(payload.toString());
+                data.writeString(payloadJson);
                 callback.transact(1, data, reply, 0);
             } finally {
                 data.recycle();
@@ -520,7 +530,27 @@ public final class ChatUiBridge {
         return null;
     }
 
+    public static final int MAX_CAPTURE_MEDIA_B64_CHARS = 128 * 1024;
+    private static final int MAX_APEX_PARCEL_CHARS = 220_000;
+
+    private static void stripNodeMediaRecursive(UiNode node, boolean alsoStripAvatars) {
+        if (node == null) return;
+        node.mediaB64 = "";
+        if (alsoStripAvatars) {
+            node.avatarB64 = "";
+        }
+        if (node.children != null) {
+            for (int i = 0; i < node.children.size(); i++) {
+                stripNodeMediaRecursive(node.children.get(i), alsoStripAvatars);
+            }
+        }
+    }
+
     private static UiNode buildUiNodeFromLiveView(View view, int depth) {
+        return buildUiNodeFromLiveView(view, depth, new int[]{ MAX_CAPTURE_MEDIA_B64_CHARS });
+    }
+
+    private static UiNode buildUiNodeFromLiveView(View view, int depth, int[] remainingMediaChars) {
         if (view == null || depth > 45 || view.getVisibility() != View.VISIBLE) return null;
         int w = view.getWidth();
         int h = view.getHeight();
@@ -582,7 +612,7 @@ public final class ChatUiBridge {
         if (view instanceof ViewGroup) {
             ViewGroup vg = (ViewGroup) view;
             for (int i = 0; i < vg.getChildCount(); i++) {
-                UiNode child = buildUiNodeFromLiveView(vg.getChildAt(i), depth + 1);
+                UiNode child = buildUiNodeFromLiveView(vg.getChildAt(i), depth + 1, remainingMediaChars);
                 if (child != null) {
                     node.children.add(child);
                 }
@@ -619,6 +649,8 @@ public final class ChatUiBridge {
         }
         if (node.avatarB64.isEmpty()
                 && node.mediaB64.isEmpty()
+                && remainingMediaChars != null
+                && remainingMediaChars[0] > 0
                 && loc[1] >= 120
                 && !inLeftGutter
                 && !inRightGutter
@@ -641,7 +673,15 @@ public final class ChatUiBridge {
                     }
                 }
                 if (!childAlreadyHasMedia) {
-                    node.mediaB64 = captureLiveMediaViewBase64(view);
+                    String capturedMedia = captureLiveMediaViewBase64(view);
+                    if (!capturedMedia.isEmpty()) {
+                        if (capturedMedia.length() <= remainingMediaChars[0]) {
+                            node.mediaB64 = capturedMedia;
+                            remainingMediaChars[0] -= capturedMedia.length();
+                        } else {
+                            remainingMediaChars[0] = 0;
+                        }
+                    }
                 }
             }
         }
@@ -1164,26 +1204,8 @@ public final class ChatUiBridge {
                     if (snap != null && snap.root != null && safePkg.equals(snap.packageName)) {
                         break;
                     }
-                    if (attempt == 1) {
-                        try {
-                            if ("com.tencent.mm".equals(safePkg)) {
-                                Runtime.getRuntime().exec(new String[]{
-                                    "am", "start", "-n", "com.tencent.mm/.ui.LauncherUI"
-                                });
-                            } else {
-                                Runtime.getRuntime().exec(new String[]{
-                                    "am", "start", "-p", safePkg
-                                });
-                            }
-                        } catch (Throwable ignored) {
-                        }
-                    } else if (attempt == 3) {
-                        try {
-                            Runtime.getRuntime().exec(new String[]{
-                                "monkey", "-p", safePkg, "-c", "android.intent.category.LAUNCHER", "1"
-                            });
-                        } catch (Throwable ignored) {
-                        }
+                    if (attempt == 2) {
+                        launchOrOpenConversation(context, safePkg, safeTargetTitle);
                     }
                 }
             }
@@ -1516,26 +1538,23 @@ public final class ChatUiBridge {
                 return;
             }
         }
-        try {
-            Intent launch = context.getPackageManager().getLaunchIntentForPackage(pkg);
-            if (launch != null) {
-                launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
-                android.os.Bundle opts = PushStore.buildBackgroundActivityLaunchOptions();
-                if (opts != null) {
-                    context.startActivity(launch, opts);
-                } else {
-                    context.startActivity(launch);
+        boolean launchedViaIntent = false;
+        Context launchContext = GuiAccessibilityService.instance != null ? GuiAccessibilityService.instance : context;
+        if (launchContext != null) {
+            try {
+                Intent launch = launchContext.getPackageManager().getLaunchIntentForPackage(pkg);
+                if (launch != null) {
+                    launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
+                    android.os.Bundle opts = PushStore.buildBackgroundActivityLaunchOptions();
+                    if (opts != null) {
+                        launchContext.startActivity(launch, opts);
+                    } else {
+                        launchContext.startActivity(launch);
+                    }
+                    launchedViaIntent = true;
                 }
+            } catch (Throwable ignored) {
             }
-        } catch (Throwable ignored) {
-        }
-        try {
-            if ("com.tencent.mm".equals(pkg)) {
-                Runtime.getRuntime().exec(new String[]{"am", "start", "-n", "com.tencent.mm/.ui.LauncherUI"});
-            } else {
-                Runtime.getRuntime().exec(new String[]{"am", "start", "-p", pkg});
-            }
-        } catch (Throwable ignored) {
         }
     }
 
@@ -1546,7 +1565,7 @@ public final class ChatUiBridge {
 
         UiWindowSnapshot apexSnap = null;
         if (isApexBridgeAvailable()) {
-            if (!sSelfApexBlocked && context != null) {
+            if (context != null) {
                 apexSnap = invokeSelfApex(context, safePkg, "snapshot", 0, 0, "");
             }
             if (apexSnap == null || apexSnap.root == null) {
@@ -1724,10 +1743,13 @@ public final class ChatUiBridge {
             int y,
             String text) {
         try {
-            File roBridge = new File(READONLY_BRIDGE_DEX_PATH);
-            String dexPath = (roBridge.isFile() && roBridge.canRead())
-                ? READONLY_BRIDGE_DEX_PATH
-                : context.getApplicationInfo().sourceDir;
+            if (context == null || context.getApplicationInfo() == null) {
+                return null;
+            }
+            String dexPath = context.getApplicationInfo().sourceDir;
+            if (dexPath == null || dexPath.isEmpty()) {
+                return null;
+            }
 
             final CountDownLatch latch = new CountDownLatch(1);
             final AtomicReference<String> jsonRef = new AtomicReference<String>();
@@ -2107,7 +2129,7 @@ public final class ChatUiBridge {
         int cy = node.bounds.centerY();
 
         if (isApexBridgeAvailable() && snap != null && !snap.packageName.isEmpty()) {
-            if (!sSelfApexBlocked && context != null) {
+            if (context != null) {
                 UiWindowSnapshot res = invokeSelfApex(context, snap.packageName, "click", cx, cy, "");
                 if (res != null && res.actionResult) return true;
             }
@@ -2131,7 +2153,7 @@ public final class ChatUiBridge {
         int cy = node.bounds.centerY();
 
         if (isApexBridgeAvailable() && snap != null && !snap.packageName.isEmpty()) {
-            if (!sSelfApexBlocked && context != null) {
+            if (context != null) {
                 UiWindowSnapshot res = invokeSelfApex(context, snap.packageName, "setText", cx, cy, text);
                 if (res != null && res.actionResult) return true;
             }
@@ -2156,13 +2178,13 @@ public final class ChatUiBridge {
     }
 
     private static boolean performBackNavigation(Context context, UiWindowSnapshot snap) {
+        GuiAccessibilityService service = GuiAccessibilityService.instance;
         if (snap != null && snap.root != null) {
             UiNode backBtn = findTopLeftBackNode(snap.root, snap.screenWidth, snap.screenHeight);
             if (backBtn != null && performNodeClick(context, snap, backBtn)) {
                 return true;
             }
         }
-        GuiAccessibilityService service = GuiAccessibilityService.instance;
         if (service != null) {
             try {
                 if (service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)) {
@@ -2170,11 +2192,7 @@ public final class ChatUiBridge {
                 }
             } catch (Throwable ignored) {
             }
-        }
-        try {
-            Runtime.getRuntime().exec(new String[]{"input", "keyevent", "4"});
-            return true;
-        } catch (Throwable ignored) {
+            return false;
         }
         return false;
     }
@@ -2415,6 +2433,7 @@ public final class ChatUiBridge {
 
             // 4. Collect candidate text and media/sticker nodes in the chat message area
             List<UiNode> textNodes = new ArrayList<UiNode>();
+            int[] remainingWindowMediaChars = new int[]{ MAX_CAPTURE_MEDIA_B64_CHARS };
             for (UiNode n : allNodes) {
                 if (n.editable || avatarNodeSet.contains(n)) continue;
                 if (n.bounds.top < topBarBottom || n.bounds.bottom > inputBarTop) continue;
@@ -2445,13 +2464,26 @@ public final class ChatUiBridge {
                     if (!overlapsAvatar) {
                         val = "[图片]";
                         String mediaB64 = n.mediaB64;
-                        if (mediaB64 == null || mediaB64.isEmpty()) {
+                        if (mediaB64 != null && !mediaB64.isEmpty()) {
+                            if (mediaB64.length() <= remainingWindowMediaChars[0]) {
+                                remainingWindowMediaChars[0] -= mediaB64.length();
+                            } else {
+                                mediaB64 = "";
+                                remainingWindowMediaChars[0] = 0;
+                            }
+                        } else if (remainingWindowMediaChars[0] > 0) {
                             if (!chatScreenAttempted) {
                                 chatScreenAttempted = true;
                                 chatScreenBmp = GuiAccessibilityService.captureScreenBitmapSync(900L);
                             }
                             if (chatScreenBmp != null) {
-                                mediaB64 = cropMediaBubbleBase64FromBitmap(chatScreenBmp, n.bounds);
+                                String cropped = cropMediaBubbleBase64FromBitmap(chatScreenBmp, n.bounds);
+                                if (cropped != null && !cropped.isEmpty() && cropped.length() <= remainingWindowMediaChars[0]) {
+                                    mediaB64 = cropped;
+                                    remainingWindowMediaChars[0] -= cropped.length();
+                                } else {
+                                    remainingWindowMediaChars[0] = 0;
+                                }
                             }
                         }
                         n = new UiNode(
@@ -2472,6 +2504,7 @@ public final class ChatUiBridge {
                 String normVal = normalizeVoiceBubbleText(val);
                 if (("[图片]".equals(normVal) || "[动画表情]".equals(normVal))
                         && (n.mediaB64 == null || n.mediaB64.isEmpty())
+                        && remainingWindowMediaChars[0] > 0
                         && n.bounds.width() >= 48
                         && n.bounds.height() >= 48) {
                     if (!chatScreenAttempted) {
@@ -2479,7 +2512,13 @@ public final class ChatUiBridge {
                         chatScreenBmp = GuiAccessibilityService.captureScreenBitmapSync(900L);
                     }
                     if (chatScreenBmp != null) {
-                        n.mediaB64 = cropMediaBubbleBase64FromBitmap(chatScreenBmp, n.bounds);
+                        String cropped = cropMediaBubbleBase64FromBitmap(chatScreenBmp, n.bounds);
+                        if (cropped != null && !cropped.isEmpty() && cropped.length() <= remainingWindowMediaChars[0]) {
+                            n.mediaB64 = cropped;
+                            remainingWindowMediaChars[0] -= cropped.length();
+                        } else {
+                            remainingWindowMediaChars[0] = 0;
+                        }
                     }
                 }
                 textNodes.add(n);
@@ -2531,13 +2570,26 @@ public final class ChatUiBridge {
                     String mediaB64 = (candidateNode != null && candidateNode.mediaB64 != null)
                         ? candidateNode.mediaB64
                         : "";
-                    if (mediaB64.isEmpty()) {
+                    if (!mediaB64.isEmpty()) {
+                        if (mediaB64.length() <= remainingWindowMediaChars[0]) {
+                            remainingWindowMediaChars[0] -= mediaB64.length();
+                        } else {
+                            mediaB64 = "";
+                            remainingWindowMediaChars[0] = 0;
+                        }
+                    } else if (remainingWindowMediaChars[0] > 0) {
                         if (!chatScreenAttempted) {
                             chatScreenAttempted = true;
                             chatScreenBmp = GuiAccessibilityService.captureScreenBitmapSync(900L);
                         }
                         if (chatScreenBmp != null) {
-                            mediaB64 = cropMediaBubbleBase64FromBitmap(chatScreenBmp, targetBounds);
+                            String cropped = cropMediaBubbleBase64FromBitmap(chatScreenBmp, targetBounds);
+                            if (cropped != null && !cropped.isEmpty() && cropped.length() <= remainingWindowMediaChars[0]) {
+                                mediaB64 = cropped;
+                                remainingWindowMediaChars[0] -= cropped.length();
+                            } else {
+                                remainingWindowMediaChars[0] = 0;
+                            }
                         }
                     }
                     UiNode stickerNode = new UiNode(

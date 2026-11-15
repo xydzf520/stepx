@@ -15,7 +15,17 @@ pub struct Transport {
     pub model: String,
 }
 
-const VERIFIED_TRANSPORT_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+const VERIFIED_USB_TRANSPORT_TTL: std::time::Duration = std::time::Duration::from_secs(15);
+const VERIFIED_WIRELESS_TRANSPORT_TTL: std::time::Duration = std::time::Duration::from_secs(4);
+const USB_PROBE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(4);
+
+fn verified_transport_ttl(transport: &str) -> std::time::Duration {
+    if crate::adb::is_wireless_transport(transport) {
+        VERIFIED_WIRELESS_TRANSPORT_TTL
+    } else {
+        VERIFIED_USB_TRANSPORT_TTL
+    }
+}
 
 #[derive(Clone, Debug)]
 struct VerifiedTransportEntry {
@@ -24,34 +34,191 @@ struct VerifiedTransportEntry {
     verified_at: std::time::Instant,
 }
 
-static ACTIVE_TRANSPORT_REGISTRY: OnceLock<Mutex<HashMap<String, VerifiedTransportEntry>>> =
+static ACTIVE_TRANSPORT_BY_SERIAL: OnceLock<Mutex<HashMap<String, VerifiedTransportEntry>>> =
     OnceLock::new();
 static KNOWN_SERIAL_BY_TRANSPORT: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+static BACKUP_TRANSPORTS_BY_SERIAL: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
+static USB_PROBE_FAILURES: OnceLock<Mutex<HashMap<String, std::time::Instant>>> = OnceLock::new();
 
 fn active_transport_registry() -> &'static Mutex<HashMap<String, VerifiedTransportEntry>> {
-    ACTIVE_TRANSPORT_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+    ACTIVE_TRANSPORT_BY_SERIAL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn known_serial_registry() -> &'static Mutex<HashMap<String, String>> {
     KNOWN_SERIAL_BY_TRANSPORT.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn remember_serial_for_transports(serial: &str, transports: &[&str]) {
-    let s = serial.trim();
-    if s.is_empty() || s.contains(':') || s.starts_with("adb-") {
+fn usb_probe_failures() -> &'static Mutex<HashMap<String, std::time::Instant>> {
+    USB_PROBE_FAILURES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn usb_probe_in_backoff(usb_id: &str) -> bool {
+    let trimmed = usb_id.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    usb_probe_failures()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(trimmed)
+        .is_some_and(|at| at.elapsed() < USB_PROBE_BACKOFF)
+}
+
+fn note_usb_probe_failure(usb_id: &str) {
+    let trimmed = usb_id.trim();
+    if !trimmed.is_empty() && !crate::adb::is_wireless_transport(trimmed) {
+        usb_probe_failures()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(trimmed.to_string(), std::time::Instant::now());
+    }
+}
+
+fn clear_usb_probe_failure(usb_id: &str) {
+    let trimmed = usb_id.trim();
+    if !trimmed.is_empty() {
+        usb_probe_failures()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(trimmed);
+    }
+}
+
+fn parse_wireless_ip_and_port(endpoint: &str) -> Option<(&str, u16)> {
+    let trimmed = endpoint.trim();
+    if trimmed.is_empty() || trimmed.starts_with("adb-") || trimmed.contains("._adb-tls-") {
+        return None;
+    }
+    let (host, port_str) = trimmed.rsplit_once(':')?;
+    if host.is_empty() {
+        return None;
+    }
+    let port = port_str.parse::<u16>().ok()?;
+    if port == 0 {
+        return None;
+    }
+    Some((host, port))
+}
+
+fn is_superseded_ephemeral_endpoint(candidate: &str, newer: &str) -> bool {
+    let Some((new_host, new_port)) = parse_wireless_ip_and_port(newer) else {
+        return false;
+    };
+    if new_port == 5555 {
+        return false;
+    }
+    let Some((cand_host, cand_port)) = parse_wireless_ip_and_port(candidate) else {
+        return false;
+    };
+    cand_port != 5555 && cand_port != new_port && cand_host.eq_ignore_ascii_case(new_host)
+}
+
+fn evict_transport_from_backup_registry(transport: &str) {
+    let trimmed = transport.trim();
+    if trimmed.is_empty() {
         return;
     }
-    if let Ok(mut map) = known_serial_registry().lock() {
-        for t in transports {
-            let trimmed = t.trim();
-            if !trimmed.is_empty() && !trimmed.starts_with("model:") {
-                map.insert(trimmed.to_string(), s.to_string());
-            }
+    if let Ok(mut map) = backup_transport_registry().lock() {
+        map.remove(trimmed);
+        for peers in map.values_mut() {
+            peers.retain(|b| b != trimmed);
         }
     }
 }
 
-fn known_serial_for_transport(transport_or_serial: &str) -> Option<String> {
+fn prune_superseded_wireless_for_serial(serial: &str, newer_transport: &str) {
+    let Some((_, new_port)) = parse_wireless_ip_and_port(newer_transport) else {
+        return;
+    };
+    if new_port == 5555 {
+        return;
+    }
+    let serial_trimmed = serial.trim();
+    let mut superseded = Vec::new();
+    if let Ok(map) = backup_transport_registry().lock() {
+        for (k, peers) in map.iter() {
+            let belongs = (!serial_trimmed.is_empty()
+                && (k == serial_trimmed
+                    || known_serial_for_transport(k).as_deref() == Some(serial_trimmed)))
+                || k == newer_transport.trim()
+                || peers.iter().any(|p| p == newer_transport.trim());
+            if !belongs {
+                continue;
+            }
+            if is_superseded_ephemeral_endpoint(k, newer_transport) && !superseded.contains(k) {
+                superseded.push(k.clone());
+            }
+            for p in peers {
+                if is_superseded_ephemeral_endpoint(p, newer_transport) && !superseded.contains(p) {
+                    superseded.push(p.clone());
+                }
+            }
+        }
+    }
+    for old_ep in &superseded {
+        evict_transport_from_backup_registry(old_ep);
+    }
+    if !superseded.is_empty() {
+        if let Ok(mut reg) = active_transport_registry().lock() {
+            reg.retain(|k, _| !superseded.contains(k));
+        }
+    }
+}
+
+/// Record a verified hardware `ro.serialno` for a specific transport.
+/// Call ONLY after `ro.serialno` has been read directly from `verified_transport`.
+pub fn record_verified_serial_for_transport(serial: &str, verified_transport: &str) {
+    let s = serial.trim();
+    let t = verified_transport.trim();
+    if s.is_empty()
+        || s.contains(':')
+        || s.starts_with("adb-")
+        || t.is_empty()
+        || t.starts_with("model:")
+    {
+        return;
+    }
+    let previous = if let Ok(mut map) = known_serial_registry().lock() {
+        map.insert(t.to_string(), s.to_string())
+    } else {
+        None
+    };
+    if let Some(old_serial) = previous {
+        if old_serial != s {
+            evict_transport_from_backup_registry(t);
+            if let Ok(mut reg) = active_transport_registry().lock() {
+                reg.retain(|k, v| {
+                    !(v.hardware_serial == old_serial && (k == t || v.active_transport == t))
+                });
+            }
+            crate::bridge::invalidate_bridge_cache(t);
+            crate::bridge::invalidate_bridge_cache(&old_serial);
+        }
+    }
+}
+
+/// Probe `ro.serialno` directly from `transport` and record the verified mapping.
+pub fn resolve_hardware_serial(adb: &Adb, transport: &str) -> Option<String> {
+    let trimmed = transport.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let _guard = crate::adb::enter_transport_recovery();
+    let got = adb
+        .run_timeout(
+            &["-s", trimmed, "shell", "getprop", "ro.serialno"],
+            std::time::Duration::from_secs(3),
+        )
+        .ok()?;
+    let serial = got.trim();
+    if serial.is_empty() || serial.contains(':') || serial.starts_with("adb-") {
+        return None;
+    }
+    record_verified_serial_for_transport(serial, trimmed);
+    Some(serial.to_string())
+}
+
+pub(crate) fn known_serial_for_transport(transport_or_serial: &str) -> Option<String> {
     let trimmed = transport_or_serial.trim();
     if trimmed.is_empty() {
         return None;
@@ -74,28 +241,126 @@ fn known_serial_for_transport(transport_or_serial: &str) -> Option<String> {
     None
 }
 
+pub(crate) fn known_transports_for_serial(serial: &str) -> Vec<String> {
+    let trimmed = serial.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    if let Ok(map) = known_serial_registry().lock() {
+        for (transport, ser) in map.iter() {
+            if ser == trimmed && !transport.is_empty() && !out.contains(transport) {
+                out.push(transport.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Purge all cached transport mappings, active sessions, and backup transports for `serial`
+/// when a remembered device is removed.
+pub fn forget_known_serial(serial: &str) {
+    let trimmed = serial.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let mut related_transports: Vec<String> = vec![trimmed.to_string()];
+    if let Ok(mut map) = known_serial_registry().lock() {
+        for (k, v) in map.iter() {
+            if k == trimmed
+                || v == trimmed
+                || canonical_serial_from_transport(k).as_deref() == Some(trimmed)
+            {
+                if !related_transports.contains(k) {
+                    related_transports.push(k.clone());
+                }
+            }
+        }
+        map.retain(|k, v| {
+            k != trimmed
+                && v != trimmed
+                && canonical_serial_from_transport(k).as_deref() != Some(trimmed)
+        });
+    }
+    if let Ok(mut reg) = active_transport_registry().lock() {
+        for (k, v) in reg.iter() {
+            if k == trimmed
+                || v.hardware_serial == trimmed
+                || v.active_transport == trimmed
+                || related_transports.contains(k)
+                || related_transports.contains(&v.active_transport)
+            {
+                if !related_transports.contains(k) {
+                    related_transports.push(k.clone());
+                }
+                if !v.active_transport.is_empty()
+                    && !related_transports.contains(&v.active_transport)
+                {
+                    related_transports.push(v.active_transport.clone());
+                }
+            }
+        }
+        reg.retain(|k, v| {
+            k != trimmed
+                && v.hardware_serial != trimmed
+                && v.active_transport != trimmed
+                && !related_transports.contains(k)
+                && !related_transports.contains(&v.active_transport)
+        });
+    }
+    if let Ok(mut backups) = backup_transport_registry().lock() {
+        backups.retain(|k, _| {
+            k != trimmed
+                && !related_transports.contains(k)
+                && canonical_serial_from_transport(k).as_deref() != Some(trimmed)
+        });
+        for peers in backups.values_mut() {
+            peers.retain(|p| {
+                p != trimmed
+                    && !related_transports.contains(p)
+                    && canonical_serial_from_transport(p).as_deref() != Some(trimmed)
+            });
+        }
+        backups.retain(|_, peers| !peers.is_empty());
+    }
+    for t in &related_transports {
+        clear_usb_probe_failure(t);
+        crate::bridge::invalidate_bridge_cache(t);
+    }
+}
+
 fn record_verified_transport(preferred: &str, hardware_serial: &str, active_transport: &str) {
     let active = active_transport.trim();
     if active.is_empty() {
         return;
     }
-    let serial = if !hardware_serial.trim().is_empty() {
-        hardware_serial.trim().to_string()
+    if !crate::adb::is_wireless_transport(active) {
+        clear_usb_probe_failure(active);
+    }
+    let explicit_serial = hardware_serial.trim();
+    let serial = if !explicit_serial.is_empty() {
+        explicit_serial.to_string()
     } else {
-        known_serial_for_transport(active)
-            .or_else(|| known_serial_for_transport(preferred))
-            .unwrap_or_default()
+        known_serial_for_transport(active).unwrap_or_default()
     };
-    remember_serial_for_transports(&serial, &[preferred, active]);
+    if !explicit_serial.is_empty() {
+        record_verified_serial_for_transport(explicit_serial, active);
+    }
+    prune_superseded_wireless_for_serial(&serial, active);
     let entry = VerifiedTransportEntry {
         active_transport: active.to_string(),
         hardware_serial: serial.clone(),
         verified_at: std::time::Instant::now(),
     };
+    let pref_trimmed = preferred.trim();
+    let pref_verified_same_serial = !pref_trimmed.is_empty()
+        && (pref_trimmed == active
+            || (!serial.is_empty()
+                && known_serial_for_transport(pref_trimmed).as_deref() == Some(serial.as_str())));
     if let Ok(mut reg) = active_transport_registry().lock() {
         reg.insert(active.to_string(), entry.clone());
-        if !preferred.trim().is_empty() {
-            reg.insert(preferred.trim().to_string(), entry.clone());
+        if pref_verified_same_serial && !is_superseded_ephemeral_endpoint(pref_trimmed, active) {
+            reg.insert(pref_trimmed.to_string(), entry.clone());
         }
         if !serial.is_empty() {
             reg.insert(serial, entry);
@@ -108,7 +373,19 @@ pub fn invalidate_verified_transport(transport_or_serial: &str) {
     if trimmed.is_empty() {
         return;
     }
+    let known_serial = known_serial_for_transport(trimmed).unwrap_or_default();
+    clear_usb_probe_failure(trimmed);
     let canonical = canonical_serial_from_transport(trimmed).unwrap_or_default();
+    if !canonical.is_empty() {
+        clear_usb_probe_failure(&canonical);
+    }
+    crate::bridge::invalidate_bridge_cache(trimmed);
+    if !known_serial.is_empty() {
+        crate::bridge::invalidate_bridge_cache(&known_serial);
+    }
+    if !canonical.is_empty() {
+        crate::bridge::invalidate_bridge_cache(&canonical);
+    }
     if let Ok(mut reg) = active_transport_registry().lock() {
         reg.retain(|k, v| {
             k != trimmed
@@ -117,6 +394,13 @@ pub fn invalidate_verified_transport(transport_or_serial: &str) {
                 && (canonical.is_empty() || (k != &canonical && v.hardware_serial != canonical))
         });
     }
+    if crate::adb::is_wireless_transport(trimmed) {
+        if let Ok(mut map) = backup_transport_registry().lock() {
+            for peers in map.values_mut() {
+                peers.retain(|b| b != trimmed);
+            }
+        }
+    }
 }
 
 pub fn promote_active_transport(serial: &str, new_transport: &str) {
@@ -124,33 +408,55 @@ pub fn promote_active_transport(serial: &str, new_transport: &str) {
     if new_t.is_empty() {
         return;
     }
+    if !crate::adb::is_wireless_transport(new_t) {
+        clear_usb_probe_failure(new_t);
+    }
     let effective_serial = if !serial.trim().is_empty() {
         serial.trim().to_string()
     } else {
         known_serial_for_transport(new_t).unwrap_or_default()
     };
+    prune_superseded_wireless_for_serial(&effective_serial, new_t);
     let mut old_transports = Vec::new();
     if let Ok(reg) = active_transport_registry().lock() {
         if !effective_serial.is_empty() {
             if let Some(existing) = reg.get(&effective_serial) {
-                if !existing.active_transport.is_empty() && existing.active_transport != new_t {
+                if !existing.active_transport.is_empty()
+                    && existing.active_transport != new_t
+                    && !is_superseded_ephemeral_endpoint(&existing.active_transport, new_t)
+                {
                     old_transports.push(existing.active_transport.clone());
                 }
             }
         }
         for (k, v) in reg.iter() {
             if !effective_serial.is_empty() && v.hardware_serial == effective_serial {
-                if v.active_transport != new_t && !old_transports.contains(&v.active_transport) {
+                if v.active_transport != new_t
+                    && !is_superseded_ephemeral_endpoint(&v.active_transport, new_t)
+                    && !old_transports.contains(&v.active_transport)
+                {
                     old_transports.push(v.active_transport.clone());
                 }
-                if k != &effective_serial && k != new_t && !old_transports.contains(k) {
+                if k != &effective_serial
+                    && k != new_t
+                    && !is_superseded_ephemeral_endpoint(k, new_t)
+                    && !old_transports.contains(k)
+                {
                     old_transports.push(k.clone());
                 }
             }
         }
     }
 
-    record_verified_transport(&effective_serial, &effective_serial, new_t);
+    let verified_serial_arg = if !effective_serial.is_empty()
+        && (!crate::adb::is_wireless_transport(new_t)
+            || known_serial_for_transport(new_t).as_deref() == Some(effective_serial.as_str()))
+    {
+        effective_serial.as_str()
+    } else {
+        ""
+    };
+    record_verified_transport(&effective_serial, verified_serial_arg, new_t);
     if let Ok(mut reg) = active_transport_registry().lock() {
         let entry = VerifiedTransportEntry {
             active_transport: new_t.to_string(),
@@ -170,7 +476,7 @@ pub fn promote_active_transport(serial: &str, new_transport: &str) {
         all_known.push(effective_serial.clone());
     }
     for old_t in &old_transports {
-        if !all_known.contains(old_t) {
+        if !is_superseded_ephemeral_endpoint(old_t, new_t) && !all_known.contains(old_t) {
             all_known.push(old_t.clone());
         }
     }
@@ -179,7 +485,10 @@ pub fn promote_active_transport(serial: &str, new_transport: &str) {
     }
     let existing_backups = backup_transports_for(&[&effective_serial, new_t]);
     for b in existing_backups {
-        if !b.is_empty() && !all_known.contains(&b) {
+        if !b.is_empty()
+            && !is_superseded_ephemeral_endpoint(&b, new_t)
+            && !all_known.contains(&b)
+        {
             all_known.push(b);
         }
     }
@@ -218,6 +527,25 @@ pub fn current_active_transport_for_serial(serial: &str) -> Option<String> {
         }
     }
     None
+}
+
+pub fn active_transport_for(serial: &str, fallback_transport: &str) -> String {
+    if !serial.trim().is_empty() {
+        if let Some(active) = current_active_transport_for_serial(serial) {
+            if !active.is_empty() {
+                return active;
+            }
+        }
+    }
+    if !fallback_transport.trim().is_empty() {
+        if let Some(active) = current_active_transport_for_serial(fallback_transport) {
+            if !active.is_empty() {
+                return active;
+            }
+        }
+        return fallback_transport.to_string();
+    }
+    serial.to_string()
 }
 
 // A host-session reset must never interrupt a send, dial, or other dispatched write.
@@ -277,6 +605,14 @@ impl Drop for HostSessionRepair {
         }
     }
 }
+fn has_in_flight_writes(target: &str) -> bool {
+    let sessions = session_activities().lock().unwrap_or_else(|e| e.into_inner());
+    let key = session_activity_identity(target);
+    related_session_activities(&sessions, &key)
+        .iter()
+        .any(|slot| slot.lock().unwrap_or_else(|e| e.into_inner()).writes > 0)
+}
+
 fn begin_host_session_repair(target: &str) -> Option<HostSessionRepair> {
     // Serialize the inspection/reservation with new write guards. Dropping a
     // guard needs only its own slot, so this never waits for a network request.
@@ -318,7 +654,7 @@ case "$*" in
 esac
 "#, log=log.display(), marker=marker.display())).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        remember_serial_for_transports(serial, &[endpoint]);
+        record_verified_serial_for_transport(serial, endpoint);
         (dir, Adb { path: script }, log)
     }
     #[test]
@@ -355,7 +691,7 @@ esac
         let endpoint = "192.0.2.165:40104";
         let serial = "REPAIR165_LATE_IDENTITY";
         let write = protect_transport_mutation(endpoint).unwrap();
-        remember_serial_for_transports(serial, &[endpoint]);
+        record_verified_serial_for_transport(serial, endpoint);
         assert!(begin_host_session_repair(serial).is_none());
         assert!(begin_host_session_repair(endpoint).is_none());
         drop(write);
@@ -370,7 +706,7 @@ esac
         let serial = "REPAIR165_NEW_ALIAS";
         let repair = begin_host_session_repair(serial).unwrap();
         let endpoint = "192.0.2.165:40105";
-        remember_serial_for_transports(serial, &[endpoint]);
+        record_verified_serial_for_transport(serial, endpoint);
         assert!(protect_transport_mutation(endpoint).is_err());
         assert!(protect_transport_mutation("UNRELATED165_DEVICE").is_ok());
         drop(repair);
@@ -435,13 +771,26 @@ pub fn recover_transport(
     failed_transport: &str,
     budget: std::time::Duration,
 ) -> Option<String> {
+    recover_transport_for_serial(adb, failed_transport, None, budget)
+}
+
+fn recover_transport_for_serial(
+    adb: &Adb,
+    failed_transport: &str,
+    explicit_serial: Option<&str>,
+    budget: std::time::Duration,
+) -> Option<String> {
     use std::time::{Duration, Instant};
     if failed_transport.trim().is_empty() || budget.is_zero() {
         return None;
     }
     static RECOVERY: OnceLock<Mutex<HashMap<(std::path::PathBuf, String), RecoverySlot>>> =
         OnceLock::new();
-    let serial = known_serial_for_transport(failed_transport);
+    let serial = explicit_serial
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.contains(':') && !s.starts_with("adb-"))
+        .map(str::to_string)
+        .or_else(|| known_serial_for_transport(failed_transport));
     let key = (
         adb.path.clone(),
         serial
@@ -535,7 +884,7 @@ fn recover_transport_until(
     candidates.sort_by_key(|id| {
         (
             if online.contains(&id.as_str()) { 0 } else { 1 },
-            if id == failed { 0 } else { 1 },
+            if id == failed { 1 } else { 0 },
             transport_priority(id),
         )
     });
@@ -580,6 +929,18 @@ fn recover_transport_until(
         // Without a known hardware identity only the original endpoint is eligible.
         if serial.is_none() && endpoint != failed {
             return None;
+        }
+        if endpoint != failed {
+            invalidate_verified_transport(failed);
+            if crate::adb::is_wireless_transport(failed) {
+                evict_transport_from_backup_registry(failed);
+                if !has_in_flight_writes(failed) {
+                    let _ = adb.run_timeout(&["disconnect", failed], Duration::from_millis(800));
+                }
+                adb.invalidate_forwards_for_transport(failed);
+                crate::push::invalidate_cached_port_for_adb(adb, failed);
+                crate::storage_expansion::invalidate_expansion_port_for_adb(adb, failed);
+            }
         }
         promote_active_transport(got, endpoint);
         record_verified_transport(failed, got, endpoint);
@@ -639,8 +1000,7 @@ fn recover_transport_until(
 }
 
 fn backup_transport_registry() -> &'static Mutex<HashMap<String, Vec<String>>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+    BACKUP_TRANSPORTS_BY_SERIAL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 pub fn set_backup_transports_for(keys: &[&str], backups: Vec<String>) {
@@ -651,21 +1011,11 @@ pub fn set_backup_transports_for(keys: &[&str], backups: Vec<String>) {
             if !non_model_keys.iter().any(|k| k == trimmed) {
                 non_model_keys.push(trimmed.to_string());
             }
-            if !trimmed.contains(':') && !trimmed.starts_with("adb-") {
-                let mut refs: Vec<&str> = keys.to_vec();
-                for b in &backups {
-                    refs.push(b.as_str());
-                }
-                remember_serial_for_transports(trimmed, &refs);
-            }
         }
     }
     if let Ok(mut map) = backup_transport_registry().lock() {
-        for key in keys {
-            let trimmed = key.trim();
-            if !trimmed.is_empty() {
-                map.insert(trimmed.to_string(), backups.clone());
-            }
+        for key in &non_model_keys {
+            map.insert(key.clone(), backups.clone());
         }
         for b in &backups {
             let bt = b.trim();
@@ -772,16 +1122,67 @@ pub fn resolve_online_transport(
     let preferred_trimmed = preferred.trim();
     let serial_trimmed = serial.trim();
 
-    if !serial_trimmed.is_empty() {
-        let mut refs = vec![preferred_trimmed];
-        for b in backups {
-            refs.push(b.as_str());
+    let mut usb_candidates: Vec<String> = Vec::new();
+    if !preferred_trimmed.is_empty() && !crate::adb::is_wireless_transport(preferred_trimmed) {
+        usb_candidates.push(preferred_trimmed.to_string());
+    }
+    for b in backups {
+        let bt = b.trim();
+        if !bt.is_empty()
+            && !crate::adb::is_wireless_transport(bt)
+            && !usb_candidates.iter().any(|u| u == bt)
+        {
+            usb_candidates.push(bt.to_string());
         }
-        remember_serial_for_transports(serial_trimmed, &refs);
+    }
+    for b in backup_transports_for(&[preferred_trimmed, serial_trimmed]) {
+        let bt = b.trim();
+        if !bt.is_empty()
+            && !crate::adb::is_wireless_transport(bt)
+            && !usb_candidates.iter().any(|u| u == bt)
+        {
+            usb_candidates.push(bt.to_string());
+        }
     }
 
-    // 1. Fast Path (0ms TTL Cache) & Promoted Transport Lookup
-    let mut stale_promoted: Option<String> = None;
+    let mut probed_usb: Vec<String> = Vec::new();
+    let mut try_prefer_usb = |adb: &Adb| -> Result<Option<String>> {
+        for usb_id in &usb_candidates {
+            if probed_usb.iter().any(|p| p == usb_id) || usb_probe_in_backoff(usb_id) {
+                continue;
+            }
+            probed_usb.push(usb_id.clone());
+            match adb.run_timeout(
+                &["-s", usb_id, "shell", "getprop", "ro.serialno"],
+                std::time::Duration::from_millis(1200),
+            ) {
+                Ok(got) => {
+                    let got = got.trim();
+                    if !got.is_empty() && (serial_trimmed.is_empty() || got == serial_trimmed) {
+                        clear_usb_probe_failure(usb_id);
+                        promote_active_transport(got, usb_id);
+                        record_verified_transport(preferred_trimmed, got, usb_id);
+                        return Ok(Some(usb_id.clone()));
+                    }
+                    if !got.is_empty()
+                        && !serial_trimmed.is_empty()
+                        && got != serial_trimmed
+                        && usb_id == preferred_trimmed
+                    {
+                        bail!("设备身份已变化，请重新选择手机。此次操作没有执行。");
+                    }
+                    note_usb_probe_failure(usb_id);
+                }
+                Err(_) => {
+                    note_usb_probe_failure(usb_id);
+                }
+            }
+        }
+        Ok(None)
+    };
+
+    // 1. Fast Path (TTL Cache: 15s USB / 4s wireless + healthy telemetry + USB preference)
+    let mut cached_active: Option<(String, std::time::Duration)> = None;
     if let Ok(reg) = active_transport_registry().lock() {
         let lookup = reg.get(preferred_trimmed).or_else(|| {
             (!serial_trimmed.is_empty())
@@ -793,32 +1194,60 @@ pub fn resolve_online_transport(
                 || entry.hardware_serial.is_empty()
                 || entry.hardware_serial == serial_trimmed;
             if serial_matches && !entry.active_transport.is_empty() {
-                if entry.verified_at.elapsed() < VERIFIED_TRANSPORT_TTL {
-                    return Ok(entry.active_transport.clone());
-                }
-                if entry.active_transport != preferred_trimmed {
-                    stale_promoted = Some(entry.active_transport.clone());
-                }
+                cached_active = Some((
+                    entry.active_transport.clone(),
+                    entry.verified_at.elapsed(),
+                ));
             }
         }
     }
 
-    // 2. Promoted Transport Check (probe promoted transport first even if > 3.5s old)
+    let mut stale_promoted: Option<String> = None;
+    if let Some((active_t, elapsed)) = cached_active {
+        if crate::adb::is_wireless_transport(&active_t) {
+            if let Some(usb_t) = try_prefer_usb(adb)? {
+                return Ok(usb_t);
+            }
+        }
+        let healthy =
+            crate::adb::TransportCoordinator::telemetry(&active_t).consecutive_failures == 0;
+        if healthy && elapsed < verified_transport_ttl(&active_t) {
+            return Ok(active_t);
+        }
+        if active_t != preferred_trimmed {
+            stale_promoted = Some(active_t);
+        }
+    }
+
+    // Prefer probing known physical USB before probing expired/unverified wireless endpoints
+    if stale_promoted
+        .as_deref()
+        .is_some_and(crate::adb::is_wireless_transport)
+        || crate::adb::is_wireless_transport(preferred_trimmed)
+    {
+        if let Some(usb_t) = try_prefer_usb(adb)? {
+            return Ok(usb_t);
+        }
+    }
+
+    // 2. Promoted Transport Check (probe promoted transport first even if TTL expired)
     if let Some(promoted) = stale_promoted {
-        if let Ok(got) = adb.run_timeout(
-            &["-s", &promoted, "shell", "getprop", "ro.serialno"],
-            std::time::Duration::from_secs(3),
-        ) {
-            let got = got.trim();
-            if !got.is_empty() && (serial_trimmed.is_empty() || got == serial_trimmed) {
-                record_verified_transport(preferred_trimmed, got, &promoted);
-                return Ok(promoted);
+        if !probed_usb.iter().any(|p| p == &promoted) {
+            if let Ok(got) = adb.run_timeout(
+                &["-s", &promoted, "shell", "getprop", "ro.serialno"],
+                std::time::Duration::from_secs(3),
+            ) {
+                let got = got.trim();
+                if !got.is_empty() && (serial_trimmed.is_empty() || got == serial_trimmed) {
+                    record_verified_transport(preferred_trimmed, got, &promoted);
+                    return Ok(promoted);
+                }
             }
         }
         invalidate_verified_transport(&promoted);
     }
 
-    if !preferred_trimmed.is_empty() {
+    if !preferred_trimmed.is_empty() && !probed_usb.iter().any(|p| p == preferred_trimmed) {
         if let Ok(got) = adb.run_timeout(
             &["-s", preferred_trimmed, "shell", "getprop", "ro.serialno"],
             std::time::Duration::from_secs(3),
@@ -831,6 +1260,8 @@ pub fn resolve_online_transport(
             if !got.is_empty() && !serial_trimmed.is_empty() && got != serial_trimmed {
                 bail!("设备身份已变化，请重新选择手机。此次操作没有执行。");
             }
+        } else if !crate::adb::is_wireless_transport(preferred_trimmed) {
+            note_usb_probe_failure(preferred_trimmed);
         }
     }
 
@@ -843,19 +1274,48 @@ pub fn resolve_online_transport(
     if !known.is_empty() {
         set_backup_transports_for(&[preferred_trimmed, serial_trimmed], known);
     }
-    recover_transport(adb, preferred_trimmed, std::time::Duration::from_secs(6))
-        .context("手机连接暂时不可用，正在等待可用通道；此次操作尚未完成")
+    recover_transport_for_serial(
+        adb,
+        preferred_trimmed,
+        (!serial_trimmed.is_empty()).then_some(serial_trimmed),
+        std::time::Duration::from_secs(6),
+    )
+    .context("手机连接暂时不可用，正在等待可用通道；此次操作尚未完成")
+}
+
+fn authoritative_ephemeral_wireless_by_ip(
+    serial: Option<&str>,
+    live_ids: &[String],
+) -> HashMap<String, String> {
+    let mut by_ip: HashMap<String, String> = HashMap::new();
+    let verified = serial.and_then(current_active_transport_for_serial);
+    for id in live_ids {
+        if let Some((host, port)) = parse_wireless_ip_and_port(id) {
+            if port != 5555 {
+                by_ip.insert(host.to_ascii_lowercase(), id.clone());
+            }
+        }
+    }
+    if let Some(vep) = verified {
+        if let Some((host, port)) = parse_wireless_ip_and_port(&vep) {
+            if port != 5555
+                && (live_ids.is_empty()
+                    || live_ids.iter().any(|id| id == &vep)
+                    || !by_ip.contains_key(&host.to_ascii_lowercase()))
+            {
+                by_ip.insert(host.to_ascii_lowercase(), vep);
+            }
+        }
+    }
+    by_ip
 }
 
 impl Transport {
     pub fn backup_transports(&self) -> Vec<String> {
-        let canonical = canonical_serial_from_transport(&self.id).unwrap_or_default();
-        let model_key = if canonical.is_empty() && !self.model.is_empty() {
-            format!("model:{}", self.model)
-        } else {
-            String::new()
-        };
-        backup_transports_for(&[&self.id, &canonical, &model_key])
+        let known_serial = canonical_serial_from_transport(&self.id)
+            .or_else(|| known_serial_for_transport(&self.id))
+            .unwrap_or_default();
+        backup_transports_for(&[&self.id, &known_serial])
             .into_iter()
             .filter(|b| b != &self.id)
             .collect()
@@ -875,18 +1335,19 @@ pub fn parse_devices(output: &str) -> Vec<Transport> {
                 .find_map(|p| p.strip_prefix("product:"))
                 .unwrap_or("")
                 .to_string();
-            Some((
-                Transport {
-                    id: parts[0].into(),
-                    state: parts[1].into(),
-                    model: parts
-                        .iter()
-                        .find_map(|p| p.strip_prefix("model:"))
-                        .unwrap_or("")
-                        .into(),
-                },
-                product,
-            ))
+            let transport = Transport {
+                id: parts[0].into(),
+                state: parts[1].into(),
+                model: parts
+                    .iter()
+                    .find_map(|p| p.strip_prefix("model:"))
+                    .unwrap_or("")
+                    .into(),
+            };
+            if transport.state == "device" && !crate::adb::is_wireless_transport(&transport.id) {
+                clear_usb_probe_failure(&transport.id);
+            }
+            Some((transport, product))
         })
         .collect();
     deduplicate_parsed_transports(raw, false)
@@ -899,37 +1360,21 @@ fn deduplicate_parsed_transports(
     struct TransportGroup {
         serial: Option<String>,
         model: String,
-        product: String,
         online: bool,
         members: Vec<Transport>,
     }
 
     let mut groups: Vec<TransportGroup> = Vec::new();
-    for (transport, product) in raw {
+    for (transport, _product) in raw {
         let online = transport.state == "device";
-        let serial = canonical_serial_from_transport(&transport.id);
+        let serial = canonical_serial_from_transport(&transport.id)
+            .or_else(|| known_serial_for_transport(&transport.id));
         if online {
             if let Some(group) = groups.iter_mut().find(|g| {
-                if !g.online {
-                    return false;
-                }
-                match (&g.serial, &serial) {
-                    (Some(gs), Some(ts)) => gs == ts,
-                    (Some(_), None) | (None, Some(_)) | (None, None) => {
-                        !g.model.is_empty()
-                            && g.model == transport.model
-                            && (g.product.is_empty() || product.is_empty() || g.product == product)
-                    }
-                }
+                g.online && matches!((&g.serial, &serial), (Some(gs), Some(ts)) if gs == ts)
             }) {
-                if group.serial.is_none() && serial.is_some() {
-                    group.serial = serial;
-                }
                 if group.model.is_empty() && !transport.model.is_empty() {
                     group.model = transport.model.clone();
-                }
-                if group.product.is_empty() && !product.is_empty() {
-                    group.product = product;
                 }
                 group.members.push(transport);
                 continue;
@@ -938,7 +1383,6 @@ fn deduplicate_parsed_transports(
         groups.push(TransportGroup {
             serial,
             model: transport.model.clone(),
-            product,
             online,
             members: vec![transport],
         });
@@ -946,7 +1390,26 @@ fn deduplicate_parsed_transports(
 
     let mut result = Vec::with_capacity(groups.len());
     for mut group in groups {
+        let live_ids: Vec<String> = group
+            .members
+            .iter()
+            .filter(|m| m.state == "device")
+            .map(|m| m.id.clone())
+            .collect();
+        let auth_ephemeral =
+            authoritative_ephemeral_wireless_by_ip(group.serial.as_deref(), &live_ids);
+        let is_superseded = |id: &str| -> bool {
+            auth_ephemeral
+                .values()
+                .any(|newer| is_superseded_ephemeral_endpoint(id, newer))
+        };
         if group.online && group.members.len() > 1 {
+            for m in &group.members {
+                if is_superseded(&m.id) {
+                    evict_transport_from_backup_registry(&m.id);
+                }
+            }
+            group.members.retain(|m| !is_superseded(&m.id));
             group.members.sort_by(|a, b| {
                 transport_priority(&a.id)
                     .cmp(&transport_priority(&b.id))
@@ -975,6 +1438,14 @@ fn deduplicate_parsed_transports(
                     }
                 }
             }
+            backups.retain(|id| {
+                if is_superseded(id) {
+                    evict_transport_from_backup_registry(id);
+                    false
+                } else {
+                    true
+                }
+            });
             let has_ipv4_wireless = backups
                 .iter()
                 .chain(std::iter::once(&primary.id))
@@ -988,11 +1459,6 @@ fn deduplicate_parsed_transports(
                     .then_with(|| a.cmp(b))
             });
             let serial_key = group.serial.unwrap_or_default();
-            let model_key = if serial_key.is_empty() && !primary.model.is_empty() {
-                format!("model:{}", primary.model)
-            } else {
-                String::new()
-            };
             let mut all_group_ids = vec![primary.id.clone()];
             for b in &backups {
                 if !all_group_ids.contains(b) {
@@ -1007,9 +1473,13 @@ fn deduplicate_parsed_transports(
                     .collect();
                 set_backup_transports_for(&[member_id.as_str()], peers);
             }
-            set_backup_transports_for(&[&primary.id, &serial_key, &model_key], backups.clone());
-            if !serial_key.is_empty() && serial_key != primary.id {
-                set_backup_transports_for(&[&serial_key], all_group_ids);
+            set_backup_transports_for(&[&primary.id], backups.clone());
+            if !serial_key.is_empty() {
+                if serial_key == primary.id {
+                    set_backup_transports_for(&[&serial_key], backups.clone());
+                } else if let Ok(mut map) = backup_transport_registry().lock() {
+                    map.insert(serial_key, all_group_ids);
+                }
             }
             result.push(primary);
         }
@@ -1048,24 +1518,13 @@ pub fn deduplicate_multi_transport_devices(devices: Vec<Device>) -> Vec<Device> 
             Some(device.serial.trim().to_string())
         } else {
             canonical_serial_from_transport(&device.transport)
+                .or_else(|| known_serial_for_transport(&device.transport))
         };
 
         if let Some(group) = groups
             .iter_mut()
-            .find(|g| match (&g.serial, &effective_serial) {
-                (Some(gs), Some(ds)) => gs == ds,
-                (Some(_), None) | (None, Some(_)) | (None, None) => {
-                    !g.model.is_empty()
-                        && g.model == device.model
-                        && (g.product.is_empty()
-                            || device.product.is_empty()
-                            || g.product == device.product)
-                }
-            })
+            .find(|g| matches!((&g.serial, &effective_serial), (Some(gs), Some(ds)) if gs == ds))
         {
-            if group.serial.is_none() && effective_serial.is_some() {
-                group.serial = effective_serial;
-            }
             if group.model.is_empty() && !device.model.is_empty() {
                 group.model = device.model.clone();
             }
@@ -1086,6 +1545,22 @@ pub fn deduplicate_multi_transport_devices(devices: Vec<Device>) -> Vec<Device> 
 
     let mut out = Vec::with_capacity(groups.len());
     for mut group in groups {
+        let live_ids: Vec<String> = group.members.iter().map(|m| m.transport.clone()).collect();
+        let auth_ephemeral =
+            authoritative_ephemeral_wireless_by_ip(group.serial.as_deref(), &live_ids);
+        let is_superseded = |id: &str| -> bool {
+            auth_ephemeral
+                .values()
+                .any(|newer| is_superseded_ephemeral_endpoint(id, newer))
+        };
+        if group.members.len() > 1 {
+            for m in &group.members {
+                if is_superseded(&m.transport) {
+                    evict_transport_from_backup_registry(&m.transport);
+                }
+            }
+            group.members.retain(|m| !is_superseded(&m.transport));
+        }
         group.members.sort_by(|a, b| {
             transport_priority(&a.transport)
                 .cmp(&transport_priority(&b.transport))
@@ -1112,6 +1587,14 @@ pub fn deduplicate_multi_transport_devices(devices: Vec<Device>) -> Vec<Device> 
                     }
                 }
             }
+            backups.retain(|id| {
+                if is_superseded(id) {
+                    evict_transport_from_backup_registry(id);
+                    false
+                } else {
+                    true
+                }
+            });
             backups.sort_by(|a, b| {
                 transport_priority(a)
                     .cmp(&transport_priority(b))
@@ -1119,6 +1602,26 @@ pub fn deduplicate_multi_transport_devices(devices: Vec<Device>) -> Vec<Device> 
             });
             primary.set_backup_transports(backups);
             out.push(primary);
+        }
+    }
+    out
+}
+
+pub(crate) fn escape_android_input_text_ascii(value: &str) -> String {
+    value.replace('%', "%25").replace(' ', "%s")
+}
+
+pub(crate) fn percent_encode_file_uri(remote_path: &str) -> String {
+    let mut out = String::with_capacity("file://".len() + remote_path.len() * 3);
+    out.push_str("file://");
+    for &b in remote_path.as_bytes() {
+        let unreserved_or_slash = b.is_ascii_alphanumeric()
+            || matches!(b, b'-' | b'.' | b'_' | b'~' | b'/');
+        if unreserved_or_slash {
+            out.push(b as char);
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(&mut out, "%{b:02X}");
         }
     }
     out
@@ -1236,7 +1739,7 @@ pub fn verify_apk_identity(path: &std::path::Path) -> Result<String> {
         std::time::Duration::from_secs(90),
     )?;
     let value = parse_apk_verification(&output)?;
-    Ok(value["package"].as_str().unwrap().to_owned())
+    Ok(value["package"].as_str().unwrap_or_default().to_owned())
 }
 
 fn check_generic_apk(path: &std::path::Path) -> Result<String> {
@@ -1296,35 +1799,24 @@ fn validate_store_package(actual: &str, expected: &str) -> Result<()> {
 
 impl Device {
     pub fn backup_transports(&self) -> Vec<String> {
-        let canonical = canonical_serial_from_transport(&self.transport).unwrap_or_default();
-        let model_key = if self.serial.is_empty() && canonical.is_empty() && !self.model.is_empty()
-        {
-            format!("model:{}", self.model)
-        } else {
-            String::new()
-        };
-        backup_transports_for(&[&self.transport, &self.serial, &canonical, &model_key])
+        let canonical = canonical_serial_from_transport(&self.transport)
+            .or_else(|| known_serial_for_transport(&self.transport))
+            .unwrap_or_default();
+        backup_transports_for(&[&self.transport, &self.serial, &canonical])
             .into_iter()
             .filter(|b| b != &self.transport)
             .collect()
     }
 
     pub fn set_backup_transports(&self, backups: Vec<String>) {
-        let canonical = canonical_serial_from_transport(&self.transport).unwrap_or_default();
-        let model_key = if self.serial.is_empty() && canonical.is_empty() && !self.model.is_empty()
-        {
-            format!("model:{}", self.model)
-        } else {
-            String::new()
-        };
+        let canonical = canonical_serial_from_transport(&self.transport)
+            .or_else(|| known_serial_for_transport(&self.transport))
+            .unwrap_or_default();
         let filtered: Vec<String> = backups
             .into_iter()
             .filter(|b| b != &self.transport)
             .collect();
-        set_backup_transports_for(
-            &[&self.transport, &self.serial, &canonical, &model_key],
-            filtered,
-        );
+        set_backup_transports_for(&[&self.transport, &self.serial, &canonical], filtered);
     }
 
     pub fn active_transport_cached(&self) -> String {
@@ -1807,14 +2299,15 @@ impl Device {
         if !local_path.is_file() {
             bail!("请选择有效的本地图片或文件附件");
         }
-        let transport = self.resolve_active_transport(adb)?;
-        let dest_dir = "/sdcard/Download/StepX";
-        let _ = adb.shell(&transport, &["mkdir", "-p", dest_dir]);
-        crate::storage::push(adb, self, local_path, dest_dir)?;
         let file_name = local_path
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("attachment");
+            .filter(|n| !n.is_empty() && !n.contains('/') && !n.contains('\0'))
+            .context("附件文件名无效或包含非 UTF-8 字符")?;
+        let transport = self.resolve_active_transport(adb)?;
+        let dest_dir = "/sdcard/Download/StepX";
+        adb.shell(&transport, &["mkdir", "-p", dest_dir])?;
+        crate::storage::push(adb, self, local_path, dest_dir)?;
         let ext = local_path
             .extension()
             .and_then(|e| e.to_str())
@@ -1825,23 +2318,20 @@ impl Device {
             "txt" | "md" | "json" | "csv" | "log" => "text/plain",
             _ => "*/*",
         };
-        let remote_uri = format!("file://{dest_dir}/{file_name}");
-        let _ = adb.shell(
-            &transport,
-            &[
-                "am",
-                "start",
-                "-a",
-                "android.intent.action.SEND",
-                "-n",
-                "com.stepos.ailauncher/.chat.activity.ShareActivity",
-                "-t",
-                mime,
-                "--eu",
-                "android.intent.extra.STREAM",
-                &remote_uri,
-            ],
+        let remote_path = format!("{dest_dir}/{file_name}");
+        let remote_uri = percent_encode_file_uri(&remote_path);
+        let share_cmd = format!(
+            "am start -a {} -n {} -t {} --eu {} {}",
+            crate::adb::shell_quote("android.intent.action.SEND"),
+            crate::adb::shell_quote("com.stepos.ailauncher/.chat.activity.ShareActivity"),
+            crate::adb::shell_quote(mime),
+            crate::adb::shell_quote("android.intent.extra.STREAM"),
+            crate::adb::shell_quote(&remote_uri),
         );
+        let out = adb.script(&transport, &share_cmd)?;
+        if out.contains("Error:") || out.contains("Exception") {
+            bail!("无法将附件投递至 Amoo：{out}");
+        }
         Ok(format!("已将附件 {file_name} 投递至 Amoo"))
     }
 
@@ -1889,15 +2379,37 @@ impl Device {
         if trimmed.is_empty() {
             bail!("请输入要发送到手机焦点框的文字");
         }
-        let transport = self.resolve_active_transport(adb)?;
-        if trimmed.is_ascii() {
-            let escaped = trimmed.replace(' ', "%s");
-            adb.shell(&transport, &["input", "text", &escaped])?;
+        // First set the phone clipboard and inject KEYCODE_PASTE (279) so both
+        // Chinese/Unicode and ASCII paste into the currently focused input box
+        // without launching Amoo or stealing foreground focus.
+        let clip_paste_res: Result<()> = (|| {
+            crate::toolbox::push_clipboard_to_phone(adb, self, trimmed)?;
+            let transport = self.resolve_active_transport(adb)?;
+            adb.shell(&transport, &["input", "keyevent", "279"])?;
+            Ok(())
+        })();
+        if clip_paste_res.is_ok() {
             return Ok(format!("已向手机当前焦点输入：{}", trimmed));
         }
-        // For CJK / Unicode text, try Amoo prepare or clipboard broadcast fallback
-        let _ = crate::bridge::amoo_prepare(adb, self, trimmed);
-        Ok(format!("已将文字同步至手机输入区：{}", trimmed))
+        let clip_err = clip_paste_res.unwrap_err();
+
+        // Pure printable ASCII fallback when the clipboard service is unavailable:
+        // escape `%` -> `%25` and spaces -> `%s`, and wrap in `shell_quote` so
+        // shell metacharacters can never execute commands on the phone.
+        if trimmed.is_ascii() && !trimmed.chars().any(|c| c.is_ascii_control()) {
+            let transport = self.resolve_active_transport(adb)?;
+            let escaped = escape_android_input_text_ascii(trimmed);
+            let quoted = crate::adb::shell_quote(&escaped);
+            adb.script(&transport, &format!("input text {quoted}"))
+                .with_context(|| {
+                    format!(
+                        "向手机焦点输入失败（剪贴板粘贴与 ASCII 输入回退均不可用：{clip_err:#}）"
+                    )
+                })?;
+            return Ok(format!("已向手机当前焦点输入：{}", trimmed));
+        }
+
+        Err(clip_err.context("无法通过手机剪贴板向当前焦点粘贴文字"))
     }
 
     pub fn push_backscreen_frame(&self, adb: &Adb, frame: &[u8]) -> Result<String> {
@@ -2571,12 +3083,14 @@ impl Device {
         if !script.is_file() {
             bail!("未找到 Google Play 特权工程脚本：{}", script.display());
         }
-        let out = crate::resources::python_command()
-            .arg(&script)
+        let adb = Adb::discover()?;
+        let transport = self.resolve_active_transport(&adb)?;
+        let mut cmd = crate::resources::python_command();
+        cmd.arg(&script)
             .arg(subcmd)
-            .env("STEPX_SERIAL", &self.transport)
-            .env("STEPX_DEVICE_SERIAL", &self.serial)
-            .output()
+            .env("STEPX_SERIAL", &transport)
+            .env("STEPX_DEVICE_SERIAL", &self.serial);
+        let out = crate::adb::run_process(cmd, None, std::time::Duration::from_secs(180))
             .context("无法调用 Google Play 特权管理脚本")?;
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);
@@ -2587,18 +3101,24 @@ impl Device {
     }
 
     pub fn run_root_bridge_python(&self, py_code: &str) -> Result<String> {
+        let adb = Adb::discover()?;
+        self.run_root_bridge_python_with_adb(&adb, py_code)
+    }
+
+    fn run_root_bridge_python_with_adb(&self, adb: &Adb, py_code: &str) -> Result<String> {
         let script =
             crate::resources::root().join("handoff/google-play-stepx/tools/root_bridge.py");
         if !script.is_file() {
             bail!("未找到 root_bridge.py：{}", script.display());
         }
-        let out = crate::resources::python_command()
-            .arg(&script)
+        let transport = self.resolve_active_transport(adb)?;
+        let mut cmd = crate::resources::python_command();
+        cmd.arg(&script)
             .arg("-c")
             .arg(py_code)
-            .env("STEPX_SERIAL", &self.transport)
-            .env("STEPX_DEVICE_SERIAL", &self.serial)
-            .output()
+            .env("STEPX_SERIAL", &transport)
+            .env("STEPX_DEVICE_SERIAL", &self.serial);
+        let out = crate::adb::run_process(cmd, None, std::time::Duration::from_secs(180))
             .context("无法调用 root_bridge.py")?;
         let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if !out.status.success() && stdout.is_empty() {
@@ -2875,7 +3395,7 @@ for comm_path in glob.glob('/proc/[0-9]*/cmdline'):
 print(f'oom_locked={adjusted}')
 "#;
         let root_note = self
-            .run_root_bridge_python(py)
+            .run_root_bridge_python_with_adb(adb, py)
             .unwrap_or_else(|_| "oom_locked=3".into());
         Ok(format!(
             "已授予 Amoo 深度特权与后台防杀保护：电池白名单 + SYSTEM_EXEMPT + 悬浮窗/文件/无障碍特权 + Root 保活 ({})",
@@ -2913,7 +3433,7 @@ if not unlocked:
 print(','.join(unlocked))
 "#;
         let unlocked = self
-            .run_root_bridge_python(py)
+            .run_root_bridge_python_with_adb(adb, py)
             .context("背屏硬件权限设置失败")?;
         if unlocked.trim().is_empty()
             || !unlocked.trim().split(',').all(|node| {
@@ -2956,7 +3476,7 @@ if os.path.exists(breath_path):
 print('ok')
 "#
         );
-        let _ = self.run_root_bridge_python(&py);
+        let _ = self.run_root_bridge_python_with_adb(adb, &py);
         let mode_label = if mode > 0 {
             "开启硬件呼吸律动 (AW20072 breath=1)"
         } else {
@@ -3188,6 +3708,7 @@ fn with_native_windows_clipboard<R>(
 
 /// Write `input` to `command` stdin without piping stdout/stderr so clipboard daemons
 /// (`xclip`, `wl-copy`) that fork a background selection-owner child never hang on pipe EOF.
+#[cfg(unix)]
 fn write_stdin_to_clipboard_command(
     mut command: Command,
     input: &[u8],
@@ -3737,6 +4258,8 @@ pub struct GoogleHealthCheck {
     pub detail: String,
 }
 
+pub use crate::google::GoogleCompatibilityState;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct GoogleSuiteStatus {
     pub checked: bool,
@@ -3758,10 +4281,14 @@ pub struct GoogleSuiteStatus {
     pub certification_note: String,
     pub certification_catalog: String,
     pub boot_security_note: String,
+    #[serde(default)]
+    pub device_blocker_note: String,
     pub compatibility_checked: bool,
     pub compatibility_supported: bool,
     pub compatibility_active: bool,
     pub compatibility_can_rollback: bool,
+    #[serde(default)]
+    pub compatibility_state: GoogleCompatibilityState,
     pub compatibility_note: String,
     pub play_protect: PlayProtectReport,
     pub health_checks: Vec<GoogleHealthCheck>,
@@ -3790,10 +4317,12 @@ impl GoogleSuiteStatus {
             certification_note: "演示数据 · 认证未验证".into(),
             certification_catalog: String::new(),
             boot_security_note: String::new(),
+            device_blocker_note: String::new(),
             compatibility_checked: false,
             compatibility_supported: false,
             compatibility_active: false,
             compatibility_can_rollback: false,
+            compatibility_state: GoogleCompatibilityState::Unknown,
             compatibility_note: "兼容补丁尚未检测".into(),
             play_protect: PlayProtectReport::demo(),
             health_checks: Vec::new(),
@@ -3904,10 +4433,12 @@ impl Default for GoogleSuiteStatus {
             certification_note: "认证尚未核验".into(),
             certification_catalog: String::new(),
             boot_security_note: String::new(),
+            device_blocker_note: String::new(),
             compatibility_checked: false,
             compatibility_supported: false,
             compatibility_active: false,
             compatibility_can_rollback: false,
+            compatibility_state: GoogleCompatibilityState::Unknown,
             compatibility_note: "兼容补丁尚未检测".into(),
             play_protect: PlayProtectReport::default(),
             health_checks: Vec::new(),
@@ -5118,8 +5649,12 @@ mod generic_apk_install_tests {
     fn deduplicates_four_line_adb_devices_and_preserves_wireless_backups() {
         use super::{
             canonical_serial_from_transport, deduplicate_multi_transport_devices,
-            deduplicate_transports, parse_devices, transport_priority, Device,
+            deduplicate_transports, forget_known_serial, parse_devices,
+            record_verified_serial_for_transport, transport_priority, Device,
         };
+
+        forget_known_serial("STEPX_TEST_DEVICE");
+        record_verified_serial_for_transport("STEPX_TEST_DEVICE", "10.0.0.42:34883");
 
         let sample = "\
 List of devices attached
@@ -6013,5 +6548,378 @@ exit 0
             dev_b.backup_transports(),
             vec!["10.0.1.102:5555".to_string()]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_distinct_pz261a_pandora_phones_never_merge_or_poison_known_serial_and_forget_purges_all() {
+        use std::os::unix::fs::PermissionsExt;
+
+        super::forget_known_serial("SERIAL_A_MULTI_UNIT");
+        super::forget_known_serial("SERIAL_B_MULTI_UNIT");
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_adb = dir.path().join("adb");
+        let script = r#"#!/bin/sh
+case "$*" in
+  "-s SERIAL_A_MULTI_UNIT shell getprop ro.serialno")
+    echo "SERIAL_A_MULTI_UNIT"
+    exit 0
+    ;;
+  "-s 192.168.1.20:40111 shell getprop ro.serialno")
+    echo "SERIAL_A_MULTI_UNIT"
+    exit 0
+    ;;
+  "-s 192.168.1.35:41555 shell getprop ro.serialno")
+    echo "SERIAL_B_MULTI_UNIT"
+    exit 0
+    ;;
+esac
+exit 1
+"#;
+        std::fs::write(&fake_adb, script).unwrap();
+        std::fs::set_permissions(&fake_adb, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let adb = crate::adb::Adb { path: fake_adb };
+
+        // 1. Before `ro.serialno` is resolved on wireless endpoints, Phone A (USB) and
+        // Phone B (wireless IP:Port) have identical `PZ261A`/`pandora` model/product and
+        // MUST remain 2 distinct entries without poisoning `KNOWN_SERIAL_BY_TRANSPORT`.
+        let sample_two_phones = "\
+List of devices attached
+SERIAL_A_MULTI_UNIT device usb:1-2 product:pandora model:PZ261A device:pandora transport_id:1
+192.168.1.35:41555  device product:pandora model:PZ261A device:pandora transport_id:2
+";
+        let before = super::parse_devices(sample_two_phones);
+        assert_eq!(before.len(), 2, "unverified wireless PZ261A must not merge into USB Phone A");
+        assert_eq!(before[0].id, "SERIAL_A_MULTI_UNIT");
+        assert!(before[0].backup_transports().is_empty());
+        assert_eq!(before[1].id, "192.168.1.35:41555");
+        assert!(before[1].backup_transports().is_empty());
+        assert_eq!(
+            super::known_serial_for_transport("192.168.1.35:41555"),
+            None,
+            "unverified IP:Port must never be recorded in KNOWN_SERIAL_BY_TRANSPORT"
+        );
+
+        let unverified_devices = super::deduplicate_multi_transport_devices(vec![
+            super::Device {
+                transport: "SERIAL_A_MULTI_UNIT".into(),
+                serial: "SERIAL_A_MULTI_UNIT".into(),
+                model: "PZ261A".into(),
+                android: "16".into(),
+                product: "pandora".into(),
+            },
+            super::Device {
+                transport: "192.168.1.35:41555".into(),
+                serial: String::new(),
+                model: "PZ261A".into(),
+                android: "16".into(),
+                product: "pandora".into(),
+            },
+        ]);
+        assert_eq!(unverified_devices.len(), 2);
+
+        // Even setting an unverified backup must NOT poison `KNOWN_SERIAL_BY_TRANSPORT`
+        super::set_backup_transports_for(
+            &["SERIAL_A_MULTI_UNIT"],
+            vec!["192.168.1.99:49999".to_string()],
+        );
+        assert_eq!(
+            super::known_serial_for_transport("192.168.1.99:49999"),
+            None,
+            "set_backup_transports_for must not stamp unverified IP:Port into KNOWN_SERIAL_BY_TRANSPORT"
+        );
+
+        // 2. Resolve `ro.serialno` on Phone B's wireless endpoint and Phone A's wireless endpoint
+        assert_eq!(
+            super::resolve_hardware_serial(&adb, "192.168.1.35:41555").as_deref(),
+            Some("SERIAL_B_MULTI_UNIT")
+        );
+        assert_eq!(
+            super::resolve_hardware_serial(&adb, "192.168.1.20:40111").as_deref(),
+            Some("SERIAL_A_MULTI_UNIT")
+        );
+
+        // 3. Now parse all 3 lines: Phone A USB + Phone A verified wireless merge into 1 with backup,
+        // while Phone B verified wireless stays a distinct 2nd device!
+        let sample_with_phone_a_wifi = "\
+List of devices attached
+SERIAL_A_MULTI_UNIT device usb:1-2 product:pandora model:PZ261A device:pandora transport_id:1
+192.168.1.20:40111  device product:pandora model:PZ261A device:pandora transport_id:3
+192.168.1.35:41555  device product:pandora model:PZ261A device:pandora transport_id:2
+";
+        let after = super::parse_devices(sample_with_phone_a_wifi);
+        assert_eq!(after.len(), 2);
+        assert_eq!(after[0].id, "SERIAL_A_MULTI_UNIT");
+        assert_eq!(
+            after[0].backup_transports(),
+            vec!["192.168.1.20:40111".to_string()]
+        );
+        assert_eq!(after[1].id, "192.168.1.35:41555");
+        assert!(after[1].backup_transports().is_empty());
+
+        let merged_devices = super::deduplicate_multi_transport_devices(vec![
+            super::Device {
+                transport: "192.168.1.20:40111".into(),
+                serial: "SERIAL_A_MULTI_UNIT".into(),
+                model: "PZ261A".into(),
+                android: "16".into(),
+                product: "pandora".into(),
+            },
+            super::Device {
+                transport: "SERIAL_A_MULTI_UNIT".into(),
+                serial: "SERIAL_A_MULTI_UNIT".into(),
+                model: "PZ261A".into(),
+                android: "16".into(),
+                product: "pandora".into(),
+            },
+            super::Device {
+                transport: "192.168.1.35:41555".into(),
+                serial: "SERIAL_B_MULTI_UNIT".into(),
+                model: "PZ261A".into(),
+                android: "16".into(),
+                product: "pandora".into(),
+            },
+        ]);
+        assert_eq!(merged_devices.len(), 2);
+        assert_eq!(merged_devices[0].serial, "SERIAL_A_MULTI_UNIT");
+        assert_eq!(merged_devices[0].transport, "SERIAL_A_MULTI_UNIT");
+        assert_eq!(
+            merged_devices[0].backup_transports(),
+            vec!["192.168.1.20:40111".to_string()]
+        );
+        assert_eq!(merged_devices[1].serial, "SERIAL_B_MULTI_UNIT");
+
+        // 4. `forget_known_serial("SERIAL_A_MULTI_UNIT")` purges KNOWN_SERIAL_BY_TRANSPORT,
+        // BACKUP_TRANSPORTS_BY_SERIAL, and ACTIVE_TRANSPORT_BY_SERIAL for Phone A without touching Phone B.
+        super::promote_active_transport("SERIAL_A_MULTI_UNIT", "192.168.1.20:40111");
+        assert!(super::current_active_transport_for_serial("SERIAL_A_MULTI_UNIT").is_some());
+        super::forget_known_serial("SERIAL_A_MULTI_UNIT");
+        assert_eq!(super::known_serial_for_transport("192.168.1.20:40111"), None);
+        assert_eq!(super::current_active_transport_for_serial("SERIAL_A_MULTI_UNIT"), None);
+        assert!(super::backup_transports_for(&["SERIAL_A_MULTI_UNIT", "192.168.1.20:40111"]).is_empty());
+        assert_eq!(
+            super::known_serial_for_transport("192.168.1.35:41555").as_deref(),
+            Some("SERIAL_B_MULTI_UNIT")
+        );
+        super::forget_known_serial("SERIAL_B_MULTI_UNIT");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn send_focus_text_uses_clipboard_paste_never_launches_amoo_and_quotes_ascii_fallback_safely() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_adb = dir.path().join("adb");
+        let calls_log = dir.path().join("calls.log");
+        let clip_mode = dir.path().join("clip_mode");
+        let clip_stdin = dir.path().join("clip_stdin.json");
+        let pwned_marker = dir.path().join("pwned");
+        let typed_out = dir.path().join("typed.txt");
+        std::fs::write(&clip_mode, "ok").unwrap();
+
+        let script = format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> '{calls}'
+if [ "$1" = "-s" ] && [ "$3" = "shell" ]; then
+  shift 3
+  cmd_str="$*"
+  case "$cmd_str" in
+    *"ro.serialno"*)
+      echo "FOCUS_TEST_SER"
+      exit 0
+      ;;
+    *"printf READY"*)
+      if [ "$(cat '{mode}')" = "ok" ]; then
+        printf 'READY'
+        exit 0
+      fi
+      exit 1
+      ;;
+    *"com.stepx.companion.Bridge"*)
+      if [ "$(cat '{mode}')" = "ok" ]; then
+        cat > '{clip_in}'
+        echo 'STEPX_RESULT:{{"ok":true,"written":true}}'
+        exit 0
+      fi
+      echo "bridge unavailable" >&2
+      exit 1
+      ;;
+    *"keyevent"*"279"*)
+      if [ "$(cat '{mode}')" = "fail_all" ]; then
+        echo "input failed" >&2
+        exit 1
+      fi
+      exit 0
+      ;;
+    "input text "*)
+      if [ "$(cat '{mode}')" = "fail_all" ]; then
+        echo "input text failed" >&2
+        exit 1
+      fi
+      # Execute through a real subshell with fake `input` function so any unquoted
+      # `;`, `&`, `$()`, backticks, or quotes would execute and create `{pwned}`!
+      input() {{
+        printf '%s' "$2" > '{typed}'
+      }}
+      pwn() {{
+        touch '{pwned}'
+      }}
+      eval "$cmd_str"
+      exit $?
+      ;;
+  esac
+fi
+exit 1
+"#,
+            calls = calls_log.display(),
+            mode = clip_mode.display(),
+            clip_in = clip_stdin.display(),
+            pwned = pwned_marker.display(),
+            typed = typed_out.display(),
+        );
+        std::fs::write(&fake_adb, script).unwrap();
+        std::fs::set_permissions(&fake_adb, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let adb = crate::adb::Adb { path: fake_adb };
+        let device = super::Device {
+            transport: "FOCUS_TEST_SER".into(),
+            serial: "FOCUS_TEST_SER".into(),
+            model: "PZ261A".into(),
+            android: "16".into(),
+            product: "pandora".into(),
+        };
+
+        // 1. Unicode / Chinese text sets clipboard + KEYCODE_PASTE (279), NEVER calling amoo_prepare
+        device
+            .send_focus_text(&adb, "你好 StepX 100% 专注输入")
+            .expect("clipboard + paste should succeed for CJK");
+        let calls1 = std::fs::read_to_string(&calls_log).unwrap();
+        let req1 = std::fs::read_to_string(&clip_stdin).unwrap();
+        assert!(req1.contains("clipboard_set") && req1.contains("你好 StepX 100% 专注输入"), "{req1}");
+        assert!(calls1.contains("279"), "{calls1}");
+        assert!(!req1.contains("amoo"), "must never launch Amoo: {req1}");
+        assert!(!calls1.contains("ailauncher"), "must never hijack foreground: {calls1}");
+
+        // 2. Clipboard service unavailable + ASCII payload with `%`, spaces, and shell metacharacters
+        std::fs::write(&clip_mode, "no_clip").unwrap();
+        let hostile = "100% safe; pwn & $(pwn) `pwn` 'q' \"dq\" (sub)";
+        device
+            .send_focus_text(&adb, hostile)
+            .expect("ASCII fallback should succeed safely when clipboard is unavailable");
+        assert!(
+            !pwned_marker.exists(),
+            "shell metacharacters in send_focus_text MUST NEVER execute on phone!"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&typed_out).unwrap(),
+            "100%25%ssafe;%spwn%s&%s$(pwn)%s`pwn`%s'q'%s\"dq\"%s(sub)"
+        );
+
+        // 3. Clipboard service unavailable + non-ASCII text propagates real error
+        assert!(
+            device.send_focus_text(&adb, "中文无剪贴板服务").is_err(),
+            "failed Unicode paste without clipboard must propagate real error"
+        );
+
+        // 4. Both clipboard+paste and ASCII fallback failing propagates real error
+        std::fs::write(&clip_mode, "fail_all").unwrap();
+        assert!(
+            device.send_focus_text(&adb, "hello").is_err(),
+            "when both clipboard+paste and ASCII fallback fail, error must be returned"
+        );
+        super::forget_known_serial("FOCUS_TEST_SER");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn amoo_share_file_percent_encodes_uri_and_shell_quotes_arguments() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_adb = dir.path().join("adb");
+        let pwned_marker = dir.path().join("share_pwned");
+        let captured_uri = dir.path().join("captured_uri.txt");
+        let attach_name = "纪要 100% #1 'draft'; pwn.txt";
+        let local_file = dir.path().join(attach_name);
+        std::fs::write(&local_file, b"hello amoo").unwrap();
+
+        let script = format!(
+            r#"#!/bin/sh
+if [ "$1" = "-s" ] && [ "$3" = "push" ]; then
+  exit 0
+fi
+if [ "$1" = "-s" ] && [ "$3" = "shell" ]; then
+  shift 3
+  cmd_str="$*"
+  case "$cmd_str" in
+    *"ro.serialno"*)
+      echo "SHARE_TEST_SER"
+      exit 0
+      ;;
+    *"mkdir"*)
+      exit 0
+      ;;
+    *"readlink"*)
+      echo "/storage/emulated/0/Download/StepX"
+      exit 0
+      ;;
+    *"test ! -e"*)
+      exit 0
+      ;;
+    "am start "*)
+      pwn() {{
+        touch '{pwned}'
+      }}
+      am() {{
+        # last argument is the STREAM URI
+        eval "last=\${{$#}}"
+        printf '%s' "$last" > '{uri_out}'
+      }}
+      eval "$cmd_str"
+      exit $?
+      ;;
+  esac
+fi
+exit 1
+"#,
+            pwned = pwned_marker.display(),
+            uri_out = captured_uri.display(),
+        );
+        std::fs::write(&fake_adb, script).unwrap();
+        std::fs::set_permissions(&fake_adb, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let adb = crate::adb::Adb { path: fake_adb };
+        let device = super::Device {
+            transport: "SHARE_TEST_SER".into(),
+            serial: "SHARE_TEST_SER".into(),
+            model: "PZ261A".into(),
+            android: "16".into(),
+            product: "pandora".into(),
+        };
+
+        let msg = device
+            .amoo_share_file(&adb, &local_file)
+            .expect("amoo_share_file should succeed with special filename");
+        assert!(msg.contains(attach_name), "{msg}");
+        assert!(
+            !pwned_marker.exists(),
+            "special filename must never inject shell commands during am start"
+        );
+        let uri = std::fs::read_to_string(&captured_uri).unwrap();
+        assert!(
+            uri.starts_with("file:///sdcard/Download/StepX/"),
+            "unexpected URI: {uri}"
+        );
+        assert!(
+            !uri.contains(' ') && !uri.contains('#') && !uri.contains('\'') && !uri.contains(';'),
+            "URI path characters must be percent-encoded: {uri}"
+        );
+        assert!(
+            uri.contains("%20100%25%20%231%20%27draft%27%3B%20pwn.txt"),
+            "percent-encoded suffix mismatch: {uri}"
+        );
+        super::forget_known_serial("SHARE_TEST_SER");
     }
 }

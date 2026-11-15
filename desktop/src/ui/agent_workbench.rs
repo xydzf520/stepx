@@ -295,6 +295,12 @@ impl Companion {
                     let detail = format!("{error:#}");
                     let reason = if detail.contains("Amoo 云连接已中断或超时") {
                         "手机 Amoo 云连接中断或超时，请检查手机网络及后台协作状态后重试。"
+                    } else if detail.contains("手机账号已变化") {
+                        "手机账号已变化，请重新同步后重试。"
+                    } else if detail.contains("手机已断开") {
+                        "手机连接已断开，请重新连接后重试。"
+                    } else if detail.contains("模型来源已变更") {
+                        "模型来源已变更，请重试。"
                     } else {
                         "模型暂未返回可用结果，请检查连接或重试。"
                     };

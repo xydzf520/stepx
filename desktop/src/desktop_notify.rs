@@ -454,11 +454,40 @@ fn should_popup_for_scope(
     }
 }
 
+fn extract_clipboard_otp(notif: &PushNotification, precomputed_otp: Option<&str>) -> Option<String> {
+    if let Some(code) = precomputed_otp
+        .map(str::trim)
+        .filter(|c| (4..=8).contains(&c.len()) && c.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return Some(code.to_string());
+    }
+    let combined = format!("{} {}", notif.title, notif.text);
+    extract_otp_code(&combined)
+}
+
+fn copy_silent_otp_to_desktop_clipboard(code: &str) {
+    if std::env::var_os("STEPX_DESKTOP_CLIPBOARD_FILE").is_some() {
+        let _ = crate::device::write_desktop_clipboard(code);
+        return;
+    }
+    if cfg!(test) {
+        return;
+    }
+    let owned = code.to_string();
+    let _ = thread::Builder::new()
+        .name("stepx-silent-otp-copy".into())
+        .spawn(move || {
+            let _ = crate::device::write_desktop_clipboard(&owned);
+        });
+}
+
 /// Detects newly arrived notifications from `next` that should trigger a desktop toast.
 ///
 /// - Deduplicates against `seen_keys`.
 /// - Suppresses notifications belonging to `active_thread_id`.
 /// - Filters according to `prefs.scope` (including `FocusHostOnly` AI 专注托管).
+/// - When `PopupMode::Silent` suppresses visual popups, still extracts and auto-copies
+///   verification codes (OTPs) to the desktop clipboard if `prefs.auto_copy_otp` is `true`.
 pub fn detect_new_toasts(
     prev_revision: u64,
     seen_keys: &mut HashSet<String>,
@@ -466,11 +495,31 @@ pub fn detect_new_toasts(
     prefs: &NotifyPreferences,
     active_thread_id: Option<&str>,
 ) -> Vec<DesktopToastItem> {
+    detect_new_toasts_with_otp_hook(
+        prev_revision,
+        seen_keys,
+        next,
+        prefs,
+        active_thread_id,
+        copy_silent_otp_to_desktop_clipboard,
+    )
+}
+
+pub fn detect_new_toasts_with_otp_hook(
+    prev_revision: u64,
+    seen_keys: &mut HashSet<String>,
+    next: &PushSnapshot,
+    prefs: &NotifyPreferences,
+    active_thread_id: Option<&str>,
+    on_silent_otp_copy: impl FnOnce(&str),
+) -> Vec<DesktopToastItem> {
     if prev_revision > 0 && next.revision <= prev_revision {
         return Vec::new();
     }
 
     let mut items = Vec::new();
+    let mut latest_silent_otp: Option<String> = None;
+
     for notif in &next.notifications {
         if notif.dismissed || notif.is_ongoing || notif.read {
             continue;
@@ -488,11 +537,6 @@ pub fn detect_new_toasts(
             notif.text.trim()
         );
         if !seen_keys.insert(dedup_key.clone()) {
-            continue;
-        }
-
-        let effective_mode = prefs.effective_popup_mode(&notif.package_name);
-        if !effective_mode.allows_popup() {
             continue;
         }
 
@@ -514,6 +558,16 @@ pub fn detect_new_toasts(
         });
 
         if !should_popup_for_scope(prefs.scope, notif, otp_code.as_deref()) {
+            continue;
+        }
+
+        let effective_mode = prefs.effective_popup_mode(&notif.package_name);
+        if !effective_mode.allows_popup() {
+            if prefs.auto_copy_otp {
+                if let Some(code) = extract_clipboard_otp(notif, otp_code.as_deref()) {
+                    latest_silent_otp = Some(code);
+                }
+            }
             continue;
         }
 
@@ -558,6 +612,10 @@ pub fn detect_new_toasts(
             can_reply: notif.can_reply,
             timestamp_ms: notif.post_time_ms,
         });
+    }
+
+    if let Some(code) = latest_silent_otp.as_deref() {
+        on_silent_otp_copy(code);
     }
 
     items
@@ -958,5 +1016,131 @@ mod tests {
             prefs.effective_popup_mode("com.tencent.mm"),
             PopupMode::Banner
         );
+    }
+
+    #[test]
+    fn silent_popup_mode_suppresses_visual_banners_while_auto_copying_otp_when_enabled() {
+        let snapshot = demo_push_snapshot();
+
+        // 1. Silent + auto_copy_otp: true -> suppresses all visual banners, extracts & copies OTP once
+        let prefs = NotifyPreferences {
+            scope: AlertScope::ImAndOtpOnly,
+            popup_mode: PopupMode::Silent,
+            auto_copy_otp: true,
+            ..NotifyPreferences::default()
+        };
+        let mut seen = HashSet::new();
+        let mut copied = None;
+        let toasts = detect_new_toasts_with_otp_hook(
+            0,
+            &mut seen,
+            &snapshot,
+            &prefs,
+            None,
+            |code| copied = Some(code.to_string()),
+        );
+        assert!(
+            toasts.is_empty(),
+            "PopupMode::Silent must suppress all visual desktop banners"
+        );
+        assert_eq!(
+            copied.as_deref(),
+            Some("839201"),
+            "PopupMode::Silent + auto_copy_otp: true must still extract and auto-copy OTP"
+        );
+
+        // Repeat poll with higher revision but identical notifications must be deduplicated
+        let mut next_snap = snapshot.clone();
+        next_snap.revision += 1;
+        let mut copied_repeat = None;
+        let repeat_toasts = detect_new_toasts_with_otp_hook(
+            snapshot.revision,
+            &mut seen,
+            &next_snap,
+            &prefs,
+            None,
+            |code| copied_repeat = Some(code.to_string()),
+        );
+        assert!(repeat_toasts.is_empty());
+        assert_eq!(
+            copied_repeat, None,
+            "seen_keys deduplication must prevent repeated clipboard writes"
+        );
+
+        // Fresh raw notification without pre-populated `otp_code` (and alongside a shelf pickup code)
+        let custom_snap = PushSnapshot {
+            revision: 99,
+            notifications: vec![
+                PushNotification {
+                    key: "0|com.cainiao|1|null|1".into(),
+                    package_name: "com.cainiao.wireless".into(),
+                    app_name: "菜鸟".into(),
+                    title: "取件提醒".into(),
+                    text: "【菜鸟驿站】凭4-2-1088到驿站取件".into(),
+                    otp_code: Some("4-2-1088".into()),
+                    post_time_ms: 1_760_000_001_000,
+                    ..Default::default()
+                },
+                PushNotification {
+                    key: "0|com.android.mms|2|null|1".into(),
+                    package_name: "com.android.mms".into(),
+                    app_name: "短信".into(),
+                    title: "10690000".into(),
+                    text: "尾号8848账户正在登录，验证码:654321，5分钟内有效".into(),
+                    otp_code: None,
+                    post_time_ms: 1_760_000_002_000,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let mut seen_custom = HashSet::new();
+        let mut copied_custom = None;
+        let custom_toasts = detect_new_toasts_with_otp_hook(
+            0,
+            &mut seen_custom,
+            &custom_snap,
+            &prefs,
+            None,
+            |code| copied_custom = Some(code.to_string()),
+        );
+        assert!(custom_toasts.is_empty());
+        assert_eq!(copied_custom.as_deref(), Some("654321"));
+
+        // 2. Silent + auto_copy_otp: false -> neither banner nor clipboard copy
+        let prefs_no_copy = NotifyPreferences {
+            auto_copy_otp: false,
+            ..prefs.clone()
+        };
+        let mut seen_no_copy = HashSet::new();
+        let mut copied_disabled = None;
+        assert!(detect_new_toasts_with_otp_hook(
+            0,
+            &mut seen_no_copy,
+            &custom_snap,
+            &prefs_no_copy,
+            None,
+            |code| copied_disabled = Some(code.to_string()),
+        )
+        .is_empty());
+        assert_eq!(copied_disabled, None);
+
+        // 3. AlertScope::Muted -> blocks both banners and silent OTP auto-copy
+        let prefs_muted = NotifyPreferences {
+            scope: AlertScope::Muted,
+            ..prefs
+        };
+        let mut seen_muted = HashSet::new();
+        let mut copied_muted = None;
+        assert!(detect_new_toasts_with_otp_hook(
+            0,
+            &mut seen_muted,
+            &custom_snap,
+            &prefs_muted,
+            None,
+            |code| copied_muted = Some(code.to_string()),
+        )
+        .is_empty());
+        assert_eq!(copied_muted, None);
     }
 }

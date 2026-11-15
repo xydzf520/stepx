@@ -189,9 +189,9 @@ fn resolve_standard_action(action: StandardAction) -> StandardMenuItemProperties
     }
 
     match action {
-        StandardAction::Close => make("Close Window", "performClose:", none, ""),
-        StandardAction::Quit => make("Quit FaCloud", "terminate:", cmd, "q"),
-        StandardAction::Hide => make("Hide FaCloud", "hide:", cmd, "h"),
+        StandardAction::Close => make("Close Window", "performClose:", cmd, "w"),
+        StandardAction::Quit => make("Quit StepX Companion", "terminate:", cmd, "q"),
+        StandardAction::Hide => make("Hide StepX Companion", "hide:", cmd, "h"),
         StandardAction::HideOtherApps => {
             make("Hide Others", "hideOtherApplications:", cmd | option, "h")
         }

@@ -144,13 +144,125 @@ pub(crate) fn humanize_wechat_emojis(text: &str) -> String {
     out
 }
 
+pub(crate) const PRIVACY_MASK_PLACEHOLDER: &str = "[防窥模式已开启，已隐藏消息内容]";
+
+pub(crate) fn masked_code_copy_status(code: &str, is_pickup: bool, privacy_mask: bool) -> String {
+    if privacy_mask {
+        if is_pickup {
+            "已复制取件码 ••••••".into()
+        } else {
+            "已复制验证码 ••••••".into()
+        }
+    } else if is_pickup {
+        format!("已复制取件码 {code}")
+    } else {
+        format!("已复制验证码 {code}")
+    }
+}
+
+pub(crate) fn masked_code_button_label(prefix: &str, code: &str, privacy_mask: bool) -> String {
+    if privacy_mask {
+        format!("{prefix} ••••••")
+    } else {
+        format!("{prefix} {code}")
+    }
+}
+
+pub(crate) fn format_im_thread_preview_text(t: &ImThread, privacy_mask: bool) -> String {
+    let last_is_outgoing =
+        t.last_sender.trim() == "我" || t.messages.last().is_some_and(|m| m.outgoing);
+    let effective_last_msg = if let Some(last_m) = t.messages.last() {
+        if (privacy_mask && !last_is_outgoing)
+            || last_m.recalled
+            || !last_m.media_hint.trim().is_empty()
+            || t.last_message.trim().is_empty()
+        {
+            let (formatted, _, _) = format_im_message_content(last_m, privacy_mask);
+            if !formatted.trim().is_empty() {
+                formatted
+            } else if privacy_mask && !last_is_outgoing {
+                PRIVACY_MASK_PLACEHOLDER.to_string()
+            } else {
+                t.last_message.clone()
+            }
+        } else {
+            t.last_message.clone()
+        }
+    } else if privacy_mask && !last_is_outgoing {
+        PRIVACY_MASK_PLACEHOLDER.to_string()
+    } else {
+        t.last_message.clone()
+    };
+    let raw_preview = if last_is_outgoing {
+        let clean_msg = sanitize_ui_display_text(&effective_last_msg);
+        if clean_msg.starts_with("我:") || clean_msg.starts_with("我：") {
+            clean_msg
+        } else {
+            format!("我: {clean_msg}")
+        }
+    } else if !t.last_sender.is_empty()
+        && t.last_sender != t.title
+        && !effective_last_msg.starts_with(&t.last_sender)
+    {
+        format!(
+            "{}: {}",
+            sanitize_ui_display_text(&t.last_sender),
+            sanitize_ui_display_text(&effective_last_msg)
+        )
+    } else {
+        sanitize_ui_display_text(&effective_last_msg)
+    };
+    let humanized_preview = humanize_wechat_emojis(&raw_preview);
+    let single_line: String = humanized_preview
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if single_line.chars().count() > 36 {
+        format!("{}…", single_line.chars().take(36).collect::<String>())
+    } else {
+        single_line
+    }
+}
+
+pub(crate) fn format_sms_thread_preview_text(
+    last_body: &str,
+    last_is_outgoing: bool,
+    privacy_mask: bool,
+) -> String {
+    if privacy_mask && !last_is_outgoing {
+        return PRIVACY_MASK_PLACEHOLDER.to_string();
+    }
+    let raw_one_line: String = last_body
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let one_line = if last_is_outgoing
+        && !raw_one_line.is_empty()
+        && !raw_one_line.starts_with("我:")
+        && !raw_one_line.starts_with("我：")
+    {
+        format!("我: {raw_one_line}")
+    } else {
+        raw_one_line
+    };
+    if one_line.chars().count() > 38 {
+        format!("{}…", one_line.chars().take(38).collect::<String>())
+    } else {
+        one_line
+    }
+}
+
 pub(crate) fn format_im_message_content(
     m: &ImMessage,
     privacy_mask: bool,
 ) -> (String, Option<&'static str>, Option<String>) {
     let recalled_badge = m.recalled.then_some("[已撤回]");
     if privacy_mask && !m.outgoing {
-        let masked = "[防窥模式已开启，已隐藏消息内容]";
+        let masked = PRIVACY_MASK_PLACEHOLDER;
         let body = if m.recalled {
             format!("[已撤回] {masked}")
         } else {
@@ -2291,6 +2403,16 @@ impl Companion {
         card
     }
 
+    pub(crate) fn sms_thread_messages(
+        &self,
+        address: &str,
+    ) -> Vec<&stepx_companion::sms::Message> {
+        if address.trim().is_empty() {
+            return Vec::new();
+        }
+        self.thread_messages(address)
+    }
+
     fn render_im_rich_modal_card(
         &self,
         idx: usize,
@@ -2470,13 +2592,10 @@ impl Companion {
             self.pill_badge_icon(notice.category_badge, icon, tint, tint_soft),
             self.chat_bubble_text_node(&notice.headline, BODY, p.text, 240.0),
         ];
+        let privacy_mask = self.push.prefs.privacy_mask;
         if let Some((code, pickup)) = &notice.highlight_code {
             header_left.push(self.pill_badge_icon(
-                if *pickup {
-                    format!("取件码 {code}")
-                } else {
-                    format!("凭据码 {code}")
-                },
+                masked_code_button_label(if *pickup { "取件码" } else { "凭据码" }, code, privacy_mask),
                 if *pickup {
                     UiIcon::Package
                 } else {
@@ -2488,7 +2607,7 @@ impl Companion {
         }
 
         let mut card_rows: Vec<El> = vec![self.wrap(header_left)];
-        if !notice.kv_rows.is_empty() {
+        if !privacy_mask && !notice.kv_rows.is_empty() {
             for (k, v) in notice.kv_rows.iter().take(4) {
                 card_rows.push(
                     Flex::row()
@@ -2514,13 +2633,12 @@ impl Companion {
         if let Some((code, pickup)) = &notice.highlight_code {
             card_btns.push(self.button_icon(
                 format!("im-srv-copy-{idx}"),
-                if *pickup {
-                    format!("复制取件码 {code}")
-                } else {
-                    format!("复制 {code}")
-                },
+                masked_code_button_label(if *pickup { "复制取件码" } else { "复制" }, code, privacy_mask),
                 UiIcon::Copy,
-                Action::CopyText(code.clone(), format!("已复制 {code}")),
+                Action::CopyText(
+                    code.clone(),
+                    masked_code_copy_status(code, *pickup, privacy_mask),
+                ),
                 Btn::Primary,
             ));
             if *pickup {
@@ -2641,21 +2759,30 @@ impl Companion {
         ];
         if let Some(code) = extract_verification_code(full_text) {
             let pickup = is_pickup_code_text(&code, full_text);
+            let privacy_mask = self.push.prefs.privacy_mask && !_outgoing;
             action_btns.insert(
                 0,
                 self.button_icon(
                     format!("im-detail-otp-{idx}"),
-                    if pickup {
-                        format!("复制取件码 {code}")
-                    } else {
-                        format!("复制验证码 {code}")
-                    },
+                    masked_code_button_label(
+                        if pickup { "复制取件码" } else { "复制验证码" },
+                        &code,
+                        privacy_mask,
+                    ),
                     if pickup { UiIcon::Package } else { UiIcon::Key },
-                    Action::CopyText(code.clone(), format!("已复制 {code}")),
+                    Action::CopyText(
+                        code.clone(),
+                        masked_code_copy_status(&code, pickup, privacy_mask),
+                    ),
                     Btn::Primary,
                 ),
             );
         }
+        let detail_display_text = if self.push.prefs.privacy_mask && !_outgoing {
+            PRIVACY_MASK_PLACEHOLDER
+        } else {
+            full_text
+        };
 
         let card = Container::new(
             Flex::column()
@@ -2665,7 +2792,7 @@ impl Companion {
                 .with_child(
                     ConstrainedBox::new(self.pane_scroll(
                         self.sms_detail_scroll.clone(),
-                        self.chat_bubble_text_node(full_text, BODY, p.text, 460.0),
+                        self.chat_bubble_text_node(detail_display_text, BODY, p.text, 460.0),
                     ))
                     .with_max_height(240.0)
                     .finish(),
@@ -2689,12 +2816,16 @@ impl Companion {
         }
         let p = self.p();
         let clean_sender = sanitize_ui_display_text(q_sender);
-        let clean_text: String = sanitize_ui_display_text(q_text)
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
+        let clean_text: String = if self.push.prefs.privacy_mask && clean_sender != "我" {
+            PRIVACY_MASK_PLACEHOLDER.to_string()
+        } else {
+            sanitize_ui_display_text(q_text)
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
         let snippet = if clean_text.chars().count() > 54 {
             format!("{}…", clean_text.chars().take(54).collect::<String>())
         } else {
@@ -2923,15 +3054,16 @@ impl Companion {
                     .map(|code| (code.clone(), is_pickup_code_text(&code, &t.last_message)))
             });
 
+        let privacy_mask = self.push.prefs.privacy_mask;
         let mut top_hdr_btns = Vec::new();
         if let Some((code, pickup)) = &latest_im_otp {
             top_hdr_btns.push(self.button_icon(
                 "im-hdr-copy-otp",
-                if *pickup {
-                    format!("复制取件码: {code}")
-                } else {
-                    format!("复制验证码: {code}")
-                },
+                masked_code_button_label(
+                    if *pickup { "复制取件码:" } else { "复制验证码:" },
+                    code,
+                    privacy_mask,
+                ),
                 if *pickup {
                     UiIcon::Package
                 } else {
@@ -2939,11 +3071,7 @@ impl Companion {
                 },
                 Action::CopyText(
                     code.clone(),
-                    if *pickup {
-                        format!("已复制取件码 {code}")
-                    } else {
-                        format!("已复制验证码 {code}")
-                    },
+                    masked_code_copy_status(code, *pickup, privacy_mask),
                 ),
                 Btn::Primary,
             ));
@@ -3090,7 +3218,7 @@ impl Companion {
                 && crate::ui::message_window::same_burst(t, &t.messages[idx - 1], m);
 
             let (raw_msg_text, recalled_badge, raw_media_badge) =
-                format_im_message_content(m, false);
+                format_im_message_content(m, privacy_mask);
             let msg_text = humanize_wechat_emojis(&raw_msg_text);
             let copy_payload = if raw_msg_text.trim().is_empty() {
                 sanitize_ui_display_text(&m.text)
@@ -3098,13 +3226,18 @@ impl Companion {
                 raw_msg_text.clone()
             };
 
-            let voice_secs = extract_voice_duration_secs(&m.text, &m.media_hint);
-            let media_info = if voice_secs.is_some() {
+            let hide_incoming_cards = privacy_mask && !is_out;
+            let voice_secs = if hide_incoming_cards {
+                None
+            } else {
+                extract_voice_duration_secs(&m.text, &m.media_hint)
+            };
+            let media_info = if hide_incoming_cards || voice_secs.is_some() {
                 None
             } else {
                 detect_im_media_kind(&m.text, &m.media_hint)
             };
-            let rich_modal_info = if voice_secs.is_some() || media_info.is_some() {
+            let rich_modal_info = if hide_incoming_cards || voice_secs.is_some() || media_info.is_some() {
                 None
             } else {
                 detect_im_rich_modal(&m.text, &m.media_hint)
@@ -3280,11 +3413,7 @@ impl Companion {
                             let pickup = is_pickup_code_text(&code, &txt_dbl);
                             ctx.dispatch_typed_action(Action::CopyText(
                                 code.clone(),
-                                if pickup {
-                                    format!("已复制取件码 {code}")
-                                } else {
-                                    format!("已复制验证码 {code}")
-                                },
+                                masked_code_copy_status(&code, pickup, privacy_mask),
                             ));
                         } else {
                             ctx.dispatch_typed_action(Action::CopyText(
@@ -3349,11 +3478,7 @@ impl Companion {
                         true,
                         Action::CopyText(
                             code.clone(),
-                            if pickup {
-                                format!("已复制取件码 {code}")
-                            } else {
-                                format!("已复制验证码 {code}")
-                            },
+                            masked_code_copy_status(&code, pickup, privacy_mask),
                         ),
                     ));
                     if pickup {
@@ -3373,12 +3498,15 @@ impl Companion {
                         Action::StudioOpenUrl(url),
                     ));
                 }
-                let service_notice =
-                    if voice_secs.is_some() || media_info.is_some() || rich_modal_info.is_some() {
-                        None
-                    } else {
-                        detect_im_service_notice(sender_name, &m.text)
-                    };
+                let service_notice = if hide_incoming_cards
+                    || voice_secs.is_some()
+                    || media_info.is_some()
+                    || rich_modal_info.is_some()
+                {
+                    None
+                } else {
+                    detect_im_service_notice(sender_name, &m.text)
+                };
 
                 let mut bubble_inner_items: Vec<El> = Vec::new();
                 if let Some(secs) = voice_secs {
@@ -3494,6 +3622,7 @@ impl Companion {
                 .with_padding_top(top_gap)
                 .finish();
                 let state = self.mouse_state(in_key);
+                let raw_dbl = m.text.clone();
                 let txt_dbl = copy_payload.clone();
                 let otp_rc = extract_verification_code(&m.text);
                 let tid_rc = t.thread_id.clone();
@@ -3507,15 +3636,11 @@ impl Companion {
                     .without_hover_animation()
                     .with_defer_events_to_children()
                     .on_double_click(move |ctx, _, _| {
-                        if let Some(code) = extract_verification_code(&txt_dbl) {
-                            let pickup = is_pickup_code_text(&code, &txt_dbl);
+                        if let Some(code) = extract_verification_code(&raw_dbl) {
+                            let pickup = is_pickup_code_text(&code, &raw_dbl);
                             ctx.dispatch_typed_action(Action::CopyText(
                                 code.clone(),
-                                if pickup {
-                                    format!("已复制取件码 {code}")
-                                } else {
-                                    format!("已复制验证码 {code}")
-                                },
+                                masked_code_copy_status(&code, pickup, privacy_mask),
                             ));
                             return;
                         }
@@ -3843,27 +3968,9 @@ impl Companion {
                 .filter(|m| norm_addr(&m.address) == norm)
                 .max_by_key(|m| m.date_ms)
                 .is_some_and(|m| m.outgoing);
-            let raw_one_line: String = rt
-                .last_body
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .collect::<Vec<_>>()
-                .join(" ");
-            let one_line = if last_is_outgoing
-                && !raw_one_line.is_empty()
-                && !raw_one_line.starts_with("我:")
-                && !raw_one_line.starts_with("我：")
-            {
-                format!("我: {raw_one_line}")
-            } else {
-                raw_one_line
-            };
-            let preview = if one_line.chars().count() > 38 {
-                format!("{}…", one_line.chars().take(38).collect::<String>())
-            } else {
-                one_line
-            };
+            let page_privacy_mask = self.push.prefs.privacy_mask;
+            let preview =
+                format_sms_thread_preview_text(&rt.last_body, last_is_outgoing, page_privacy_mask);
             let otp_code = extract_verification_code(&rt.last_body);
             let sms_tkey =
                 stepx_companion::desktop_notify::NotifyPreferences::sms_target_key(&addr_key);
@@ -4216,56 +4323,8 @@ impl Companion {
                 title_badges.push(self.pill_badge(app_label, p.text2, p.tag_bg));
             }
 
-            let effective_last_msg = if let Some(last_m) = t.messages.last() {
-                if last_m.recalled
-                    || !last_m.media_hint.trim().is_empty()
-                    || t.last_message.trim().is_empty()
-                {
-                    let (formatted, _, _) = format_im_message_content(last_m, false);
-                    if !formatted.trim().is_empty() {
-                        formatted
-                    } else {
-                        t.last_message.clone()
-                    }
-                } else {
-                    t.last_message.clone()
-                }
-            } else {
-                t.last_message.clone()
-            };
-            let last_is_outgoing =
-                t.last_sender.trim() == "我" || t.messages.last().is_some_and(|m| m.outgoing);
-            let raw_preview = if last_is_outgoing {
-                let clean_msg = sanitize_ui_display_text(&effective_last_msg);
-                if clean_msg.starts_with("我:") || clean_msg.starts_with("我：") {
-                    clean_msg
-                } else {
-                    format!("我: {clean_msg}")
-                }
-            } else if !t.last_sender.is_empty()
-                && t.last_sender != t.title
-                && !effective_last_msg.starts_with(&t.last_sender)
-            {
-                format!(
-                    "{}: {}",
-                    sanitize_ui_display_text(&t.last_sender),
-                    sanitize_ui_display_text(&effective_last_msg)
-                )
-            } else {
-                sanitize_ui_display_text(&effective_last_msg)
-            };
-            let humanized_preview = humanize_wechat_emojis(&raw_preview);
-            let single_line: String = humanized_preview
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .collect::<Vec<_>>()
-                .join(" ");
-            let preview_str = if single_line.chars().count() > 36 {
-                format!("{}…", single_line.chars().take(36).collect::<String>())
-            } else {
-                single_line
-            };
+            let page_privacy_mask = self.push.prefs.privacy_mask;
+            let preview_str = format_im_thread_preview_text(t, page_privacy_mask);
 
             let row_key = format!("im-th:{}", t.thread_id);
             let pin_btn_id = format!("im-row-pin-{i}");
@@ -4433,11 +4492,7 @@ impl Companion {
                     let pickup = is_pickup_code_text(code, &last_msg_dbl);
                     ctx.dispatch_typed_action(Action::CopyText(
                         code.clone(),
-                        if pickup {
-                            format!("已复制取件码 {code}")
-                        } else {
-                            format!("已复制验证码 {code}")
-                        },
+                        masked_code_copy_status(code, pickup, page_privacy_mask),
                     ));
                 }
                 ctx.dispatch_typed_action(Action::Focus(F_IM_REPLY));
@@ -4576,14 +4631,15 @@ impl Companion {
                 if is_pinned {
                     title_items.push(self.content_icon(UiIcon::Pin, 12.0, p.accent));
                 }
+                let page_privacy_mask = self.push.prefs.privacy_mask;
                 if let Some(code) = &t.otp_code {
-                    let pickup = is_pickup_code_text(code, &t.preview);
+                    let pickup = is_pickup_code_text(code, &t.last_body);
                     title_items.push(self.pill_badge_icon(
-                        if pickup {
-                            format!("取件码 {code}")
-                        } else {
-                            format!("验证码 {code}")
-                        },
+                        masked_code_button_label(
+                            if pickup { "取件码" } else { "验证码" },
+                            code,
+                            page_privacy_mask,
+                        ),
                         if pickup { UiIcon::Package } else { UiIcon::Key },
                         p.warning,
                         p.warning_soft,
@@ -4693,11 +4749,7 @@ impl Companion {
                         let pickup = is_pickup_code_text(code, &body_dbl);
                         ctx.dispatch_typed_action(Action::CopyText(
                             code.clone(),
-                            if pickup {
-                                format!("已复制取件码 {code}")
-                            } else {
-                                format!("已复制验证码 {code}")
-                            },
+                            masked_code_copy_status(code, pickup, page_privacy_mask),
                         ));
                     }
                 })
@@ -4765,6 +4817,7 @@ impl Companion {
                     .clone()
                     .or_else(|| extract_verification_code(&n.text));
 
+                let page_privacy_mask = self.push.prefs.privacy_mask;
                 let mut title_badges =
                     vec![self.line_w(display_title, CAPTION, p.text, Weight::Semibold)];
                 if is_pinned {
@@ -4773,11 +4826,11 @@ impl Companion {
                 if let Some(code) = &otp_code {
                     let pickup = is_pickup_code_text(code, &n.text);
                     title_badges.push(self.pill_badge_icon(
-                        if pickup {
-                            format!("取件码 {code}")
-                        } else {
-                            format!("验证码 {code}")
-                        },
+                        masked_code_button_label(
+                            if pickup { "取件码" } else { "验证码" },
+                            code,
+                            page_privacy_mask,
+                        ),
                         if pickup { UiIcon::Package } else { UiIcon::Key },
                         p.warning,
                         p.warning_soft,
@@ -4786,7 +4839,9 @@ impl Companion {
                     title_badges.push(self.pill_badge(&source_label, p.text2, p.tag_bg));
                 }
 
-                let raw_preview = if !n.text.trim().is_empty() {
+                let raw_preview = if page_privacy_mask {
+                    PRIVACY_MASK_PLACEHOLDER.to_string()
+                } else if !n.text.trim().is_empty() {
                     sanitize_ui_display_text(&n.text)
                 } else if !n.sub_text.trim().is_empty() {
                     sanitize_ui_display_text(&n.sub_text)
@@ -4956,11 +5011,7 @@ impl Companion {
                         let pickup = is_pickup_code_text(code, &ntext_dbl);
                         ctx.dispatch_typed_action(Action::CopyText(
                             code.clone(),
-                            if pickup {
-                                format!("已复制取件码 {code}")
-                            } else {
-                                format!("已复制验证码 {code}")
-                            },
+                            masked_code_copy_status(code, pickup, page_privacy_mask),
                         ));
                     } else {
                         ctx.dispatch_typed_action(Action::Push(PushAction::OpenOnPhone(
@@ -5293,7 +5344,11 @@ impl Companion {
                 cards.push(SmartValueCard {
                     icon: UiIcon::Package,
                     tint: amber,
-                    title: format!("取件码 {pickup}"),
+                    title: masked_code_button_label(
+                        "取件码",
+                        pickup,
+                        self.push.prefs.privacy_mask,
+                    ),
                     code: Some(pickup.clone()),
                     jump,
                     done: Some(pickup.clone()),
@@ -5337,7 +5392,11 @@ impl Companion {
                 cards.push(SmartValueCard {
                     icon: UiIcon::Key,
                     tint: p.accent,
-                    title: format!("验证码 {otp}"),
+                    title: masked_code_button_label(
+                        "验证码",
+                        otp,
+                        self.push.prefs.privacy_mask,
+                    ),
                     code: Some(otp.clone()),
                     jump,
                     done: None,
@@ -5355,7 +5414,11 @@ impl Companion {
                 cards.push(SmartValueCard {
                     icon: UiIcon::Copy,
                     tint: p.blue,
-                    title: format!("剪贴板: {short_clip}"),
+                    title: if self.push.prefs.privacy_mask {
+                        "剪贴板: ••••••".to_string()
+                    } else {
+                        format!("剪贴板: {short_clip}")
+                    },
                     code: Some(phone_clip_val.to_string()),
                     jump: Action::Push(PushAction::SelectImThread(format!(
                         "notif_detail::{clip_nkey}"
@@ -5515,11 +5578,22 @@ impl Companion {
                     vec![self.line_w("重要", CAPTION, p.text, Weight::Semibold)];
                 for (c_idx, card) in cards.into_iter().take(4).enumerate() {
                     let action_btn = if let Some(code) = &card.code {
+                        let copy_status = if self.push.prefs.privacy_mask {
+                            if card.done.is_some() {
+                                "已复制取件码 ••••••".into()
+                            } else if matches!(card.icon, UiIcon::Key) {
+                                "已复制验证码 ••••••".into()
+                            } else {
+                                "已复制 ••••••".into()
+                            }
+                        } else {
+                            format!("已复制 {}", code)
+                        };
                         self.button_icon(
                             format!("sms-val-copy-{c_idx}"),
                             "复制",
                             UiIcon::Copy,
-                            Action::CopyText(code.clone(), format!("已复制 {}", code)),
+                            Action::CopyText(code.clone(), copy_status),
                             Btn::Ghost,
                         )
                     } else {
@@ -5813,10 +5887,11 @@ impl Companion {
             .unwrap_or_else(|| "请选择可用 SIM".into());
         let can_send = self.capabilities.as_ref().is_some_and(|c| c.send_sms)
             && sims.iter().any(|s| Some(s.id) == selected_sim);
+        let page_privacy_mask = self.push.prefs.privacy_mask;
         let has_recipient = !peer_num.trim().is_empty();
         let is_composing_without_history =
             is_new_sms || (selected_thread_info.is_none() && has_recipient);
-        let real_msgs = self.thread_messages(&active_addr);
+        let real_msgs = self.sms_thread_messages(&active_addr);
         let latest_sms_otp = real_msgs.iter().rev().find_map(|m| {
             extract_verification_code(&m.body)
                 .map(|code| (code.clone(), is_pickup_code_text(&code, &m.body)))
@@ -5868,11 +5943,11 @@ impl Companion {
         if let Some((code, pickup)) = &latest_sms_otp {
             top_peer_actions.push(self.button_icon(
                 "sms-hdr-copy-otp",
-                if *pickup {
-                    format!("复制取件码: {code}")
-                } else {
-                    format!("复制验证码: {code}")
-                },
+                masked_code_button_label(
+                    if *pickup { "复制取件码:" } else { "复制验证码:" },
+                    code,
+                    page_privacy_mask,
+                ),
                 if *pickup {
                     UiIcon::Package
                 } else {
@@ -5880,11 +5955,7 @@ impl Companion {
                 },
                 Action::CopyText(
                     code.clone(),
-                    if *pickup {
-                        format!("已复制取件码 {code}")
-                    } else {
-                        format!("已复制验证码 {code}")
-                    },
+                    masked_code_copy_status(code, *pickup, page_privacy_mask),
                 ),
                 Btn::Primary,
             ));
@@ -6012,7 +6083,12 @@ impl Companion {
             } else {
                 clean_txt
             };
-            let b = Container::new(self.chat_bubble_text_node(&display_txt, BODY, p.text, 440.0))
+            let bubble_txt = if page_privacy_mask {
+                PRIVACY_MASK_PLACEHOLDER
+            } else {
+                display_txt.as_str()
+            };
+            let b = Container::new(self.chat_bubble_text_node(bubble_txt, BODY, p.text, 440.0))
                 .with_horizontal_padding(14.)
                 .with_vertical_padding(9.)
                 .with_background_color(p.bg)
@@ -6043,11 +6119,7 @@ impl Companion {
                     true,
                     Action::CopyText(
                         code.clone(),
-                        if pickup {
-                            format!("已复制取件码 {code}")
-                        } else {
-                            format!("已复制验证码 {code}")
-                        },
+                        masked_code_copy_status(code, pickup, page_privacy_mask),
                     ),
                 ));
                 if pickup {
@@ -6132,11 +6204,7 @@ impl Companion {
                         let pickup = is_pickup_code_text(&code, &txt_dbl);
                         ctx.dispatch_typed_action(Action::CopyText(
                             code.clone(),
-                            if pickup {
-                                format!("已复制取件码 {code}")
-                            } else {
-                                format!("已复制验证码 {code}")
-                            },
+                            masked_code_copy_status(&code, pickup, page_privacy_mask),
                         ));
                     } else {
                         ctx.dispatch_typed_action(Action::CopyText(
@@ -6255,11 +6323,7 @@ impl Companion {
                         let pickup = is_pickup_code_text(&code, &txt_dbl);
                         ctx.dispatch_typed_action(Action::CopyText(
                             code.clone(),
-                            if pickup {
-                                format!("已复制取件码 {code}")
-                            } else {
-                                format!("已复制验证码 {code}")
-                            },
+                            masked_code_copy_status(&code, pickup, page_privacy_mask),
                         ));
                     } else {
                         ctx.dispatch_typed_action(Action::CopyText(
@@ -7024,5 +7088,100 @@ mod tests {
             ..Default::default()
         };
         assert!(is_scraped_ui_noise_thread(&polluted_thread));
+    }
+
+    #[test]
+    fn empty_address_thread_messages_and_privacy_mask_previews_work() {
+        use super::{
+            format_im_thread_preview_text, format_sms_thread_preview_text,
+            masked_code_button_label, masked_code_copy_status, Companion, PRIVACY_MASK_PLACEHOLDER,
+        };
+        use stepx_companion::push::{ImMessage, ImThread};
+        use stepx_companion::sms::Message;
+
+        let mut app = Companion::new_for_test();
+        app.sms.push(Message {
+            provider_id: Some(901),
+            address: String::new(),
+            body: "孤立验证码 884210".into(),
+            date_ms: 1_700_000_000_000,
+            outgoing: false,
+            kind: 1,
+            read: false,
+            subscription: None,
+        });
+        app.sms.push(Message {
+            provider_id: Some(902),
+            address: "10690001".into(),
+            body: "【菜鸟驿站】取件码 4-2-1088".into(),
+            date_ms: 1_700_000_000_100,
+            outgoing: false,
+            kind: 1,
+            read: false,
+            subscription: None,
+        });
+
+        assert!(app.sms_thread_messages("").is_empty());
+        assert!(app.sms_thread_messages("   ").is_empty());
+        assert_eq!(app.sms_thread_messages("10690001").len(), 1);
+
+        let im_thread = ImThread {
+            thread_id: "com.tencent.mm::alice".into(),
+            package_name: "com.tencent.mm".into(),
+            title: "Alice".into(),
+            last_sender: "Alice".into(),
+            last_message: "验证码 654321 请勿泄露".into(),
+            messages: vec![ImMessage {
+                id: "m1".into(),
+                sender: "Alice".into(),
+                text: "验证码 654321 请勿泄露".into(),
+                outgoing: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            format_im_thread_preview_text(&im_thread, true),
+            PRIVACY_MASK_PLACEHOLDER
+        );
+        assert!(format_im_thread_preview_text(&im_thread, false).contains("654321"));
+
+        let out_im_thread = ImThread {
+            thread_id: "com.tencent.mm::bob".into(),
+            package_name: "com.tencent.mm".into(),
+            title: "Bob".into(),
+            last_sender: "我".into(),
+            last_message: "我马上到".into(),
+            messages: vec![ImMessage {
+                id: "m2".into(),
+                sender: "我".into(),
+                text: "我马上到".into(),
+                outgoing: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(format_im_thread_preview_text(&out_im_thread, true), "我: 我马上到");
+
+        assert_eq!(
+            format_sms_thread_preview_text("【顺丰速运】取件码 3-1-2099", false, true),
+            PRIVACY_MASK_PLACEHOLDER
+        );
+        assert_eq!(
+            format_sms_thread_preview_text("好的收到", true, true),
+            "我: 好的收到"
+        );
+        assert_eq!(
+            masked_code_copy_status("654321", false, true),
+            "已复制验证码 ••••••"
+        );
+        assert_eq!(
+            masked_code_copy_status("3-1-2099", true, true),
+            "已复制取件码 ••••••"
+        );
+        assert_eq!(
+            masked_code_button_label("验证码", "654321", true),
+            "验证码 ••••••"
+        );
     }
 }

@@ -273,3 +273,87 @@ fn alarms_fit_actual_width_and_weekly_standard_exposes_details() {
         }
     });
 }
+
+#[test]
+fn one_shot_evening_alarm_and_mon_wed_fri_repeating_alarm_never_falsely_show_expired() {
+    let gov = stepx_companion::home_hub::HomeReminderGovernanceStore::default();
+    let now_ms = 1_794_000_000_000i64;
+
+    // 1. Evening creation (21:30 = 1290 mins) of tomorrow morning's 07:30 one-shot alarm:
+    // Android schedules it for tomorrow morning — MUST show "明日响铃", NEVER "已过"!
+    let one_shot_tomorrow = PhoneAlarmItem {
+        id: 901,
+        hour: 7,
+        minutes: 30,
+        enabled: true,
+        days_of_week: 0,
+        message: "早起赶高铁".into(),
+        ..Default::default()
+    };
+    let status_evening = resolve_alarm_status(&one_shot_tomorrow, now_ms, 21 * 60 + 30, 0, &gov);
+    assert_eq!(
+        status_evening,
+        ResolvedAlarmStatus::Tomorrow {
+            diff_mins: 1440 + (7 * 60 + 30) - (21 * 60 + 30)
+        }
+    );
+    assert_eq!(status_evening.home_badge_label(), "明日响铃");
+    assert_ne!(status_evening.home_badge_label(), "已过");
+    assert!(status_evening.is_valid_active());
+
+    let monday = NaiveDate::from_ymd_opt(2026, 11, 9).unwrap();
+    let tuesday = NaiveDate::from_ymd_opt(2026, 11, 10).unwrap();
+    assert!(!home_alarm_on_date(&one_shot_tomorrow, monday, monday, 21 * 60 + 30));
+    assert!(home_alarm_on_date(&one_shot_tomorrow, tuesday, monday, 21 * 60 + 30));
+
+    // 2. Mon/Wed/Fri repeating alarm (days_of_week = 1 | 4 | 16 = 21) at 08:00:
+    let mwf_alarm = PhoneAlarmItem {
+        id: 902,
+        hour: 8,
+        minutes: 0,
+        enabled: true,
+        days_of_week: (1 << 0) | (1 << 2) | (1 << 4),
+        message: "晨跑锻炼".into(),
+        ..Default::default()
+    };
+
+    // Viewed on Tuesday morning (weekday_idx = 1, 09:00): next ring is Wednesday (offset = 1 -> "明日响铃")
+    let status_tue = resolve_alarm_status(&mwf_alarm, now_ms, 9 * 60, 1, &gov);
+    assert_eq!(
+        status_tue,
+        ResolvedAlarmStatus::Tomorrow {
+            diff_mins: 1440 + 8 * 60 - 9 * 60
+        }
+    );
+    assert_eq!(status_tue.home_badge_label(), "明日响铃");
+    assert_ne!(status_tue.home_badge_label(), "已过");
+    assert!(status_tue.is_valid_active());
+
+    // Viewed on Monday evening after today's 08:00 ring (weekday_idx = 0, 20:00):
+    // next ring is Wednesday (offset = 2, target_weekday = 2 -> "周三响铃"), NEVER "已过"!
+    let status_mon_evening = resolve_alarm_status(&mwf_alarm, now_ms, 20 * 60, 0, &gov);
+    assert_eq!(
+        status_mon_evening,
+        ResolvedAlarmStatus::FutureWeekday {
+            day_offset: 2,
+            target_weekday: 2,
+            diff_mins: 2 * 1440 + 8 * 60 - 20 * 60,
+        }
+    );
+    assert_eq!(status_mon_evening.home_badge_label(), "周三响铃");
+    assert_ne!(status_mon_evening.home_badge_label(), "已过");
+    assert!(status_mon_evening.is_valid_active());
+
+    // Viewed on Friday evening (weekday_idx = 4, 20:00): next ring is Monday (offset = 3 -> "周一响铃")
+    let status_fri_evening = resolve_alarm_status(&mwf_alarm, now_ms, 20 * 60, 4, &gov);
+    assert_eq!(status_fri_evening.home_badge_label(), "周一响铃");
+    assert!(status_fri_evening.is_valid_active());
+
+    // Disabled alarm is inactive ("未开启")
+    let mut disabled = one_shot_tomorrow.clone();
+    disabled.enabled = false;
+    let status_disabled = resolve_alarm_status(&disabled, now_ms, 21 * 60 + 30, 0, &gov);
+    assert_eq!(status_disabled, ResolvedAlarmStatus::Disabled);
+    assert_eq!(status_disabled.home_badge_label(), "未开启");
+    assert!(!status_disabled.is_valid_active());
+}

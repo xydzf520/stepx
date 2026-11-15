@@ -12,6 +12,7 @@ pub(crate) const POPUP_WIN_H_FULL_REPLY: f64 = 194.0;
 pub(crate) const POPUP_WIN_W: f64 = POPUP_WIN_W_FULL_REPLY;
 pub(crate) const POPUP_WIN_H_WIDGET: f64 = POPUP_WIN_H_FULL_REPLY;
 pub(crate) const POPUP_WIN_H_PLAIN: f64 = POPUP_WIN_H_BANNER;
+pub(crate) const REPLY_FOCUS_GRACE: std::time::Duration = std::time::Duration::from_millis(400);
 
 fn popup_editor_action(action: &Action) -> bool {
     matches!(
@@ -89,6 +90,7 @@ impl TypedActionView for DesktopPopupWindowView {
         if let Action::NotificationCenter(NotificationCenterAction::PopupHoverChanged(hovered)) = action {
             // Claim pointer ownership before an incoming snapshot can swap cards.
             let changed = owner.update(ctx, |view, owner_ctx| {
+                view.notification_center.last_dispatched_hover.set(Some(*hovered));
                 if view.notification_center.popup_hovered == *hovered { return false; }
                 view.notification_center.popup_hovered = *hovered;
                 if !hovered && view.tick_notification_popup_timer(0) { owner_ctx.notify(); }
@@ -161,6 +163,7 @@ impl TypedActionView for DesktopPopupWindowView {
             return;
         }
         let _ = self.tx.send(PopupAction { action: action.clone(), item_id, reply_draft: None });
+        owner.update(ctx, |_, owner_ctx| owner_ctx.notify());
         ctx.notify();
     }
 }
@@ -183,12 +186,15 @@ impl View for DesktopPopupWindowView {
         })
     }
 
-    fn on_window_closed(&mut self, _: &mut ViewContext<Self>) {
+    fn on_window_closed(&mut self, ctx: &mut ViewContext<Self>) {
         let _ = self.tx.send(PopupAction {
             action: Action::NotificationCenter(NotificationCenterAction::DismissPopup),
             item_id: None,
             reply_draft: None,
         });
+        if let Some(owner) = self.companion.upgrade(ctx) {
+            owner.update(ctx, |_, owner_ctx| owner_ctx.notify());
+        }
     }
 
     fn render(&self, app: &AppContext) -> El {
@@ -259,10 +265,16 @@ pub struct DesktopPopupController {
     window: Option<PopupWindowHandle>,
     pub(crate) main_window_active: bool,
     pub(crate) reply_focused: bool,
+    pub(crate) reply_focus_requested_at: Option<std::time::Instant>,
     pending_reply_item: Option<String>,
 }
 
 impl DesktopPopupController {
+    pub(crate) fn within_reply_focus_grace(&self, now: std::time::Instant) -> bool {
+        self.reply_focus_requested_at
+            .is_some_and(|at| now.saturating_duration_since(at) < REPLY_FOCUS_GRACE)
+    }
+
     pub fn is_created(&self) -> bool {
         self.window.is_some()
     }
@@ -307,6 +319,7 @@ impl Companion {
     fn take_popup_reply_draft(&mut self, item_id: &str) -> Option<String> {
         if !self.popup_editor_target_is_current(Some(item_id))
             || self.desktop_popup.pending_reply_item.is_some()
+            || self.notification_center.is_reply_sending(item_id)
             || !self.fields[F_TOAST_REPLY].preedit.is_empty()
             || self.fields[F_TOAST_REPLY].text.trim().is_empty()
         { return None; }
@@ -317,16 +330,30 @@ impl Companion {
         Some(draft)
     }
 
-    fn restore_popup_reply_draft(&mut self, item_id: &str, submitted: &str) {
+    pub(super) fn restore_popup_reply_draft(&mut self, item_id: &str, submitted: &str) {
+        if submitted.is_empty() {
+            return;
+        }
         if self.notification_center.popup_reply_item_id.as_deref() == Some(item_id) {
-            let field = &mut self.fields[F_TOAST_REPLY];
-            let prefix = if field.text.is_empty() { submitted.to_string() } else { format!("{submitted}\n") };
-            // Preserve text/IME typed after Enter, including its caret/selection.
-            field.text.insert_str(0, &prefix);
-            field.cursor += prefix.len();
-            field.anchor = field.anchor.map(|anchor| anchor + prefix.len());
+            let restored = {
+                let field = &mut self.fields[F_TOAST_REPLY];
+                if field.text != submitted {
+                    let prefix = if field.text.is_empty() { submitted.to_string() } else { format!("{submitted}\n") };
+                    // Preserve text/IME typed after Enter, including its caret/selection.
+                    field.text.insert_str(0, &prefix);
+                    field.cursor += prefix.len();
+                    field.anchor = field.anchor.map(|anchor| anchor + prefix.len());
+                }
+                field.text.clone()
+            };
+            self.notification_center
+                .popup_reply_drafts
+                .insert(item_id.to_string(), restored);
         } else {
             let next = self.notification_center.popup_reply_drafts.entry(item_id.to_string()).or_default();
+            if next == submitted {
+                return;
+            }
             *next = if next.is_empty() { submitted.to_string() } else { format!("{submitted}\n{next}") };
         }
     }
@@ -376,10 +403,12 @@ impl Companion {
                     field.anchor = None;
                 }
                 self.desktop_popup.reply_focused = true;
+                self.desktop_popup.reply_focus_requested_at = Some(std::time::Instant::now());
             }
             Action::InputPointer(F_TOAST_REPLY, position, extend, clicks) => {
                 self.fields[F_TOAST_REPLY].place_pointer(*position, *extend, *clicks);
                 self.desktop_popup.reply_focused = true;
+                self.desktop_popup.reply_focus_requested_at = Some(std::time::Instant::now());
             }
             Action::InputPointerUp => self.fields[F_TOAST_REPLY].dragging = false,
             Action::ExtendSelection(direction) if self.desktop_popup.reply_focused => {
@@ -436,14 +465,22 @@ impl Companion {
         }
         // Clicking back into another window ends an empty reply session. A
         // stale editor flag must not pin an old card over later verification codes.
-        if self.desktop_popup.reply_focused && self.fields[F_TOAST_REPLY].preedit.is_empty() {
+        if self.desktop_popup.reply_focused
+            && self.fields[F_TOAST_REPLY].preedit.is_empty()
+            && !self
+                .desktop_popup
+                .within_reply_focus_grace(std::time::Instant::now())
+        {
             let unfocused = self.desktop_popup.window.as_ref().is_some_and(|popup| {
                 #[cfg(any(target_os = "linux", target_os = "windows"))]
                 { facloud_ui::windowing::winit::winit_window_for_id(ctx, popup.id).is_some_and(|window| !window.has_focus()) }
                 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
                 { ctx.windows().active_window() != Some(popup.id) }
             });
-            if unfocused { self.desktop_popup.reply_focused = false; }
+            if unfocused {
+                self.desktop_popup.reply_focused = false;
+                self.desktop_popup.reply_focus_requested_at = None;
+            }
         }
         let pending_actions: Vec<PopupAction> = self
             .desktop_popup
@@ -601,8 +638,24 @@ impl Companion {
         });
     }
 
-    pub(crate) fn close_desktop_popup_window(&mut self, ctx: &mut ViewContext<Self>) {
+    pub(crate) fn clear_popup_window_transient_state(&mut self) {
+        if let Some(reply_id) = self.notification_center.popup_reply_item_id.as_ref() {
+            if !self.fields[F_TOAST_REPLY].text.trim().is_empty() {
+                self.notification_center
+                    .popup_reply_drafts
+                    .insert(reply_id.clone(), self.fields[F_TOAST_REPLY].text.clone());
+            }
+        }
         self.notification_center.popup_hovered = false;
+        self.notification_center.popup_menu_item_id = None;
+        self.notification_center.reset_hover_dispatch_cache();
+        self.desktop_popup.reply_focused = false;
+        self.desktop_popup.reply_focus_requested_at = None;
+        self.desktop_popup.pending_reply_item = None;
+    }
+
+    pub(crate) fn close_desktop_popup_window(&mut self, ctx: &mut ViewContext<Self>) {
+        self.clear_popup_window_transient_state();
         if let Some(mut handle) = self.desktop_popup.window.take() {
             if handle.visible {
                 ctx.windows().hide_window(handle.id);
@@ -1062,9 +1115,44 @@ mod tests {
             time_label: "刚刚".into(),
             sort_ts_ms: 123,
             unread: true,
+            can_inline_reply: false,
             status_tag: None,
             primary_action: None,
         }
+    }
+
+    #[test]
+    fn reply_focus_grace_and_close_transient_cleanup_preserve_drafts() {
+        let mut app = Companion::new_for_test();
+        let now = std::time::Instant::now();
+        app.desktop_popup.reply_focused = true;
+        app.desktop_popup.reply_focus_requested_at = Some(now);
+        assert!(app
+            .desktop_popup
+            .within_reply_focus_grace(now + std::time::Duration::from_millis(150)));
+        assert!(!app
+            .desktop_popup
+            .within_reply_focus_grace(now + std::time::Duration::from_millis(450)));
+
+        app.notification_center.popup_hovered = true;
+        app.notification_center.popup_menu_item_id = Some("desktop-popup-test".into());
+        app.notification_center.popup_reply_item_id = Some("desktop-popup-test".into());
+        app.desktop_popup.pending_reply_item = Some("desktop-popup-test".into());
+        app.fields[F_TOAST_REPLY].set("未发出的回复草稿");
+
+        app.clear_popup_window_transient_state();
+        assert!(!app.notification_center.popup_hovered);
+        assert!(app.notification_center.popup_menu_item_id.is_none());
+        assert!(!app.desktop_popup.reply_focused);
+        assert!(app.desktop_popup.reply_focus_requested_at.is_none());
+        assert!(app.desktop_popup.pending_reply_item.is_none());
+        assert_eq!(
+            app.notification_center
+                .popup_reply_drafts
+                .get("desktop-popup-test")
+                .map(String::as_str),
+            Some("未发出的回复草稿")
+        );
     }
 
     #[test]

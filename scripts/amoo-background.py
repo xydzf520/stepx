@@ -18,6 +18,10 @@ import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / 'scripts') not in sys.path:
+    sys.path.insert(0, str(ROOT / 'scripts'))
+from host_runtime import migrate_legacy_state, optional_tool_home, user_state_root
+from source_integrity import read_python_source
 spec = importlib.util.spec_from_file_location('companion_permissions', ROOT / 'scripts/companion-permissions.py')
 permissions = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(permissions)
@@ -29,7 +33,22 @@ ALLOWED_AGENTBUS_SHA256S = (
     'e89a65e1a153e87fdec850caffe9a19db4ed70244754e847e0c512c540a902f8',
 )
 SOCKET = 'stepx-amoo-lease-v1'
-STATE = Path(os.environ.get('XDG_STATE_HOME', Path.home() / '.local/state')) / 'stepx-companion/amoo-background'
+_DEFAULT_STATE = user_state_root() / 'amoo-background'
+STATE = _DEFAULT_STATE
+
+
+def _ensure_state_dir():
+    if STATE == _DEFAULT_STATE and not os.environ.get('STEPX_STATE_DIR') and not STATE.exists():
+        home = optional_tool_home()
+        if home is not None:
+            legacy_base = Path(os.environ.get('XDG_STATE_HOME') or (home / '.local/state'))
+            legacy = legacy_base / 'stepx-companion/amoo-background'
+            if legacy != STATE and legacy.exists():
+                migrate_legacy_state(legacy, STATE)
+    STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name != 'nt':
+        STATE.chmod(0o700)
+    return STATE
 
 
 def process_identity():
@@ -81,7 +100,7 @@ def preflight(apk):
 
 
 def build_worker(dex, cert, uid, identity):
-    source = (permissions.WORKFLOW / 'module/inject.py').read_text()
+    source = read_python_source(permissions.WORKFLOW / 'module/inject.py').decode('utf-8')
     if hashlib.sha256(source.encode()).hexdigest() != permissions.LOADER_SHA256:
         raise RuntimeError('Audited native loader changed; review required')
     source, count = re.subn(r'dex=base64\.b64decode\([^\n]+?\);dexp=',
@@ -123,11 +142,11 @@ LEASE_APK_SHA256={identity.get('agentbus_sha256', AGENTBUS_SHA256)!r}
 
 
 def save(path, value):
-    STATE.mkdir(parents=True, exist_ok=True, mode=0o700); STATE.chmod(0o700)
+    _ensure_state_dir()
     temporary = path.with_suffix('.new')
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, 'w') as stream:
-        json.dump(value, stream, indent=2); stream.flush(); os.fsync(stream.fileno())
+    with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+        json.dump(value, stream, ensure_ascii=False, indent=2); stream.flush(); os.fsync(stream.fileno())
     os.replace(temporary, path)
 
 
@@ -136,6 +155,7 @@ def apply(apk, retry_reviewed=False):
     if result['installed']:
         # Do not inject another arena, change signing policy, or refresh a task lease.
         return {**result, 'status': 'already_present', 'injected': False}
+    _ensure_state_dir()
     key = hashlib.sha256((result['boot_id'] + ':' + str(result['pid']) + ':' + result['start_ticks']).encode()).hexdigest()[:24]
     record = STATE / (key + '.json')
     if record.exists() and not retry_reviewed:

@@ -438,19 +438,24 @@ impl Companion {
                 vec![Action::BackScreen(BackScreenAction::GalleryNextPhoto)],
                 false,
             ),
-            self.button_icon(
-                format!("{id_prefix}-rot"),
-                if rot_deg > 0 {
-                    format!("旋转 90° ({rot_deg}°)")
-                } else {
-                    "旋转 90°".into()
-                },
-                UiIcon::Refresh,
-                Action::BackScreen(BackScreenAction::GalleryRotateRight(
-                    item.remote_path.clone(),
-                )),
-                Btn::Secondary,
-            ),
+            if self.back_screen.gallery_rotating_path.as_deref() == Some(item.remote_path.as_str())
+            {
+                self.disabled_button("旋转中…")
+            } else {
+                self.button_icon(
+                    format!("{id_prefix}-rot"),
+                    if rot_deg > 0 {
+                        format!("旋转 90° ({rot_deg}°)")
+                    } else {
+                        "旋转 90°".into()
+                    },
+                    UiIcon::Refresh,
+                    Action::BackScreen(BackScreenAction::GalleryRotateRight(
+                        item.remote_path.clone(),
+                    )),
+                    Btn::Secondary,
+                )
+            },
         ];
         if rot_deg > 0 {
             nav_controls.push(self.button_icon(

@@ -1,12 +1,13 @@
 """Version retention and interrupted GMS installation, without phone writes."""
-import importlib.util,json,sys,tempfile,unittest
+import contextlib,importlib.util,json,sys,tempfile,unittest
 from pathlib import Path
 from unittest.mock import patch
 ROOT=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT/'scripts'))
 sys.path.insert(0,str(ROOT/'handoff/google-play-stepx/tools'))
 from companion_apk import installation_choice,PACKAGE
-import common
+import common,install_recovery
+from workflow_errors import WorkflowError
 spec=importlib.util.spec_from_file_location('lifecycle_manage',ROOT/'handoff/google-play-stepx/tools/manage.py')
 manage=importlib.util.module_from_spec(spec);spec.loader.exec_module(manage)
 
@@ -29,7 +30,7 @@ class InstallLifecycle(unittest.TestCase):
         (p/'baseline.json').write_text(json.dumps({'serial':'phone1','fingerprint':manage.CONFIG['fingerprint'],'packages':[]}))
         (p/'install-progress.json').write_text(json.dumps({'serial':'phone1','fingerprint':manage.CONFIG['fingerprint'],'completed':[]}))
     def test_only_owned_incomplete_transaction_can_resume(self):
-        with tempfile.TemporaryDirectory() as tmp,patch.object(manage,'DEVICE_KEY','phone1'),patch.object(manage,'baseline_matches',side_effect=lambda b:b['serial']=='phone1'):
+        with tempfile.TemporaryDirectory() as tmp,patch.object(manage,'DEVICE_KEY','phone1'),patch.object(manage,'baseline_matches',side_effect=lambda b:b['serial']=='phone1'),patch.object(manage,'verified_fingerprint',return_value=manage.CONFIG['fingerprint']):
             p=Path(tmp)
             with patch.object(manage,'STATE',p):
                 self.assertFalse(manage.resumable_install());self.fixture(p);self.assertTrue(manage.resumable_install())
@@ -37,11 +38,12 @@ class InstallLifecycle(unittest.TestCase):
     def test_prepare_retry_keeps_original_backup(self):
         with tempfile.TemporaryDirectory() as tmp:
             p=Path(tmp);self.fixture(p);original=(p/'baseline.json').read_bytes()
-            with patch.object(manage,'STATE',p),patch.object(manage,'preflight',return_value={'user_unlocked':True}),patch.object(manage,'resumable_install',return_value=True),patch.object(manage,'sha256',return_value=manage.CONFIG['stock_sha256']),patch.object(manage,'root_json') as root:
+            with patch.object(manage,'STATE',p),patch.object(manage,'preflight',return_value={'user_unlocked':True,'fingerprint':manage.CONFIG['fingerprint'],'google_packages':{}}),patch.object(manage,'resumable_install',return_value=True),patch.object(manage,'sha256',return_value=manage.CONFIG['stock_sha256']),patch.object(manage,'root_json') as root:
                 manage.prepare();self.assertEqual((p/'baseline.json').read_bytes(),original);root.assert_not_called()
     def test_partial_install_skips_exact_existing_apks(self):
         existing=manage.PACKAGES[0];installed=[]
         def shell(*a):
+            if a[:4]==('pm','list','packages','--user') and len(a)==5:return 'package:'+existing
             if a[:3]==('pm','list','packages'):return 'package:'+existing if a[-1]==existing else ''
             if a[:2]==('pm','path'):return 'package:/data/app/'+a[-1]+'/base.apk'
             if a[0]=='sha256sum':return next(v['sha256'] for v in manage.CONFIG['apks'] if v['package'] in a[1])+'  base.apk'
@@ -50,18 +52,25 @@ class InstallLifecycle(unittest.TestCase):
             installed.append(a);return type('Result',(),{'stdout':'Success'})()
         with tempfile.TemporaryDirectory() as tmp:
             p=Path(tmp);self.fixture(p)
-            with patch.object(manage,'STATE',p),patch.object(manage,'guard'),patch.object(manage,'baseline_matches',return_value=True),patch.object(manage,'resumable_install',return_value=True),patch.object(manage,'check_apks'),patch.object(manage,'shell',side_effect=shell),patch.object(manage,'run',side_effect=run),patch.object(manage,'save_json'):
+            with patch.object(manage,'STATE',p),patch.object(install_recovery,'STATE',p),patch.object(manage,'DEVICE_KEY','phone1'),patch.object(manage,'guard'),patch.object(manage,'baseline_matches',return_value=True),patch.object(manage,'verified_fingerprint',return_value=manage.CONFIG['fingerprint']),patch.object(manage,'resumable_install',return_value=True),patch.object(manage,'check_apks'),patch.object(manage,'temporary_install_gate',side_effect=lambda _pkg:contextlib.nullcontext()),patch.object(manage,'shell',side_effect=shell),patch.object(install_recovery,'shell',side_effect=shell),patch.object(manage,'run',side_effect=run),patch.object(manage,'save_json'):
                 manage.install_apks()
             self.assertEqual(len(installed),2)
             self.assertTrue(all('-r' not in a for a in installed))
     def test_foreign_partial_apk_never_overwritten(self):
+        existing=manage.PACKAGES[0]
         with tempfile.TemporaryDirectory() as tmp:
             p=Path(tmp);self.fixture(p)
+            foreign_hash='b'*64
             def shell(*a):
-                if a[0]=='sha256sum':return 'unknownhash base.apk'
-                if a[:2]==('pm','path'):return 'package:/data/app/pkg/base.apk'
-                return 'package:present'
-            with patch.object(manage,'STATE',p),patch.object(manage,'guard'),patch.object(manage,'baseline_matches',return_value=True),patch.object(manage,'resumable_install',return_value=True),patch.object(manage,'check_apks'),patch.object(manage,'shell',side_effect=shell),patch.object(manage,'run') as run:
-                with self.assertRaisesRegex(AssertionError,'版本不同'):manage.install_apks()
+                if a[:4]==('pm','list','packages','--user') and len(a)==5:return 'package:'+existing
+                if a[:3]==('pm','list','packages'):return 'package:'+existing if a[-1]==existing else ''
+                if a[0]=='sha256sum':return foreign_hash+'  base.apk'
+                if a[:2]==('pm','path'):return 'package:/data/app/'+existing+'/base.apk'
+                return ''
+            def verify_run(a,**kw):
+                return type('Result',(),{'stdout':''})()
+            with patch.object(manage,'STATE',p),patch.object(install_recovery,'STATE',p),patch.object(manage,'DEVICE_KEY','phone1'),patch.object(manage,'guard'),patch.object(manage,'baseline_matches',return_value=True),patch.object(manage,'verified_fingerprint',return_value=manage.CONFIG['fingerprint']),patch.object(manage,'resumable_install',return_value=True),patch.object(manage,'check_apks'),patch.object(manage,'shell',side_effect=shell),patch.object(install_recovery,'shell',side_effect=shell),patch.object(install_recovery,'sha256',return_value=foreign_hash),patch.object(install_recovery,'sdk_command',return_value=['apksigner']),patch.object(install_recovery,'run',side_effect=verify_run),patch.object(manage,'run') as run:
+                with self.assertRaises(WorkflowError) as ctx:manage.install_apks()
+                self.assertEqual(ctx.exception.code,'untrusted_package')
                 run.assert_not_called()
 if __name__=='__main__':unittest.main()

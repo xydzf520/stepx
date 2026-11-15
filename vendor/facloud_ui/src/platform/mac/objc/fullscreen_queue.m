@@ -40,10 +40,10 @@
     }
 
     if ([fullscreenQueue count] > 0) {
-        NSWindow *window = fullscreenQueue.firstObject;
+        NSWindow *window = [[fullscreenQueue.firstObject retain] autorelease];
         [fullscreenQueue removeObjectAtIndex:0];
 
-        [window performSelector:@selector(toggleFullScreen:)];
+        [window toggleFullScreen:nil];
     }
 }
 

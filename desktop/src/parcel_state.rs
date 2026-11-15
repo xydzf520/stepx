@@ -7,7 +7,10 @@ use crate::{
     sms::Message,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+
+const ACTIVE_CODE_WINDOW_MS: i64 = 7 * 86_400_000;
+const COMPLETED_RETENTION_MS: i64 = 90 * 86_400_000;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompletionIndex {
@@ -48,6 +51,12 @@ impl CompletionIndex {
                     .entry(signal.id.clone())
                     .and_modify(|old| *old = (*old).max((signal.stage, signal.at)))
                     .or_insert((signal.stage, signal.at));
+                if let Some(prev_id) = &signal.prev_day_tail_id {
+                    self.capsule_receipts
+                        .entry(prev_id.clone())
+                        .and_modify(|old| *old = (*old).max((signal.stage, signal.at)))
+                        .or_insert((signal.stage, signal.at));
+                }
             }
         }
     }
@@ -134,45 +143,142 @@ impl CompletionIndex {
             }
         }
         let mut index = previous.clone();
-        let mut bindings: BTreeMap<String, (BTreeSet<String>, i64)> = BTreeMap::new();
-        for (keys, at, _) in &events {
-            if let Some(code) = keys.iter().find(|k| k.starts_with("code:")) {
-                for tracking in keys.iter().filter(|k| k.starts_with("parcel:")) {
-                    let binding = bindings.entry(code.clone()).or_default();
-                    binding.0.insert(tracking.clone());
-                    binding.1 = binding.1.max(*at);
-                }
-            }
-        }
-        for (code, (tracking, at)) in bindings {
-            if tracking.len() > 1 {
-                index.ambiguous_codes.insert(code, at);
-            }
-        }
-        // Shelf codes are not globally unique. An ambiguous code must not close
-        // two distinct waybills; an exact waybill receipt can still close its own.
-        for code in index.ambiguous_codes.keys() {
-            index.completed.remove(code);
-        }
+        // Record explicit waybill completions first so already-completed waybills never
+        // make a reused locker/shelf slot appear ambiguous for a newer parcel arrival.
         for (keys, at, terminal) in &events {
             if *terminal {
-                for key in keys {
+                for key in keys.iter().filter(|k| k.starts_with("parcel:")) {
                     index.record(key.clone(), *at);
                 }
             }
         }
+
+        // Process events chronologically (arrivals before terminal receipts at identical ms)
+        // and track active uncompleted waybills per pickup code within a 7-day window.
+        let mut sorted_events = events.clone();
+        sorted_events.sort_by_key(|(_, at, terminal)| (*at, *terminal));
+
+        let mut active_waybills_by_code: BTreeMap<String, BTreeMap<String, i64>> = BTreeMap::new();
+        let prune_active_for_code =
+            |code: &str,
+             ref_at: i64,
+             active_map: &mut BTreeMap<String, BTreeMap<String, i64>>,
+             completed: &BTreeMap<String, i64>| {
+                if let Some(waybills) = active_map.get_mut(code) {
+                    waybills.retain(|parcel_key, arr_at| {
+                        let within_window = ref_at.saturating_sub(*arr_at) <= ACTIVE_CODE_WINDOW_MS;
+                        let completed_before_ref = completed
+                            .get(parcel_key)
+                            .is_some_and(|done| *done >= *arr_at && *done < ref_at);
+                        within_window && !completed_before_ref
+                    });
+                }
+            };
+
+        for (keys, at, terminal) in &sorted_events {
+            let codes: Vec<&String> = keys.iter().filter(|k| k.starts_with("code:")).collect();
+            let parcels: Vec<&String> = keys.iter().filter(|k| k.starts_with("parcel:")).collect();
+            if !*terminal {
+                for code in codes {
+                    prune_active_for_code(
+                        code,
+                        *at,
+                        &mut active_waybills_by_code,
+                        &index.completed,
+                    );
+                    if !parcels.is_empty() {
+                        let entry = active_waybills_by_code.entry(code.clone()).or_default();
+                        for parcel in &parcels {
+                            entry
+                                .entry((*parcel).clone())
+                                .and_modify(|old| *old = (*old).max(*at))
+                                .or_insert(*at);
+                        }
+                        if entry.len() > 1 {
+                            index.ambiguous_codes.insert(code.clone(), *at);
+                            index.completed.remove(code);
+                        } else if index
+                            .ambiguous_codes
+                            .get(code)
+                            .is_some_and(|amb_at| *amb_at < *at)
+                        {
+                            // Older waybills sharing `code` were completed or aged out; rebind cleanly.
+                            index.ambiguous_codes.remove(code);
+                        }
+                    } else if active_waybills_by_code
+                        .get(code)
+                        .is_none_or(|m| m.is_empty())
+                        && index
+                            .ambiguous_codes
+                            .get(code)
+                            .is_some_and(|amb_at| *amb_at < *at)
+                    {
+                        index.ambiguous_codes.remove(code);
+                    }
+                }
+            } else {
+                for parcel in &parcels {
+                    index.record((*parcel).clone(), *at);
+                }
+                for code in codes {
+                    prune_active_for_code(
+                        code,
+                        *at,
+                        &mut active_waybills_by_code,
+                        &index.completed,
+                    );
+                    let active_len = active_waybills_by_code.get(code).map_or(0, |m| m.len());
+                    if active_len <= 1
+                        && index.ambiguous_codes.get(code).is_some_and(|amb_at| {
+                            at.saturating_sub(*amb_at) > ACTIVE_CODE_WINDOW_MS
+                        })
+                    {
+                        index.ambiguous_codes.remove(code);
+                    }
+                    index.record(code.clone(), *at);
+                    if !index.ambiguous_codes.contains_key(code) {
+                        if let Some(waybills) = active_waybills_by_code.get_mut(code) {
+                            if waybills.len() == 1 {
+                                if let Some((sole_parcel, arr_at)) =
+                                    waybills.iter().next().map(|(k, v)| (k.clone(), *v))
+                                {
+                                    if arr_at <= *at {
+                                        index.record(sole_parcel, *at);
+                                        waybills.clear();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(max_at) = sorted_events.last().map(|(_, at, _)| *at) {
+            index.ambiguous_codes.retain(|code, amb_at| {
+                max_at.saturating_sub(*amb_at) <= ACTIVE_CODE_WINDOW_MS
+                    || active_waybills_by_code.get(code).map_or(0, |m| m.len()) > 1
+            });
+        }
+
+        // Shelf codes are not globally unique. An ambiguous code must not close
+        // two distinct active waybills; an exact waybill receipt can still close its own.
+        for code in index.ambiguous_codes.keys() {
+            index.completed.remove(code);
+        }
         // A pickup notice can bind a code to an actual waybill. A subsequent waybill
-        // receipt then closes the code too; neither app name nor sender is an identity.
+        // receipt (including one persisted across restart) closes the non-ambiguous code too.
         for (keys, at, terminal) in &events {
             if !terminal {
-                let receipt = keys
+                let parcel_receipt = keys
                     .iter()
+                    .filter(|k| k.starts_with("parcel:"))
                     .filter_map(|k| index.completed.get(k).copied())
                     .filter(|done| *done >= *at)
                     .max();
-                if let Some(done) = receipt {
-                    for key in keys {
-                        index.record(key.clone(), done);
+                if let Some(done) = parcel_receipt {
+                    for code in keys.iter().filter(|k| k.starts_with("code:")) {
+                        index.record(code.clone(), done);
                     }
                 }
             }
@@ -191,19 +297,32 @@ impl CompletionIndex {
     }
 
     pub fn merge(&mut self, other: &Self, now_ms: i64) {
+        let amb_cutoff = now_ms.saturating_sub(ACTIVE_CODE_WINDOW_MS);
         for (code, at) in &other.ambiguous_codes {
-            self.ambiguous_codes.insert(code.clone(), *at);
-            self.completed.remove(code);
+            if *at >= amb_cutoff && !self.completed.get(code).is_some_and(|done| *done > *at) {
+                self.ambiguous_codes
+                    .entry(code.clone())
+                    .and_modify(|old| *old = (*old).max(*at))
+                    .or_insert(*at);
+                self.completed.remove(code);
+            }
         }
         for (key, at) in &other.completed {
+            if key.starts_with("code:")
+                && self
+                    .ambiguous_codes
+                    .get(key)
+                    .is_some_and(|amb_at| *at > *amb_at && at.saturating_sub(*amb_at) > ACTIVE_CODE_WINDOW_MS)
+            {
+                self.ambiguous_codes.remove(key);
+            }
             self.record(key.clone(), *at);
         }
         // Keep terminal evidence much longer than pending reminder windows, even
         // when the original phone notification has left its history window.
         self.completed
-            .retain(|_, at| *at >= now_ms.saturating_sub(90 * 86_400_000));
-        self.ambiguous_codes
-            .retain(|_, at| *at >= now_ms.saturating_sub(90 * 86_400_000));
+            .retain(|_, at| *at >= now_ms.saturating_sub(COMPLETED_RETENTION_MS));
+        self.ambiguous_codes.retain(|_, at| *at >= amb_cutoff);
     }
 
     pub fn is_completed(&self, code: &str, tracking: &str, event_ms: i64) -> bool {
@@ -402,5 +521,79 @@ mod tests {
             home_hub::extract_live_express_parcels_with_receipts(&pending, &done, &[], "", &index);
         assert_eq!(parcels.len(), 1);
         assert_eq!(parcels[0].tracking_no, "ZTO123456789012");
+    }
+
+    #[test]
+    fn reused_shelf_slot_from_last_week_does_not_poison_code_only_completion_today() {
+        let now = chrono::Utc::now().timestamp_millis();
+        let last_week = now - 8 * 86_400_000;
+        let today_arrival = now - 120_000;
+
+        // Last week: parcel SF111 arrived on shelf 3-1-1002 and was picked up (even after colliding last week)
+        let messages = vec![
+            sms(
+                "【菜鸟驿站】顺丰快件SF1628890000111已到站，凭取件码 3-1-1002 取件",
+                last_week,
+            ),
+            sms(
+                "【菜鸟驿站】圆通包裹YT2200112233445已到站，凭取件码 3-1-1002 取件",
+                last_week + 10_000,
+            ),
+            sms(
+                "【菜鸟驿站】顺丰快件SF1628890000111已取出",
+                last_week + 300_000,
+            ),
+            sms(
+                "【菜鸟驿站】圆通包裹YT2200112233445已取出",
+                last_week + 360_000,
+            ),
+            // Today: new parcel ZTO arrives on reused shelf slot 3-1-1002
+            sms(
+                "【菜鸟驿站】中通包裹ZTO987654321098已到站，请凭取件码 3-1-1002 及时取件",
+                today_arrival,
+            ),
+        ];
+
+        // Before pickup today: today's ZTO parcel must be active (not falsely closed by last week)
+        let before_pickup = CompletionIndex::collect(&messages, &[], &[]);
+        assert!(!before_pickup.is_completed("3-1-1002", "ZTO987654321098", today_arrival));
+
+        // Now user picks up today's parcel and receives a code-only completion SMS
+        let mut after_messages = messages.clone();
+        after_messages.push(sms("【菜鸟驿站】取件码 3-1-1002 已取件", now));
+
+        let after_pickup = CompletionIndex::collect(&after_messages, &[], &[]);
+        assert!(
+            after_pickup.is_completed("3-1-1002", "ZTO987654321098", today_arrival),
+            "Shelf slot 3-1-1002 picked up last week must not block code-only completion SMS today"
+        );
+        assert!(home_hub::extract_live_express_parcels_with_receipts(
+            &after_messages,
+            &[],
+            &[],
+            "",
+            &after_pickup,
+        )
+        .is_empty());
+
+        // Same-week sequential reuse (completed 2 days ago via code-only SMS, reused today) also works
+        let two_days_ago = now - 2 * 86_400_000;
+        let sequential_reuse = vec![
+            sms(
+                "【菜鸟驿站】韵达包裹YD1234567890123已到站，取件码 3-1-1002",
+                two_days_ago,
+            ),
+            sms(
+                "【菜鸟驿站】取件码 3-1-1002 已取件",
+                two_days_ago + 1_800_000,
+            ),
+            sms(
+                "【菜鸟驿站】极兔包裹JT7654321098765已到站，取件码 3-1-1002",
+                today_arrival,
+            ),
+            sms("【菜鸟驿站】取件码 3-1-1002 已取件", now),
+        ];
+        let seq_index = CompletionIndex::collect(&sequential_reuse, &[], &[]);
+        assert!(seq_index.is_completed("3-1-1002", "JT7654321098765", today_arrival));
     }
 }

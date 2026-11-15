@@ -7,7 +7,7 @@ use facloud_ui_core::{keymap::Keystroke, Event};
 
 use cocoa::{
     appkit::{NSEvent, NSEventModifierFlags, NSEventType},
-    base::{id, YES},
+    base::{id, nil, YES},
     foundation::NSString,
 };
 use pathfinder_geometry::vector::vec2f;
@@ -49,6 +49,9 @@ pub unsafe fn from_native(
     window_height: Option<f32>,
     is_first_mouse: bool,
 ) -> Option<Event> {
+    if native_event == nil {
+        return None;
+    }
     let event_type = native_event.eventType();
 
     // Filter out event types that aren't in the NSEventType enum.
@@ -76,13 +79,23 @@ pub unsafe fn from_native(
                 right_alt: (native_modifiers.bits() & RIGHT_ALT_MASK) != 0,
                 key_without_modifiers,
             };
-            let unmodified_chars = native_event.charactersIgnoringModifiers();
-            let unmodified_chars = CStr::from_ptr(unmodified_chars.UTF8String() as *mut c_char)
+            let unmodified_nsstr = native_event.charactersIgnoringModifiers();
+            if unmodified_nsstr == nil {
+                return None;
+            }
+            let unmodified_ptr = unmodified_nsstr.UTF8String();
+            if unmodified_ptr.is_null() {
+                return None;
+            }
+            let unmodified_chars = CStr::from_ptr(unmodified_ptr as *const c_char)
                 .to_str()
                 .ok()?;
 
             let unmodified_chars = if let Some(first_char) = unmodified_chars.chars().next() {
-                unicode_char_to_key(first_char as u16).unwrap_or(unmodified_chars)
+                u16::try_from(u32::from(first_char))
+                    .ok()
+                    .and_then(unicode_char_to_key)
+                    .unwrap_or(unmodified_chars)
             } else {
                 return None;
             };
@@ -96,7 +109,12 @@ pub unsafe fn from_native(
                 key: unmodified_chars.into(),
             };
 
-            let chars = native_event.characters().UTF8String() as *mut c_char;
+            let raw_chars = native_event.characters();
+            let chars = if raw_chars == nil {
+                std::ptr::null()
+            } else {
+                raw_chars.UTF8String() as *const c_char
+            };
             let chars = if chars.is_null() {
                 // `UTF8String` can return null in some rare cases where the
                 // string isn't valid UTF-8.  For example, if the user

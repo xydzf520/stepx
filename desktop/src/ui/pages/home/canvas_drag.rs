@@ -54,6 +54,17 @@ pub enum HomePointerOp {
     },
 }
 
+/// Pinned quick-reply target for `F_PUSH_REPLY` on `Page::Home` so newly arrived
+/// push notifications cannot hijack an active draft or focused composer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LockedHomeReplyTarget {
+    pub key: String,
+    pub thread_id: String,
+    pub package_name: String,
+    pub title: String,
+    pub device_serial: Option<String>,
+}
+
 /// Shared hit-rect and pointer-drag registry for `Page::Home` modules.
 #[derive(Clone, Debug, Default)]
 pub struct HomePointerRegistry {
@@ -79,6 +90,8 @@ pub struct HomePointerRegistry {
     pub viewport: Option<Vector2F>,
     pub canvas_width: Option<f32>,
     pub pointer_redraw_due: Option<std::time::Instant>,
+    pub locked_reply_target: Option<LockedHomeReplyTarget>,
+    pub last_rendered_reply_target: Option<LockedHomeReplyTarget>,
 }
 
 impl HomePointerRegistry {
@@ -396,6 +409,52 @@ impl facloud_ui::Element for HomeBoundsRecorder {
         app: &facloud_ui::AppContext,
     ) -> bool {
         self.child.dispatch_event(event, ctx, app)
+    }
+}
+
+/// Blocks pointer activation of inner module card buttons while Home layout
+/// edit / move / drag mode is active so dragging or rearranging cards never
+/// accidentally fires card actions.
+struct HomeEditBodyGuard {
+    child: El,
+}
+
+impl facloud_ui::Element for HomeEditBodyGuard {
+    fn layout(
+        &mut self,
+        constraint: SizeConstraint,
+        ctx: &mut LayoutContext,
+        app: &facloud_ui::AppContext,
+    ) -> Vector2F {
+        self.child.layout(constraint, ctx, app)
+    }
+
+    fn after_layout(&mut self, ctx: &mut AfterLayoutContext, app: &facloud_ui::AppContext) {
+        self.child.after_layout(ctx, app);
+    }
+
+    fn paint(&mut self, origin: Vector2F, ctx: &mut PaintContext, app: &facloud_ui::AppContext) {
+        self.child.paint(origin, ctx, app);
+    }
+
+    fn size(&self) -> Option<Vector2F> {
+        self.child.size()
+    }
+
+    fn origin(&self) -> Option<Point> {
+        self.child.origin()
+    }
+
+    fn dispatch_event(
+        &mut self,
+        event: &facloud_ui::event::DispatchedEvent,
+        ctx: &mut EventContext,
+        app: &facloud_ui::AppContext,
+    ) -> bool {
+        if matches!(event.raw_event(), facloud_ui::Event::ScrollWheel { .. }) {
+            return self.child.dispatch_event(event, ctx, app);
+        }
+        false
     }
 }
 
@@ -918,7 +977,6 @@ impl facloud_ui::Element for HomeEditAnimatedCard {
     }
 }
 
-
 impl Companion {
     pub(super) fn home_toolbar_weather_label(&self) -> String {
         if !self.weather_snapshot.from_live_api && !self.demo_mode {
@@ -933,7 +991,12 @@ impl Companion {
         let p = self.p();
         let layout = self.home_modules.preset.map(|preset| preset.label()).unwrap_or("自定义布局");
         let row_count = self.home_modules.pack_rows().len();
-        let capsules = self.collect_top_bar_live_capsules();
+        let now_ms = Local::now().timestamp_millis();
+        let capsules: Vec<_> = self
+            .collect_top_bar_live_capsules()
+            .into_iter()
+            .filter(|c| self.is_capsule_within_proximity(c, now_ms))
+            .collect();
         let total_caps = capsules.len();
         let live_caps = capsules
             .iter()
@@ -1265,7 +1328,8 @@ impl Companion {
             || self.home_pending_move.is_some()
             || self.home_drag_active();
         let card_stack = if show_ctrl_bar {
-            self.home_surface_stack(4., vec![ctrl_bar, body])
+            let guarded_body: El = Box::new(HomeEditBodyGuard { child: body });
+            self.home_surface_stack(4., vec![ctrl_bar, guarded_body])
         } else {
             body
         };
@@ -1787,6 +1851,110 @@ mod responsive_home_controls_tests {
                         }
                     });
                 }
+            }
+        });
+    }
+
+    #[test]
+    fn edit_mode_guards_inner_module_card_buttons_from_firing() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        struct GuardProbeView {
+            app: Companion,
+            edit_mode: bool,
+            clicks: Arc<AtomicUsize>,
+        }
+        impl facloud_ui::Entity for GuardProbeView {
+            type Event = ();
+        }
+        impl facloud_ui::TypedActionView for GuardProbeView {
+            type Action = ();
+        }
+        impl facloud_ui::View for GuardProbeView {
+            fn ui_name() -> &'static str {
+                "home_edit_body_guard_probe"
+            }
+            fn render(&self, _: &facloud_ui::AppContext) -> El {
+                let clicks = self.clicks.clone();
+                let inner_btn = SavePosition::new(
+                    Hoverable::new(self.app.mouse_state("probe-inner-card-btn"), |_| {
+                        Container::new(Empty::new().finish())
+                            .with_uniform_padding(16.)
+                            .finish()
+                    })
+                    .on_click(move |_, _, _| {
+                        clicks.fetch_add(1, Ordering::SeqCst);
+                    })
+                    .finish(),
+                    "probe-inner-card-btn-pos",
+                )
+                .finish();
+                let mut companion = Companion::new_for_test();
+                companion.home_module_edit_mode = self.edit_mode;
+                let wrapped = companion.wrap_module_with_edit_controls(
+                    HomeModuleId::CalendarPanorama,
+                    0,
+                    1,
+                    inner_btn,
+                );
+                Stack::new()
+                    .with_child(Align::new(wrapped).top_left().finish())
+                    .finish()
+            }
+        }
+
+        facloud_ui::App::test((), |mut app| async move {
+            for (edit_mode, expected_clicks) in [(false, 1usize), (true, 0usize)] {
+                let clicks = Arc::new(AtomicUsize::new(0));
+                let clicks_check = clicks.clone();
+                let (window, _) = app.add_window(
+                    facloud_ui::platform::WindowStyle::NotStealFocus,
+                    move |_| GuardProbeView {
+                        app: Companion::new_for_test(),
+                        edit_mode,
+                        clicks,
+                    },
+                );
+                let root = app.root_view_id(window).unwrap();
+                app.update(move |ctx| {
+                    let mut presenter = facloud_ui::Presenter::new(window);
+                    presenter.invalidate(
+                        facloud_ui::WindowInvalidation {
+                            updated: std::collections::HashSet::from([root]),
+                            ..Default::default()
+                        },
+                        ctx,
+                    );
+                    presenter.build_scene(vec2f(720., 600.), 1., None, ctx);
+                    let btn_rect = presenter
+                        .position_cache()
+                        .get_position("probe-inner-card-btn-pos")
+                        .expect("inner button rect");
+                    let center = btn_rect.origin() + btn_rect.size() * 0.5;
+                    presenter.dispatch_event(
+                        facloud_ui::Event::LeftMouseDown {
+                            position: center,
+                            modifiers: Default::default(),
+                            click_count: 1,
+                            is_first_mouse: false,
+                        },
+                        ctx,
+                    );
+                    presenter.dispatch_event(
+                        facloud_ui::Event::LeftMouseUp {
+                            position: center,
+                            modifiers: Default::default(),
+                        },
+                        ctx,
+                    );
+                    assert_eq!(
+                        clicks_check.load(Ordering::SeqCst),
+                        expected_clicks,
+                        "edit_mode={edit_mode} inner button click count mismatch"
+                    );
+                });
             }
         });
     }

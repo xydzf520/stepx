@@ -26,7 +26,6 @@ static TRANSFER_LOCK: Mutex<()> = Mutex::new(());
 const RESERVE: u64 = 128 * 1024 * 1024;
 const EXPANSION_SOCKET_NAME: &str = "localabstract:stepx_push_v1";
 const SOCKET_MISS_TTL: Duration = Duration::from_secs(15);
-const VERIFY_CACHE_TTL: Duration = Duration::from_secs(5);
 
 struct ExpansionForwardEntry {
     port: Option<u16>,
@@ -39,40 +38,26 @@ fn expansion_forward_cache() -> &'static Mutex<HashMap<String, ExpansionForwardE
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn device_verify_cache() -> &'static Mutex<HashMap<(PathBuf, String, String), Instant>> {
-    static CACHE: OnceLock<Mutex<HashMap<(PathBuf, String, String), Instant>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn verify_device_cached(adb: &Adb, d: &Device) -> Result<()> {
-    let key = (adb.path.clone(), d.transport.clone(), d.serial.clone());
-    if let Ok(guard) = device_verify_cache().lock() {
-        if let Some(ts) = guard.get(&key) {
-            if ts.elapsed() < VERIFY_CACHE_TTL {
-                return Ok(());
-            }
-        }
-    }
-    d.verify(adb)?;
-    if let Ok(mut guard) = device_verify_cache().lock() {
-        guard.insert(key, Instant::now());
-    }
-    Ok(())
-}
-
 fn obtain_expansion_port(adb: &Adb, serial: &str, force_refresh: bool) -> Result<(u16, bool)> {
-    if !force_refresh {
-        if let Ok(guard) = expansion_forward_cache().lock() {
-            if let Some(entry) = guard.get(serial) {
-                if let Some(port) = entry.port {
-                    if entry.updated_at.elapsed() <= Duration::from_secs(300) {
-                        return Ok((port, true));
-                    }
-                } else if entry.updated_at.elapsed() < SOCKET_MISS_TTL {
-                    anyhow::bail!("本地推送流连接不可用（冷却期内直接回退）");
+    let mut old_port_to_remove = None;
+    if let Ok(mut guard) = expansion_forward_cache().lock() {
+        if let Some(entry) = guard.get(serial) {
+            if let Some(port) = entry.port {
+                if !force_refresh && entry.updated_at.elapsed() <= Duration::from_secs(300) {
+                    return Ok((port, true));
                 }
+                old_port_to_remove = Some(port);
+                guard.remove(serial);
+            } else if !force_refresh && entry.updated_at.elapsed() < SOCKET_MISS_TTL {
+                anyhow::bail!("本地推送流连接不可用（冷却期内直接回退）");
             }
         }
+    }
+    if let Some(old_port) = old_port_to_remove {
+        let _ = adb.run_timeout(
+            &["-s", serial, "forward", "--remove", &format!("tcp:{old_port}")],
+            Duration::from_millis(800),
+        );
     }
     let out = adb.run_timeout(
         &["-s", serial, "forward", "tcp:0", EXPANSION_SOCKET_NAME],
@@ -82,35 +67,79 @@ fn obtain_expansion_port(adb: &Adb, serial: &str, force_refresh: bool) -> Result
         .lines()
         .find_map(|line| line.trim().parse::<u16>().ok())
         .context("无法解析 adb forward 分配的本地端口")?;
-    if let Ok(mut guard) = expansion_forward_cache().lock() {
-        guard.insert(
-            serial.to_string(),
-            ExpansionForwardEntry {
-                port: Some(port),
-                stream: None,
-                updated_at: Instant::now(),
-            },
+    let displaced_port = expansion_forward_cache()
+        .lock()
+        .ok()
+        .and_then(|mut guard| {
+            guard.insert(
+                serial.to_string(),
+                ExpansionForwardEntry {
+                    port: Some(port),
+                    stream: None,
+                    updated_at: Instant::now(),
+                },
+            )
+        })
+        .and_then(|entry| entry.port)
+        .filter(|&p| p != port);
+    if let Some(old_port) = displaced_port {
+        let _ = adb.run_timeout(
+            &["-s", serial, "forward", "--remove", &format!("tcp:{old_port}")],
+            Duration::from_millis(800),
         );
     }
     Ok((port, false))
 }
 
-fn mark_expansion_socket_unavailable(serial: &str) {
-    if let Ok(mut guard) = expansion_forward_cache().lock() {
-        guard.insert(
-            serial.to_string(),
-            ExpansionForwardEntry {
-                port: None,
-                stream: None,
-                updated_at: Instant::now(),
-            },
+fn mark_expansion_socket_unavailable_for_adb(adb: &Adb, serial: &str) {
+    let old_port = expansion_forward_cache()
+        .lock()
+        .ok()
+        .and_then(|mut guard| {
+            guard.insert(
+                serial.to_string(),
+                ExpansionForwardEntry {
+                    port: None,
+                    stream: None,
+                    updated_at: Instant::now(),
+                },
+            )
+        })
+        .and_then(|entry| entry.port);
+    if let Some(old_port) = old_port {
+        let _ = adb.run_timeout(
+            &["-s", serial, "forward", "--remove", &format!("tcp:{old_port}")],
+            Duration::from_millis(800),
         );
     }
 }
 
-fn invalidate_expansion_port(serial: &str) {
+#[allow(dead_code)]
+pub(crate) fn invalidate_expansion_port(serial: &str) {
     if let Ok(mut guard) = expansion_forward_cache().lock() {
         guard.remove(serial);
+    }
+}
+
+pub(crate) fn invalidate_expansion_port_for_adb(adb: &Adb, serial: &str) {
+    let old_port = expansion_forward_cache()
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.remove(serial))
+        .and_then(|entry| entry.port);
+    if let Some(old_port) = old_port {
+        let _ = adb.run_timeout(
+            &["-s", serial, "forward", "--remove", &format!("tcp:{old_port}")],
+            Duration::from_millis(800),
+        );
+    }
+}
+
+fn clear_expansion_socket_miss(serial: &str) {
+    if let Ok(mut guard) = expansion_forward_cache().lock() {
+        if guard.get(serial).is_some_and(|entry| entry.port.is_none()) {
+            guard.remove(serial);
+        }
     }
 }
 
@@ -200,9 +229,12 @@ fn sync_dir(p: &Path) -> Result<()> {
     Ok(())
 }
 pub fn valid_id(s: &str) -> bool {
-    s.len() == 32
+    (s.len() == 32 || s.len() == 64)
         && s.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+fn is_protected_vault_state(state: &str) -> bool {
+    matches!(state, "verified" | "phone_deleted" | "archived" | "restored")
 }
 fn strval<'a>(v: &'a Value, k: &str) -> &'a str {
     v[k].as_str().unwrap_or("")
@@ -268,7 +300,18 @@ fn data_name(j: &Value) -> String {
 }
 pub fn local_file(c: &Config, j: &Value) -> Result<PathBuf> {
     check_record(j)?;
-    let p = file_dir(c, strval(j, "id"))?.join(data_name(j));
+    let dir = file_dir(c, strval(j, "id"))?;
+    if j["source"] == "desktop_manual" {
+        if let Ok(name) = crate::storage::validate_entry_name(strval(j, "name")) {
+            let named = dir.join(name);
+            if fs::symlink_metadata(&named)
+                .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
+            {
+                return Ok(named);
+            }
+        }
+    }
+    let p = dir.join(data_name(j));
     ensure!(
         p.is_file() && !fs::symlink_metadata(&p)?.file_type().is_symlink(),
         "电脑原件不存在，请检查保存文件夹"
@@ -349,7 +392,7 @@ fn try_call_expansion_socket(
         let (port, from_cache) = match obtain_expansion_port(adb, serial, force_refresh) {
             Ok(res) => res,
             Err(e) => {
-                mark_expansion_socket_unavailable(serial);
+                mark_expansion_socket_unavailable_for_adb(adb, serial);
                 return Err(e);
             }
         };
@@ -387,10 +430,10 @@ fn try_call_expansion_socket(
             }
             Err(err) => {
                 if !from_cache || attempt == 1 {
-                    mark_expansion_socket_unavailable(serial);
+                    mark_expansion_socket_unavailable_for_adb(adb, serial);
                     return Err(err);
                 }
-                invalidate_expansion_port(serial);
+                invalidate_expansion_port_for_adb(adb, serial);
             }
         }
     }
@@ -458,11 +501,12 @@ pub fn call_provider(
         "{}",
         r["error"].as_str().unwrap_or("手机操作未完成")
     );
+    clear_expansion_socket_miss(serial);
     Ok(r)
 }
 
 pub fn phone_call(adb: &Adb, d: &Device, q: Value) -> Result<Value> {
-    verify_device_cached(adb, d)?;
+    let transport = d.resolve_active_transport(adb)?;
     let timeout = if matches!(
         q["op"].as_str(),
         Some(
@@ -474,7 +518,7 @@ pub fn phone_call(adb: &Adb, d: &Device, q: Value) -> Result<Value> {
         Duration::from_secs(600)
     };
     let arg_json = serde_json::to_string(&q)?;
-    call_provider(adb, &d.transport, "request", &arg_json, timeout)
+    call_provider(adb, &transport, "request", &arg_json, timeout)
 }
 pub fn offer(adb: &Adb, d: &Device, c: &Config) -> Result<Value> {
     let ready = c.folder.as_ref().is_some_and(|f| f.is_dir());
@@ -504,10 +548,11 @@ pub fn records(c: &Config) -> Result<Vec<Value>> {
             if let Ok(b) = fs::read(p) {
                 if let Ok(j) = serde_json::from_slice::<Value>(&b) {
                     if check_record(&j).is_ok() {
-                        if local_file(c, &j).is_err() && j["state"] != "archived" {
-                            let _ = fs::remove_dir_all(e.path());
-                        } else {
+                        let state = strval(&j, "state");
+                        if is_protected_vault_state(state) || local_file(c, &j).is_ok() {
                             rows.push(j);
+                        } else if state == "transferring" {
+                            let _ = fs::remove_dir_all(e.path());
                         }
                     }
                 }
@@ -571,15 +616,16 @@ fn migrate_cancellable(
             }
         }
         ensure!(
-            free_space(&dir)? > j["size"].as_u64().unwrap() + RESERVE,
+            free_space(&dir)? > j["size"].as_u64().context("扩容文件大小无效")? + RESERVE,
             "电脑空间不足，保留手机原件"
         );
         let tmp = tempfile::Builder::new()
             .prefix(".stepx-transfer-")
             .tempfile_in(&dir)?;
         progress("正在传输到电脑", &j);
+        let pull_transport = d.resolve_active_transport(adb)?;
         adb.transfer(
-            &d.transport,
+            &pull_transport,
             "pull",
             Path::new(&format!("/sdcard/{}", strval(&j, "path"))),
             tmp.path(),
@@ -593,7 +639,7 @@ fn migrate_cancellable(
     let mut receipt = j.clone();
     receipt["state"] = json!("verified");
     atomic_json(&dir.join("receipt.json"), &receipt)?;
-    progress("正在保留入口并释放空间", &j);
+    progress("正在保留入口并释放空间", &receipt);
     // A phone receipt is requested only after both the original and manifest are durable.
     ensure!(!stop.load(Ordering::Acquire), "设备已切换，手机原件保留");
     let staged=phone_call(adb,d,json!({"op":"commit","id":j["id"],"desktopId":desktop,"token":j["token"],"sha256":j["sha256"],"size":j["size"]}))?["file"].clone();
@@ -612,11 +658,15 @@ fn migrate_cancellable(
         // Revalidate on the phone immediately before unlink; never delete by a display name.
         let q = shell_quote(&cleanup);
         let hash = shell_quote(strval(&j, "sha256"));
-        let command=format!("test ! -L {q} && test -f {q} && h=$(sha256sum {q}) && test \"${{h%% *}}\" = {hash} && rm -- {q} && test ! -e {q}");
+        let command=format!("test ! -L {q} && test -f {q} && h=$(sha256sum {q}) && h=${{h#\\\\}} && test \"${{h%% *}}\" = {hash} && rm -- {q} && test ! -e {q}");
+        let cleanup_transport = d.resolve_active_transport(adb)?;
         adb.run_timeout(
-            &["-s", &d.transport, "shell", &command],
+            &["-s", &cleanup_transport, "shell", &command],
             Duration::from_secs(600),
         )?;
+        receipt["state"] = json!("phone_deleted");
+        atomic_json(&dir.join("receipt.json"), &receipt)?;
+        progress("正在完成归档确认", &receipt);
     }
     let mut result = phone_call(
         adb,
@@ -629,6 +679,157 @@ fn migrate_cancellable(
     progress("迁移完成", &result);
     Ok(result)
 }
+
+fn record_migration_failure(cfg: &Config, file: &Value, error_msg: &str) -> bool {
+    if !valid_id(strval(file, "id")) {
+        return false;
+    }
+    let mem_state = strval(file, "state");
+    let Ok(dir) = file_dir(cfg, strval(file, "id")) else {
+        return !matches!(mem_state, "phone_deleted" | "archived" | "restored");
+    };
+    let receipt_path = dir.join("receipt.json");
+    let existing_receipt = fs::read(&receipt_path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+    let disk_state = existing_receipt
+        .as_ref()
+        .map(|r| strval(r, "state"))
+        .unwrap_or("");
+    if is_protected_vault_state(disk_state) || is_protected_vault_state(mem_state) {
+        return !matches!(disk_state, "phone_deleted" | "archived" | "restored")
+            && !matches!(mem_state, "phone_deleted" | "archived" | "restored");
+    }
+    if local_file(cfg, file).is_ok() {
+        let mut failed = existing_receipt.unwrap_or_else(|| file.clone());
+        failed["state"] = json!("failed");
+        failed["error"] = json!(error_msg);
+        let _ = atomic_json(&receipt_path, &failed);
+    } else if disk_state.is_empty() || disk_state == "transferring" {
+        let _ = fs::remove_dir_all(dir);
+    }
+    true
+}
+
+pub fn import_local_files(cfg: &Config, paths: &[PathBuf]) -> Result<usize> {
+    let vault_root = vault(cfg)?;
+    let desktop = crate::companion_link::desktop_id()?;
+    let mut imported = 0usize;
+    for src in paths {
+        let meta = fs::symlink_metadata(src)
+            .with_context(|| format!("无法读取文件：{}", src.display()))?;
+        ensure!(
+            meta.is_file() && !meta.file_type().is_symlink(),
+            "仅支持归档普通文件：{}",
+            src.display()
+        );
+        let size = meta.len();
+        ensure!(
+            size > 0 && size <= 32 * 1024 * 1024 * 1024,
+            "文件为空或超过单文件 32 GB 上限：{}",
+            src.display()
+        );
+        let raw_name = src
+            .file_name()
+            .and_then(|s| s.to_str())
+            .context("文件名必须是 UTF-8")?;
+        let name = crate::storage::validate_entry_name(raw_name)?;
+        ensure!(!name.starts_with('.'), "不支持归档隐藏文件：{name}");
+
+        let sha = digest(src)?;
+        let id = crate::data_store::sha256(format!("desktop_manual:{sha}:{name}").as_bytes());
+        let ext = Path::new(name)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let (kind, rel_prefix) = if matches!(
+            ext.as_str(),
+            "jpg" | "jpeg" | "png" | "webp" | "gif" | "heic" | "bmp" | "dng"
+        ) {
+            ("photos", "DCIM/Camera")
+        } else if matches!(
+            ext.as_str(),
+            "mp4" | "mov" | "mkv" | "avi" | "webm" | "3gp" | "flv"
+        ) {
+            ("videos", "DCIM/Camera")
+        } else if matches!(
+            ext.as_str(),
+            "mp3" | "wav" | "flac" | "m4a" | "aac" | "ogg" | "opus" | "amr"
+        ) {
+            ("audio", "Documents")
+        } else {
+            ("documents", "Documents")
+        };
+
+        let dir = vault_root.join(&id);
+        safe_dir(&dir)?;
+        let target = dir.join(name);
+        let receipt_path = dir.join("receipt.json");
+        let mut newly_stored = false;
+
+        if fs::symlink_metadata(&target).is_ok() {
+            let existing_meta = fs::symlink_metadata(&target)?;
+            ensure!(
+                existing_meta.is_file() && !existing_meta.file_type().is_symlink(),
+                "扩容库已存在非普通文件项"
+            );
+            ensure!(
+                existing_meta.len() == size && digest(&target)? == sha,
+                "扩容库同名条目内容不一致，未覆盖现有文件"
+            );
+        } else {
+            ensure!(
+                free_space(&dir)? > size + RESERVE,
+                "电脑空间不足，未归档文件"
+            );
+            let mut tmp = tempfile::Builder::new()
+                .prefix(".stepx-import-")
+                .tempfile_in(&dir)?;
+            let copied = std::io::copy(&mut fs::File::open(src)?, tmp.as_file_mut())?;
+            ensure!(
+                copied == size && digest(tmp.path())? == sha,
+                "本地文件在归档期间发生变化，请重试"
+            );
+            tmp.as_file().sync_all()?;
+            tmp.persist_noclobber(&target)
+                .context("归档目标文件已存在，未覆盖")?;
+            sync_dir(&dir)?;
+            newly_stored = true;
+        }
+
+        if newly_stored || !receipt_path.exists() {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let mtime_ms = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(now_ms);
+            let receipt = json!({
+                "id": id,
+                "token": &id[..32],
+                "desktop": desktop,
+                "source": "desktop_manual",
+                "state": "archived",
+                "kind": kind,
+                "name": name,
+                "path": format!("{rel_prefix}/{name}"),
+                "sha256": sha,
+                "size": size,
+                "modified": mtime_ms,
+                "mtimeMs": mtime_ms,
+                "archivedAt": now_ms,
+                "archivedAtMs": now_ms,
+                "localPath": target.to_string_lossy().to_string(),
+            });
+            check_record(&receipt)?;
+            atomic_json(&receipt_path, &receipt)?;
+            imported += 1;
+        }
+    }
+    Ok(imported)
+}
 pub fn deliver(adb: &Adb, d: &Device, c: &Config, j: &Value) -> Result<Value> {
     check_record(j)?;
     let desktop = crate::companion_link::desktop_id()?;
@@ -638,7 +839,8 @@ pub fn deliver(adb: &Adb, d: &Device, c: &Config, j: &Value) -> Result<Value> {
     let id = strval(j, "id");
     let remote = strval(j, "incoming");
     ensure!(remote==format!("/storage/emulated/0/Android/data/com.stepx.companion.app/files/expansion-incoming/{id}/original.part"),"手机接收目录无效");
-    adb.transfer(&d.transport, "push", &file, Path::new(remote))?;
+    let transport = d.resolve_active_transport(adb)?;
+    adb.transfer(&transport, "push", &file, Path::new(remote))?;
     let mut r =
         phone_call(adb, d, json!({"op":"deliver","id":id,"desktopId":desktop}))?["file"].clone();
     r["phoneSerial"] = json!(d.serial);
@@ -785,6 +987,7 @@ pub enum Command {
     },
     Restore(String),
     Folder(PathBuf),
+    ImportLocalFiles(Vec<PathBuf>),
 }
 pub struct Worker {
     pub serial: String,
@@ -826,10 +1029,13 @@ impl Worker {
             }
         });
         thread::spawn(move || {
+            let init_transport = d
+                .resolve_active_transport(&adb)
+                .unwrap_or_else(|_| d.transport.clone());
             let _ = adb.run_timeout(
                 &[
                     "-s",
-                    &d.transport,
+                    &init_transport,
                     "shell",
                     "pm grant com.stepx.companion.app android.permission.ACCESS_MEDIA_LOCATION >/dev/null 2>&1; pm grant com.stepx.companion.app android.permission.READ_MEDIA_IMAGES >/dev/null 2>&1; pm grant com.stepx.companion.app android.permission.READ_MEDIA_VIDEO >/dev/null 2>&1; pm grant com.stepx.companion.app android.permission.WRITE_SECURE_SETTINGS >/dev/null 2>&1; appops set com.stepx.companion.app ACCESS_MEDIA_LOCATION allow >/dev/null 2>&1; settings put secure com.stepx.companion.app_op_100 4 >/dev/null 2>&1; cmd notification allow_listener com.stepx.companion.app/com.stepx.companion.app.PushNotificationService >/dev/null 2>&1 || true; true",
                 ],
@@ -908,6 +1114,11 @@ impl Worker {
                                 )?;
                             }
                             Command::Refresh => {
+                                cooldown.clear();
+                                inspected = Instant::now() - Duration::from_secs(60);
+                            }
+                            Command::ImportLocalFiles(paths) => {
+                                import_local_files(&cfg, &paths)?;
                                 cooldown.clear();
                                 inspected = Instant::now() - Duration::from_secs(60);
                             }
@@ -1006,20 +1217,13 @@ impl Worker {
                                 if let Some(file) =
                                     snap.active.as_ref().filter(|f| valid_id(strval(f, "id")))
                                 {
-                                    let _ = phone_call(
-                                        &adb,
-                                        &d,
-                                        json!({"op":"fail","id":file["id"],"error":format!("{e:#}")}),
-                                    );
-                                    if let Ok(dir) = file_dir(&cfg, strval(file, "id")) {
-                                        if local_file(&cfg, file).is_ok() {
-                                            let mut failed = file.clone();
-                                            failed["state"] = json!("failed");
-                                            failed["error"] = json!(format!("{e:#}"));
-                                            let _ = atomic_json(&dir.join("receipt.json"), &failed);
-                                        } else {
-                                            let _ = fs::remove_dir_all(dir);
-                                        }
+                                    let err_msg = format!("{e:#}");
+                                    if record_migration_failure(&cfg, file, &err_msg) {
+                                        let _ = phone_call(
+                                            &adb,
+                                            &d,
+                                            json!({"op":"fail","id":file["id"],"error":err_msg}),
+                                        );
                                     }
                                 }
                                 return Err(e);
@@ -1215,5 +1419,206 @@ mod tests {
         server.join().unwrap();
         let log = fs::read_to_string(&log_path).unwrap();
         assert!(!log.contains("content call"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finalize_failure_after_phone_unlink_preserves_phone_deleted_vault_archive() {
+        use std::net::TcpListener;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let _cfg_guard = resources::override_config_dir_for_current_thread(temp.path().join("cfg"));
+        let desktop = crate::companion_link::desktop_id().unwrap();
+
+        let vault_parent = temp.path().join("vault-parent");
+        fs::create_dir_all(&vault_parent).unwrap();
+        let cfg = Config {
+            folder: Some(vault_parent.clone()),
+            ..Default::default()
+        };
+
+        let payload = b"precious-family-video-bytes";
+        let sha = crate::data_store::sha256(payload);
+        let id = "a1b2c3d4e5f60718293a4b5c6d7e8f90";
+        let token = "0123456789abcdef0123456789abcdef";
+
+        let phone_dir = temp.path().join("phone_dcim");
+        fs::create_dir_all(&phone_dir).unwrap();
+        let phone_source = phone_dir.join("VID_20261111.mp4");
+        fs::write(&phone_source, payload).unwrap();
+        let phone_cleanup = phone_dir.join(format!(".stepx-migrate-{id}"));
+        fs::write(&phone_cleanup, payload).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let desktop_srv = desktop.clone();
+        let sha_srv = sha.clone();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            for expected_op in ["prepare", "commit", "finalize"] {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let req: Value = serde_json::from_str(&line).unwrap();
+                let inner: Value = serde_json::from_str(req["arg"].as_str().unwrap()).unwrap();
+                assert_eq!(inner["op"], expected_op);
+                let reply = match expected_op {
+                    "prepare" => json!({
+                        "ok": true,
+                        "file": {
+                            "id": id,
+                            "token": token,
+                            "desktop": desktop_srv,
+                            "path": "DCIM/Camera/VID_20261111.mp4",
+                            "name": "VID_20261111.mp4",
+                            "sha256": sha_srv,
+                            "size": payload.len(),
+                            "state": "transferring"
+                        }
+                    }),
+                    "commit" => json!({
+                        "ok": true,
+                        "file": {
+                            "id": id,
+                            "state": "releasing",
+                            "cleanupPath": format!("/storage/emulated/0/DCIM/Camera/.stepx-migrate-{id}")
+                        }
+                    }),
+                    "finalize" => json!({
+                        "ok": false,
+                        "error": "simulated USB disconnect during finalize"
+                    }),
+                    _ => unreachable!(),
+                };
+                writeln!(reader.get_mut(), "{reply}").unwrap();
+                reader.get_mut().flush().unwrap();
+            }
+        });
+
+        let adb_path = temp.path().join("adb");
+        let q_phone_src = shell_quote(phone_source.to_str().unwrap());
+        let map_dcim = phone_dir.to_str().unwrap();
+        fs::write(
+            &adb_path,
+            format!(
+                r#"#!/bin/sh
+set -eu
+case "$*" in
+  *ro.serialno*) printf 'vault-phone\n' ;;
+  *forward*tcp:0*) printf '{port}\n' ;;
+  *forward*--remove*) exit 0 ;;
+  *\ pull\ *)
+    eval "dst=\${{$#}}"
+    cp {q_phone_src} "$dst"
+    ;;
+  *\ shell\ *)
+    cmd=$(printf '%s' "$4" | sed 's|/storage/emulated/0/DCIM/Camera|{map_dcim}|g')
+    sh -c "$cmd"
+    ;;
+  *) exit 99 ;;
+esac
+"#
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&adb_path, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let adb = Adb { path: adb_path };
+        let dev = Device {
+            transport: "vault-phone".into(),
+            serial: "vault-phone".into(),
+            model: "PZ261A".into(),
+            android: "16".into(),
+            product: "pandora".into(),
+        };
+
+        let mut latest_active = Value::Null;
+        let err = migrate(
+            &adb,
+            &dev,
+            &cfg,
+            json!({"path": "DCIM/Camera/VID_20261111.mp4"}),
+            |_, j| latest_active = j.clone(),
+        )
+        .unwrap_err();
+        server.join().unwrap();
+        assert!(err.to_string().contains("finalize"));
+        assert!(
+            !phone_cleanup.exists(),
+            "phone original was already deleted before finalize failed"
+        );
+
+        // Worker error handler runs on the failed migration: must NEVER downgrade to `failed`!
+        let notify_phone = record_migration_failure(&cfg, &latest_active, &format!("{err:#}"));
+        assert!(
+            !notify_phone,
+            "must not report op=fail after phone original was already deleted"
+        );
+
+        let saved_receipt: Value = serde_json::from_slice(
+            &fs::read(vault_parent.join("StepX Storage").join(id).join("receipt.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved_receipt["state"], "phone_deleted");
+        assert_eq!(
+            fs::read(local_file(&cfg, &saved_receipt).unwrap()).unwrap(),
+            payload
+        );
+
+        // `records()` must preserve `verified`, `phone_deleted`, `archived`, and `restored`,
+        // and only clean up stale `transferring` directories.
+        let stale_id = "f".repeat(32);
+        let stale_dir = vault_parent.join("StepX Storage").join(&stale_id);
+        fs::create_dir_all(&stale_dir).unwrap();
+        let mut stale_receipt = record();
+        stale_receipt["id"] = json!(stale_id);
+        stale_receipt["state"] = json!("transferring");
+        atomic_json(&stale_dir.join("receipt.json"), &stale_receipt).unwrap();
+
+        let listed = records(&cfg).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["id"], id);
+        assert_eq!(listed[0]["state"], "phone_deleted");
+        assert!(!stale_dir.exists(), "stale transferring dir should be cleaned");
+    }
+
+    #[test]
+    fn import_local_files_creates_64_hex_vault_entries_without_overwriting_and_survives_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let _cfg_guard = resources::override_config_dir_for_current_thread(temp.path().join("cfg"));
+        let vault_parent = temp.path().join("vault-parent");
+        fs::create_dir_all(&vault_parent).unwrap();
+        let cfg = Config {
+            folder: Some(vault_parent.clone()),
+            ..Default::default()
+        };
+
+        let src_dir = temp.path().join("sources");
+        fs::create_dir_all(&src_dir).unwrap();
+        let doc_path = src_dir.join("项目合同.pdf");
+        let img_path = src_dir.join("IMG_20261111.jpg");
+        fs::write(&doc_path, b"pdf-contract-v1").unwrap();
+        fs::write(&img_path, b"jpeg-bytes-v1").unwrap();
+
+        let count = import_local_files(&cfg, &[doc_path.clone(), img_path.clone()]).unwrap();
+        assert_eq!(count, 2);
+
+        // Re-importing the same files must not overwrite or duplicate vault entries.
+        let count_again = import_local_files(&cfg, &[doc_path.clone()]).unwrap();
+        assert_eq!(count_again, 0);
+
+        let listed = records(&cfg).unwrap();
+        assert_eq!(listed.len(), 2);
+        for item in &listed {
+            let id = item["id"].as_str().unwrap();
+            let name = item["name"].as_str().unwrap();
+            assert_eq!(id.len(), 64);
+            assert_eq!(item["state"], "archived");
+            assert_eq!(item["source"], "desktop_manual");
+            let stored = vault_parent.join("StepX Storage").join(id).join(name);
+            assert!(stored.is_file());
+            assert_eq!(local_file(&cfg, item).unwrap(), stored);
+        }
     }
 }
