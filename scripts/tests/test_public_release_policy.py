@@ -763,61 +763,64 @@ class ReleasePackagingHardeningTests(unittest.TestCase):
             ])
             self.assertEqual(archive.read_bytes(), b'verified-embed-zip')
 
-    def test_strip_pe_authenticode_removes_certificates_in_reverse_order(self):
-        removed = []
-        closed = []
+    def test_windows_java_manifest_edit_removes_only_an_embedded_signature_before_resource_update(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            sdk = root / 'Windows Kits/10/bin/10.0.26100.0/x64'
+            sdk.mkdir(parents=True)
+            mt = sdk / 'mt.exe'
+            mt.touch()
+            java = root / 'java.exe'
+            optional = 88
+            cert_entry = optional + 112 + 4 * 8
+            base = bytearray(512)
+            base[:2] = b'MZ'
+            struct.pack_into('<I', base, 60, 64)
+            base[64:68] = b'PE\0\0'
+            struct.pack_into('<H', base, 84, 240)
+            struct.pack_into('<H', base, optional, 0x20B)
+            struct.pack_into('<I', base, optional + 108, 16)
 
-        class FakeKernel32:
-            class CreateFileW:
-                argtypes = None
-                restype = None
-                def __call__(self, *args):
-                    return 42
+            for signed in (False, True):
+                with self.subTest(signed=signed):
+                    image = bytearray(base)
+                    if signed:
+                        struct.pack_into('<II', image, cert_entry, 504, 8)
+                    java.write_bytes(image)
+                    self.assertEqual(runtime_pkg.has_embedded_pe_signature(java), signed)
 
-            class CloseHandle:
-                argtypes = None
-                restype = None
-                def __call__(self, handle):
-                    closed.append(handle)
-                    return 1
+                    def run(command, *, check):
+                        self.assertTrue(check)
+                        if command[0] == str(mt.with_name('signtool.exe')):
+                            self.assertEqual(command[1:], ['remove', '/s', str(java)])
+                            java.write_bytes(base)
+                        elif command[2].startswith('-inputresource:'):
+                            manifest = Path(command[3].removeprefix('-out:'))
+                            manifest.write_text('<assembly xmlns="urn:schemas-microsoft-com:asm.v1"/>',
+                                                encoding='utf-8')
+                        else:
+                            self.assertFalse(runtime_pkg.has_embedded_pe_signature(java))
+                            self.assertRegex(Path(command[3]).read_text(encoding='utf-8'),
+                                             r'activeCodePage>UTF-8<')
 
-        FakeKernel32.CreateFileW = FakeKernel32.CreateFileW()
-        FakeKernel32.CloseHandle = FakeKernel32.CloseHandle()
+                    with mock.patch.dict(os.environ, {'ProgramFiles(x86)': str(root)}), \
+                         mock.patch.object(runtime_pkg.subprocess, 'run', side_effect=run) as commands:
+                        runtime_pkg.enable_windows_utf8_launcher(java)
+                    tools = [Path(call.args[0][0]).name for call in commands.call_args_list]
+                    self.assertEqual(tools, ['mt.exe', 'signtool.exe', 'mt.exe'] if signed
+                                     else ['mt.exe', 'mt.exe'])
 
-        class FakeImagehlp:
-            class ImageEnumerateCertificates:
-                argtypes = None
-                restype = None
-                def __call__(self, handle, type_filter, count_ptr, indices, index_count):
-                    count_ptr._obj.value = 2
-                    return 1
-
-            class ImageRemoveCertificate:
-                argtypes = None
-                restype = None
-                def __call__(self, handle, index):
-                    removed.append((handle, index))
-                    return 1
-
-        FakeImagehlp.ImageEnumerateCertificates = FakeImagehlp.ImageEnumerateCertificates()
-        FakeImagehlp.ImageRemoveCertificate = FakeImagehlp.ImageRemoveCertificate()
-
-        import ctypes
-        import ctypes.wintypes
-        fake_wintypes = types.SimpleNamespace(
-            LPCWSTR=ctypes.c_wchar_p,
-            DWORD=ctypes.c_uint32,
-            WORD=ctypes.c_uint16,
-            HANDLE=ctypes.c_void_p,
-            BOOL=ctypes.c_int,
-        )
-        with mock.patch.object(ctypes, 'WinDLL', side_effect=lambda name, **kw: FakeKernel32 if name == 'kernel32' else FakeImagehlp, create=True), \
-             mock.patch.object(ctypes, 'get_last_error', return_value=0, create=True), \
-             mock.patch.dict(sys.modules, {'ctypes.wintypes': fake_wintypes}):
-            count = runtime_pkg.strip_pe_authenticode(Path('java.exe'))
-        self.assertEqual(count, 2)
-        self.assertEqual(removed, [(42, 1), (42, 0)])
-        self.assertEqual(closed, [42])
+    @unittest.skipUnless(os.name == 'nt', 'requires the native Windows SDK')
+    def test_windows_utf8_manifest_on_jlink_launcher(self):
+        jdk = runtime_pkg.resolve_jdk_with_jmods(windows=True)
+        with tempfile.TemporaryDirectory(prefix='stepx-jlink-') as td:
+            image = Path(td) / 'java'
+            subprocess.run([str(jdk / 'bin/jlink.exe'), '--add-modules', 'java.base',
+                            '--strip-debug', '--no-header-files', '--no-man-pages',
+                            '--output', str(image)], check=True, timeout=60)
+            java = image / 'bin/java.exe'
+            runtime_pkg.enable_windows_utf8_launcher(java)
+            subprocess.run([str(java), '-version'], check=True, timeout=15)
 
 
 if __name__ == '__main__':

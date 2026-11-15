@@ -1,5 +1,5 @@
 """Package host-side installers with no dependency on a developer SDK path."""
-import argparse, hashlib, os, platform, shutil, subprocess, tarfile, tempfile, urllib.request, zipfile
+import argparse, hashlib, os, platform, shutil, struct, subprocess, tarfile, tempfile, urllib.request, zipfile
 from pathlib import Path
 from release_download import download_verified_tool
 
@@ -36,54 +36,34 @@ def sort_mt_candidates(paths):
     )
 
 
-def strip_pe_authenticode(executable):
-    """Remove PE Authenticode certificates invalidated after manifest edits."""
-    import ctypes
-    from ctypes import wintypes
-
-    CERT_SECTION_TYPE_ANY = 0xFF
-    GENERIC_READ_WRITE = 0x80000000 | 0x40000000
-    FILE_SHARE_READ = 0x00000001
-    OPEN_EXISTING = 3
-    FILE_ATTRIBUTE_NORMAL = 0x00000080
-    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
-
-    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
-    kernel32.CreateFileW.argtypes = [
-        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
-        ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
-    ]
-    kernel32.CreateFileW.restype = wintypes.HANDLE
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel32.CloseHandle.restype = wintypes.BOOL
-
-    imagehlp = ctypes.WinDLL('imagehlp', use_last_error=True)
-    imagehlp.ImageEnumerateCertificates.argtypes = [
-        wintypes.HANDLE, wintypes.WORD, ctypes.POINTER(wintypes.DWORD),
-        ctypes.POINTER(wintypes.DWORD), wintypes.DWORD,
-    ]
-    imagehlp.ImageEnumerateCertificates.restype = wintypes.BOOL
-    imagehlp.ImageRemoveCertificate.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-    imagehlp.ImageRemoveCertificate.restype = wintypes.BOOL
-
-    handle = kernel32.CreateFileW(
-        str(executable), GENERIC_READ_WRITE, FILE_SHARE_READ,
-        None, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None,
-    )
-    if handle in (None, 0, INVALID_HANDLE_VALUE):
-        raise OSError(ctypes.get_last_error(), f'CreateFileW failed for {executable}')
-    try:
-        count = wintypes.DWORD(0)
-        if not imagehlp.ImageEnumerateCertificates(
-            handle, CERT_SECTION_TYPE_ANY, ctypes.byref(count), None, 0
-        ):
-            raise OSError(ctypes.get_last_error(), f'ImageEnumerateCertificates failed for {executable}')
-        for index in range(count.value - 1, -1, -1):
-            if not imagehlp.ImageRemoveCertificate(handle, index):
-                raise OSError(ctypes.get_last_error(), f'ImageRemoveCertificate({index}) failed for {executable}')
-        return count.value
-    finally:
-        kernel32.CloseHandle(handle)
+def has_embedded_pe_signature(executable):
+    """Check the PE32+ certificate directory in the bundled x64 Java launcher."""
+    data = executable.read_bytes()
+    if len(data) < 64 or data[:2] != b'MZ':
+        raise ValueError(f'{executable.name}: invalid DOS header')
+    pe, = struct.unpack_from('<I', data, 60)
+    optional = pe + 24
+    if pe < 64 or optional > len(data) or data[pe:pe + 4] != b'PE\0\0':
+        raise ValueError(f'{executable.name}: invalid PE header')
+    optional_size, = struct.unpack_from('<H', data, pe + 20)
+    if optional_size < 112 or optional + optional_size > len(data):
+        raise ValueError(f'{executable.name}: truncated optional header')
+    magic, = struct.unpack_from('<H', data, optional)
+    if magic != 0x20B:
+        raise ValueError(f'{executable.name}: expected PE32+ launcher')
+    directory_count, = struct.unpack_from('<I', data, optional + 108)
+    if directory_count <= 4:
+        return False
+    certificate_table = 112 + 4 * 8
+    if certificate_table + 8 > optional_size:
+        raise ValueError(f'{executable.name}: truncated certificate directory')
+    # The certificate directory points to a file offset, unlike most PE directories.
+    offset, size = struct.unpack_from('<II', data, optional + certificate_table)
+    if not offset and not size:
+        return False
+    if offset < optional + optional_size or offset % 8 or size < 8 or offset + size > len(data):
+        raise ValueError(f'{executable.name}: invalid certificate table')
+    return True
 
 
 def download_windows_python(archive):
@@ -106,9 +86,10 @@ def enable_windows_utf8_launcher(executable):
     kits=Path(os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)'))/'Windows Kits/10/bin'
     candidates=sort_mt_candidates(kits.glob('*/x64/mt.exe'))
     if not candidates:raise RuntimeError('Windows SDK manifest tool is required when packaging Java')
+    mt = candidates[0]
     with tempfile.TemporaryDirectory() as td:
         manifest=Path(td)/'java.manifest'
-        subprocess.run([str(candidates[0]),'-nologo','-inputresource:'+str(executable)+';#1','-out:'+str(manifest)],check=True)
+        subprocess.run([str(mt),'-nologo','-inputresource:'+str(executable)+';#1','-out:'+str(manifest)],check=True)
         import xml.etree.ElementTree as ET
         tree=ET.parse(manifest);root=tree.getroot()
         namespace='urn:schemas-microsoft-com:asm.v3'
@@ -121,8 +102,13 @@ def enable_windows_utf8_launcher(executable):
         if codepage is None:codepage=ET.SubElement(settings,tag)
         codepage.text='UTF-8'
         tree.write(manifest,encoding='utf-8',xml_declaration=True)
-        subprocess.run([str(candidates[0]),'-nologo','-manifest',str(manifest),'-outputresource:'+str(executable)+';#1'],check=True)
-    strip_pe_authenticode(executable)
+        # Changing the embedded manifest invalidates the vendor signature on this
+        # generated copy. Remove the intact signature before editing the resource.
+        if has_embedded_pe_signature(executable):
+            subprocess.run([str(mt.with_name('signtool.exe')), 'remove', '/s', str(executable)], check=True)
+        subprocess.run([str(mt),'-nologo','-manifest',str(manifest),'-outputresource:'+str(executable)+';#1'],check=True)
+    if has_embedded_pe_signature(executable):
+        raise RuntimeError('Modified Java launcher still has an embedded signature')
 
 def resolve_jdk_with_jmods(windows):
     suffix='.exe' if windows else ''
