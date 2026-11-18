@@ -650,9 +650,9 @@ class CompatDynamicIdentityTests(unittest.TestCase):
             if args == ('ps', '-AZ'):
                 return f'{expected_gms_domain} u0_a241 1200 900 com.google.android.gms:persistent'
             if args == ('dumpsys', 'package', 'com.google.android.gms'):
-                return 'Packages:\n  Package [com.google.android.gms]\n    appId=10241\n    versionName=26.42.31\n    seInfo=gmscore\n'
+                return 'Packages:\n  Package [com.google.android.gms]\n    appId=10241\n    versionCode=264231036 minSdk=35\n    versionName=26.42.31\n    seInfo=gmscore\n'
             if args == ('dumpsys', 'package', 'com.android.vending'):
-                return 'Packages:\n  Package [com.android.vending]\n    userId=10268\n    versionName=45.2.19\n    seInfo=default:targetSdkVersion=35:complete\n'
+                return 'Packages:\n  Package [com.android.vending]\n    userId=10268\n    versionCode=85361701 minSdk=35\n    versionName=45.2.19\n    seInfo=default:targetSdkVersion=35:complete\n'
             if args == ('ls', '-Zd', '/data/user/0/com.android.vending'):
                 raise RuntimeError('ls -Zd unavailable; compute MLS from dynamic 10xxx uid')
             if args == ('pm', 'path', '--user', '0', 'com.google.android.gms'):
@@ -784,7 +784,7 @@ class CompatDynamicIdentityTests(unittest.TestCase):
             if args == ('ps', '-AZ'):
                 return ''
             if args == ('dumpsys', 'package', 'com.google.android.gms'):
-                return f'Packages:\n  Package [com.google.android.gms]\n    appId={uid_box["gms"]}\n'
+                return f'Packages:\n  Package [com.google.android.gms]\n    appId={uid_box["gms"]}\n    versionCode=264131036 minSdk=35\n'
             if args == ('ls', '-Zd', '/data/user/0/com.google.android.gms'):
                 raise RuntimeError('ls unavailable')
             if args == ('pm', 'path', '--user', '0', 'com.google.android.gms'):
@@ -828,6 +828,86 @@ class CompatDynamicIdentityTests(unittest.TestCase):
                         'gms': {'package': 'com.google.android.gms', 'uid': invalid_uid, 'domain': 'u:r:gmscore_app:s0:c512,c768'},
                         'play': {'package': 'com.android.vending', 'uid': 10268, 'domain': 'u:r:untrusted_app:s0:c12,c257,c512,c768'},
                     }))
+
+    def test_below_floor_versions_rejected_before_file_checks(self):
+        serial = 'PHONE999'
+
+        def shell_fn(*args):
+            if args == ('getprop', 'ro.serialno'):
+                return serial
+            if args == ('ps', '-AZ'):
+                return ''
+            if args == ('dumpsys', 'package', 'com.google.android.gms'):
+                return 'Packages:\n  Package [com.google.android.gms]\n    appId=10241\n    versionCode=100 minSdk=35\n'
+            if args == ('dumpsys', 'package', 'com.android.vending'):
+                return 'Packages:\n  Package [com.android.vending]\n    userId=10268\n    versionCode=85361541 minSdk=35\n'
+            raise AssertionError(f'must not reach file checks: {args}')
+
+        with tempfile.TemporaryDirectory() as temp:
+            fake_mod = self._fake_companion_module(Path(temp), serial, shell_fn,
+                                                   lambda *a, **kw: None, lambda *a, **kw: {})
+
+            class FakeSpec:
+                loader = types.SimpleNamespace(exec_module=lambda m: None)
+
+            with patch.dict(os.environ, {'STEPX_SERIAL': serial, 'STEPX_DEVICE_SERIAL': serial}, clear=False), \
+                    patch.object(compat, 'SERIAL', serial), \
+                    patch.object(compat.importlib.util, 'spec_from_file_location', return_value=FakeSpec()), \
+                    patch.object(compat.importlib.util, 'module_from_spec', return_value=fake_mod):
+                with self.assertRaises(compat.RepairError) as old_gms:
+                    compat.Transport().check('status')
+                self.assertEqual(old_gms.exception.code, 'unsupported_apk')
+                self.assertIn('Google Play 服务', old_gms.exception.public_message)
+
+
+class FirmwareTierTests(unittest.TestCase):
+    BASE = 'StepX/pandora/pandora:16/BQ2A.260122.002-BP2A.250705.008/172:user/release-keys'
+
+    def fp(self, incremental='999', brand='StepX', product='pandora', device='pandora',
+           release='16', build='BQ2A.260122.002-BP2A.250705.008', btype='user', tags='release-keys'):
+        return f'{brand}/{product}/{device}:{release}/{build}/{incremental}:{btype}/{tags}'
+
+    def test_verified_builds(self):
+        self.assertEqual(common.fingerprint_tier(self.BASE), 'verified')
+        self.assertEqual(common.fingerprint_tier(self.fp('12')), 'verified')
+        for listed in common.ALLOWED_FINGERPRINTS:
+            self.assertEqual(common.fingerprint_tier(listed), 'verified')
+
+    def test_forward_requires_same_family_at_or_above_minimum(self):
+        self.assertEqual(common.fingerprint_tier(self.fp('172')), 'verified')
+        self.assertEqual(common.fingerprint_tier(self.fp('173')), 'forward')
+        self.assertEqual(common.fingerprint_tier(self.fp('99999')), 'forward')
+        # A different build id is normal for OTAs of the same release train.
+        self.assertEqual(common.fingerprint_tier(self.fp('500', build='BQ3A.260601.001')), 'forward')
+
+    def test_numeric_incremental_comparison(self):
+        # '99' sorts after '172' lexicographically; only a numeric compare is safe.
+        self.assertEqual(common.fingerprint_tier(self.fp('99')), 'too_old')
+        self.assertEqual(common.fingerprint_tier(self.fp('5')), 'too_old')
+        self.assertEqual(common.fingerprint_tier(self.fp('171')), 'too_old')
+
+    def test_foreign_or_unsafe_firmware_rejected(self):
+        self.assertEqual(common.fingerprint_tier(self.fp(product='other')), 'unsupported')
+        self.assertEqual(common.fingerprint_tier(self.fp(device='otherdev')), 'unsupported')
+        self.assertEqual(common.fingerprint_tier(self.fp(release='15')), 'unsupported')
+        self.assertEqual(common.fingerprint_tier(self.fp(btype='userdebug')), 'unsupported')
+        self.assertEqual(common.fingerprint_tier(self.fp(tags='test-keys')), 'unsupported')
+        self.assertEqual(common.fingerprint_tier(self.fp(incremental='abc')), 'unsupported')
+        for bad in ('', 'not-a-fingerprint', self.fp()[:-1], 'a/b/c/d/e/f/g/h'):
+            self.assertEqual(common.fingerprint_tier(bad), 'unsupported')
+
+    def test_family_match_keeps_recovery_state_across_builds(self):
+        self.assertTrue(common.firmware_family_matches(self.fp('999')))
+        self.assertTrue(common.firmware_family_matches(self.fp('99')))
+        self.assertFalse(common.firmware_family_matches(self.fp(product='other')))
+        self.assertFalse(common.firmware_family_matches(None))
+        self.assertFalse(common.firmware_family_matches('junk'))
+
+    def test_baseline_matches_within_family_only(self):
+        with patch.object(common, 'DEVICE_KEY', 'dev-1'), patch.object(common, 'SERIAL', 'dev-1'):
+            self.assertTrue(common.baseline_matches({'serial': 'dev-1', 'fingerprint': self.fp('999')}))
+            self.assertFalse(common.baseline_matches({'serial': 'dev-1', 'fingerprint': self.fp(product='other')}))
+            self.assertFalse(common.baseline_matches({'serial': 'other', 'fingerprint': self.fp('999')}))
 
 
 if __name__ == '__main__': unittest.main()

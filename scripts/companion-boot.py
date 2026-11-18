@@ -54,7 +54,7 @@ def _ensure_usb_fallback():
 
 def verified_fingerprint():
     actual=p.shell('getprop','ro.build.fingerprint')
-    if actual not in p.ALLOWED_FINGERPRINTS:raise RuntimeError('Current firmware was not reviewed')
+    if p.fingerprint_tier(actual) not in ('verified','forward'):raise RuntimeError('Current firmware was not reviewed')
     return actual
 
 def private(value,name):
@@ -102,7 +102,7 @@ def validate_baseline_evidence(value,cert,uid,names):
     if evidence.parent.resolve()!=p.STATE.resolve() or evidence.is_symlink() or not evidence.is_file() or evidence.stat().st_size>1048576:raise RuntimeError(failure)
     record=json.loads(evidence.read_text(encoding='utf-8'))
     if (record.get('signer')!=cert or record.get('uid')!=uid or record.get('serial')!=p.device_key()
-            or record.get('fingerprint')!=value.get('fingerprint') or record.get('fingerprint') not in p.ALLOWED_FINGERPRINTS
+            or record.get('fingerprint')!=value.get('fingerprint') or not p.firmware_family_matches(record.get('fingerprint'))
             or record.get('origin')!=value.get('origin') or record.get('permission_changes') is not False
             or not record.get('boot_id') or record.get('boot_id')!=value.get('boot_id')
             or type(record.get('captured_at')) is not int or record['captured_at']<=0 or record.get('captured_at')!=value.get('captured_at')):raise RuntimeError(failure)
@@ -306,6 +306,14 @@ def install(apk,rebind=False):
         original_sha256=STOCK_SHA if standalone else ORIGINAL_SHA)
     files['config.json']=json.dumps(config).encode()
     code='''import os,json,hashlib,base64,stat,fcntl,uuid
+def _ffam(v):
+ try:
+  brand,rest=v.split('/',1);product,rest=rest.split('/',1)
+  device,rest=rest.split(':',1);release,rest=rest.split('/',1)
+  build,rest=rest.split('/',1);incremental,rest=rest.split(':',1)
+  btype,tags=rest.split('/',1)
+  return (brand,product,device,release,btype,tags)
+ except ValueError:return None
 BASE='/usr/local/lib/stepx-companion';STATE='/var/lib/stepx-companion';HOOK=CONFIG.get('hook_path','/usr/local/lib/stepx-gms/boot.py')
 def read_regular(path):
  fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW)
@@ -376,7 +384,7 @@ with os.fdopen(lockfd,'r+b') as lock:
   if changed_identity:
    if old.get('package')!=CONFIG.get('package') or old.get('package')!='com.stepx.companion.app':raise RuntimeError('Old boot adapter does not belong to this companion package')
    if not CONFIG.get('serial') or old.get('serial')!=CONFIG['serial']:raise RuntimeError('Old boot adapter belongs to another device')
-   if old.get('fingerprint') not in ALLOWED_FINGERPRINTS:raise RuntimeError('Old boot firmware was not reviewed')
+   if _ffam(old.get('fingerprint'))!=FAMILY:raise RuntimeError('Old boot firmware was not reviewed')
    if old.get('boot_mode','chained')!=CONFIG.get('boot_mode','chained') or old.get('hook_path',HOOK)!=HOOK:raise RuntimeError('Old boot entry mode differs; refusing implicit relocation')
    if old.get('original_sha256')!=ORIGINAL:raise RuntimeError('Old original backup identity differs')
    if type(old.get('uid')) is not int or not 10000<=old['uid']<100000 or not isinstance(old.get('signer'),str) or len(old['signer'])!=64:raise RuntimeError('Old companion identity is incomplete')
@@ -462,7 +470,7 @@ with os.fdopen(lockfd,'r+b') as lock:
             read+=" with os.fdopen(fd,'rb') as f:\n  assert stat.S_ISREG(os.fstat(f.fileno()).st_mode);data=f.read(262144)\n"
             read+=" if hashlib.sha256(data).hexdigest()!=expected:raise RuntimeError('Staged boot artifact mismatch')\n"
             read+=' DATA[name]=base64.b64encode(data).decode()\n'
-            operation=('ORIGINAL='+repr(config['original_sha256'])+'\nCONFIG='+repr(config)+'\nALLOW_REBIND='+repr(bool(rebind))+'\nALLOWED_FINGERPRINTS='+repr(tuple(p.ALLOWED_FINGERPRINTS))+'\n'+read+code).encode()
+            operation=('ORIGINAL='+repr(config['original_sha256'])+'\nCONFIG='+repr(config)+'\nALLOW_REBIND='+repr(bool(rebind))+'\nFAMILY='+repr(p.fingerprint_family(p.CONFIG['fingerprint']))+'\n'+read+code).encode()
             if len(operation)>32768:raise RuntimeError('Boot transaction exceeds verified size bound')
             operation_path=stage+'/install.py'
             stage_file(operation_path,operation)

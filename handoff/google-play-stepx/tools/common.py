@@ -43,6 +43,77 @@ ALLOWED_FINGERPRINTS = tuple(dict.fromkeys(CONFIG.get('fingerprints') or [
     'StepX/pandora/pandora:16/BQ2A.260122.002-BP2A.250705.008/12:user/release-keys',
     'StepX/pandora/pandora:16/BQ2A.260122.002-BP2A.250705.008/172:user/release-keys',
 ]))
+
+_FINGERPRINT_RE = re.compile(
+    r'^([^/:]+)/([^/:]+)/([^/:]+):([^/:]+)/([^/:]+)/([^/:]+):([^/:]+)/([^/:]+)$')
+
+
+def _parse_fingerprint(value):
+    """Split brand/product/device:release/build_id/incremental:type/tags."""
+    match = _FINGERPRINT_RE.match(value or '')
+    if not match:
+        return None
+    brand, product, device, release, build_id, incremental, build_type, tags = match.groups()
+    return {
+        'brand': brand, 'product': product, 'device': device,
+        'release': release, 'build_id': build_id, 'incremental': incremental,
+        'type': build_type, 'tags': tags,
+    }
+
+
+def _base_fingerprint():
+    return _parse_fingerprint(CONFIG.get('fingerprint'))
+
+
+def fingerprint_family(value):
+    """(brand, product, device, release, type, tags) of an exact-format fp, else None."""
+    fields = _parse_fingerprint(value)
+    if not fields:
+        return None
+    return (fields['brand'], fields['product'], fields['device'],
+            fields['release'], fields['type'], fields['tags'])
+
+
+def _same_family(fields, base):
+    return (fields['brand'], fields['product'], fields['device'], fields['release'],
+            fields['type'], fields['tags']) == (
+            base['brand'], base['product'], base['device'],
+            base['release'], base['type'], base['tags'])
+
+
+def fingerprint_tier(actual):
+    """Classify the reported build fingerprint.
+
+    'verified' is an audited build; 'forward' is a newer build of the same
+    device family (same brand/product/device/release, still user/release-keys)
+    whose incremental number reaches the configured minimum; 'too_old' is the
+    same family below that minimum; anything else is 'unsupported'.
+    """
+    if actual in ALLOWED_FINGERPRINTS:
+        return 'verified'
+    base = _base_fingerprint()
+    fields = _parse_fingerprint(actual)
+    if not base or not fields or not _same_family(fields, base):
+        return 'unsupported'
+    minimum = str(CONFIG.get('min_incremental') or base['incremental'])
+    try:
+        if int(fields['incremental']) < int(minimum):
+            return 'too_old'
+    except ValueError:
+        return 'unsupported'
+    return 'forward'
+
+
+def firmware_family_matches(value):
+    """True when `value` is a fingerprint of this device family (any build)."""
+    base = _base_fingerprint()
+    fields = _parse_fingerprint(value)
+    return bool(base and fields and _same_family(fields, base))
+
+
+# Set by guard(): the device runs an unverified-but-eligible newer build. Callers
+# may record it in evidence; per-site byte pins still decide write safety.
+FORWARD_FIRMWARE = False
 SERIAL = os.environ.get('STEPX_SERIAL') or os.environ.get('STEPX_DEVICE_SERIAL') or CONFIG.get('serial', '')
 DEVICE_SERIAL = os.environ.get('STEPX_DEVICE_SERIAL', '')
 EXPECTED_HW_SERIAL = DEVICE_SERIAL or (SERIAL if SERIAL and not _is_wireless_transport(SERIAL) else '')
@@ -262,7 +333,7 @@ def shell(*args):
 
 
 def guard(native=False):
-    global EXPECTED_HW_SERIAL, _active_transport
+    global EXPECTED_HW_SERIAL, _active_transport, FORWARD_FIRMWARE
     # ADB transport names (USB, IP:port or mDNS) are not hardware identities.
     # Wireless operations must carry the physical serial selected by the desktop.
     if not SERIAL or SERIAL.startswith('-') or any(c.isspace() for c in SERIAL):
@@ -290,18 +361,26 @@ def guard(native=False):
     if _failover_from != SERIAL:
         _active_transport = SERIAL
     actual_fp = shell('getprop', 'ro.build.fingerprint')
-    if actual_fp not in ALLOWED_FINGERPRINTS:
+    tier = fingerprint_tier(actual_fp)
+    FORWARD_FIRMWARE = tier == 'forward'
+    if tier == 'too_old':
+        raise WorkflowError('unsupported_firmware', '当前手机固件版本早于适配的最低构建号；请先更新手机系统，再重新检测。')
+    if tier == 'unsupported':
         raise WorkflowError('unsupported_firmware', '当前手机固件尚未通过 Google 安装适配验证。请先更新手机系统或桌面客户端，再重新检测；重复安装不会解决，现有数据已保留。')
     actual_sdk = shell('getprop', 'ro.build.version.sdk')
     if actual_sdk != CONFIG['sdk'] or shell('getprop', 'ro.product.cpu.abilist') != CONFIG['abi']:
         raise WorkflowError('unsupported_firmware', '当前系统版本或处理器架构不在已验证的 Google 安装范围；请更新客户端后重新检测。')
     if shell('getenforce') != 'Enforcing':
         raise WorkflowError('unsupported_firmware', '手机系统安全状态与已验证配置不同，已停止安装和自动修复。')
-    if native:
+    if native and tier == 'verified':
+        # Native byte pins only exist for audited builds. On 'forward' firmware
+        # they cannot be evaluated; per-site pins (stock launcher hash, install
+        # baselines, receipts) and worker quarantine still bound the risk.
         for path, expected_hash in CONFIG['native_hashes'].items():
             if shell('sha256sum', path).split()[0] != expected_hash:
                 raise WorkflowError('unsupported_firmware', '手机系统关键库与已验证固件不一致，已停止安装。请更新客户端适配后重新检测。')
     init_state()
+    return tier
 
 
 def init_state():
@@ -317,13 +396,17 @@ def init_state():
 
 
 def baseline_matches(value):
-    return bool(DEVICE_KEY) and value.get('serial') in (DEVICE_KEY, SERIAL) and value.get('fingerprint') in ALLOWED_FINGERPRINTS
+    # Recovery state belongs to the device family, not to one exact build: an
+    # OTA must not orphan it. Callers that resume writes still compare the
+    # recorded fingerprint against verified_fingerprint() for byte equality.
+    return bool(DEVICE_KEY) and value.get('serial') in (DEVICE_KEY, SERIAL) \
+        and firmware_family_matches(value.get('fingerprint'))
 
 
 def verified_fingerprint():
     """The target profile lists compatible firmware; it is not device evidence."""
     actual = shell('getprop', 'ro.build.fingerprint')
-    if actual not in ALLOWED_FINGERPRINTS:
+    if fingerprint_tier(actual) not in ('verified', 'forward'):
         raise RuntimeError('Unsupported firmware; recovery metadata was not changed')
     return actual
 

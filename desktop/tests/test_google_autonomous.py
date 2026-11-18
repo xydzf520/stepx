@@ -337,14 +337,15 @@ class OperationLockTests(unittest.TestCase):
 
 class ManagedMonitorUpgradeTests(unittest.TestCase):
     def test_upgrade_requires_owned_bytes_identity_and_idle_before_activation(self):
-        for failure in [None, 'identity', 'artifacts', 'call']:
+        for failure in [None, 'identity', 'firmware', 'artifacts', 'call']:
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tmp:
                 config = {'package':'com.stepx.companion.app', 'serial':'fixture-phone',
                           'boot_mode':'chained', 'fingerprint':'fixture-firmware'}
                 if failure == 'identity': config['serial'] = 'different-phone'
+                if failure == 'firmware': config['fingerprint'] = 'different-family'
                 boot = SimpleNamespace(STATE_LOCAL=Path(tmp),
                     p=SimpleNamespace(PACKAGE='com.stepx.companion.app', device_key=lambda:'fixture-phone',
-                                      ALLOWED_FINGERPRINTS=('fixture-firmware',)),
+                                      firmware_family_matches=lambda value: value == 'fixture-firmware'),
                     status=Mock(return_value={'installed':True,'config':config}),
                     activate=Mock(return_value={'status':'activated','system_server_unchanged':True,
                                               'google_login':{'status':'scheduled','update_monitor':True}}))

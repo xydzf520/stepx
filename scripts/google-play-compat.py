@@ -46,12 +46,14 @@ SCOPES = {
         "domain": "u:r:gmscore_app:s0:c512,c768",
         "apk_sha256": "0a0af2a2c44c459a0dded52cb7e176704d640ae738980d12360697cf96c8da4e",
         "cert_sha256": "5f2391277b1dbd489000467e4c2fa6af802430080457dce2f618992e9dfb5402",
+        "min_version_code": 264131035,
     },
     "play": {
         "package": "com.android.vending", "uid": 10185,
         "domain": "u:r:untrusted_app:s0:c185,c256,c512,c768",
         "apk_sha256": "5d062e4acbe631a0c3683cd0654637ec5724cd18890e1a272be834622d2660b3",
         "cert_sha256": "7ce83c1b71f3d572fed04c8d40c5cb10ff75e6d87d9df6fbd53f0468c2905053",
+        "min_version_code": 85361540,
     },
 }
 MODULE_FILES = {
@@ -447,6 +449,7 @@ class Transport:
     def __init__(self):
         self.module = None
         self.last_proof = None
+        self.forward_firmware = False
         self.scopes = copy.deepcopy(SCOPES)
 
     def _verify_package_signer(self, package, paths, apk_hashes, expected_cert, defaults):
@@ -492,9 +495,10 @@ class Transport:
         spec.loader.exec_module(module)
         self.module = module
         try:
-            module.guard(native=True)
+            tier = module.guard(native=True)
         except Exception:
             raise RepairError("unsupported_firmware", "手机系统版本、原生文件或 USB 连接与已验证环境不符，未修改手机。") from None
+        self.forward_firmware = tier == "forward"
         _require(module.shell("getprop", "ro.serialno") == SERIAL,
                  "unsupported_device", "连接到的手机不是当前已验证的 StepX 手机。")
         cert_pins = _target_cert_pins()
@@ -510,6 +514,13 @@ class Transport:
             _require(bool(uid_match), "unsupported_package_identity", "Google 组件身份与已验证安装不符，未修改手机。")
             uid = int(uid_match.group(1))
             _require(10000 <= uid < 100000, "unsupported_package_identity", "Google 组件身份与已验证安装不符，未修改手机。")
+            vcode = re.search(r"\bversionCode=([0-9]+)\b", dump)
+            label = "Google Play 服务" if package == SCOPES["gms"]["package"] else "Google Play 商店"
+            _require(bool(vcode), "unsupported_apk",
+                     "无法读取 " + label + "的版本号，未修改手机。")
+            _require(int(vcode.group(1)) >= defaults["min_version_code"],
+                     "unsupported_apk",
+                     label + "版本（" + vcode.group(1) + "）早于已验证基线；请先将其更新后再重试。")
             domain = _resolve_selinux_domain(module, scope, package, uid, dump, ps_lines)
             paths = [
                 line[8:]
@@ -683,6 +694,15 @@ def _rollback(transport, directory, receipt):
 
 
 def execute(action, directory, transport, force_close_receipt=False):
+    result = _execute(action, directory, transport, force_close_receipt)
+    if getattr(transport, "forward_firmware", False) and isinstance(result, dict):
+        result["forward_firmware"] = True
+        result["message"] = (result.get("message") or "") + \
+            "（固件为未逐项验证的新版本，已按最低版本兼容策略放行。）"
+    return result
+
+
+def _execute(action, directory, transport, force_close_receipt=False):
     receipt = current_receipt(directory)
     if getattr(transport, "accepts_action", False):
         transport.check(action)

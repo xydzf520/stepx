@@ -68,7 +68,7 @@ def read_payload():
 def validate_record(record):
     require(record.get('schema') == SCHEMA
             and record.get('serial') == recovery.SERIAL
-            and record.get('fingerprint') in recovery.ALLOWED_FINGERPRINTS
+            and recovery.firmware_family_matches(record.get('fingerprint'))
             and record.get('ability_sha256') in recovery.ALLOWED_APK_SHA256S
             and record.get('main') == MAIN and record.get('socket') == SOCKET,
             'Unknown task host identity or firmware')

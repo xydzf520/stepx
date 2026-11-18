@@ -197,10 +197,11 @@ REVIEWED_PERMISSIONS = {
 
 
 def preflight():
-    guard(native=True)
+    tier = guard(native=True)
     import install_recovery
     result = {
         'fingerprint': verified_fingerprint(),
+        'firmware_tier': tier,
         'boot_completed': shell('getprop', 'sys.boot_completed'),
         'user_unlocked': 'RUNNING_UNLOCKED' in shell('dumpsys', 'user'),
         'avb': shell('getprop', 'ro.boot.verifiedbootstate'),
@@ -794,7 +795,7 @@ def phone_recovery_summary(phone, boot_id, pid, dumps, registered, timezone=None
 
 
 def status():
-    guard()
+    tier = guard()
     init_state()
     result = root_json('''import os,json
 p='/var/lib/stepx-gms/last.json'
@@ -852,6 +853,7 @@ print(json.dumps(r))''')
         or (phone.get('schema') == 2 and phone.get('runtime_revision') not in (None, MONITOR_REVISION)))
     summary['phone_recovery_current_session'] = phone.get('boot_id') == result['boot_id'] and str(phone.get('system_server_pid')) == current_pid
     summary['phone_recovery_current_components'] = phone_component_identity_matches(phone, component_versions(dumps), timezone, time_cache)
+    summary['firmware_tier'] = tier
     if (phone.get('schema') == 2 and summary['phone_recovery_current_session']
             and phone.get('status') != 'ready'):
         summary.update(status='needs_repair', needs_repair=True,
@@ -1018,7 +1020,7 @@ def upgrade_owned_monitor():
         config = current.get('config') or {}
         if (not current.get('installed') or config.get('package') != boot.p.PACKAGE
                 or config.get('serial') != boot.p.device_key() or config.get('boot_mode') != 'chained'
-                or config.get('fingerprint') not in boot.p.ALLOWED_FINGERPRINTS):
+                or not boot.p.firmware_family_matches(config.get('fingerprint'))):
             raise RuntimeError('No identity-bound managed companion; automatic monitor upgrade stopped')
         # Every active byte must still match the existing owned manifest before
         # any native activation. The installer repeats this guard transactionally.

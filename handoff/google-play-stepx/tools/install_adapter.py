@@ -8,7 +8,14 @@ import argparse
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--recovery', action='store_true', help='Use a verified repair snapshot; never enables destructive rollback')
 args = parser.parse_args()
-guard(native=True)
+tier = guard(native=True)
+if tier == 'forward':
+    # The reviewed boot hook wraps stock launcher bytes that only exist on
+    # audited firmware. On an unverified newer build we must not touch the
+    # launcher: installed Google components keep working for this session;
+    # reboot durability requires a verified build or a client update.
+    print('当前固件为未逐项验证的新版本，未改动开机启动文件；重启后请在桌面端重新检测并修复。')
+    raise SystemExit(0)
 operation_lease = hold_operation_lock()
 STOCK_SHA = '5cfe5a88a97eca424bd4922fe813e0cc553adad0e8623105311ec1514022152f'
 baseline = json.loads((BACKUP / ('recovery-baseline.json' if args.recovery else 'baseline.json')).read_text(encoding='utf-8'))

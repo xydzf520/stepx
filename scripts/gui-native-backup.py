@@ -41,6 +41,30 @@ STARTUP_PROPERTIES = ('persist.openclaw.zygote.path', 'sys.openclaw.env.start')
 SCHEMA = 'stepx.native-gui.backup.v1'
 
 
+def _fp_fields(value):
+    try:
+        brand, rest = str(value or '').split('/', 1)
+        product, rest = rest.split('/', 1)
+        device, rest = rest.split(':', 1)
+        release, rest = rest.split('/', 1)
+        build, rest = rest.split('/', 1)
+        incremental, rest = rest.split(':', 1)
+        btype, tags = rest.split('/', 1)
+        return (brand, product, device, release, build, incremental, btype, tags)
+    except ValueError:
+        return None
+
+
+_BASE_FIELDS = _fp_fields(FINGERPRINT)
+
+
+def firmware_family_matches(value):
+    """Recorded evidence stays valid across builds of this device family."""
+    fields = _fp_fields(value)
+    return bool(_BASE_FIELDS and fields
+                and fields[:4] + fields[6:] == _BASE_FIELDS[:4] + _BASE_FIELDS[6:])
+
+
 def require(condition, message):
     if not condition:
         raise RuntimeError(message)
@@ -204,7 +228,7 @@ def load_backup(directory):
     require(digest(directory / 'ability.original.apk') == manifest_sha, 'Local original APK is corrupt')
     baseline = manifest['snapshot']
     require(baseline['identity'].get('ro.serialno') == SERIAL
-            and baseline['identity'].get('ro.build.fingerprint') in (*ALLOWED_FINGERPRINTS, FINGERPRINT)
+            and firmware_family_matches(baseline['identity'].get('ro.build.fingerprint'))
             and baseline['identity'].get('ro.build.version.sdk') == '36'
             and baseline['identity'].get('ro.product.cpu.abi') == 'arm64-v8a'
             and baseline['identity'].get('selinux') == 'Enforcing',

@@ -16,13 +16,13 @@ class BootFilesystemTests(unittest.TestCase):
         self.base=self.root/'usr/local/lib/stepx-companion';self.hook=self.root/'usr/local/lib/stepx-gms/boot.py'
         self.hook.parent.mkdir(parents=True);self.original=b'# existing factory adapter\n';self.hook.write_bytes(self.original)
         self.chain=b'# companion chain\n'
-        self.config={'version':2,'package':'com.stepx.companion.app','serial':'test-device','fingerprint':'reviewed-fw','signer':'a'*64,'uid':10215,'installed_boot':'old','payload_installed_boot':'old','chain_sha256':hashof(self.chain),'grant_sha256':hashof(b'# grant'),'boot_sha256':hashof(b'# boot'),'launcher_sha256':hashof(b'# launcher'),'original_sha256':hashof(self.original),'baseline':{'permission':7}}
+        self.config={'version':2,'package':'com.stepx.companion.app','serial':'test-device','fingerprint':'StepX/pandora/pandora:16/BQ2A.260122.002-BP2A.250705.008/172:user/release-keys','signer':'a'*64,'uid':10215,'installed_boot':'old','payload_installed_boot':'old','chain_sha256':hashof(self.chain),'grant_sha256':hashof(b'# grant'),'boot_sha256':hashof(b'# boot'),'launcher_sha256':hashof(b'# launcher'),'original_sha256':hashof(self.original),'baseline':{'permission':7}}
         self.data={name:base64.b64encode(data).decode() for name,data in {'chain.py':self.chain,'grant.py':b'# grant','boot.py':b'# boot','config.json':json.dumps(self.config).encode(),'launcher.py':b'# launcher'}.items()}
     def tearDown(self):self.temp.cleanup()
     def run_code(self,code,**extra):
         code=code.replace("'/usr/local/bin/",repr(str(self.root/'usr/local/bin')+'/')[:-1]).replace("'/usr/local/lib/",repr(str(self.root/'usr/local/lib')+'/')[:-1]).replace("'/var/lib/",repr(str(self.root/'var/lib')+'/')[:-1])
         output=io.StringIO()
-        with contextlib.redirect_stdout(output):exec(code,{'ORIGINAL':hashof(self.original),'CONFIG':dict(self.config),'DATA':dict(self.data),'ALLOW_REBIND':False,'ALLOWED_FINGERPRINTS':('reviewed-fw',),**extra})
+        with contextlib.redirect_stdout(output):exec(code,{'ORIGINAL':hashof(self.original),'CONFIG':dict(self.config),'DATA':dict(self.data),'ALLOW_REBIND':False,'FAMILY':('StepX','pandora','pandora','16','user','release-keys'),**extra})
         return json.loads(output.getvalue())
     def install(self,rebind=False):return self.run_code(install_code(),ALLOW_REBIND=rebind)
     def test_install_keeps_exact_backup_and_can_restore(self):

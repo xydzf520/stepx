@@ -51,7 +51,7 @@ def installation_device():
     if not fingerprint:
         raise RuntimeError('无法读取手机固件信息，尚未安装')
     return {'firmware': fingerprint,
-            'system_adaptation_supported': fingerprint in p.ALLOWED_FINGERPRINTS}
+            'system_adaptation_supported': p.fingerprint_tier(fingerprint) in ('verified', 'forward')}
 
 def package_paths():
     # Android returns exit 1 with no output when this package is not installed.

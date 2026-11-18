@@ -825,6 +825,7 @@ pub fn install(device: &Device, adb: &Adb, progress: impl Fn(&str)) -> Result<Go
     if preflight["user_unlocked"].as_bool() != Some(true) {
         bail!("请先解锁手机，再安装 Google Play 与 StepX伴侣");
     }
+    let forward_firmware = preflight["firmware_tier"].as_str() == Some("forward");
     let plan = install_plan(&preflight)?;
     if preflight["installation"]["requires_install_switch"] == true || plan == GoogleInstallPlan::Missing {
         require_install_switch(&preflight)?;
@@ -843,7 +844,10 @@ pub fn install(device: &Device, adb: &Adb, progress: impl Fn(&str)) -> Result<Go
     };
     // The Google launch hook only exists after first installation. Configure the
     // companion chain now, never report the pre-hook result as reboot-ready.
-    if plan != GoogleInstallPlan::Existing {
+    // On forward firmware both boot hooks are refused by their own byte pins
+    // (missing GMS hook or unknown stock launcher), so skip the call and let
+    // the forward-firmware note explain the degraded durability instead.
+    if plan != GoogleInstallPlan::Existing && !forward_firmware {
         progress("正在补齐 StepX伴侣开机恢复并回读权限…");
         companion = crate::companion_app::complete_boot_setup(adb, device)
             .context("Google 组件已安装；伴侣开机恢复未完成，现有数据保留，请重试修复")?;
@@ -866,9 +870,12 @@ pub fn install(device: &Device, adb: &Adb, progress: impl Fn(&str)) -> Result<Go
         message.push(' ');
         message.push_str(&google.compatibility_note);
     }
+    // On forward firmware the reviewed boot hook was never installed (its
+    // stock-launcher pins do not exist there), so repair-runtime cannot pass.
     if plan != GoogleInstallPlan::Missing
         && google.installed
         && !google.boot_module_ready
+        && !forward_firmware
     {
         progress("恢复 Google 组件更新后的运行权限…");
         run_script(device, adb, "manage.py", &["repair-runtime"])?;
@@ -885,6 +892,9 @@ pub fn install(device: &Device, adb: &Adb, progress: impl Fn(&str)) -> Result<Go
     if !google.installed { bail!("Google 组件仍未安装完整，请继续安装；已有组件和账号已保留"); }
     if google.boot_module_ready && !google.persistent_flags_clear {
         bail!("Google 组件已保留，但持久化标记检查未通过，请重新检测；当前不能按安装成功验收");
+    }
+    if forward_firmware && google.installed && !google.boot_module_ready {
+        message.push_str(" 当前固件为未逐项验证的新版本，开机自恢复未配置；重启后请在桌面端重新检测并修复。");
     }
     if !google.boot_module_ready || google.health_needs_repair {
         message.push_str(" 服务尚未全部就绪。请按提示重启手机并解锁后重新检测；当前不代表 Google 登录或认证通过。");
@@ -920,6 +930,7 @@ fn install_fresh(device: &Device, adb: &Adb, progress: impl Fn(&str)) -> Result<
     // Preflight validates the exact firmware before downloading or changing phone data.
     let preflight: serde_json::Value =
         serde_json::from_str(&run_script(device, adb, "manage.py", &["preflight"])?)?;
+    let forward_firmware = preflight["firmware_tier"].as_str() == Some("forward");
     require_install_switch(&preflight)?;
     if preflight["user_unlocked"].as_bool() != Some(true) {
         bail!("请先在手机上解锁，再安装 Google 服务");
@@ -944,7 +955,11 @@ fn install_fresh(device: &Device, adb: &Adb, progress: impl Fn(&str)) -> Result<
     run_script(device, adb, "package_state.py", &["--save-first"])?;
     progress("6 / 6 · 安装开机适配，完成后需手动重启");
     run_script(device, adb, "install_adapter.py", &[])?;
-    Ok("安装步骤已完成。请手动重启手机并解锁，再点击「检测状态」；确认适配通过前暂不要登录 Google。".into())
+    Ok(if forward_firmware {
+        "安装步骤已完成。当前固件为未逐项验证的新版本，开机自恢复未配置；请保持手机运行并点击「检测状态」确认适配；若重启手机，需回到桌面端重新检测修复。".into()
+    } else {
+        "安装步骤已完成。请手动重启手机并解锁，再点击「检测状态」；确认适配通过前暂不要登录 Google。".into()
+    })
 }
 
 #[cfg(test)]

@@ -37,7 +37,7 @@ for _extra_dir in (_SELF.parent, ROOT / 'scripts', WORKFLOW / 'tools'):
     if _extra_dir.is_dir() and str(_extra_dir) not in sys.path:
         sys.path.insert(0, str(_extra_dir))
 import common
-from common import ADB, ALLOWED_FINGERPRINTS, CONFIG, guard, root_json, shell
+from common import ADB, ALLOWED_FINGERPRINTS, CONFIG, fingerprint_family, fingerprint_tier, firmware_family_matches, guard, root_json, shell
 from host_runtime import (
     file_lock,
     java_environment,
@@ -238,7 +238,7 @@ def finish_install():
         return {'status': 'unchanged', 'package': PACKAGE, 'restore_required': False}
     baseline = json.loads(path.read_text())
     allowed_serials = {s for s in (device_key(), ADB[-1], os.environ.get('STEPX_DEVICE_SERIAL', '')) if s}
-    if baseline.get('package') != PACKAGE or baseline.get('key') != INSTALL_KEY or baseline.get('serial') not in allowed_serials or baseline.get('fingerprint') not in ALLOWED_FINGERPRINTS or baseline.get('temporary') != INSTALL_VALUE:
+    if baseline.get('package') != PACKAGE or baseline.get('key') != INSTALL_KEY or baseline.get('serial') not in allowed_serials or not firmware_family_matches(baseline.get('fingerprint')) or baseline.get('temporary') != INSTALL_VALUE:
         raise RuntimeError('USB installation recovery baseline mismatch')
     previous = baseline.get('previous')
     if previous is not None and (not isinstance(previous, str) or len(previous) > 512):
@@ -264,7 +264,7 @@ def baseline_path(cert, uid):
 
 
 def validate_baseline(prior, cert, uid):
-    if prior and (prior.get('signer') != cert or prior.get('fingerprint') not in ALLOWED_FINGERPRINTS or prior.get('uid') != uid):
+    if prior and (prior.get('signer') != cert or not firmware_family_matches(prior.get('fingerprint')) or prior.get('uid') != uid):
         raise RuntimeError('Companion permission baseline or UID mismatch')
 
 
@@ -302,7 +302,7 @@ def runtime_identity(cert, uid):
     if not re.fullmatch(r'[0-9a-f-]{36}', boot) or not re.fullmatch(r'[1-9][0-9]*', pid):
         raise RuntimeError('Unable to verify the current OEM freezer runtime')
     actual_fp = shell('getprop', 'ro.build.fingerprint')
-    if actual_fp not in ALLOWED_FINGERPRINTS:
+    if fingerprint_tier(actual_fp) not in ('verified', 'forward'):
         raise RuntimeError('Unsupported firmware for OEM freezer runtime')
     identity = {'serial': device_key(), 'fingerprint': actual_fp, 'package': PACKAGE,
                 'signer': cert, 'uid': uid, 'boot_id': boot, 'system_server_pid': int(pid)}
